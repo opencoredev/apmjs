@@ -367,6 +367,7 @@ async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | 
   }
   if (action === "yank") {
     if (v.status === "revoked" || v.status === "revoke-pending") return fail(409, "This version is revoked, which is stronger than a yank.");
+    if (v.status === "yanked") return json({ ok: true, name, version, status: "yanked", already: true });
     ctx.store.setStatus(name, version, { status: "yanked", reason: reason ?? null, at, by: user });
     moveTagsOff(ctx, name, version);
     ctx.store.addEvent({ package: name, kind: "yank", actor: user, at, detail: { version, reason: reason ?? null } });
@@ -521,10 +522,13 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
         return { name: c, available: !taken && cc.length === 0, taken };
       }),
   );
-  const latest0 = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
+  const latestRaw = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
+  const latest0 = src && latestRaw ? await ensureAnalyzed(env, src, latestRaw) : null;
   const latestReport = latest0 ? reportFor(ctx, latest0) : null;
   return {
     query,
+    // popular names this one could be mistaken for, whether or not it is taken (install-side typo warning)
+    lookalikes: valid ? typoConflicts(query) : [],
     valid,
     taken: src !== null,
     source: src?.kind ?? null,

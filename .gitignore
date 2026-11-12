@@ -4,3 +4,5 @@ dist
 .next
 *.tgz
 .hill-climb/*/data
+shots
+apps/web/.next
