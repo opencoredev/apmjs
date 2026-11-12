@@ -31,7 +31,7 @@ import {
   type ScoreReport,
   type TarEntry,
 } from "@apm/core";
-import type { LiveAction } from "./actions.ts";
+import { canonicalSince, type LiveAction } from "./actions.ts";
 import type { VersionRecord } from "./db.ts";
 import { fail, json, splitPath, highest, servedVersions, tagTarget, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
 import { digestLabel, type Upstream, type UpstreamPackage } from "./upstream.ts";
@@ -485,12 +485,14 @@ async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | 
 async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, IncidentBody);
   if (!parsed.ok) return parsed.res;
-  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp }, { kind: "incident" });
-  if (who instanceof Response) return who;
   // `since` is exclusive: pass the time of the last publish you trust.
   const since = Date.parse(parsed.value.since);
   if (Number.isNaN(since)) return fail(400, "since must be an ISO timestamp");
   if (ctx.now() - since > INCIDENT_WINDOW_MS) return fail(400, "Incident response reaches back at most 30 days. Revoke older versions one by one (apm revoke).");
+  // the range and whether it is a preview are part of what the second factor authorizes
+  const command: LiveAction = { kind: "incident", since: canonicalSince(parsed.value.since), dryRun: parsed.value.dryRun === true };
+  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp }, command);
+  if (who instanceof Response) return who;
   const reason = parsed.value.reason ?? "account compromised";
   const user = who.user;
   const targets: VersionRecord[] = [];

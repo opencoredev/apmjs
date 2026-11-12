@@ -187,9 +187,10 @@ export async function linkProvider(provider: "github" | "vercel", next: string, 
   return null;
 }
 
-/** A CLI command a person approves on the website, once. Mirrors the registry's LiveAction. */
+/** A CLI command a person approves on the website, once. Mirrors the registry's LiveAction (packages/registry/src/actions.ts). */
 const Name = z.string().min(1).max(214);
 const Version = z.string().min(1).max(256);
+const DeprecateChange = z.object({ version: Version, message: z.string().max(1024).nullable() });
 
 export const LiveAction = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("revoke"), name: Name, version: Version }),
@@ -197,8 +198,8 @@ export const LiveAction = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("yank"), name: Name, version: Version }),
   z.object({ kind: z.literal("unyank"), name: Name, version: Version }),
   z.object({ kind: z.literal("dist-tag"), name: Name, tag: z.string().min(1).max(128), version: Version.nullable() }),
-  z.object({ kind: z.literal("deprecate"), name: Name }),
-  z.object({ kind: z.literal("incident") }),
+  z.object({ kind: z.literal("deprecate"), name: Name, changes: z.array(DeprecateChange).min(1).max(1000) }),
+  z.object({ kind: z.literal("incident"), since: z.string().min(1).max(64), dryRun: z.boolean() }),
   z.object({ kind: z.literal("owner-add"), name: Name, user: z.string().min(1).max(64) }),
   z.object({ kind: z.literal("owner-remove"), name: Name, user: z.string().min(1).max(64) }),
 ]);
@@ -215,9 +216,12 @@ export function commandText(a: LiveAction): string {
     case "dist-tag":
       return a.version === null ? `npm dist-tag rm ${a.name} ${a.tag}` : `npm dist-tag add ${a.name}@${a.version} ${a.tag}`;
     case "deprecate":
-      return `npm deprecate ${a.name}`;
+      return [...a.changes]
+        .sort((x, y) => (x.version < y.version ? -1 : x.version > y.version ? 1 : 0))
+        .map((c) => `npm deprecate ${a.name}@${c.version} ${JSON.stringify(c.message ?? "")}`)
+        .join(" && ");
     case "incident":
-      return "apm incident";
+      return `apm incident --since ${a.since}${a.dryRun ? " --dry-run" : ""}`;
     case "owner-add":
       return `apm owner add ${a.user} ${a.name}`;
     case "owner-remove":

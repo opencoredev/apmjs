@@ -366,9 +366,15 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (perm) return fail(perm.status, perm.error);
 
   if (!body._attachments || Object.keys(body._attachments).length === 0) {
-    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "deprecate", name }, otp: npmOtp(req) });
+    // the versions and messages that would change are what a second factor authorizes; no change needs none
+    const [first, ...rest] = deprecationChanges(ctx, name, body);
 
-    if (denied) return otpFail(denied);
+    if (first) {
+      const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "deprecate", name, changes: [first, ...rest] }, otp: npmOtp(req) });
+
+      if (denied) return otpFail(denied);
+    }
+
     return handleMetadataUpdate(ctx, name, body, auth.user);
   }
 
@@ -622,6 +628,23 @@ function commitRows(ctx: Ctx, v: CommitInput, m: { at: number; size: number }): 
 }
 
 /** A publish-shaped PUT without a tarball: npm deprecate. Answers with the versions it changed; a missing version changes nothing. */
+/** The deprecation message a metadata PUT sets on a version: a non-empty string, or null to take it off. */
+function deprecationOf(manifest: Record<string, unknown>): string | null {
+  const dep = manifest.deprecated;
+
+  return typeof dep === "string" && dep.length > 0 ? dep : null;
+}
+
+/** What a metadata PUT (npm deprecate) would change: each existing version whose message differs. */
+function deprecationChanges(ctx: Ctx, name: string, body: PublishBody): { version: string; message: string | null }[] {
+  return Object.entries(body.versions).flatMap(([version, manifest]) => {
+    const v = ctx.store.getVersion(name, version);
+    const next = deprecationOf(manifest);
+
+    return v && next !== v.deprecated ? [{ version, message: next }] : [];
+  });
+}
+
 function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: string): Response {
   const pkg = ctx.store.getPackage(name);
   if (!pkg) return fail(404, "Not found");
@@ -637,8 +660,7 @@ function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: s
     for (const [version, manifest] of asked) {
       const v = ctx.store.getVersion(name, version);
       if (!v) continue;
-      const dep = manifest.deprecated;
-      const next = typeof dep === "string" && dep.length > 0 ? dep : null;
+      const next = deprecationOf(manifest);
       if (next !== v.deprecated) {
         ctx.store.setDeprecated(name, version, next);
         ctx.store.addEvent({ package: name, kind: next ? "deprecate" : "undeprecate", actor: user, at, detail: { version, message: next } });
