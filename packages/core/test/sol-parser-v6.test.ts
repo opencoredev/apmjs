@@ -137,7 +137,7 @@ describe("a limit keeps what it could not follow, and says so", () => {
     const r = scoreFiles({ [fixture.file]: fixture.src }, fixture.file);
 
     expect(r.score).toBeLessThan(SCORE_FLOOR);
-    expect(r.notChecked.some((n) => n.startsWith("an expression that can be more than 6 values"))).toBe(true);
+    expect(r.notChecked.some((n) => n.startsWith("an expression with more than 6 possible values"))).toBe(true);
   });
 
   test("more than 32 returns: the rest are unknown, and the limit is named", () => {

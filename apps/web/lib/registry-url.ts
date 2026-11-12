@@ -6,6 +6,11 @@ export function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
 }
 
+/** The registry path of a package's answer. proxy.ts reads the same URL as the page, so the page reuses its answer. */
+export function packageApiPath(name: string): string {
+  return `-/apm/v1/packages/${encodeName(name)}`;
+}
+
 /** The registry path for one file of one version (GET /-/apm/v1/file/<name>/<version>?path=...). */
 export function fileApiPath(input: { name: string; version: string; path: string }): string {
   return `-/apm/v1/file/${encodeName(input.name)}/${encodeURIComponent(input.version)}?path=${encodeURIComponent(input.path)}`;

@@ -479,6 +479,8 @@ export const viewerOf = (req: Request, caller: Caller) =>
       return user ? ({ kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: { kind: "token" } } satisfies Viewer) : ({ kind: "anon" } satisfies Viewer);
     }
 
+    // a website session is a cookie: without one there is nothing to read, and Better Auth is not built for nothing
+    if (!req.headers.has("cookie")) return { kind: "anon" } satisfies Viewer;
     const auth = yield* Auth;
     const s = yield* auth.sessionOf(req);
 

@@ -6,6 +6,8 @@
 //  3. Package pages and file views: with Cache Components the page shell is sent before the page can look
 //     the package up, so the response status is decided here: a rewrite to an unmatched path for a registry
 //     404 (Next.js renders its not-found page with a 404), and a standalone 503 page when it can't be read.
+//     A package or file known to exist is answered from the edge cache (lib/package-status.ts), and a package
+//     looked up here stays cached for the page, so a view reads the package from the registry at most once.
 import { NextResponse, type NextRequest } from "next/server";
 import { CLIENT_FORWARDING_HEADERS, edgeClientIp } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
@@ -52,14 +54,13 @@ export async function proxy(request: NextRequest): Promise<Response> {
 
   if (route) {
     const name = route.name;
-    const status = await packageStatus(name, request.signal);
+    // a file view asks for the file alone: the registry answers 404 when the package, the version or the file is
+    // missing. Both checks are answered from the edge cache once the answer is known to be yes.
+    const status = route.kind === "file" ? await fileStatus(route, request.signal) : await packageStatus(name, request.signal);
 
-    if (status.kind === "missing") return missing();
+    if (status === "missing") return missing();
 
-    // a file of a version: a 404 when the version or the file isn't there; any other answer renders the page
-    if (status.kind === "ok" && route.kind === "file" && (await fileStatus(route, request.signal)) === "missing") return missing();
-
-    if (status.kind === "unavailable") {
+    if (status === "unavailable") {
       const html = unavailablePage({ name, retryPath: `${pathname}${request.nextUrl.search}` });
 
       return new Response(html, {

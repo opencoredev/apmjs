@@ -983,15 +983,17 @@ const sessionUser = (req: Request) =>
   });
 
 // ---------- search: local packages merged with the upstream's search ----------
-/** A score for an upstream search hit, only when that version was analyzed before. Never fetches a tarball. */
-const storedUpstreamScore = (name: string, version: string, date: string | null | undefined) =>
-  Effect.gen(function* () {
-    const analysis = parseAnalysis(yield* (yield* Store).latestUpstreamAnalysis(name, version));
+/**
+ * A score for an upstream search hit, only when that version was analyzed before. Never fetches a tarball: it reads
+ * what latestUpstreamAnalyses found for every hit at once.
+ */
+function storedUpstreamScore(analyses: ReadonlyMap<string, unknown>, hit: { name: string; version: string; date?: string | null | undefined }, at: number): CompactScore | null {
+  const analysis = parseAnalysis(analyses.get(`${hit.name} ${hit.version}`));
 
-    if (!analysis) return null;
+  if (!analysis) return null;
 
-    return compact(finalize(analysis, { publishedAt: Date.parse(date ?? "") || 0, now: yield* now, deprecated: null, status: "active", statusReason: null }));
-  });
+  return compact(finalize(analysis, { publishedAt: Date.parse(hit.date ?? "") || 0, now: at, deprecated: null, status: "active", statusReason: null }));
+}
 
 /**
  * Local hits first (they are what this registry serves under that name), then the upstream's in its own order.
@@ -1017,14 +1019,11 @@ const searchResponse = (url: URL) =>
     // npm refuses text shorter than two characters, so asking it would only look like an outage
     const up = upstream && text.trim().length >= 2 ? yield* upstream.search(text.trim(), Math.min(250, from + size)) : null;
 
-    const upstreamHits =
-      up?.kind === "ok"
-        ? yield* Effect.forEach(
-            up.objects,
-            (o) => Effect.map(storedUpstreamScore(o.package.name, o.package.version, o.package.date), (apmScore) => ({ ...o, source: "npm" as const, apmScore })),
-            { concurrency: 8 },
-          )
-        : [];
+    // one query for every hit's stored score, not one per hit: they would queue on the request's one connection
+    const hits = up?.kind === "ok" ? up.objects : [];
+    const analyses = yield* (yield* Store).latestUpstreamAnalyses(hits.map((o) => ({ name: o.package.name, version: o.package.version })));
+    const at = yield* now;
+    const upstreamHits = hits.map((o) => ({ ...o, source: "npm" as const, apmScore: storedUpstreamScore(analyses, o.package, at) }));
 
     const merged = mergeSearch({ text, local, upstream: upstreamHits });
     const total = local.length + (up?.kind === "ok" ? Math.max(up.total, upstreamHits.length) : 0);

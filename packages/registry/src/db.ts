@@ -320,8 +320,11 @@ export type StoreApi = {
 
   /** The current scorer's analyses of this package, keyed by `${version} ${digest}`. */
   readonly upstreamAnalyses: (name: string) => Effect.Effect<Map<string, unknown>, StoreError>;
-  /** For display where the tarball digest is not known (search hits): the newest current-scorer analysis. */
-  readonly latestUpstreamAnalysis: (name: string, version: string) => Effect.Effect<unknown, StoreError>;
+  /**
+   * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
+   * keyed `"<name> <version>"`, in one query however many versions are asked for.
+   */
+  readonly latestUpstreamAnalyses: (versions: readonly { name: string; version: string }[]) => Effect.Effect<Map<string, unknown>, StoreError>;
   readonly setUpstreamAnalysis: (input: { name: string; version: string; digest: string; analysis: unknown; at: number }) => Effect.Effect<void, StoreError>;
   /** Records that a version was sent for analysis; false when it was sent less than `staleMs` ago. */
   readonly claimAnalysisJob: (name: string, version: string, now: number, staleMs: number) => Effect.Effect<boolean, StoreError>;
@@ -754,17 +757,28 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
 
         return new Map(rows.map((row) => [`${row.version} ${row.digest}`, withList(row.analysis, dismissalsFor(dismissals, row.version, row.digest))]));
       }),
-    latestUpstreamAnalysis: (name, version) =>
+    latestUpstreamAnalyses: (versions) =>
       Effect.gen(function* () {
-        const row = yield* run(
-          "latestUpstreamAnalysis",
-          sql`SELECT digest, analysis FROM upstream_analysis WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} ORDER BY analyzed_at DESC LIMIT 1`,
-          one(z.object({ digest: z.string(), analysis: z.unknown() })),
+        if (versions.length === 0) return new Map<string, unknown>();
+
+        const names = versions.map((v) => v.name);
+        const numbers = versions.map((v) => v.version);
+
+        const rows = yield* run(
+          "latestUpstreamAnalyses",
+          sql`SELECT DISTINCT ON (u.package, u.version) u.package, u.version, u.digest, u.analysis
+              FROM upstream_analysis u
+              JOIN unnest(${names}::text[], ${numbers}::text[]) AS wanted(package, version) ON u.package = wanted.package AND u.version = wanted.version
+              WHERE u.scorer = ${SCORER}
+              ORDER BY u.package, u.version, u.analyzed_at DESC`,
+          all(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
         );
 
-        if (row === null) return null;
+        const dismissals = yield* dismissalsOf([...new Set(rows.map((r) => r.package))]);
 
-        return withList(row.analysis, dismissalsFor(yield* dismissalsOf([name]), version, row.digest));
+        return new Map(
+          rows.map((r) => [`${r.package} ${r.version}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest))]),
+        );
       }),
     setUpstreamAnalysis: (input) =>
       run(

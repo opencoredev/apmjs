@@ -159,6 +159,21 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   return made;
 }
 
+/**
+ * npm packuments shared by every isolate in a data center through the Workers Cache API, below the isolate cache. A
+ * cold isolate then reads a packument another one fetched a moment ago instead of asking npm again. Only npm's own
+ * 200 answer is kept, as the text npm sent, and parsed on every read exactly as a fresh one is. The Cache API works
+ * on custom domains (production); on workers.dev its calls do nothing, and under Miniflare it works as in production.
+ * A TTL under a second (the tests that move an upstream between requests) turns it off.
+ */
+const SHARED_MIN_TTL_MS = 1_000;
+
+/** The data center's cache. Call it only inside a Worker request: Bun (the unit tests) has no `caches`. */
+const workerCache = (): Cache => caches.default;
+
+/** The Cache API key of a packument. This host is never fetched; it only names the entry. */
+const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v1/${encodeURIComponent(url)}`);
+
 function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
 }
@@ -183,8 +198,11 @@ export type UpstreamApi = {
 };
 
 export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/registry/Upstream") {
-  /** The proxy of `baseUrl` (ending with "/"). */
-  static layer(baseUrl: string, ttlMs: number = DEFAULT_TTL_MS): Layer.Layer<Upstream, never, Store | Blobs> {
+  /**
+   * The proxy of `baseUrl` (ending with "/"). `background` finishes work after the response (the shared packument
+   * cache's writes); without it those writes are skipped.
+   */
+  static layer(baseUrl: string, ttlMs: number = DEFAULT_TTL_MS, background: ((work: Promise<void>) => void) | null = null): Layer.Layer<Upstream, never, Store | Blobs> {
     return Layer.effect(
       Upstream,
       Effect.gen(function* () {
@@ -293,8 +311,46 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             Effect.orElseSucceed((): UpstreamSearch => ({ kind: "unavailable" })),
           );
 
+        // `background` is set only inside a Worker request, where `caches` always exists
+        const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
+
+        /** npm's packument, from the shared cache when another isolate fetched it within the TTL. */
+        const fetchPackument = (url: string): Effect.Effect<{ status: number; body: unknown }, unknown> =>
+          Effect.tryPromise({
+            try: async (): Promise<{ status: number; body: unknown }> => {
+              const key = packumentKey(url);
+              const shared = sharing ? workerCache() : null;
+              const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
+
+              if (hit) {
+                const body: unknown = JSON.parse(await hit.text());
+
+                return { status: 200, body };
+              }
+
+              const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+
+              if (res.status !== 200) {
+                await res.body?.cancel();
+
+                return { status: res.status, body: null };
+              }
+
+              const text = await res.text();
+              const body: unknown = JSON.parse(text);
+
+              if (shared && background) {
+                const copy = new Response(text, { headers: { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}` } });
+                background(shared.put(key, copy).catch(() => undefined));
+              }
+
+              return { status: 200, body };
+            },
+            catch: (cause) => cause,
+          });
+
         const fetchPackage = (name: string): Effect.Effect<CachedProbe | { kind: "unknown" }> =>
-          fetchJson(`${baseUrl}${encodeName(name)}`, 10_000).pipe(
+          fetchPackument(`${baseUrl}${encodeName(name)}`).pipe(
             Effect.map(({ status, body }): CachedProbe | { kind: "unknown" } => {
               if (status === 404) return { kind: "absent" };
 

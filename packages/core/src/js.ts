@@ -703,15 +703,18 @@ const MAX_EVAL_DEPTH = 3;
  */
 type Budget = { decoded: number; notes: Set<string> };
 
-/** Why a reading stopped short, as the not-checked list says it. */
+/**
+ * Why a reading stopped short, as the not-checked list names it, followed by the files. Past each limit the text rules
+ * judged the code; the website says so once ("apm read those files with its text rules") and lists these as details.
+ */
 const LIMIT_NOTES = {
-  candidates: "an expression that can be more than 6 values: the rest were read as unknown, and judged by the text rules alone",
-  returns: "a function with more than 32 return statements: the rest were read as unknown, and judged by the text rules alone",
-  thisWrites: "a constructor that sets one field more than 8 times: the rest were read as unknown, and judged by the text rules alone",
-  depth: "values nested more than 24 levels deep: past that they were read as unknown, and judged by the text rules alone",
-  evalDepth: "code run from a string more than 3 levels deep: it was read raw, with every match counted",
-  decoded: "more than 256 KB of decoded or evaluated text in one file: the rest was judged by the text rules alone",
-  flow: "a value followed through more than 32 steps: apm could not prove it harmless, so the text rules judged it",
+  candidates: "an expression with more than 6 possible values",
+  returns: "a function with more than 32 return statements",
+  thisWrites: "a constructor that sets one field more than 8 times",
+  depth: "values nested more than 24 levels deep",
+  evalDepth: "code run from a string more than 3 levels deep",
+  decoded: "more than 256 KB of decoded text in one file",
+  flow: "a value passed through more than 32 steps",
 } as const;
 
 /**

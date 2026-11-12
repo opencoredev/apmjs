@@ -179,7 +179,7 @@ export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: L
   const withScoring =
     settings.upstreamUrl === null
       ? Layer.provideMerge(Analysis.none, base)
-      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS), base));
+      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), base));
 
   return Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl }), withScoring);
 }

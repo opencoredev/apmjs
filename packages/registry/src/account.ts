@@ -83,6 +83,8 @@ export const sweepConfirmations = Effect.gen(function* () {
 
 const signedIn = (req: Request) =>
   Effect.gen(function* () {
+    // a session is a cookie: a visitor without one (the header's check on every page) is answered without Better Auth
+    if (!req.headers.has("cookie")) return yield* Effect.fail(refuse(401, `Sign in at ${(yield* RegistryConfig).webUrl} first.`));
     const auth = yield* Auth;
     const s = yield* auth.sessionOf(req);
 

@@ -3,20 +3,20 @@ import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Dismissed, type Facts, type Fetched, type PackageInfo } from "@/lib/registry";
+import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
 import { packageLinks, type PackageLink } from "@/lib/package-links";
 import { PackageLinks } from "@/components/package-links";
-import { headerNotice } from "@/lib/review-schema";
+import { headerNotice, type ReviewAnswer } from "@/lib/review-schema";
 import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
 import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
 import { citedLine } from "@/lib/file-excerpt";
-import { splitPossible, splitTestFile, summarizeLimitations } from "@/lib/limitations";
+import { limitationCount, sortLimitations, splitPossible, splitTestFile, summarizeLimitations, type ReadingLimit } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
@@ -133,18 +133,62 @@ function LimitationsLine({ notChecked }: { notChecked: readonly string[] }) {
   );
 }
 
+/** A general limit as a sentence: "runtime behavior: what the code does..." reads "Runtime behavior: what...". */
+function sentence(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** The files apm read with its text rules alone, behind their own disclosure: which limit, in which files. */
+function ComplexCode({ complex }: { complex: readonly ReadingLimit[] }) {
+  return (
+    <li>
+      <details className="group/complex">
+        <summary className="cursor-pointer list-none select-none [&::-webkit-details-marker]:hidden">
+          Some code was too complex to follow; apm read those files with its text rules{" "}
+          <span className="whitespace-nowrap text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] group-hover/complex:decoration-inverse-foreground">
+            (<span className="group-open/complex:hidden">details</span>
+            <span className="hidden group-open/complex:inline">hide details</span>)
+          </span>
+        </summary>
+        <ul className="mt-2 flex flex-col gap-1.5 border-l-2 border-inverse-border pl-3">
+          {complex.map((c) => (
+            <li key={`${c.limit} ${c.files}`}>
+              <span className="font-mono text-[12.5px] text-inverse-foreground [overflow-wrap:anywhere]">{c.files}</span>: {c.limit}
+            </li>
+          ))}
+        </ul>
+      </details>
+    </li>
+  );
+}
+
 function LimitationsList({ notChecked }: { notChecked: readonly string[] }) {
+  const l = sortLimitations(notChecked);
+
   return (
     <details id="not-checked" className="group scroll-mt-44 sm:scroll-mt-24 border-t border-inverse-border bg-inverse-raised">
       <summary className="flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-5 py-3 text-sm text-inverse-foreground select-none hover:bg-inverse-border/40 sm:px-6 [&::-webkit-details-marker]:hidden">
         <span>
-          What this score does not check <span className="text-inverse-muted tabular-nums">({notChecked.length})</span>
+          What this score does not check <span className="text-inverse-muted tabular-nums">({limitationCount(l)})</span>
         </span>
         <ChevronDownIcon className="size-4 text-inverse-muted transition-transform group-open:rotate-180" aria-hidden />
       </summary>
-      <ul className="flex flex-col gap-2 px-5 pb-4 text-sm leading-6 text-pretty text-inverse-muted sm:px-6">
-        {notChecked.map((n) => (
-          <li key={n}>{n}</li>
+      <ul className="flex list-disc flex-col gap-2 py-1 pr-5 pb-4 pl-10 text-sm leading-6 text-pretty text-inverse-muted marker:text-inverse-border sm:pr-6 sm:pl-11">
+        {l.general.map((n) => (
+          <li key={n}>{sentence(n)}</li>
+        ))}
+        {l.complex.length > 0 && <ComplexCode complex={l.complex} />}
+        {l.unread.map((n) => (
+          <li key={n}>{sentence(n)}</li>
+        ))}
+        {l.dependencies.length > 0 && (
+          <li>
+            {l.dependencies.length === 1 ? "A dependency" : `${l.dependencies.length} dependencies`} apm could not score:{" "}
+            <span className="font-mono text-[12.5px] [overflow-wrap:anywhere]">{l.dependencies.join(", ")}</span>
+          </li>
+        )}
+        {l.other.map((n) => (
+          <li key={n}>{sentence(n)}</li>
         ))}
       </ul>
     </details>
@@ -443,6 +487,93 @@ function shownVersion(pkg: PackageInfo, v: string | string[] | undefined): strin
   return asked !== undefined && pkg.versions.some((x) => x.version === asked) ? asked : pkg.latest;
 }
 
+/** The header's note about an open or confirmed AI review flag, once the review answer arrives. */
+async function AiNotice({ review }: { review: Promise<Fetched<ReviewAnswer>> }) {
+  const r = await review;
+  const notice = r.kind === "ok" && r.value.review !== null ? headerNotice(r.value.review) : null;
+
+  if (!notice) return null;
+
+  return (
+    <a
+      href="#ai-review"
+      className={`inline-flex min-h-8 items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium underline-offset-4 hover:underline ${notice.tone === "bad" ? "bg-bad-soft text-bad" : "bg-warn-soft text-warn"}`}
+    >
+      {notice.text}
+      <span aria-hidden>↓</span>
+    </a>
+  );
+}
+
+/** The AI review section, or nothing when the registry has the AI review off or does not know the version. */
+async function AiReviewSlot({ review, signInHref }: { review: Promise<Fetched<ReviewAnswer>>; signInHref: string }) {
+  const r = await review;
+
+  if (r.kind !== "ok") return null;
+
+  return (
+    <section aria-labelledby="ai-review" className="order-5 lg:order-none">
+      <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{r.value.version}</span>}>
+        AI review
+      </SectionTitle>
+      <AiReviewSection initial={r.value} signInHref={signInHref} />
+    </section>
+  );
+}
+
+function AiReviewLoading({ version }: { version: string }) {
+  return (
+    <section aria-labelledby="ai-review" aria-busy="true" className="order-5 lg:order-none">
+      <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{version}</span>}>
+        AI review
+      </SectionTitle>
+      <Skeleton className="h-20 w-full rounded-xl" />
+    </section>
+  );
+}
+
+/** The readme from npm's packument, or, when it has none, from the shown version's tarball. */
+async function ReadmeSlot(props: { name: string; pkg: PackageInfo; version: string | null; tarball: Promise<Fetched<TarballReadme> | null>; links: readonly PackageLink[] }) {
+  const readme = readmeSource({ packument: props.pkg.readme, version: props.version, tarball: await props.tarball });
+
+  return readme.kind === "packument" || readme.kind === "tarball" ? (
+    <ReadmeSection name={props.name} readme={readme.text} repository={props.pkg.repository} origin={readme.kind === "tarball" ? { path: readme.path, version: readme.version } : null} />
+  ) : (
+    <NoReadme name={props.name} source={readme} links={props.links} />
+  );
+}
+
+/** The public log: what happened to the package on apm, newest first. */
+async function PublicLog({ events }: { events: Promise<Fetched<PackageEvent[]>> }) {
+  const e = await events;
+
+  if (e.kind === "unavailable") {
+    return (
+      <section aria-labelledby="log" className="order-8 lg:order-none">
+        <SectionTitle id="log">Public log</SectionTitle>
+        <p className="text-[15px] text-muted-foreground">Couldn&apos;t load the public log. The registry did not answer; reload to try again.</p>
+      </section>
+    );
+  }
+
+  if (e.kind !== "ok" || e.value.length === 0) return null;
+
+  return (
+    <section aria-labelledby="log" className="order-8 lg:order-none">
+      <SectionTitle id="log">Public log</SectionTitle>
+      <ol className="relative flex flex-col gap-5 border-l pl-5">
+        {e.value.slice(0, 15).map((ev, i) => (
+          <li key={`${ev.at}-${i}`} className="relative text-[15px] leading-6">
+            <span className="absolute top-2 -left-[25px] size-2 rounded-full bg-faint ring-4 ring-background" aria-hidden />
+            <span className="font-mono text-[13px] text-muted-foreground">{ev.actor}</span> {describeEvent(ev)}
+            <div className="text-sm text-muted-foreground">{ago(ev.at)}</div>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 async function PackageContent({ params, searchParams }: PageProps) {
   const route = parsePackageRoute((await params).name);
 
@@ -450,36 +581,35 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
   const name = route.name;
-  const found = await getPackage(name);
+  // proxy.ts looked the package up (or knew it exists) before the shell went out, and left its answer in the edge
+  // cache, so this read is usually from memory
+  const [found, query] = await Promise.all([getPackage(name), searchParams]);
 
-  // proxy.ts already answered 404 or 503 before the shell went out; this covers a registry that
-  // fails between that check and this read.
+  // proxy.ts already answered 404 or 503; this covers a registry that fails between that check and this read
   if (found.kind === "missing") notFound();
 
   if (found.kind === "unavailable") return <RegistryUnavailable what={`the package ${name}`} retryHref={packagePath(name)} />;
   const pkg = found.value;
-  const version = shownVersion(pkg, (await searchParams).v);
+  const version = shownVersion(pkg, query.v);
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
 
-  const [events, review, versionScore, tarballReadme] = await Promise.all([
-    // an upstream package's log holds what apm's reviewers did to it (dismissed evidence); none answers 404
-    getEvents(name),
-    version ? getReview(name, version) : Promise.resolve(none),
-    version && !isLatest ? getVersionScore(name, version) : Promise.resolve(none),
-    // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
-    version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null),
-  ]);
+  // Started together, now. Each section below waits only for its own answer inside a Suspense boundary, so the
+  // header, the install box and the score render without waiting for the slowest call.
+  const review = version ? getReview(name, version) : Promise.resolve<Fetched<ReviewAnswer>>(none);
+  // an upstream package's log holds what apm's reviewers did to it (dismissed evidence); none answers 404
+  const events = getEvents(name);
+  // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
+  const tarballReadme = version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null);
+  // an older version's own score: the header badge and the score panel show it, so it is awaited here
+  const versionScore = version && !isLatest ? await getVersionScore(name, version) : none;
 
-  const readme = readmeSource({ packument: pkg.readme, version, tarball: tarballReadme });
   const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
-
-  let score = pkg.score;
-
-  if (!isLatest) score = versionScore.kind === "ok" ? versionScore.value : null;
+  const score = isLatest ? pkg.score : versionScore.kind === "ok" ? versionScore.value : null;
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
-  const aiNotice = review.kind === "ok" && review.value.review !== null ? headerNotice(review.value.review) : null;
+  const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
+  const signInHref = `/signin?next=${encodeURIComponent(here)}`;
 
   return (
     <div className="flex flex-col gap-10 sm:gap-12">
@@ -488,15 +618,9 @@ async function PackageContent({ params, searchParams }: PageProps) {
           <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>
           {version && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{version}</span>}
           <ScoreBadge score={score?.score} grade={score?.grade} className="h-8" />
-          {aiNotice && (
-            <a
-              href="#ai-review"
-              className={`inline-flex min-h-8 items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium underline-offset-4 hover:underline ${aiNotice.tone === "bad" ? "bg-bad-soft text-bad" : "bg-warn-soft text-warn"}`}
-            >
-              {aiNotice.text}
-              <span aria-hidden>↓</span>
-            </a>
-          )}
+          <Suspense fallback={null}>
+            <AiNotice review={review} />
+          </Suspense>
         </div>
         {!isLatest && pkg.latest && (
           <p className="text-sm text-muted-foreground">
@@ -532,22 +656,17 @@ async function PackageContent({ params, searchParams }: PageProps) {
             {score ? <ScorePanel score={score} name={pkg.name} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
           </section>
 
-          {review.kind === "ok" && (
-            <section aria-labelledby="ai-review" className="order-5 lg:order-none">
-              <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{review.value.version}</span>}>
-                AI review
-              </SectionTitle>
-              <AiReviewSection answer={review.value} />
-            </section>
+          {version && (
+            <Suspense fallback={<AiReviewLoading version={version} />}>
+              <AiReviewSlot review={review} signInHref={signInHref} />
+            </Suspense>
           )}
 
           <section aria-labelledby="readme" className="order-6 lg:order-none">
             <SectionTitle id="readme">Readme</SectionTitle>
-            {readme.kind === "packument" || readme.kind === "tarball" ? (
-              <ReadmeSection name={pkg.name} readme={readme.text} repository={pkg.repository} origin={readme.kind === "tarball" ? { path: readme.path, version: readme.version } : null} />
-            ) : (
-              <NoReadme name={pkg.name} source={readme} links={links} />
-            )}
+            <Suspense fallback={<Skeleton className="h-12 w-full rounded-xl" />}>
+              <ReadmeSlot name={pkg.name} pkg={pkg} version={version} tarball={tarballReadme} links={links} />
+            </Suspense>
           </section>
 
           <section aria-labelledby="versions" className="order-7 lg:order-none">
@@ -566,26 +685,9 @@ async function PackageContent({ params, searchParams }: PageProps) {
               <FactsPanel facts={pkg.facts} maintainers={pkg.maintainers} lastPublish={latest?.publishedAt ?? null} />
             </div>
           </section>
-          {events.kind === "unavailable" && (
-            <section aria-labelledby="log" className="order-8 lg:order-none">
-              <SectionTitle id="log">Public log</SectionTitle>
-              <p className="text-[15px] text-muted-foreground">Couldn&apos;t load the public log. The registry did not answer; reload to try again.</p>
-            </section>
-          )}
-          {events.kind === "ok" && events.value.length > 0 && (
-            <section aria-labelledby="log" className="order-8 lg:order-none">
-              <SectionTitle id="log">Public log</SectionTitle>
-              <ol className="relative flex flex-col gap-5 border-l pl-5">
-                {events.value.slice(0, 15).map((e, i) => (
-                  <li key={`${e.at}-${i}`} className="relative text-[15px] leading-6">
-                    <span className="absolute top-2 -left-[25px] size-2 rounded-full bg-faint ring-4 ring-background" aria-hidden />
-                    <span className="font-mono text-[13px] text-muted-foreground">{e.actor}</span> {describeEvent(e)}
-                    <div className="text-sm text-muted-foreground">{ago(e.at)}</div>
-                  </li>
-                ))}
-              </ol>
-            </section>
-          )}
+          <Suspense fallback={null}>
+            <PublicLog events={events} />
+          </Suspense>
         </div>
       </div>
     </div>

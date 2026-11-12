@@ -1,6 +1,7 @@
 // Reads one JSON document from the registry with a time budget and a size cap, and says why it failed.
 // No "server-only" here so the unit tests can import it; lib/registry.ts is the server entry point.
 import type { z } from "zod";
+import { evict, inBackground, lookup, store, type CachePolicy } from "./edge-cache";
 import { registryFetch } from "./registry-transport";
 
 /** Every registry call gives up after this long, so a stalled registry can't pin a render. */
@@ -76,10 +77,35 @@ export type FetchJsonOptions<T> = {
   timeoutMs?: number;
   maxBytes?: number;
   headers?: HeadersInit;
+  /**
+   * Keep a 2xx answer in the edge cache (lib/edge-cache.ts) for this long, keyed by the URL. Only for answers that are
+   * the same for everyone: a cached read never sends `headers`.
+   */
+  cache?: CachePolicy;
 };
 
+/** One read of the registry: the parsed value, or why there is none, and the body to cache when it was a 2xx. */
+type Loaded<T> = { result: Fetched<T>; body: string | null };
+
+/** Parses a registry body with `schema`. */
+function parseBody<T>(text: string, schema: z.ZodType<T>): Fetched<T> {
+  let json: unknown;
+
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { kind: "unavailable", reason: { kind: "invalid", message: "the body is not JSON" } };
+  }
+
+  const parsed = schema.safeParse(json);
+
+  if (!parsed.success) return { kind: "unavailable", reason: { kind: "invalid", message: parsed.error.issues.slice(0, 3).map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") } };
+
+  return { kind: "ok", value: parsed.data };
+}
+
 /** GET `url`, read at most `maxBytes`, and parse the body with `schema`. Never throws. */
-export async function fetchJson<T>(opts: FetchJsonOptions<T>): Promise<Fetched<T>> {
+async function load<T>(opts: FetchJsonOptions<T>): Promise<Loaded<T>> {
   const timeoutMs = opts.timeoutMs ?? REGISTRY_TIMEOUT_MS;
   const signal = withTimeout(timeoutMs, opts.signal);
 
@@ -90,30 +116,51 @@ export async function fetchJson<T>(opts: FetchJsonOptions<T>): Promise<Fetched<T
     if (kind !== "ok") {
       await res.body?.cancel();
 
-      return kind === "missing" ? { kind: "missing" } : { kind: "unavailable", reason: { kind: "status", status: res.status } };
+      return { result: kind === "missing" ? { kind: "missing" } : { kind: "unavailable", reason: { kind: "status", status: res.status } }, body: null };
     }
 
     const body = await readCappedText(res, opts.maxBytes ?? MAX_REGISTRY_BODY_BYTES);
 
-    if (body.kind === "too-large") return { kind: "unavailable", reason: body };
-    let json: unknown;
+    if (body.kind === "too-large") return { result: { kind: "unavailable", reason: body }, body: null };
+    const result = parseBody(body.text, opts.schema);
 
-    try {
-      json = JSON.parse(body.text);
-    } catch {
-      return { kind: "unavailable", reason: { kind: "invalid", message: "the body is not JSON" } };
-    }
-
-    const parsed = opts.schema.safeParse(json);
-
-    if (!parsed.success) return { kind: "unavailable", reason: { kind: "invalid", message: parsed.error.issues.slice(0, 3).map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") } };
-
-    return { kind: "ok", value: parsed.data };
+    return { result, body: result.kind === "ok" ? body.text : null };
   } catch (error) {
-    if (error instanceof DOMException && error.name === "TimeoutError") return { kind: "unavailable", reason: { kind: "timeout" } };
+    if (error instanceof DOMException && error.name === "TimeoutError") return { result: { kind: "unavailable", reason: { kind: "timeout" } }, body: null };
 
-    return { kind: "unavailable", reason: { kind: "network", message: error instanceof Error ? error.message : "fetch failed" } };
+    return { result: { kind: "unavailable", reason: { kind: "network", message: error instanceof Error ? error.message : "fetch failed" } }, body: null };
   }
+}
+
+/** Reads the registry and keeps what it should: a 2xx is stored, a 404 or 410 drops what was stored, an outage keeps it. */
+async function loadAndKeep<T>(opts: FetchJsonOptions<T>, policy: CachePolicy): Promise<Fetched<T>> {
+  const { result, body } = await load(opts);
+
+  if (body !== null) store(opts.url, body, policy);
+  else if (result.kind === "missing" || (result.kind === "unavailable" && result.reason.kind === "status" && result.reason.status === 410)) evict(opts.url);
+
+  return result;
+}
+
+/** GET `url`, read at most `maxBytes`, and parse the body with `schema`; from the edge cache when `cache` is set. Never throws. */
+export async function fetchJson<T>(opts: FetchJsonOptions<T>): Promise<Fetched<T>> {
+  const policy = opts.cache;
+
+  if (!policy || opts.headers !== undefined) return (await load(opts)).result;
+  const hit = await lookup(opts.url, policy);
+
+  if (hit) {
+    const cached = parseBody(hit.text, opts.schema);
+
+    if (cached.kind === "ok") {
+      // the background refresh must outlive this request's abort signal
+      if (hit.stale) inBackground(loadAndKeep({ ...opts, signal: undefined }, policy));
+
+      return cached;
+    }
+  }
+
+  return loadAndKeep(opts, policy);
 }
 
 /** One line for the server log. */

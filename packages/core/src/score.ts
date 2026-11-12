@@ -98,15 +98,15 @@ const FactsSchema = z.object({
 
 const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(SKIP_REASONS) });
 
-/** What a static read of the tarball cannot see. Shown with every score; docs/SCORE.md explains each. */
+/**
+ * What a static read of the tarball cannot see, in plain words. Shown with every score; docs/SCORE.md explains each.
+ * The website shows this list as written and folds the per-file reading limits (LIMIT_NOTES in js.ts) into one line.
+ */
 export const NOT_CHECKED: readonly string[] = [
-  "runtime behavior: code that downloads, decrypts or builds a second stage while running",
-  "code hidden by anything but base64, hex, \\x escapes, char codes or joined string literals (XOR, compression, a custom encoding)",
-  "names built at runtime from values apm cannot work out in the file (array lookups, computed indexes, values read at runtime, values passed through a function's parameters)",
-  "documentation, type, JSON, style and markup files that no code reaches by a path apm can read; a computed require is reported as dynamic-require",
+  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
+  "code hidden by a custom encoding, compression or encryption",
+  "the code of its dependencies, beyond their own scores",
   "native binaries and WebAssembly: listed, not read",
-  "a popular name reused under another scope (@someone/react): scopes exist so names can be reused",
-  "the code of dependencies beyond their own scores",
   "whether the publisher's machine or CI was compromised",
 ];
 
