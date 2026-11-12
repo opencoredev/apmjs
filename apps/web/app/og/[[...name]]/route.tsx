@@ -4,8 +4,9 @@ import { ImageResponse } from "next/og";
 import type { NextRequest } from "next/server";
 import { MARK_INK, MARK_PULLED, WORD } from "@/components/logo";
 import { toneOf, type Tone } from "@/components/score-badge";
+import { AGENT_CACHE } from "@/lib/agent/agent-http";
 import { parsePackageRoute } from "@/lib/package-route";
-import { getPackage } from "@/lib/registry";
+import { getPackageUncached } from "@/lib/registry";
 
 const SIZE = { width: 1200, height: 630 };
 
@@ -86,18 +87,20 @@ function packageCard(input: { name: string; version: string | null; description:
 
 export async function GET(_request: NextRequest, ctx: RouteContext<"/og/[[...name]]">): Promise<Response> {
   const segs = (await ctx.params).name ?? [];
-  const headers = { "cache-control": "public, max-age=3600, s-maxage=3600" };
 
-  if (segs.length === 0) return new ImageResponse(siteCard(), { ...SIZE, headers });
+  // the site card never changes between deploys
+  if (segs.length === 0) return new ImageResponse(siteCard(), { ...SIZE, headers: { "cache-control": "public, max-age=3600, s-maxage=3600" } });
   const route = parsePackageRoute(segs);
 
   if (route?.kind !== "package") return new Response("Not found", { status: 404 });
-  const found = await getPackage(route.name);
+  // a package card shows a score that a yank, a revoke or a dismissal changes: stored for seconds, not an hour
+  const headers = { "cache-control": AGENT_CACHE.view };
+  const found = await getPackageUncached(route.name);
 
-  if (found.kind === "missing") return new Response("Not found", { status: 404 });
-  // registry down: the card still names the package, unscored, and is not cached for long
+  if (found.kind === "missing") return new Response("Not found", { status: 404, headers });
+  // registry down: the card still names the package, unscored
   const pkg = found.kind === "ok" ? found.value : null;
   const card = packageCard({ name: pkg?.name ?? route.name, version: pkg?.latest ?? null, description: pkg?.description ?? "", score: pkg?.score?.score ?? null, grade: pkg?.score?.grade ?? null });
 
-  return new ImageResponse(card, { ...SIZE, headers: pkg ? headers : { "cache-control": "public, max-age=60" } });
+  return new ImageResponse(card, { ...SIZE, headers });
 }

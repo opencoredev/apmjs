@@ -22,13 +22,13 @@ function json_(body: JsonRpcResponse | { error: string; docs: string }, status =
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...MCP_CORS, ...extra } });
 }
 
-export type McpDeps = { source: AgentSource; take: () => Take };
+export type McpDeps = { source: AgentSource; take: () => Take | Promise<Take> };
 
 export async function mcpPost(request: Request, deps: McpDeps): Promise<Response> {
   const version = request.headers.get("mcp-protocol-version");
 
   if (version !== null && !isKnownProtocolVersion(version)) return json_(rpcError(null, RPC.invalidRequest, `Unsupported MCP-Protocol-Version: ${version}`), 400);
-  const allowed = deps.take();
+  const allowed = await deps.take();
 
   if (!allowed.ok) return json_(rpcError(null, RPC.internal, "Too many requests. Wait a moment and try again."), 429, { "retry-after": String(allowed.retryAfterSeconds) });
   const raw = await request.text();
@@ -45,7 +45,7 @@ export async function mcpPost(request: Request, deps: McpDeps): Promise<Response
   if (!message.success) return json_(rpcError(null, RPC.invalidRequest, "Not a JSON-RPC 2.0 message."), 400);
   const answer = await handleMessage(message.data, deps.source);
 
-  if (answer === null) return new Response(null, { status: 202, headers: MCP_CORS });
+  if (answer === null) return new Response(null, { status: 202, headers: { ...MCP_CORS, "cache-control": "no-store" } });
 
   return json_(answer);
 }
@@ -60,5 +60,5 @@ export function mcpGet(): Response {
 }
 
 export function mcpOptions(): Response {
-  return new Response(null, { status: 204, headers: MCP_CORS });
+  return new Response(null, { status: 204, headers: { ...MCP_CORS, "cache-control": "no-store" } });
 }

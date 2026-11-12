@@ -104,6 +104,66 @@ describe("upstream proxy", () => {
     expect(Number.isNaN(Date.parse(packages[0]?.at ?? ""))).toBe(false);
   });
 
+  test("recent-packages takes only a whole-number limit from 1 to 200; anything else is a 400", async () => {
+    for (const bad of ["1.5", "0", "201", "-1", "abc", "", "1e2", " 5"]) {
+      const r = await getJson(`${reg.url}-/apm/v1/recent-packages?limit=${encodeURIComponent(bad)}`);
+
+      expect(r.status, `limit=${bad}`).toBe(400);
+      expect(String(dig(r.body, "error"))).toContain("limit must be a whole number from 1 to 200");
+    }
+
+    const two = await getJson(`${reg.url}-/apm/v1/recent-packages?limit=2`);
+
+    expect(two.status).toBe(200);
+    expect(z.object({ packages: z.array(z.unknown()) }).parse(two.body).packages.length).toBeLessThanOrEqual(2);
+    expect((await getJson(`${reg.url}-/apm/v1/recent-packages`)).status).toBe(200);
+  });
+
+  test("one version's state and score come from the versions route, which knows every version, not only the newest 200", async () => {
+    const res = await fetch(`${reg.url}-/apm/v1/packages/up-pkg/versions/1.0.0`);
+    const body: unknown = await res.json();
+
+    expect(res.status, JSON.stringify(body)).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(dig(body, "version")).toBe("1.0.0");
+    expect(dig(body, "status")).toBe("active");
+    expect(dig(body, "statusReason")).toBeNull();
+    expect(Number(dig(body, "score", "score"))).toBeGreaterThanOrEqual(85);
+    expect(dig(body, "facts", "installScripts")).toBe(false);
+    const evil = await getJson(`${reg.url}-/apm/v1/packages/up-evil/versions/1.0.0`);
+
+    // the facts are this version's own: up-evil has an install script, up-pkg has none
+    expect(dig(evil.body, "facts", "installScripts")).toBe(true);
+    const none = await getJson(`${reg.url}-/apm/v1/packages/up-pkg/versions/9.9.9`);
+
+    expect(none.status).toBe(404);
+    expect(String(dig(none.body, "error"))).toContain("up-pkg has no version 9.9.9");
+  });
+
+  test("popular-scores answers every named package in one response", async () => {
+    const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg,up-evil,nope-not-here`);
+
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    const { packages } = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string().nullable(), score: z.number().nullable(), grade: z.string().nullable() })) }).parse(r.body);
+
+    expect(packages.map((p) => p.name)).toEqual(["up-pkg", "up-evil", "nope-not-here"]);
+    expect(packages[0]).toMatchObject({ version: "1.2.0" });
+    expect(packages[1]?.score ?? 100).toBeLessThan(40);
+    expect(packages[2]).toEqual({ name: "nope-not-here", version: null, score: null, grade: null });
+    expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=`)).status).toBe(400);
+    expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=${Array.from({ length: 25 }, (_, i) => `p${i}`).join(",")}`)).status).toBe(400);
+  });
+
+  test("a resolve answer says the AI review is off when this registry runs none, and is never cached", async () => {
+    const res = await fetch(`${reg.url}-/apm/v1/resolve?name=up-pkg&range=1.1.0`);
+    const body: unknown = await res.json();
+
+    expect(res.status, JSON.stringify(body)).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(dig(body, "tree", "reviews")).toEqual({ kind: "off" });
+    expect(z.object({ tree: z.object({ unchecked: z.number().int().min(0) }).loose() }).loose().safeParse(body).success).toBe(true);
+  });
+
   test("the ~safe view applies the cooldown to upstream packages", async () => {
     const { body } = await getJson(`${reg.url}~safe/up-pkg`);
     expect(dig(body, "versions", "1.2.0")).toBeUndefined();

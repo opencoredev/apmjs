@@ -63,6 +63,7 @@ import {
   type PackumentView,
   type PublishHook,
 } from "./server.ts";
+import { ReviewConfig, reviewStandings } from "./review.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
@@ -928,6 +929,84 @@ const packageExists = (path: string) =>
     return new Response(null, { status: listed.kind === "absent" ? 404 : 200 });
   });
 
+/**
+ * GET /-/apm/v1/packages/:name/versions/:version: one version's state and score, whatever its age. The package answer
+ * lists only the newest 200 versions and carries latest's facts, so a view of any other version reads this.
+ * Never cached: the status (yank, revoke) changes at any time.
+ */
+const versionResponse = (name: string, version: string) =>
+  Effect.gen(function* () {
+    const at = yield* now;
+    const src = yield* lookup(name);
+
+    if (!src) return fail(404, "Not found");
+    const v0 = src.versions.find((x) => x.version === version);
+
+    if (!v0) return fail(404, `${name} has no version ${version}.`);
+    const v = yield* ensureAnalyzed(src, v0);
+    const report = reportFor(v, at);
+
+    return json(
+      {
+        name,
+        version: v.version,
+        source: src.kind,
+        status: v.status,
+        statusReason: v.status_reason,
+        deprecated: v.deprecated,
+        publishedAt: new Date(v.published_at).toISOString(),
+        publishedBy: v.published_by,
+        facts: report?.facts ?? null,
+        score: report ? { score: report.score, grade: report.grade, notChecked: report.notChecked, ...reviewable(v, report) } : null,
+      },
+      200,
+      { "cache-control": "no-store" },
+    );
+  });
+
+/** Names one /popular-scores request may ask about: the home page shows a dozen. */
+export const MAX_POPULAR_NAMES = 24;
+
+/**
+ * GET /-/apm/v1/popular-scores?names=a,b,c: the latest version's score of each package, in one answer, so the website's
+ * popular list costs one request however many packages it shows. A name apm has no score for yet is null.
+ */
+const popularScoresResponse = (url: URL) =>
+  Effect.gen(function* () {
+    const at = yield* now;
+    const names = [...new Set((url.searchParams.get("names") ?? "").split(",").map((n) => n.trim()).filter((n) => n.length > 0))];
+
+    if (names.length === 0 || names.length > MAX_POPULAR_NAMES) return fail(400, `names must list 1 to ${MAX_POPULAR_NAMES} package names, comma-separated`);
+
+    const packages = yield* Effect.forEach(
+      names,
+      (name) =>
+        Effect.gen(function* () {
+          const src = yield* lookup(name);
+          const latest0 = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
+
+          if (!src || !latest0) return { name, version: null, score: null, grade: null };
+          const latest = yield* ensureAnalyzed(src, latest0);
+          const r = reportFor(latest, at);
+
+          return { name, version: latest.version, score: r?.score ?? null, grade: r?.grade ?? null };
+        }),
+      { concurrency: 4 },
+    );
+
+    return json({ packages });
+  });
+
+type LimitParse = { kind: "ok"; limit: number } | { kind: "invalid"; error: string };
+
+/** A `limit` query parameter: absent means `fallback`; anything but a whole number from 1 to `max` is an error. */
+export function parseLimit(raw: string | null, fallback: number, max: number): LimitParse {
+  if (raw === null) return { kind: "ok", limit: fallback };
+  const n = /^\d{1,6}$/.test(raw) ? Number(raw) : Number.NaN;
+
+  return Number.isInteger(n) && n >= 1 && n <= max ? { kind: "ok", limit: n } : { kind: "invalid", error: `limit must be a whole number from 1 to ${max} (got "${raw}")` };
+}
+
 const eventsResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -1184,8 +1263,10 @@ const recentResponse = (url: URL) =>
 /** GET /-/apm/v1/recent-packages: the npm packages scored most recently, newest first (the website's sitemap). */
 const recentPackagesResponse = (url: URL) =>
   Effect.gen(function* () {
-    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50) || 50));
-    const rows = yield* (yield* Store).recentlyScored(limit);
+    const parsed = parseLimit(url.searchParams.get("limit"), 50, 200);
+
+    if (parsed.kind === "invalid") return fail(400, parsed.error);
+    const rows = yield* (yield* Store).recentlyScored(parsed.limit);
 
     return json({ packages: rows.map((r) => ({ name: r.package, at: new Date(r.at).toISOString() })) });
   });
@@ -1264,8 +1345,11 @@ type TreeBlock = { name: string; version: string; reason: string; via: string[] 
 /** A dependency the walk could not score: a git or URL spec, a missing package, a failed analysis or the walk's limit. */
 type UncheckedDep = { dependency: string; reason: string; via: string[] };
 
-/** `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry. */
-type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; packages: { name: string; version: string }[] };
+/**
+ * `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry.
+ * `digests`: the tarball digest of each of those, which keys its AI review; not sent.
+ */
+type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; packages: { name: string; version: string }[]; digests: (string | null)[] };
 
 const MAX_UNCHECKED_LISTED = 50;
 
@@ -1281,6 +1365,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
     const blocks: TreeBlock[] = [];
     const uncheckedDeps: UncheckedDep[] = [];
     const packages: Tree["packages"] = [];
+    const digests: Tree["digests"] = [];
     let unchecked = 0;
 
     const miss = (dependency: string, reason: string, via: string[]): void => {
@@ -1326,6 +1411,8 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
       if (seen.has(key)) continue;
       seen.add(key);
       packages.push({ name: dep.name, version: picked.v.version });
+      const digest = digestOf(picked.v);
+      digests.push(digest ? digestLabel(digest) : null);
       let v = picked.v;
 
       if (!parseAnalysis(v.score) && analyses < limits.maxAnalyses) {
@@ -1354,10 +1441,60 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
       if (item.via.length < 12) for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
     }
 
-    const tree: Tree = { blocks, unchecked, uncheckedDeps, packages };
+    const tree: Tree = { blocks, unchecked, uncheckedDeps, packages, digests };
 
     return tree;
   });
+
+type DepRef = { name: string; version: string };
+
+/**
+ * The AI review standing of every dependency the walk checked. "off" when this registry runs no AI review. A client
+ * deciding on an install treats confirmed as do-not-install and the other lists as a reason to look first.
+ */
+type TreeReviews = { kind: "off" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
+
+const treeReviews = (tree: Tree) =>
+  Effect.gen(function* () {
+    if (Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return { kind: "off" } satisfies TreeReviews;
+    const standings = yield* reviewStandings(tree.packages.map((p, i) => ({ ...p, digest: tree.digests[i] ?? null })));
+    const out: Extract<TreeReviews, { kind: "on" }> = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
+
+    for (const p of tree.packages) {
+      const standing = standings.get(`${p.name}@${p.version}`) ?? "not-reviewed";
+
+      switch (standing) {
+        case "confirmed":
+          out.confirmed.push(p);
+          break;
+        case "under-review":
+          out.underReview.push(p);
+          break;
+        case "queued":
+        case "leased":
+          out.pending.push(p);
+          break;
+        case "no-answer":
+        case "failed":
+          out.noAnswer.push(p);
+          break;
+        case "found-nothing":
+        case "cleared":
+        case "not-reviewed":
+          break;
+        default: {
+          const _exhaustive: never = standing;
+
+          return _exhaustive;
+        }
+      }
+    }
+
+    return out;
+  });
+
+/** The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. */
+const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({ blocks: tree.blocks, unchecked: tree.unchecked, uncheckedDeps: tree.uncheckedDeps, packages: tree.packages, reviews });
 
 const resolveResponse = (url: URL) =>
   Effect.gen(function* () {
@@ -1397,15 +1534,17 @@ const resolveResponse = (url: URL) =>
 
       if (block === null) {
         const report = reportFor(v, at);
-        const tree = yield* treeBlocks(v, treePolicy);
+        const walked = yield* treeBlocks(v, treePolicy);
+        const tree = treeAnswer(walked, yield* treeReviews(walked));
 
-        if (tree.blocks.length > 0) {
-          const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
+        if (walked.blocks.length > 0) {
+          const list = walked.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
 
           return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report: embeddedReport(v, report) }, tree }, 422);
         }
 
-        return json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
+        // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
+        return json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } }, 200, { "cache-control": "no-store" });
       }
 
       skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
@@ -1785,6 +1924,8 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
 
     if (rest === "recent-packages") return yield* recentPackagesResponse(url);
 
+    if (rest === "popular-scores") return yield* popularScoresResponse(url);
+
     if (rest === "resolve") return yield* resolveResponse(url);
 
     if (rest === "me") return caller.kind === "user" ? json({ username: caller.user }) : fail(401, "Not logged in");
@@ -1811,6 +1952,8 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       if (!sp) return fail(404, "Not found");
 
       if (sp.rest[0] === "events") return yield* eventsResponse(sp.name);
+
+      if (sp.rest[0] === "versions" && sp.rest.length === 2 && sp.rest[1]) return yield* versionResponse(sp.name, sp.rest[1]);
 
       if (sp.rest.length === 0) return yield* packageResponse(sp.name);
     }

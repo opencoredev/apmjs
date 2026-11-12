@@ -1,33 +1,28 @@
-// Scores for the home page's popular packages: one small read per package, in parallel, cached per package so a
-// busy home page costs the registry a dozen reads an hour. A miss is remembered for a minute, so a registry
-// that is down or still scoring a tarball is not asked again on every view.
+// Scores for the home page's popular packages: one request for all of them, through the shared edge cache, so a cold
+// isolate makes at most one registry read (none when the data center already holds the answer). Kept for an hour in
+// this isolate; a miss is remembered for a minute. The pure part is ./popular-scores.ts.
 import "server-only";
-import { createSharedCache } from "../rate-limit";
-import { latestScore, type LatestScore } from "./registry-source";
-
-const SCORE_TTL_MS = 60 * 60 * 1000;
-const MISS_TTL_MS = 60 * 1000;
+import type { CachePolicy } from "../edge-cache";
+import { fetchCachedJson } from "../registry-fetch";
+import { REGISTRY } from "../registry-url";
+import { PopularScoresAnswer, popularScores, type PopularScore } from "./popular-scores";
+import { POPULAR_PACKAGES } from "./site";
 
 /** The badges stream in after the grid; none of them waits longer than this. */
 const READ_BUDGET_MS = 4_000;
 
-const scores = createSharedCache<LatestScore>({ ttlMs: SCORE_TTL_MS, maxEntries: 200 });
-const misses = new Map<string, number>();
+/** Popular packages' latest scores move slowly; every isolate in a data center shares one answer. */
+const POPULAR_POLICY: CachePolicy = { freshMs: 10 * 60_000, staleMs: 60 * 60_000 };
+
+const url = `${REGISTRY}-/apm/v1/popular-scores?${new URLSearchParams({ names: POPULAR_PACKAGES.map((p) => p.name).join(",") })}`;
+
+const popular = popularScores({
+  load: () => fetchCachedJson({ url, schema: PopularScoresAnswer, timeoutMs: READ_BUDGET_MS, cache: POPULAR_POLICY }),
+  ttlMs: 60 * 60_000,
+  missTtlMs: 60_000,
+});
 
 /** The latest version's score, or null when the registry has none yet or did not answer in time. */
-export async function popularScore(name: string, now = Date.now()): Promise<LatestScore | null> {
-  const missedUntil = misses.get(name);
-
-  if (missedUntil !== undefined && missedUntil > now) return null;
-
-  const value = await scores.get(name, async () => {
-    const r = await latestScore(name, READ_BUDGET_MS);
-
-    return r.kind === "ok" ? r.value : null;
-  });
-
-  if (value === null) misses.set(name, now + MISS_TTL_MS);
-  else misses.delete(name);
-
-  return value;
+export function popularScore(name: string): Promise<PopularScore | null> {
+  return popular.score(name);
 }

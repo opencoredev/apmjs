@@ -16,6 +16,8 @@ export type AgentIo = {
 
 const ReviewWire = z.object({
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
+  // the job's own state: status folds "leased" into "queued"; an older registry sends none
+  job: z.enum(["queued", "leased", "done", "failed"]).nullish(),
   review: z.object({ state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.array(z.unknown()) }).nullable(),
 });
 
@@ -23,19 +25,44 @@ const ErrorWire = z.object({ error: z.string() });
 
 const UNREADABLE = "the registry sent an answer apm could not read";
 
-/** The AI review of one version as the verdict reads it; none when AI review is off or could not be read. */
+/**
+ * The AI review of one version as the verdict reads it. A 404 means the registry runs no AI review (the resolve answer
+ * already showed the version exists). A read that failed, or an answer apm cannot read, is "unreadable": the verdict
+ * then says it cannot tell, never that there is nothing to see.
+ */
 async function reviewOf(api: Api, name: string, version: string): Promise<ReviewInput> {
+  let r: { status: number; body: unknown };
+
   try {
-    const r = await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`);
-    const parsed = r.status === 200 ? ReviewWire.safeParse(r.body) : null;
-
-    if (!parsed?.success) return { kind: "none" };
-
-    if (parsed.data.review) return { kind: "reviewed", state: parsed.data.review.state, findings: parsed.data.review.findings.length };
-
-    return parsed.data.status === "queued" ? { kind: "queued" } : { kind: "none" };
+    r = await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`);
   } catch {
-    return { kind: "none" };
+    return { kind: "unreadable" };
+  }
+
+  if (r.status === 404) return { kind: "off" };
+  const parsed = r.status === 200 ? ReviewWire.safeParse(r.body) : null;
+
+  if (!parsed?.success) return { kind: "unreadable" };
+  const a = parsed.data;
+
+  if (a.review) return { kind: "reviewed", state: a.review.state, findings: a.review.findings.length };
+
+  if (a.job === "leased") return { kind: "leased" };
+
+  switch (a.status) {
+    case "queued":
+      return { kind: "queued" };
+    case "failed":
+      return { kind: "failed" };
+    case "not-reviewed":
+      return { kind: "not-reviewed" };
+    case "reviewed":
+      return { kind: "unreadable" };
+    default: {
+      const _exhaustive: never = a.status;
+
+      return _exhaustive;
+    }
   }
 }
 
@@ -54,7 +81,12 @@ async function resolvedFor(api: Api, name: string, range: string | null): Promis
   if (r.status === 200) {
     const ok = ResolveOk.safeParse(r.body);
 
-    return ok.success ? { kind: "ok", version: ok.data.version, report: ok.data.report, skipped: ok.data.skipped, unchecked: ok.data.tree?.uncheckedDeps ?? [] } : { kind: "unavailable", reason: UNREADABLE };
+    if (!ok.success) return { kind: "unavailable", reason: UNREADABLE };
+    const tree = ok.data.tree;
+    const uncheckedDeps = tree?.uncheckedDeps ?? [];
+
+    // the registry's total, not the length of the list (it names at most 50); no review summary is unknown, not clean
+    return { kind: "ok", version: ok.data.version, report: ok.data.report, skipped: ok.data.skipped, deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" } } };
   }
 
   if (r.status === 422) {
@@ -80,8 +112,9 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
 
   const { name, range } = parseSpec(spec);
   const resolved = await resolvedFor(api, name, range);
-  const none: ReviewInput = { kind: "none" };
-  const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version) : none;
+  // only an "ok" resolve reads the review; the other verdicts never look at it
+  const unread: ReviewInput = { kind: "unreadable" };
+  const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version) : unread;
   const v = explain({ name, range, resolved, review });
   const code = EXIT[v.verdict];
 

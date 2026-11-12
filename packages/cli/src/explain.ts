@@ -1,6 +1,10 @@
 // `apm explain <pkg>[@range]`: a short verdict an agent (or a person) can act on before an install. Pure.
 // The website's explain_install MCP tool and GET /api/explain use the same rules (apps/web/lib/agent/verdict.ts);
-// change both together. Like the rest of apm it never calls a version "safe".
+// change both together: tests/fixtures/explain-verdicts.json holds the cases both must answer the same way.
+//
+// The rule: "install" only when apm knows the version and everything it brings in is fine. Anything apm could not
+// read is "unknown"; anything it read but has not finished checking is "review-first". Like the rest of apm it never
+// calls a version "safe".
 import type { Report } from "./api.ts";
 
 export const VERDICTS = ["install", "review-first", "do-not-install", "not-found", "unknown"] as const;
@@ -13,15 +17,35 @@ export const CLEAN_SCORE = 75;
 /** Exit codes, so a script can branch without parsing: 2 stays the CLI's usage error. */
 export const EXIT: Record<VerdictKind, number> = { install: 0, "do-not-install": 1, "not-found": 1, "review-first": 3, unknown: 4 };
 
+export type DepRef = { name: string; version: string };
+
+/** How the AI reviews of the dependencies stand; "unknown" when the registry did not say. */
+export type DepReviews = { kind: "off" } | { kind: "unknown" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
+
+/** The dependency walk: what apm could not score (the registry's total, and up to 50 named) and the AI reviews. */
+export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews };
+
 export type ResolvedInput =
-  | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; unchecked: { dependency: string; reason: string }[] }
+  | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
   | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
 export type ReviewState = "found-nothing" | "under-review" | "no-answer" | "confirmed" | "cleared";
 
-export type ReviewInput = { kind: "reviewed"; state: ReviewState; findings: number } | { kind: "queued" } | { kind: "none" };
+/**
+ * Where the AI review of the picked version stands. queued and leased are a review in progress; failed and a
+ * no-answer result ended without one; not-reviewed means the version was never picked; off means the registry runs
+ * none; unreadable means apm could not ask.
+ */
+export type ReviewInput =
+  | { kind: "reviewed"; state: ReviewState; findings: number }
+  | { kind: "queued" }
+  | { kind: "leased" }
+  | { kind: "failed" }
+  | { kind: "not-reviewed" }
+  | { kind: "off" }
+  | { kind: "unreadable" };
 
 export type Verdict = {
   verdict: VerdictKind;
@@ -34,18 +58,41 @@ export type Verdict = {
   commands: { apm: string; bun: string; npm: string; pnpm: string } | null;
 };
 
+const SHOWN = 3;
+
+/** Control characters (a terminal's escapes included), line breaks and bidi overrides: what can fake a line. */
+// oxlint-disable-next-line eslint/no-control-regex -- matching control characters is the point: they are removed
+const LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g;
+
+/** Registry text (which carries publisher text, such as a yank reason) on one line, so none can pose as apm's. */
+export function oneLine(text: string): string {
+  return text.replace(LINE_BREAKERS, " ").replace(/\s+/g, " ").trim();
+}
+
 function commands(name: string, version: string): NonNullable<Verdict["commands"]> {
   const spec = `${name}@${version}`;
 
   return { apm: `apm add ${spec}`, bun: `bun add ${spec}`, npm: `npm install ${spec}`, pnpm: `pnpm add ${spec}` };
 }
 
+const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+
+const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => oneLine(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
+
 function reviewReason(review: ReviewInput): string {
   switch (review.kind) {
-    case "none":
+    case "not-reviewed":
       return "No AI review of this version.";
+    case "off":
+      return "This registry runs no AI review.";
+    case "unreadable":
+      return "apm could not read the AI review of this version.";
     case "queued":
-      return "The AI review of this version is still running.";
+      return "The AI review of this version is queued and has not started.";
+    case "leased":
+      return "The AI review of this version is running.";
+    case "failed":
+      return "The AI review of this version could not run.";
     case "reviewed":
       switch (review.state) {
         case "found-nothing":
@@ -55,7 +102,7 @@ function reviewReason(review: ReviewInput): string {
         case "no-answer":
           return "The AI review gave no usable answer for this version.";
         case "under-review":
-          return `The AI review flagged this version (${review.findings} finding${review.findings === 1 ? "" : "s"}); a person at apm is checking it.`;
+          return `The AI review flagged this version (${plural(review.findings, "finding", "findings")}); a person at apm is checking it.`;
         case "confirmed":
           return "apm reviewers confirmed this version is malicious.";
         default: {
@@ -73,6 +120,28 @@ function reviewReason(review: ReviewInput): string {
   }
 }
 
+/** Why the picked version itself needs a look before an install, or null when its review is settled or absent. */
+function reviewHold(review: ReviewInput): string | null {
+  switch (review.kind) {
+    case "queued":
+    case "leased":
+      return "its AI review has not finished";
+    case "failed":
+      return "its AI review ended without an answer";
+    case "reviewed":
+      return review.state === "under-review" ? "the AI review flagged it and a person has not decided yet" : review.state === "no-answer" ? "its AI review ended without an answer" : null;
+    case "not-reviewed":
+    case "off":
+    case "unreadable":
+      return null;
+    default: {
+      const _exhaustive: never = review;
+
+      return _exhaustive;
+    }
+  }
+}
+
 export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
   const { name, resolved, review } = input;
   const range = input.range ?? "latest";
@@ -81,19 +150,15 @@ export function explain(input: { name: string; range: string | null; resolved: R
 
   switch (resolved.kind) {
     case "unavailable":
-      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: ${resolved.reason}. Nothing was checked; try again.`, reasons: [], commands: null };
+      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: ${oneLine(resolved.reason)}. Nothing was checked; try again.`, reasons: [], commands: null };
     case "missing":
-      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [resolved.reason], commands: null };
-    case "refused":
-      return {
-        ...base,
-        verdict: "do-not-install",
-        version: resolved.newest,
-        score: null,
-        summary: `Do not install ${asked}: ${resolved.reason}`,
-        reasons: [resolved.reason, ...resolved.skipped.slice(0, 3).map((s) => `Skipped ${s.version}: ${s.reason}.`)],
-        commands: null,
-      };
+      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [oneLine(resolved.reason)], commands: null };
+    case "refused": {
+      const skips = resolved.skipped.slice(0, SHOWN).map((s) => `Skipped ${oneLine(s.version)}: ${oneLine(s.reason)}.`);
+
+      return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: ${oneLine(resolved.reason)}`, reasons: [oneLine(resolved.reason), ...skips], commands: null };
+    }
+
     case "ok":
       break;
     default: {
@@ -103,37 +168,88 @@ export function explain(input: { name: string; range: string | null; resolved: R
     }
   }
 
-  const { version, report } = resolved;
+  const { version, report, deps } = resolved;
   const id = `${name}@${version}`;
   const score = report ? { score: report.score, grade: report.grade } : null;
-  const lost = (report?.signals ?? []).filter((s) => s.points < 0).sort((a, b) => a.points - b.points);
+  const known = { ...base, version, score };
 
+  // 1. confirmed malicious, the version or anything it installs
   if (review.kind === "reviewed" && review.state === "confirmed") {
-    return { ...base, verdict: "do-not-install", version, score, summary: `Do not install ${id}: apm reviewers confirmed it is malicious.`, reasons: [reviewReason(review)], commands: null };
+    return { ...known, verdict: "do-not-install", summary: `Do not install ${id}: apm reviewers confirmed it is malicious.`, reasons: [reviewReason(review)], commands: null };
   }
 
-  const flagged = review.kind === "reviewed" && review.state === "under-review";
-  const lowScore = report !== null && report.score < CLEAN_SCORE;
-  const reasons: string[] = [];
+  if (deps.reviews.kind === "on" && deps.reviews.confirmed.length > 0) {
+    const bad = deps.reviews.confirmed;
 
-  if (flagged) reasons.push(reviewReason(review));
-
-  for (const s of lost.slice(0, 3)) reasons.push(`${s.label} (${s.points} points${s.confidence === "possible" ? ", possible" : ""}).`);
-
-  if (lost.length > 3) reasons.push(`${lost.length - 3} more signal${lost.length - 3 === 1 ? "" : "s"} lost points.`);
-
-  if (!flagged) reasons.push(reviewReason(review));
-
-  if (resolved.unchecked.length > 0) reasons.push(`${resolved.unchecked.length} dependenc${resolved.unchecked.length === 1 ? "y" : "ies"} apm could not score: ${resolved.unchecked.slice(0, 3).map((d) => d.dependency).join(", ")}.`);
-
-  if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${resolved.skipped.slice(0, 3).map((s) => `${s.version} (${s.reason})`).join("; ")}.`);
-  const scoreText = score ? `scores ${score.score}/100 (${score.grade})` : "is not scored yet";
-
-  if (flagged || lowScore || report === null) {
-    const why = flagged ? "the AI review flagged it and a person has not decided yet" : lowScore ? `it lost points: ${lost[0]?.label ?? "see the signals"}` : "apm has no score for it yet";
-
-    return { ...base, verdict: "review-first", version, score, summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${why}.`, reasons, commands: commands(name, version) };
+    return {
+      ...known,
+      verdict: "do-not-install",
+      summary: `Do not install ${id}: it depends on ${listed(bad)}, which apm reviewers confirmed ${bad.length === 1 ? "is" : "are"} malicious.`,
+      reasons: [`apm reviewers confirmed ${bad.length === 1 ? "this dependency is" : "these dependencies are"} malicious: ${listed(bad)}.`],
+      commands: null,
+    };
   }
 
-  return { ...base, verdict: "install", version, score, summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, and nothing in its dependency tree was refused.`, reasons, commands: commands(name, version) };
+  // 2. what apm could not read: it cannot say
+  if (review.kind === "unreadable") {
+    return { ...known, verdict: "unknown", summary: `apm could not read the AI review of ${id}, so it cannot say. Nothing was decided; try again.`, reasons: [reviewReason(review)], commands: null };
+  }
+
+  if (deps.reviews.kind === "unknown") {
+    return { ...known, verdict: "unknown", summary: `apm could not read the AI reviews of ${id}'s dependencies, so it cannot say. Nothing was decided; try again.`, reasons: [], commands: null };
+  }
+
+  // 3. what apm read but has not finished checking, most serious first
+  const lost = (report?.signals ?? []).filter((s) => s.points < 0).sort((a, b) => a.points - b.points);
+  const holds: { why: string; reason: string }[] = [];
+  const own = reviewHold(review);
+
+  if (own) holds.push({ why: own, reason: reviewReason(review) });
+  const depReviews: DepReviews = deps.reviews;
+
+  if (depReviews.kind === "on") {
+    const { underReview, pending, noAnswer } = depReviews;
+
+    if (underReview.length > 0) holds.push({ why: "the AI review flagged a dependency and a person has not decided yet", reason: `The AI review flagged ${plural(underReview.length, "dependency", "dependencies")}; a person at apm is checking: ${listed(underReview)}.` });
+
+    if (pending.length > 0) holds.push({ why: "the AI review of a dependency has not finished", reason: `The AI review of ${plural(pending.length, "dependency", "dependencies")} has not finished: ${listed(pending)}.` });
+
+    if (noAnswer.length > 0) holds.push({ why: "the AI review of a dependency ended without an answer", reason: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
+  }
+
+  if (report !== null && report.score < CLEAN_SCORE) holds.push({ why: `it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}`, reason: "" });
+
+  if (deps.unchecked > 0) {
+    holds.push({
+      why: `apm could not score ${deps.unchecked} of its dependencies`,
+      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => oneLine(d.dependency)).join(", ")}.`,
+    });
+  }
+
+  const reasons = holds.slice(0, 1).flatMap((h) => (h.reason ? [h.reason] : []));
+
+  for (const s of lost.slice(0, SHOWN)) reasons.push(`${oneLine(s.label)} (${s.points} points${s.confidence === "possible" ? ", possible" : ""}).`);
+
+  if (lost.length > SHOWN) reasons.push(`${plural(lost.length - SHOWN, "more signal", "more signals")} lost points.`);
+
+  for (const h of holds.slice(1)) if (h.reason) reasons.push(h.reason);
+
+  if (!own) reasons.push(reviewReason(review));
+
+  if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${resolved.skipped.slice(0, SHOWN).map((s) => `${oneLine(s.version)} (${oneLine(s.reason)})`).join("; ")}.`);
+  const run = commands(name, version);
+
+  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.`, reasons, commands: run };
+  const scoreText = `scores ${report.score}/100 (${report.grade})`;
+  const first = holds[0];
+
+  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.`, reasons, commands: run };
+
+  return {
+    ...known,
+    verdict: "install",
+    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.`,
+    reasons,
+    commands: run,
+  };
 }

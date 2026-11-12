@@ -18,8 +18,19 @@ export type Report = z.infer<typeof ReportSchema>;
 const Skipped = z.array(z.object({ version: z.string(), reason: z.string(), revokeReason: z.string().nullish() }));
 const UncheckedDep = z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) });
 
-/** `packages`: every name@version the registry's walk checked (older registries send none). */
-export const Tree = z.object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(z.object({ name: z.string(), version: z.string() })).default([]) }).loose();
+const DepRef = z.object({ name: z.string(), version: z.string() });
+
+/** The AI review standing of every dependency the walk checked (older registries send none). */
+export const TreeReviews = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("off") }),
+  z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
+]);
+
+/** `packages`: every name@version the registry's walk checked (older registries send none). `unchecked` is the total. */
+export const Tree = z
+  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), reviews: TreeReviews.optional() })
+  .loose();
+
 export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional() });
 export const ResolveFail = z.object({ error: z.string(), name: z.string(), version: z.null(), skipped: Skipped });
 export type ResolveOk = z.infer<typeof ResolveOk>;

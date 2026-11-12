@@ -812,3 +812,70 @@ describe("a revoked version", () => {
     }
   }, 60_000);
 });
+
+// The install verdict (apm explain, the website's explain_install) reads these: a review in progress must stay
+// apart from one that ended, and the resolve answer carries the review standing of every dependency it walked.
+describe("AI review standings for install decisions", () => {
+  test("the review answer tells a leased job from a queued one", async () => {
+    await publish(reg, alice, { name: "ai-review-standing-demo", version: "1.0.0", license: "MIT", main: "index.js" });
+    const queued = await review("ai-review-standing-demo", "1.0.0");
+
+    expect(dig(queued.body, "status")).toBe("queued");
+    expect(dig(queued.body, "job")).toBe("queued");
+    const leased = LeaseResponse.parse((await getJson(`${reg.url}-/apm/v1/review-jobs?max=16`, { headers: { authorization: `Bearer ${SERVICE_TOKEN}` } })).body).jobs;
+
+    expect(leased.map((j) => j.name)).toContain("ai-review-standing-demo");
+    const working = await review("ai-review-standing-demo", "1.0.0");
+
+    // status keeps its old meaning for older clients; job says a reviewer has it
+    expect(dig(working.body, "status")).toBe("queued");
+    expect(dig(working.body, "job")).toBe("leased");
+    // hand the leases back so the next test's reviewer finds every job
+    clock += 16 * 60_000;
+  });
+
+  test("the resolve answer lists dependencies whose AI review is pending, unanswered, flagged or confirmed malicious", async () => {
+    const DEP = "ai-review-tree-dep";
+    const MUTE = "ai-review-tree-mute";
+    const ROOT = "ai-review-tree-root";
+
+    const resolve = async (): Promise<{ status: number; cache: string | null; body: unknown }> => {
+      const res = await fetch(`${reg.url}-/apm/v1/resolve?name=${ROOT}`);
+
+      return { status: res.status, cache: res.headers.get("cache-control"), body: await res.json() };
+    };
+
+    const empty = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
+    const dep = [{ name: DEP, version: "1.0.0" }];
+    const mute = [{ name: MUTE, version: "1.0.0" }];
+
+    // both only name the host the fake model flags, in a comment, so their scores stay above the floor. The model
+    // cites line 2: in DEP that holds the host (a flag), in MUTE it does not (the citation fails: no answer).
+    await publish(reg, alice, { name: DEP, version: "1.0.0", license: "MIT", main: "index.js" }, { "index.js": "module.exports = 1;\n// docs: collector.example.invalid\n" });
+    await publish(reg, alice, { name: MUTE, version: "1.0.0", license: "MIT", main: "index.js" }, { "index.js": "// docs: collector.example.invalid\nmodule.exports = 2;\n" });
+    await publish(reg, alice, { name: ROOT, version: "1.0.0", license: "MIT", main: "index.js", dependencies: { [DEP]: "^1.0.0", [MUTE]: "^1.0.0" } });
+    clock += 25 * 60 * 60_000;
+
+    const pending = await resolve();
+
+    expect(pending.status, JSON.stringify(pending.body)).toBe(200);
+    expect(pending.cache).toBe("private, no-store");
+    expect(dig(pending.body, "tree", "reviews")).toEqual({ ...empty, pending: [...dep, ...mute] });
+
+    await runOnce(reviewer(), 16);
+    expect(dig((await review(DEP, "1.0.0")).body, "review", "state")).toBe("under-review");
+    expect(dig((await review(MUTE, "1.0.0")).body, "review", "state")).toBe("no-answer");
+    expect(dig((await resolve()).body, "tree", "reviews")).toEqual({ ...empty, underReview: dep, noAnswer: mute });
+
+    await reg.query("UPDATE reviews SET human_state = 'confirmed', human_at = $1 WHERE package = $2", [clock, DEP]);
+    const confirmed = await resolve();
+
+    // still a 200: the policy (score, cooldown, revokes) passed; the answer says what the AI review found below it
+    expect(confirmed.status).toBe(200);
+    expect(dig(confirmed.body, "tree", "reviews")).toEqual({ ...empty, confirmed: dep, noAnswer: mute });
+
+    await reg.query("UPDATE reviews SET human_state = 'dismissed', human_at = $1 WHERE package = ANY($2)", [clock, [DEP, MUTE]]);
+    expect(dig((await review(DEP, "1.0.0")).body, "review", "state")).toBe("cleared");
+    expect(dig((await resolve()).body, "tree", "reviews")).toEqual(empty);
+  });
+});

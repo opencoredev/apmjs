@@ -1,5 +1,8 @@
-// Loads what the package's Markdown view shows: the package, the score of the version asked for, and its AI
-// review. Shared by GET /package/<name>.md and the check_package MCP tool.
+// Loads what the package's Markdown view shows: the package, the state, facts and score of the version asked for,
+// and its AI review. Shared by GET /package/<name>.md and the check_package MCP tool.
+//
+// The package answer lists only the newest 200 versions and carries latest's facts, so the shown version (latest
+// included) is read from the registry's versions route, which knows every version. Nothing here is cached.
 import type { PackageView } from "./package-md";
 import type { AgentSource } from "./source";
 
@@ -13,15 +16,20 @@ export async function loadPackageView(input: { name: string; version: string | n
 
   if (found.kind === "unavailable") return { kind: "unavailable" };
   const pkg = found.value;
-
-  if (input.version !== null && !pkg.versions.some((v) => v.version === input.version)) return { kind: "missing", reason: `${name} has no version ${input.version}. Latest is ${pkg.latest ?? "unknown"}.` };
   const version = input.version ?? pkg.latest;
-  const older = version !== null && version !== pkg.latest;
 
-  const [score, review] = await Promise.all([
-    older ? source.versionScore({ name, version }) : Promise.resolve(null),
-    version !== null ? source.review({ name, version }) : Promise.resolve({ kind: "missing" } as const),
-  ]);
+  if (version === null) return { kind: "ok", view: { pkg, version: null, status: null, facts: null, score: null, review: { kind: "missing" }, registry: input.registry } };
 
-  return { kind: "ok", view: { pkg, version, score: older ? (score?.kind === "ok" ? score.value : null) : pkg.score, review, registry: input.registry } };
+  const [info, review] = await Promise.all([source.version({ name, version }), source.review({ name, version })]);
+
+  if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
+
+  // without the version's own answer the view would show another version's facts or a stale status: say so instead
+  if (info.kind === "unavailable") return { kind: "unavailable" };
+  const v = info.value;
+
+  return {
+    kind: "ok",
+    view: { pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, review, registry: input.registry },
+  };
 }

@@ -12,7 +12,7 @@
 //     file, and a package or file known to exist is answered from the edge cache (lib/package-status.ts).
 import { NextResponse, type NextRequest } from "next/server";
 import { markdownApiPath, markdownRoute } from "@/lib/agent/md-route";
-import { CLIENT_FORWARDING_HEADERS, edgeClientIp } from "@/lib/client-ip";
+import { forwardingHeaders } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
 import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
 import { forwardToRegistry, isRegistryPath } from "@/lib/registry-proxy";
@@ -21,16 +21,7 @@ import { securityHeaders } from "@/lib/security-headers";
 import { unavailablePage } from "@/lib/unavailable-page";
 
 function forwardedHeaders(request: NextRequest): Headers {
-  const headers = new Headers(request.headers);
-  const edge = edgeClientIp(request.headers);
-
-  for (const name of CLIENT_FORWARDING_HEADERS) headers.delete(name);
-
-  // With no X-Forwarded-For, Next.js fills it from the TCP peer for app routes. Requests forwarded to
-  // the registry don't get that, so they only carry an address when the edge reported one.
-  if (edge) headers.set("x-forwarded-for", edge);
-
-  return headers;
+  return forwardingHeaders(request.headers);
 }
 
 /** The package route a /package/... path names; null when it names none. */

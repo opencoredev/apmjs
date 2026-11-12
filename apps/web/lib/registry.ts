@@ -40,6 +40,9 @@ const Facts = z.object({
 
 export type Facts = z.infer<typeof Facts>;
 
+/** A version's full score as the package answer (latest) and the versions route (any version) carry it. */
+const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
+
 const PackageInfo = z.object({
   name: z.string(),
   source: z.enum(["local", "upstream"]),
@@ -57,7 +60,7 @@ const PackageInfo = z.object({
   maintainers: z.array(z.string()),
   latest: z.string().nullable(),
   facts: Facts.nullable(),
-  score: z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable }).nullable(),
+  score: PackageScore.nullable(),
   versions: z.array(
     z.object({
       version: z.string(),
@@ -138,11 +141,27 @@ export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }
 
+const reviewPath = (name: string, version: string): string => `-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`;
+
 /**
  * The public AI review of one version, read from the registry on every view (its findings quote the package). "missing"
  * when the registry has AI review off or does not know the version.
  */
-export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer);
+export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
+
+// ---- uncached reads, for what an agent acts on (lib/agent): an install verdict or a view that names a version's status
+// must never repeat an answer from before a yank, a revoke or a confirmed AI review ----
+
+/** The package answer, straight from the registry. */
+export const getPackageUncached = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo);
+
+/** The public AI review of one version, straight from the registry. */
+export const getReviewUncached = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
+
+const VersionInfo = z.object({ version: z.string(), status: z.string(), statusReason: z.string().nullable(), deprecated: z.string().nullable(), facts: Facts.nullable(), score: PackageScore.nullable() });
+
+/** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
+export const getVersionInfo = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> => getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo);
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
 

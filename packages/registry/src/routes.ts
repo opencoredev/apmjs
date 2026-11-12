@@ -54,6 +54,9 @@ const REGISTRY_ROUTES = [
   { name: "score", pattern: path(`/-/apm/v1/score/${NAME}${TAIL}`) },
   { name: "package", pattern: path(`/-/apm/v1/packages/${NAME}`) },
   { name: "events", pattern: path(`/-/apm/v1/packages/${NAME}/events${TAIL}`) },
+  // one version's answer for the agent views (apps/web/lib/agent): exactly two segments after the name
+  { name: "versions", pattern: path(`/-/apm/v1/packages/${NAME}/versions/${SEG}`) },
+  { name: "popular-scores", pattern: path("/-/apm/v1/popular-scores") },
   { name: "recent-packages", pattern: path("/-/apm/v1/recent-packages") },
   // a version's files and readme (files.ts)
   { name: "file", pattern: path(`/-/apm/v1/file/${NAME}/${SEG}`) },

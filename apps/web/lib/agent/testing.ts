@@ -3,7 +3,7 @@ import type { ExcerptAnswer } from "../file-excerpt";
 import type { Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { SearchAnswer } from "../search-schema";
-import type { AgentSource, NameReport, ResolveOutcome, VersionScore } from "./source";
+import type { AgentSource, NameReport, ResolveOutcome, VersionInfo } from "./source";
 
 export const signal = (s: Partial<Signal> & Pick<Signal, "id" | "label" | "points">): Signal => ({ evidence: [], confidence: "confirmed", ...s });
 
@@ -47,7 +47,8 @@ export const REVIEW_CLEAN: ReviewAnswer = {
 
 export type Fake = Partial<{
   packages: Record<string, PackageInfo>;
-  scores: Record<string, VersionScore>;
+  /** Answers of the versions route, by name@version; a version not here falls back to the package answer's list. */
+  versions: Record<string, VersionInfo>;
   reviews: Record<string, ReviewAnswer>;
   resolve: (name: string, range: string) => ResolveOutcome;
   search: SearchAnswer | null;
@@ -71,11 +72,20 @@ export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
 
       return p ? { kind: "ok", value: p } : { kind: "missing" };
     },
-    async versionScore({ name, version }) {
-      calls.push(`score ${name}@${version}`);
-      const s = f.scores?.[`${name}@${version}`];
+    async version({ name, version }) {
+      calls.push(`version ${name}@${version}`);
 
-      return s ? { kind: "ok", value: s } : { kind: "missing" };
+      if (f.down) return down;
+      const v = f.versions?.[`${name}@${version}`];
+
+      if (v) return { kind: "ok", value: v };
+      // like the registry: latest's facts and score are the package answer's; any other version must be given above
+      const p = f.packages?.[name];
+      const listed = p?.versions.find((x) => x.version === version);
+
+      if (!p || !listed) return { kind: "missing" };
+
+      return { kind: "ok", value: { version, status: listed.status, statusReason: listed.statusReason, deprecated: listed.deprecated, facts: version === p.latest ? p.facts : null, score: version === p.latest ? p.score : null } };
     },
     async review({ name, version }) {
       calls.push(`review ${name}@${version}`);

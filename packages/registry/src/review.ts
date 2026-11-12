@@ -207,6 +207,40 @@ const reviewAndJob = (name: string, version: string, digest: string) =>
     ),
   );
 
+/** Where the AI review of one version stands: its public result, or the state of its job, or not picked for review. */
+export type ReviewStanding = PublicState | "queued" | "leased" | "failed" | "not-reviewed";
+
+/**
+ * The review standing of each name@version (keyed `name@version`), for the resolve route's dependency walk. One
+ * query per table, whatever the tree's size. A version whose tarball digest is unknown has no review: not-reviewed.
+ */
+export const reviewStandings = (items: readonly { name: string; version: string; digest: string | null }[]) =>
+  Effect.gen(function* () {
+    const out = new Map<string, ReviewStanding>();
+    const keyed = items.filter((i): i is { name: string; version: string; digest: string } => i.digest !== null);
+
+    for (const i of items) out.set(`${i.name}@${i.version}`, "not-reviewed");
+
+    if (keyed.length === 0) return out;
+    const sql = yield* SqlClient.SqlClient;
+    const names = [...new Set(keyed.map((i) => i.name))];
+    const versions = [...new Set(keyed.map((i) => i.version))];
+    const wanted = new Set(keyed.map((i) => `${i.name}@${i.version}@${i.digest}`));
+    const reviews = yield* query("reviewStandings", sql`SELECT * FROM reviews WHERE package = ANY(${names}) AND version = ANY(${versions})`, all(ReviewRow));
+    const jobs = yield* query("jobStandings", sql`SELECT * FROM review_jobs WHERE package = ANY(${names}) AND version = ANY(${versions})`, all(JobRow));
+
+    for (const j of jobs) {
+      if (!wanted.has(`${j.package}@${j.version}@${j.digest}`)) continue;
+
+      if (j.state === "queued" || j.state === "leased" || j.state === "failed") out.set(`${j.package}@${j.version}`, j.state);
+    }
+
+    // a stored result wins over its job's state, as on the review route
+    for (const r of reviews) if (wanted.has(`${r.package}@${r.version}@${r.digest}`)) out.set(`${r.package}@${r.version}`, publicState(r));
+
+    return out;
+  });
+
 /** Adds a job, or merges reasons into the waiting one. A finished job is reopened only for a request after no answer. */
 const enqueue = (job: { name: string; version: string; digest: string; source: Source; reasons: EnqueueReason[] }) =>
   Effect.gen(function* () {
@@ -756,6 +790,8 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
         status,
         // a revoked version's findings keep their file, line and sentence, not the quoted source
         redacted,
+        // `status` folds a leased job into "queued"; `job` keeps them apart for clients that act on the difference
+        job: job?.state ?? null,
         review: review ? publicView(review) : null,
         viewer: role,
         private: review && role !== "public" ? privateView(review) : null,

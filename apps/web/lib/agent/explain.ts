@@ -1,5 +1,6 @@
-// Reads what an install verdict needs (the registry's resolve answer, then the AI review of the version it picked)
-// and returns the verdict. Shared by GET /api/explain and the explain_install MCP tool.
+// Reads what an install verdict needs (the registry's resolve answer with its dependency walk, then the AI review of
+// the version it picked) and returns the verdict. Shared by GET /api/explain and the explain_install MCP tool. Both
+// reads skip every cache (see AgentSource): a version confirmed malicious a second ago must not get "install".
 import { looksLikePackageName } from "../search-schema";
 import type { AgentSource } from "./source";
 import { explainInstall, reviewInput, type Verdict } from "./verdict";
@@ -19,7 +20,8 @@ export function parsePackageSpec(spec: string): { name: string; range: string | 
 export async function explainFor(input: { name: string; range: string | null; source: AgentSource }): Promise<Verdict> {
   const { name, range, source } = input;
   const resolve = await source.resolve({ name, range: range ?? "latest" });
-  const review = resolve.kind === "ok" ? await source.review({ name, version: resolve.version }) : null;
+  // only an "ok" resolve reads the review; the other verdicts never look at it
+  const review = resolve.kind === "ok" ? reviewInput(await source.review({ name, version: resolve.version })) : ({ kind: "unreadable" } as const);
 
-  return explainInstall({ name, range, resolve, review: reviewInput(review?.kind === "ok" ? review.value : null) });
+  return explainInstall({ name, range, resolve, review });
 }

@@ -2,10 +2,10 @@
 import "server-only";
 import { z } from "zod";
 import { ExcerptAnswer } from "../file-excerpt";
-import { getExcerpt, getPackage, getRecent, getReview, getVersionScore, search, type Fetched } from "../registry";
+import { getExcerpt, getPackageUncached, getRecent, getReviewUncached, getVersionInfo, search, type Fetched } from "../registry";
 import { fetchJson, logUnavailable, readCappedText, REGISTRY_TIMEOUT_MS, withTimeout } from "../registry-fetch";
 import { registryFetch } from "../registry-transport";
-import { encodeName, REGISTRY } from "../registry-url";
+import { REGISTRY } from "../registry-url";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
 import { parseJson } from "./json";
 import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome } from "./source";
@@ -47,24 +47,16 @@ async function names(input: { name: string; scope: string | null }): Promise<Nam
   return r.kind === "ok" ? r.value : null;
 }
 
+/** The agent views read version state and the AI review without the edge cache: see AgentSource. */
 export const registrySource: AgentSource = {
-  package: getPackage,
-  versionScore: ({ name, version }) => getVersionScore(name, version),
-  review: ({ name, version }) => getReview(name, version),
+  package: getPackageUncached,
+  version: ({ name, version }) => getVersionInfo(name, version),
+  review: ({ name, version }) => getReviewUncached(name, version),
   resolve,
   search: ({ query }) => search(query),
   names,
   excerpt: (input): Promise<Fetched<ExcerptAnswer>> => getExcerpt(input),
 };
-
-const LatestScore = z.object({ version: z.string(), score: z.number(), grade: z.string() });
-
-export type LatestScore = z.infer<typeof LatestScore>;
-
-/** The latest version's score only, for the home page's popular list. A short budget: the list never waits long. */
-export async function latestScore(name: string, timeoutMs: number): Promise<Fetched<LatestScore>> {
-  return fetchJson({ url: `${REGISTRY}-/apm/v1/score/${encodeName(name)}`, schema: LatestScore, timeoutMs });
-}
 
 const RecentPackages = z.object({ packages: z.array(z.object({ name: z.string(), at: z.string() })) });
 

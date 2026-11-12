@@ -167,6 +167,17 @@ export function openApiDocument() {
         parameters: [nameParam, versionParam],
         responses: { 200: json("ScoreAnswer", "The score"), 404: err("No such package or version"), 503: err("Not scored yet; queued for analysis") },
       }),
+      "/-/apm/v1/packages/{name}/versions/{version}": readOnly("One version's status, facts and score, for any version (the package answer lists the newest 200)", {
+        operationId: "getVersion",
+        parameters: [nameParam, versionParam],
+        responses: {
+          200: {
+            description: "The version's status (active, yanked, revoke-pending, revoked) with its reason, its own facts, and its score; facts and score are null until it is scored. Never cached.",
+            content: { "application/json": { schema: { type: "object", required: ["name", "version", "status", "statusReason", "facts", "score"], additionalProperties: true } } },
+          },
+          404: err("No such package or version"),
+        },
+      }),
       "/-/apm/v1/names": readOnly("Name check: is a name taken, too close to a popular one, and which variations are free", {
         operationId: "checkName",
         parameters: [

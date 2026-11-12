@@ -11,7 +11,7 @@ import { REGISTRY } from "../registry-url";
 import { siteUrl } from "./site";
 import type { Json } from "./json";
 import type { AgentSource } from "./source";
-import { codeBlock, UNTRUSTED_NOTE } from "./text";
+import { codeBlock, inlineCode, oneLine, UNTRUSTED_NOTE } from "./text";
 import { explainFor } from "./explain";
 import { verdictText } from "./verdict";
 
@@ -99,7 +99,13 @@ const searchPackages: Tool<typeof SearchInput> = {
 
     if (!answer) return unavailable("search");
     const hits = answer.hits.slice(0, limit);
-    const lines = hits.map((h) => `- ${h.name}@${h.version}${h.score ? ` score ${h.score.score}/100 (${h.score.grade})` : " (not scored yet)"}${h.weeklyDownloads !== null ? `, ${h.weeklyDownloads} downloads/week` : ""}${h.source === "local" ? ", published to apm" : ""}: ${h.description.replace(/\s+/g, " ").slice(0, 160)}`);
+
+    // names, versions and descriptions come from npm and publishers: one line each, the description quoted
+    const lines = hits.map(
+      (h) =>
+        `- ${oneLine(h.name)}@${oneLine(h.version)}${h.score ? ` score ${h.score.score}/100 (${oneLine(h.score.grade)})` : " (not scored yet)"}${h.weeklyDownloads !== null ? `, ${h.weeklyDownloads} downloads/week` : ""}${h.source === "local" ? ", published to apm" : ""}${h.description ? `: ${inlineCode(oneLine(h.description).slice(0, 160))}` : ""}`,
+    );
+
     const head = hits.length === 0 ? `Nothing matches "${query}".` : `${hits.length} of ${answer.total} for "${query}"${answer.upstreamFailed ? " (npm did not answer; apm packages only)" : ""}:`;
 
     return text([head, ...lines, "", UNTRUSTED_NOTE].join("\n"), { query, total: answer.total, upstreamFailed: answer.upstreamFailed, hits });
@@ -117,18 +123,20 @@ const checkPackage: Tool<typeof CheckPackageInput> = {
     if (loaded.kind === "missing") return text(loaded.reason, { name, version: version ?? null, found: false }, true);
 
     if (loaded.kind === "unavailable") return unavailable(name);
-    const { pkg, version: shown, score, review } = loaded.view;
+    const { pkg, version: shown, status, facts, score, review } = loaded.view;
 
     return text(packageMarkdown(loaded.view), {
       name: pkg.name,
       version: shown,
       latest: pkg.latest,
+      // the shown version's own state and facts, read without a cache
+      status,
       score: score ? { score: score.score, grade: score.grade } : null,
       signals: score?.signals ?? [],
       capabilities: capabilitiesOf(score?.signals ?? null),
-      facts: pkg.facts,
+      facts,
       notChecked: score?.notChecked ?? [],
-      aiReview: review.kind === "ok" ? { status: review.value.status, state: review.value.review?.state ?? null, findings: review.value.review?.findings ?? [] } : null,
+      aiReview: review.kind === "ok" ? { status: review.value.status, job: review.value.job ?? null, state: review.value.review?.state ?? null, findings: review.value.review?.findings ?? [] } : null,
       url: siteUrl(packagePath(pkg.name)),
     });
   },
@@ -147,14 +155,14 @@ const checkName: Tool<typeof CheckNameInput> = {
     const lines: string[] = [];
 
     if (!r.valid) lines.push(`${name} is not a valid package name.`);
-    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.join(", ")}` : ""}${r.latest ? `; latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
+    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map(inlineCode).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
     else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
     else if (r.available) lines.push(`${name} is available.`);
     else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
 
-    for (const l of r.lookalikes) lines.push(`Look-alike: ${l.reason}`);
+    for (const l of r.lookalikes) lines.push(`Look-alike: ${oneLine(l.reason)}`);
 
-    for (const s of r.similar) lines.push(`Similar: ${s.reason}`);
+    for (const s of r.similar) lines.push(`Similar: ${oneLine(s.reason)}`);
     const free = r.suggestions.filter((s) => s.checked && s.available).map((s) => s.name);
 
     if (free.length > 0) lines.push(`Free${r.scope ? ` under @${r.scope}` : ""}: ${free.join(", ")}`);
@@ -184,16 +192,16 @@ const fileExcerpt: Tool<typeof ExcerptInput> = {
   async run(args, source) {
     const r = await source.excerpt(args);
 
-    if (r.kind === "missing") return text(`${args.name}@${args.version} has no file ${args.path}.`, undefined, true);
+    if (r.kind === "missing") return text(`${args.name}@${inlineCode(args.version)} has no file ${inlineCode(args.path)}.`, undefined, true);
 
-    if (r.kind === "unavailable") return text(`Could not read ${args.path}: the registry did not answer, or line ${args.line} is past the end of the file.`, undefined, true);
+    if (r.kind === "unavailable") return text(`Could not read ${inlineCode(args.path)}: the registry did not answer, or line ${args.line} is past the end of the file.`, undefined, true);
     const e = r.value;
 
-    if (e.kind === "binary") return text(`${e.path} in ${e.name}@${e.version} is a binary file (${e.size} bytes).`, { ...e });
+    if (e.kind === "binary") return text(`${inlineCode(e.path)} in ${oneLine(e.name)}@${inlineCode(e.version)} is a binary file (${e.size} bytes).`, { ...e });
     const width = String(e.to).length;
     const body = e.lines.map((l) => `${String(l.n).padStart(width)}  ${l.text}${l.truncated ? ` [line cut, ${l.truncated.bytes} bytes]` : ""}`).join("\n");
 
-    return text([`${e.path} in ${e.name}@${e.version}, lines ${e.from}-${e.to} of ${e.totalLines}:`, UNTRUSTED_NOTE, "", codeBlock(body)].join("\n"), { ...e });
+    return text([`${inlineCode(e.path)} in ${oneLine(e.name)}@${inlineCode(e.version)}, lines ${e.from}-${e.to} of ${e.totalLines}:`, UNTRUSTED_NOTE, "", codeBlock(body)].join("\n"), { ...e });
   },
 };
 

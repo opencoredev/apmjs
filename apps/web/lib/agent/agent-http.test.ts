@@ -1,0 +1,78 @@
+// Review finding 1: GET /api/explain was cached for 60 seconds and the Markdown view for 5 minutes, so a version
+// confirmed malicious or yanked kept its old answer. Decisions are never stored; views for seconds at most.
+import { describe, expect, test } from "bun:test";
+import { AGENT_CACHE, explainResponse, markdownResponse } from "./agent-http";
+import type { Message } from "./mcp";
+import { mcpPost } from "./mcp-http";
+import type { ResolveOutcome } from "./source";
+import { fakeSource, pkg, REVIEW_CLEAN } from "./testing";
+
+const allow = () => ({ ok: true }) as const;
+
+const clean: ResolveOutcome = {
+  kind: "ok",
+  version: "1.3.0",
+  source: "upstream",
+  report: { score: 92, grade: "A", signals: [], notChecked: [] },
+  skipped: [],
+  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] } },
+};
+
+/** The longest a response may be stored, in seconds; 0 for no-store or no-cache. */
+function maxAge(res: Response): number {
+  const cc = res.headers.get("cache-control") ?? "";
+
+  if (/no-store|no-cache/.test(cc)) return 0;
+  const ages = [...cc.matchAll(/(?:s-maxage|max-age)=(\d+)/g)].map((m) => Number(m[1]));
+
+  if (ages.length === 0) throw new Error(`no cache policy: "${cc}"`);
+
+  return Math.max(...ages);
+}
+
+describe("GET /api/explain is never stored", () => {
+  test("a verdict, a bad request and a rate-limited request all say no-store", async () => {
+    const source = fakeSource({ resolve: () => clean, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const ok = await explainResponse(new URL("https://apmjs.dev/api/explain?package=left-pad"), { source, take: allow });
+
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("cache-control")).toBe("no-store");
+    expect((await ok.json()).verdict).toBe("install");
+    expect((await explainResponse(new URL("https://apmjs.dev/api/explain"), { source, take: allow })).headers.get("cache-control")).toBe("no-store");
+    const limited = await explainResponse(new URL("https://apmjs.dev/api/explain?package=left-pad"), { source, take: () => ({ ok: false, retryAfterSeconds: 2 }) });
+
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+describe("the MCP endpoint is never stored", () => {
+  test("a tool answer and a notification's 202 say no-store", async () => {
+    const post = (body: Message) => new Request("https://apmjs.dev/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const source = fakeSource({ resolve: () => clean, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const call = await mcpPost(post({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "explain_install", arguments: { name: "left-pad" } } }), { source, take: allow });
+
+    expect(call.headers.get("cache-control")).toBe("no-store");
+    const note = await mcpPost(post({ jsonrpc: "2.0", method: "notifications/initialized" }), { source, take: allow });
+
+    expect(note.status).toBe(202);
+    expect(note.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+describe("the Markdown view is stored for seconds at most", () => {
+  test("found, missing and unavailable answers", async () => {
+    const source = fakeSource({ packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
+    const ok = await markdownResponse({ name: "left-pad", version: null, registry: "https://registry.apmjs.dev/", source });
+
+    expect(ok.status).toBe(200);
+    expect(maxAge(ok)).toBeLessThanOrEqual(5);
+    expect(maxAge(await markdownResponse({ name: "left-pad", version: "9.9.9", registry: "https://registry.apmjs.dev/", source }))).toBeLessThanOrEqual(5);
+    expect(maxAge(await markdownResponse({ name: "left-pad", version: null, registry: "https://registry.apmjs.dev/", source: fakeSource({ down: true }) }))).toBe(0);
+  });
+
+  test("the view policy is a few seconds, the decision policy never stored", () => {
+    expect(AGENT_CACHE.decision).toBe("no-store");
+    expect(Number(/max-age=(\d+)/.exec(AGENT_CACHE.view)?.[1])).toBeLessThanOrEqual(5);
+  });
+});

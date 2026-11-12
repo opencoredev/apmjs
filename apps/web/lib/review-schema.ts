@@ -51,6 +51,8 @@ export const ReviewAnswer = z.object({
   name: z.string(),
   version: z.string(),
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
+  // the job's own state: status folds "leased" (a reviewer has it) into "queued". An older registry sends none.
+  job: z.enum(["queued", "leased", "done", "failed"]).nullish(),
   review: PublicReview.nullable(),
   /**
    * The version is revoked: findings keep their file, line and sentence, with no excerpt. Required: a registry too old

@@ -87,7 +87,7 @@ describe("tools", () => {
 
     expect(r.isError).toBe(false);
     expect(r.text).toContain('1 of 2 for "pad":');
-    expect(r.text).toContain("- left-pad@1.3.0 score 75/100 (B), 1000 downloads/week: String left pad");
+    expect(r.text).toContain("- left-pad@1.3.0 score 75/100 (B), 1000 downloads/week: `String left pad`");
     expect(r.text).not.toContain("right-pad");
     expect(r.calls).toEqual(["search pad"]);
   });
@@ -130,13 +130,20 @@ describe("tools", () => {
     });
 
     expect(r.calls).toEqual(["names left-pad leo"]);
-    expect(r.text).toContain("left-pad is taken by stevemao; latest 1.3.0, score 75/100.");
+    expect(r.text).toContain("left-pad is taken by `stevemao`; latest `1.3.0`, score 75/100.");
     expect(r.text).toContain("Free under @leo: @leo/left-pad");
   });
 
   test("explain_install resolves the range, reads the review of the picked version, and gives a verdict", async () => {
     const r = await call("explain_install", { name: "left-pad", version: "^1" }, {
-      resolve: () => ({ kind: "ok", version: "1.3.0", source: "upstream", report: { score: 92, grade: "A", signals: [], notChecked: [] }, skipped: [], uncheckedDeps: [] }),
+      resolve: () => ({
+        kind: "ok",
+        version: "1.3.0",
+        source: "upstream",
+        report: { score: 92, grade: "A", signals: [], notChecked: [] },
+        skipped: [],
+        deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] } },
+      }),
       reviews: { "left-pad@1.3.0": REVIEW_CLEAN },
     });
 
@@ -151,7 +158,7 @@ describe("tools", () => {
     });
 
     expect(r.calls).toEqual(["excerpt left-pad@1.3.0 index.js:2±1"]);
-    expect(r.text).toContain("index.js in left-pad@1.3.0, lines 1-3 of 3:");
+    expect(r.text).toContain("`index.js` in left-pad@`1.3.0`, lines 1-3 of 3:");
     expect(r.text).toContain("````\n1  a\n2  ```\n3  c\n````");
   });
 
