@@ -8,7 +8,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 
 | npm pain | apm |
 | --- | --- |
-| A hacked version can't be pulled (72h unpublish, dependents rule) | `yank` (hidden from new installs, lockfiles keep working) and `revoke` (410 + critical advisory in `bun audit` / `npm audit`), any time, with password re-auth and a 24h pending window for old or depended-on versions |
+| A hacked version can't be pulled (72h unpublish, dependents rule) | `yank` (hidden from new installs, lockfiles keep working) and `revoke` (410 + critical advisory in `bun audit` / `npm audit`), any time, with a fresh 2FA or passkey check and a 24h pending window for old or depended-on versions |
 | Account compromised: rotate tokens, hunt versions by hand | `apm incident --since <time>` revokes every token and every version published since then (preview with `--dry-run`, 30-day cap) |
 | No trustworthy safety signal | Per-version score: install scripts, shell, network, credential access, eval, obfuscation, new publisher, risky new dependencies, typosquat names. Every point has file:line evidence. Popularity is not an input |
 | Publishing is a chore and leaks secrets | `apm publish` packs with your PM, lists files, blocks secrets and missing `main`/`types`/`bin`, previews the score, `--bump patch`. The registry repeats the checks server-side |

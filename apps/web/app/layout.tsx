@@ -4,6 +4,7 @@ import { Suspense } from "react";
 import { Host_Grotesk, Geist_Mono } from "next/font/google";
 import { SearchBar } from "@/components/search-bar";
 import { SiteNav, SiteNavFallback } from "@/components/site-nav";
+import { AccountButton } from "@/components/account-button";
 import { Logo, LogoMark } from "@/components/logo";
 import "./globals.css";
 
@@ -27,9 +28,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             <Suspense fallback={<div className="order-last h-10 w-full sm:order-none sm:w-auto sm:max-w-xl sm:flex-1" />}>
               <SearchBar />
             </Suspense>
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-2">
               <Suspense fallback={<SiteNavFallback />}>
                 <SiteNav />
+              </Suspense>
+              <Suspense fallback={<span className="inline-block h-9 w-[76px]" aria-hidden />}>
+                <AccountButton />
               </Suspense>
             </div>
           </div>

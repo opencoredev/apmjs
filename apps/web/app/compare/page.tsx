@@ -61,7 +61,7 @@ const GROUPS: readonly Group[] = [
   {
     title: "Publishing",
     rows: [
-      { label: "The flow", npm: "Two logins, 7-day tokens, misleading 404 or `ENEEDAUTH`.", apm: "File list, score preview and `--bump patch` before it goes out." },
+      { label: "The flow", npm: "Two logins, 7-day tokens, misleading 404 or `ENEEDAUTH`.", apm: "File list and score preview before upload, then a person approves the version with a passkey or 2FA." },
       { label: "Mistakes", npm: "Ships secrets `.npmignore` missed and a `main` that doesn’t exist.", apm: "Blocks secrets and missing main, types or bin. The registry checks again." },
     ],
   },
@@ -69,7 +69,7 @@ const GROUPS: readonly Group[] = [
     title: "Names",
     rows: [
       { label: "Typosquats", npm: "Blocks punctuation variants only.", apm: "Refuses one-edit look-alikes of popular packages. Search shows them next to your query." },
-      { label: "Dependency confusion", npm: "Unscoped names are first come, first served.", apm: "Names already on npm can’t be published. If npm is unreachable, publishing fails closed." },
+      { label: "Dependency confusion", npm: "Unscoped names are first come, first served.", apm: "New packages are scoped to your GitHub login. A bare name always means the npm package." },
     ],
   },
   {
@@ -84,7 +84,7 @@ const GROUPS: readonly Group[] = [
 const NPM_WINS = [
   { title: "Scale and trust", body: "npm is the real registry. apm is a working demo." },
   { title: "Trusted publishing and provenance", body: "npm has OIDC and provenance. apm has neither yet." },
-  { title: "Account security", body: "npm has passkeys and 2FA. apm has passwords and tokens." },
+  { title: "Account security", body: "Both have passkeys and 2FA. npm’s account system has years of use behind it; apm’s is new." },
   { title: "Hosting your code", body: "apm can’t take a name that already exists on npm." },
 ] as const;
 

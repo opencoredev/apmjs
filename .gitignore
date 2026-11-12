@@ -6,3 +6,6 @@ dist
 .hill-climb/*/data
 shots
 apps/web/.next
+.env
+.env.local
+.env.*.local

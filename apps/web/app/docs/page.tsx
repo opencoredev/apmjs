@@ -80,11 +80,12 @@ scanner = "@apm/bun-scanner"`}</Code>
           <Text>apm runs in front of your package manager and passes through any command it does not know.</Text>
           <Code>{`apm add zod              # score + 24h cooldown, then bun add zod@<exact>
 apm x create-thing       # risk card before running anything
-apm publish --bump patch # file list, secret scan, entry check, then publish
+apm login                # sign in through the browser (GitHub or Vercel)
+apm publish --bump patch # file list, secret scan, entry check, upload; you approve it on the web
 apm score left-pad       # every signal with file and line
 apm name my-lib          # free? too close to something popular?
 apm audit                # installed versions vs revocations
-apm revoke my-lib@1.2.3 --reason "token stolen"
+apm revoke @you/my-lib@1.2.3 --reason "token stolen" --otp 123456
 apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
         </Block>
 
@@ -94,7 +95,7 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
               ["Yank", "Hidden from new installs. Lockfiles keep working. Reversible."],
               [
                 "Revoke",
-                "For malicious versions. Needs your password. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
+                "For malicious versions. Needs a fresh second factor: pass --otp with your authenticator code, or confirm on your account page within the last 10 minutes. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
               ],
               ["Audits", "Revoked versions show up as critical advisories in bun audit and npm audit, and their tarballs return 410."],
               ["Log", "Every action lands in the package’s public log."],
