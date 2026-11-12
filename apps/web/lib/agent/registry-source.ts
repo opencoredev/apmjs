@@ -53,6 +53,8 @@ export const registrySource: AgentSource = {
   version: ({ name, version }) => getVersionInfo(name, version),
   review: ({ name, version }) => getReview(name, version),
   resolve,
+  // the website's search: an answer with a local package is read from the registry every time (a revoke changes its
+  // description); only one made entirely of npm's packages is served from the cache (lib/registry.ts)
   search: ({ query }) => search(query),
   names,
   // lines of source: read from the registry every time, which alone decides whether a version's source may be shown
