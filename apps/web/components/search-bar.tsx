@@ -41,7 +41,7 @@ export function SearchBar({ autoFocus = false }: { autoFocus?: boolean }) {
         go(value);
       }}
     >
-      <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+      <SearchIcon className="pointer-events-none absolute top-1/2 left-4 size-[18px] -translate-y-1/2 text-muted-foreground" aria-hidden />
       <input
         ref={inputRef}
         type="search"
@@ -53,7 +53,7 @@ export function SearchBar({ autoFocus = false }: { autoFocus?: boolean }) {
         spellCheck={false}
         placeholder="Search or check a name"
         aria-label="Search packages"
-        className="h-11 w-full rounded-lg border border-input bg-background pr-16 pl-9 text-sm outline-none [&:not(:placeholder-shown)]:font-mono transition-[border-color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/40"
+        className="h-12 w-full rounded-xl border border-transparent bg-surface pr-14 pl-11 text-base outline-none transition-[background-color,border-color,box-shadow] duration-150 placeholder:text-muted-foreground hover:border-border focus-visible:border-ring/60 focus-visible:bg-background focus-visible:shadow-[0_0_0_4px_color-mix(in_oklab,var(--ring)_18%,transparent)] focus-visible:outline-none [&:not(:placeholder-shown)]:font-mono [&::-webkit-search-cancel-button]:appearance-none"
         onChange={(e) => {
           const next = e.target.value;
           setValue(next);
@@ -67,8 +67,8 @@ export function SearchBar({ autoFocus = false }: { autoFocus?: boolean }) {
           }
         }}
       />
-      <span className="pointer-events-none absolute top-1/2 right-3 flex -translate-y-1/2 items-center gap-2 text-muted-foreground">
-        {pending ? <LoaderCircleIcon className="size-4 animate-spin" aria-label="Searching" /> : <kbd className="rounded border px-1.5 font-mono text-[11px]">/</kbd>}
+      <span className="pointer-events-none absolute top-1/2 right-3.5 flex -translate-y-1/2 items-center gap-2 text-muted-foreground">
+        {pending ? <LoaderCircleIcon className="size-4 animate-spin" aria-label="Searching" /> : <kbd className="grid h-6 min-w-6 place-items-center rounded-md border bg-background px-1.5 font-mono text-xs">/</kbd>}
       </span>
     </form>
   );

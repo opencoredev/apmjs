@@ -1,19 +1,36 @@
 import { cn } from "cn";
 
+export type Tone = "none" | "ok" | "warn" | "bad";
+
+export function toneOf(score: number | null | undefined): Tone {
+  if (score === null || score === undefined) return "none";
+  if (score >= 75) return "ok";
+  if (score >= 40) return "warn";
+  return "bad";
+}
+
+const SOFT: Record<Tone, string> = {
+  none: "bg-surface text-muted-foreground",
+  ok: "bg-ok-soft text-ok",
+  warn: "bg-warn-soft text-warn",
+  bad: "bg-bad-soft text-bad",
+};
+
+/** Tinted fill and text for a score, as Tailwind classes. */
 export function scoreTone(score: number | null | undefined): string {
-  if (score === null || score === undefined) return "border-border text-muted-foreground";
-  if (score >= 75) return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400";
-  if (score >= 40) return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400";
-  return "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400";
+  return SOFT[toneOf(score)];
 }
 
 export function ScoreBadge({ score, grade, className }: { score: number | null | undefined; grade?: string | null; className?: string }) {
+  const unscored = score === null || score === undefined;
   return (
     <span
-      className={cn("inline-flex h-6 min-w-14 items-center justify-center gap-1 rounded-md border px-1.5 font-mono text-xs tabular-nums", scoreTone(score), className)}
-      title={score === null || score === undefined ? "Not scored yet" : `apm score ${score}/100`}
+      className={cn("inline-flex h-7 min-w-[3.75rem] shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-mono text-[13px] tabular-nums", scoreTone(score), className)}
+      title={unscored ? "Not scored yet" : `apm score ${score}/100`}
     >
-      {score === null || score === undefined ? "–" : (
+      {unscored ? (
+        <span aria-label="Not scored">n/a</span>
+      ) : (
         <>
           <span className="font-semibold">{grade ?? ""}</span>
           <span>{score}</span>
@@ -25,10 +42,7 @@ export function ScoreBadge({ score, grade, className }: { score: number | null |
 
 export function StatusBadge({ status }: { status: string }) {
   if (status === "active") return null;
-  const tone =
-    status === "yanked"
-      ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-      : "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400";
+  const tone = status === "yanked" ? SOFT.warn : SOFT.bad;
   const label = status === "revoke-pending" ? "revoke pending" : status;
-  return <span className={cn("inline-flex h-5 items-center rounded border px-1.5 text-[11px] font-medium", tone)}>{label}</span>;
+  return <span className={cn("inline-flex h-6 items-center rounded-md px-2 text-xs font-medium", tone)}>{label}</span>;
 }
