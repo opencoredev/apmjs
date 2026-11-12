@@ -37,36 +37,52 @@ function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
 }
 
+/** "unknown" means the upstream could not be asked; it is never treated as "absent". */
+export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" } | { kind: "unknown" };
+
 export class Upstream {
-  private cache = new Map<string, { at: number; pkg: UpstreamPackage | null }>();
-  private inflight = new Map<string, Promise<UpstreamPackage | null>>();
+  private cache = new Map<string, { at: number; probe: Probe }>();
+  private inflight = new Map<string, Promise<Probe>>();
   constructor(
     readonly baseUrl: string,
     private readonly ttlMs = 60_000,
   ) {}
 
+  /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   async get(ctx: Ctx, name: string): Promise<UpstreamPackage | null> {
+    const p = await this.probe(ctx, name);
+    return p.kind === "found" ? p.pkg : null;
+  }
+
+  async probe(ctx: Ctx, name: string): Promise<Probe> {
     const hit = this.cache.get(name);
-    if (hit && Date.now() - hit.at < this.ttlMs) return hit.pkg;
+    if (hit && Date.now() - hit.at < this.ttlMs) return hit.probe;
     const running = this.inflight.get(name);
     if (running) return running;
     const p = this.fetchPackage(ctx, name).finally(() => this.inflight.delete(name));
     this.inflight.set(name, p);
-    const pkg = await p;
-    this.cache.set(name, { at: Date.now(), pkg });
-    return pkg;
+    const probe = await p;
+    if (probe.kind !== "unknown") this.cache.set(name, { at: Date.now(), probe });
+    return probe;
   }
 
-  private async fetchPackage(ctx: Ctx, name: string): Promise<UpstreamPackage | null> {
+  private async fetchPackage(ctx: Ctx, name: string): Promise<Probe> {
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}${encodeName(name)}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
     } catch {
-      return null;
+      return { kind: "unknown" };
     }
-    if (res.status !== 200) return null;
-    const parsed = UpPackument.safeParse(await res.json());
-    if (!parsed.success) return null;
+    if (res.status === 404) return { kind: "absent" };
+    if (res.status !== 200) return { kind: "unknown" };
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      return { kind: "unknown" };
+    }
+    const parsed = UpPackument.safeParse(json);
+    if (!parsed.success) return { kind: "unknown" };
     const raw = parsed.data;
     const tarballs = new Map<string, string>();
     const versions: VersionRecord[] = [];
@@ -92,7 +108,7 @@ export class Upstream {
       });
     }
     versions.sort((a, b) => a.published_at - b.published_at);
-    return {
+    const pkg: UpstreamPackage = {
       name,
       distTags: raw["dist-tags"],
       description: raw.description ?? "",
@@ -101,6 +117,7 @@ export class Upstream {
       versions,
       tarballs,
     };
+    return { kind: "found", pkg };
   }
 
   /** Fetches (or reads from disk) and verifies the tarball against the upstream integrity. */

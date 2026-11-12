@@ -177,6 +177,63 @@ function signal(id: SignalId, evidence: string[]): Signal {
   return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5) };
 }
 
+function isText(data: Uint8Array): boolean {
+  const n = Math.min(data.length, 4096);
+  for (let i = 0; i < n; i++) if (data[i] === 0) return false;
+  return true;
+}
+
+/** Paths an install-script command runs: `node setup`, `sh ./install.sh`, `bun x.ts`. */
+export function scriptTargets(cmd: string): string[] {
+  const out: string[] = [];
+  const re = /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|tsx|ts-node)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g;
+  for (const m of cmd.matchAll(re)) if (m[1] && !m[1].startsWith("-")) out.push(m[1]);
+  return out;
+}
+
+function stringsIn(v: unknown, out: string[]): void {
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) stringsIn(x, out);
+  else if (isRecord(v)) for (const x of Object.values(v)) stringsIn(x, out);
+}
+
+function declaredEntries(manifest: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const k of ["main", "module", "browser", "bin", "exports"] as const) stringsIn(manifest[k], out);
+  return out.filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
+}
+
+function relativeImports(text: string): string[] {
+  const out: string[] = [];
+  const re = /(?:require\s*\(|import\s*\(|from\s+|import\s+)\s*['"`](\.{1,2}\/[^'"`]+)['"`]/g;
+  for (const m of text.matchAll(re)) if (m[1]) out.push(m[1]);
+  return out.slice(0, 200);
+}
+
+function dirOf(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i >= 0 ? p.slice(0, i) : "";
+}
+
+function joinPath(dir: string, rel: string): string {
+  const parts = dir ? dir.split("/") : [];
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return parts.join("/");
+}
+
+function resolveIn(byPath: Map<string, TarEntry>, raw: string): TarEntry | undefined {
+  const p = joinPath("", raw);
+  for (const c of [p, `${p}.js`, `${p}.cjs`, `${p}.mjs`, `${p}.ts`, `${p}/index.js`, `${p}/index.cjs`, `${p}/index.mjs`]) {
+    const f = byPath.get(c);
+    if (f) return f;
+  }
+  return undefined;
+}
+
 export type DependencyRisk = { name: string; version: string; score: number };
 
 export type AnalyzeInput = {
@@ -219,12 +276,23 @@ export function analyze(input: AnalyzeInput): Analysis {
   }
   if (files.some((f) => f.path === "binding.gyp")) add("install-script", "binding.gyp: node-gyp build runs at install");
 
-  for (const f of files) {
+  // Files that run: every file with a code extension, plus whatever install scripts, main, bin and
+  // exports point at, plus anything those reach through a relative require/import, whatever its name.
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  const queue: string[] = files.filter((f) => CODE_EXT.test(f.path)).map((f) => f.path);
+  for (const cmd of Object.values(scripts)) for (const p of scriptTargets(cmd)) queue.push(p);
+  for (const p of declaredEntries(manifest)) queue.push(p);
+  const seen = new Set<string>();
+  while (queue.length > 0 && seen.size < 2000) {
+    const want = queue.shift() ?? "";
+    const f = resolveIn(byPath, want);
+    if (!f || seen.has(f.path)) continue;
+    seen.add(f.path);
     if (isBinary(f)) {
       add("binary", f.path);
       continue;
     }
-    if (!CODE_EXT.test(f.path) || f.data.length > 5_000_000) continue;
+    if (f.data.length > 5_000_000 || !isText(f.data)) continue;
     const text = new TextDecoder().decode(f.data);
     for (const rule of RULES) {
       const m = rule.re.exec(text);
@@ -233,7 +301,9 @@ export function analyze(input: AnalyzeInput): Analysis {
         add(rule.id, `${f.path}:${line}: ${snippet}`);
       }
     }
+    for (const spec of relativeImports(text)) queue.push(joinPath(dirOf(f.path), spec));
   }
+  for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
 
   const facts = factsOf(manifest, files);
   if (!facts.license) add("no-license", "package.json has no license field");

@@ -17,6 +17,7 @@ import {
   missingEntries,
   COOLDOWN_MS,
   SCORE_FLOOR,
+  POPULAR_NAMES,
   type DependencyRisk,
   type ScoreReport,
   type TarEntry,
@@ -202,8 +203,17 @@ function makeOnPublish(env: Env): PublishHook {
     }
 
     if (!existing) {
-      if (env.upstream && (await env.upstream.get(ctx, name))) {
-        return { ok: false, status: 403, error: `"${name}" already exists on the public registry. apm shares one namespace with it, so you cannot publish over it here. Publish under your scope (@${user}/${name}) instead.` };
+      if (POPULAR_NAMES.includes(name)) {
+        return { ok: false, status: 403, error: `"${name}" is a reserved name (a widely used public package). Publish under your scope (@${user}/${name}) instead.` };
+      }
+      if (env.upstream) {
+        const probe = await env.upstream.probe(ctx, name);
+        if (probe.kind === "found") {
+          return { ok: false, status: 403, error: `"${name}" already exists on the public registry. apm shares one namespace with it, so you cannot publish over it here. Publish under your scope (@${user}/${name}) instead.` };
+        }
+        if (probe.kind === "unknown" && !name.startsWith("@")) {
+          return { ok: false, status: 503, error: `Cannot check whether "${name}" exists on the public registry right now, so a first publish of this name is refused. Try again shortly, or publish under your scope (@${user}/${name}).` };
+        }
       }
       const conflicts = typoConflicts(name);
       if (conflicts.length > 0) {
@@ -256,9 +266,11 @@ function moveTagsOff(ctx: Ctx, name: string, version: string): void {
 /** Revokes now when the version is fresh and nothing depends on it; otherwise starts a pending revoke. */
 function revokeVersion(ctx: Ctx, v: VersionRecord, actor: string, reason: string, opts: { forceFinal?: boolean } = {}): "revoked" | "revoke-pending" {
   const at = ctx.now();
+  // A fresh version revoked with the owner's password is the malware case: final at once, even if
+  // other packages depend on it (they are the victims). Older versions that builds rely on get 24h.
   const fresh = at - v.published_at <= FRESH_MS;
   const dependents = ctx.store.dependentsOf(v.package);
-  const final = opts.forceFinal === true || (fresh && dependents.length === 0);
+  const final = opts.forceFinal === true || fresh;
   const status = final ? "revoked" : "revoke-pending";
   ctx.store.setStatus(v.package, v.version, { status, reason, at, by: actor });
   ctx.store.deleteAdvisoriesFor(v.package, v.version);
@@ -546,7 +558,7 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
 export type Policy = { cooldownMs: number; floor: number };
 export const DEFAULT_POLICY: Policy = { cooldownMs: COOLDOWN_MS, floor: SCORE_FLOOR };
 
-/** Why a version fails the policy, or null when it passes. Unanalyzed versions pass the score check. */
+/** Why a version fails the policy, or null when it passes. A version that was never scored fails. */
 export function policyBlock(ctx: Ctx, v: VersionRecord, policy: Policy): string | null {
   if (v.status === "revoked") return `revoked: ${v.status_reason ?? "no reason given"}`;
   if (v.status === "revoke-pending") return `revocation pending: ${v.status_reason ?? "no reason given"}`;
@@ -554,7 +566,8 @@ export function policyBlock(ctx: Ctx, v: VersionRecord, policy: Policy): string 
   const age = ctx.now() - v.published_at;
   if (age < policy.cooldownMs) return `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`;
   const r = reportFor(ctx, v, { ignoreRecent: true });
-  if (r && r.score < policy.floor) {
+  if (!r) return "not scored yet";
+  if (r.score < policy.floor) {
     return `score ${r.score}/100 is below ${policy.floor} (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`;
   }
   return null;
@@ -722,6 +735,15 @@ async function upstreamRoute(req: Request, url: URL, env: Env, viaSafe: boolean)
   }
   if (sp.rest.length > 0) return null;
   const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
+  if (viaSafe) {
+    // score the newest cooled versions before answering; anything left unscored stays hidden
+    const now = env.ctx.now();
+    const cooled = src.versions
+      .filter((v) => now - v.published_at >= DEFAULT_POLICY.cooldownMs)
+      .sort((a, b) => Bun.semver.order(b.version, a.version))
+      .slice(0, 5);
+    for (const v of cooled) await ensureAnalyzed(env, src, v);
+  }
   const body = upstreamPackument(env, src, abbreviated, viaSafe ? safeView(env.ctx) : null);
   return json(body, 200, { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });
 }
