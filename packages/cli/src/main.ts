@@ -3,15 +3,16 @@
 // then hands the real work to the package manager the project already uses.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
-import { lockedEntry } from "./lockfile.ts";
+import { bunKeyNames, findLockfile, isLockPm, lockedEntry, type LockNode, type LockPm } from "./lockfile.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
+import { bunInstallDir, removeInstalled, restore, snapshot, verifyTree } from "./verify.ts";
 
 const VERSION = "0.1.0";
 const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
@@ -208,7 +209,20 @@ type UncheckedDeps = z.infer<typeof Tree>["uncheckedDeps"];
  * `forceable`: --force would get past this refusal, because some version is held back only by the score floor
  * or the cooldown. Revoked and yanked versions, unknown names and dangerous dependencies never are.
  */
-type Resolved = { name: string; version: string | null; report: Report | null; skipped: { version: string; reason: string }[]; blocked: string | null; forceable: boolean; source: string; unchecked: UncheckedDeps };
+type TreePackages = z.infer<typeof Tree>["packages"];
+
+/** `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry. */
+type Resolved = {
+  name: string;
+  version: string | null;
+  report: Report | null;
+  skipped: { version: string; reason: string }[];
+  blocked: string | null;
+  forceable: boolean;
+  source: string;
+  unchecked: UncheckedDeps;
+  tree: TreePackages;
+};
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
 
@@ -226,7 +240,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [] };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [] };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
@@ -234,12 +248,12 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [] };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [] };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [] };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [] };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -276,12 +290,11 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
 const DistSchema = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose() }).loose()) }).loose();
 
 /**
- * The lockfile must record, for each added package, the integrity the checked registry serves. bun and pnpm
- * keep a locked name@version even when told another registry, so this runs before the install (an entry
- * pinned to another artifact is refused before its scripts run) and after it (`afterInstall`: the entry
- * the package manager just wrote).
+ * Before the install: a lockfile entry for an added name@version must hold the integrity the checked registry
+ * serves. bun and pnpm keep a locked name@version even when told another registry, so an entry pinned to
+ * another artifact is refused before anything is fetched. The whole tree is checked after the install.
  */
-async function lockMismatches(input: { api: Api; cwd: string; pm: Pm; results: Resolved[]; afterInstall: boolean }): Promise<string[]> {
+async function lockMismatches(input: { api: Api; cwd: string; pm: Pm; results: Resolved[] }): Promise<string[]> {
   const { api, cwd, pm } = input;
   const problems: string[] = [];
 
@@ -289,10 +302,7 @@ async function lockMismatches(input: { api: Api; cwd: string; pm: Pm; results: R
     if (r.version === null) continue;
     const locked = lockedEntry({ cwd, pm, name: r.name, version: r.version });
 
-    if (!locked?.integrity) {
-      if (input.afterInstall && pm !== "yarn") warn(yellow(`apm: could not find ${r.name}@${r.version} in the ${pm} lockfile to confirm it came from ${api.cfg.registry}`));
-      continue;
-    }
+    if (!locked?.integrity) continue;
 
     let expected: string | undefined;
 
@@ -307,6 +317,89 @@ async function lockMismatches(input: { api: Api; cwd: string; pm: Pm; results: R
   }
 
   return problems;
+}
+
+/** Every scope in the checked trees: the added packages, what the registry walked under them, and what it could not check. */
+function treeScopes(results: Resolved[]): string[] {
+  return scopesOf(results.flatMap((r) => [r.name, ...r.tree.map((p) => p.name), ...r.unchecked.map((u) => u.dependency)]));
+}
+
+/**
+ * Runs the install scripts `apm add` held back, now that the tree is verified: npm rebuilds the packages
+ * that have them, pnpm builds what it recorded as pending, and bun reinstalls them from its verified
+ * lockfile (bun only runs scripts while installing a package, and only for trusted ones).
+ */
+async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[]; registry: string; scopes: string[] }): Promise<number> {
+  const { pm, cwd } = input;
+  const withScripts = input.nodes.filter((n) => n.hasInstallScript);
+  const env = pmEnv(input.registry, input.scopes);
+  const opts = { cwd, env, stdoutToStderr: jsonMode };
+
+  switch (pm) {
+    case "npm": {
+      const names = [...new Set(withScripts.map((n) => n.name))];
+
+      return names.length === 0 ? 0 : (await runCmd(["npm", "rebuild", ...names], opts)).code;
+    }
+    case "pnpm":
+      return (await runCmd(["pnpm", "rebuild", "--pending"], opts)).code;
+    case "bun": {
+      if (withScripts.length === 0) return 0;
+      const lock = findLockfile(cwd, "bun");
+      const root = lock ? dirname(lock) : cwd;
+
+      for (const n of withScripts) rmSync(bunInstallDir(root, bunKeyNames(n.key)), { recursive: true, force: true });
+
+      return (await runCmd(["bun", "install", "--frozen-lockfile", ...registryArgs("bun", input.registry, input.scopes)], opts)).code;
+    }
+    default: {
+      const _exhaustive: never = pm;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * After an install with scripts held back: every package under the added ones must be the artifact the
+ * checked registry serves. A refused install is undone (package.json and the lockfile put back, the
+ * unverified packages removed) and its scripts never run. Returns the exit code.
+ */
+async function verifyAndRunScripts(input: { api: Api; cwd: string; pm: LockPm; results: Resolved[]; scopes: string[]; before: ReturnType<typeof snapshot> }): Promise<number> {
+  const { api, cwd, pm } = input;
+  const check = await verifyTree({ api, cwd, pm, roots: input.results.map((r) => r.name) });
+
+  switch (check.kind) {
+    case "unreadable":
+      fail(`refused: apm could not confirm what ${pm} installed: ${check.reason}`);
+      say("Install scripts were not run. Turn the lockfile back on (apm compares it with the registry it checked), then run apm add again.");
+
+      return 1;
+    case "mismatch": {
+      for (const b of check.bad) fail(`refused: ${b.node.name}@${b.node.version} is not the checked artifact: ${b.why}`);
+      restore(input.before);
+      const removed = removeInstalled({ cwd, nodes: check.bad.map((b) => b.node) });
+
+      say(`Install scripts were not run. apm put package.json and the lockfile back${removed.length > 0 ? ` and removed ${removed.length} unverified package director${removed.length === 1 ? "y" : "ies"}` : ""}.`);
+      say("Check the lockfile and .npmrc for another registry, delete the stale lockfile entries, then run apm add again.");
+
+      return 1;
+    }
+    case "verified": {
+      for (const n of check.notFromRegistry) say(`  ${yellow("!")} not from a registry, not checked: ${n.name}@${n.version}`);
+      say(dim(`apm: ${check.nodes.length} installed package${check.nodes.length === 1 ? "" : "s"} match ${api.cfg.registry}; running install scripts`));
+      const code = await runHeldScripts({ pm, cwd, nodes: check.nodes, registry: api.cfg.registry, scopes: input.scopes });
+
+      if (code !== 0) fail(`apm: the install scripts failed (exit ${code})`);
+
+      return code;
+    }
+    default: {
+      const _exhaustive: never = check;
+
+      return _exhaustive;
+    }
+  }
 }
 
 async function cmdAdd(a: Args): Promise<number> {
@@ -335,7 +428,7 @@ async function cmdAdd(a: Args): Promise<number> {
     return 1;
   }
 
-  const scopes = scopesOf(results.map((r) => r.name));
+  const scopes = treeScopes(results);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "install")) {
     emitJson(false, det, results, lastError);
@@ -343,7 +436,7 @@ async function cmdAdd(a: Args): Promise<number> {
     return 1;
   }
 
-  const pinnedElsewhere = await lockMismatches({ api, cwd, pm: det.pm, results, afterInstall: false });
+  const pinnedElsewhere = await lockMismatches({ api, cwd, pm: det.pm, results });
 
   for (const m of pinnedElsewhere) fail(`refused: the lockfile pins another artifact: ${m}`);
 
@@ -353,7 +446,10 @@ async function cmdAdd(a: Args): Promise<number> {
     return 1;
   }
   const pinned = results.map((r) => `${r.name}@${r.version}`);
-  const cmd = [...addArgs(det.pm, pinned, has(a, "dev")), ...registryArgs(det.pm, cfg.registry, scopes)];
+  const lockPm = isLockPm(det.pm) ? det.pm : null;
+  // bun, npm and pnpm install with every script held back; they run once the whole tree is verified
+  const before = lockPm ? snapshot({ cwd, pm: lockPm }) : null;
+  const cmd = [...addArgs(det.pm, pinned, { dev: has(a, "dev"), ignoreScripts: lockPm !== null }), ...registryArgs(det.pm, cfg.registry, scopes)];
   say(dim(`→ ${cmd.join(" ")}  (${det.pm}: ${det.why})`));
   const run = await runCmd(cmd, { cwd, env: pmEnv(cfg.registry, scopes), stdoutToStderr: jsonMode });
 
@@ -363,15 +459,12 @@ async function cmdAdd(a: Args): Promise<number> {
     return run.code;
   }
 
-  const mismatched = await lockMismatches({ api, cwd, pm: det.pm, results, afterInstall: true });
+  if (lockPm && before) {
+    const code = await verifyAndRunScripts({ api, cwd, pm: lockPm, results, scopes, before });
 
-  for (const m of mismatched) fail(`not the checked artifact: ${m}`);
+    emitJson(code === 0, det, results, code === 0 ? null : lastError);
 
-  if (mismatched.length > 0) {
-    say(`Remove ${mismatched.length === 1 ? "it" : "them"} (${det.pm} remove …) and check the lockfile and .npmrc for another registry.`);
-    emitJson(false, det, results, lastError);
-
-    return 1;
+    return code;
   }
 
   emitJson(true, det, results);
@@ -418,7 +511,7 @@ async function cmdX(a: Args): Promise<number> {
     return 1;
   }
 
-  const scopes = scopesOf([r.name]);
+  const scopes = treeScopes([r]);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "run")) return 1;
   const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown"].includes(x));

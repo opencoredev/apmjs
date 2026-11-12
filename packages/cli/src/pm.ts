@@ -63,16 +63,19 @@ export function detectPm(cwd: string, flag: string | null): Detection {
   return { pm: "npm", why: "default" };
 }
 
-export function addArgs(pm: Pm, specs: string[], dev: boolean): string[] {
+/** The add command. `ignoreScripts` holds every install script back until apm has verified what was installed. */
+export function addArgs(pm: Pm, specs: string[], opts: { dev: boolean; ignoreScripts: boolean }): string[] {
+  const hold = opts.ignoreScripts ? ["--ignore-scripts"] : [];
+
   switch (pm) {
     case "bun":
-      return ["bun", "add", ...(dev ? ["--dev"] : []), ...specs];
+      return ["bun", "add", ...(opts.dev ? ["--dev"] : []), ...hold, ...specs];
     case "npm":
-      return ["npm", "install", ...(dev ? ["--save-dev"] : []), ...specs];
+      return ["npm", "install", ...(opts.dev ? ["--save-dev"] : []), ...hold, ...specs];
     case "pnpm":
-      return ["pnpm", "add", ...(dev ? ["--save-dev"] : []), ...specs];
+      return ["pnpm", "add", ...(opts.dev ? ["--save-dev"] : []), ...hold, ...specs];
     case "yarn":
-      return ["yarn", "add", ...(dev ? ["--dev"] : []), ...specs];
+      return ["yarn", "add", ...(opts.dev ? ["--dev"] : []), ...hold, ...specs];
     default: {
       const _exhaustive: never = pm;
       return _exhaustive;
