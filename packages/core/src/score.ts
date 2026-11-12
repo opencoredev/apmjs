@@ -15,6 +15,7 @@ export type SignalId =
   | "new-publisher"
   | "no-license"
   | "typosquat"
+  | "install-download"
   | "risky-dependency"
   | "new-dependency"
   | "recent"
@@ -57,6 +58,7 @@ export const POINTS: Record<SignalId, number> = {
   "new-publisher": -10,
   "no-license": -3,
   typosquat: -20,
+  "install-download": -40,
   "risky-dependency": -30,
   "new-dependency": -5,
   // informational: age is handled by the cooldown, never by the number
@@ -77,6 +79,7 @@ const LABELS: Record<SignalId, string> = {
   "new-publisher": "Published by an account that never published this package before",
   "no-license": "No license declared",
   typosquat: "Name is one typo away from a popular package",
+  "install-download": "Install script downloads or runs code inline (curl | sh, node -e with network)",
   "risky-dependency": "Depends on a package that scores below the floor",
   "new-dependency": "Adds dependencies the previous version did not have",
   recent: "Published less than 24 hours ago; most malicious versions are caught within hours",
@@ -183,6 +186,14 @@ function isText(data: Uint8Array): boolean {
   return true;
 }
 
+/** The canonical dropper shape: an install command that fetches or evaluates remote code itself. */
+export function isInlineDownload(cmd: string): boolean {
+  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(cmd)) return true;
+  if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
+  const inlineEval = /\b(?:node|bun|deno)\s+(?:-e|--eval|-p|--print|eval)\b/.test(cmd);
+  return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
+}
+
 /** Paths an install-script command runs: `node setup`, `sh ./install.sh`, `bun x.ts`. */
 export function scriptTargets(cmd: string): string[] {
   const out: string[] = [];
@@ -270,6 +281,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   const scripts = installScriptsOf(manifest);
   for (const [k, cmd] of Object.entries(scripts)) {
     add("install-script", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+    if (isInlineDownload(cmd)) add("install-download", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
     for (const rule of RULES) {
       if (rule.re.test(cmd)) add(rule.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
     }
@@ -316,7 +328,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   for (const d of input.riskyDependencies ?? []) add("risky-dependency", `${d.name}@${d.version} scores ${d.score}/100`);
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
-  const order: SignalId[] = ["credential-access", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
+  const order: SignalId[] = ["credential-access", "install-download", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
   const signals = order.flatMap((id) => {
     const ev = found.get(id);
     return ev ? [signal(id, ev)] : [];

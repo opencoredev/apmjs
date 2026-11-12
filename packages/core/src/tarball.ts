@@ -58,6 +58,19 @@ export function readTarball(tgz: Uint8Array): TarEntry[] {
   return entries;
 }
 
+/** Paths that appear more than once, or that try to escape the package folder. */
+export function ambiguousPaths(entries: readonly TarEntry[]): string[] {
+  const seen = new Set<string>();
+  const bad = new Set<string>();
+  for (const e of entries) {
+    const norm = e.path.split("/").filter((s) => s !== "" && s !== ".").join("/");
+    if (e.path.startsWith("/") || norm.split("/").includes("..")) bad.add(e.path);
+    if (seen.has(norm)) bad.add(norm);
+    seen.add(norm);
+  }
+  return [...bad];
+}
+
 export function entryText(e: TarEntry): string {
   return new TextDecoder().decode(e.data);
 }

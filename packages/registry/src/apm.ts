@@ -18,6 +18,7 @@ import {
   COOLDOWN_MS,
   SCORE_FLOOR,
   POPULAR_NAMES,
+  ambiguousPaths,
   type DependencyRisk,
   type ScoreReport,
   type TarEntry,
@@ -165,6 +166,10 @@ function makeOnPublish(env: Env): PublishHook {
       files = readTarball(tarball);
     } catch {
       return { ok: false, status: 400, error: "The tarball is not a valid gzip'd tar." };
+    }
+    const ambiguous = ambiguousPaths(files);
+    if (ambiguous.length > 0) {
+      return { ok: false, status: 422, error: `Refusing to publish: the tarball has duplicate or escaping paths (${ambiguous.slice(0, 5).join(", ")}). Different tools would extract different files from it.` };
     }
     const pj = files.find((f) => f.path === "package.json");
     if (!pj) return { ok: false, status: 400, error: "The tarball has no package.json." };
@@ -587,6 +592,60 @@ function parseDuration(s: string | null, fallback: number): number {
   return n * mult;
 }
 
+type TreeBlock = { name: string; version: string; reason: string; via: string[] };
+
+/**
+ * Walks the dependency tree the package manager would install (newest active version matching each
+ * range) and returns the versions that are revoked or score below the floor. Bounded: at most
+ * `maxNodes` packages and `maxAnalyses` tarball analyses; the rest is reported as unchecked.
+ */
+async function treeBlocks(env: Env, root: VersionRecord, floor: number, limits = { maxNodes: 300, maxAnalyses: 40 }): Promise<{ blocks: TreeBlock[]; unchecked: number }> {
+  const blocks: TreeBlock[] = [];
+  const seen = new Set<string>();
+  let analyses = 0;
+  let unchecked = 0;
+  const queue: { name: string; range: string; via: string[] }[] = dependencyEntries(root.manifest).map(([name, range]) => ({ name, range, via: [`${root.package}@${root.version}`] }));
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (!item) break;
+    if (seen.size >= limits.maxNodes) {
+      unchecked += queue.length + 1;
+      break;
+    }
+    const src = await lookup(env, item.name);
+    if (!src) continue;
+    // what the package manager would pick: the newest active version in range (pulled versions are hidden)
+    const pick = src.versions
+      .filter((v) => v.status === "active" && Bun.semver.satisfies(v.version, item.range))
+      .sort((a, b) => Bun.semver.order(b.version, a.version))[0] ?? null;
+    if (!pick) continue;
+    const key = `${item.name}@${pick.version}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let v = pick;
+    if (!isAnalysis(v.score)) {
+      if (analyses < limits.maxAnalyses) {
+        analyses++;
+        v = await ensureAnalyzed(env, src, v);
+      }
+    }
+    const r = reportFor(env.ctx, v, { ignoreRecent: true });
+    if (!r) unchecked++;
+    else if (r.score < floor) blocks.push({ name: item.name, version: v.version, reason: `score ${r.score}/100 (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`, via: item.via });
+    if (item.via.length < 12) for (const [n, range] of dependencyEntries(v.manifest)) queue.push({ name: n, range, via: [...item.via, key] });
+  }
+  return { blocks, unchecked };
+}
+
+function dependencyEntries(manifest: Record<string, unknown>): [string, string][] {
+  const out: [string, string][] = [];
+  for (const k of ["dependencies", "optionalDependencies"] as const) {
+    const d = manifest[k];
+    if (isRecord(d)) for (const [n, r] of Object.entries(d)) if (typeof r === "string") out.push([n, r]);
+  }
+  return out;
+}
+
 async function resolveResponse(env: Env, url: URL): Promise<Response> {
   const ctx = env.ctx;
   const name = url.searchParams.get("name") ?? "";
@@ -610,7 +669,12 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
     const block = policyBlock(ctx, v, policy);
     if (block === null) {
       const report = reportFor(ctx, v);
-      return json({ name, range, source: src.kind, version: v.version, report, skipped, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
+      const tree = policy.floor > 0 ? await treeBlocks(env, v, policy.floor) : { blocks: [], unchecked: 0 };
+      if (tree.blocks.length > 0) {
+        const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
+        return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);
+      }
+      return json({ name, range, source: src.kind, version: v.version, report, skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
     }
     skipped.push({ version: v.version, reason: block });
     if (skipped.length >= 20) break;

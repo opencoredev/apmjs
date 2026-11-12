@@ -89,6 +89,11 @@ function env(): Record<string, string | undefined> {
   return { ...process.env };
 }
 
+/** Child env for the package manager: it installs from the same registry apm just checked. */
+function pmEnv(registry: string): Record<string, string | undefined> {
+  return { ...process.env, npm_config_registry: registry, NPM_CONFIG_REGISTRY: registry };
+}
+
 async function readPassword(a: Args): Promise<string> {
   const given = flag(a, "password");
   if (given) return given;
@@ -196,7 +201,7 @@ async function cmdAdd(a: Args): Promise<number> {
   const pinned = results.map((r) => `${r.name}@${r.version}`);
   const cmd = addArgs(det.pm, pinned, has(a, "dev"));
   say(dim(`→ ${cmd.join(" ")}  (${det.pm}: ${det.why})`));
-  const run = await runCmd(cmd, { cwd, env: env(), stdoutToStderr: jsonMode });
+  const run = await runCmd(cmd, { cwd, env: pmEnv(cfg.registry), stdoutToStderr: jsonMode });
   if (jsonMode) emitJson(run.code === 0, det, results);
   return run.code;
 }
@@ -227,7 +232,8 @@ async function cmdX(a: Args): Promise<number> {
     warn("usage: apm x <package>[@version] [args...]");
     return 2;
   }
-  const api = new Api(loadConfig(cwd, env()));
+  const cfg = loadConfig(cwd, env());
+  const api = new Api(cfg);
   const det = pmFor(a, cwd);
   const r = await resolveSpec(api, spec, a);
   printResolved(r);
@@ -239,7 +245,7 @@ async function cmdX(a: Args): Promise<number> {
   const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown"].includes(x));
   const cmd = execArgs(det.pm, `${r.name}@${r.version}`, rest.length > 0 ? passArgs : []);
   say(dim(`→ ${cmd.join(" ")}`));
-  return (await runCmd(cmd, { cwd, env: env() })).code;
+  return (await runCmd(cmd, { cwd, env: pmEnv(cfg.registry) })).code;
 }
 
 // ---------- score / name ----------
