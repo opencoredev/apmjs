@@ -121,3 +121,25 @@ export function explanation(r: PublicReview): string | null {
     }
   }
 }
+
+/**
+ * What the package header says about the AI review, so a reader sees an open or confirmed flag before
+ * the install command. Nothing for a clean, cleared or unanswered review: the section below covers those.
+ */
+export function headerNotice(r: PublicReview): { tone: "warn" | "bad"; text: string } | null {
+  switch (r.state) {
+    case "under-review":
+      return { tone: "warn", text: "AI review flagged this version, pending confirmation" };
+    case "confirmed":
+      return { tone: "bad", text: "Confirmed malicious by apm reviewers" };
+    case "found-nothing":
+    case "no-answer":
+    case "cleared":
+      return null;
+    default: {
+      const _exhaustive: never = r.state;
+
+      return _exhaustive;
+    }
+  }
+}

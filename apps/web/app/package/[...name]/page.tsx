@@ -4,6 +4,7 @@ import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
 import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { headerNotice } from "@/lib/review-schema";
 import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
@@ -393,6 +394,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
   if (!isLatest) score = versionScore.kind === "ok" ? versionScore.value : null;
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
+  const aiNotice = review.kind === "ok" && review.value.review !== null ? headerNotice(review.value.review) : null;
 
   return (
     <div className="flex flex-col gap-10 sm:gap-12">
@@ -401,6 +403,15 @@ async function PackageContent({ params, searchParams }: PageProps) {
           <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>
           {version && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{version}</span>}
           <ScoreBadge score={score?.score} grade={score?.grade} className="h-8" />
+          {aiNotice && (
+            <a
+              href="#ai-review"
+              className={`inline-flex min-h-8 items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium underline-offset-4 hover:underline ${aiNotice.tone === "bad" ? "bg-bad-soft text-bad" : "bg-warn-soft text-warn"}`}
+            >
+              {aiNotice.text}
+              <span aria-hidden>↓</span>
+            </a>
+          )}
         </div>
         {!isLatest && pkg.latest && (
           <p className="text-sm text-muted-foreground">
