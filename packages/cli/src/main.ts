@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
-import { analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
+import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -923,6 +923,14 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} was not scanned for secrets; check it yourself.`));
+  const ambiguous = ambiguousPaths(files);
+
+  if (ambiguous.length > 0) {
+    fail(`Refusing to publish ${id}: the tarball has duplicate or escaping paths (${ambiguous.slice(0, 5).join(", ")}).`);
+
+    return 1;
+  }
+
   const missing = missingEntries(manifest, files);
   if (missing.length > 0) {
     for (const m of missing) say(red(`✗ "${m.field}" points to ${m.path}, which is not in the tarball`));

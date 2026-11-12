@@ -1,0 +1,484 @@
+[
+  {
+    "name": "duplicate-path-literal",
+    "v3": 40,
+    "manifest": {
+      "name": "probe-pkg",
+      "version": "1.0.0",
+      "license": "MIT",
+      "main": "index.js",
+      "imports": {
+        "#x": "./a.js"
+      }
+    },
+    "files": [
+      {
+        "path": "package.json",
+        "text": "{\"name\":\"probe-pkg\",\"version\":\"1.0.0\",\"license\":\"MIT\",\"main\":\"index.js\",\"imports\":{\"#x\":\"./a.js\"}}"
+      },
+      {
+        "path": "index.js",
+        "text": ""
+      },
+      {
+        "path": "a.js",
+        "text": "require('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');"
+      },
+      {
+        "path": "a.js",
+        "text": ""
+      }
+    ]
+  },
+  {
+    "name": "duplicate-path-joined",
+    "v3": 30,
+    "manifest": {
+      "name": "probe-pkg",
+      "version": "1.0.0",
+      "license": "MIT",
+      "main": "index.js",
+      "imports": {
+        "#x": "./a.js"
+      }
+    },
+    "files": [
+      {
+        "path": "package.json",
+        "text": "{\"name\":\"probe-pkg\",\"version\":\"1.0.0\",\"license\":\"MIT\",\"main\":\"index.js\",\"imports\":{\"#x\":\"./a.js\"}}"
+      },
+      {
+        "path": "index.js",
+        "text": ""
+      },
+      {
+        "path": "a.js",
+        "text": "require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');"
+      },
+      {
+        "path": "a.js",
+        "text": ""
+      }
+    ]
+  },
+  {
+    "name": "evidence-overflow",
+    "v3": 90,
+    "manifest": {
+      "name": "probe-pkg",
+      "version": "1.0.0",
+      "license": "MIT",
+      "main": "index.js"
+    },
+    "files": [
+      {
+        "path": "package.json",
+        "text": "{\"name\":\"probe-pkg\",\"version\":\"1.0.0\",\"license\":\"MIT\",\"main\":\"index.js\"}"
+      },
+      {
+        "path": "index.js",
+        "text": "/* fetch(\"https://example.invalid\"); */"
+      },
+      {
+        "path": "other0.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other1.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other2.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other3.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other4.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other5.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other6.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other7.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other8.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other9.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other10.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other11.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other12.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other13.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other14.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other15.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other16.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other17.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other18.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other19.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other20.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other21.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other22.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other23.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other24.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other25.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other26.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other27.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other28.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other29.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other30.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other31.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other32.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other33.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other34.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other35.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other36.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other37.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other38.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other39.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other40.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other41.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other42.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other43.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other44.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other45.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other46.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other47.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other48.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other49.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other50.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other51.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other52.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other53.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other54.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other55.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other56.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other57.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other58.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other59.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other60.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other61.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other62.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other63.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other64.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other65.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other66.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other67.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other68.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other69.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other70.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other71.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other72.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other73.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other74.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other75.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other76.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other77.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other78.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other79.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other80.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other81.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other82.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other83.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other84.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other85.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other86.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other87.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other88.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other89.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other90.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other91.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other92.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other93.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other94.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other95.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other96.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other97.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other98.js",
+        "text": "fetch(\"https://example.invalid\");"
+      },
+      {
+        "path": "other99.js",
+        "text": "fetch(\"https://example.invalid\");"
+      }
+    ]
+  }
+]

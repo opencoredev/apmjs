@@ -98,7 +98,7 @@ function reviewable(v: VersionRecord, r: ScoreReport) {
   return {
     scorer: r.scorer,
     digest: d ? digestLabel(d) : null,
-    signals: r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, ...s }) => s),
+    signals: r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s),
     dismissed: r.dismissed ?? [],
   };
 }

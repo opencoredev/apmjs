@@ -10,7 +10,7 @@ import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
-import type { TarEntry } from "./tarball.ts";
+import { ambiguousPaths, type TarEntry } from "./tarball.ts";
 
 export { isInlineDownload } from "./scripts.ts";
 
@@ -66,6 +66,11 @@ const SignalSchema = z.object({
   more: z.array(z.string()).optional(),
   /** Evidence past `evidence` and `more`, counted, not kept. */
   uncounted: z.number().optional(),
+  /**
+   * Every source the signal's evidence cites (see `citedSource`), including evidence past `more`. Set only when
+   * evidence was counted and not kept, so no file the analysis cited is lost to the display cap.
+   */
+  sources: z.array(z.string()).optional(),
   /** A confirmed signal's possible evidence: what the signal falls back to when every confirmed item is dismissed. */
   fallback: z.array(z.string()).optional(),
 });
@@ -354,7 +359,11 @@ function labelOf(id: SignalId, confidence: Confidence, evidence: readonly string
 function keepRest(out: Signal, sorted: readonly string[]): Signal {
   if (sorted.length > SHOWN_EVIDENCE) out.more = sorted.slice(SHOWN_EVIDENCE, KEPT_EVIDENCE);
 
-  if (sorted.length > KEPT_EVIDENCE) out.uncounted = sorted.length - KEPT_EVIDENCE;
+  if (sorted.length > KEPT_EVIDENCE) {
+    out.uncounted = sorted.length - KEPT_EVIDENCE;
+    // the display cap drops evidence; the sources it cites are kept, so every cited file stays on record
+    out.sources = [...new Set(sorted.map(citedSource))];
+  }
 
   return out;
 }
@@ -592,8 +601,8 @@ type V3Walk = {
   installCommands: readonly { text: string }[];
   gyp: TarEntry | undefined;
   budget: number;
-  /** Files the text rules already read whole, each with v3's imports of it when they were worked out. */
-  readWhole: ReadonlyMap<string, Imports | null>;
+  /** Entries the text rules already read whole, each with v3's imports of it when they were worked out. */
+  readWhole: ReadonlyMap<TarEntry, Imports | null>;
   /** `file:line` of each computed load already reported. */
   dynamicAt: ReadonlySet<string>;
   add: Found["add"];
@@ -666,7 +675,8 @@ function readLikeV3(w: V3Walk): V3Skips {
     }
 
     scanned += f.data.length;
-    const known = w.readWhole.get(f.path);
+    // keyed by the entry, not its path: only these bytes' own read can stand in for reading them
+    const known = w.readWhole.get(f);
     let text: string | null = null;
     const textOf = (): string => (text ??= new TextDecoder().decode(f.data));
 
@@ -716,9 +726,30 @@ function readLikeV3(w: V3Walk): V3Skips {
   return { skipped, unanalyzed };
 }
 
-/** Static analysis of one version. Run once at publish; stored with the version. */
+/**
+ * A file list `analyze` refuses: a path that appears more than once (after dropping `.` and empty segments) or
+ * escapes the package folder. Different tools would extract different bytes for it, so no score can speak for it.
+ * The registry refuses such a tarball at publish by the same rule (`ambiguousPaths`).
+ */
+export class AmbiguousPathsError extends Error {
+  override readonly name = "AmbiguousPathsError";
+  readonly paths: readonly string[];
+
+  constructor(paths: readonly string[]) {
+    super(`duplicate or escaping paths: ${paths.slice(0, 5).join(", ")}${paths.length > 5 ? ` and ${paths.length - 5} more` : ""}`);
+    this.paths = paths;
+  }
+}
+
+/**
+ * Static analysis of one version. Run once at publish; stored with the version. Throws AmbiguousPathsError when two
+ * files share a path or a path escapes the package folder.
+ */
 export function analyze(input: AnalyzeInput): Analysis {
   const { manifest, files } = input;
+  const ambiguous = ambiguousPaths(files);
+
+  if (ambiguous.length > 0) throw new AmbiguousPathsError(ambiguous);
   const found = collector();
   const add = found.add;
   const byPath = new Map(files.map((f) => [f.path, f]));
@@ -802,7 +833,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   let qi = 0;
   const limits = new Map<string, string[]>();
   // files whose whole text the text rules read here, with v3's imports of each parsed one, for the v3 walk below
-  const readWhole = new Map<string, Imports | null>();
+  const readWhole = new Map<TarEntry, Imports | null>();
   const dynamicAt = new Set<string>();
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
@@ -847,7 +878,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     const v3Imports = scan.read === "parsed" ? importsOf(joinStrings(text).text) : null;
     const imports = v3Imports ? { ...scan.imports, paths: [...new Set([...scan.imports.paths, ...v3Imports.paths])] } : scan.imports;
 
-    readWhole.set(f.path, v3Imports);
+    readWhole.set(f, v3Imports);
 
     // a computed load in JavaScript counts wherever it is: a file nothing here reaches can still be loaded and run by its
     // path. In any other file it is only v3's pattern over text, reported where v3 reported it, in a reached file.
@@ -1013,6 +1044,14 @@ export function evidenceAt(evidence: string): { file: string; line: number } | n
   const m = CITED_LINE.exec(evidence);
 
   return m?.[1] && m[2] ? { file: m[1], line: Number(m[2]) } : null;
+}
+
+/**
+ * What one piece of evidence cites: the file for evidence that names a file and line (`lib/a.js:4: …`), else the
+ * part before the first ": " (`package.json scripts.postinstall`, `binding.gyp`, a binary's path).
+ */
+export function citedSource(evidence: string): string {
+  return evidenceAt(evidence)?.file ?? evidence.split(": ")[0] ?? evidence;
 }
 
 /**

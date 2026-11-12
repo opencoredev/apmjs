@@ -5,18 +5,13 @@
 // file, for the rest (`package.json scripts.postinstall: …`, `binding.gyp: …`, a binary's path) the part before the
 // first ": ". Lines are not compared: v3 cites the first match of a rule and v9 may cite an earlier or a better one
 // in the same file (the call the tree confirmed before a comment that names it).
-import { evidenceAt, finalize, type Analysis, type AnalyzeInput } from "../src/index.ts";
+import { citedSource, finalize, type Analysis, type AnalyzeInput } from "../src/index.ts";
 import { analyze as analyzeV3, finalize as finalizeV3 } from "./v3/score.ts";
 
 /** The input both scorers take: what `analyze` reads, less the options v3 did not have. */
 export type SupersetInput = Pick<AnalyzeInput, "name" | "manifest" | "files" | "publisher" | "previousPublishers">;
 
 const STATE = { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null } as const;
-
-/** What one piece of evidence cites. */
-export function citedSource(evidence: string): string {
-  return evidenceAt(evidence)?.file ?? evidence.split(": ")[0] ?? evidence;
-}
 
 /** Every v3 finding the v9 analysis lacks, and a line when v9 scores higher; empty when the property holds. */
 export function supersetGaps(input: SupersetInput, v9: Analysis): string[] {
@@ -35,9 +30,10 @@ export function supersetGaps(input: SupersetInput, v9: Analysis): string[] {
 
     if (s9.points > s3.points) gaps.push(`${s3.id}: v9 takes ${s9.points}, v3 took ${s3.points}`);
 
-    // past the kept evidence v9 counts items instead of listing them, so the sources cannot all be compared
-    if ((s9.uncounted ?? 0) > 0) continue;
+    // past the kept evidence v9 counts items instead of listing them, and keeps every source they cite in `sources`
     const cited = new Set([...s9.evidence, ...(s9.more ?? [])].map(citedSource));
+
+    for (const source of s9.sources ?? []) cited.add(source);
 
     for (const e of s3.evidence) if (!cited.has(citedSource(e))) gaps.push(`${s3.id}: v3 cites ${citedSource(e)} (${e}), v9 does not`);
   }

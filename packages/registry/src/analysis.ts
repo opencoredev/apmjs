@@ -1,7 +1,7 @@
 // Scoring upstream versions. A request analyzes a few small tarballs itself, within a per-request budget, and
 // sends everything else to the analysis queue, whose consumer does the heavy work outside any request's CPU limit.
 import { Context, Effect, Layer, Ref, Semaphore } from "effect";
-import { analyze, parseAnalysis, readTarball, type Analysis as Scored, type TarEntry } from "@apm/core";
+import { ambiguousPaths, analyze, parseAnalysis, readTarball, type Analysis as Scored, type TarEntry } from "@apm/core";
 import type { Queue } from "@cloudflare/workers-types";
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type VersionRecord } from "./db.ts";
@@ -42,6 +42,9 @@ export function analyzeUpstreamTarball(pkg: UpstreamPackage, v: VersionRecord, b
   } catch {
     return null;
   }
+
+  // a path twice, or one escaping the folder: tools disagree on what it holds, so it is not scored (analyze refuses it)
+  if (ambiguousPaths(files).length > 0) return null;
 
   const pj = files.find((f) => f.path === "package.json");
   let manifest = v.manifest;
