@@ -1,0 +1,19 @@
+{
+  "name": "@apm/reviewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@apm/ai-review": "workspace:*",
+    "@apm/core": "workspace:*",
+    "zod": "^4.6.7"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opencoredev/apmjs.git"
+  }
+}

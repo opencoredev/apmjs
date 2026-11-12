@@ -9,6 +9,7 @@ import { Upstream } from "./upstream.ts";
 import { createAuth, type AuthOptions } from "./auth.ts";
 import { buildAccess } from "./access.ts";
 import { accountRoutes, sweepStaged } from "./account.ts";
+import { reviewModule, type ReviewOptions } from "./review.ts";
 
 export type StartOptions = {
   dataDir: string;
@@ -31,6 +32,8 @@ export type StartOptions = {
   auth?: Partial<AuthOptions>;
   /** The clock authenticator codes are checked against. Wall-clock time unless a test passes its own. */
   totpNow?: () => number;
+  /** AI release review: the job queue for the reviewer process and the review routes. Off when absent. */
+  review?: ReviewOptions;
 };
 
 export type StartedRegistry = {
@@ -90,11 +93,18 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
   const ctx: Ctx = { store, now, baseUrl: () => base, access };
   const apm = apmExtensions(ctx, upstream);
   const account = accountRoutes({ ctx, auth });
+  const review = opts.review ? reviewModule({ ctx, auth, upstream, options: opts.review }) : null;
+
+  if (review) {
+    ctx.afterCommit = review.onLocalCommit;
+
+    if (upstream) upstream.onPackage = review.onUpstreamPackage;
+  }
   const ext: Extensions = {
     ...apm,
     routes: async (req, url, c, a) => {
       sweepStaged(c);
-      return (await account(req, url)) ?? (apm.routes ? apm.routes(req, url, c, a) : null);
+      return (review ? await review.routes(req, url, a) : null) ?? (await account(req, url)) ?? (apm.routes ? apm.routes(req, url, c, a) : null);
     },
   };
   const handler = createHandler(ctx, ext);
@@ -114,6 +124,7 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
     url: base,
     stop: async () => {
       await server.stop(true);
+      await review?.idle();
       store.close();
     },
     mintToken: ({ user, scope }) => {

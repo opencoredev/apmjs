@@ -28,7 +28,14 @@ export type Access = {
   /** Why this token may not change live state (`action`), or null. Staging tokens need a fresh second factor for it. */
   liveChangeRefusal: (input: { user: string; scope: TokenScope; action: LiveAction; otp?: string | undefined }) => Promise<Refusal | null>;
 };
-export type Ctx = { store: Store; now: () => number; baseUrl: () => string; access: Access };
+export type Ctx = {
+  store: Store;
+  now: () => number;
+  baseUrl: () => string;
+  access: Access;
+  /** Runs after a version goes live (direct publish or approval). Index wires the AI review queue here. */
+  afterCommit?: (v: { name: string; version: string; firstPublish: boolean }) => void;
+};
 /** "publish" tokens go live at once (legacy logins, test tokens, later CI trusted publishing); "stage" tokens need approval. */
 export type TokenScope = "publish" | "stage";
 
@@ -488,14 +495,17 @@ export function commitVersion(
   if (!path) throw new Error(`${v.name}@${v.version}: malformed integrity`);
   const created = placeBlob(path, bytes);
   const size = bytes.length;
+  let firstPublish = false;
 
   try {
     ctx.store.tx(() => {
       if (ctx.store.getVersion(v.name, v.version)) {
         throw new CommitRefusal(409, `Cannot publish over existing version ${v.name}@${v.version}. Versions are immutable; bump the version.`);
       }
-      if (!ctx.store.getPackage(v.name)) ctx.store.createPackage(v.name, at, v.publisher);
-      else if (!ctx.store.owners(v.name).includes(v.publisher)) {
+      if (!ctx.store.getPackage(v.name)) {
+        ctx.store.createPackage(v.name, at, v.publisher);
+        firstPublish = true;
+      } else if (!ctx.store.owners(v.name).includes(v.publisher)) {
         throw new CommitRefusal(403, `You do not have permission to publish "${v.name}". Owners: ${ctx.store.owners(v.name).join(", ")}`);
       }
       commitRows(ctx, v, { at, size });
@@ -509,6 +519,7 @@ export function commitVersion(
     throw e;
   }
   if (!(v.tarball instanceof Uint8Array)) rmSync(v.tarball.stagedPath, { force: true });
+  ctx.afterCommit?.({ name: v.name, version: v.version, firstPublish });
   return { kind: "committed" };
 }
 

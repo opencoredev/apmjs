@@ -33,12 +33,24 @@ type RegistryModule = {
     namePolicy?: NamePolicy;
     auth?: { secret: string; github?: { clientId: string; clientSecret: string; endpoints?: GitHubEndpoints } };
     totpNow?: () => number;
+    review?: ReviewOptions;
   }) => Promise<StartedRegistry>;
 };
 
 function isRegistryModule(m: unknown): m is RegistryModule {
   return typeof m === "object" && m !== null && "startRegistry" in m && typeof m.startRegistry === "function";
 }
+
+/** AI release review options, as packages/registry/src/review.ts takes them. */
+export type ReviewOptions = {
+  serviceTokenHash: string;
+  admins: readonly string[];
+  popularWeekly?: number;
+  downloadsUrl?: string;
+  leaseMs?: number;
+  requestsPerHour?: number;
+  maxAttempts?: number;
+};
 
 export type StartOptions = {
   now?: () => number;
@@ -51,6 +63,8 @@ export type StartOptions = {
   namePolicy?: NamePolicy;
   /** A fake GitHub to sign in through. */
   github?: FakeGitHub;
+  /** Turns on the AI review queue and routes. */
+  review?: ReviewOptions;
 };
 
 export async function startRegistry(opts: StartOptions = {}): Promise<Registry> {
@@ -68,6 +82,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
     namePolicy: opts.namePolicy ?? "open",
     // Authenticator codes follow the tests' TOTP clock, so a test can ask for a fresh code without waiting 30s.
     totpNow: () => totpClock.now,
+    review: opts.review,
     auth: {
       secret: `test-only-secret-${randomBytes(24).toString("hex")}`,
       ...(opts.github ? { github: { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints } } : {}),
