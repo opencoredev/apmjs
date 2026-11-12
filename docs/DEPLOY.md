@@ -1,11 +1,11 @@
 # Deploying apm
 
-apm deploys with one command per stage. `packages/infra/deploy.ts` builds the registry Worker, creates and migrates the stage's Neon database, then runs the Alchemy stack in `packages/infra/alchemy.run.ts`, which creates or updates everything on Cloudflare and builds the website.
+apm deploys with one command per stage. `packages/infra/deploy.ts` builds the registry Worker, creates and migrates the stage's Neon database, then runs the Alchemy stack in `packages/infra/alchemy.run.ts`, which creates or updates everything on Cloudflare and builds the website and the docs site.
 
-| Stage | Registry | Website | Neon database |
-| --- | --- | --- | --- |
-| `staging` | `https://apmjs-registry-staging.<subdomain>.workers.dev/` | `https://apmjs-web-staging.<subdomain>.workers.dev/` | `apmjs_staging` |
-| `production` | `https://registry.apmjs.dev/` | `https://apmjs.dev/` | `neondb` |
+| Stage | Registry | Website | Docs | Neon database |
+| --- | --- | --- | --- | --- |
+| `staging` | `https://apmjs-registry-staging.<subdomain>.workers.dev/` | `https://apmjs-web-staging.<subdomain>.workers.dev/` | `https://apmjs-docs-staging.<subdomain>.workers.dev/` | `apmjs_staging` |
+| `production` | `https://registry.apmjs.dev/` | `https://apmjs.dev/` | `https://docs.apmjs.dev/` | `neondb` |
 
 `<subdomain>` is the account's workers.dev subdomain; deploy.ts reads it from the Cloudflare API.
 
@@ -41,13 +41,13 @@ bun packages/infra/smoke.ts --stage staging              # check it with stock c
 ## Production cutover
 
 1. Confirm the zone is on Cloudflare: `dig NS apmjs.dev +short` must print `etta.ns.cloudflare.com` and `norman.ns.cloudflare.com`.
-2. `bun packages/infra/deploy.ts deploy --stage production`. The stack attaches `registry.apmjs.dev` and `apmjs.dev` to the Workers as custom domains; Alchemy creates the DNS records and certificates.
-3. Check: `curl https://registry.apmjs.dev/-/ping`, open `https://apmjs.dev`, then repeat the stock-client checks by hand or with `bun packages/infra/smoke.ts --stage production` (which skips the staged publish).
+2. `bun packages/infra/deploy.ts deploy --stage production`. The stack attaches `registry.apmjs.dev`, `apmjs.dev` and `docs.apmjs.dev` to the Workers as custom domains; Alchemy creates the DNS records and certificates.
+3. Check: `curl https://registry.apmjs.dev/-/ping`, open `https://apmjs.dev` and `https://docs.apmjs.dev`, then repeat the stock-client checks by hand or with `bun packages/infra/smoke.ts --stage production` (which skips the staged publish).
 4. Sign in with GitHub on `https://apmjs.dev/signin` to confirm the OAuth callback.
 
 ## What the stack creates
 
-Per stage: the R2 bucket `apmjs-blobs-<stage>`, the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, and in production the two custom domains. Workers Logs is on for both Workers.
+Per stage: the R2 bucket `apmjs-blobs-<stage>`, the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
 
 ## State
 

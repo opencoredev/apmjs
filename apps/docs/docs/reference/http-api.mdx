@@ -1,0 +1,130 @@
+---
+title: Registry HTTP API
+description: The npm-compatible routes and the /-/apm/v1/* API of registry.apmjs.dev, with methods, parameters, auth and errors.
+sidebar:
+  label: HTTP API
+---
+
+The registry at `https://registry.apmjs.dev/` speaks the npm registry protocol, so stock clients work unchanged, and adds its own API under `/-/apm/v1/`. This page lists every public route. Routes used only by the website (sign-in, approvals, second factors) and by the AI reviewer are listed at the end without detail.
+
+## Conventions
+
+- **Auth.** Send `Authorization: Bearer <token>` with the token from `apm login`. Routes marked "token" need one; the rest are public.
+- **Second factor.** Routes marked "factor" also need `otp` (a six-digit authenticator code) in the JSON body, or a website approval of that exact command made in the last 10 minutes.
+- **Errors.** A failure answers JSON with an `error` message and the matching status: `400` bad input, `401` no token, `403` not allowed, `404` not found, `405` wrong method, `409` conflict, `410` revoked or expired, `413` too large, `422` refused by a check, `429` over a quota, `503` an upstream check could not run.
+- **Per-user answers** (account, staged uploads, tokens, login, and any `/-/` answer to a request carrying credentials) are sent with `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`.
+- **Package names** in paths are URL-encoded the npm way: `@scope%2fname`.
+- **Size limits.** Publish bodies 32 MB, JSON API bodies 5 MB, a tarball's `package.json` 1 MB.
+
+## The `~safe` view
+
+Prefix any path with `/~safe` to read through the safe view: `https://registry.apmjs.dev/~safe/<package>`. Package documents, versions and tarballs then leave out versions that are revoked, pending revocation, yanked, younger than 24 hours, unscored, or scoring under 40, and `latest` points at the newest version that passes. A hidden version answers `404` with the reason. See [The ~safe view](/guides/safe-view).
+
+## npm protocol routes
+
+| Method and path | Auth | Answers |
+| --- | --- | --- |
+| `GET /-/ping` | none | `{}` |
+| `GET /<package>` | none | The package document (packument). Supports the abbreviated form (`Accept: application/vnd.npm.install-v1+json`) and `ETag`. Each version carries apm's score as `_apmScore`. |
+| `GET /<package>/<version or tag>` | none | One version's document. Revoked versions answer `404`. |
+| `GET /<package>/-/<file>.tgz` | none | The tarball, checked against its published sha512 before it is sent. A revoked version answers `410` with the reason. |
+| `PUT /<package>` | token | Publish one version. With a login token it is staged and answers `202` with `approvalUrl`, `expiresAt` and an `npm-notice` header holding the link. `npm deprecate` uses this route too; with a login token it needs a code in `npm-otp`. |
+| `GET /-/package/<package>/dist-tags` | none | The dist-tags. |
+| `PUT /-/package/<package>/dist-tags/<tag>` | token, factor | Move a tag. A login token needs a code (npm sends it as `npm-otp`). |
+| `DELETE /-/package/<package>/dist-tags/<tag>` | token, factor | Remove a tag. |
+| `PUT /<package>/-rev/<rev>` | token, factor | `npm owner add` and `npm owner rm`. Needs a code in `npm-otp`. |
+| `DELETE /<package>/-rev/<rev>` | | Always `405`. apm does not unpublish; use yank or revoke. |
+| `GET /-/v1/search?text=&size=&from=` | none | Search across apm and npm. `size` at most 250. |
+| `POST /-/npm/v1/security/advisories/bulk` | none | Advisories for `bun audit` and `npm audit`. Revoked versions are critical advisories. |
+| `GET /-/whoami` | token | `{ "username": "..." }` |
+| `DELETE /-/user/token/<token>` | token | Revoke the token that made the request. |
+| `PUT /-/user/org.couchdb.user:<name>` | none | npm password login. Only on self-hosted registries with `APM_LEGACY_AUTH=1`. |
+
+Packages that are not on apm are fetched from `https://registry.npmjs.org/`, checked against npm's checksum, and scored on first request.
+
+## apm API
+
+### `GET /-/apm/v1/resolve`
+
+What `apm add` installs. Query: `name`, `range` (default `latest`), `cooldown` (`24h`, `90m`, `2d`, `0`; a bare number is hours; default 24h), `floor` (default `40`). A lower floor applies to the named package only; its dependencies are checked at 40 or the stricter floor.
+
+- `200`: `{ name, version, report, skipped, source, tree }`. `tree.packages` lists every package the registry walked; `tree.uncheckedDeps` lists those it could not score (git and URL specs, missing packages, past the 300-package walk limit).
+- `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's reason.
+- `404`: no such package.
+
+### `GET /-/apm/v1/score/<package>[/<version or tag>]`
+
+One version's score. Without a version, `latest`.
+
+```json
+{
+  "name": "zod", "version": "4.6.7", "status": "active",
+  "score": 90, "grade": "A",
+  "signals": [{ "id": "eval", "label": "Evaluates code built at runtime (eval, Function, vm)", "points": -10, "confidence": "confirmed", "evidence": ["v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);"] }],
+  "notChecked": ["runtime behavior: code that downloads, decrypts or builds a second stage while running"],
+  "publishedAt": "2026-10-12T16:29:37.778Z", "publishedBy": "GitHub Actions",
+  "previous": { "version": "4.6.6", "score": 90, "grade": "A" },
+  "changes": []
+}
+```
+
+### `GET /-/apm/v1/names?q=<name>`
+
+Name check, as `apm name` shows it: `{ query, valid, taken, available, owners, latest, conflicts, similar, suggestions }`. Optional `user` says whose scope to check against; it defaults to the caller.
+
+### `POST /-/apm/v1/scan`
+
+The Bun scanner's check. Body: `{ "packages": [{ "name": "zod", "version": "4.6.7" }] }`. At most 200 packages without a token, 2,000 with one; the rest come back as unchecked.
+
+- `200`: `{ advisories: [{ package, version, level, description, url }], unchecked: [{ package, version, reason }] }`. A revoked version (or one pending revocation), or one scoring under 40, comes back with `level: "fatal"`, which makes Bun cancel the install. A version not scored yet is listed as unchecked.
+
+### `POST /-/apm/v1/audit`
+
+Body: `{ "<package>": ["<version>", ...] }`. Answers `{ advisories, unavailable }`: npm-style advisories per package, and the packages whose upstream advisories could not be fetched.
+
+### `GET /-/apm/v1/packages/<package>`
+
+The package as the website shows it: versions with status, scores and dist-tags. `GET /-/apm/v1/packages/<package>/events` is its public log: publishes, yanks, revokes, restores, owner changes and evidence dismissals, with who and why.
+
+### `GET /-/apm/v1/recent?limit=<n>`
+
+Recent events across the registry, newest first. `limit` 1 to 50, default 12.
+
+### `GET /-/apm/v1/file/<package>/<version>?path=<path>`
+
+One file of a version, as text, from the same verified tarball the install routes serve. Up to 1 MB whole. Add `&line=<n>&context=<k>` (k at most 100) for lines n-k to n+k of a file of any size. A file that is not UTF-8 answers its size and no text; a line past the end answers `416`; a revoked version answers `410`.
+
+### `GET /-/apm/v1/readme/<package>/<version>`
+
+The README in the version's tarball, picked the way npm picks one.
+
+### `GET /-/apm/v1/review/<package>/<version>`
+
+The AI review result for a version, when the registry runs the review. `POST .../request` asks for one (signed-in users, 5 an hour).
+
+### Version state
+
+All take a JSON body and a token, and need the caller to own the package.
+
+| Method and path | Body | Factor |
+| --- | --- | --- |
+| `POST /-/apm/v1/yank` | `{ name, version, reason? , otp? }` | A login token needs `otp`. |
+| `POST /-/apm/v1/unyank` | `{ name, version, otp? }` | A login token needs `otp`. |
+| `POST /-/apm/v1/revoke` | `{ name, version, reason, otp }` | Required. |
+| `POST /-/apm/v1/restore` | `{ name, version, reason?, otp }` | Required. |
+| `POST /-/apm/v1/incident` | `{ since, reason?, dryRun?, otp }` | Required. `since` is ISO, at most 30 days back. |
+| `POST /-/apm/v1/owners` | `{ name, user, otp }` | Required. Adds an owner. |
+| `DELETE /-/apm/v1/owners` | `{ name, user, otp }` | Required. Removes an owner. |
+
+Revoke answers `{ ok, name, version, status, finalAt?, note? }`; `status` is `revoked`, or `revoke-pending` with `finalAt` 24 hours later. Incident answers `{ ok, revoked, tokensRevoked, dryRun? }`.
+
+## Routes for the website and the reviewer
+
+These exist for apmjs.dev and the AI reviewer process. They need a website session with the website's `Origin`, or the reviewer's service token, and are not a stable API:
+
+- sign-in: `/api/auth/*`, `GET /-/apm/v1/auth/config`, `POST /-/apm/v1/login/device` and `/login/device/token` (the device flow `apm login` uses);
+- account: `GET /-/apm/v1/account`, `POST /-/apm/v1/account/tokens/revoke`;
+- second factors: `POST /-/apm/v1/factor/passkey-challenge`, `POST /-/apm/v1/factor/confirm`, `POST /-/apm/v1/verify`;
+- staged uploads: `GET /-/apm/v1/staged`, `GET /-/apm/v1/staged/<id>`, `GET .../file`, `POST .../approve`, `POST .../reject`;
+- evidence review: `/-/apm/v1/evidence-admin/*`;
+- AI review queue: `/-/apm/v1/review-jobs*`, `/-/apm/v1/review-admin/*`.

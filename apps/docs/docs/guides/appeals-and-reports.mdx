@@ -1,0 +1,66 @@
+---
+title: Appeal a score or report a package
+sidebar:
+  label: Appeals and reports
+description: Ask a person to dismiss a wrong piece of score evidence, report a malicious package, or report a vulnerability in apm itself.
+---
+
+There are three kinds of report, and each goes to a different place:
+
+| You found | Where it goes | Public? |
+| --- | --- | --- |
+| A wrong line of evidence in a version's score | An "Appeal a score" issue | Yes |
+| A malicious, compromised or typosquatting package | A "Report a package" issue | Yes, on purpose |
+| A security bug in apm itself | GitHub private vulnerability reporting | No |
+
+## Appeal a score
+
+Some evidence in a score is wrong. Two real examples: a credential file named in a list of files a dev server refuses to serve, and WebAssembly in base64 counted as obfuscated code. apm does not loosen a rule to fix one package. A person reads the evidence and can dismiss that one item.
+
+1. Open the version page on apmjs.dev, or run `apm score <package>@<version>`, and copy the signal and the cited line.
+2. Open an [Appeal a score](https://github.com/opencoredev/apmjs/issues/new?template=appeal-a-score.yml) issue with the package and exact version, the evidence line, and what the code does with it. Link to the source if it helps.
+
+If the evidence is wrong, one of apm's reviewers dismisses it. They must be signed in on the website and confirm with a fresh authenticator code or passkey; no token can dismiss evidence.
+
+What a dismissal does:
+
+- The score is recomputed without the item everywhere a score is read: the version page, the package page, the `~safe` view and `apm add`.
+- The version page keeps the item, struck through, with "Dismissed by an apm reviewer", the reason and the date.
+- The package's public log records the dismissal, its reason and who made it.
+- It applies to that exact tarball and that scorer version only. Another version, different bytes or a new scorer reads the item afresh.
+- It can be undone. An undo needs its own reason and is logged the same way.
+
+Only code signals can be dismissed: shell, network, credential access, eval and obfuscation. Facts such as "has an install script" cannot.
+
+## Report a package
+
+Open a [Report a package](https://github.com/opencoredev/apmjs/issues/new?template=report-package.yml) issue. Reports are public so that other people installing the same version find out.
+
+Include:
+
+- the package and the exact version;
+- what is wrong: malicious code, a compromised account, a typosquat or impersonation, or something else unsafe;
+- the evidence: a file and line, a network call, an install script, or a link to an analysis.
+
+When a report is confirmed:
+
+- the version is yanked or revoked, so `apm`, the `~safe` view and the Bun scanner stop installing it;
+- the package's public log records who reported it and what changed;
+- for a package that comes from npm, apm also reports it to the npm security team and to the OSV database, because apm cannot remove it at the source.
+
+If the package is yours and your account was compromised, do not wait for a report: see [Respond to a compromised account](/guides/pull-a-version#respond-to-a-compromised-account).
+
+## Report a vulnerability in apm
+
+Do not open a public issue. Use GitHub's [private vulnerability reporting](https://github.com/opencoredev/apmjs/security/advisories/new) on the apm repository. The aim is to reply within 3 days.
+
+In scope:
+
+- the registry, including the publish, revoke and token endpoints;
+- the `apm` CLI;
+- the Bun scanner;
+- the score engine. A package that hides behaviour from the score is in scope.
+
+## Name disputes
+
+To claim a name or scope someone else holds, for example because you own the GitHub org or the trademark, open a [name dispute](https://github.com/opencoredev/apmjs/issues/new?template=name-dispute.yml).

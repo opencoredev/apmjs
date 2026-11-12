@@ -1,0 +1,16 @@
+---
+title: Capabilities
+description: Declaring what your package needs (network, shell, file system) in package.json. This page is a placeholder until the feature ships.
+sidebar:
+  badge: Soon
+---
+
+:::note
+Capabilities are not part of apm yet. Work on an `apm.capabilities` field in `package.json` is in progress, and this page will describe it once it lands. Nothing on this page works today.
+:::
+
+{/* TODO(capabilities): the apm.capabilities field is being built on the feat/capabilities branch, which was not
+    pushed when this site was written. Replace this page with the field's schema, an example, how the score
+    and the approval page use a declaration, and what happens when code does more than it declares. */}
+
+Until the field exists, the [score's](/concepts/score) code signals (`network`, `shell-exec`, `credential-access`, `eval`, `obfuscated`) are apm's record of what a version's code does, each with the file and line it came from.

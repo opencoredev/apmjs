@@ -1,0 +1,96 @@
+---
+title: Yank, revoke and incident response
+description: Hide a version from new installs, pull a malicious one for everyone, or revoke every token and recent version after an account compromise.
+sidebar:
+  label: Pull a version
+---
+
+apm gives an owner three ways to take a version back, at any age:
+
+| You want to | Run | Effect |
+| --- | --- | --- |
+| Stop new installs of a broken version | `apm yank` | Hidden from new installs. Lockfiles that already pin it keep working. Undo with `apm unyank`. |
+| Pull a malicious version for everyone | `apm revoke` | Its tarball answers 410, and `bun audit` and `npm audit` report a critical advisory. Undo a mistake with `apm restore`. |
+| Recover from a stolen account | `apm incident` | Revokes every token on your account and every version you published since a given time. |
+
+Every one of these goes into the package's public log, with who did it and why.
+
+## Yank a version
+
+```bash
+apm yank @you/my-lib@1.2.3 --reason "breaks on Node 22"
+apm unyank @you/my-lib@1.2.3
+```
+
+`--reason` is optional for a yank. With the token from `apm login`, yank and unyank also need a fresh code: add `--otp 123456`.
+
+## Revoke a version
+
+```bash
+apm revoke @you/my-lib@1.2.3 --reason "token stolen, this version sends env vars to a remote host"
+```
+
+`--reason` is required. Everyone with the version installed sees it.
+
+Revoking needs a fresh second factor. Give it one of three ways:
+
+- `--otp <code>` with a code from your authenticator app;
+- type the code when the terminal asks for it;
+- press Enter, open the link in the error, and approve that exact command on your account page. The approval works once, for 10 minutes; run the command again.
+
+What happens next depends on the version's age:
+
+- **Under 72 hours old**: revoked at once, even when other packages depend on it. Those dependents are what a malicious version would attack.
+- **Older**: yanked at once (`revoke-pending`), so new installs skip it, and fully revoked 24 hours later. Existing lockfiles keep working until then. If a second owner runs `apm revoke` on the same version, it becomes final at once.
+
+```text
+✓ @you/my-lib@1.2.3 is now revoke-pending
+  becomes a full revoke at 2026-11-13T18:00:00.000Z. Hidden from new installs now. Existing lockfiles keep working until it becomes final, or until another owner confirms.
+```
+
+Once a version is revoked:
+
+- its tarball answers `410 Gone` with your reason, on the plain registry and on `~safe`;
+- `bun audit`, `npm audit` and `apm audit` report it as a critical advisory;
+- the [Bun scanner](/guides/bun-scanner) cancels any install that includes it.
+
+### Undo a revoke
+
+```bash
+apm restore @you/my-lib@1.2.3 --otp 123456
+```
+
+A restored version goes back to `yanked`, not to active, and its advisory is removed. Unyank it separately if it should install again.
+
+## Respond to a compromised account
+
+When someone else may have published as you, revoke everything since your last publish you trust. Preview first:
+
+```bash
+apm incident --since 2026-11-10T00:00:00Z --dry-run --otp 123456
+apm incident --since 2026-11-10T00:00:00Z --reason "npm token leaked in CI logs" --otp 123456
+```
+
+```text
+Incident response done:
+  revoke @you/my-lib@1.2.4
+  revoke @you/other@0.3.1
+  revoked 3 token(s)
+```
+
+- `--since` is an ISO time. It reaches back at most 30 days; revoke older versions one by one.
+- Each version is revoked by the same rule as `apm revoke` (at once under 72 hours, after 24 hours otherwise), with the reason `incident: <your reason>`.
+- Every token on the account is revoked, including the one that ran the command. Check your GitHub account's security, run `apm login` again, then read each package's event log on apmjs.dev.
+
+## Check what you have installed
+
+```bash
+apm audit
+```
+
+`apm audit` compares every installed version with apm's revocations and the upstream advisories. It exits non-zero on any finding, and also when anything could not be checked: an audit with unchecked items is not a pass.
+
+## Related
+
+- [How accounts are protected](/concepts/security-model)
+- [Report a package that is not yours](/guides/appeals-and-reports#report-a-package)

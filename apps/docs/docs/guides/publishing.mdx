@@ -1,0 +1,107 @@
+---
+title: Publish a package
+description: Sign in with GitHub, run apm publish, and approve the upload with a passkey or authenticator code. Agents publish the same way and hand you the link.
+---
+
+On apm, an upload is not a release. `apm publish` uploads the version, and it goes live only when you approve it on apmjs.dev with a passkey or a code from your authenticator app. A stolen token, or an agent working on your machine, can upload but cannot release.
+
+## Before you start
+
+You need:
+
+- a GitHub account. Sign in at `https://apmjs.dev/signin`.
+- a passkey or an authenticator app (TOTP) set up on your account page, `https://apmjs.dev/account`. The registry refuses an upload from an account with neither, because nobody could approve it.
+- the `apm` CLI. See [Quick start](/quickstart#2-get-the-apm-cli).
+
+Your packages live under your scope, which is your GitHub login in lower case. Set the name in `package.json`:
+
+```json title="package.json"
+{
+  "name": "@your-github-login/my-package",
+  "version": "1.0.0"
+}
+```
+
+A bare name like `my-package` always means the npm package, so apm does not hand out bare names. See [Names and scopes](/guides/names).
+
+## 1. Sign in from the terminal
+
+```bash
+apm login
+```
+
+apm prints a link and a code and opens your browser. Check that the page shows the same code, then approve it. The CLI saves a token for `registry.apmjs.dev` in your user `.npmrc` (mode `0600`), where npm, pnpm and bun also read it.
+
+```text
+✓ logged in to https://registry.apmjs.dev/ as your-github-login
+  token saved to /home/you/.npmrc; npm, pnpm and bun read it from there
+  publishes with it wait for you to approve them in the browser
+```
+
+On a machine with no browser, pass `--no-browser` and open the link on your phone. `apm whoami` shows who the token belongs to.
+
+## 2. Publish
+
+Run it in the package folder. Preview first with `--dry-run`; it uploads nothing and leaves `package.json` alone.
+
+```bash
+apm publish --dry-run
+apm publish --bump patch
+```
+
+Before anything is uploaded, apm:
+
+1. refuses if `publishConfig.registry`, or a scoped registry line in `.npmrc` or `bunfig.toml`, would send the upload somewhere other than the registry apm checked;
+2. with `--bump patch|minor|major` or an exact version, writes the new version to `package.json`;
+3. when `package.json` has no `"files"` allowlist, refuses if any secret-shaped file sits in the folder, because whether it ships depends on the package manager;
+4. packs the package with your own package manager and reads the tarball it made;
+5. refuses if the tarball holds a secret, has duplicate or escaping paths, or if `main`, `types`, `bin`, `module`, `browser` or an `exports` target points at a file that is not in it;
+6. lists the files and their sizes and prints the score the version would get.
+
+A prerelease (`1.2.0-beta.1`) is tagged `next` unless you pass `--tag`. Then apm uploads with your package manager's own `publish` command.
+
+The registry repeats the secret and entry-point checks, and also refuses:
+
+- a version that already exists (versions are immutable);
+- a version that is not strict semver;
+- a first publish of a name that exists on npm, a reserved popular name, or a name one edit from a popular package;
+- a sixth upload of one package waiting for approval, a 21st for your account, or waiting uploads over 256 MB.
+
+## 3. Approve it
+
+The upload is staged, not live:
+
+```text
+● @your-github-login/my-package@1.0.1 is uploaded but not live yet: it is waiting for approval.
+  Approve it within 24h with your passkey or authenticator code: https://apmjs.dev/approve/<id>
+```
+
+Open the link. The approval page shows the files and the score evidence first, then the approve and reject controls. Approve with your passkey, or type a code from your authenticator app. The code or passkey check counts for that one upload only.
+
+Everything waiting for you is listed at `https://apmjs.dev/publish`. An upload nobody approves expires after 24 hours; publish again to get a new link.
+
+## Publishing from an agent
+
+An agent publishes the same way you do. It runs `apm publish` with your login token, the version is staged, and the agent hands you the link. You approve on the website, from any device. Nothing the agent holds can make the version live.
+
+For a script or agent, `--json` prints one JSON document on stdout:
+
+```bash
+apm publish --json
+```
+
+```json
+{ "ok": true, "status": "staged", "approval": "https://apmjs.dev/approve/<id>", "name": "@your-github-login/my-package", "version": "1.0.1", "registry": "https://registry.apmjs.dev/", "files": 4, "score": 100, "grade": "A" }
+```
+
+Tell the agent to send you the `approval` URL and stop. Approving is your job.
+
+## Publishing with npm, pnpm or bun directly
+
+The token from `apm login` works with `npm publish`, `pnpm publish` and `bun publish` too. The registry answers with the approval link in a notice header: npm prints it as `npm notice`, bun as `note:`. You skip the CLI's local checks (secret scan of the folder, file list, score preview); the registry's own checks still run.
+
+## After it is live
+
+- Move dist-tags, deprecate, yank or unyank with a login token only together with a fresh code (`--otp`).
+- To pull a bad version, see [Yank, revoke and incident response](/guides/pull-a-version).
+- For publishing from CI, see [CI and trusted publishing](/guides/ci).

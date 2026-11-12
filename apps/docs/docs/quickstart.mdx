@@ -1,0 +1,85 @@
+---
+title: Quick start
+description: Point bun, npm or pnpm at apm, then add a package with the apm CLI.
+---
+
+By the end of this page your package manager installs through apm, and `apm add` checks a package before it installs it.
+
+The registry is `https://registry.apmjs.dev/`. It serves every npm package, and adds a score, yank and revoke on top.
+
+## 1. Point your package manager at apm
+
+Pick your package manager. Each setting goes in the project folder, so it applies to that project only.
+
+<Tabs>
+  <Tab title="Bun">
+    Add this to `bunfig.toml`. The scanner makes plain `bun install` refuse revoked versions and versions scoring under 40.
+
+    ```toml title="bunfig.toml"
+    [install]
+    registry = "https://registry.apmjs.dev/"
+
+    [install.security]
+    scanner = "@apm/bun-scanner"
+    ```
+
+    The scanner is not on a registry yet. Until it is, install it from a clone of apm; see [Bun scanner](/guides/bun-scanner#install-it). Without it, the `registry` line alone still works.
+  </Tab>
+  <Tab title="npm">
+    Add this to `.npmrc`. The `~safe` view hides versions under 24 hours old and versions scoring under 40.
+
+    ```ini title=".npmrc"
+    registry=https://registry.apmjs.dev/~safe/
+    ```
+  </Tab>
+  <Tab title="pnpm">
+    pnpm reads the same `.npmrc` as npm.
+
+    ```ini title=".npmrc"
+    registry=https://registry.apmjs.dev/~safe/
+    ```
+  </Tab>
+</Tabs>
+
+Then install as usual (`bun install`, `npm install`, `pnpm install`). Packages come from apm, which fetches them from npm, checks each tarball against npm's checksum and scores it.
+
+:::tip
+For npm and pnpm, the plain registry URL (without `~safe/`) serves every version npm has. Use it when you only want `apm add` to apply the checks.
+:::
+
+## 2. Get the apm CLI
+
+`apm` is not on a registry yet. Run it from a clone. You need Bun 1.4 or newer.
+
+```bash
+git clone https://github.com/opencoredev/apmjs.git
+cd apmjs && bun install
+alias apm="bun $PWD/packages/cli/src/main.ts"
+apm --version
+```
+
+`apm --version` prints `0.1.0`. Put the `alias` line in your shell profile to keep it.
+
+apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then falls back to bun when bun is installed and npm when it is not. Pass `--pm npm` to choose.
+
+## 3. Add a package
+
+```bash
+apm add zod
+```
+
+apm asks the registry for the newest version that is at least 24 hours old and scores 40 or more, prints its score card, and checks every package under it. Then it runs your package manager with the exact version, holds back install scripts until it has compared every installed package with what the registry served, and runs the scripts last.
+
+```text
+✓ zod@4.6.7  score 90/100 (A)
+   -10 eval  Evaluates code built at runtime (eval, Function, vm)
+        v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);
+```
+
+If a package is refused, apm says why and whether `--force` would help. `--force` lifts the score floor and the cooldown for the named package only. Revoked and yanked versions stay blocked.
+
+## Next steps
+
+- See every signal and its evidence: `apm score <package>`, or the version page on `https://apmjs.dev`.
+- Publish a package: [Publish a package](/guides/publishing).
+- Make CI fail on anything it could not check: [Bun scanner in CI](/guides/bun-scanner#strict-mode-for-ci).

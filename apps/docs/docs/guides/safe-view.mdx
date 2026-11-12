@@ -1,0 +1,45 @@
+---
+title: The ~safe registry view
+description: A registry URL that hides versions under 24 hours old, versions scoring under 40, and pulled versions, for any client with no extra tools.
+---
+
+`https://registry.apmjs.dev/~safe/` is the same registry with a filter in front. Any client that lets you set the registry URL gets the filter, with no apm tools installed.
+
+```ini title=".npmrc"
+registry=https://registry.apmjs.dev/~safe/
+```
+
+## What it hides
+
+A version is served only when all of these hold:
+
+| Rule | Hidden when |
+| --- | --- |
+| Not pulled | It is revoked, waiting to be revoked, or yanked. |
+| Cooldown | It was published less than 24 hours ago. |
+| Score floor | It scores under 40 out of 100. |
+| Scored | apm has not scored it yet. |
+
+The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason, for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
+
+## How `latest` moves
+
+Dist-tags point at what the view serves. If the newest version is hidden, `latest` points at the newest version that passes. `npm install some-package` then installs that one, without any change to your `package.json`.
+
+## Scoring on first request
+
+Every npm package is scored the first time apm sees it. When a client asks the view for a package, apm scores the five newest versions past the cooldown before it answers. Versions that are still unscored stay hidden. Small tarballs are scored during the request; large ones go to a queue, so a version can be missing for a short time and then appear.
+
+## When to use it, and when not
+
+Use `~safe` when you want the checks with stock tools and no CLI. Compared with `apm add`:
+
+- `apm add` also checks every package under the one you add, verifies what your package manager installed against what the registry served, and runs install scripts only after that.
+- `~safe` filters each version on its own. A package that depends on a hidden version fails to install, with the reason in the error.
+
+The view cannot be tuned. To install one version it hides, use the plain registry for that install, or `apm add <package> --force`, which lifts the floor and cooldown for that package only.
+
+## Related
+
+- [How the score works](/concepts/score)
+- [Registry HTTP API](/reference/http-api)

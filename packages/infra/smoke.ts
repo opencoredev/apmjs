@@ -25,6 +25,7 @@ const stage = Stage.parse(stageAt > 0 ? process.argv[stageAt + 1] : "staging");
 const SUBDOMAIN = process.env.WORKERS_SUBDOMAIN ?? "leoisadev";
 const registry = stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${stage}.${SUBDOMAIN}.workers.dev/`;
 const web = stage === "production" ? "https://apmjs.dev/" : `https://apmjs-web-${stage}.${SUBDOMAIN}.workers.dev/`;
+const docs = stage === "production" ? "https://docs.apmjs.dev/" : `https://apmjs-docs-${stage}.${SUBDOMAIN}.workers.dev/`;
 const work = mkdtempSync(join(tmpdir(), "apm-smoke-"));
 const results: { ok: boolean; name: string; detail: string }[] = [];
 
@@ -62,6 +63,16 @@ function installed(dir: string, name: string): string | null {
   const p = join(dir, "node_modules", ...name.split("/"), "package.json");
 
   return existsSync(p) ? z.object({ version: z.string() }).parse(JSON.parse(readFileSync(p, "utf8"))).version : null;
+}
+
+// ---------- docs ----------
+async function docsSite(): Promise<void> {
+  const home = await fetch(docs, { redirect: "manual" });
+  const text = await home.text();
+  record(home.status === 200 && text.includes("apm documentation"), "the docs site serves its home page", `HTTP ${home.status}`);
+  // assets-only Worker with drop-trailing-slash: a page answers at its own path, without a redirect
+  const page = await fetch(`${docs}quickstart`, { redirect: "manual" });
+  record(page.status === 200, "a docs page answers without a redirect", `/quickstart HTTP ${page.status}`);
 }
 
 // ---------- stock clients ----------
@@ -256,6 +267,8 @@ async function stagedPublish(): Promise<void> {
 }
 
 process.stdout.write(`smoke: ${stage} registry ${registry}\n`);
+
+await docsSite();
 
 await stockClients();
 
