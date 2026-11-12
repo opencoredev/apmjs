@@ -11,10 +11,17 @@ export const MAX_ANALYZED_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_SCANNED_BYTES = 200 * 1024 * 1024;
 
 /**
+ * Wall-clock time one analysis may take. Every step of the analysis is bounded by input size and by work budgets, so
+ * this is a backstop: a file reached after it is not read, and the analysis says so (incomplete or unanalyzed-files).
+ */
+export const MAX_ANALYSIS_MS = 90_000;
+
+/**
  * "too-large": one file over MAX_ANALYZED_FILE_BYTES. "over-budget": the analysis had read MAX_SCANNED_BYTES already.
  * "compressed": an archive (gzip, zip, bzip2, xz, 7z, zstd) whose contents the secret scan cannot read.
+ * "over-time": the analysis had run for MAX_ANALYSIS_MS already.
  */
-export const SKIP_REASONS = ["too-large", "over-budget", "compressed"] as const;
+export const SKIP_REASONS = ["too-large", "over-budget", "compressed", "over-time"] as const;
 
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
@@ -31,6 +38,8 @@ export function describeSkip(s: SkippedFile): string {
       return `${s.path} (${mb} MB, past the analysis budget)`;
     case "compressed":
       return `${s.path} (a compressed archive; its contents are not read)`;
+    case "over-time":
+      return `${s.path} (${mb} MB, reached after the analysis's ${MAX_ANALYSIS_MS / 1000} s time limit)`;
     default: {
       const _exhaustive: never = s.reason;
 

@@ -28,6 +28,8 @@ export const FACT_KINDS = [
   "sends-secrets",
   "runs-download",
   "runs-hidden",
+  // downloaded text spliced into a longer shell command: a possible flow, not a confirmed one
+  "splices-download",
 ] as const;
 
 export type FactKind = (typeof FACT_KINDS)[number];

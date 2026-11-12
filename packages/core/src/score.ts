@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
-import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
+import { describeSkip, MAX_ANALYSIS_MS, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
@@ -14,6 +14,7 @@ import { ambiguousPaths, type TarEntry } from "./tarball.ts";
 import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
 import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
 import type { Exports, Label } from "./flow.ts";
+import { CrossFile, MAX_CROSS_FILE_STEPS } from "./xfile.ts";
 
 export { CAPABILITY_IDS, declarationOf, type CapabilityId, type Declaration } from "./declare.ts";
 
@@ -150,10 +151,10 @@ const CapabilitySchema = z.object({
  * The website shows this list as written and folds the per-file reading limits (LIMIT_NOTES in js.ts) into one line.
  */
 export const NOT_CHECKED: readonly string[] = [
-  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
+  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code, or deleting files",
   "code hidden by a custom encoding, compression or encryption",
   "the code of its dependencies, beyond their own scores",
-  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone costs nothing",
+  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone, or one named token sent in a request, costs nothing",
   "native binaries and WebAssembly: listed, not read",
   "whether the publisher's machine or CI was compromised",
 ];
@@ -635,6 +636,10 @@ export type AnalyzeInput = {
   uncheckedDependencies?: readonly string[];
   /** How many bytes of file content one analysis reads. Defaults to MAX_SCANNED_BYTES. */
   maxScannedBytes?: number;
+  /** Steps the flow analysis across files may take. Defaults to MAX_CROSS_FILE_STEPS. */
+  maxCrossFileSteps?: number;
+  /** Milliseconds one analysis may run before it stops reading files. Defaults to MAX_ANALYSIS_MS. */
+  maxAnalysisMs?: number;
 };
 
 /** What each dependency installs: the registry name behind an npm: alias, the key for anything else. */
@@ -974,6 +979,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   // through a path apm can resolve; then every other file that could be code, whatever its name.
   // A byte budget, not a file count, bounds the work, so filler files can only push out other filler.
   const budget = input.maxScannedBytes ?? MAX_SCANNED_BYTES;
+  const deadline = performance.now() + (input.maxAnalysisMs ?? MAX_ANALYSIS_MS);
   const installTargets = new Set<string>();
   const first: string[] = [];
 
@@ -1044,20 +1050,30 @@ export function analyze(input: AnalyzeInput): Analysis {
   const readHeld = (path: string, e: ExecutedCode, depth: number): void => {
     const spent = heldBytes.get(path) ?? 0;
 
-    if (depth > MAX_HELD_DEPTH || spent + e.code.length > MAX_HELD_BYTES) return;
+    if (depth > MAX_HELD_DEPTH || spent + e.code.length > MAX_HELD_BYTES) {
+      // code that runs is never left unread quietly; a string that only holds code is not run, so it may be
+      if (e.origin === "run" || e.origin === "recovered") add("incomplete", `${path}:${e.line}: ${e.snippet} (${depth > MAX_HELD_DEPTH ? `code run from a string more than ${MAX_HELD_DEPTH} levels deep` : `more than ${MAX_HELD_BYTES / 1024} KB of code run from strings in one file`}; apm did not read it)`);
+
+      return;
+    }
+
     heldBytes.set(path, spent + e.code.length);
     const scan = scanFile(e.code, "js");
     const facts = fileFacts.get(path) ?? [];
     const snippet = `${e.snippet}${HELD_NOTES[e.origin]}`;
 
-    for (const fact of readFacts(e.code, scan.hidden, scan.commands)) if (e.origin !== "held" || HELD_RISKS.has(fact.kind)) facts.push({ ...fact, line: e.line, snippet, near: true });
+    for (const fact of readFacts(e.code, scan.hidden, scan.commands)) if ((e.origin !== "held" && e.origin !== "data") || HELD_RISKS.has(fact.kind)) facts.push({ ...fact, line: e.line, snippet, near: true });
 
     if (e.origin === "recovered" && (scan.read === "raw" || scan.findings.some((x) => x.confidence === "confirmed"))) facts.push({ kind: "runs-hidden", line: e.line, snippet, text: false, near: true });
     fileFacts.set(path, facts);
     const flows: { flows: FlowFinding[]; exports: Exports } = fileFlows.get(path) ?? { flows: [], exports: new Map() };
 
-    for (const x of scan.flows ?? []) flows.flows.push({ ...x, line: e.line, snippet });
+    // a string kept as data (an export, a property value, an array element) is not run: its flows are not the file's
+    // (a package that exports example code), and what it would do counts only through the facts above
+    if (e.origin !== "data") for (const x of scan.flows ?? []) flows.flows.push({ ...x, line: e.line, snippet });
     fileFlows.set(path, flows);
+
+    if (e.origin === "run" || e.origin === "recovered") for (const u of scan.unread ?? []) add("incomplete", `${path}:${e.line}: ${e.snippet} (${u.why})`);
 
     // code that code held as text runs or holds in turn, as sure as the outer one is to run
     for (const inner of scan.executed ?? []) readHeld(path, { ...inner, line: e.line, snippet: e.snippet, origin: e.origin === "run" ? inner.origin : e.origin }, depth + 1);
@@ -1080,6 +1096,12 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     if (scanned + f.data.length > budget) {
       (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-budget" });
+
+      return;
+    }
+
+    if (performance.now() > deadline) {
+      (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-time" });
 
       return;
     }
@@ -1112,6 +1134,8 @@ export function analyze(input: AnalyzeInput): Analysis {
       fileFlows.set(f.path, { flows: [...(scan.flows ?? [])], exports: scan.exports ?? new Map() });
 
       for (const e of scan.executed ?? []) readHeld(f.path, e, 1);
+
+      for (const u of scan.unread ?? []) add("incomplete", `${f.path}:${u.line}: ${u.snippet} (${u.why})`);
     }
 
     // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does
@@ -1191,14 +1215,18 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
 
-  addFlowFacts(fileFlows, fileFacts, byPath);
+  const cross = addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps);
+
+  if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
   for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
   for (const list of [unanalyzed, v3.unanalyzed]) {
     if (list.length === 0) continue;
     const bytes = list.reduce((n, s) => n + s.size, 0);
-    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
+    const limit = list.some((s) => s.reason === "over-time") ? `${(input.maxAnalysisMs ?? MAX_ANALYSIS_MS) / 1000} s analysis time limit` : `${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget`;
+
+    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${limit} (first: ${list[0]?.path ?? ""})`);
   }
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
@@ -1243,7 +1271,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   const notChecked = [
     ...NOT_CHECKED,
     ...[...limits].map(([note, paths]) => `${note} (${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ` and ${paths.length - 3} more files` : ""})`),
-    ...[unanalyzed, v3.unanalyzed].flatMap((list) => (list.length > 0 ? [`${list.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`] : [])),
+    ...[unanalyzed, v3.unanalyzed].flatMap((list) => (list.length === 0 ? [] : list.some((s) => s.reason === "over-time") ? [`${list.length} file(s) not analyzed: the analysis reached its time limit first`] : [`${list.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`])),
     ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`),
   ];
 
@@ -1272,21 +1300,11 @@ const HELD_NOTES: Record<ExecutedCode["origin"], string> = {
   run: " (in code it runs from a string)",
   recovered: " (in its own source, which it turns back into code and runs)",
   held: " (in a string that holds code)",
+  data: " (in a string it keeps as data)",
 };
 
 /** The facts a string that only holds code adds: what it would do that malware does, not what it can do. */
 const HELD_RISKS: ReadonlySet<Fact["kind"]> = new Set(["env-dump", "credential-read", "credential-near", "remote-shell", "fetched-code", "capture-endpoint"]);
-
-/** The label a `read:` label reads, rebuilt so its type is checked; only these can resolve to a credential path. */
-function readOf(l: Label): Label | null {
-  const inner = l.slice("read:".length);
-
-  if (inner === "cred-path") return "cred-path";
-
-  if (inner.startsWith("import:")) return `import:${inner.slice("import:".length)}`;
-
-  return inner.startsWith("read:") ? `read:${inner.slice("read:".length)}` : null;
-}
 
 /** At most this many flow facts of one kind per file. */
 const MAX_FLOW_FACTS = 40;
@@ -1297,34 +1315,14 @@ const MAX_FLOW_FACTS = 40;
  * command. What a relative import carries is what that file exports (worked out the same way, through its own imports),
  * so a read in one file and a request in another are one flow.
  */
-function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>): void {
-  const resolve = (path: string, labels: readonly Label[], seen: ReadonlySet<string>): Set<Label> => {
-    const out = new Set<Label>();
+function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>, maxSteps?: number): CrossFile {
+  const cross = new CrossFile(
+    (path) => fileFlows.get(path)?.exports,
+    (from, spec) => resolveIn(byPath, joinPath(dirOf(from), spec))?.path,
+    maxSteps,
+  );
 
-    for (const l of labels) {
-      if (l.startsWith("import:")) {
-        // `import:<spec>#<name>`, and `+` for a named member of that export (which is not a credential path)
-        const m = /^import:(.*)#([^#]*?)(\+?)$/.exec(l);
-        const target = m ? resolveIn(byPath, joinPath(dirOf(path), m[1] ?? "")) : undefined;
-
-        if (!m || !target || seen.has(target.path)) continue;
-        const exports = fileFlows.get(target.path)?.exports;
-        const name = m[2] ?? "";
-        // an export the module names gives its own labels; any other member of the module value is a named member of it
-        const own = exports?.get(name);
-        const deeper = m[3] === "+" || (own === undefined && name !== "");
-
-        for (const x of resolve(target.path, own ?? exports?.get("") ?? [], new Set([...seen, target.path]))) if (!(deeper && x === "cred-path")) out.add(x);
-      } else if (l.startsWith("read:")) {
-        // a read of a path another file gives: a credential file's contents when that path names one
-        const inner = readOf(l);
-
-        if (inner && resolve(path, [inner], seen).has("cred-path")) out.add("cred");
-      } else out.add(l);
-    }
-
-    return out;
-  };
+  const resolve = (path: string, labels: readonly Label[]): Set<Label> => cross.resolve(path, labels);
 
   for (const [path, { flows }] of fileFlows) {
     const facts = fileFacts.get(path) ?? [];
@@ -1334,7 +1332,7 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
     };
 
     for (const f of flows) {
-      const labels = resolve(path, f.labels, new Set([path]));
+      const labels = resolve(path, f.labels);
 
       if (f.kind === "request") {
         if (labels.has("env")) fact("sends-env", f, "sends the whole environment in a request");
@@ -1345,11 +1343,15 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
         if (families.size >= 3) fact("sends-secrets", f, `sends ${[...families].join(", ")} tokens in one request`);
       } else if (f.kind === "read") {
         if (labels.has("cred-path")) fact("reads-credential", f, "opens a path that names a credential file");
-      } else if (labels.has("net")) fact("runs-download", f, f.kind === "code" ? "runs code it downloaded" : "runs a command it downloaded");
+      } else if (!labels.has("net") && !(labels.has("net-field") && f.kind !== "splice")) continue;
+      else if (f.kind === "splice") fact("splices-download", f, "puts downloaded text into a longer command a shell runs");
+      else fact("runs-download", f, f.kind === "code" ? "runs code it downloaded" : f.kind === "file" ? "runs a program it downloaded and wrote to a file" : "runs a command it downloaded");
     }
 
     fileFacts.set(path, facts);
   }
+
+  return cross;
 }
 
 // ---------- apm-score-v10: capabilities and risk signals ----------
@@ -1549,7 +1551,10 @@ function assess(input: AssessInput): Assessed {
   const downloads = allFacts("runs-download").map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "runs what it downloaded"})`));
   const shells = allFacts("remote-shell").flatMap(({ path, fact }) => (shellFiles.has(path) || installFiles.has(path) ? [factLine(path, fact)] : []));
 
-  put("remote-shell", [...new Set([...downloads, ...shells, ...allFacts("fetched-code").map(({ path, fact }) => factLine(path, fact, " (runs a value right after a network call)"))])]);
+  // downloaded text spliced into a longer command may run as one (`exec('echo ' + body)`); apm cannot tell, so possible
+  const spliced = allFacts("splices-download").map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "downloaded text in a command"}; it may run as a command)`));
+
+  put("remote-shell", [...new Set([...downloads, ...shells, ...spliced, ...allFacts("fetched-code").map(({ path, fact }) => factLine(path, fact, " (runs a value right after a network call)"))])]);
   const remote = risks.get("remote-shell");
 
   if (remote && downloads.length + shells.length > 0) remote.points = CONFIRMED_FLOW_POINTS;

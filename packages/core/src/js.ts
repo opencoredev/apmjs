@@ -6,6 +6,7 @@
 // is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
+import { runDecoder, type Known } from "./decode.ts";
 import { Flow, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
@@ -673,6 +674,9 @@ const TOKEN_RE = /\b(?:AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|NPM_TOKEN|NODE_AUTH_TO
 /** How much decoded text one file may produce, and how much code held in strings it may have read as code. */
 const MAX_DECODED_BYTES = 256 * 1024;
 
+/** How long a function apm runs as a decoder may be, in characters of source. */
+const MAX_DECODER_CHARS = 2000;
+
 /** How deep code held in a string is followed: code that evaluates code that evaluates code. */
 const MAX_EVAL_DEPTH = 3;
 
@@ -1112,6 +1116,10 @@ class Reader {
    * is used some other way (a builtin the package redefines can run it). score.ts reads each one as a program.
    */
   readonly executed: Executed[] = [];
+  /** Strings kept as data: what a module exports, an object property's value, an array element (see `markData`). */
+  private readonly dataStrings = new Set<AnyNode>();
+  /** Code it runs that apm did not read: longer than a held program may be, even with its padding squeezed out. */
+  readonly unread: { at: number; why: string }[] = [];
   /** Where values go (flow.ts); read for the outermost program only, since score.ts reads code held in strings itself. */
   flow: FlowRead = NO_FLOW;
   private readonly scopes: Scopes;
@@ -1137,6 +1145,7 @@ class Reader {
   }
 
   read(): void {
+    this.markData();
     this.visit(this.program, "plain");
 
     for (const at of this.envDumps) {
@@ -1161,11 +1170,92 @@ class Reader {
         returnedBy: (fn) => returnedBy(fn).nodes,
         limit: () => this.budget.notes.add(LIMIT_NOTES.flow),
       }).read();
+
+      // text the program writes to a file and then loads runs as code
+      for (const w of this.flow.ranWritten) this.hold(w.at, w.code, "run");
     } catch (e) {
-      // a value chain deep enough to exhaust the stack is not followed; the text rules still read the file
+      // a value chain deep enough to exhaust the stack is not followed: the text rules still read the file, and the
+      // analysis says it did not follow where values go here
       if (!(e instanceof RangeError)) throw e;
       this.budget.notes.add(LIMIT_NOTES.flow);
+      this.unread.push({ at: 0, why: "values nested too deep for apm to follow where they go" });
     }
+  }
+
+  /**
+   * The strings a program keeps as data: what a module exports (`module.exports = "..."`, `exports.x = ...`,
+   * `export default ...`, `export const x = ...`), and the strings in object and array literals it exports that way,
+   * also through a constant (`module.exports = { examples }`). A literal with a method or function in it is not data,
+   * since its own code can run what it holds; a string handed to a call apm cannot name is not either.
+   */
+  private markData(): void {
+    const roots: AnyNode[] = [];
+    const stack: AnyNode[] = [this.program];
+
+    for (let n = stack.pop(); n; n = stack.pop()) {
+      if (n.type === "ExportDefaultDeclaration") roots.push(n.declaration);
+      else if (n.type === "ExportNamedDeclaration" && n.declaration?.type === "VariableDeclaration") {
+        for (const d of n.declaration.declarations) if (d.init) roots.push(d.init);
+      } else if (n.type === "AssignmentExpression" && n.left.type === "MemberExpression") {
+        let root: AnyNode = n.left;
+
+        while (root.type === "MemberExpression") root = root.object;
+
+        if (root.type === "Identifier" && (root.name === "module" || root.name === "exports") && this.bindingOf(root) === null) roots.push(n.right);
+      }
+
+      stack.push(...childNodes(n));
+    }
+
+    const seen = new Set<AnyNode>();
+    const isFn = (v: AnyNode): boolean => isFunctionNode(v) || v.type === "FunctionDeclaration";
+
+    const mark = (v: AnyNode, depth: number): void => {
+      const t = unwrap(v);
+
+      if (depth > 4 || seen.has(t)) return;
+      seen.add(t);
+
+      switch (t.type) {
+        case "Literal":
+        case "TemplateLiteral":
+        case "BinaryExpression":
+          this.dataStrings.add(t);
+
+          return;
+        case "Identifier": {
+          const init = this.constInit(t);
+
+          if (init) mark(init, depth + 1);
+
+          return;
+        }
+
+        case "ObjectExpression": {
+          const values = t.properties.flatMap((p) => (p.type === "Property" ? [p] : []));
+          const code = t.properties.some((p) => p.type === "SpreadElement") || values.some((p) => p.kind !== "init" || p.method || isFn(unwrap(p.value)));
+
+          // strings beside a method are not data; an object of examples and helpers (`{ examples, render }`) is
+          for (const p of values) {
+            const value = unwrap(p.value);
+            const str = value.type === "Literal" || value.type === "TemplateLiteral" || value.type === "BinaryExpression";
+
+            if (!(code && str)) mark(p.value, depth + 1);
+          }
+
+          return;
+        }
+
+        case "ArrayExpression":
+          for (const e of t.elements) if (e && e.type !== "SpreadElement") mark(e, depth + 1);
+
+          return;
+        default:
+          return;
+      }
+    };
+
+    for (const r of roots) mark(r, 0);
   }
 
   private add(id: CodeSignal, at: number, strength: Strength, how: How, confidence: Confidence, why: string): void {
@@ -1511,7 +1601,9 @@ class Reader {
 
   private memberKey(n: MemberExpression): { name: string; built: boolean } | null {
     if (!n.computed) return n.property.type === "Identifier" ? { name: n.property.name, built: false } : null;
-    const s = n.property.type === "PrivateIdentifier" ? null : this.str(n.property);
+    // `o[['post']]`: a one-element array key is that element's string
+    const prop = n.property.type === "ArrayExpression" && n.property.elements.length === 1 && n.property.elements[0] && n.property.elements[0].type !== "SpreadElement" ? n.property.elements[0] : n.property;
+    const s = prop.type === "PrivateIdentifier" ? null : this.str(prop);
 
     return s?.exact && !s.numeric ? { name: s.value, built: s.how !== "as written" } : s?.exact ? { name: s.value, built: false } : null;
   }
@@ -1696,7 +1788,7 @@ class Reader {
       case "CallExpression":
         return this.strCall(n);
       case "MemberExpression":
-        return this.regexSource(n);
+        return this.regexSource(n) ?? this.arrayElement(n);
       case "ChainExpression":
       case "TSAsExpression":
       case "TSSatisfiesExpression":
@@ -1706,6 +1798,17 @@ class Reader {
       default:
         return null;
     }
+  }
+
+  /** `table[1]`: an element of an array literal (or a constant holding one), by an index apm knows. */
+  private arrayElement(n: MemberExpression): Str | null {
+    if (!n.computed || n.object.type === "Super" || n.property.type === "PrivateIdentifier") return null;
+    const key = this.str(n.property);
+
+    if (!key?.exact || !/^\d+$/.test(key.value)) return null;
+    const parts = this.arrayStrings(n.object);
+
+    return parts?.[Number(key.value)] ?? null;
   }
 
   /** `/…/.source`, also through a constant holding the regex: the pattern's text, which code can hand to an evaluator. */
@@ -1777,6 +1880,9 @@ class Reader {
 
   private strCall(n: CallExpression): Str | null {
     if (n.callee.type === "Super") return null;
+    const decoded = this.localDecoded(n);
+
+    if (decoded) return decoded;
     const callee = this.resolve(n.callee);
     const name = callee.kind === "global" ? callee.path : "";
     const args = n.arguments.filter((a): a is Expression => a.type !== "SpreadElement");
@@ -1851,6 +1957,58 @@ class Reader {
       default:
         return null;
     }
+  }
+
+  /** `re.exec(s)` and `re.test(s)` on a regex literal, a constant holding one or `new RegExp(…)`: not a command. */
+  private isRegexMethod(n: CallExpression | NewExpression): boolean {
+    const callee = n.callee.type === "Super" ? null : unwrap(n.callee);
+
+    if (callee?.type !== "MemberExpression" || callee.object.type === "Super") return false;
+    let recv: AnyNode | null = unwrap(callee.object);
+
+    if (recv.type === "Identifier") recv = this.constInit(recv);
+
+    if (!recv) return false;
+
+    return (recv.type === "Literal" && "regex" in recv && recv.regex !== undefined) || ((recv.type === "NewExpression" || recv.type === "CallExpression") && recv.callee.type === "Identifier" && recv.callee.name === "RegExp");
+  }
+
+  /** A small function this file defines, called with strings or numbers apm knows: what it returns, run (decode.ts). */
+  private localDecoded(n: CallExpression): Str | null {
+    const fn = this.localFunctionOf(n.callee);
+
+    if (!fn || fn.end - fn.start > MAX_DECODER_CHARS || n.arguments.length === 0) return null;
+    const args: Known[] = [];
+    let pieces = 0;
+
+    for (const a of n.arguments) {
+      const s = a.type === "SpreadElement" ? null : this.str(a);
+
+      if (!s?.exact) return null;
+      args.push(s.numeric ? { kind: "number", value: Number(s.value) } : { kind: "text", value: s.value });
+      pieces += s.pieces;
+    }
+
+    const value = runDecoder(fn, args, {
+      constant: (id) => {
+        const s = this.str(id);
+
+        if (!s?.exact) return null;
+
+        return s.numeric ? { kind: "number", value: Number(s.value) } : { kind: "text", value: s.value };
+      },
+      localFunction: (callee) => this.localFunctionOf(callee),
+    });
+
+    return value === null ? null : this.decoded(value, { value: "", exact: true, how: "as written", pieces, via: null, numeric: false }, "a decoder function it defines");
+  }
+
+  private localFunctionOf(callee: AnyNode): AnyNode | null {
+    if (callee.type === "Super") return null;
+    const r = this.resolve(callee);
+    const node = r.kind === "local" && r.obj ? r.obj.node : null;
+
+    return node && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") ? node : null;
   }
 
   /** The strings of an array literal (or a constant holding one), or of `'abc'.split('').reverse()`. */
@@ -1960,7 +2118,7 @@ class Reader {
 
     const sure = role === "shell";
 
-    if (s.exact && isHeldCode(s.value)) this.hold(at, s.value, "held");
+    if (s.exact && isHeldCode(s.value)) this.hold(at, s.value, this.dataStrings.has(n) ? "data" : "held");
 
     // what the program hands a shell or a process, for the risk signals that read commands (apm-score-v10)
     if (role === "shell" && this.commands.length < MAX_COMMANDS) this.commands.push({ at, value: s.value.slice(0, MAX_COMMAND_CHARS) });
@@ -2003,8 +2161,17 @@ class Reader {
 
   /** Keeps code held in a string for score.ts to read, within the file's decoded-text budget. */
   private hold(at: number, code: string, origin: Executed["origin"]): void {
-    if (this.depth > 0 || this.executed.length >= MAX_EXECUTED || code.length > MAX_HELD_CHARS) return;
-    this.executed.push({ at, code, origin });
+    if (this.depth > 0) return;
+    const held = code.length > MAX_HELD_CHARS ? squeeze(code) : code;
+
+    // code it runs is never dropped unread: past either limit, the analysis says so
+    if (this.executed.length >= MAX_EXECUTED || held.length > MAX_HELD_CHARS) {
+      if (origin === "run" && this.unread.length < MAX_EXECUTED) this.unread.push({ at, why: held.length > MAX_HELD_CHARS ? `runs ${held.length} characters of code from a string, more than the ${MAX_HELD_CHARS / 1024} KB apm reads` : `runs code from more than ${MAX_EXECUTED} strings, more than apm reads` });
+
+      return;
+    }
+
+    this.executed.push({ at, code: held, origin });
   }
 
   /** The `name` and `text` rules on a string, and token names, each as sure as the string's role allows. */
@@ -2529,7 +2696,7 @@ class Reader {
       const binding = firstStr?.exact ? firstStr.value : null;
 
       if (name === "process.dlopen" || binding === null || !HARMLESS_BINDINGS.test(binding)) this.add("shell-exec", at, STRENGTH.call, "as written", "confirmed", "");
-    } else if (!isLocal && r.kind !== "module" && COMMAND_ARGS.has(last) && last !== "$") {
+    } else if (!isLocal && r.kind !== "module" && COMMAND_ARGS.has(last) && last !== "$" && !this.isRegexMethod(n)) {
       rest = "shell";
       effect = false;
     } else if (byName(r) && last === "fetch") {
@@ -2857,9 +3024,13 @@ export type FlowFinding = { kind: Sink["kind"]; line: number; snippet: string; l
 /**
  * Code a file holds as text, for score.ts to read as a program: `run`, a string it hands an evaluator; `recovered`, its
  * own source (a function, a regex, the file) turned back into text and run, with comment and regex delimiters taken
- * out so what they held reads as the code it becomes; `held`, a string that reads as a program and is used otherwise.
+ * out so what they held reads as the code it becomes; `held`, a string that reads as a program and is used otherwise
+ * (handed to a call apm cannot name, which may run it); `data`, such a string kept only as data (`markData`).
  */
-export type ExecutedCode = { line: number; snippet: string; code: string; origin: "run" | "recovered" | "held" };
+export type ExecutedCode = { line: number; snippet: string; code: string; origin: "run" | "recovered" | "held" | "data" };
+
+/** Code a file runs that apm did not read (too long even squeezed), cited at the call that runs it. */
+export type Unread = { line: number; snippet: string; why: string };
 
 /** An environment variable read by name (`*` when the name is built at runtime), or the whole object used (`null`). */
 export type EnvRead = { line: number; snippet: string; name: string | null };
@@ -2876,22 +3047,24 @@ export type JsScan =
       exports: Exports;
       executed: ExecutedCode[];
       env: EnvRead[];
+      /** Code the file runs that apm did not read, which makes the analysis incomplete. */
+      unread: Unread[];
     }
   | { kind: "failed"; reason: "syntax" | "too-large" };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
-type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; executed: Executed[] };
+type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; executed: Executed[]; unread: { at: number; why: string }[] };
 
 /** At most this many commands per program, each cut to this many characters: enough to read what a command does. */
 const MAX_COMMANDS = 200;
 const MAX_COMMAND_CHARS = 4000;
 
 /** Code a program holds as text, and where (see Reader.executed). */
-type Executed = { at: number; code: string; origin: "run" | "held" };
+type Executed = { at: number; code: string; origin: "run" | "held" | "data" };
 
 /** At most this many held programs per file, each at most this long; score.ts reads them within its own byte budget. */
 const MAX_EXECUTED = 50;
-const MAX_HELD_CHARS = 64 * 1024;
+const MAX_HELD_CHARS = 256 * 1024;
 
 /** Names a string that reads as a program must call: a builtin that reaches the network, a process, a file or code. */
 const HELD_NAMES = /\b(?:fetch|require|getBuiltinModule|import|process|Bun|Deno|eval|Function|XMLHttpRequest|WebSocket)\b/;
@@ -2903,7 +3076,7 @@ function isHeldCode(s: string): boolean {
   return s.length >= 12 && open > 0 && s.lastIndexOf(")") > open && HELD_NAMES.test(s);
 }
 
-const NO_FLOW: FlowRead = { sinks: [], recovered: [], exports: new Map(), env: [] };
+const NO_FLOW: FlowRead = { sinks: [], recovered: [], exports: new Map(), env: [], ranWritten: [] };
 
 /** Reads every program `text` parses to, one at a time. Null when no parser accepted it or a tree was too large or too deep. */
 function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: "syntax" | "too-large" } {
@@ -2963,7 +3136,7 @@ function readProgram(p: Parsed, depth: number, budget: Budget): Read | null {
 
     r.read();
 
-    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands, flow: r.flow, executed: r.executed };
+    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands, flow: r.flow, executed: r.executed, unread: r.unread };
   } catch (e) {
     if (e instanceof RangeError) return null;
     throw e;
@@ -3039,56 +3212,68 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
   const executed: ExecutedCode[] = once(r.reads.flatMap((x) => x.executed), (e) => `${e.at} ${e.origin}`).map((e) => ({ ...lineOf(text, e.at), code: e.code, origin: e.origin }));
   const leftOut = r.reads[0]?.leftOut;
 
+  const unread: Unread[] = once(r.reads.flatMap((x) => x.unread), (u) => `${u.at}`).map((u) => ({ ...lineOf(text, u.at), why: u.why }));
+
   for (const rec of once(r.reads.flatMap((x) => x.flow.recovered), (x) => `${x.at} ${x.ranges.join(";")}`)) {
     for (const [from, to] of rec.ranges) {
-      const code = leftOut ? recoveredText(text, leftOut, from, to) : null;
+      const got = leftOut ? recoveredText(text, leftOut, from, to) : null;
 
-      if (code !== null && executed.length < 60) executed.push({ ...lineOf(text, rec.at), code, origin: "recovered" });
+      if (got === null) continue;
+
+      if (got === "too-long" || executed.length >= MAX_EXECUTED + 10) unread.push({ ...lineOf(text, rec.at), why: got === "too-long" ? `runs text it recovers from its own source that is longer than the ${MAX_RECOVERED_CHARS / 1024} KB apm reads, even with padding squeezed out` : "runs more recovered source than apm reads" });
+      else executed.push({ ...lineOf(text, rec.at), code: got.code, origin: "recovered" });
     }
   }
 
 
-  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands, flows, exports, executed, env };
+  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands, flows, exports, executed, env, unread };
 }
 
-/** How much of a file's own source one recovery is read as code. */
+/** How much of a file's own source one recovery is read as code, once runs of whitespace are squeezed to one. */
 const MAX_RECOVERED_CHARS = 256 * 1024;
+
+/** Runs of whitespace squeezed to one space, or one newline where the run held one: what padding hides behind goes. */
+export function squeeze(code: string): string {
+  return code.replace(/\s{2,}/g, (m) => (m.includes("\n") ? "\n" : " "));
+}
 
 /**
  * The text a program gets back from its own source between `from` and `to`, as code: the comment and regex delimiters
- * in it are blanked, so what a comment or a regex body held reads as the code it becomes once sliced out and run. Null
- * when nothing in the range was left out of the program as written (then it is code apm already read), or when what
- * was left out names no network, process, credential or code call (comments that are prose).
+ * in it are blanked, so what a comment or a regex body held reads as the code it becomes once sliced out and run, and
+ * padding is squeezed out. Null when nothing in the range was left out of the program as written (then it is code apm
+ * already read), or when what was left out names no network, process, credential or code call (comments that are
+ * prose); `too-long` when what it would run is longer than apm reads even squeezed, which the caller reports.
  */
-function recoveredText(text: string, l: LeftOut, from: number, to: number): string | null {
-  const end = Math.min(to, from + MAX_RECOVERED_CHARS);
-  const chars = text.slice(from, end).split("");
+function recoveredText(text: string, l: LeftOut, from: number, to: number): { code: string } | "too-long" | null {
   // what the comments and regex bodies in the range hold; recovered text matters only when they name a dangerous call
   const pieces: string[] = [];
-  let hidden = false;
-
-  const blank = (a: number, b: number): void => {
-    for (let i = Math.max(a, from); i < Math.min(b, end); i++) chars[i - from] = " ";
-  };
+  const blanks: Range[] = [];
 
   for (const [a, b] of l.comments) {
-    if (a < from || b > end) continue;
-    hidden = true;
-    pieces.push(text.slice(a, b));
+    if (a < from || b > to) continue;
+    pieces.push(squeeze(text.slice(a, b)));
 
-    if (text.startsWith("/*", a)) {
-      blank(a, a + 2);
-      blank(b - 2, b);
-    } else blank(a, a + (text.startsWith("<!--", a) ? 4 : text.startsWith("-->", a) ? 3 : 2));
+    if (text.startsWith("/*", a)) blanks.push([a, a + 2], [b - 2, b]);
+    else blanks.push([a, a + (text.startsWith("<!--", a) ? 4 : text.startsWith("-->", a) ? 3 : 2)]);
   }
 
   for (const [a, b] of l.regexes) {
-    if (a < from || b > end) continue;
-    hidden = true;
+    if (a < from || b > to) continue;
     pieces.push(text.slice(a, b));
-    blank(a, a + 1);
-    blank(text.lastIndexOf("/", b - 1), b);
+    blanks.push([a, a + 1], [text.lastIndexOf("/", b - 1), b]);
   }
 
-  return hidden && scanTextRules(pieces.join("\n")).some((f) => f.confidence === "confirmed") ? chars.join("") : null;
+  if (pieces.length === 0 || !scanTextRules(pieces.join("\n")).some((f) => f.confidence === "confirmed")) return null;
+  let out = "";
+  let cursor = from;
+
+  for (const [a, b] of blanks.sort((x, y) => x[0] - y[0])) {
+    if (a < cursor) continue;
+    out += text.slice(cursor, a) + " ".repeat(b - a);
+    cursor = b;
+  }
+
+  const code = squeeze(out + text.slice(cursor, to));
+
+  return code.length > MAX_RECOVERED_CHARS ? "too-long" : { code };
 }

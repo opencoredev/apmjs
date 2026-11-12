@@ -5,16 +5,18 @@
 
 /** Today's general limits, word for word as packages/core NOT_CHECKED writes them (limitations.test.ts checks). */
 export const GENERAL_LIMITS: readonly string[] = [
-  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
+  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code, or deleting files",
   "code hidden by a custom encoding, compression or encryption",
   "the code of its dependencies, beyond their own scores",
-  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone costs nothing",
+  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone, or one named token sent in a request, costs nothing",
   "native binaries and WebAssembly: listed, not read",
   "whether the publisher's machine or CI was compromised",
 ];
 
 /** General entries earlier scorers wrote. Shown as today's list, not as written. */
 const EARLIER_GENERAL: ReadonlySet<string> = new Set([
+  "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
+  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone costs nothing",
   "runtime behavior: code that downloads, decrypts or builds a second stage while running",
   "code hidden by anything but base64, hex, \\x escapes, char codes or joined string literals (XOR, compression, a custom encoding)",
   "names built at runtime from values apm cannot work out in the file (array lookups, computed indexes, values read at runtime)",

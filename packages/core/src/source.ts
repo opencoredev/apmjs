@@ -1,7 +1,7 @@
 // Static reading of one file's text. Every file is read with the text rules (rules.ts) over its whole text, after a
 // pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
 // codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
-import { scanJs, type Command, type EnvRead, type ExecutedCode, type FlowFinding, type Imports } from "./js.ts";
+import { scanJs, type Command, type EnvRead, type ExecutedCode, type FlowFinding, type Imports, type Unread } from "./js.ts";
 import type { Dialect, Range } from "./parse.ts";
 import { parseEach } from "./parse.ts";
 import { joinStrings, scanTextRules } from "./textrules.ts";
@@ -13,7 +13,7 @@ export { decodedStrings, joinStrings, type Built, type Decoded, type Joined } fr
 
 export { namedSignal, type CodeSignal, type Confidence, type Hidden, type TextFinding, type Where } from "./rules.ts";
 
-export type { Command, EnvRead, ExecutedCode, FlowFinding, Imports } from "./js.ts";
+export type { Command, EnvRead, ExecutedCode, FlowFinding, Imports, Unread } from "./js.ts";
 
 /**
  * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed, and read whole with the text rules too; everything else
@@ -202,6 +202,8 @@ export type FileScan = {
   executed?: ExecutedCode[];
   /** For a parsed file: environment variables it reads, however it reaches the environment. */
   env?: EnvRead[];
+  /** For a parsed file: code it runs that apm did not read, which makes the analysis incomplete. */
+  unread?: Unread[];
 };
 
 /** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
@@ -217,7 +219,7 @@ export function scanFile(text: string, lang: Lang): FileScan {
     const js = scanJs(text, lang);
 
     if (js.kind === "parsed") {
-      return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env };
+      return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env, unread: js.unread };
     }
 
     return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
