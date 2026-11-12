@@ -107,6 +107,8 @@ export class Upstream {
   private searchCache = new Map<string, { at: number; result: Extract<UpstreamSearch, { kind: "ok" }> }>();
   private searchInflight = new Map<string, Promise<UpstreamSearch>>();
   private scopeCache = new Map<string, { at: number; answer: "found" | "absent" }>();
+  /** Runs when a packument is fetched (not on cache hits). Index wires the AI review's enqueue policy here. */
+  onPackage: ((pkg: UpstreamPackage) => void) | null = null;
   /** The only origins tarballs are fetched from, on every redirect hop. */
   private readonly origins: ReadonlySet<string>;
   constructor(
@@ -194,6 +196,8 @@ export class Upstream {
     this.inflight.set(name, p);
     const probe = await p;
     if (probe.kind !== "unknown") this.cache.set(name, { at: Date.now(), probe });
+
+    if (probe.kind === "found") this.onPackage?.(probe.pkg);
     return probe;
   }
 

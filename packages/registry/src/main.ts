@@ -1,6 +1,16 @@
+import { readFileSync } from "node:fs";
 import { startRegistry } from "./index.ts";
+import { legacyAuthRefusal } from "./startup.ts";
+import { serviceTokenHashOf, type ReviewOptions } from "./review.ts";
 
 const env = process.env;
+const refusal = legacyAuthRefusal(env);
+
+if (refusal !== null) {
+  process.stderr.write(`apm registry refused to start: ${refusal}\n`);
+  process.exit(1);
+}
+
 const port = Number(env.APM_PORT ?? 4873);
 const dataDir = env.APM_DATA_DIR ?? ".data";
 const upstream = env.APM_UPSTREAM ?? "https://registry.npmjs.org/";
@@ -12,7 +22,28 @@ const github = pair(env.APM_GITHUB_CLIENT_ID, env.APM_GITHUB_CLIENT_SECRET);
 const vercel = pair(env.APM_VERCEL_CLIENT_ID, env.APM_VERCEL_CLIENT_SECRET);
 const namePolicy = env.APM_NAME_POLICY === "open" ? "open" : "scoped";
 
+// AI release review: on when the reviewer's service token file is set. See docs/AI-REVIEW.md.
+function reviewOptions(): ReviewOptions | undefined {
+  const file = env.APM_REVIEW_TOKEN_FILE;
+
+  if (!file) return undefined;
+
+  const options: ReviewOptions = {
+    serviceTokenHash: serviceTokenHashOf(readFileSync(file, "utf8")),
+    admins: (env.APM_ADMINS ?? "").split(","),
+  };
+
+  if (env.APM_REVIEW_POPULAR_WEEKLY) options.popularWeekly = Number(env.APM_REVIEW_POPULAR_WEEKLY);
+
+  if (env.APM_NPM_DOWNLOADS_URL) options.downloadsUrl = env.APM_NPM_DOWNLOADS_URL;
+
+  return options;
+}
+
+const review = reviewOptions();
+
 const { url } = await startRegistry({
+  review,
   dataDir,
   port,
   hostname: env.APM_HOST ?? "127.0.0.1",
@@ -30,5 +61,5 @@ const { url } = await startRegistry({
   },
 });
 process.stdout.write(
-  `apm registry listening on ${url} (sign-in: ${[github ? "GitHub" : null, vercel ? "Vercel" : null].filter(Boolean).join(", ") || "no OAuth apps configured"}; legacy auth ${on(env.APM_LEGACY_AUTH) ? "on" : "off"}; names ${namePolicy})\n`,
+  `apm registry listening on ${url} (sign-in: ${[github ? "GitHub" : null, vercel ? "Vercel" : null].filter(Boolean).join(", ") || "no OAuth apps configured"}; legacy auth ${on(env.APM_LEGACY_AUTH) ? "on" : "off"}; names ${namePolicy}; AI review ${review ? "on" : "off"})\n`,
 );

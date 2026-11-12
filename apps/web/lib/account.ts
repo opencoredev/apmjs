@@ -5,6 +5,7 @@
 import { createAuthClient } from "better-auth/react";
 import { passkeyClient } from "@better-auth/passkey/client";
 import { z } from "zod";
+import "./zod-csp";
 
 function makeClient() {
   return createAuthClient({ baseURL: window.location.origin, plugins: [passkeyClient()] });
@@ -30,11 +31,13 @@ export const Account = z.object({
   scope: z.string().nullable(),
   scopeTaken: z.string().nullable().default(null),
   github: z.string().nullable(),
+  /** The GitHub login changed after the scope was claimed. The scope stays. */
+  githubRenamed: z.boolean().default(false),
   name: z.string(),
   email: z.string(),
   image: z.string().nullable(),
   linked: z.array(z.object({ provider: z.string(), accountId: z.string() })),
-  security: z.object({ totp: z.boolean(), passkeys: z.number(), verifiedAt: z.string().nullable() }),
+  security: z.object({ totp: z.boolean(), passkeys: z.number() }),
   canPublish: z.boolean(),
   tokens: z.array(
     z.object({ id: z.string(), label: z.string(), scope: z.string(), createdAt: z.string(), expiresAt: z.string().nullable(), revokedAt: z.string().nullable() }),
@@ -60,16 +63,28 @@ export type StagedSummary = z.infer<typeof StagedSummary>;
 
 const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
 
+export type Signal = z.infer<typeof Signal>;
+
 export const StagedDetail = StagedSummary.extend({
   newPackage: z.boolean(),
   currentLatest: z.string().nullable(),
   description: z.string(),
   size: z.number(),
+  /** The tarball's sha512, in npm's integrity format. */
+  integrity: z.string(),
   files: z.array(z.object({ path: z.string(), size: z.number() })),
-  score: z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional() }).nullable(),
+  score: z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).default([]) }).nullable(),
+  floor: z.number(),
+  analysis: z.enum(["complete", "incomplete"]),
+  /** "typed": the person types the package name to approve (incomplete analysis or a score under the floor). */
+  confirmation: z.discriminatedUnion("kind", [z.object({ kind: z.literal("plain") }), z.object({ kind: z.literal("typed"), reason: z.string() })]),
 });
 
 export type StagedDetail = z.infer<typeof StagedDetail>;
+
+export const StagedFile = z.object({ path: z.string(), size: z.number(), binary: z.boolean(), truncated: z.boolean(), text: z.string().nullable() });
+
+export type StagedFile = z.infer<typeof StagedFile>;
 
 export type Loaded<T> = { kind: "ok"; value: T } | { kind: "signed-out" } | { kind: "error"; status: number; message: string };
 
@@ -115,9 +130,31 @@ export async function call<T>(path: string, schema: z.ZodType<T>, init: { method
   return parsed.success ? { kind: "ok", value: parsed.data } : { kind: "error", status: res.status, message: "The registry sent an answer this page does not understand." };
 }
 
+/** A second factor for an account change: a code from the app, a recovery code, or the passkey check just made. */
+export type FactorProof = { kind: "totp"; code: string } | { kind: "recovery"; code: string } | { kind: "passkey" };
+
+/** The header the registry reads a factor proof from on account changes. */
+export function proofHeaders(proof: FactorProof | null): Headers {
+  const headers = new Headers();
+
+  if (proof !== null) headers.set("x-apm-second-factor", proof.kind === "passkey" ? "passkey" : `${proof.kind}:${proof.code.trim()}`);
+
+  return headers;
+}
+
 /** POST to Better Auth's own routes. */
-export async function authPost(path: string, body: unknown): Promise<{ ok: boolean; body: unknown; message: string }> {
-  const res = await fetch(`/api/auth/${path}`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+export async function authPost(path: string, body: unknown, proof: FactorProof | null = null): Promise<{ ok: boolean; status: number; body: unknown; message: string }> {
+  let res: Response;
+
+  try {
+    const headers = proofHeaders(proof);
+
+    headers.set("content-type", "application/json");
+    res = await fetch(`/api/auth/${path}`, { method: "POST", credentials: "same-origin", headers, body: JSON.stringify(body) });
+  } catch {
+    return { ok: false, status: 0, body: null, message: "Could not reach the registry. Check your connection and try again." };
+  }
+
   const text = await res.text();
   let parsed: unknown = text;
 
@@ -127,7 +164,7 @@ export async function authPost(path: string, body: unknown): Promise<{ ok: boole
     // not JSON
   }
 
-  return { ok: res.ok, body: parsed, message: messageOf(parsed, res.status) };
+  return { ok: res.ok, status: res.status, body: parsed, message: messageOf(parsed, res.status) };
 }
 
 export async function signIn(provider: "github" | "vercel", next: string): Promise<string | null> {
@@ -140,14 +177,74 @@ export async function signIn(provider: "github" | "vercel", next: string): Promi
   return null;
 }
 
-export async function linkProvider(provider: "github" | "vercel", next: string): Promise<string | null> {
-  const r = await authPost("link-social", { provider, callbackURL: next, disableRedirect: true });
+export async function linkProvider(provider: "github" | "vercel", next: string, proof: FactorProof | null = null): Promise<string | null> {
+  const r = await authPost("link-social", { provider, callbackURL: next, disableRedirect: true }, proof);
   const url = typeof r.body === "object" && r.body !== null && "url" in r.body && typeof r.body.url === "string" ? r.body.url : null;
 
   if (!r.ok || !url) return r.message;
   window.location.assign(url);
 
   return null;
+}
+
+/** A CLI command a person approves on the website, once. Mirrors the registry's LiveAction. */
+const Name = z.string().min(1).max(214);
+const Version = z.string().min(1).max(256);
+
+export const LiveAction = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("revoke"), name: Name, version: Version }),
+  z.object({ kind: z.literal("restore"), name: Name, version: Version }),
+  z.object({ kind: z.literal("yank"), name: Name, version: Version }),
+  z.object({ kind: z.literal("unyank"), name: Name, version: Version }),
+  z.object({ kind: z.literal("dist-tag"), name: Name, tag: z.string().min(1).max(128), version: Version.nullable() }),
+  z.object({ kind: z.literal("deprecate"), name: Name }),
+  z.object({ kind: z.literal("incident") }),
+  z.object({ kind: z.literal("owner-add"), name: Name, user: z.string().min(1).max(64) }),
+  z.object({ kind: z.literal("owner-remove"), name: Name, user: z.string().min(1).max(64) }),
+]);
+
+export type LiveAction = z.infer<typeof LiveAction>;
+
+export function commandText(a: LiveAction): string {
+  switch (a.kind) {
+    case "revoke":
+    case "restore":
+    case "yank":
+    case "unyank":
+      return `apm ${a.kind} ${a.name}@${a.version}`;
+    case "dist-tag":
+      return a.version === null ? `npm dist-tag rm ${a.name} ${a.tag}` : `npm dist-tag add ${a.name}@${a.version} ${a.tag}`;
+    case "deprecate":
+      return `npm deprecate ${a.name}`;
+    case "incident":
+      return "apm incident";
+    case "owner-add":
+      return `apm owner add ${a.user} ${a.name}`;
+    case "owner-remove":
+      return `apm owner rm ${a.user} ${a.name}`;
+    default: {
+      const _exhaustive: never = a;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** The command named in an account page link (`?confirm=<base64url JSON>`), or null. */
+export function commandFromLink(search: string): LiveAction | null {
+  const raw = new URLSearchParams(search).get("confirm");
+
+  if (!raw) return null;
+
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const json: unknown = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    const parsed = LiveAction.safeParse(json);
+
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
 }
 
 export const PROVIDER_LABEL: Record<"github" | "vercel", string> = { github: "GitHub", vercel: "Vercel" };

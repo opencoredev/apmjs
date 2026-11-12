@@ -1,15 +1,21 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { z } from "zod";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, call, StagedSummary, timeLeft } from "@/lib/account";
 import { ExactPart, looksLikePackageName } from "@/lib/search-schema";
 import { cn } from "@/lib/utils";
 
-type State = { kind: "loading" } | { kind: "signed-out" } | { kind: "error"; message: string } | { kind: "ok"; account: Account; staged: StagedSummary[] };
+/** The versions waiting for approval: loading, loaded, or failed to load (never shown as an empty list). */
+type Waiting = { kind: "loading" } | { kind: "ok"; staged: StagedSummary[] } | { kind: "error"; message: string };
+
+type State = { kind: "loading" } | { kind: "signed-out" } | { kind: "error"; message: string } | { kind: "ok"; account: Account; waiting: Waiting };
+
+const StagedList = z.object({ staged: z.array(StagedSummary) });
 
 type Check = { kind: "idle" } | { kind: "checking" } | { kind: "invalid" } | { kind: "done"; answer: ExactPart } | { kind: "failed" };
 
@@ -101,14 +107,32 @@ function NameCheck({ scope }: { scope: string }) {
 export function PublishView() {
   const [state, setState] = useState<State>({ kind: "loading" });
 
-  useEffect(() => {
-    void Promise.all([call("account", Account), call("staged", z.object({ staged: z.array(StagedSummary) }))]).then(([a, s]) => {
-      if (a.kind === "signed-out") return setState({ kind: "signed-out" });
+  const load = useCallback(async () => {
+    const [a, s] = await Promise.all([call("account", Account), call("staged", StagedList)]);
 
-      if (a.kind === "error") return setState({ kind: "error", message: a.message });
-      setState({ kind: "ok", account: a.value, staged: s.kind === "ok" ? s.value.staged : [] });
-    });
+    if (a.kind === "signed-out") return setState({ kind: "signed-out" });
+
+    if (a.kind === "error") return setState({ kind: "error", message: a.message });
+
+    const waiting: Waiting =
+      s.kind === "ok" ? { kind: "ok", staged: s.value.staged } : { kind: "error", message: s.kind === "error" ? s.message : "Your session ended. Sign in again to see what is waiting." };
+
+    setState({ kind: "ok", account: a.value, waiting });
   }, []);
+
+  const retryWaiting = useCallback(async () => {
+    setState((prev) => (prev.kind === "ok" ? { ...prev, waiting: { kind: "loading" } } : prev));
+    const s = await call("staged", StagedList);
+
+    const waiting: Waiting =
+      s.kind === "ok" ? { kind: "ok", staged: s.value.staged } : { kind: "error", message: s.kind === "error" ? s.message : "Your session ended. Sign in again to see what is waiting." };
+
+    setState((prev) => (prev.kind === "ok" ? { ...prev, waiting } : prev));
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   if (state.kind === "loading") return <div className="h-96 animate-pulse rounded-2xl bg-muted" />;
 
@@ -120,8 +144,20 @@ export function PublishView() {
     );
   }
 
-  if (state.kind === "error") return <p className="text-bad">{state.message}</p>;
-  const { account: a, staged } = state;
+  if (state.kind === "error") {
+    return (
+      <div className="flex max-w-xl flex-col items-start gap-3">
+        <p role="alert" className="text-bad">
+          {state.message}
+        </p>
+        <Button variant="outline" onClick={() => void load()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+
+  const { account: a, waiting } = state;
   const scope = a.scope;
 
   return (
@@ -153,11 +189,20 @@ export function PublishView() {
 
       <section className="flex flex-col gap-4">
         <h2 className="text-lg font-medium tracking-tight">Waiting for your approval</h2>
-        {staged.length === 0 ? (
+        {waiting.kind === "loading" ? (
+          <div className="h-14 animate-pulse rounded-xl bg-muted" aria-label="Loading versions waiting for approval" />
+        ) : waiting.kind === "error" ? (
+          <div role="alert" className="flex flex-col items-start gap-3 rounded-xl bg-bad-soft px-4 py-3">
+            <p className="text-[15px] leading-6 text-bad">Could not load the versions waiting for your approval. {waiting.message}</p>
+            <Button variant="outline" className="bg-background" onClick={() => void retryWaiting()}>
+              Try again
+            </Button>
+          </div>
+        ) : waiting.staged.length === 0 ? (
           <p className="text-[15px] text-muted-foreground">Nothing is waiting. Versions you or your agents upload show up here for 24 hours.</p>
         ) : (
           <ul className="flex flex-col divide-y rounded-xl border">
-            {staged.map((s) => (
+            {waiting.staged.map((s) => (
               <li key={s.id}>
                 <Link href={`/approve/${s.id}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 transition-colors hover:bg-muted/50">
                   <span className="w-full min-w-0 font-mono text-[15px] [overflow-wrap:anywhere] sm:w-auto sm:flex-1">

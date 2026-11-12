@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { z } from "zod";
+import "@/lib/zod-csp";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SignInPanel } from "@/components/sign-in-panel";

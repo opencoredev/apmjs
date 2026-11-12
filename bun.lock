@@ -14,6 +14,15 @@
         "zod": "4.6.7",
       },
     },
+    "apps/reviewer": {
+      "name": "@apm/reviewer",
+      "version": "0.1.0",
+      "dependencies": {
+        "@apm/ai-review": "workspace:*",
+        "@apm/core": "workspace:*",
+        "zod": "^4.6.7",
+      },
+    },
     "apps/web": {
       "name": "web",
       "version": "0.1.0",
@@ -43,6 +52,14 @@
         "typescript": "^5",
       },
     },
+    "packages/ai-review": {
+      "name": "@apm/ai-review",
+      "version": "0.1.0",
+      "dependencies": {
+        "@apm/core": "workspace:*",
+        "zod": "^4.6.7",
+      },
+    },
     "packages/bun-scanner": {
       "name": "@apm/bun-scanner",
       "version": "0.1.0",
@@ -69,6 +86,7 @@
       "name": "@apm/registry",
       "version": "0.1.0",
       "dependencies": {
+        "@apm/ai-review": "workspace:*",
         "@apm/core": "workspace:*",
         "@better-auth/passkey": "1.7.21",
         "@better-auth/utils": "0.5.1",
@@ -83,6 +101,8 @@
   "packages": {
     "@alloc/quick-lru": ["@alloc/quick-lru@5.3.0", "", {}, "sha512-U4+70Pc5ZS9osnCBCE5Jha/ciHM+Yp+CNMNC/7HvYbNRk1Ldd+f7qO65W5qfhu/TCv+/ozljlXXe9Nj8419DMA=="],
 
+    "@apm/ai-review": ["@apm/ai-review@workspace:packages/ai-review"],
+
     "@apm/bun-scanner": ["@apm/bun-scanner@workspace:packages/bun-scanner"],
 
     "@apm/cli": ["@apm/cli@workspace:packages/cli"],
@@ -90,6 +110,8 @@
     "@apm/core": ["@apm/core@workspace:packages/core"],
 
     "@apm/registry": ["@apm/registry@workspace:packages/registry"],
+
+    "@apm/reviewer": ["@apm/reviewer@workspace:apps/reviewer"],
 
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
 

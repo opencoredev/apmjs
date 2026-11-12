@@ -6,6 +6,7 @@ const SECTIONS = [
   { id: "cli", title: "The CLI" },
   { id: "pulling", title: "Pulling a bad version" },
   { id: "score", title: "What the score is, and is not" },
+  { id: "ai-review", title: "The AI review" },
 ] as const;
 
 type SectionId = (typeof SECTIONS)[number]["id"];
@@ -67,6 +68,10 @@ registry = "https://apmjs.dev/"
 
 [install.security]
 scanner = "@apm/bun-scanner"`}</Code>
+          <Text>
+            The scanner warns about each package it could not check, for example when the registry is down, and lets the install go ahead. In CI, make it cancel the install instead:
+          </Text>
+          <Code label="CI">{`APM_SCANNER_STRICT=1 bun install --frozen-lockfile`}</Code>
         </Block>
 
         <Block id="npm">
@@ -96,8 +101,10 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
               ["Yank", "Hidden from new installs. Lockfiles keep working. Reversible."],
               [
                 "Revoke",
-                "For malicious versions. Needs a fresh second factor: pass --otp with your authenticator code, or confirm on your account page within the last 10 minutes. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
+                "For malicious versions. Needs a fresh second factor: pass --otp with your authenticator code, or open the link the command prints and approve that one command on your account page, then run it again within 10 minutes. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
               ],
+              ["Login tokens", "The token from apm login uploads versions that wait for your approval. It moves dist-tags, deprecates, yanks or unyanks only with --otp (npm asks for the code itself)."],
+              ["Scopes", "Your scope is your GitHub login when you first sign in, tied to your GitHub account's numeric id. It is permanent: renaming on GitHub does not move or free it. To move packages to a new name, open a name dispute."],
               ["Audits", "Revoked versions show up as critical advisories in bun audit and npm audit, and their tarballs return 410."],
               ["Log", "Every action lands in the package’s public log."],
             ].map(([term, def]) => (
@@ -114,6 +121,30 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
             A heuristic read of the tarball and publish history: install scripts, shell and network calls, credential access, eval, obfuscation, new publishers, risky new dependencies, typosquat
             names. It cannot see code that downloads a second stage at run time. Popularity is never an input.
           </Text>
+        </Block>
+
+        <Block id="ai-review">
+          <Text>
+            A language model reads each new release of in-scope packages: every apm publish, and new releases of npm packages with 10,000 or more weekly downloads, first publishes, and versions
+            that add an install script. For an update it reads the change from the previous version; for a first release it reads the files. It shows its result next to the score, never inside it.
+          </Text>
+          <Text>
+            Every finding cites a file and line, and apm checks that the quoted text is really on that line before showing it. A clean result says what was read: &ldquo;AI review found nothing in
+            the change from 4.4.1, read 2 of 2 changed files.&rdquo; It never says a version is safe.
+          </Text>
+          <dl className="flex flex-col">
+            {[
+              ["What it reads", "The package's own code and data files, install-script targets and entry points first, up to about 16,000 tokens. Files cut by that budget are listed as not read."],
+              ["What it can't see", "Dependencies, binaries, platform-specific optional packages, code downloaded at install or run time, and anything outside the tarball, such as a stolen publishing account."],
+              ["A flag", "Shows as \u201cUnder review\u201d in public. The package's owners see the cited lines on the version page. A person at apm confirms or dismisses it; only a confirmed result is labeled in public."],
+              ["Its limits", "A model's opinion is not proof. In apm's test it caught 36 of 40 malicious releases and called no benign release malicious, but it flagged 2 to 7% of benign ones as suspicious, mostly when it could not see a file."],
+            ].map(([term, def]) => (
+              <div key={term} className="grid gap-1 border-b py-4 last:border-b-0 sm:grid-cols-[140px_1fr] sm:gap-6">
+                <dt className="font-medium">{term}</dt>
+                <dd className="text-[17px] leading-7 text-pretty text-muted-foreground">{def}</dd>
+              </div>
+            ))}
+          </dl>
         </Block>
       </article>
     </div>

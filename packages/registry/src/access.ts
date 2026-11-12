@@ -1,9 +1,11 @@
 // Publishing rules that depend on who someone is: GitHub-scoped names, npm scope reservation,
 // "a passkey or 2FA before you publish", and the fresh second factor destructive actions need.
-import { STEPUP_MS, type ApmAuth } from "./auth.ts";
+import { actionKey, commandLine, confirmUrl } from "./actions.ts";
+import type { ApmAuth } from "./auth.ts";
 import type { Store } from "./db.ts";
+import { parseSixDigits } from "./factors.ts";
 import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
-import type { Access, NamePolicy } from "./server.ts";
+import { TOKEN_CAPABILITIES, type Access, type NamePolicy } from "./server.ts";
 import type { Upstream } from "./upstream.ts";
 
 export function buildAccess(input: {
@@ -76,7 +78,7 @@ export function buildAccess(input: {
       return null;
     },
 
-    async secondFactor({ user, password, otp }) {
+    async secondFactor({ user, password, otp, action }) {
       const u = store.getUser(user);
       if (legacyAuth && password) {
         if (!u) return { status: 401, error: "Incorrect password." };
@@ -97,33 +99,44 @@ export function buildAccess(input: {
         }
       }
       const authId = u?.auth_user_id ?? null;
-      if (otp) {
+
+      if (otp !== undefined) {
+        const code = parseSixDigits(otp);
+
+        if (!code) return { status: 400, error: "--otp takes the 6-digit code from your authenticator app." };
         if (!authId) return { status: 401, error: "This account has no authenticator app to check a code against." };
-        const check = await auth.verifyTotp(authId, otp.trim());
+        const check = await auth.checkProof({ authUserId: authId, sessionToken: null, proof: { kind: "totp", code }, purpose: actionKey(action) });
         switch (check.kind) {
           case "ok":
             return null;
           case "bad":
             return { status: 401, error: "That code is not valid. Use the current 6-digit code from your authenticator app." };
+          case "reused":
+            return { status: 401, error: "That code was already used. Wait for the next code from your authenticator app." };
           case "locked":
             return { status: 429, error: "Too many wrong codes. Wait 15 minutes and try again." };
           case "none":
-            return { status: 401, error: `No authenticator app is set up. Set one up at ${webUrl()}account, or confirm with your passkey there.` };
+            return { status: 401, error: `No authenticator app is set up. Set one up at ${webUrl()}account, or confirm this command with your passkey there.` };
           default: {
             const _exhaustive: never = check;
             return _exhaustive;
           }
         }
       }
-      if (authId) {
-        const at = store.stepupAt(authId);
-        const t = now();
-        if (at !== null && at <= t && t - at <= STEPUP_MS) return null;
-      }
+
+      // A person confirmed exactly this command on the website: it runs once.
+      if (authId && auth.ledger.consumeGrant({ authUserId: authId, action: actionKey(action), at: now() })) return null;
+      const link = authId ? ` or approve exactly this command (${commandLine(action)}) at ${confirmUrl(webUrl(), action)} and run it again within 10 minutes` : "";
       return {
         status: 401,
-        error: `This needs a fresh second factor as well as your token: pass --otp <code from your authenticator app>, or confirm with your passkey or code at ${webUrl()}account and run it again within 10 minutes.${legacyAuth ? " Password accounts can pass --password-stdin." : ""} A stolen token alone cannot do this.`,
+        error: `This needs a fresh second factor as well as your token: pass --otp <code from your authenticator app>${link}.${legacyAuth ? " Password accounts can pass --password-stdin." : ""} A stolen token alone cannot do this.`,
       };
+    },
+
+    async liveChangeRefusal({ user, scope, action, otp }) {
+      if (TOKEN_CAPABILITIES[scope].liveChanges === "token") return null;
+
+      return this.secondFactor({ user, otp, action });
     },
   };
 }

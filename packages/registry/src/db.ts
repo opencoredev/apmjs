@@ -95,11 +95,6 @@ CREATE TABLE IF NOT EXISTS password_failures (
   count INTEGER NOT NULL,
   since INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS stepups (
-  auth_user_id TEXT PRIMARY KEY,
-  at INTEGER NOT NULL,
-  method TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS github_profiles (
   github_id TEXT PRIMARY KEY,
   login TEXT NOT NULL,
@@ -274,6 +269,10 @@ export class Store {
     this.db.query("UPDATE users SET auth_user_id = ?, github_id = ?, github_login = ? WHERE name = ?").run(link.authUserId, link.githubId, link.githubLogin, name);
   }
 
+  /** The GitHub login shown for a name, refreshed after a GitHub rename. The name itself never changes. */
+  setGitHubLogin(name: string, login: string): void {
+    this.db.query("UPDATE users SET github_login = ? WHERE name = ?").run(login, name);
+  }
   // GitHub logins seen at sign-in, by GitHub's numeric id
   setGitHubProfile(githubId: string, login: string, at: number): void {
     this.db.query("INSERT OR REPLACE INTO github_profiles (github_id, login, updated_at) VALUES (?, ?, ?)").run(githubId, login, at);
@@ -283,10 +282,6 @@ export class Store {
     return row ? z.object({ login: z.string() }).parse(row).login : null;
   }
 
-  // step-up: the last time an account proved a second factor
-  setStepup(authUserId: string, at: number, method: string): void {
-    this.db.query("INSERT OR REPLACE INTO stepups (auth_user_id, at, method) VALUES (?, ?, ?)").run(authUserId, at, method);
-  }
   /** Wrong passwords for `user` in the current window: the count and when the window started. */
   passwordFailures(user: string): { count: number; since: number } | null {
     const row = this.db.query("SELECT count, since FROM password_failures WHERE user = ?").get(user);
@@ -296,10 +291,6 @@ export class Store {
   setPasswordFailures(user: string, f: { count: number; since: number } | null): void {
     if (f === null) this.db.query("DELETE FROM password_failures WHERE user = ?").run(user);
     else this.db.query("INSERT OR REPLACE INTO password_failures (user, count, since) VALUES (?, ?, ?)").run(user, f.count, f.since);
-  }
-  stepupAt(authUserId: string): number | null {
-    const row = this.db.query("SELECT at FROM stepups WHERE auth_user_id = ?").get(authUserId);
-    return row ? z.object({ at: z.number() }).parse(row).at : null;
   }
 
   // staged versions: uploaded with a login token, waiting for a person to approve

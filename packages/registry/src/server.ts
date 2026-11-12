@@ -4,6 +4,7 @@ import { existsSync, linkSync, readFileSync, rmSync, writeFileSync, mkdirSync } 
 import { join, dirname, resolve, sep } from "node:path";
 import { z } from "zod";
 import { editDistance, isValidTagName, isValidVersion } from "@apm/core";
+import type { LiveAction } from "./actions.ts";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 
@@ -20,12 +21,33 @@ export type Access = {
   newNameRefusal: (input: { name: string; user: string }) => Promise<Refusal | null>;
   /** Why `user` may not stage a publish (no passkey or 2FA), or null. */
   stageRefusal: (user: string) => Refusal | null;
-  /** Why `user` may not do a destructive action with this proof (password only in legacy mode, or a TOTP code), or null. */
-  secondFactor: (input: { user: string; password?: string | undefined; otp?: string | undefined }) => Promise<Refusal | null>;
+  /**
+   * Why `user` may not do `action` with this proof, or null. A password counts only in legacy mode; a TOTP code
+   * counts once; with neither, a website confirmation of exactly this command counts once.
+   */
+  secondFactor: (input: { user: string; password?: string | undefined; otp?: string | undefined; action: LiveAction }) => Promise<Refusal | null>;
+  /** Why this token may not change live state (`action`), or null. Staging tokens need a fresh second factor for it. */
+  liveChangeRefusal: (input: { user: string; scope: TokenScope; action: LiveAction; otp?: string | undefined }) => Promise<Refusal | null>;
 };
-export type Ctx = { store: Store; now: () => number; baseUrl: () => string; access: Access };
+export type Ctx = {
+  store: Store;
+  now: () => number;
+  baseUrl: () => string;
+  access: Access;
+  /** Runs after a version goes live (direct publish or approval). Index wires the AI review queue here. */
+  afterCommit?: (v: { name: string; version: string; firstPublish: boolean }) => void;
+};
 /** "publish" tokens go live at once (legacy logins, test tokens, later CI trusted publishing); "stage" tokens need approval. */
 export type TokenScope = "publish" | "stage";
+
+/**
+ * What each kind of token may do. A staging token (apm login, the website's device flow) uploads versions that wait
+ * for a person, and changes live state (dist-tags, deprecate, yank, unyank) only with a fresh second factor.
+ */
+export const TOKEN_CAPABILITIES: Record<TokenScope, { publish: "live" | "staged"; liveChanges: "token" | "second-factor" }> = {
+  publish: { publish: "live", liveChanges: "token" },
+  stage: { publish: "staged", liveChanges: "second-factor" },
+};
 /** What a token row's scope means today. "legacy" tokens came from password logins: direct publish only while legacy auth is on. */
 export function effectiveScope(stored: string, legacyAuth: boolean): TokenScope {
   if (stored === "stage") return "stage";
@@ -340,6 +362,9 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (perm) return fail(perm.status, perm.error);
 
   if (!body._attachments || Object.keys(body._attachments).length === 0) {
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "deprecate", name }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     return handleMetadataUpdate(ctx, name, body, auth.user);
   }
 
@@ -362,7 +387,10 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (existing && ctx.store.getVersion(name, version)) {
     return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
   }
-  if (auth.scope === "stage") {
+
+  const staged = TOKEN_CAPABILITIES[auth.scope].publish === "staged";
+
+  if (staged) {
     const pending = ctx.store.pendingStaged(name, version);
     if (pending && pending.expires_at > ctx.now()) {
       return fail(409, `${name}@${version} is already waiting for approval: ${approvalUrl(ctx, pending.id)}`);
@@ -394,7 +422,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   // header-safe: a tar path may hold control characters
   const warningText = warnings.length > 0 ? `Warning: ${warnings.join(" ")}`.replace(/[\x00-\x1f\x7f]/g, " ") : null;
 
-  if (auth.scope === "stage") {
+  if (staged) {
     const at = ctx.now();
     const id = randomBytes(12).toString("base64url");
     const path = stagedTarballPath(ctx, id);
@@ -505,14 +533,17 @@ export function commitVersion(
   if (!path) throw new Error(`${v.name}@${v.version}: malformed integrity`);
   const created = placeBlob(path, bytes);
   const size = bytes.length;
+  let firstPublish = false;
 
   try {
     ctx.store.tx(() => {
       if (ctx.store.getVersion(v.name, v.version)) {
         throw new CommitRefusal(409, `Cannot publish over existing version ${v.name}@${v.version}. Versions are immutable; bump the version.`);
       }
-      if (!ctx.store.getPackage(v.name)) ctx.store.createPackage(v.name, at, v.publisher);
-      else if (!ctx.store.owners(v.name).includes(v.publisher)) {
+      if (!ctx.store.getPackage(v.name)) {
+        ctx.store.createPackage(v.name, at, v.publisher);
+        firstPublish = true;
+      } else if (!ctx.store.owners(v.name).includes(v.publisher)) {
         throw new CommitRefusal(403, `You do not have permission to publish "${v.name}". Owners: ${ctx.store.owners(v.name).join(", ")}`);
       }
       commitRows(ctx, v, { at, size });
@@ -526,6 +557,7 @@ export function commitVersion(
     throw e;
   }
   if (!(v.tarball instanceof Uint8Array)) rmSync(v.tarball.stagedPath, { force: true });
+  ctx.afterCommit?.({ name: v.name, version: v.version, firstPublish });
   return { kind: "committed" };
 }
 
@@ -599,6 +631,16 @@ function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: s
   return json({ ok: true, updated });
 }
 
+/** The one-time code npm sends with `--otp` (and after asking, when a 401 says `www-authenticate: OTP`). */
+function npmOtp(req: Request): string | undefined {
+  return req.headers.get("npm-otp") ?? undefined;
+}
+
+/** A refusal npm answers by asking for a one-time code. */
+function otpFail(r: Refusal): Response {
+  return json({ error: r.error }, r.status, r.status === 401 ? { "www-authenticate": "OTP" } : {});
+}
+
 // ---------- dist-tags ----------
 async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string | undefined, auth: Auth): Promise<Response> {
   const pkg = ctx.store.getPackage(name);
@@ -625,11 +667,17 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
     if (!isValidVersion(version)) return fail(400, `Invalid version "${version}"`);
     const v = ctx.store.getVersion(name, version);
     if (!v || v.status !== "active") return fail(404, `Version ${version} not found or not active`);
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "dist-tag", name, tag, version }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     tags[tag] = version;
   } else if (req.method === "DELETE") {
     if (tag === "latest") return fail(400, "Cannot delete latest");
 
     if (tagTarget(tags, tag) === undefined) return fail(404, `No dist-tag ${tag} on ${name}.`);
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "dist-tag", name, tag, version: null }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     delete tags[tag];
   } else {
     return fail(405, "Method not allowed");
@@ -694,10 +742,6 @@ function handleUserLookup(ctx: Ctx, rawName: string): Response {
 
 const RevBody = z.object({ maintainers: z.array(z.object({ name: z.string() }).loose()).optional(), versions: z.unknown().optional() }).loose();
 
-function otpRequired(error: string): Response {
-  return json({ error }, 401, { "www-authenticate": "OTP" });
-}
-
 async function handleRevPut(req: Request, ctx: Ctx, name: string, auth: Auth): Promise<Response> {
   if (auth.kind !== "user") return fail(401, "Log in first (apm login).");
 
@@ -727,29 +771,23 @@ async function handleRevPut(req: Request, ctx: Ctx, name: string, auth: Auth): P
   const remove = owners.filter((n) => !names.includes(n));
 
   if (add.length === 0 && remove.length === 0) return json({ ok: true, owners });
-  const unknown = add.find((n) => !ctx.store.getUser(n));
+  // one change per request, so one code (or one website confirmation) covers exactly one command
+  if (add.length + remove.length !== 1) return fail(400, "Change one owner at a time (npm owner add or npm owner rm).");
+  const added = add[0];
+  const removed = remove[0];
+  const action = added !== undefined ? { kind: "owner-add" as const, name, user: added } : { kind: "owner-remove" as const, name, user: removed ?? "" };
 
-  if (unknown !== undefined) return fail(404, `No user ${unknown}.`);
+  if (added !== undefined && !ctx.store.getUser(added)) return fail(404, `No user ${added}.`);
 
-  if (remove.length >= owners.length + add.length) return fail(409, `${name} would have no owners. Add another owner first.`);
-  const otp = req.headers.get("npm-otp")?.trim();
+  if (removed !== undefined && owners.length === 1) return fail(409, `${removed} is the last owner of ${name}. Add another owner first.`);
+  const refused = await ctx.access.secondFactor({ user: auth.user, otp: npmOtp(req), action });
 
-  if (!otp) return otpRequired(`Changing owners needs a code from your authenticator app: run it again with --otp=<code>.`);
-  const refused = await ctx.access.secondFactor({ user: auth.user, otp });
-
-  if (refused) return refused.status === 401 ? otpRequired(refused.error) : fail(refused.status, refused.error);
+  if (refused) return otpFail(refused);
   const at = ctx.now();
-  ctx.store.tx(() => {
-    for (const u of add) {
-      ctx.store.addOwner(name, u);
-      ctx.store.addEvent({ package: name, kind: "owner-add", actor: auth.user, at, detail: { user: u, via: "npm owner" } });
-    }
 
-    for (const u of remove) {
-      ctx.store.removeOwner(name, u);
-      ctx.store.addEvent({ package: name, kind: "owner-remove", actor: auth.user, at, detail: { user: u, via: "npm owner" } });
-    }
-  });
+  if (added !== undefined) ctx.store.addOwner(name, added);
+  else if (removed !== undefined) ctx.store.removeOwner(name, removed);
+  ctx.store.addEvent({ package: name, kind: action.kind, actor: auth.user, at, detail: { user: action.user, via: "npm owner" } });
 
   return json({ ok: true, owners: ctx.store.owners(name) });
 }

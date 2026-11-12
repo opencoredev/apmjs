@@ -1,13 +1,17 @@
 import type { NextConfig } from "next";
+import { securityHeaders } from "./lib/security-headers";
 
-const REGISTRY = (process.env.APM_REGISTRY ?? "http://127.0.0.1:4873/").replace(/\/?$/, "/");
+const dev = process.env.NODE_ENV === "development";
 
 const nextConfig: NextConfig = {
-  // Sign-in and the account routes are served by the registry; proxying them keeps the session cookie on this origin.
-  async rewrites() {
+  poweredByHeader: false,
+  // Sign-in and the account routes (/api/auth/*, /-/apm/v1/*) are served by the registry. proxy.ts
+  // forwards them, so the session cookie stays on this origin and every answer gets a no-store policy.
+  async headers() {
     return [
-      { source: "/api/auth/:path*", destination: `${REGISTRY}api/auth/:path*` },
-      { source: "/-/apm/v1/:path*", destination: `${REGISTRY}-/apm/v1/:path*` },
+      { source: "/:path*", headers: securityHeaders(dev) },
+      // Publisher-written readme text: no scripts, no subresources, even if a browser tried to render it.
+      { source: "/api/readme", headers: [{ key: "Content-Security-Policy", value: "sandbox; default-src 'none'; frame-ancestors 'none'" }] },
     ];
   },
   /* config options here */

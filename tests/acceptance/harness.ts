@@ -89,12 +89,25 @@ type RegistryModule = {
     legacyAuth?: boolean;
     namePolicy?: NamePolicy;
     auth?: { secret: string; github?: { clientId: string; clientSecret: string; endpoints?: GitHubEndpoints } };
+    totpNow?: () => number;
+    review?: ReviewOptions;
   }) => Promise<StartedRegistry>;
 };
 
 function isRegistryModule(m: unknown): m is RegistryModule {
   return typeof m === "object" && m !== null && "startRegistry" in m && typeof m.startRegistry === "function";
 }
+
+/** AI release review options, as packages/registry/src/review.ts takes them. */
+export type ReviewOptions = {
+  serviceTokenHash: string;
+  admins: readonly string[];
+  popularWeekly?: number;
+  downloadsUrl?: string;
+  leaseMs?: number;
+  requestsPerHour?: number;
+  maxAttempts?: number;
+};
 
 export type StartOptions = {
   now?: () => number;
@@ -107,6 +120,8 @@ export type StartOptions = {
   namePolicy?: NamePolicy;
   /** A fake GitHub to sign in through. */
   github?: FakeGitHub;
+  /** Turns on the AI review queue and routes. */
+  review?: ReviewOptions;
 };
 
 export async function startRegistry(opts: StartOptions = {}): Promise<Registry> {
@@ -122,6 +137,9 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
     ...(opts.upstreamTtlMs !== undefined ? { upstreamTtlMs: opts.upstreamTtlMs } : {}),
     legacyAuth: opts.legacyAuth ?? true,
     namePolicy: opts.namePolicy ?? "open",
+    // Authenticator codes follow the tests' TOTP clock, so a test can ask for a fresh code without waiting 30s.
+    totpNow: () => totpClock.now,
+    review: opts.review,
     auth: {
       secret: `test-only-secret-${randomBytes(24).toString("hex")}`,
       ...(opts.github ? { github: { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints } } : {}),
@@ -354,7 +372,13 @@ export function dig(v: unknown, ...path: (string | number)[]): unknown {
 
 // ---------- sign-in: a fake GitHub, a cookie jar, TOTP and the device login ----------
 
-export type FakeGitHub = { url: string; endpoints: GitHubEndpoints; stop: () => Promise<void> };
+export type FakeGitHub = {
+  url: string;
+  endpoints: GitHubEndpoints;
+  stop: () => Promise<void>;
+  /** Renames a GitHub account: the numeric id stays, the login changes. The old login is free for someone else. */
+  rename: (from: string, to: string) => void;
+};
 
 /**
  * A stand-in for github.com: /login/oauth/authorize signs in whoever the test names with `login=`
@@ -362,10 +386,11 @@ export type FakeGitHub = { url: string; endpoints: GitHubEndpoints; stop: () => 
  */
 export function startFakeGitHub(): FakeGitHub {
   const ids = new Map<string, number>();
+  let nextId = 5000;
   const idOf = (login: string): number => {
     const known = ids.get(login);
     if (known !== undefined) return known;
-    const id = 5000 + ids.size;
+    const id = nextId++;
     ids.set(login, id);
     return id;
   };
@@ -390,7 +415,9 @@ export function startFakeGitHub(): FakeGitHub {
       const login = loginOf(req);
       if (!login) return Response.json({ message: "Requires authentication" }, { status: 401 });
       if (u.pathname === "/user") return Response.json({ id: idOf(login), login, name: login, email: null, avatar_url: `https://avatars.example.test/${login}` });
-      if (u.pathname === "/user/emails") return Response.json([{ email: `${login.toLowerCase()}@users.example.test`, primary: true, verified: true }]);
+
+      // GitHub verifies each address for one account only, so the address follows the numeric id, not the login.
+      if (u.pathname === "/user/emails") return Response.json([{ email: `gh-${idOf(login)}@users.example.test`, primary: true, verified: true }]);
       return Response.json({ message: "Not Found" }, { status: 404 });
     },
   });
@@ -399,6 +426,11 @@ export function startFakeGitHub(): FakeGitHub {
     url,
     endpoints: { authorize: `${url}/login/oauth/authorize`, token: `${url}/login/oauth/access_token`, user: `${url}/user`, emails: `${url}/user/emails` },
     stop: () => server.stop(true),
+    rename(from, to) {
+      const id = idOf(from);
+      ids.delete(from);
+      ids.set(to, id);
+    },
   };
 }
 
@@ -423,7 +455,7 @@ export class Browser {
     }
   }
 
-  async fetch(pathOrUrl: string, init: { method?: string; body?: unknown; redirect?: "manual" | "follow" } = {}): Promise<Response> {
+  async fetch(pathOrUrl: string, init: { method?: string; body?: unknown; redirect?: "manual" | "follow"; headers?: Record<string, string> } = {}): Promise<Response> {
     const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${this.reg.url}${pathOrUrl.replace(/^\//, "")}`;
     const res = await fetch(url, {
       method: init.method ?? "GET",
@@ -432,6 +464,7 @@ export class Browser {
         origin: new URL(this.reg.url).origin,
         cookie: this.cookie(),
         ...(init.body !== undefined ? { "content-type": "application/json" } : {}),
+        ...init.headers,
       },
       ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
     });
@@ -439,7 +472,7 @@ export class Browser {
     return res;
   }
 
-  async json(pathOrUrl: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: unknown }> {
+  async json(pathOrUrl: string, init: { method?: string; body?: unknown; headers?: Record<string, string> } = {}): Promise<{ status: number; body: unknown }> {
     const res = await this.fetch(pathOrUrl, init);
     const text = await res.text();
     let body: unknown = text;
@@ -484,18 +517,39 @@ function base32Decode(text: string): Uint8Array {
   return new Uint8Array(out);
 }
 
-/** RFC 6238 TOTP (SHA-1, 6 digits, 30s), what an authenticator app shows for this base32 secret. */
-export function totp(secret: string, at: number = Date.now()): string {
+/** The clock the registry checks authenticator codes against in tests. Starts at real time. */
+export const totpClock = { now: Date.now() };
+const STEP_MS = 30_000;
+const lastStep = new Map<string, number>();
+
+/** RFC 6238 TOTP (SHA-1, 6 digits, 30s) for one time step. */
+function codeAt(secret: string, step: number): string {
   const counter = Buffer.alloc(8);
-  counter.writeBigUInt64BE(BigInt(Math.floor(at / 30_000)));
+  counter.writeBigUInt64BE(BigInt(step));
   const h = createHmac("sha1", base32Decode(secret)).update(counter).digest();
   const offset = (h[h.length - 1] ?? 0) & 0x0f;
   return String((h.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
+/**
+ * What an authenticator app shows for this base32 secret, never a code this secret already got from
+ * here: the registry accepts each time step once. Uses the current step or the next one (both inside
+ * the registry's one-step window) and moves the TOTP clock forward only when both were handed out.
+ */
+export function totp(secret: string): string {
+  const now = Math.floor(totpClock.now / STEP_MS);
+  const step = Math.max(now, (lastStep.get(secret) ?? Number.NEGATIVE_INFINITY) + 1);
+
+  if (step > now + 1) totpClock.now += (step - now - 1) * STEP_MS;
+  lastStep.set(secret, step);
+
+  return codeAt(secret, step);
+}
+
 /** A six-digit code that is not valid for this secret now (nor one step either side). */
 export function wrongTotp(secret: string): string {
-  const valid = new Set([-30_000, 0, 30_000].map((d) => totp(secret, Date.now() + d)));
+  const now = Math.floor(totpClock.now / STEP_MS);
+  const valid = new Set([now - 1, now, now + 1, now + 2].map((s) => codeAt(secret, s)));
   for (let n = 0; ; n++) {
     const c = String(n).padStart(6, "0");
     if (!valid.has(c)) return c;
@@ -504,14 +558,22 @@ export function wrongTotp(secret: string): string {
 
 /** Turns on authenticator-app 2FA for the signed-in account; returns the base32 secret. */
 export async function enableTotp(b: Browser): Promise<string> {
+  return (await enableTotpWithCodes(b)).secret;
+}
+
+/** Turns on authenticator-app 2FA; returns the secret and the recovery codes shown once at setup. */
+export async function enableTotpWithCodes(b: Browser): Promise<{ secret: string; recoveryCodes: string[] }> {
   const en = await b.json("api/auth/two-factor/enable", { method: "POST", body: {} });
   const uri = dig(en.body, "totpURI");
   if (en.status !== 200 || typeof uri !== "string") throw new Error(`2FA enable failed: ${en.status} ${JSON.stringify(en.body)}`);
   const secret = new URL(uri).searchParams.get("secret");
   if (!secret) throw new Error("totpURI has no secret");
+  const codes = dig(en.body, "backupCodes");
+  const recoveryCodes = Array.isArray(codes) ? codes.map(String) : [];
   const v = await b.json("api/auth/two-factor/verify-totp", { method: "POST", body: { code: totp(secret) } });
   if (v.status !== 200) throw new Error(`2FA verify failed: ${v.status} ${JSON.stringify(v.body)}`);
-  return secret;
+
+  return { secret, recoveryCodes };
 }
 
 /** `apm login`'s device flow, with the signed-in browser approving the code. Returns the CLI token. */

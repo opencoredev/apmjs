@@ -247,8 +247,8 @@ describe("publish approval", () => {
 });
 
 describe("second factor for destructive actions", () => {
-  test("revoke needs a fresh second factor: a token alone fails, --otp works, and a web check counts for 10 minutes", async () => {
-    for (const v of ["1.0.0", "1.0.1"]) {
+  test("revoke needs a fresh second factor: a token alone fails, --otp works, and a website confirmation covers that one command for 10 minutes", async () => {
+    for (const v of ["1.0.0", "1.0.1", "1.0.2"]) {
       const id = await stage("@octo-cat/revokable", v);
       const ok = await approve(octo, id, totp(octoSecret));
       expect(ok.status, JSON.stringify(ok.body)).toBe(200);
@@ -260,9 +260,14 @@ describe("second factor for destructive actions", () => {
         body: JSON.stringify({ name: "@octo-cat/revokable", version, reason: "test revoke", ...extra }),
       });
 
+    const confirm = (version: string) =>
+      octo.json("-/apm/v1/verify", { method: "POST", body: { code: totp(octoSecret), command: { kind: "revoke", name: "@octo-cat/revokable", version } } });
+
     const bare = await revoke("1.0.0");
     expect(bare.status).toBe(401);
     expect(String(dig(bare.body, "error"))).toMatch(/otp|passkey|second factor/i);
+    // the refusal links to a page that confirms exactly this command
+    expect(String(dig(bare.body, "error"))).toContain("account?confirm=");
     // passwords are not a second factor once legacyAuth is off
     expect((await revoke("1.0.0", { password: "anything-at-all" })).status).toBe(401);
     expect((await revoke("1.0.0", { otp: wrongTotp(octoSecret) })).status).toBe(401);
@@ -270,14 +275,15 @@ describe("second factor for destructive actions", () => {
     expect(withOtp.status, JSON.stringify(withOtp.body)).toBe(200);
     expect(dig(withOtp.body, "status")).toBe("revoked");
 
-    // confirming on the website lets the CLI act for 10 minutes, then no longer
-    const check = await octo.json("-/apm/v1/verify", { method: "POST", body: { code: totp(octoSecret) } });
+    // confirming a command on the website lets the CLI run that command once within 10 minutes
+    const check = await confirm("1.0.1");
     expect(check.status, JSON.stringify(check.body)).toBe(200);
+    expect(String(dig(check.body, "command"))).toBe("apm revoke @octo-cat/revokable@1.0.1");
     clock += 11 * MINUTE;
     expect((await revoke("1.0.1")).status).toBe(401);
-    const again = await octo.json("-/apm/v1/verify", { method: "POST", body: { code: totp(octoSecret) } });
-    expect(again.status).toBe(200);
+    expect((await confirm("1.0.1")).status).toBe(200);
     clock += 2 * MINUTE;
+    expect((await revoke("1.0.2")).status).toBe(401);
     const fresh = await revoke("1.0.1");
     expect(fresh.status, JSON.stringify(fresh.body)).toBe(200);
   });

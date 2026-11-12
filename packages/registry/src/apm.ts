@@ -31,6 +31,7 @@ import {
   type ScoreReport,
   type TarEntry,
 } from "@apm/core";
+import type { LiveAction } from "./actions.ts";
 import type { VersionRecord } from "./db.ts";
 import { fail, json, splitPath, highest, servedVersions, tagTarget, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
 import { digestLabel, type Upstream, type UpstreamPackage } from "./upstream.ts";
@@ -391,10 +392,10 @@ async function parseBody<T>(req: Request, schema: z.ZodType<T>): Promise<Parsed<
   }
 }
 
-/** Destructive actions need a fresh second factor on top of the bearer token (a password only in legacy mode). */
-async function reauth(ctx: Ctx, auth: Auth, proof: { password?: string | undefined; otp?: string | undefined }): Promise<Response | { user: string }> {
+/** Destructive actions need a fresh second factor for this exact action on top of the bearer token (a password only in legacy mode). */
+async function reauth(ctx: Ctx, auth: Auth, proof: { password?: string | undefined; otp?: string | undefined }, action: LiveAction): Promise<Response | { user: string }> {
   if (auth.kind !== "user") return fail(401, "Log in first (apm login).");
-  const refused = await ctx.access.secondFactor({ user: auth.user, password: proof.password, otp: proof.otp });
+  const refused = await ctx.access.secondFactor({ user: auth.user, password: proof.password, otp: proof.otp, action });
   if (refused) return fail(refused.status, refused.error);
   return { user: auth.user };
 }
@@ -410,12 +411,20 @@ async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | 
   if (!parsed.ok) return parsed.res;
   const { name, version, reason, password, otp } = parsed.value;
   let user: string;
+  const live: LiveAction = { kind: action, name, version };
   if (action === "revoke" || action === "restore") {
-    const who = await reauth(ctx, auth, { password, otp });
+    const who = await reauth(ctx, auth, { password, otp }, live);
     if (who instanceof Response) return who;
     user = who.user;
   } else {
     if (auth.kind !== "user") return fail(401, "Log in first (apm login).");
+    // yank and unyank change what installs: a staging token needs a fresh second factor for them
+    const ownerFirst = requireOwner(ctx, auth.user, name);
+
+    if (ownerFirst) return ownerFirst;
+    const refused = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: live, otp });
+
+    if (refused) return fail(refused.status, refused.error);
     user = auth.user;
   }
   const denied = requireOwner(ctx, user, name);
@@ -476,7 +485,7 @@ async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | 
 async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, IncidentBody);
   if (!parsed.ok) return parsed.res;
-  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp });
+  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp }, { kind: "incident" });
   if (who instanceof Response) return who;
   // `since` is exclusive: pass the time of the last publish you trust.
   const since = Date.parse(parsed.value.since);
@@ -486,6 +495,9 @@ async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Respo
   const user = who.user;
   const targets: VersionRecord[] = [];
   for (const name of ctx.store.listPackageNames()) {
+    // only packages the account still owns: a former owner's old publishes are the current owners' call
+    if (!ctx.store.owners(name).includes(user)) continue;
+
     for (const v of ctx.store.listVersions(name)) {
       if (v.published_by === user && v.published_at > since && v.status !== "revoked") targets.push(v);
     }
@@ -507,12 +519,13 @@ async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Respo
 async function handleOwners(req: Request, ctx: Ctx, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, OwnerBody);
   if (!parsed.ok) return parsed.res;
-  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp });
+  const remove = req.method === "DELETE";
+  const ownerAction: LiveAction = { kind: remove ? "owner-remove" : "owner-add", name: parsed.value.name, user: parsed.value.user };
+  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp }, ownerAction);
   if (who instanceof Response) return who;
   const denied = requireOwner(ctx, who.user, parsed.value.name);
   if (denied) return denied;
   if (!ctx.store.getUser(parsed.value.user)) return fail(404, `No user ${parsed.value.user}.`);
-  const remove = req.method === "DELETE";
   if (remove) {
     const removed = ctx.store.removeOwner(parsed.value.name, parsed.value.user);
     switch (removed) {
@@ -878,6 +891,9 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
 
   if (parsedPolicy.kind === "invalid") return fail(400, parsedPolicy.error);
   const policy = parsedPolicy.policy;
+  // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
+  // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
+  const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
   const src = await lookup(env, name);
   if (!src) return fail(404, `No package named ${name}.`);
   const tagged = tagTarget(src.distTags, range);
@@ -897,7 +913,7 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
     const block = policyBlock(ctx, v, policy);
     if (block === null) {
       const report = reportFor(ctx, v);
-      const tree: Tree = policy.floor > 0 || policy.cooldownMs > 0 ? await treeBlocks(env, v, policy) : { blocks: [], unchecked: 0, uncheckedDeps: [] };
+      const tree: Tree = await treeBlocks(env, v, treePolicy);
       if (tree.blocks.length > 0) {
         const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
         return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);

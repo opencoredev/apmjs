@@ -6,11 +6,12 @@ import { betterAuth } from "better-auth";
 import { genericOAuth, twoFactor, deviceAuthorization } from "better-auth/plugins";
 import { createAuthMiddleware } from "better-auth/api";
 import { getMigrations } from "better-auth/db/migration";
-import { symmetricDecrypt } from "better-auth/crypto";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { passkey } from "@better-auth/passkey";
-import { createOTP } from "@better-auth/utils/otp";
+import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Store, User } from "./db.ts";
+import { FactorLedger, matchingStep, parseSixDigits, type SixDigits } from "./factors.ts";
 
 export type GitHubEndpoints = { authorize: string; token: string; user: string; emails: string };
 export type AuthOptions = {
@@ -27,11 +28,10 @@ const GITHUB: GitHubEndpoints = {
   emails: "https://api.github.com/user/emails",
 };
 
-/** How long a passkey or TOTP check on the website counts for actions that need a fresh second factor. */
-export const STEPUP_MS = 10 * 60_000;
 const CLI_CLIENT_ID = "apm-cli";
-const MAX_FAILURES = 5;
-const FAILURE_WINDOW_MS = 15 * 60_000;
+
+/** The header the website sends the existing factor in, for account changes that need it. */
+export const PROOF_HEADER = "x-apm-second-factor";
 
 const GitHubUser = z.object({ id: z.number(), login: z.string(), name: z.string().nullish(), email: z.string().nullish(), avatar_url: z.string().nullish() });
 const GitHubEmails = z.array(z.object({ email: z.string(), primary: z.boolean(), verified: z.boolean() }));
@@ -41,7 +41,11 @@ const DeviceTokenShape = z.object({ access_token: z.string() });
 const ApiErrorShape = z.object({ body: z.object({ error: z.string() }).loose() });
 
 export type SignedIn = { authUserId: string; sessionToken: string; signedInAt: number };
-export type SecondFactorCheck = { kind: "ok" } | { kind: "bad" } | { kind: "none" } | { kind: "locked" };
+
+/** A second factor offered for one action: a TOTP code, a recovery code, or this session's passkey check. */
+export type FactorProof = { kind: "totp"; code: SixDigits } | { kind: "recovery"; code: string } | { kind: "passkey" };
+
+export type ProofCheck = { kind: "ok" } | { kind: "bad" } | { kind: "reused" } | { kind: "none" } | { kind: "locked" };
 export type DevicePoll =
   | { kind: "pending" }
   | { kind: "slow_down" }
@@ -62,7 +66,12 @@ export type ApmAuth = {
   profileOf: (authUserId: string) => { name: string; email: string; image: string | null } | null;
   linked: (authUserId: string) => Linked[];
   factors: (authUserId: string) => { totp: boolean; passkeys: number };
-  verifyTotp: (authUserId: string, code: string) => Promise<SecondFactorCheck>;
+  /**
+   * Checks a proof and spends it on `purpose`. Every TOTP and recovery-code check takes from one budget;
+   * a TOTP step is accepted once; a passkey check is bound to the session it made (`sessionToken`).
+   */
+  checkProof: (input: { authUserId: string; sessionToken: string | null; proof: FactorProof; purpose: string }) => Promise<ProofCheck>;
+  ledger: FactorLedger;
   startDevice: () => Promise<DeviceStart>;
   pollDevice: (deviceCode: string) => Promise<DevicePoll>;
 };
@@ -79,8 +88,79 @@ function decodeBase32(text: string): Uint8Array {
   return new Uint8Array(out);
 }
 
-export async function createAuth(input: { store: Store; options: AuthOptions; baseURL: string; now: () => number }): Promise<ApmAuth> {
+/** Parses the proof header: `totp:123456`, `recovery:abcde-12345` or `passkey`. */
+export function parseProofHeader(value: string | null): FactorProof | null {
+  if (value === null) return null;
+  const v = value.trim();
+
+  if (v === "passkey") return { kind: "passkey" };
+
+  if (v.startsWith("totp:")) {
+    const code = parseSixDigits(v.slice(5));
+
+    return code ? { kind: "totp", code } : null;
+  }
+
+  if (v.startsWith("recovery:")) {
+    const code = v.slice(9).trim();
+
+    return /^[A-Za-z0-9-]{6,64}$/.test(code) ? { kind: "recovery", code } : null;
+  }
+
+  return null;
+}
+
+type Gate = "open" | "factor-if-enrolled";
+
+/**
+ * The Better Auth routes the website and the device page use, and nothing else. Account changes that add or
+ * remove a way in need the existing factor when the account has one. Everything else answers 404.
+ */
+const ROUTES: ReadonlyMap<string, { methods: readonly string[]; gate: Gate }> = new Map([
+  ["get-session", { methods: ["GET"], gate: "open" }],
+  ["sign-in/social", { methods: ["POST"], gate: "open" }],
+  ["sign-out", { methods: ["POST"], gate: "open" }],
+  ["error", { methods: ["GET"], gate: "open" }],
+  ["link-social", { methods: ["POST"], gate: "factor-if-enrolled" }],
+  ["two-factor/enable", { methods: ["POST"], gate: "factor-if-enrolled" }],
+  ["two-factor/disable", { methods: ["POST"], gate: "factor-if-enrolled" }],
+  // Registration options are harmless on their own; the step that adds the passkey needs the existing factor.
+  ["passkey/generate-register-options", { methods: ["GET"], gate: "open" }],
+  ["passkey/verify-registration", { methods: ["POST"], gate: "factor-if-enrolled" }],
+  ["passkey/generate-authenticate-options", { methods: ["GET"], gate: "open" }],
+  ["passkey/verify-authentication", { methods: ["POST"], gate: "open" }],
+  ["device", { methods: ["GET"], gate: "open" }],
+  ["device/approve", { methods: ["POST"], gate: "open" }],
+  ["device/deny", { methods: ["POST"], gate: "open" }],
+]);
+
+/** OAuth providers redirect back here. */
+const CALLBACK_PREFIXES = ["callback/", "oauth2/callback/"];
+
+/** What apm's own answers on the auth routes carry. */
+type AuthReply = { error: string; code?: string } | { status: true };
+function jsonResponse(body: AuthReply, status: number): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+function sameText(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
+export async function createAuth(input: {
+  store: Store;
+  options: AuthOptions;
+  baseURL: string;
+  now: () => number;
+  /** The clock authenticator codes are checked against. Wall-clock time; tests pass their own. */
+  totpNow?: () => number;
+}): Promise<ApmAuth> {
   const { store, options, now } = input;
+  const totpNow = input.totpNow ?? Date.now;
+  const ledger = new FactorLedger(store.db);
   const db = store.db;
   const baseURL = input.baseURL.replace(/\/$/, "");
   const web = new URL(baseURL);
@@ -141,16 +221,19 @@ export async function createAuth(input: { store: Store; options: AuthOptions; ba
             }),
           ]
         : []),
+      // Accounts come from GitHub or Vercel and have no password. The route gates below ask for the existing
+      // factor instead, and apm checks TOTP codes itself (one budget, each step once).
       twoFactor({ issuer: "apm", allowPasswordless: true }),
       passkey({ rpID: web.hostname, rpName: "apm", origin: web.origin }),
       deviceAuthorization({ expiresIn: "15m", interval: "1s", validateClient: (id) => id === CLI_CLIENT_ID }),
     ],
     hooks: {
       after: createAuthMiddleware(async (ctx) => {
-        // Signing in with a passkey is a fresh second factor.
+        // A passkey sign-in is a fresh second factor for one action, from the session it just made.
         if (ctx.path === "/passkey/verify-authentication") {
           const s = ctx.context.newSession;
-          if (s) store.setStepup(s.user.id, now(), "passkey");
+
+          if (s) ledger.recordPasskeyProof({ sessionToken: s.session.token, authUserId: s.user.id, at: now() });
         }
       }),
     },
@@ -160,8 +243,6 @@ export async function createAuth(input: { store: Store; options: AuthOptions; ba
   await migrations.runMigrations();
   const context = await auth.$context;
 
-  const failures = new Map<string, { count: number; since: number }>();
-
   function accountsOf(authUserId: string): Linked[] {
     return db
       .query("SELECT providerId, accountId FROM account WHERE userId = ? ORDER BY createdAt")
@@ -170,78 +251,247 @@ export async function createAuth(input: { store: Store; options: AuthOptions; ba
       .map((r) => ({ provider: r.providerId, accountId: r.accountId }));
   }
 
+  function gitHubLoginOf(authUserId: string): { githubId: string; login: string } | null {
+    const github = accountsOf(authUserId).find((a) => a.provider === "github");
+    const login = github ? store.gitHubLogin(github.accountId) : null;
+
+    return github && login ? { githubId: github.accountId, login } : null;
+  }
+
   function apmUserOf(authUserId: string): User | null {
     const bound = store.getUserByAuthId(authUserId);
-    if (bound) return bound;
-    const github = accountsOf(authUserId).find((a) => a.provider === "github");
-    if (!github) return null;
-    const login = store.gitHubLogin(github.accountId);
-    if (!login) return null;
+
+    if (bound) {
+      // The scope stays bound to GitHub's numeric id. A rename only changes the login shown.
+      const gh = gitHubLoginOf(authUserId);
+
+      if (gh && bound.github_id === gh.githubId && bound.github_login !== gh.login) {
+        store.setGitHubLogin(bound.name, gh.login);
+
+        return store.getUserByAuthId(authUserId);
+      }
+
+      return bound;
+    }
+
+    const gh = gitHubLoginOf(authUserId);
+
+    if (!gh) return null;
+    const { login } = gh;
     const name = login.toLowerCase();
     const existing = store.getUser(name);
-    const link = { authUserId, githubId: github.accountId, githubLogin: login };
+    const link = { authUserId, githubId: gh.githubId, githubLogin: login };
     if (!existing) {
       const profile = db.query("SELECT email FROM user WHERE id = ?").get(authUserId);
       const email = profile ? z.object({ email: z.string() }).parse(profile).email : "";
-      store.createUser({ name, password_hash: "", email, created_at: now(), auth_user_id: authUserId, github_id: github.accountId, github_login: login });
-    } else if (existing.auth_user_id === null && existing.password_hash === "" && (existing.github_id === null || existing.github_id === github.accountId)) {
+      store.createUser({ name, password_hash: "", email, created_at: now(), auth_user_id: authUserId, github_id: gh.githubId, github_login: login });
+    } else if (existing.auth_user_id === null && existing.password_hash === "" && (existing.github_id === null || existing.github_id === gh.githubId)) {
       // A passwordless name made outside sign-in (an operator's minted token): the GitHub account with that login claims it.
       store.bindUser(name, link);
     } else {
-      // The name belongs to someone else: an older password account, or a renamed GitHub login another account took.
+      // The name belongs to someone else: an older password account, or a scope a renamed GitHub account keeps.
       return null;
     }
     return store.getUserByAuthId(authUserId);
   }
 
-  async function verifyTotp(authUserId: string, code: string): Promise<SecondFactorCheck> {
-    const f = failures.get(authUserId);
-    const t = Date.now();
-    if (f && t - f.since < FAILURE_WINDOW_MS && f.count >= MAX_FAILURES) return { kind: "locked" };
-    const row = db.query("SELECT secret, verified FROM twoFactor WHERE userId = ?").get(authUserId);
-    if (!row) return { kind: "none" };
-    const tf = z.object({ secret: z.string(), verified: z.union([z.number(), z.boolean(), z.null()]) }).parse(row);
-    if (tf.verified === 0 || tf.verified === false) return { kind: "none" };
-    const raw = await symmetricDecrypt({ key: context.secretConfig, data: tf.secret });
-    const secret = raw.startsWith("base32:") ? decodeBase32(raw.slice(7)) : raw;
-    // TOTP is anchored to wall-clock time, not the registry's clock.
-    const ok = /^\d{6}$/.test(code) && (await createOTP(secret, { digits: 6, period: 30 }).verify(code));
-    if (ok) {
-      failures.delete(authUserId);
-      return { kind: "ok" };
+  const TwoFactorRow = z.object({ secret: z.string(), backupCodes: z.string(), verified: z.union([z.number(), z.boolean(), z.null()]) });
+
+  function twoFactorRow(authUserId: string): z.infer<typeof TwoFactorRow> | null {
+    const row = db.query("SELECT secret, backupCodes, verified FROM twoFactor WHERE userId = ?").get(authUserId);
+
+    return row ? TwoFactorRow.parse(row) : null;
+  }
+
+  const isVerified = (v: number | boolean | null): boolean => v !== 0 && v !== false;
+
+  /** Runs one budgeted check: reserves an attempt first, settles it with the outcome. */
+  async function budgeted(authUserId: string, check: () => Promise<ProofCheck>): Promise<ProofCheck> {
+    const r = ledger.reserve({ authUserId, at: totpNow() });
+
+    if (r.kind === "locked") return { kind: "locked" };
+    let result: ProofCheck = { kind: "bad" };
+
+    try {
+      result = await check();
+    } finally {
+      ledger.settle({ id: r.id, authUserId, ok: result.kind === "ok" });
     }
-    const fresh = !f || t - f.since >= FAILURE_WINDOW_MS;
-    failures.set(authUserId, fresh ? { count: 1, since: t } : { count: (f?.count ?? 0) + 1, since: f?.since ?? t });
-    return { kind: "bad" };
+
+    return result;
+  }
+
+  async function checkTotp(authUserId: string, code: SixDigits, phase: "enrolled" | "enrolling"): Promise<ProofCheck> {
+    const row = twoFactorRow(authUserId);
+
+    if (!row || isVerified(row.verified) !== (phase === "enrolled")) return { kind: "none" };
+
+    return budgeted(authUserId, async () => {
+      const raw = await symmetricDecrypt({ key: context.secretConfig, data: row.secret });
+      const key = raw.startsWith("base32:") ? decodeBase32(raw.slice(7)) : new TextEncoder().encode(raw);
+      // TOTP is anchored to wall-clock time, not the registry's clock.
+      const step = matchingStep({ key, code, at: totpNow() });
+
+      if (step === null) return { kind: "bad" };
+
+      return ledger.acceptStep({ authUserId, step }) ? { kind: "ok" } : { kind: "reused" };
+    });
+  }
+
+  async function checkRecovery(authUserId: string, code: string): Promise<ProofCheck> {
+    const row = twoFactorRow(authUserId);
+
+    if (!row || !isVerified(row.verified)) return { kind: "none" };
+
+    return budgeted(authUserId, async () => {
+      const codes = z.array(z.string()).parse(JSON.parse(await symmetricDecrypt({ key: context.secretConfig, data: row.backupCodes })));
+      const match = codes.find((c) => sameText(c, code));
+
+      if (match === undefined) return { kind: "bad" };
+      const rest = await symmetricEncrypt({ key: context.secretConfig, data: JSON.stringify(codes.filter((c) => c !== match)) });
+      // Compare-and-swap: of two requests spending the same code, one wins.
+      const swapped = db.query("UPDATE twoFactor SET backupCodes = ? WHERE userId = ? AND backupCodes = ?").run(rest, authUserId, row.backupCodes);
+
+      return swapped.changes === 1 ? { kind: "ok" } : { kind: "reused" };
+    });
+  }
+
+  async function checkProof(input: { authUserId: string; sessionToken: string | null; proof: FactorProof; purpose: string }): Promise<ProofCheck> {
+    const { authUserId, proof } = input;
+
+    switch (proof.kind) {
+      case "totp":
+        return checkTotp(authUserId, proof.code, "enrolled");
+      case "recovery":
+        return checkRecovery(authUserId, proof.code);
+      case "passkey":
+        if (input.sessionToken === null) return { kind: "none" };
+
+        return ledger.consumePasskeyProof({ sessionToken: input.sessionToken, authUserId, purpose: input.purpose, at: now() }) ? { kind: "ok" } : { kind: "none" };
+      default: {
+        const _exhaustive: never = proof;
+
+        return _exhaustive;
+      }
+    }
+  }
+
+  function factors(authUserId: string) {
+    const u = db.query("SELECT twoFactorEnabled FROM user WHERE id = ?").get(authUserId);
+    const totp = u ? Boolean(z.object({ twoFactorEnabled: z.union([z.number(), z.boolean(), z.null()]) }).parse(u).twoFactorEnabled) : false;
+    const pk = db.query("SELECT count(*) AS n FROM passkey WHERE userId = ?").get(authUserId);
+
+    return { totp, passkeys: pk ? z.object({ n: z.number() }).parse(pk).n : 0 };
+  }
+
+  async function sessionOf(req: Request): Promise<SignedIn | null> {
+    const raw: unknown = await auth.api.getSession({ headers: req.headers }).catch(() => null);
+    const s = SessionShape.safeParse(raw);
+
+    if (!s.success) return null;
+
+    return { authUserId: s.data.user.id, sessionToken: s.data.session.token, signedInAt: s.data.session.createdAt.getTime() };
+  }
+
+  function refusal(check: ProofCheck): Response {
+    switch (check.kind) {
+      case "ok":
+        return jsonResponse({ error: "ok" }, 500);
+      case "locked":
+        return jsonResponse({ error: "Too many wrong codes. Wait 15 minutes and try again.", code: "LOCKED" }, 429);
+      case "reused":
+        return jsonResponse({ error: "That code was already used. Wait for the next code from your authenticator app.", code: "CODE_REUSED" }, 401);
+      case "bad":
+        return jsonResponse({ error: "That code is not valid.", code: "INVALID_CODE" }, 401);
+      case "none":
+        return jsonResponse({ error: "Confirm with your passkey first, or use your authenticator app.", code: "NO_FACTOR" }, 401);
+      default: {
+        const _exhaustive: never = check;
+
+        return _exhaustive;
+      }
+    }
+  }
+
+  /** Finishes authenticator setup: the first code from the app turns 2FA on. apm checks it, so the step is spent. */
+  async function enroll(req: Request): Promise<Response> {
+    const who = await sessionOf(req);
+
+    if (!who) return jsonResponse({ error: "Sign in first." }, 401);
+    const body = z.object({ code: z.string() }).safeParse(await req.json().catch(() => null));
+    const code = body.success ? parseSixDigits(body.data.code) : null;
+
+    if (!code) return jsonResponse({ error: "Send the 6-digit code your authenticator app shows.", code: "INVALID_CODE" }, 400);
+    const row = twoFactorRow(who.authUserId);
+
+    if (!row) return jsonResponse({ error: "Start authenticator setup first." }, 400);
+
+    if (isVerified(row.verified)) return jsonResponse({ error: "Your authenticator app is already set up." }, 400);
+    const check = await checkTotp(who.authUserId, code, "enrolling");
+
+    if (check.kind !== "ok") return refusal(check);
+    db.transaction(() => {
+      db.query("UPDATE twoFactor SET verified = 1 WHERE userId = ?").run(who.authUserId);
+      db.query("UPDATE user SET twoFactorEnabled = 1 WHERE id = ?").run(who.authUserId);
+    })();
+
+    return jsonResponse({ status: true }, 200);
+  }
+
+  async function handler(req: Request): Promise<Response> {
+    const path = new URL(req.url).pathname.replace(/^\/api\/auth\//, "");
+
+    if (path === "two-factor/verify-totp" && req.method === "POST") return enroll(req);
+
+    if (CALLBACK_PREFIXES.some((p) => path.startsWith(p)) && (req.method === "GET" || req.method === "POST")) return auth.handler(req);
+    const route = ROUTES.get(path);
+
+    if (!route || !route.methods.includes(req.method)) return jsonResponse({ error: "Not found" }, 404);
+
+    if (route.gate === "factor-if-enrolled") {
+      const who = await sessionOf(req);
+
+      if (who) {
+        const f = factors(who.authUserId);
+
+        if (f.totp || f.passkeys > 0) {
+          const proof = parseProofHeader(req.headers.get(PROOF_HEADER));
+
+          if (!proof) {
+            return jsonResponse(
+              { error: "This changes how you sign in, so it needs your current authenticator code, a recovery code, or your passkey.", code: "SECOND_FACTOR_REQUIRED" },
+              403,
+            );
+          }
+
+          const check = await checkProof({ authUserId: who.authUserId, sessionToken: who.sessionToken, proof, purpose: `account:${path}` });
+
+          if (check.kind !== "ok") return refusal(check);
+        }
+      }
+    }
+
+    return auth.handler(req);
   }
 
   return {
-    handler: (req) => auth.handler(req),
+    handler,
     providers: { github: gh !== null, vercel: options.vercel !== undefined },
-    async sessionOf(req) {
-      const raw: unknown = await auth.api.getSession({ headers: req.headers }).catch(() => null);
-      const s = SessionShape.safeParse(raw);
-      if (!s.success) return null;
-      return { authUserId: s.data.user.id, sessionToken: s.data.session.token, signedInAt: s.data.session.createdAt.getTime() };
-    },
+    sessionOf,
     apmUserOf,
     gitHubNameOf(authUserId) {
-      const github = accountsOf(authUserId).find((a) => a.provider === "github");
-      const login = github ? store.gitHubLogin(github.accountId) : null;
-      return login ? login.toLowerCase() : null;
+      const gh = gitHubLoginOf(authUserId);
+
+      return gh ? gh.login.toLowerCase() : null;
     },
     profileOf(authUserId) {
       const row = db.query("SELECT name, email, image FROM user WHERE id = ?").get(authUserId);
       return row ? z.object({ name: z.string(), email: z.string(), image: z.string().nullable() }).parse(row) : null;
     },
     linked: accountsOf,
-    factors(authUserId) {
-      const u = db.query("SELECT twoFactorEnabled FROM user WHERE id = ?").get(authUserId);
-      const totp = u ? Boolean(z.object({ twoFactorEnabled: z.union([z.number(), z.boolean(), z.null()]) }).parse(u).twoFactorEnabled) : false;
-      const pk = db.query("SELECT count(*) AS n FROM passkey WHERE userId = ?").get(authUserId);
-      return { totp, passkeys: pk ? z.object({ n: z.number() }).parse(pk).n : 0 };
-    },
-    verifyTotp,
+    factors,
+    checkProof,
+    ledger,
     async startDevice() {
       const raw: unknown = await auth.api.deviceCode({ body: { client_id: CLI_CLIENT_ID } });
       const d = DeviceStartShape.parse(raw);
