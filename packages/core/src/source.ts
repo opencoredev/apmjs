@@ -208,6 +208,14 @@ export function scanFile(text: string, lang: Lang): FileScan {
   return { findings: scanTextRules(text, lang), imports, read: lang === "data" ? "lexed" : "raw", rejected: false, notes: [], sinkOnly: [], patches: null };
 }
 
+/**
+ * apm-score-v3's rules over the whole of a parsed file, comments, regex bodies and TypeScript types included: what
+ * the floor leaves out, read for a package that runs code built from text (see `RUNS_TEXT` in score.ts).
+ */
+export function scanWholeText(text: string): TextFinding[] {
+  return scanTextRules(text, "unparsed");
+}
+
 /** The rule findings for one text read as `lang`. */
 export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
   return scanFile(text, lang).findings;

@@ -1,9 +1,12 @@
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
+import { z } from "zod";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
+import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
 import { packageLinks, type PackageLink } from "@/lib/package-links";
 import { PackageLinks } from "@/components/package-links";
@@ -103,6 +106,18 @@ function Evidence(props: { signal: string; evidence: string; name: string; versi
   );
 }
 
+/** The signals whose evidence an apm reviewer may dismiss: what the source rules read, not facts like an install script. */
+const DISMISSABLE: ReadonlySet<string> = new Set(["shell-exec", "network", "credential-access", "eval", "obfuscated"]);
+
+/** What names one evidence item for a reviewer's control, or null when it cites no file line or the score has no digest. */
+type ItemKey = { name: string; version: string; digest: string; scorer: string };
+
+function itemOf(key: ItemKey | null, signal: string, evidence: string): EvidenceItem | null {
+  const cited = key && DISMISSABLE.has(signal) ? citeEvidence(signal, evidence) : null;
+
+  return key && cited?.citation.line ? { ...key, signal, file: cited.citation.path, line: cited.citation.line } : null;
+}
+
 /** What the score did not check: a short line under the number, and the whole list behind a disclosure. */
 function LimitationsLine({ notChecked }: { notChecked: readonly string[] }) {
   const s = summarizeLimitations(notChecked);
@@ -156,6 +171,11 @@ function NoteEvidence(props: { signal: string; evidence: string; name: string; v
 /** The page's one dark panel: score, meter, and every signal with its file:line evidence. */
 function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["score"]>; name: string; version: string | null }) {
   const tone = INVERSE_TONE[toneOf(score.score)];
+  const key: ItemKey | null = version && score.digest && score.scorer ? { name, version, digest: score.digest, scorer: score.scorer } : null;
+  const dismissedOf = (signal: string) => score.dismissed.filter((d) => d.signal === signal);
+  const restoreItem = (d: Dismissed): EvidenceItem | null => (key ? { ...key, signal: d.signal, file: d.file, line: d.line } : null);
+  // a signal whose every item was dismissed is gone from the number, but its items stay listed
+  const cleared = [...new Set(score.dismissed.map((d) => d.signal))].filter((id) => !score.signals.some((s) => s.id === id));
   const lost = score.signals.filter((s) => s.points < 0);
   const notes = score.signals.filter((s) => s.points >= 0);
   const notChecked = score.notChecked ?? [];
@@ -189,8 +209,9 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
         </div>
         {notChecked.length > 0 && <LimitationsLine notChecked={notChecked} />}
       </div>
+      <EvidenceAdminProvider>
       <ul className="border-t border-inverse-border">
-        {lost.length === 0 && <li className="px-5 py-4 text-[15px] text-inverse-muted sm:px-6">No risk signals in {version ?? "this version"}.</li>}
+        {lost.length === 0 && cleared.length === 0 && <li className="px-5 py-4 text-[15px] text-inverse-muted sm:px-6">No risk signals in {version ?? "this version"}.</li>}
         {lost.map((s) => (
           <li key={s.id} className="flex gap-4 border-b border-inverse-border px-5 py-4 last:border-b-0 sm:px-6">
             <span className={`w-9 shrink-0 text-right font-mono text-[15px] leading-6 tabular-nums ${s.confidence === "possible" ? "text-inverse-muted" : INVERSE_TONE[s.points <= -20 ? "bad" : "warn"].text}`}>{s.points}</span>
@@ -200,8 +221,31 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
                 {s.confidence === "possible" && <span className="mr-1 inline-flex h-5 items-center rounded-full border border-inverse-border px-2 align-[1px] text-xs text-inverse-foreground">possible</span>}
                 <span className="text-inverse-muted">{s.label}</span>
               </div>
-              {s.evidence.slice(0, 3).map((ev) => (
-                <Evidence key={ev} signal={s.id} evidence={ev} name={name} version={version} />
+              {s.evidence.slice(0, 3).map((ev) => {
+                const item = itemOf(key, s.id, ev);
+
+                return (
+                  <div key={ev}>
+                    <Evidence signal={s.id} evidence={ev} name={name} version={version} />
+                    {item && <EvidenceAdminControl item={item} mode="dismiss" />}
+                  </div>
+                );
+              })}
+              {dismissedOf(s.id).map((d) => (
+                <DismissedEvidence key={`${d.file}:${d.line}`} d={d} item={restoreItem(d)} />
+              ))}
+            </div>
+          </li>
+        ))}
+        {cleared.map((id) => (
+          <li key={id} className="flex gap-4 border-b border-inverse-border px-5 py-4 last:border-b-0 sm:px-6">
+            <span className="w-9 shrink-0 text-right font-mono text-[15px] leading-6 text-inverse-muted tabular-nums">0</span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[15px] leading-6">
+                <span className="font-mono">{id}</span> <span className="text-inverse-muted">Every piece of evidence was dismissed, so it costs no points.</span>
+              </div>
+              {dismissedOf(id).map((d) => (
+                <DismissedEvidence key={`${d.file}:${d.line}`} d={d} item={restoreItem(d)} />
               ))}
             </div>
           </li>
@@ -216,6 +260,7 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
           </li>
         ))}
       </ul>
+      </EvidenceAdminProvider>
       {notChecked.length > 0 && <LimitationsList notChecked={notChecked} />}
     </div>
   );
@@ -356,6 +401,15 @@ function ScoreSummary({ score, className }: { score: PackageInfo["score"]; class
   );
 }
 
+/** The item a dismissal or its undo names, as the log shows it: "credential-access evidence (index.js:1)". */
+const EvidenceDetail = z.object({ signal: z.string(), file: z.string(), line: z.number() });
+
+function evidenceCited(e: PackageEvent): string {
+  const d = EvidenceDetail.safeParse(e.detail);
+
+  return d.success ? `${d.data.signal} evidence (${d.data.file}:${d.data.line})` : "evidence";
+}
+
 function describe(e: PackageEvent): string {
   const field = (k: string): string => {
     const val: unknown = typeof e.detail === "object" && e.detail !== null ? Reflect.get(e.detail, k) : undefined;
@@ -388,6 +442,10 @@ function describe(e: PackageEvent): string {
       return `removed owner ${field("user")}`;
     case "dist-tag":
       return `tagged ${v} as ${field("tag")}`;
+    case "evidence-dismissed":
+      return `dismissed ${evidenceCited(e)} in ${v}${reason}`;
+    case "evidence-restored":
+      return `restored ${evidenceCited(e)} in ${v}`;
     default:
       return e.kind;
   }
@@ -455,7 +513,8 @@ async function PackageContent({ params, searchParams }: PageProps) {
   const none: Fetched<never> = { kind: "missing" };
 
   const [events, review, versionScore, tarballReadme] = await Promise.all([
-    pkg.source === "local" ? getEvents(name) : Promise.resolve<Fetched<PackageEvent[]>>({ kind: "ok", value: [] }),
+    // an upstream package's log holds what apm's reviewers did to it (dismissed evidence); none answers 404
+    getEvents(name),
     version ? getReview(name, version) : Promise.resolve(none),
     version && !isLatest ? getVersionScore(name, version) : Promise.resolve(none),
     // only when npm's packument has no readme (react's has none): the README in the shown version's tarball

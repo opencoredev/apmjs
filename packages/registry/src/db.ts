@@ -5,8 +5,9 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
 import { z } from "zod";
-import { dependencySpecs, isRegistryDependency, SCORER } from "@apm/core";
+import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
+import { digestLabel, digestOf } from "./digest.ts";
 import { FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, PASSKEY_PROOF_MS } from "./factors.ts";
 import { StoreError } from "./errors.ts";
 
@@ -104,6 +105,48 @@ const StagedRow = z.object({
   decided_at: IntOrNull,
   decided_by: z.string().nullable(),
 });
+
+const DismissalRow = z.object({
+  id: Int,
+  scorer: z.string(),
+  package: z.string(),
+  version: z.string(),
+  digest: z.string(),
+  signal: z.string(),
+  file: z.string(),
+  line: Int,
+  reason: z.string(),
+  dismissed_by: z.string(),
+  dismissed_at: Int,
+  restored_by: z.string().nullable(),
+  restored_at: IntOrNull,
+});
+
+/** A piece of score evidence an apm reviewer dismissed, by the exact bytes, scorer, signal, file and line it cites. */
+export type DismissalRecord = z.infer<typeof DismissalRow>;
+
+/** What names one evidence item: the version's exact tarball digest, the scorer that cited it, the signal, the file and the line. */
+export type DismissalKey = { package: string; version: string; digest: string; scorer: string; signal: string; file: string; line: number };
+
+/** The live dismissals made for exactly this version's bytes, as the scorer reads them. */
+function dismissalsFor(rows: readonly DismissalRecord[], version: string, digest: string | null): EvidenceDismissal[] {
+  return rows.flatMap((r) => (digest !== null && r.version === version && r.digest === digest ? [{ scorer: r.scorer, signal: r.signal, file: r.file, line: r.line, reason: r.reason, at: r.dismissed_at }] : []));
+}
+
+/**
+ * A stored analysis with the evidence dismissed for exactly these bytes left out (and listed as dismissed), so every
+ * reader (the version page, the packument's score, `~safe`, the install gate) scores without it. A dismissal for
+ * another digest, version or scorer does not apply. Null when the stored value is not an analysis.
+ */
+export function dismissedAnalysis(analysis: Analysis | null, list: readonly EvidenceDismissal[]): Analysis | null {
+  return analysis && list.length > 0 ? applyDismissals(analysis, list) : analysis;
+}
+
+function versionDigest(v: { integrity: string; shasum: string }): string | null {
+  const d = digestOf(v);
+
+  return d ? digestLabel(d) : null;
+}
 
 const EventRow = z.object({ id: Int, package: z.string(), kind: z.string(), actor: z.string(), at: Int, detail: z.unknown() });
 
@@ -272,6 +315,13 @@ export type StoreApi = {
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
   readonly advisoriesFor: (name: string) => Effect.Effect<Advisory[], StoreError>;
 
+  /** Live dismissals (not undone) on these packages. */
+  readonly dismissalsOf: (names: readonly string[]) => Effect.Effect<DismissalRecord[], StoreError>;
+  /** Records a dismissal; false when that exact item is already dismissed. */
+  readonly addDismissal: (d: DismissalKey & { reason: string; by: string; at: number }) => Effect.Effect<boolean, StoreError>;
+  /** Undoes a live dismissal; the row it undid, or null when the item was not dismissed. */
+  readonly restoreDismissal: (d: DismissalKey & { by: string; at: number }) => Effect.Effect<DismissalRecord | null, StoreError>;
+
   readonly addEvent: (e: { package: string; kind: string; actor: string; at: number; detail?: unknown }) => Effect.Effect<void, StoreError>;
   readonly eventsFor: (name: string) => Effect.Effect<EventRecord[], StoreError>;
   /** The latest events of `kinds`, leaving out those by `hiddenActors` or on packages under `hiddenScopes` (`@scope/`). */
@@ -350,6 +400,23 @@ const make = Effect.gen(function* () {
     );
 
   const getPackage = (name: string) => run("getPackage", sql`SELECT * FROM packages WHERE name = ${name}`, one(PackageOut));
+
+  /** A stored score as stored, or, with dismissals for its bytes, the analysis without them. */
+  const withList = (stored: VersionRecord["score"], list: readonly EvidenceDismissal[]): VersionRecord["score"] =>
+    list.length === 0 ? stored : (dismissedAnalysis(parseAnalysis(stored), list) ?? stored);
+
+  const dismissalsOf = (names: readonly string[]): Effect.Effect<DismissalRecord[], StoreError> =>
+    names.length === 0
+      ? Effect.succeed([])
+      : run("dismissalsOf", sql`SELECT * FROM evidence_dismissals WHERE package = ANY(${names}) AND restored_at IS NULL ORDER BY dismissed_at, id`, all(DismissalRow));
+
+  /** Versions as they are scored: what an apm reviewer dismissed for exactly these bytes is left out. */
+  const withDismissals = (rows: VersionRecord[]): Effect.Effect<VersionRecord[], StoreError> =>
+    rows.length === 0
+      ? Effect.succeed(rows)
+      : Effect.map(dismissalsOf([...new Set(rows.map((v) => v.package))]), (ds) =>
+          ds.length === 0 ? rows : rows.map((v) => ({ ...v, score: withList(v.score, dismissalsFor(ds.filter((d) => d.package === v.package), v.version, versionDigest(v))) })),
+        );
 
   const insertStaged = (s: NewStaged) =>
     run(
@@ -576,7 +643,7 @@ const make = Effect.gen(function* () {
         )
         .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "removeOwner", cause })))),
 
-    listVersions: (name) => run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)),
+    listVersions: (name) => Effect.flatMap(run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
     activeVersionsOf: (names) =>
       names.length === 0
         ? Effect.succeed([])
@@ -584,9 +651,11 @@ const make = Effect.gen(function* () {
             "activeVersionsOf",
             sql`SELECT * FROM versions WHERE package = ANY(${names}) AND status = 'active' ORDER BY package, published_at, seq`,
             all(VersionRow),
-          ),
+          ).pipe(Effect.flatMap(withDismissals)),
     getVersion: (name, version) =>
-      run("getVersion", sql`SELECT * FROM versions WHERE package = ${name} AND version = ${version}`, one(VersionRow)),
+      run("getVersion", sql`SELECT * FROM versions WHERE package = ${name} AND version = ${version}`, one(VersionRow)).pipe(
+        Effect.flatMap((v) => (v === null ? Effect.succeed(null) : Effect.map(withDismissals([v]), (got) => got[0] ?? null))),
+      ),
     insertVersion: (v) =>
       run(
         "insertVersion",
@@ -637,22 +706,32 @@ const make = Effect.gen(function* () {
         "publishedSince",
         sql`SELECT * FROM versions WHERE published_by = ${user} AND published_at > ${since} AND status <> 'revoked' ORDER BY package, published_at, seq`,
         all(VersionRow),
-      ),
+      ).pipe(Effect.flatMap(withDismissals)),
 
     upstreamAnalyses: (name) =>
-      run(
-        "upstreamAnalyses",
-        sql`SELECT version, digest, analysis FROM upstream_analysis WHERE package = ${name} AND scorer = ${SCORER}`,
-        all(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })).transform(
-          (rows) => new Map(rows.map((row) => [`${row.version} ${row.digest}`, row.analysis])),
-        ),
-      ),
+      Effect.gen(function* () {
+        const rows = yield* run(
+          "upstreamAnalyses",
+          sql`SELECT version, digest, analysis FROM upstream_analysis WHERE package = ${name} AND scorer = ${SCORER}`,
+          all(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
+        );
+
+        const dismissals = rows.length === 0 ? [] : yield* dismissalsOf([name]);
+
+        return new Map(rows.map((row) => [`${row.version} ${row.digest}`, withList(row.analysis, dismissalsFor(dismissals, row.version, row.digest))]));
+      }),
     latestUpstreamAnalysis: (name, version) =>
-      run(
-        "latestUpstreamAnalysis",
-        sql`SELECT analysis FROM upstream_analysis WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} ORDER BY analyzed_at DESC LIMIT 1`,
-        one(z.object({ analysis: z.unknown() })).transform((row) => row?.analysis ?? null),
-      ),
+      Effect.gen(function* () {
+        const row = yield* run(
+          "latestUpstreamAnalysis",
+          sql`SELECT digest, analysis FROM upstream_analysis WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} ORDER BY analyzed_at DESC LIMIT 1`,
+          one(z.object({ digest: z.string(), analysis: z.unknown() })),
+        );
+
+        if (row === null) return null;
+
+        return withList(row.analysis, dismissalsFor(yield* dismissalsOf([name]), version, row.digest));
+      }),
     setUpstreamAnalysis: (input) =>
       run(
         "setUpstreamAnalysis",
@@ -685,6 +764,24 @@ const make = Effect.gen(function* () {
       ),
     advisoriesFor: (name) => run("advisoriesFor", sql`SELECT * FROM advisories WHERE package = ${name} ORDER BY id`, all(AdvisoryRow)),
 
+    dismissalsOf,
+    addDismissal: (d) =>
+      run(
+        "addDismissal",
+        sql`INSERT INTO evidence_dismissals (scorer, package, version, digest, signal, file, line, reason, dismissed_by, dismissed_at)
+            VALUES (${d.scorer}, ${d.package}, ${d.version}, ${d.digest}, ${d.signal}, ${d.file}, ${d.line}, ${d.reason}, ${d.by}, ${d.at})
+            ON CONFLICT (package, version, digest, scorer, signal, file, line) WHERE restored_at IS NULL DO NOTHING RETURNING id`,
+        changed,
+      ),
+    restoreDismissal: (d) =>
+      run(
+        "restoreDismissal",
+        sql`UPDATE evidence_dismissals SET restored_by = ${d.by}, restored_at = ${d.at}
+            WHERE package = ${d.package} AND version = ${d.version} AND digest = ${d.digest} AND scorer = ${d.scorer}
+              AND signal = ${d.signal} AND file = ${d.file} AND line = ${d.line} AND restored_at IS NULL
+            RETURNING *`,
+        one(DismissalRow),
+      ),
     addEvent: (e) =>
       run(
         "addEvent",

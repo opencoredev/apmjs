@@ -69,7 +69,7 @@ const WorkerEnv = z.object({
     .string()
     .regex(/^[0-9a-fA-F]{64}$/, "APM_REVIEW_TOKEN_HASH must be a sha256 hex digest")
     .optional(),
-  /** Comma-separated GitHub logins that may confirm or dismiss flagged reviews. */
+  /** Comma-separated GitHub logins of apm's reviewers: they confirm or dismiss flagged reviews and dismiss score evidence. */
   APM_ADMINS: OptionalText,
   APM_REVIEW_POPULAR_WEEKLY: z.coerce.number().int().min(0).optional(),
   APM_NPM_DOWNLOADS_URL: OptionalText,
@@ -97,6 +97,7 @@ function settingsOf(env: WorkerEnv, requestUrl: string): RegistrySettings {
     upstreamUrl: upstream === "off" ? null : withSlash(upstream),
     legacyAuth: env.APM_LEGACY_AUTH,
     namePolicy: env.APM_NAME_POLICY ?? "scoped",
+    admins: (env.APM_ADMINS ?? "").split(","),
   };
 }
 

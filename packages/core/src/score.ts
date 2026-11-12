@@ -8,7 +8,7 @@ import { entryPoints, targetFiles } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
-import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type TextFinding } from "./source.ts";
+import { importsOf, joinStrings, langOf, scanFile, scanText, scanWholeText, type Confidence, type TextFinding } from "./source.ts";
 import type { TarEntry } from "./tarball.ts";
 
 export { isInlineDownload } from "./scripts.ts";
@@ -59,6 +59,22 @@ const SignalSchema = z.object({
   evidence: z.array(z.string()),
   // analyses before v4 asserted every signal
   confidence: z.enum(["confirmed", "possible"]).default("confirmed"),
+  /** Evidence past the five shown, so a reviewer's dismissal can tell when none is left. */
+  more: z.array(z.string()).optional(),
+  /** Evidence past `evidence` and `more`, counted, not kept. */
+  uncounted: z.number().optional(),
+  /** A confirmed signal's possible evidence: what the signal falls back to when every confirmed item is dismissed. */
+  fallback: z.array(z.string()).optional(),
+});
+
+/** One evidence item an apm reviewer dismissed (see `applyDismissals`), shown struck through with the reason. */
+const DismissedSchema = z.object({
+  signal: z.enum(SIGNAL_IDS),
+  file: z.string(),
+  line: z.number(),
+  evidence: z.array(z.string()),
+  reason: z.string(),
+  at: z.number(),
 });
 
 const FactsSchema = z.object({
@@ -92,6 +108,8 @@ const AnalysisSchema = z.object({
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
   skipped: z.array(SkippedSchema).default([]),
+  /** Evidence an apm reviewer dismissed for these exact bytes and this scorer; the score leaves it out. */
+  dismissed: z.array(DismissedSchema).optional(),
 });
 
 export type Signal = z.infer<typeof SignalSchema>;
@@ -101,6 +119,8 @@ export type Facts = z.infer<typeof FactsSchema>;
 export type ModuleFormat = Facts["moduleFormat"];
 
 export type Analysis = z.infer<typeof AnalysisSchema>;
+
+export type DismissedEvidence = z.infer<typeof DismissedSchema>;
 
 export type Grade = "A" | "B" | "C" | "D" | "F";
 
@@ -155,7 +175,19 @@ const POSSIBLE_LABELS: Record<CodeSignalId, string> = {
   obfuscated: "Possibly obfuscated: holds encoded or assembled text that apm did not see run",
 };
 
-function isCodeSignal(id: SignalId): id is CodeSignalId {
+/**
+ * A confirmed code signal whose every piece of evidence is a text match (no call or load the parsed program showed)
+ * says what was found, not what the code does. The points are the same: v3's rules count the match.
+ */
+const TEXT_LABELS: Record<CodeSignalId, string> = {
+  "shell-exec": "Mentions a shell command or child_process; apm did not see one started",
+  network: "Mentions a network call (fetch, http, a socket); apm did not see a request made",
+  "credential-access": "Mentions a credential file (.npmrc, .ssh) or secret variable; apm did not see one read",
+  eval: "Mentions a way to run code built at runtime (eval, Function, vm); apm did not see it called",
+  obfuscated: "Holds encoded or escaped text (base64, \\x runs, _0x names); apm did not see it run",
+};
+
+export function isCodeSignal(id: SignalId): id is CodeSignalId {
   return id in POSSIBLE_POINTS;
 }
 
@@ -298,13 +330,44 @@ export function isTestPath(path: string): boolean {
   return /(?:^|\/)(?:__tests__|__mocks__|tests?|spec)\//i.test(path) || /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path);
 }
 
-function signal(id: SignalId, all: string[], confidence: Confidence = "confirmed"): Signal {
+/** The evidence a signal shows, and what it keeps past that for a reviewer's dismissal. */
+const SHOWN_EVIDENCE = 5;
+const KEPT_EVIDENCE = 100;
+
+/** Whether a piece of evidence is a text match only, not a call or load the parsed program showed. */
+export function isTextEvidence(e: string): boolean {
+  return e.includes(TEXT_MATCH) || e.includes(TEXT_MATCH_RUN);
+}
+
+function labelOf(id: SignalId, confidence: Confidence, evidence: readonly string[]): string {
+  if (!isCodeSignal(id)) return LABELS[id];
+
+  if (confidence === "possible") return POSSIBLE_LABELS[id];
+
+  return evidence.length > 0 && evidence.every(isTextEvidence) ? TEXT_LABELS[id] : LABELS[id];
+}
+
+/** Past the shown evidence: what is kept for a reviewer's dismissal, and how many more were not kept. */
+function keepRest(out: Signal, sorted: readonly string[]): Signal {
+  if (sorted.length > SHOWN_EVIDENCE) out.more = sorted.slice(SHOWN_EVIDENCE, KEPT_EVIDENCE);
+
+  if (sorted.length > KEPT_EVIDENCE) out.uncounted = sorted.length - KEPT_EVIDENCE;
+
+  return out;
+}
+
+function signal(id: SignalId, all: string[], confidence: Confidence = "confirmed", fallback: readonly string[] = []): Signal {
   // what the package itself ships is cited before what only its tests do
-  const evidence = [...all].sort((a, b) => Number(a.includes(IN_TEST_FILE)) - Number(b.includes(IN_TEST_FILE))).slice(0, 5);
+  const sorted = [...all].sort((a, b) => Number(a.includes(IN_TEST_FILE)) - Number(b.includes(IN_TEST_FILE)));
+  const evidence = sorted.slice(0, SHOWN_EVIDENCE);
+  const label = labelOf(id, confidence, sorted);
 
-  if (confidence === "possible" && isCodeSignal(id)) return { id, label: POSSIBLE_LABELS[id], points: POSSIBLE_POINTS[id], evidence, confidence };
+  if (confidence === "possible" && isCodeSignal(id)) return keepRest({ id, label, points: POSSIBLE_POINTS[id], evidence, confidence }, sorted);
+  const out = keepRest({ id, label, points: POINTS[id], evidence, confidence: "confirmed" }, sorted);
 
-  return { id, label: LABELS[id], points: POINTS[id], evidence, confidence: "confirmed" };
+  if (isCodeSignal(id) && fallback.length > 0) out.fallback = fallback.slice(0, SHOWN_EVIDENCE);
+
+  return out;
 }
 
 /** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
@@ -408,7 +471,7 @@ type Found = {
    */
   add: (id: SignalId, ev: string, confidence?: Confidence, textOnly?: boolean) => void;
   has: (id: SignalId) => boolean;
-  get: (id: SignalId) => { evidence: string[]; confidence: Confidence } | undefined;
+  get: (id: SignalId) => { evidence: string[]; confidence: Confidence; possible: string[] } | undefined;
 };
 
 function collector(): Found {
@@ -433,7 +496,9 @@ function collector(): Found {
 
       if (!entry) return undefined;
 
-      return entry.confirmed.length > 0 ? { evidence: ranked(entry.confirmed), confidence: "confirmed" } : { evidence: ranked(entry.possible), confidence: "possible" };
+      const possible = ranked(entry.possible);
+
+      return entry.confirmed.length > 0 ? { evidence: ranked(entry.confirmed), confidence: "confirmed", possible } : { evidence: possible, confidence: "possible", possible: [] };
     },
   };
 }
@@ -445,10 +510,19 @@ function collector(): Found {
  */
 export const TEXT_MATCH = " (text match: counted unless it sits in a comment, a regex or a type)";
 
-function describeFinding(where: string, f: TextFinding): string {
+/**
+ * What a match in a comment, a regex body or an erased type says when it counts: the package runs code built from
+ * text (eval, Function, vm, a shell, a computed load), and that is how such text becomes code (`String(fn)`, `re.source`).
+ */
+export const TEXT_MATCH_RUN = " (text match in a comment, a regex or a type: counted because this package runs code built from text)";
+
+/** The signals that let a package turn text it holds into code: while one stands, comments, regex bodies and types count. */
+const RUNS_TEXT: readonly SignalId[] = ["eval", "shell-exec", "dynamic-require", "install-download"];
+
+function describeFinding(where: string, f: TextFinding, note: string = TEXT_MATCH): string {
   const how = f.how === "as written" ? "" : ` (${f.how})`;
   const why = f.confidence === "possible" ? ` [possible: ${f.why}]` : "";
-  const text = f.confidence === "confirmed" && f.tree !== true ? TEXT_MATCH : "";
+  const text = f.confidence === "confirmed" && f.tree !== true ? note : "";
 
   return `${where}:${f.line}: ${f.snippet}${how}${text}${isTestPath(where) ? IN_TEST_FILE : ""}${why}`;
 }
@@ -580,6 +654,8 @@ export function analyze(input: AnalyzeInput): Analysis {
   const sinkOnly: { path: string; finding: TextFinding }[] = [];
   let patched: string | null = null;
   const limits = new Map<string, string[]>();
+  // parsed files, with the signals their own reading confirmed: read again whole if the package runs code from text
+  const parsed: { file: TarEntry; sure: ReadonlySet<SignalId> }[] = [];
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
     if (isBinary(f)) {
@@ -616,6 +692,8 @@ export function analyze(input: AnalyzeInput): Analysis {
     if (scan.rejected && exposedOnly.has(f.path) && NOT_CODE.test(f.path)) return;
 
     for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, finding.tree !== true);
+
+    if (scan.read === "parsed") parsed.push({ file: f, sure: new Set(scan.findings.flatMap((x) => (x.confidence === "confirmed" ? [x.id] : []))) });
 
     for (const finding of scan.sinkOnly) sinkOnly.push({ path: f.path, finding });
 
@@ -672,6 +750,16 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   if (patched) for (const { path, finding } of sinkOnly) add(finding.id, describeFinding(path, finding), finding.confidence, true);
 
+  // `String(fn)` (comments included), `re.source` and a file reading itself turn left-out text into code, but only
+  // through an evaluator: while eval, Function, vm, a shell or a computed load stands, that text counts as v3 read it
+  if (RUNS_TEXT.some((id) => found.has(id))) {
+    for (const { file, sure } of parsed) {
+      for (const finding of scanWholeText(new TextDecoder().decode(file.data))) {
+        if (!sure.has(finding.id)) add(finding.id, describeFinding(file.path, finding, TEXT_MATCH_RUN), finding.confidence, true);
+      }
+    }
+  }
+
   for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
   if (unanalyzed.length > 0) {
@@ -719,7 +807,7 @@ export function analyze(input: AnalyzeInput): Analysis {
   const signals = order.flatMap((id) => {
     const got = found.get(id);
 
-    return got ? [signal(id, got.evidence, got.confidence)] : [];
+    return got ? [signal(id, got.evidence, got.confidence, got.possible)] : [];
   });
 
   const notChecked = [
@@ -765,6 +853,81 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   const score = Math.max(0, Math.min(100, raw));
 
   return { ...analysis, signals, score, grade: gradeOf(score) };
+}
+
+/** One evidence item an apm reviewer dismissed: the scorer that cited it, the signal, and the file and line it cites. */
+export type EvidenceDismissal = { scorer: string; signal: string; file: string; line: number; reason: string; at: number };
+
+/** The signals a reviewer may dismiss evidence of: what the source rules read, never a fact like an install script. */
+export const DISMISSABLE: ReadonlySet<string> = new Set<string>(["shell-exec", "network", "credential-access", "eval", "obfuscated"]);
+
+const CITED_LINE = /^([^\s:][^:\n]*?):(\d+)(?=: |$)/;
+
+/** The file and line a piece of code evidence cites (`lib/a.js:4: …`), or null when it cites none. */
+export function evidenceAt(evidence: string): { file: string; line: number } | null {
+  const m = CITED_LINE.exec(evidence);
+
+  return m?.[1] && m[2] ? { file: m[1], line: Number(m[2]) } : null;
+}
+
+/**
+ * The analysis with the evidence apm's reviewers dismissed left out, for the scorer that wrote it: a signal keeps
+ * what is left, falls back to its possible evidence when every confirmed item went, and goes when nothing is left
+ * (so `finalize` scores without it). A dismissal names a scorer, and the registry hands over only those made for
+ * this version's exact tarball digest, so none carries over to other bytes, another version or another scorer.
+ * What was dismissed stays listed in `dismissed`, with the reason, so a page can show it struck through.
+ */
+export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismissal[]): Analysis {
+  const mine = list.filter((d) => d.scorer === analysis.scorer && DISMISSABLE.has(d.signal));
+
+  if (mine.length === 0) return analysis;
+  const dismissed: DismissedEvidence[] = [];
+  const signals: Signal[] = [];
+
+  for (const s of analysis.signals) {
+    const own = mine.filter((d) => d.signal === s.id);
+    const all = [...s.evidence, ...(s.more ?? [])];
+
+    const matchOf = (e: string): EvidenceDismissal | undefined => {
+      const at = evidenceAt(e);
+
+      return at ? own.find((d) => d.file === at.file && d.line === at.line) : undefined;
+    };
+
+    const gone = own.length === 0 ? [] : all.filter((e) => matchOf(e) !== undefined);
+
+    if (gone.length === 0) {
+      signals.push(s);
+      continue;
+    }
+
+    for (const d of own) {
+      const evidence = gone.filter((e) => matchOf(e) === d);
+
+      if (evidence.length > 0) dismissed.push({ signal: s.id, file: d.file, line: d.line, evidence, reason: d.reason, at: d.at });
+    }
+
+    const left = all.filter((e) => matchOf(e) === undefined);
+    const uncounted = s.uncounted ?? 0;
+
+    if (left.length > 0 || uncounted > 0) {
+      const { more: _more, ...rest } = s;
+      // with evidence past what was kept, the label stays as the full list made it
+      const label = uncounted > 0 ? s.label : labelOf(s.id, s.confidence, left);
+
+      const kept: Signal = { ...rest, label, evidence: left.slice(0, SHOWN_EVIDENCE) };
+
+      if (left.length > SHOWN_EVIDENCE) kept.more = left.slice(SHOWN_EVIDENCE);
+      signals.push(kept);
+      continue;
+    }
+
+    const fallback = (s.fallback ?? []).filter((e) => matchOf(e) === undefined);
+
+    if (s.confidence === "confirmed" && isCodeSignal(s.id) && fallback.length > 0) signals.push(signal(s.id, fallback, "possible"));
+  }
+
+  return { ...analysis, signals, dismissed: [...(analysis.dismissed ?? []), ...dismissed] };
 }
 
 /** A stored analysis (v1 or v2), or null when the value is not one. */

@@ -1,0 +1,215 @@
+// Score evidence an apm reviewer dismisses: only a reviewer signed in on the website, with a fresh code, can do it
+// (tokens get 403); the score is recomputed without the item; nothing carries over to another version or digest;
+// an undo restores it; both go into the package's public log. Every package is inert: one names `.npmrc` in a
+// list it never reads, the way vite's dev-server deny list does.
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { z } from "zod";
+import { deviceLogin, dig, enableTotp, getJson, pkgTgz, putPublish, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
+
+const DENY = "module.exports = { deny: ['.env', '.env.*', '.npmrc'] };\n";
+
+let reg: Registry;
+let gh: FakeGitHub;
+let npm: ReturnType<typeof Bun.serve>;
+let alice: string;
+let admin: Browser;
+let adminSecret: string;
+let adminToken: string;
+let outsider: Browser;
+let outsiderSecret: string;
+
+type Item = { name: string; version: string; digest: string; scorer: string; signal: string; file: string; line: number };
+
+async function score(name: string, version: string): Promise<{ status: number; body: unknown }> {
+  return getJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`);
+}
+
+/** The credential item a version's score cites, as the version page names it. */
+async function credentialItem(name: string, version: string): Promise<Item> {
+  const s = await score(name, version);
+  const evidence = dig(s.body, "signals");
+  const cred = Array.isArray(evidence) ? evidence.find((x) => dig(x, "id") === "credential-access") : undefined;
+  const first = String(dig(cred, "evidence", 0) ?? "");
+  const m = /^([^:]+):(\d+):/.exec(first);
+
+  if (!m?.[1] || !m[2]) throw new Error(`no credential evidence: ${JSON.stringify(s.body)}`);
+
+  return { name, version, digest: String(dig(s.body, "digest")), scorer: String(dig(s.body, "scorer")), signal: "credential-access", file: m[1], line: Number(m[2]) };
+}
+
+/** What a request adds to the item: the reviewer's reason, the code, an undo's note. */
+type Extra = { reason?: string; code?: string; note?: string };
+
+const dismiss = (b: Browser, item: Item, extra: Extra = {}) => b.json("-/apm/v1/evidence-admin/dismiss", { method: "POST", body: { ...item, reason: "A deny list: the dev server refuses to serve .npmrc.", ...extra } });
+
+const restore = (b: Browser, item: Item, extra: Extra = {}) => b.json("-/apm/v1/evidence-admin/restore", { method: "POST", body: { ...item, ...extra } });
+
+/** The signal ids a score answer lists. */
+const ScoreSignals = z.object({ signals: z.array(z.object({ id: z.string() })) });
+
+async function events(name: string): Promise<{ kind: string; actor: string; detail: unknown }[]> {
+  const r = await getJson(`${reg.url}-/apm/v1/packages/${encodeURIComponent(name)}/events`);
+  const list = dig(r.body, "events");
+
+  return Array.isArray(list) ? list.map((e) => ({ kind: String(dig(e, "kind")), actor: String(dig(e, "actor")), detail: dig(e, "detail") })) : [];
+}
+
+beforeAll(async () => {
+  // a fake npm with one package: the upstream case (vite's), scored from its tarball
+  const upstreamTgz = pkgTgz({ name: "deny-list-upstream", version: "2.0.0", license: "MIT", main: "index.js" }, { "index.js": DENY });
+
+  npm = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(req) {
+      const u = new URL(req.url);
+
+      if (u.pathname === "/deny-list-upstream/-/deny-list-upstream-2.0.0.tgz") return new Response(upstreamTgz);
+
+      if (u.pathname !== "/deny-list-upstream") return Response.json({ error: "Not found" }, { status: 404 });
+
+      return Response.json({
+        name: "deny-list-upstream",
+        "dist-tags": { latest: "2.0.0" },
+        versions: {
+          "2.0.0": {
+            name: "deny-list-upstream",
+            version: "2.0.0",
+            main: "index.js",
+            license: "MIT",
+            dist: {
+              tarball: `${npm.url.toString()}deny-list-upstream/-/deny-list-upstream-2.0.0.tgz`,
+              shasum: createHash("sha1").update(upstreamTgz).digest("hex"),
+              integrity: `sha512-${createHash("sha512").update(upstreamTgz).digest("base64")}`,
+            },
+          },
+        },
+        time: { "2.0.0": "2026-11-01T00:00:00Z" },
+      });
+    },
+  });
+  gh = startFakeGitHub();
+  reg = await startRegistry({ github: gh, upstream: npm.url.toString(), upstreamTtlMs: 1, admins: ["octo-admin"] });
+  alice = await reg.mintToken({ user: "alice", scope: "publish" });
+  admin = await signInWithGitHub(reg, gh, "octo-admin");
+  adminSecret = await enableTotp(admin);
+  adminToken = (await deviceLogin(admin)).token;
+  outsider = await signInWithGitHub(reg, gh, "someone-else");
+  outsiderSecret = await enableTotp(outsider);
+}, 60_000);
+
+afterAll(async () => {
+  await reg?.stop();
+  await gh?.stop();
+  npm?.stop(true);
+});
+
+describe("dismissing score evidence", () => {
+  test("only a reviewer's website session with a fresh code can dismiss; tokens get 403", async () => {
+    expect((await putPublish(reg, alice, { name: "deny-list-a", version: "1.0.0", license: "MIT", main: "index.js" }, { files: { "index.js": DENY } })).status).toBe(201);
+    const item = await credentialItem("deny-list-a", "1.0.0");
+
+    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(75);
+    expect((await getJson(`${reg.url}-/apm/v1/evidence-admin/me`)).body).toEqual({ admin: false });
+    expect(dig((await admin.json("-/apm/v1/evidence-admin/me")).body, "admin")).toBe(true);
+    expect(dig((await outsider.json("-/apm/v1/evidence-admin/me")).body, "admin")).toBe(false);
+
+    const post = (token: string) =>
+      getJson(`${reg.url}-/apm/v1/evidence-admin/dismiss`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ ...item, reason: "x", code: totp(adminSecret) }),
+      });
+
+    expect((await getJson(`${reg.url}-/apm/v1/evidence-admin/dismiss`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...item, reason: "x" }) })).status).toBe(401);
+    // the reviewer's own CLI token, and a publisher's token, are refused
+    expect((await post(adminToken)).status).toBe(403);
+    expect((await post(alice)).status).toBe(403);
+    // a signed-in person who is not a reviewer, even with their own fresh code
+    expect((await dismiss(outsider, item, { code: totp(outsiderSecret) })).status).toBe(403);
+    // the reviewer without a fresh factor, and with a wrong one
+    expect((await dismiss(admin, item)).status).toBe(401);
+    expect((await dismiss(admin, item, { code: "000000" })).status).toBe(401);
+    // a reason is required
+    expect((await dismiss(admin, item, { reason: " ", code: totp(adminSecret) })).status).toBe(400);
+    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(75);
+  });
+
+  test("the score is recomputed without the item, which stays listed as dismissed", async () => {
+    const item = await credentialItem("deny-list-a", "1.0.0");
+    const done = await dismiss(admin, item, { code: totp(adminSecret) });
+
+    expect(done.status).toBe(200);
+    expect(dig(done.body, "score", "score")).toBe(100);
+    const s = await score("deny-list-a", "1.0.0");
+
+    expect(dig(s.body, "score")).toBe(100);
+    expect(ScoreSignals.parse(s.body).signals.map((x) => x.id)).not.toContain("credential-access");
+    expect(dig(s.body, "dismissed", 0, "signal")).toBe("credential-access");
+    expect(dig(s.body, "dismissed", 0, "reason")).toBe("A deny list: the dev server refuses to serve .npmrc.");
+    expect(String(dig(s.body, "dismissed", 0, "evidence", 0))).toContain(".npmrc");
+    // the package page, the version list and the packument's score agree
+    const pkg = await getJson(`${reg.url}-/apm/v1/packages/deny-list-a`);
+
+    expect(dig(pkg.body, "score", "score")).toBe(100);
+    expect(dig(pkg.body, "versions", 0, "score")).toBe(100);
+    expect(dig((await getJson(`${reg.url}deny-list-a`)).body, "versions", "1.0.0", "_apmScore", "score")).toBe(100);
+    // the same item cannot be dismissed twice
+    expect((await dismiss(admin, item, { code: totp(adminSecret) })).status).toBe(409);
+  });
+
+  test("a new version, another digest or another scorer is not affected", async () => {
+    expect((await putPublish(reg, alice, { name: "deny-list-a", version: "1.0.1", license: "MIT", main: "index.js" }, { files: { "index.js": DENY } })).status).toBe(201);
+    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-a", "1.0.1")).body, "dismissed")).toEqual([]);
+    const item = await credentialItem("deny-list-a", "1.0.1");
+    const otherDigest = String(dig((await score("deny-list-a", "1.0.0")).body, "digest"));
+
+    expect(otherDigest).not.toBe(item.digest);
+
+    // naming 1.0.1 with 1.0.0's digest, or a scorer that did not score it, is refused
+    expect((await dismiss(admin, { ...item, digest: otherDigest }, { code: totp(adminSecret) })).status).toBe(409);
+    expect((await dismiss(admin, { ...item, scorer: "apm-score-v7" }, { code: totp(adminSecret) })).status).toBe(409);
+    // an item the score does not cite
+    expect((await dismiss(admin, { ...item, line: 99 }, { code: totp(adminSecret) })).status).toBe(404);
+    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(75);
+  });
+
+  test("an undo restores the item and its points", async () => {
+    const s = await score("deny-list-a", "1.0.0");
+    const d = dig(s.body, "dismissed", 0);
+    const item: Item = { name: "deny-list-a", version: "1.0.0", digest: String(dig(s.body, "digest")), scorer: String(dig(s.body, "scorer")), signal: String(dig(d, "signal")), file: String(dig(d, "file")), line: Number(dig(d, "line")) };
+
+    expect((await restore(admin, item)).status).toBe(401);
+    expect((await restore(admin, item, { code: totp(adminSecret), note: "Reopened to check again." })).status).toBe(200);
+    const after = await score("deny-list-a", "1.0.0");
+
+    expect(dig(after.body, "score")).toBe(75);
+    expect(dig(after.body, "dismissed")).toEqual([]);
+    expect(ScoreSignals.parse(after.body).signals.map((x) => x.id)).toContain("credential-access");
+    expect((await restore(admin, item, { code: totp(adminSecret) })).status).toBe(404);
+  });
+
+  test("dismissals and undos are in the package's public log, with who and why", async () => {
+    const log = await events("deny-list-a");
+    const dismissed = log.find((e) => e.kind === "evidence-dismissed");
+    const restored = log.find((e) => e.kind === "evidence-restored");
+
+    expect(dismissed?.actor).toBe("octo-admin");
+    expect(dig(dismissed?.detail, "reason")).toBe("A deny list: the dev server refuses to serve .npmrc.");
+    expect(dig(dismissed?.detail, "version")).toBe("1.0.0");
+    expect(dig(dismissed?.detail, "signal")).toBe("credential-access");
+    expect(restored?.actor).toBe("octo-admin");
+    expect(dig(restored?.detail, "note")).toBe("Reopened to check again.");
+  });
+
+  test("an upstream package's evidence can be dismissed, and its log is public", async () => {
+    expect(dig((await score("deny-list-upstream", "2.0.0")).body, "score")).toBe(75);
+    const item = await credentialItem("deny-list-upstream", "2.0.0");
+
+    expect((await dismiss(admin, item, { code: totp(adminSecret) })).status).toBe(200);
+    expect(dig((await score("deny-list-upstream", "2.0.0")).body, "score")).toBe(100);
+    expect((await events("deny-list-upstream")).map((e) => e.kind)).toEqual(["evidence-dismissed"]);
+  });
+});

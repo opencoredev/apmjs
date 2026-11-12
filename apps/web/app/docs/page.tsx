@@ -1,11 +1,15 @@
 export const metadata = { title: "apm docs" };
 
+/** The "Appeal a score" issue form (.github/ISSUE_TEMPLATE/appeal-a-score.yml). */
+const APPEAL_URL = "https://github.com/opencoredev/apmjs/issues/new?template=appeal-a-score.yml";
+
 const SECTIONS = [
   { id: "bun", title: "Use it with Bun" },
   { id: "npm", title: "Use it with npm or pnpm" },
   { id: "cli", title: "The CLI" },
   { id: "pulling", title: "Pulling a bad version" },
   { id: "score", title: "What the score is, and is not" },
+  { id: "appeals", title: "Appealing a score" },
   { id: "ai-review", title: "The AI review" },
 ] as const;
 
@@ -120,6 +124,24 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
           <Text>
             A heuristic read of the tarball and publish history: install scripts, shell and network calls, credential access, eval, obfuscation, new publishers, risky new dependencies, typosquat
             names. It cannot see code that downloads a second stage at run time. Popularity is never an input.
+          </Text>
+        </Block>
+
+        <Block id="appeals">
+          <Text>
+            Some evidence in a score is wrong: a credential file named in a list of files a dev server refuses to serve, or WebAssembly counted as obfuscated code. apm does not loosen a rule to
+            fix one package. A person at apm reads the evidence and can dismiss that one item, for that one version&apos;s exact tarball.
+          </Text>
+          <Text>
+            The score is then computed without it. The version page keeps the item, struck through, with &ldquo;Dismissed by an apm reviewer&rdquo;, the reason and the date, and the dismissal goes
+            into the package&apos;s public log with who made it. It never carries over to another version, to other bytes, or to a later version of the scorer, and it can be undone.
+          </Text>
+          <Text>
+            To ask for one, open an{" "}
+            <a href={APPEAL_URL} className="text-foreground underline underline-offset-4" target="_blank" rel="noopener noreferrer">
+              Appeal a score
+            </a>{" "}
+            issue with the package, the version, the cited line, and what the code does with it.
           </Text>
         </Block>
 

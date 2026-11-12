@@ -127,9 +127,28 @@ const NOT_TS: readonly Lang[] = ["script", "module"];
 // ---------- the v7 review's families: proofs v7 took that the code did not honour ----------
 
 /** A family a shape belongs to, so the coverage check can ask that each one is drawn. */
-type Family = "conversion" | "with" | "default-parameter" | "reflected" | "local-eval" | "custom-fetch" | "unparsed-patch";
+type Family = "conversion" | "with" | "default-parameter" | "reflected" | "local-eval" | "custom-fetch" | "unparsed-patch" | "text-runtime";
 
 type FamilyWrapper = CodeWrapper & { family: Family };
+
+/** Line terminators: a regex literal cannot hold one, and a line comment ends at each. */
+const LINE_BREAK = /[\n\r\u2028\u2029]/;
+
+/** `code` in a function's comment, read back with `String(f)` and run: node's function source keeps its comments. */
+function commentSource(code: string): string {
+  if (!code.includes("*/")) return `function txt_(){/*${code}*/}eval(String(txt_).slice(18,-3));`;
+
+  if (!LINE_BREAK.test(code)) return `function txt_(){//${code}\n}eval(String(txt_).slice(18,-2));`;
+
+  return `eval(${q(code)});`;
+}
+
+/** `code` as a regex body, every special character escaped, read back with `re.source`, unescaped and run. */
+function regexSource(code: string): string {
+  if (LINE_BREAK.test(code)) return commentSource(code);
+
+  return `const re_=/${code.replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&")}/;eval(re_.source.replace(/\\\\(.)/g,'$1'));`;
+}
 
 /** Indirect eval of an object's own `s`, from inside a conversion hook. */
 const RUN_S = "(0,eval)(this.s)";
@@ -158,6 +177,9 @@ const FAMILY_WRAPPERS: readonly FamilyWrapper[] = [
   { family: "local-eval", langs: SLOPPY, name: "local-eval-reads-dead", wrap: (c) => `function f(){const s=${q(c)};const eval=globalThis.eval;eval('eval(s)')}f();` },
   // a fetch apm cannot identify, handed a data: URL, can turn it into anything
   { family: "custom-fetch", name: "data-local-method", wrap: (c) => `function run(send){const o={fetch(u){return send(u.slice(5))}};o.fetch('data:'+${q(c)})}run(globalThis.eval);` },
+  // text the floor leaves out (a comment, a regex body) read back as text and run: the evaluator lets it count
+  { family: "text-runtime", name: "comment-function-source", wrap: commentSource },
+  { family: "text-runtime", name: "regex-source", wrap: regexSource },
   { family: "custom-fetch", name: "data-global-replaced", wrap: (c) => `const original=globalThis.fetch;globalThis.fetch=function(u){globalThis.fetch=original;return (0,eval)(u.slice(5))};fetch('data:'+${q(c)});` },
 ];
 
@@ -431,7 +453,7 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
 
     for (let i = 0; i < CI_CASES; i++) for (const n of makeCase(r).names) seen.add(n);
 
-    const families: Family[] = ["conversion", "with", "default-parameter", "reflected", "local-eval", "custom-fetch", "unparsed-patch"];
+    const families: Family[] = ["conversion", "with", "default-parameter", "reflected", "local-eval", "custom-fetch", "unparsed-patch", "text-runtime"];
     const missing = [...SURROUNDINGS.map((s) => s.name), ...PAYLOADS.map((_, i) => `payload:${i}`), "padded", "wildcard-export", "unparsed-patch", ...families.map((f) => `family:${f}`)].filter((n) => !seen.has(n));
 
     expect(missing).toEqual([]);

@@ -14,6 +14,8 @@ export type RegistrySettings = {
   readonly legacyAuth: boolean;
   /** "scoped": new packages live under the publisher's GitHub login. "open": bare names allowed (tests, legacy). */
   readonly namePolicy: NamePolicy;
+  /** GitHub logins (APM_ADMINS) of apm's reviewers: they decide AI review flags and dismiss score evidence. */
+  readonly admins: readonly string[];
 };
 
 export class RegistryConfig extends Context.Service<RegistryConfig, RegistrySettings>()("@apm/registry/RegistryConfig") {}

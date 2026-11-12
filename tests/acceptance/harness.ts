@@ -113,6 +113,8 @@ export type StartOptions = {
   github?: FakeGitHub;
   /** Turns on the AI review queue and routes. */
   review?: ReviewOptions;
+  /** GitHub logins of apm's reviewers (APM_ADMINS), without turning the AI review on. */
+  admins?: readonly string[];
   /** Worker variables to set or override (APM_PUBLIC_URL, APM_ALLOW_LEGACY_IN_PROD, ...). */
   env?: Readonly<Record<string, string>>;
 };
@@ -134,7 +136,10 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   if (opts.github) options.github = { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints };
 
-  const env = { ...reviewEnv(opts.review), ...opts.env };
+  const admins: Record<string, string> = {};
+
+  if (opts.admins) admins.APM_ADMINS = opts.admins.join(",");
+  const env = { ...admins, ...reviewEnv(opts.review), ...opts.env };
 
   if (Object.keys(env).length > 0) options.env = env;
   const srv = await startWorkerRegistry(options);

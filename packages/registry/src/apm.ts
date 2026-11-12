@@ -38,6 +38,7 @@ import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
+import { digestLabel, digestOf } from "./digest.ts";
 import { Store, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, parseBody } from "./http.ts";
@@ -85,6 +86,21 @@ export function reportFor(v: VersionRecord, at: number, opts: { ignoreRecent?: b
     status: v.status,
     statusReason: v.status_reason,
   });
+}
+
+/**
+ * What a page needs to name one evidence item for a reviewer's dismissal (the scorer and these bytes' digest), the
+ * items already dismissed, and the signals without the evidence kept only for dismissals.
+ */
+function reviewable(v: VersionRecord, r: ScoreReport) {
+  const d = digestOf(v);
+
+  return {
+    scorer: r.scorer,
+    digest: d ? digestLabel(d) : null,
+    signals: r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, ...s }) => s),
+    dismissed: r.dismissed ?? [],
+  };
 }
 
 function compact(r: ScoreReport): CompactScore {
@@ -750,6 +766,7 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
       publishedAt: new Date(v.published_at).toISOString(),
       publishedBy: v.published_by,
       ...report,
+      ...reviewable(v, report),
       previous: prev && prevReport ? { version: prev.version, score: prevReport.score, grade: prevReport.grade } : null,
       changes: prev && prevReport ? signalChanges(prevReport.signals, report.signals) : [],
     });
@@ -807,7 +824,7 @@ const packageResponse = (name: string) =>
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
       facts: latestReport?.facts ?? null,
-      score: latestReport ? { score: latestReport.score, grade: latestReport.grade, signals: latestReport.signals, notChecked: latestReport.notChecked } : null,
+      score: latest && latestReport ? { score: latestReport.score, grade: latestReport.grade, notChecked: latestReport.notChecked, ...reviewable(latest, latestReport) } : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 200)
@@ -832,8 +849,10 @@ const eventsResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
 
-    if (!(yield* store.getPackage(name))) return fail(404, "Not found");
     const events = yield* store.eventsFor(name);
+
+    // a package proxied from upstream has a log only for what apm's reviewers did to it (dismissed evidence)
+    if (events.length === 0 && !(yield* store.getPackage(name))) return fail(404, "Not found");
 
     return json({ name, events: events.map((e) => ({ kind: e.kind, actor: e.actor, at: new Date(e.at).toISOString(), detail: e.detail })) });
   });

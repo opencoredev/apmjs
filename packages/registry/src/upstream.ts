@@ -3,6 +3,7 @@
 import { Context, Effect, Layer, Option } from "effect";
 import { z } from "zod";
 import { Blobs } from "./blobs.ts";
+import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { Store, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
@@ -58,24 +59,7 @@ const UpSearch = z.object({ objects: z.array(z.unknown()), total: z.number().opt
 export type UpstreamSearch = { kind: "ok"; objects: UpSearchObject[]; total: number } | { kind: "unavailable" };
 
 /** The checksum the upstream publishes for a tarball: sha512 when it has one, else the legacy sha1. */
-export type Digest = { algo: "sha512" | "sha1"; hex: string };
-
-export function digestOf(v: { integrity: string; shasum: string }): Digest | null {
-  if (v.integrity.startsWith("sha512-")) {
-    const raw = Buffer.from(v.integrity.slice("sha512-".length), "base64");
-
-    if (raw.length === 64) return { algo: "sha512", hex: raw.toString("hex") };
-  }
-
-  if (/^[0-9a-f]{40}$/i.test(v.shasum)) return { algo: "sha1", hex: v.shasum.toLowerCase() };
-
-  return null;
-}
-
-/** "sha512-<hex>": names a tarball's bytes; stored analyses are keyed by it. */
-export function digestLabel(d: Digest): string {
-  return `${d.algo}-${d.hex}`;
-}
+export { digestLabel, digestOf, type Digest } from "./digest.ts";
 
 /** The blob key a verified upstream tarball is cached under: the same content address local tarballs use. */
 export function upstreamBlobKey(d: Digest): string {

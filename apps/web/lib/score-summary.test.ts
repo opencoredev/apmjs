@@ -45,3 +45,12 @@ test("shortLabel stops at the first explanation", () => {
   expect(shortLabel("Starts shell commands or child processes, or loads child_process")).toBe("Starts shell commands or child processes");
   expect(shortLabel("Contains obfuscated code")).toBe("Contains obfuscated code");
 });
+
+test("a signal backed only by text matches reads as a mention on the phone too", () => {
+  // the labels apm-score-v8 gives a confirmed signal the parsed program did not see happen (packages/core/src/score.ts)
+  const credential = signal({ id: "credential-access", label: "Mentions a credential file (.npmrc, .ssh) or secret variable; apm did not see one read", points: -25 });
+  const shell = signal({ id: "shell-exec", label: "Mentions a shell command or child_process; apm did not see one started", points: -15 });
+
+  expect(scoreLineText(scoreLine([shell, credential]))).toBe("Mentions a credential file · −25 points +1 more");
+  expect(scoreLineText(scoreLine([shell]))).toBe("Mentions a shell command or child_process · −15 points");
+});

@@ -45,7 +45,7 @@ async function mint(req: Request, env: TestEnv, clock: ReturnType<typeof Clock.f
 
   if (!body.success) return fail(400, body.error.message);
   const parsed = parseEnv(env);
-  const settings = { baseUrl: "http://localhost/", webUrl: "http://localhost/", upstreamUrl: null, legacyAuth: false, namePolicy: "open" as const };
+  const settings = { baseUrl: "http://localhost/", webUrl: "http://localhost/", upstreamUrl: null, legacyAuth: false, namePolicy: "open" as const, admins: [] };
   const { user, scope } = body.data;
 
   const program = Effect.gen(function* () {

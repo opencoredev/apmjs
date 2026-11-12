@@ -15,6 +15,14 @@ const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(),
 
 export type Signal = z.infer<typeof Signal>;
 
+/** Evidence an apm reviewer dismissed for this exact version: shown struck through, with the reason. */
+const Dismissed = z.object({ signal: z.string(), file: z.string(), line: z.number(), evidence: z.array(z.string()), reason: z.string(), at: z.number() });
+
+export type Dismissed = z.infer<typeof Dismissed>;
+
+// what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out
+const Reviewable = { scorer: z.string().optional(), digest: z.string().nullish(), dismissed: z.array(Dismissed).default([]) };
+
 const Facts = z.object({
   moduleFormat: z.enum(["esm", "cjs", "dual"]),
   types: z.enum(["bundled", "none"]),
@@ -42,7 +50,7 @@ const PackageInfo = z.object({
   maintainers: z.array(z.string()),
   latest: z.string().nullable(),
   facts: Facts.nullable(),
-  score: z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional() }).nullable(),
+  score: z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable }).nullable(),
   versions: z.array(
     z.object({
       version: z.string(),
@@ -114,7 +122,7 @@ export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> 
 /** The public AI review of one version. "missing" when the registry has AI review off or does not know the version. */
 export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer);
 
-const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional() });
+const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
 
 /** One version's full score, for a version other than latest. */
 export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>

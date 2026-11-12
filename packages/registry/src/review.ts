@@ -462,12 +462,12 @@ export const considerUpstream = (pkg: UpstreamPackage) =>
 
 // ---------- viewers ----------
 /** Who is asking. A website session carries its sign-in, which review decisions check a fresh factor against. */
-type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: { kind: "token" } | { kind: "session"; session: SignedIn } };
+export type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: { kind: "token" } | { kind: "session"; session: SignedIn } };
 
 /** A viewer signed in on the website. */
-type SessionViewer = Extract<Viewer, { kind: "user" }> & { via: { kind: "session"; session: SignedIn } };
+export type SessionViewer = Extract<Viewer, { kind: "user" }> & { via: { kind: "session"; session: SignedIn } };
 
-const viewerOf = (req: Request, caller: Caller) =>
+export const viewerOf = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
     const store = yield* Store;
 
@@ -505,7 +505,7 @@ const isMaintainer = (v: Viewer, name: string) =>
   v.kind === "user" ? Effect.map(Store.use((store) => store.owners(name)), (owners) => owners.includes(v.user.name)) : Effect.succeed(false);
 
 /** Cookie-authenticated writes must come from the website or the registry itself. */
-const checkOrigin = (req: Request, v: Viewer) =>
+export const checkOrigin = (req: Request, v: Viewer) =>
   Effect.gen(function* () {
     const origin = req.headers.get("origin");
 
@@ -591,7 +591,7 @@ function privateView(r: StoredReview) {
   };
 }
 
-const resolveVersion = (name: string, version: string | undefined) =>
+export const resolveVersion = (name: string, version: string | undefined) =>
   Effect.gen(function* () {
     if (!version) return yield* Effect.fail(refuse(404, "Name a version."));
     const cat: Catalog = yield* catalog(name);
