@@ -61,6 +61,7 @@ export class Upstream {
   private inflight = new Map<string, Promise<Probe>>();
   private searchCache = new Map<string, { at: number; result: Extract<UpstreamSearch, { kind: "ok" }> }>();
   private searchInflight = new Map<string, Promise<UpstreamSearch>>();
+  private scopeCache = new Map<string, { at: number; answer: "found" | "absent" }>();
   constructor(
     readonly baseUrl: string,
     private readonly ttlMs = 60_000,
@@ -104,6 +105,29 @@ export class Upstream {
     } catch {
       return { kind: "unavailable" };
     }
+  }
+
+  /**
+   * Whether `@scope` has packages upstream. npm answers /-/org/<scope>/package for user and org scopes
+   * alike: 200 with a map of packages, or 404 "Scope not found".
+   */
+  async scopeExists(scope: string): Promise<"found" | "absent" | "unknown"> {
+    const hit = this.scopeCache.get(scope);
+    if (hit && Date.now() - hit.at < this.ttlMs) return hit.answer;
+    let answer: "found" | "absent" | "unknown";
+    try {
+      const res = await fetch(`${this.baseUrl}-/org/${encodeURIComponent(scope)}/package`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(5_000) });
+      if (res.status === 404) answer = "absent";
+      else if (res.status !== 200) answer = "unknown";
+      else {
+        const body = z.record(z.string(), z.unknown()).safeParse(await res.json());
+        answer = body.success ? (Object.keys(body.data).length > 0 ? "found" : "absent") : "unknown";
+      }
+    } catch {
+      answer = "unknown";
+    }
+    if (answer !== "unknown") this.scopeCache.set(scope, { at: Date.now(), answer });
+    return answer;
   }
 
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */

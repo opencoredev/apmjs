@@ -312,9 +312,10 @@ function revokeVersion(ctx: Ctx, v: VersionRecord, actor: string, reason: string
 }
 
 const Password = z.string().min(1).optional();
-const StateBody = z.object({ name: z.string(), version: z.string(), reason: z.string().optional(), password: Password });
-const IncidentBody = z.object({ since: z.string(), reason: z.string().optional(), password: Password, dryRun: z.boolean().optional() });
-const OwnerBody = z.object({ name: z.string(), user: z.string(), password: Password });
+const Otp = z.string().min(1).optional();
+const StateBody = z.object({ name: z.string(), version: z.string(), reason: z.string().optional(), password: Password, otp: Otp });
+const IncidentBody = z.object({ since: z.string(), reason: z.string().optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
+const OwnerBody = z.object({ name: z.string(), user: z.string(), password: Password, otp: Otp });
 
 async function readJson(req: Request): Promise<unknown> {
   const enc = req.headers.get("content-encoding") ?? "";
@@ -332,12 +333,11 @@ async function parseBody<T>(req: Request, schema: z.ZodType<T>): Promise<Parsed<
   }
 }
 
-/** Destructive actions need the account password on top of the bearer token. */
-async function reauth(ctx: Ctx, auth: Auth, password: string | undefined): Promise<Response | { user: string }> {
+/** Destructive actions need a fresh second factor on top of the bearer token (a password only in legacy mode). */
+async function reauth(ctx: Ctx, auth: Auth, proof: { password?: string | undefined; otp?: string | undefined }): Promise<Response | { user: string }> {
   if (auth.kind !== "user") return fail(401, "Log in first (apm login).");
-  if (!password) return fail(401, "This action needs your account password as well as a token (apm asks for it; agents pass --password-stdin). A stolen publish token alone cannot revoke.");
-  const u = ctx.store.getUser(auth.user);
-  if (!u || !(await Bun.password.verify(password, u.password_hash))) return fail(401, "Incorrect password.");
+  const refused = await ctx.access.secondFactor({ user: auth.user, password: proof.password, otp: proof.otp });
+  if (refused) return fail(refused.status, refused.error);
   return { user: auth.user };
 }
 
@@ -350,10 +350,10 @@ function requireOwner(ctx: Ctx, user: string, name: string): Response | null {
 async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | "unyank" | "revoke" | "restore"): Promise<Response> {
   const parsed = await parseBody(req, StateBody);
   if (!parsed.ok) return parsed.res;
-  const { name, version, reason, password } = parsed.value;
+  const { name, version, reason, password, otp } = parsed.value;
   let user: string;
   if (action === "revoke" || action === "restore") {
-    const who = await reauth(ctx, auth, password);
+    const who = await reauth(ctx, auth, { password, otp });
     if (who instanceof Response) return who;
     user = who.user;
   } else {
@@ -418,7 +418,7 @@ async function handleState(req: Request, ctx: Ctx, auth: Auth, action: "yank" | 
 async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, IncidentBody);
   if (!parsed.ok) return parsed.res;
-  const who = await reauth(ctx, auth, parsed.value.password);
+  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp });
   if (who instanceof Response) return who;
   // `since` is exclusive: pass the time of the last publish you trust.
   const since = Date.parse(parsed.value.since);
@@ -441,13 +441,15 @@ async function handleIncident(req: Request, ctx: Ctx, auth: Auth): Promise<Respo
     for (const v of targets) statuses[`${v.package}@${v.version}`] = revokeVersion(ctx, v, user, `incident: ${reason}`);
   });
   const tokensRevoked = ctx.store.revokeTokensOf(user, ctx.now());
-  return json({ ok: true, user, since: new Date(since).toISOString(), revoked: ids, statuses, tokensRevoked, next: "Every token is revoked. Change your password, log in again with apm login, then read each package's event log." });
+  return json({ ok: true, user, since: new Date(since).toISOString(), revoked: ids, statuses, tokensRevoked, next: ctx.access.legacyAuth
+      ? "Every token is revoked. Change your password, log in again with apm login, then read each package's event log."
+      : "Every token is revoked. Check your GitHub account's security, run apm login again, then read each package's event log." });
 }
 
 async function handleOwners(req: Request, ctx: Ctx, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, OwnerBody);
   if (!parsed.ok) return parsed.res;
-  const who = await reauth(ctx, auth, parsed.value.password);
+  const who = await reauth(ctx, auth, { password: parsed.value.password, otp: parsed.value.otp });
   if (who instanceof Response) return who;
   const denied = requireOwner(ctx, who.user, parsed.value.name);
   if (denied) return denied;

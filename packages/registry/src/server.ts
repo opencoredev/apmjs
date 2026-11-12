@@ -1,13 +1,34 @@
 // HTTP routing for the npm wire protocol plus the apm extensions under /-/apm/v1.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { z } from "zod";
 import { editDistance } from "@apm/core";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 
-export type Ctx = { store: Store; now: () => number; baseUrl: () => string };
-export type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: string };
+export type NamePolicy = "scoped" | "open";
+export type Refusal = { status: number; error: string };
+/** Who may publish what, and how. Built in index.ts from the auth setup and the upstream. */
+export type Access = {
+  /** npm's password adduser and password re-auth. Off in production. */
+  legacyAuth: boolean;
+  namePolicy: NamePolicy;
+  /** The website: approval links and the device page live here. Ends with "/". */
+  webUrl: () => string;
+  /** Why `user` may not publish a first version of `name`, or null. */
+  newNameRefusal: (input: { name: string; user: string }) => Promise<Refusal | null>;
+  /** Why `user` may not stage a publish (no passkey or 2FA), or null. */
+  stageRefusal: (user: string) => Refusal | null;
+  /** Why `user` may not do a destructive action with this proof (password only in legacy mode, or a TOTP code), or null. */
+  secondFactor: (input: { user: string; password?: string | undefined; otp?: string | undefined }) => Promise<Refusal | null>;
+};
+export type Ctx = { store: Store; now: () => number; baseUrl: () => string; access: Access };
+/** "publish" tokens go live at once (legacy logins, test tokens, later CI trusted publishing); "stage" tokens need approval. */
+export type TokenScope = "publish" | "stage";
+export type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: string; scope: TokenScope };
+
+/** A staged version waits this long for approval. */
+export const STAGE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // ---------- responses ----------
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -66,12 +87,20 @@ function authOf(req: Request, ctx: Ctx): Auth {
   const tok = ctx.store.getToken(tokenHash);
   if (!tok || tok.revoked_at !== null) return { kind: "anon" };
   if (tok.expires_at !== null && tok.expires_at < ctx.now()) return { kind: "anon" };
-  return { kind: "user", user: tok.user, tokenHash };
+  return { kind: "user", user: tok.user, tokenHash, scope: tok.scope === "stage" ? "stage" : "publish" };
 }
-export function issueToken(ctx: Ctx, user: string, label: string, ttlMs: number | null = null): string {
+export function issueToken(ctx: Ctx, input: { user: string; label: string; scope: TokenScope; ttlMs?: number }): string {
   const token = newToken();
   const at = ctx.now();
-  ctx.store.insertToken({ token_hash: hashToken(token), user, label, scope: "publish", created_at: at, expires_at: ttlMs === null ? null : at + ttlMs, revoked_at: null });
+  ctx.store.insertToken({
+    token_hash: hashToken(token),
+    user: input.user,
+    label: input.label,
+    scope: input.scope,
+    created_at: at,
+    expires_at: input.ttlMs === undefined ? null : at + input.ttlMs,
+    revoked_at: null,
+  });
   return token;
 }
 
@@ -190,6 +219,10 @@ export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean, ex
 export function tarballPath(ctx: Ctx, name: string, version: string): string {
   return join(ctx.store.tarballDir, ...name.split("/"), `${tarballBase(name)}-${version}.tgz`);
 }
+/** Staged tarballs sit outside the served tree until approval. */
+export function stagedTarballPath(ctx: Ctx, id: string): string {
+  return join(ctx.store.tarballDir, "..", "staged", `${id}.tgz`);
+}
 
 // ---------- publish ----------
 const Attachment = z.object({ data: z.string(), length: z.number().optional(), content_type: z.string().optional() });
@@ -223,16 +256,13 @@ export type Extensions = {
   routes?: (req: Request, url: URL, ctx: Ctx, auth: Auth) => Promise<Response | null> | Response | null;
 };
 
-function canPublishName(ctx: Ctx, name: string, user: string): { ok: true } | { ok: false; status: number; error: string } {
+/** Why `user` may not publish to `name` (owners for existing packages, the name policy for new ones), or null. */
+export async function publishRefusal(ctx: Ctx, name: string, user: string): Promise<Refusal | null> {
   const pkg = ctx.store.getPackage(name);
   if (pkg) {
-    return ctx.store.owners(name).includes(user) ? { ok: true } : { ok: false, status: 403, error: `You do not have permission to publish "${name}". Owners: ${ctx.store.owners(name).join(", ")}` };
+    return ctx.store.owners(name).includes(user) ? null : { status: 403, error: `You do not have permission to publish "${name}". Owners: ${ctx.store.owners(name).join(", ")}` };
   }
-  if (name.startsWith("@")) {
-    const scope = name.slice(1, name.indexOf("/"));
-    if (scope !== user) return { ok: false, status: 403, error: `Scope @${scope} belongs to another user or org.` };
-  }
-  return { ok: true };
+  return ctx.access.newNameRefusal({ name, user });
 }
 
 async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, ext: Extensions): Promise<Response> {
@@ -245,8 +275,8 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   }
   if (body.name !== name) return fail(400, `Body name ${body.name} does not match URL ${name}`);
   if (!isValidName(name)) return fail(400, `Invalid package name "${name}"`);
-  const perm = canPublishName(ctx, name, auth.user);
-  if (!perm.ok) return fail(perm.status, perm.error);
+  const perm = await publishRefusal(ctx, name, auth.user);
+  if (perm) return fail(perm.status, perm.error);
 
   if (!body._attachments || Object.keys(body._attachments).length === 0) {
     return handleMetadataUpdate(ctx, name, body, auth.user);
@@ -265,8 +295,14 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (existing && ctx.store.getVersion(name, version)) {
     return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
   }
-  const shasum = createHash("sha1").update(tarball).digest("hex");
-  const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
+  if (auth.scope === "stage") {
+    const pending = ctx.store.pendingStaged(name, version);
+    if (pending && pending.expires_at > ctx.now()) {
+      return fail(409, `${name}@${version} is already waiting for approval: ${approvalUrl(ctx, pending.id)}`);
+    }
+    const noFactor = ctx.access.stageRefusal(auth.user);
+    if (noFactor) return fail(noFactor.status, noFactor.error);
+  }
 
   let score: unknown = null;
   let storedManifest: Record<string, unknown> = manifest;
@@ -277,51 +313,109 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     storedManifest = verdict.manifest;
   }
 
-  const at = ctx.now();
-  const path = tarballPath(ctx, name, version);
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, tarball);
   const cleanManifest: Record<string, unknown> = { ...storedManifest };
   for (const k of ["_id", "dist", "_npmUser", "_attachments", "readme", "_resolved", "_integrity", "_from"]) delete cleanManifest[k];
-  const requestedTag = Object.keys(body["dist-tags"])[0] ?? "latest";
+  const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
+  const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
+  const shasum = createHash("sha1").update(tarball).digest("hex");
+  const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
 
-  ctx.store.tx(() => {
-    if (!existing) ctx.store.createPackage(name, at, auth.user);
-    ctx.store.insertVersion({
+  if (auth.scope === "stage") {
+    const at = ctx.now();
+    const id = randomBytes(12).toString("base64url");
+    const path = stagedTarballPath(ctx, id);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, tarball);
+    ctx.store.insertStaged({
+      id,
       package: name,
       version,
       manifest: cleanManifest,
       shasum,
       integrity,
       size: tarball.length,
-      published_at: at,
-      published_by: auth.user,
+      tag,
+      readme,
       score,
+      staged_by: auth.user,
+      staged_at: at,
+      expires_at: at + STAGE_TTL_MS,
     });
-    const pkg = ctx.store.getPackage(name);
+    const link = approvalUrl(ctx, id);
+    const expiresAt = new Date(at + STAGE_TTL_MS).toISOString();
+    // bun prints this header as "note: ...", npm as "npm notice ...": that is how the link reaches a person.
+    const notice = `${name}@${version} is uploaded but NOT live. A person must approve it within 24h: ${link}`;
+    return json({ ok: true, success: true, staged: true, id, approvalUrl: link, expiresAt, message: notice }, 202, { "npm-notice": notice });
+  }
+
+  commitVersion(ctx, { name, version, manifest: cleanManifest, tarball, shasum, integrity, tag, readme, score, publisher: auth.user, detail: {} });
+  return json({ ok: true, id: name, rev: `${ctx.now()}`, success: true, score }, 201);
+}
+
+export function approvalUrl(ctx: Ctx, id: string): string {
+  return `${ctx.access.webUrl()}approve/${id}`;
+}
+
+/** Makes a version live: tarball in place, version row, dist-tags, package metadata and the publish event. */
+export function commitVersion(
+  ctx: Ctx,
+  v: {
+    name: string;
+    version: string;
+    manifest: Record<string, unknown>;
+    tarball: Uint8Array | { stagedPath: string };
+    shasum: string;
+    integrity: string;
+    tag: string;
+    readme: string | null;
+    score: unknown;
+    publisher: string;
+    detail: Record<string, unknown>;
+  },
+): void {
+  const at = ctx.now();
+  const path = tarballPath(ctx, v.name, v.version);
+  mkdirSync(dirname(path), { recursive: true });
+  if (v.tarball instanceof Uint8Array) writeFileSync(path, v.tarball);
+  else renameSync(v.tarball.stagedPath, path);
+  const size = v.tarball instanceof Uint8Array ? v.tarball.length : readFileSync(path).length;
+  const existing = ctx.store.getPackage(v.name);
+
+  ctx.store.tx(() => {
+    if (!existing) ctx.store.createPackage(v.name, at, v.publisher);
+    ctx.store.insertVersion({
+      package: v.name,
+      version: v.version,
+      manifest: v.manifest,
+      shasum: v.shasum,
+      integrity: v.integrity,
+      size,
+      published_at: at,
+      published_by: v.publisher,
+      score: v.score,
+    });
+    const pkg = ctx.store.getPackage(v.name);
     const tags = { ...(pkg?.distTags ?? {}) };
-    const isPrerelease = version.includes("-");
+    const isPrerelease = v.version.includes("-");
     const currentLatest = tags.latest;
     // a prerelease never takes `latest` once a stable release exists; it goes to `next`
-    const tag = requestedTag === "latest" && isPrerelease && currentLatest ? "next" : requestedTag;
-    if (tag === "latest" && currentLatest && Bun.semver.order(version, currentLatest) < 0) {
+    const tag = v.tag === "latest" && isPrerelease && currentLatest ? "next" : v.tag;
+    if (tag === "latest" && currentLatest && Bun.semver.order(v.version, currentLatest) < 0) {
       // publishing an older line (a 1.x backport) never moves latest backwards
     } else {
-      tags[tag] = version;
+      tags[tag] = v.version;
     }
-    ctx.store.setDistTags(name, tags, at);
-    const description = typeof manifest.description === "string" ? manifest.description : undefined;
-    const keywords = Array.isArray(manifest.keywords) ? manifest.keywords.filter((k): k is string => typeof k === "string") : undefined;
-    const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : undefined);
-    ctx.store.updatePackageMeta(name, {
+    ctx.store.setDistTags(v.name, tags, at);
+    const description = typeof v.manifest.description === "string" ? v.manifest.description : undefined;
+    const keywords = Array.isArray(v.manifest.keywords) ? v.manifest.keywords.filter((k): k is string => typeof k === "string") : undefined;
+    ctx.store.updatePackageMeta(v.name, {
       modifiedAt: at,
       ...(description !== undefined ? { description } : {}),
       ...(keywords !== undefined ? { keywords } : {}),
-      ...(readme !== undefined ? { readme } : {}),
+      ...(v.readme !== null ? { readme: v.readme } : {}),
     });
-    ctx.store.addEvent({ package: name, kind: "publish", actor: auth.user, at, detail: { version, tag: requestedTag } });
+    ctx.store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
   });
-  return json({ ok: true, id: name, rev: `${at}`, success: true, score }, 201);
 }
 
 function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: string): Response {
@@ -376,6 +470,9 @@ const UserBody = z.object({ name: z.string().min(1), password: z.string().min(1)
 const USER_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
 
 async function handleAddUser(req: Request, ctx: Ctx, rawName: string): Promise<Response> {
+  if (!ctx.access.legacyAuth) {
+    return fail(403, "Password accounts are off on this registry. Run `apm login`: it opens your browser to sign in with GitHub, and the token works with npm and bun too.");
+  }
   let body: z.infer<typeof UserBody>;
   try {
     body = UserBody.parse(await req.json());
@@ -389,11 +486,11 @@ async function handleAddUser(req: Request, ctx: Ctx, rawName: string): Promise<R
   if (existing) {
     const ok = await Bun.password.verify(body.password, existing.password_hash);
     if (!ok) return fail(401, "Incorrect username or password.");
-    return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, name, "cli login") }, 201);
+    return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "publish" }) }, 201);
   }
   if (body.password.length < 8) return fail(400, "Password must be at least 8 characters.");
   ctx.store.createUser({ name, password_hash: await Bun.password.hash(body.password), email: body.email ?? "", created_at: ctx.now() });
-  return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, name, "cli login") }, 201);
+  return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "publish" }) }, 201);
 }
 
 // ---------- search ----------

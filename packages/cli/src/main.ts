@@ -11,7 +11,7 @@ import { loadConfig, saveToken } from "./config.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection } from "./pm.ts";
 
 const VERSION = "0.1.0";
-const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password"]);
+const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
 
 type Args = { cmd: string; positional: string[]; flags: Map<string, string | true>; raw: string[] };
 
@@ -106,6 +106,30 @@ async function readPassword(a: Args): Promise<string> {
   const answer = await readHidden();
   process.stdout.write("\n");
   return answer;
+}
+
+type Proof = { password?: string; otp?: string };
+
+/**
+ * The second factor for revoke, restore, incident and owner changes: --otp <code>, or a password on
+ * legacy password registries. Without either, a terminal is asked for the code; Enter skips it, which
+ * works when you confirmed with your passkey on the website in the last 10 minutes.
+ */
+async function readProof(a: Args): Promise<Proof> {
+  if (flag(a, "password") || has(a, "password-stdin")) return { password: await readPassword(a) };
+  const otp = flag(a, "otp");
+  if (otp) return { otp };
+  if (!process.stdin.isTTY) return {};
+  const answer = prompt("Code from your authenticator app (Enter to skip if you just confirmed on the website):");
+  return answer && answer.trim() ? { otp: answer.trim() } : {};
+}
+
+function errorOf(body: unknown, status: number): string {
+  if (typeof body === "object" && body !== null) {
+    if ("message" in body && typeof body.message === "string") return body.message;
+    if ("error" in body && typeof body.error === "string") return body.error;
+  }
+  return `HTTP ${status}`;
 }
 
 function readHidden(): Promise<string> {
@@ -378,9 +402,9 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
     warn("apm revoke needs --reason; everyone with this version installed will see it.");
     return 2;
   }
-  const needsPassword = action === "revoke" || action === "restore";
-  const password = needsPassword ? await readPassword(a) : undefined;
-  const r = await api.raw(`-/apm/v1/${action}`, { method: "POST", body: { name: parsed.name, version: parsed.range, ...(reason ? { reason } : {}), ...(password ? { password } : {}) } });
+  const needsFactor = action === "revoke" || action === "restore";
+  const proof = needsFactor ? await readProof(a) : {};
+  const r = await api.raw(`-/apm/v1/${action}`, { method: "POST", body: { name: parsed.name, version: parsed.range, ...(reason ? { reason } : {}), ...proof } });
   if (r.status !== 200) {
     warn(red(`apm ${action} failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));
     return 1;
@@ -398,8 +422,8 @@ async function cmdIncident(a: Args): Promise<number> {
     return 2;
   }
   const api = new Api(loadConfig(process.cwd(), env()));
-  const password = await readPassword(a);
-  const body = { since, reason: flag(a, "reason") ?? "account compromised", password, dryRun: has(a, "dry-run") };
+  const proof = await readProof(a);
+  const body = { since, reason: flag(a, "reason") ?? "account compromised", ...proof, dryRun: has(a, "dry-run") };
   const r = await api.raw("-/apm/v1/incident", { method: "POST", body });
   if (r.status !== 200) {
     warn(red(`apm incident failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));
@@ -413,7 +437,62 @@ async function cmdIncident(a: Args): Promise<number> {
 }
 
 // ---------- login ----------
+const DeviceStart = z.object({ deviceCode: z.string(), userCode: z.string(), verificationUrl: z.string(), verificationUrlComplete: z.string(), interval: z.number(), expiresIn: z.number() });
+const DeviceDone = z.object({ token: z.string(), username: z.string() });
+
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
+  try {
+    Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore", stdin: "ignore" }).unref();
+  } catch {
+    // no browser here: the URL is printed
+  }
+}
+
+/** Device login: the browser signs in (GitHub or Vercel) and approves the code; the CLI gets a token that stages publishes. */
 async function cmdLogin(a: Args): Promise<number> {
+  if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
+  const cfg = loadConfig(process.cwd(), env());
+  const api = new Api({ ...cfg, token: null });
+  const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
+  const d = DeviceStart.safeParse(start.body);
+  if (start.status !== 200 || !d.success) {
+    warn(red(`login failed: ${errorOf(start.body, start.status)}`));
+    return 1;
+  }
+  const code = d.data.userCode.length === 8 ? `${d.data.userCode.slice(0, 4)}-${d.data.userCode.slice(4)}` : d.data.userCode;
+  process.stdout.write(`Open ${d.data.verificationUrlComplete}\nand check that it shows the code ${bold(code)}, then approve.\n`);
+  const canOpen = !has(a, "no-browser") && process.stdout.isTTY === true && (process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY));
+  if (canOpen) openBrowser(d.data.verificationUrlComplete);
+  say(dim("Waiting for the browser…"));
+  let interval = Math.max(1, d.data.interval) * 1000;
+  const deadline = Date.now() + d.data.expiresIn * 1000;
+  while (Date.now() < deadline) {
+    await Bun.sleep(interval);
+    const r = await api.raw("-/apm/v1/login/device/token", { method: "POST", body: { deviceCode: d.data.deviceCode } });
+    if (r.status === 200) {
+      const done = DeviceDone.parse(r.body);
+      saveToken(cfg.userconfig, cfg.registry, done.token);
+      say(`${green("✓")} logged in to ${cfg.registry} as ${bold(done.username)}`);
+      say(dim(`  token saved to ${cfg.userconfig}; npm, pnpm and bun read it from there`));
+      say(dim(`  publishes with it wait for you to approve them in the browser`));
+      return 0;
+    }
+    const err = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "";
+    if (err === "authorization_pending") continue;
+    if (err === "slow_down") {
+      interval += 1000;
+      continue;
+    }
+    warn(red(`login failed: ${errorOf(r.body, r.status)}`));
+    return 1;
+  }
+  warn(red("login failed: the code expired before it was approved. Run apm login again."));
+  return 1;
+}
+
+/** npm's password login, for registries that run with legacy auth on. */
+async function cmdPasswordLogin(a: Args): Promise<number> {
   const cfg = loadConfig(process.cwd(), env());
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
@@ -428,7 +507,7 @@ async function cmdLogin(a: Args): Promise<number> {
   });
   const tok = z.object({ token: z.string() }).safeParse(r.body);
   if ((r.status !== 201 && r.status !== 200) || !tok.success) {
-    warn(red(`login failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));
+    warn(red(`login failed: ${errorOf(r.body, r.status)}`));
     return 1;
   }
   saveToken(cfg.userconfig, cfg.registry, tok.data.token);
@@ -567,6 +646,14 @@ async function cmdPublish(a: Args): Promise<number> {
     warn(red(`apm publish: ${det.pm} publish failed for ${id}`));
     return pub.code;
   }
+  // A login token stages the version: the registry answers with an approval link in its notice.
+  const approval = /(https?:\/\/\S+?\/approve\/[A-Za-z0-9_-]+)/.exec(pub.out)?.[1];
+  if (approval) {
+    say(`${yellow("●")} ${bold(id)} is uploaded but not live yet: it is waiting for approval.`);
+    say(`  Approve it within 24h with your passkey or authenticator code: ${bold(approval)}`);
+    say(dim("  If an agent ran this publish, it should hand this link to you."));
+    return 0;
+  }
   say(`${green("✓")} published ${bold(id)}${tag ? ` with tag ${tag}` : ""} via ${det.pm}`);
   return 0;
 }
@@ -580,13 +667,13 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
   apm audit                  installed versions vs revocations and advisories
   apm yank|unyank <pkg>@<v>  hide from new installs (lockfiles keep working)
-  apm revoke <pkg>@<v> --reason "..."   pull a malicious version (asks for your password)
+  apm revoke <pkg>@<v> --reason "..."   pull a malicious version (asks for your authenticator code)
   apm restore <pkg>@<v>      undo a mistaken revoke (back to yanked)
   apm incident --since <time> [--dry-run]   account compromised: revoke tokens and recent versions
-  apm login | whoami
+  apm login | whoami        sign in through the browser; publishes then wait for your approval
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
 
-Flags: --pm bun|npm|pnpm|yarn, --force, --no-cooldown, --json, --password-stdin
+Flags: --pm bun|npm|pnpm|yarn, --force, --no-cooldown, --json, --otp <code>, --no-browser
 Registry: APM_REGISTRY or registry= in .npmrc (default ${"https://apmjs.dev/"})`;
 
 async function passthrough(a: Args): Promise<number> {

@@ -70,6 +70,35 @@ CREATE TABLE IF NOT EXISTS events (
   detail TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS events_pkg ON events(package, at);
+CREATE TABLE IF NOT EXISTS staged (
+  id TEXT PRIMARY KEY,
+  package TEXT NOT NULL,
+  version TEXT NOT NULL,
+  manifest TEXT NOT NULL,
+  shasum TEXT NOT NULL,
+  integrity TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  tag TEXT NOT NULL,
+  readme TEXT,
+  score TEXT,
+  staged_by TEXT NOT NULL,
+  staged_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  decided_at INTEGER,
+  decided_by TEXT
+);
+CREATE INDEX IF NOT EXISTS staged_pkg ON staged(package, version);
+CREATE TABLE IF NOT EXISTS stepups (
+  auth_user_id TEXT PRIMARY KEY,
+  at INTEGER NOT NULL,
+  method TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS github_profiles (
+  github_id TEXT PRIMARY KEY,
+  login TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upstream_analysis (
   package TEXT NOT NULL,
   version TEXT NOT NULL,
@@ -78,9 +107,24 @@ CREATE TABLE IF NOT EXISTS upstream_analysis (
 );
 `;
 
+/** Columns added after the first schema; each is added once to an existing database. */
+const ADDED_COLUMNS: { table: string; column: string; decl: string }[] = [
+  { table: "users", column: "auth_user_id", decl: "TEXT" },
+  { table: "users", column: "github_id", decl: "TEXT" },
+  { table: "users", column: "github_login", decl: "TEXT" },
+];
+
 export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
 
-const UserRow = z.object({ name: z.string(), password_hash: z.string(), email: z.string(), created_at: z.number() });
+const UserRow = z.object({
+  name: z.string(),
+  password_hash: z.string(),
+  email: z.string(),
+  created_at: z.number(),
+  auth_user_id: z.string().nullable(),
+  github_id: z.string().nullable(),
+  github_login: z.string().nullable(),
+});
 const TokenRow = z.object({
   token_hash: z.string(),
   user: z.string(),
@@ -125,6 +169,25 @@ const AdvisoryRow = z.object({
   created_at: z.number(),
   created_by: z.string(),
 });
+export type StagedStatus = "pending" | "approved" | "rejected" | "expired";
+const StagedRow = z.object({
+  id: z.string(),
+  package: z.string(),
+  version: z.string(),
+  manifest: z.string(),
+  shasum: z.string(),
+  integrity: z.string(),
+  size: z.number(),
+  tag: z.string(),
+  readme: z.string().nullable(),
+  score: z.string().nullable(),
+  staged_by: z.string(),
+  staged_at: z.number(),
+  expires_at: z.number(),
+  status: z.enum(["pending", "approved", "rejected", "expired"]),
+  decided_at: z.number().nullable(),
+  decided_by: z.string().nullable(),
+});
 const EventRow = z.object({ id: z.number(), package: z.string(), kind: z.string(), actor: z.string(), at: z.number(), detail: z.string() });
 
 export type User = z.infer<typeof UserRow>;
@@ -138,6 +201,8 @@ export type VersionRecord = Omit<z.infer<typeof VersionRow>, "manifest" | "score
   score: unknown;
 };
 export type Advisory = Omit<z.infer<typeof AdvisoryRow>, "versions"> & { versions: string[] };
+export type StagedRecord = Omit<z.infer<typeof StagedRow>, "manifest" | "score"> & { manifest: Record<string, unknown>; score: unknown };
+export type NewStaged = Omit<StagedRecord, "status" | "decided_at" | "decided_by">;
 export type EventRecord = Omit<z.infer<typeof EventRow>, "detail"> & { detail: unknown };
 
 const StringRecord = z.record(z.string(), z.string());
@@ -159,6 +224,11 @@ export class Store {
     this.db = new Database(join(dataDir, "registry.sqlite"), { create: true });
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    for (const c of ADDED_COLUMNS) {
+      const cols = this.db.query(`PRAGMA table_info(${c.table})`).all().map((r) => z.object({ name: z.string() }).parse(r).name);
+      if (!cols.includes(c.column)) this.db.exec(`ALTER TABLE ${c.table} ADD COLUMN ${c.column} ${c.decl}`);
+    }
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_auth_user ON users(auth_user_id) WHERE auth_user_id IS NOT NULL");
   }
 
   close(): void {
@@ -170,8 +240,78 @@ export class Store {
     const row = this.db.query("SELECT * FROM users WHERE name = ?").get(name);
     return row ? UserRow.parse(row) : null;
   }
-  createUser(u: User): void {
-    this.db.query("INSERT INTO users (name, password_hash, email, created_at) VALUES (?, ?, ?, ?)").run(u.name, u.password_hash, u.email, u.created_at);
+  getUserByAuthId(authUserId: string): User | null {
+    const row = this.db.query("SELECT * FROM users WHERE auth_user_id = ?").get(authUserId);
+    return row ? UserRow.parse(row) : null;
+  }
+  createUser(u: Pick<User, "name" | "password_hash" | "email" | "created_at"> & Partial<Pick<User, "auth_user_id" | "github_id" | "github_login">>): void {
+    this.db
+      .query("INSERT INTO users (name, password_hash, email, created_at, auth_user_id, github_id, github_login) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(u.name, u.password_hash, u.email, u.created_at, u.auth_user_id ?? null, u.github_id ?? null, u.github_login ?? null);
+  }
+  /** Binds an existing name to a signed-in account and its GitHub identity. */
+  bindUser(name: string, link: { authUserId: string; githubId: string; githubLogin: string }): void {
+    this.db.query("UPDATE users SET auth_user_id = ?, github_id = ?, github_login = ? WHERE name = ?").run(link.authUserId, link.githubId, link.githubLogin, name);
+  }
+
+  // GitHub logins seen at sign-in, by GitHub's numeric id
+  setGitHubProfile(githubId: string, login: string, at: number): void {
+    this.db.query("INSERT OR REPLACE INTO github_profiles (github_id, login, updated_at) VALUES (?, ?, ?)").run(githubId, login, at);
+  }
+  gitHubLogin(githubId: string): string | null {
+    const row = this.db.query("SELECT login FROM github_profiles WHERE github_id = ?").get(githubId);
+    return row ? z.object({ login: z.string() }).parse(row).login : null;
+  }
+
+  // step-up: the last time an account proved a second factor
+  setStepup(authUserId: string, at: number, method: string): void {
+    this.db.query("INSERT OR REPLACE INTO stepups (auth_user_id, at, method) VALUES (?, ?, ?)").run(authUserId, at, method);
+  }
+  stepupAt(authUserId: string): number | null {
+    const row = this.db.query("SELECT at FROM stepups WHERE auth_user_id = ?").get(authUserId);
+    return row ? z.object({ at: z.number() }).parse(row).at : null;
+  }
+
+  // staged versions: uploaded with a login token, waiting for a person to approve
+  private toStaged(row: unknown): StagedRecord {
+    const r = StagedRow.parse(row);
+    return { ...r, manifest: JsonObject.parse(parseJson(r.manifest)), score: r.score ? parseJson(r.score) : null };
+  }
+  insertStaged(s: NewStaged): void {
+    this.db
+      .query(
+        "INSERT INTO staged (id, package, version, manifest, shasum, integrity, size, tag, readme, score, staged_by, staged_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(s.id, s.package, s.version, JSON.stringify(s.manifest), s.shasum, s.integrity, s.size, s.tag, s.readme, s.score === null ? null : JSON.stringify(s.score), s.staged_by, s.staged_at, s.expires_at);
+  }
+  getStaged(id: string): StagedRecord | null {
+    const row = this.db.query("SELECT * FROM staged WHERE id = ?").get(id);
+    return row ? this.toStaged(row) : null;
+  }
+  pendingStaged(name: string, version: string): StagedRecord | null {
+    const row = this.db.query("SELECT * FROM staged WHERE package = ? AND version = ? AND status = 'pending' ORDER BY staged_at DESC LIMIT 1").get(name, version);
+    return row ? this.toStaged(row) : null;
+  }
+  /** Pending versions this user staged or may approve as an owner, newest first. */
+  pendingFor(user: string): StagedRecord[] {
+    return this.db
+      .query(
+        "SELECT * FROM staged WHERE status = 'pending' AND (staged_by = ? OR package IN (SELECT package FROM owners WHERE user = ?)) ORDER BY staged_at DESC LIMIT 100",
+      )
+      .all(user, user)
+      .map((r) => this.toStaged(r));
+  }
+  decideStaged(id: string, d: { status: Exclude<StagedStatus, "pending">; at: number; by: string }): void {
+    this.db.query("UPDATE staged SET status = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(d.status, d.at, d.by, id);
+  }
+  /** Marks pending versions past their deadline as expired; returns their ids. */
+  expireStaged(now: number): string[] {
+    const ids = this.db
+      .query("SELECT id FROM staged WHERE status = 'pending' AND expires_at <= ?")
+      .all(now)
+      .map((r) => z.object({ id: z.string() }).parse(r).id);
+    if (ids.length > 0) this.db.query("UPDATE staged SET status = 'expired', decided_at = ?, decided_by = 'registry' WHERE status = 'pending' AND expires_at <= ?").run(now, now);
+    return ids;
   }
 
   // tokens
@@ -186,6 +326,9 @@ export class Store {
   }
   listTokens(user: string): Token[] {
     return this.db.query("SELECT * FROM tokens WHERE user = ? ORDER BY created_at DESC").all(user).map((r) => TokenRow.parse(r));
+  }
+  revokeToken(hash: string, at: number): void {
+    this.db.query("UPDATE tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL").run(at, hash);
   }
   revokeTokensOf(user: string, at: number): number {
     return this.db.query("UPDATE tokens SET revoked_at = ? WHERE user = ? AND revoked_at IS NULL").run(at, user).changes;
