@@ -426,8 +426,12 @@ function noReadmeCopy({ name, source, hasLinks }: { name: string; source: NoRead
 }
 
 /** No readme to render: says why, and offers the package's own links instead. */
-function NoReadme({ name, source, links }: { name: string; source: NoReadmeSource; links: readonly PackageLink[] }) {
-  const { title, body } = noReadmeCopy({ name, source, hasLinks: links.length > 0 });
+function NoReadme({ name, source, links, unscorable = false }: { name: string; source: NoReadmeSource; links: readonly PackageLink[]; unscorable?: boolean }) {
+  // a version apm cannot score has a tarball the registry does not open: reloading will not bring its README
+  const { title, body } =
+    unscorable && source.kind === "unknown"
+      ? { title: "Readme not shown", body: `The registry does not open this version's tarball (see the score above), so it could not look for a README there.${links.length > 0 ? " Its own links may have documentation:" : ""}` }
+      : noReadmeCopy({ name, source, hasLinks: links.length > 0 });
 
   return (
     <div className="flex flex-col gap-2 rounded-xl border px-4 py-4 sm:px-5">
@@ -585,13 +589,13 @@ function AiReviewLoading({ version }: { version: string }) {
 }
 
 /** The readme from npm's packument, or, when it has none, from the shown version's tarball. */
-async function ReadmeSlot(props: { name: string; pkg: PackageInfo; version: string | null; tarball: Promise<Fetched<TarballReadme> | null>; links: readonly PackageLink[] }) {
+async function ReadmeSlot(props: { name: string; pkg: PackageInfo; version: string | null; tarball: Promise<Fetched<TarballReadme> | null>; links: readonly PackageLink[]; unscorable: boolean }) {
   const readme = readmeSource({ packument: props.pkg.readme, version: props.version, tarball: await props.tarball });
 
   return readme.kind === "packument" || readme.kind === "tarball" ? (
     <ReadmeSection name={props.name} readme={readme.text} repository={props.pkg.repository} origin={readme.kind === "tarball" ? { path: readme.path, version: readme.version } : null} />
   ) : (
-    <NoReadme name={props.name} source={readme} links={props.links} />
+    <NoReadme name={props.name} source={readme} links={props.links} unscorable={props.unscorable} />
   );
 }
 
@@ -751,7 +755,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
           <section aria-labelledby="readme" className="order-7 lg:order-none">
             <SectionTitle id="readme">Readme</SectionTitle>
             <Suspense fallback={<Skeleton className="h-12 w-full rounded-xl" />}>
-              <ReadmeSlot name={pkg.name} pkg={pkg} version={version} tarball={tarballReadme} links={links} />
+              <ReadmeSlot name={pkg.name} pkg={pkg} version={version} tarball={tarballReadme} links={links} unscorable={unscorable} />
             </Suspense>
           </section>
 

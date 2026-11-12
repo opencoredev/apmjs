@@ -34,7 +34,7 @@ Resolves each package to the newest version that passes the policy, checks its d
 | `--cooldown <duration>` | Skip versions younger than this. `24h` (default), `90m`, `2d`, `0`. A bare number is hours. |
 | `--no-cooldown` | Same as `--cooldown 0`. |
 | `--floor <n>` | Refuse versions scoring below `n`. Default `40`. Dependencies are always checked at 40 or the stricter floor you ask for. |
-| `--force` | Lift the floor and the cooldown for the named packages only. Revoked and yanked versions, unknown names and dangerous dependencies stay blocked. |
+| `--force` | Lift the floor and the cooldown for the named packages only. Revoked and yanked versions, versions apm has not scored or cannot score, unknown names and dangerous dependencies stay blocked. |
 | `-D`, `--dev` | Add as a dev dependency. |
 
 With `--json`:

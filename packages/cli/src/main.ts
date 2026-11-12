@@ -293,7 +293,7 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
     say(dim("  --force lifts the score floor and the cooldown for the named package only; its dependencies are still checked."));
   }
 
-  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, unknown names and dangerous dependencies stay blocked.`);
+  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm has not scored or cannot score, unknown names and dangerous dependencies stay blocked.`);
 }
 
 const DistSchema = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose() }).loose()) }).loose();

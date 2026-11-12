@@ -17,7 +17,7 @@ describe("unscoredNotice", () => {
     const n = unscoredNotice({ pkg: { latest: "16.4.6", unscored: { kind: "unscorable", reason: "too-large", text: TOO_LARGE }, versions: [row("16.4.6", TOO_LARGE)] }, version: "16.4.6" });
 
     expect(n.kind).toBe("unscorable");
-    expect(n.text).toBe(`A${TOO_LARGE.slice(1)}. Installs through apm refuse it.`);
+    expect(n.text).toBe(`${TOO_LARGE}. Installs through apm refuse it.`);
     expect(n.text).not.toContain("queued");
   });
 

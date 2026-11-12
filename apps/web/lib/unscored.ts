@@ -15,7 +15,7 @@ export function unscoredNotice(input: { pkg: Pick<PackageInfo, "unscored" | "ver
   if (isLatest && pkg.unscored) {
     switch (pkg.unscored.kind) {
       case "unscorable":
-        return { kind: "unscorable", text: `${capitalized(pkg.unscored.text)}. Installs through apm refuse it.` };
+        return { kind: "unscorable", text: `${pkg.unscored.text}. Installs through apm refuse it.` };
       case "queued":
         return { kind: "queued", text: "Not scored yet: its tarball is queued for analysis. Check back in a minute." };
       case "unreadable":
@@ -30,11 +30,8 @@ export function unscoredNotice(input: { pkg: Pick<PackageInfo, "unscored" | "ver
 
   const row = pkg.versions.find((v) => v.version === version);
 
-  if (row?.unscorable) return { kind: "unscorable", text: `${capitalized(row.unscorable)}. Installs through apm refuse it.` };
+  // the registry's sentence starts with "apm", which stays lowercase
+  if (row?.unscorable) return { kind: "unscorable", text: `${row.unscorable}. Installs through apm refuse it.` };
 
   return { kind: "unknown", text: "Not scored yet." };
-}
-
-function capitalized(s: string): string {
-  return s.length === 0 ? s : `${s[0]?.toUpperCase() ?? ""}${s.slice(1)}`;
 }
