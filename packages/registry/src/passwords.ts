@@ -8,24 +8,19 @@ export const PASSWORD_WINDOW_MS = 15 * 60 * 1000;
 
 export type PasswordCheck = "ok" | "bad" | "locked";
 
-/** Checks `password` against `hash` unless the account is locked out; counts a wrong one and clears the count on success. */
+/**
+ * Checks `password` against `hash` unless the account is locked out. The attempt is counted as a failure before
+ * the (slow) hash check, atomically, so concurrent wrong guesses are all counted; a correct one clears the count.
+ */
 export async function checkPassword(input: { store: Store; user: string; password: string; hash: string; now: number }): Promise<PasswordCheck> {
   const { store, user, now } = input;
-  const f = store.passwordFailures(user);
-  const live = f !== null && now - f.since < PASSWORD_WINDOW_MS;
 
-  if (live && f.count >= MAX_PASSWORD_FAILURES) return "locked";
+  if (store.reservePasswordAttempt({ user, now, max: MAX_PASSWORD_FAILURES, windowMs: PASSWORD_WINDOW_MS }) === "locked") return "locked";
   const ok = input.hash !== "" && (await Bun.password.verify(input.password, input.hash));
 
-  if (ok) {
-    if (f) store.setPasswordFailures(user, null);
+  if (ok) store.setPasswordFailures(user, null);
 
-    return "ok";
-  }
-
-  store.setPasswordFailures(user, live ? { count: f.count + 1, since: f.since } : { count: 1, since: now });
-
-  return "bad";
+  return ok ? "ok" : "bad";
 }
 
 export const LOCKED_MESSAGE = `Too many wrong passwords for this account. Wait ${PASSWORD_WINDOW_MS / 60_000} minutes and try again.`;

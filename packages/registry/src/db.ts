@@ -310,6 +310,24 @@ export class Store {
     if (f === null) this.db.query("DELETE FROM password_failures WHERE user = ?").run(user);
     else this.db.query("INSERT OR REPLACE INTO password_failures (user, count, since) VALUES (?, ?, ?)").run(user, f.count, f.since);
   }
+  /**
+   * Counts one password attempt before it is checked, in one write transaction: "locked" when the account
+   * already has `max` failures inside the window. Concurrent guesses each take one, so none sees a stale count.
+   * A correct password clears the count afterwards (setPasswordFailures(user, null)).
+   */
+  reservePasswordAttempt(input: { user: string; now: number; max: number; windowMs: number }): "reserved" | "locked" {
+    return this.db
+      .transaction((): "reserved" | "locked" => {
+        const f = this.passwordFailures(input.user);
+        const live = f !== null && input.now - f.since < input.windowMs;
+
+        if (live && f.count >= input.max) return "locked";
+        this.setPasswordFailures(input.user, live ? { count: f.count + 1, since: f.since } : { count: 1, since: input.now });
+
+        return "reserved";
+      })
+      .immediate();
+  }
 
   // staged versions: uploaded with a login token, waiting for a person to approve
   private toStaged(row: unknown): StagedRecord {
