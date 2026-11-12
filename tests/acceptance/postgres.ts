@@ -54,7 +54,8 @@ async function startPostgres(): Promise<Postgres> {
 
   if (init.status !== 0) throw new Error(`initdb failed: ${init.stderr}`);
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const opts = `-p ${port} -k ${dir} -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=400`;
+  // TCP only: a Unix socket under a nested TMPDIR (scripts/score.ts, the hygiene test) can pass the 107-byte path limit
+  const opts = `-p ${port} -c unix_socket_directories='' -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=400`;
   const start = spawnSync(join(bin, "pg_ctl"), ["-D", data, "-o", opts, "-l", join(dir, "log"), "-w", "start"], { encoding: "utf8" });
 
   if (start.status !== 0) throw new Error(`pg_ctl start failed: ${start.stderr}${start.stdout}`);
