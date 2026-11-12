@@ -41,6 +41,11 @@ export function isValidRange(r: string): boolean {
 
 const TAG_RE = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
 
+/** A dist-tag name: a letter, then letters, digits, dot, dash or underscore, and never something npm would read as a version or range (`v1`, `x`). */
+export function isValidTagName(tag: string): boolean {
+  return TAG_RE.test(tag) && !isValidRange(tag);
+}
+
 /** What one dependency entry asks the package manager to install. `key` is the folder name in node_modules. */
 export type DependencySpec =
   | { kind: "registry"; key: string; name: string; range: string; aliased: boolean }

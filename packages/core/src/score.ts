@@ -1,11 +1,16 @@
-// apm-score-v1: a per-version safety score. Pure functions, tarball and history in, report out.
+// apm-score: a per-version safety score. Pure functions, tarball and history in, report out.
 // 100 means nothing risky was found. Every deduction is a named signal with evidence.
 // Popularity is deliberately not an input: it is gameable and says nothing about compromise.
+// What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
-import { describeSkip, MAX_ANALYZED_FILE_BYTES, type SkippedFile } from "./limits.ts";
+import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
+import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
+import { importsOf, joinStrings, scanText, type TextFinding } from "./source.ts";
 import type { TarEntry } from "./tarball.ts";
+
+export { isInlineDownload } from "./scripts.ts";
 
 export const SIGNAL_IDS = [
   "install-script",
@@ -26,12 +31,15 @@ export const SIGNAL_IDS = [
   "deprecated",
   "yanked",
   "revoked",
+  "git-install-script",
+  "dynamic-require",
+  "unanalyzed-files",
 ] as const;
 
 export type SignalId = (typeof SIGNAL_IDS)[number];
 
-/** v2 lists the files it could not read; v1 analyses (stored before) read as having skipped nothing. */
-export const SCORER = "apm-score-v2";
+/** v2 lists the files it could not read. v3 reads every file, follows install-script indirection and decodes cheap encodings. */
+export const SCORER = "apm-score-v3";
 const SignalSchema = z.object({ id: z.enum(SIGNAL_IDS), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
 
 const FactsSchema = z.object({
@@ -45,16 +53,22 @@ const FactsSchema = z.object({
   dependencyCount: z.number(),
 });
 
-const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large"]) });
+const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large", "over-budget"]) });
 
+/** What a static read of the tarball cannot see. Shown with every score; docs/SCORE.md explains each. */
 export const NOT_CHECKED: readonly string[] = [
   "runtime behavior: code that downloads, decrypts or builds a second stage while running",
+  "code hidden by anything but base64, hex, \\x escapes, char codes or joined string literals (XOR, compression, a custom encoding)",
+  "names built at runtime other than by joining string literals (array lookups, reversed strings, computed indexes)",
+  "documentation, type, JSON, style and markup files that no code reaches by a path apm can read; a computed require is reported as dynamic-require",
+  "native binaries and WebAssembly: listed, not read",
+  "a popular name reused under another scope (@someone/react): scopes exist so names can be reused",
   "the code of dependencies beyond their own scores",
   "whether the publisher's machine or CI was compromised",
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -97,6 +111,10 @@ export const POINTS: Record<SignalId, number> = {
   deprecated: -5,
   yanked: 0,
   revoked: -100,
+  "git-install-script": -10,
+  // informational: plugin loaders do this honestly, and every file is read anyway; it marks code apm could not follow
+  "dynamic-require": 0,
+  "unanalyzed-files": -20,
 };
 
 const LABELS: Record<SignalId, string> = {
@@ -104,80 +122,72 @@ const LABELS: Record<SignalId, string> = {
   "shell-exec": "Starts shell commands or child processes",
   network: "Makes network requests",
   "credential-access": "Reads credential files or secret environment variables",
-  eval: "Evaluates code built at runtime (eval, new Function, vm)",
+  eval: "Evaluates code built at runtime (eval, Function, vm)",
   obfuscated: "Contains obfuscated code",
   binary: "Ships compiled binaries that cannot be reviewed as source",
   "new-publisher": "Published by an account that never published this package before",
   "no-license": "No license declared",
-  typosquat: "Name is one typo away from a popular package",
-  "install-download": "Install script downloads or runs code inline (curl | sh, node -e with network)",
+  typosquat: "Name looks like a popular package's",
+  "install-download": "Install script downloads or runs code inline (curl | sh, npx, node -e with network)",
   "risky-dependency": "Depends on a package that scores below the floor",
   "new-dependency": "Adds dependencies the previous version did not have",
-  incomplete: "Some code was too large to analyze, so this version is unverified",
+  incomplete: "Some code that runs was too large to analyze, so this version is unverified",
   recent: "Published less than 24 hours ago; most malicious versions are caught within hours",
   deprecated: "Deprecated by its maintainer",
   yanked: "Yanked: hidden from new installs by its maintainer",
   revoked: "Revoked: pulled as malicious or compromised",
+  "git-install-script": "Runs shell or network commands when installed from git (prepare, prepack)",
+  "dynamic-require": "Loads code by a name built at runtime, so apm could not tell which file runs",
+  "unanalyzed-files": "Some files were not analyzed: the package is larger than the analysis reads",
 };
 
-const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh|ps1|py)$/;
-const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"] as const;
+/** Files that run by name: node, bun, deno, shells, PowerShell and Python. */
+const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh|bash|ps1|py|cmd|bat)$/i;
 
-const RULES: { id: "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated"; re: RegExp }[] = [
-  { id: "shell-exec", re: /\bchild_process\b|\bexec(?:File)?Sync\s*\(|\bspawnSync\s*\(|\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b|\bBun\.spawn\b|\bBun\.\$|\bDeno\.Command\b/ },
-  {
-    id: "network",
-    re: /\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\(\s*['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]\s*\)|from\s+['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]|\bXMLHttpRequest\b|\bnew\s+WebSocket\b|\bcurl\s+|\bwget\s+|\bdns\.(?:resolve|lookup)\b|\bimport\s*\(\s*['"`]https?:\/\//,
-  },
-  {
-    id: "credential-access",
-    re: /\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|AWS_SECRET_ACCESS_KEY|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/,
-  },
-  {
-    id: "eval",
-    re: /(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b|\[\s*(['"`])[\w$]{0,8}\1\s*\+\s*(['"`])[\w$]{0,8}\2\s*\]|=\s*require\s*[;,\n]|\brequire\s*\(\s*String\.fromCharCode/,
-  },
-  { id: "obfuscated", re: /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/ },
-];
+/**
+ * Files that never run by their name: docs, types, source maps, JSON, styles and markup. They are read
+ * when code reaches them by a path apm can resolve; otherwise they are left out, or every README with
+ * `curl ... | sh` in its install instructions would read as a dropper.
+ */
+const NOT_CODE = /(?:^|\/)(?:readme|changelog|changes|history|license|licence|copying|authors|contributors|notice|security|code_of_conduct)(?:\.[\w.-]*)?$|\.(?:md|markdown|mdx|txt|rst|adoc|d\.[cm]?ts|map|json|jsonc|json5|ya?ml|toml|css|scss|sass|less|styl|html?|svg|xml|csv|tsv|lock|flow)$/i;
 
-/** obfuscator.io output: twenty or more `_0x1a2b` identifiers. Counted in one linear pass (a regex with a
- *  repeated `[\s\S]*` backtracks exponentially on large files). Returns the first one's index, or -1. */
-function hexIdentifierRun(text: string): number {
-  const re = /_0x[0-9a-f]{4,}/g;
-  let first = -1;
-  let n = 0;
-
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    if (first < 0) first = m.index;
-
-    if (++n >= 20) return first;
-  }
-
-  return -1;
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function lineOf(text: string, index: number): { line: number; snippet: string } {
-  const before = text.slice(0, index);
-  const line = before.split("\n").length;
-  const start = before.lastIndexOf("\n") + 1;
-  const end = text.indexOf("\n", index);
-  const snippet = text.slice(start, end === -1 ? undefined : end).trim().slice(0, 80);
-
-  return { line, snippet };
-}
-
+/** Executables and native modules: never read, reported as `binary`. */
 function isBinary(e: TarEntry): boolean {
-  if (e.path.endsWith(".node") || e.path.endsWith(".exe") || e.path.endsWith(".dll") || e.path.endsWith(".so") || e.path.endsWith(".dylib")) return true;
+  if (/\.(?:node|exe|dll|so|dylib)$/.test(e.path)) return true;
   const d = e.data;
 
   if (d.length < 4) return false;
   const magic = ((d[0] ?? 0) << 24) | ((d[1] ?? 0) << 16) | ((d[2] ?? 0) << 8) | (d[3] ?? 0);
 
   return magic === 0x7f454c46 || magic === 0xcffaedfe || magic === 0xfeedfacf || magic === 0xcafebabe || (d[0] === 0x4d && d[1] === 0x5a && e.path.endsWith(".exe"));
+}
+
+/** Images, fonts, archives and WebAssembly, recognised by their first bytes. JavaScript cannot start with these. */
+function isBinaryData(e: TarEntry): boolean {
+  const d = e.data;
+
+  if (d.length < 4) return false;
+  const b = (i: number): number => d[i] ?? -1;
+  const ascii = (s: string, at = 0): boolean => [...s].every((c, i) => b(at + i) === c.charCodeAt(0));
+
+  return (
+    (b(0) === 0x89 && ascii("PNG", 1)) ||
+    (b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) ||
+    ascii("GIF8") ||
+    (ascii("RIFF") && ascii("WEBP", 8)) ||
+    ascii("wOFF") ||
+    ascii("wOF2") ||
+    ascii("OTTO") ||
+    (b(0) === 0 && b(1) === 1 && b(2) === 0 && b(3) === 0) ||
+    (b(0) === 0 && ascii("asm", 1)) ||
+    (b(0) === 0x1f && b(1) === 0x8b) ||
+    (ascii("PK") && b(2) === 3 && b(3) === 4) ||
+    ascii("%PDF")
+  );
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function hasTypesCondition(v: unknown): boolean {
@@ -203,6 +213,8 @@ export function moduleFormatOf(manifest: Record<string, unknown>): ModuleFormat 
 
   return "cjs";
 }
+
+const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"] as const;
 
 export function installScriptsOf(manifest: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
@@ -240,17 +252,7 @@ function signal(id: SignalId, evidence: string[]): Signal {
   return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5) };
 }
 
-/** The canonical dropper shape: an install command that fetches or evaluates remote code itself. */
-export function isInlineDownload(cmd: string): boolean {
-  if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(cmd)) return true;
-
-  if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
-  const inlineEval = /\b(?:node|bun|deno)\s+(?:-e|--eval|-p|--print|eval)\b/.test(cmd);
-
-  return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
-}
-
-/** Paths an install-script command runs: `node setup`, `sh ./install.sh`, `bun x.ts`. */
+/** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
 export function scriptTargets(cmd: string): string[] {
   const out: string[] = [];
   const re = /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|tsx|ts-node)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g;
@@ -266,21 +268,13 @@ function stringsIn(v: unknown, out: string[]): void {
   else if (isRecord(v)) for (const x of Object.values(v)) stringsIn(x, out);
 }
 
+/** Entry points, most direct first: bin, then main, module, browser and exports. */
 function declaredEntries(manifest: Record<string, unknown>): string[] {
   const out: string[] = [];
 
-  for (const k of ["main", "module", "browser", "bin", "exports"] as const) stringsIn(manifest[k], out);
+  for (const k of ["bin", "main", "module", "browser", "exports"] as const) stringsIn(manifest[k], out);
 
   return out.filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
-}
-
-function relativeImports(text: string): string[] {
-  const out: string[] = [];
-  const re = /(?:require\s*\(|import\s*\(|from\s+|import\s+)\s*['"`](\.{1,2}\/[^'"`]+)['"`]/g;
-
-  for (const m of text.matchAll(re)) if (m[1]) out.push(m[1]);
-
-  return out.slice(0, 200);
 }
 
 function dirOf(p: string): string {
@@ -302,16 +296,23 @@ function joinPath(dir: string, rel: string): string {
   return parts.join("/");
 }
 
+/** The file node would load for `raw`: exact, then each extension it tries, then a directory index. */
+const PROBES = ["", ".js", ".cjs", ".mjs", ".json", ".node", ".ts", ".cts", ".mts", "/index.js", "/index.cjs", "/index.mjs", "/index.json", "/index.node", "/index.ts"];
+
 function resolveIn(byPath: Map<string, TarEntry>, raw: string): TarEntry | undefined {
   const p = joinPath("", raw);
 
-  for (const c of [p, `${p}.js`, `${p}.cjs`, `${p}.mjs`, `${p}.ts`, `${p}/index.js`, `${p}/index.cjs`, `${p}/index.mjs`]) {
-    const f = byPath.get(c);
+  for (const ext of PROBES) {
+    const f = byPath.get(`${p}${ext}`);
 
     if (f) return f;
   }
 
   return undefined;
+}
+
+function isShellScript(f: TarEntry, text: string): boolean {
+  return /\.(?:sh|bash|zsh|ps1|cmd|bat)$/i.test(f.path) || /^#!.*\b(?:ba|z|da)?sh\b/.test(text) || (!/\.[^/]+$/.test(f.path) && !/^#!.*\b(?:node|bun|deno)\b/.test(text));
 }
 
 export type DependencyRisk = { name: string; version: string; score: number };
@@ -328,6 +329,8 @@ export type AnalyzeInput = {
   addedDependencies?: readonly string[];
   /** Dependencies apm could not score (git, URL, missing): listed under "not checked". */
   uncheckedDependencies?: readonly string[];
+  /** How many bytes of file content one analysis reads. Defaults to MAX_SCANNED_BYTES. */
+  maxScannedBytes?: number;
 };
 
 /** What each dependency installs: the registry name behind an npm: alias, the key for anything else. */
@@ -335,91 +338,207 @@ export function dependencyNames(manifest: Record<string, unknown>): string[] {
   return [...new Set(dependencySpecs(manifest).map((d) => (isRegistryDependency(d) ? d.name : d.key)))];
 }
 
-/** Static analysis of one version. Run once at publish; stored with the version. */
-export function analyze(input: AnalyzeInput): Analysis {
-  const { manifest, files } = input;
+type Found = { add: (id: SignalId, ev: string) => void; has: (id: SignalId) => boolean; get: (id: SignalId) => string[] | undefined };
+
+function collector(): Found {
   const found = new Map<SignalId, string[]>();
 
-  const add = (id: SignalId, ev: string): void => {
-    const list = found.get(id) ?? [];
+  return {
+    add(id, ev) {
+      const list = found.get(id) ?? [];
 
-    if (!list.includes(ev)) list.push(ev);
-    found.set(id, list);
+      if (!list.includes(ev)) list.push(ev);
+      found.set(id, list);
+    },
+    has: (id) => found.has(id),
+    get: (id) => found.get(id),
   };
+}
 
-  const scripts = installScriptsOf(manifest);
+function describeFinding(where: string, f: TextFinding): string {
+  return `${where}:${f.line}: ${f.snippet}${f.how === "as written" ? "" : ` (${f.how})`}`;
+}
 
-  for (const [k, cmd] of Object.entries(scripts)) {
-    add("install-script", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[]): Set<string> {
+  return new Set(fields.flatMap((f) => (isRecord(manifest[f]) ? Object.keys(manifest[f]) : [])));
+}
 
-    if (isInlineDownload(cmd)) add("install-download", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+/** Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. */
+function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[]): void {
+  const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
+  // a git install also installs devDependencies before it runs prepare
+  const gitInstalled = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]);
 
-    for (const rule of RULES) {
-      if (rule.re.test(cmd)) add(rule.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
-    }
-  }
+  for (const h of hooks) {
+    const own = h.commands[0]?.text ?? "";
 
-  if (files.some((f) => f.path === "binding.gyp")) add("install-script", "binding.gyp: node-gyp build runs at install");
+    if (h.kind === "install") found.add("install-script", `package.json scripts.${h.hook}: ${own.slice(0, 80)}`);
+    let risky = false;
 
-  // Files that run: every file with a code extension, plus whatever install scripts, main, bin and
-  // exports point at, plus anything those reach through a relative require/import, whatever its name.
-  // Every reached file is read, whatever its bytes look like: skipping "non-text" would let a NUL byte hide code.
-  const byPath = new Map(files.map((f) => [f.path, f]));
-  const queue: string[] = [];
-  const queued = new Set<string>();
+    for (const c of h.commands) {
+      const label = `package.json ${c.from}: ${c.text.slice(0, 80)}`;
 
-  const enqueue = (p: string): void => {
-    if (queued.has(p)) return;
-    queued.add(p);
-    queue.push(p);
-  };
+      if (h.kind !== "publish" && isInlineDownload(c.text, { viaEval: c.viaEval, localBins: h.kind === "git" ? gitInstalled : installed })) {
+        found.add("install-download", label);
+        risky = true;
+      }
 
-  for (const f of files) if (CODE_EXT.test(f.path)) enqueue(f.path);
-
-  for (const cmd of Object.values(scripts)) for (const p of scriptTargets(cmd)) enqueue(p);
-
-  for (const p of declaredEntries(manifest)) enqueue(p);
-  const seen = new Set<string>();
-  const skipped: SkippedFile[] = [];
-
-  for (let qi = 0; qi < queue.length; qi++) {
-    const f = resolveIn(byPath, queue[qi] ?? "");
-
-    if (!f || seen.has(f.path)) continue;
-    seen.add(f.path);
-
-    if (isBinary(f)) {
-      add("binary", f.path);
-      continue;
-    }
-
-    if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
-      skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
-      continue;
-    }
-
-    const text = new TextDecoder().decode(f.data);
-
-    for (const rule of RULES) {
-      const m = rule.re.exec(text);
-
-      if (m) {
-        const { line, snippet } = lineOf(text, m.index);
-        add(rule.id, `${f.path}:${line}: ${snippet}`);
+      for (const f of scanText(c.text)) {
+        found.add(f.id, `${label}${f.how === "as written" ? "" : ` (${f.how})`}`);
+        risky = true;
       }
     }
 
-    const hex = hexIdentifierRun(text);
+    if (h.kind === "git" && risky) found.add("git-install-script", `package.json scripts.${h.hook}: ${own.slice(0, 80)} (npm runs it when this package is installed from git)`);
+  }
 
-    if (hex >= 0) {
-      const { line, snippet } = lineOf(text, hex);
-      add("obfuscated", `${f.path}:${line}: ${snippet}`);
+  // scripts no hook reaches never run on an installer's machine; only what they would do to one is reported
+  for (const [k, cmd] of Object.entries(otherScripts(manifest, hooks))) {
+    for (const f of scanText(cmd)) if (f.id === "credential-access" || f.id === "obfuscated") found.add(f.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+  }
+}
+
+/** Static analysis of one version. Run once at publish; stored with the version. */
+export function analyze(input: AnalyzeInput): Analysis {
+  const { manifest, files } = input;
+  const found = collector();
+  const add = found.add;
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  const hooks = expandHooks(manifest);
+  analyzeHooks(found, manifest, hooks);
+  const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
+
+  // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
+  const gyp = byPath.get("binding.gyp");
+
+  if (gyp) {
+    add("install-script", "binding.gyp: node-gyp build runs at install");
+
+    for (const cmd of gypCommands(new TextDecoder().decode(gyp.data))) {
+      if (isInlineDownload(cmd)) add("install-download", `binding.gyp: ${cmd.slice(0, 80)}`);
+
+      for (const f of scanText(cmd)) add(f.id, `binding.gyp: ${cmd.slice(0, 80)}`);
+    }
+  }
+
+  // a Makefile or CMakeLists.txt that an install hook builds is an install script too
+  if (installCommands.some((c) => /\b(?:make|cmake-js|cmake)\b/.test(c.text))) {
+    for (const name of ["Makefile", "makefile", "GNUmakefile", "CMakeLists.txt"]) {
+      const f = byPath.get(name);
+
+      if (f && isInlineDownload(new TextDecoder().decode(f.data))) add("install-download", `${name}: built by an install script and downloads code`);
+    }
+  }
+
+  // What gets read, in order: what install hooks run, then entry points, then whatever those reach
+  // through a path apm can resolve; then every other file that could be code, whatever its name.
+  // A byte budget, not a file count, bounds the work, so filler files can only push out other filler.
+  const budget = input.maxScannedBytes ?? MAX_SCANNED_BYTES;
+  const installTargets = new Set<string>();
+  const first: string[] = [];
+
+  for (const c of installCommands) {
+    for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+      const f = resolveIn(byPath, w);
+
+      if (f && f.path !== "package.json") {
+        installTargets.add(f.path);
+        first.push(f.path);
+      }
+    }
+  }
+
+  if (gyp) first.push(gyp.path);
+
+  for (const p of declaredEntries(manifest)) {
+    const f = resolveIn(byPath, p);
+
+    // type declarations listed under exports never run
+    if (f && !/\.d\.[cm]?ts$/.test(f.path)) first.push(f.path);
+  }
+
+  const reachable = new Set<string>(first);
+  const queue = [...reachable];
+  const seen = new Set<string>();
+  const skipped: SkippedFile[] = [];
+  const unanalyzed: SkippedFile[] = [];
+  let scanned = 0;
+  let qi = 0;
+
+  const analyzeFile = (f: TarEntry, reached: boolean): void => {
+    if (isBinary(f)) {
+      add("binary", f.path);
+
+      return;
     }
 
-    for (const spec of relativeImports(text)) enqueue(joinPath(dirOf(f.path), spec));
+    if (isBinaryData(f)) return;
+
+    if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
+      skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
+
+      return;
+    }
+
+    if (scanned + f.data.length > budget) {
+      (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-budget" });
+
+      return;
+    }
+
+    scanned += f.data.length;
+    // read whatever the bytes are: skipping "non-text" would let a NUL byte hide code
+    const text = new TextDecoder().decode(f.data);
+
+    for (const finding of scanText(text)) add(finding.id, describeFinding(f.path, finding));
+
+    if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
+    const imports = importsOf(joinStrings(text).text);
+
+    for (const d of imports.dynamic) if (reached) add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
+
+    for (const spec of imports.paths) {
+      const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
+
+      if (!target || seen.has(target.path)) continue;
+
+      if (reached && !reachable.has(target.path)) {
+        reachable.add(target.path);
+        queue.push(target.path);
+      }
+    }
+  };
+
+  for (; qi < queue.length; qi++) {
+    const f = byPath.get(queue[qi] ?? "");
+
+    if (!f || seen.has(f.path)) continue;
+    seen.add(f.path);
+    analyzeFile(f, true);
+  }
+
+  const rest = files.filter((f) => !seen.has(f.path) && !NOT_CODE.test(f.path)).sort((a, b) => Number(!CODE_EXT.test(a.path)) - Number(!CODE_EXT.test(b.path)));
+
+  for (const f of rest) {
+    seen.add(f.path);
+    analyzeFile(f, false);
+
+    // anything the second pass reaches by a resolvable path is read too, even with a non-code name
+    for (; qi < queue.length; qi++) {
+      const g = byPath.get(queue[qi] ?? "");
+
+      if (!g || seen.has(g.path)) continue;
+      seen.add(g.path);
+      analyzeFile(g, true);
+    }
   }
 
   for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
+
+  if (unanalyzed.length > 0) {
+    const bytes = unanalyzed.reduce((n, s) => n + s.size, 0);
+    add("unanalyzed-files", `${unanalyzed.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${unanalyzed[0]?.path ?? ""})`);
+  }
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
 
@@ -438,7 +557,25 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
-  const order: SignalId[] = ["incomplete", "credential-access", "install-download", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
+  const order: SignalId[] = [
+    "incomplete",
+    "credential-access",
+    "install-download",
+    "shell-exec",
+    "install-script",
+    "git-install-script",
+    "risky-dependency",
+    "network",
+    "eval",
+    "obfuscated",
+    "unanalyzed-files",
+    "dynamic-require",
+    "typosquat",
+    "new-publisher",
+    "new-dependency",
+    "binary",
+    "no-license",
+  ];
 
   const signals = order.flatMap((id) => {
     const ev = found.get(id);
@@ -446,9 +583,13 @@ export function analyze(input: AnalyzeInput): Analysis {
     return ev ? [signal(id, ev)] : [];
   });
 
-  const notChecked = [...NOT_CHECKED, ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`)];
+  const notChecked = [
+    ...NOT_CHECKED,
+    ...(unanalyzed.length > 0 ? [`${unanalyzed.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`] : []),
+    ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`),
+  ];
 
-  return { scorer: SCORER, signals, facts, notChecked, skipped };
+  return { scorer: SCORER, signals, facts, notChecked, skipped: [...skipped, ...unanalyzed] };
 }
 
 export function gradeOf(score: number): Grade {

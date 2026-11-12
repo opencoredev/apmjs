@@ -356,6 +356,9 @@ function installedPackages(root: string): Map<string, Set<string>> {
   return out;
 }
 
+/** Packages per scan request: what the registry checks without a token. */
+const SCAN_BATCH = 200;
+
 async function cmdAudit(a: Args): Promise<number> {
   const cwd = process.cwd();
   const api = new Api(loadConfig(cwd, env()));
@@ -367,7 +370,11 @@ async function cmdAudit(a: Args): Promise<number> {
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
   const audit = await api.post("-/apm/v1/audit", query, AuditResponse);
-  const scan = await api.post("-/apm/v1/scan", { packages: [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version }))) }, ScanResponse);
+  // the registry checks at most 200 packages per scan without a token, so large trees go in batches
+  const all = [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version })));
+  const batches = Array.from({ length: Math.ceil(all.length / SCAN_BATCH) }, (_, i) => all.slice(i * SCAN_BATCH, (i + 1) * SCAN_BATCH));
+  const parts = await Promise.all(batches.map((packages) => api.post("-/apm/v1/scan", { packages }, ScanResponse)));
+  const scan = { advisories: parts.flatMap((p) => p.advisories), unchecked: parts.flatMap((p) => p.unchecked) };
   const findings: { id: string; severity: string; text: string }[] = [];
   // checks that could not run: an audit with any of these is not a pass
   const unchecked: { id: string; reason: string }[] = [

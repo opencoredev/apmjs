@@ -2,6 +2,7 @@
 // "a passkey or 2FA before you publish", and the fresh second factor destructive actions need.
 import { STEPUP_MS, type ApmAuth } from "./auth.ts";
 import type { Store } from "./db.ts";
+import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 import type { Access, NamePolicy } from "./server.ts";
 import type { Upstream } from "./upstream.ts";
 
@@ -78,8 +79,22 @@ export function buildAccess(input: {
     async secondFactor({ user, password, otp }) {
       const u = store.getUser(user);
       if (legacyAuth && password) {
-        if (u && u.password_hash !== "" && (await Bun.password.verify(password, u.password_hash))) return null;
-        return { status: 401, error: "Incorrect password." };
+        if (!u) return { status: 401, error: "Incorrect password." };
+        const check = await checkPassword({ store, user, password, hash: u.password_hash, now: now() });
+
+        switch (check) {
+          case "ok":
+            return null;
+          case "bad":
+            return { status: 401, error: "Incorrect password." };
+          case "locked":
+            return { status: 429, error: LOCKED_MESSAGE };
+          default: {
+            const _exhaustive: never = check;
+
+            return _exhaustive;
+          }
+        }
       }
       const authId = u?.auth_user_id ?? null;
       if (otp) {

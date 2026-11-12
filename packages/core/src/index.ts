@@ -13,3 +13,5 @@ export * from "./limits.ts";
 export { POPULAR_NAMES } from "./popular.ts";
 
 export * from "./entries.ts";
+
+export { expandHooks, gypCommands, LIFECYCLE, type ExpandedHook, type HookKind } from "./scripts.ts";

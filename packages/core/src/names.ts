@@ -39,24 +39,94 @@ function squash(name: string): string {
 
 export type TypoConflict = { name: string; distance: number; reason: string };
 
+/** Endings people add to a popular name when they guess at it: `react.js`, `expressjs`, `lodash-js`. */
+const GUESSED_SUFFIXES = [".js", "js", "-js", ".mjs"] as const;
+
+/** Names this long are allowed two dropped or two added letters: `typscrip` still reads as `typescript`. */
+const LONG_NAME = 8;
+
+function scopeOf(name: string): string {
+  return isScoped(name) ? name.slice(1, name.indexOf("/")) : "";
+}
+
+function bareOf(name: string): string {
+  return isScoped(name) ? name.slice(name.indexOf("/") + 1) : name;
+}
+
+/** Swaps of two neighbouring letters, the commonest typo: `raect` for `react`. */
+function isTransposition(a: string, b: string): boolean {
+  if (a.length !== b.length || a === b) return false;
+  const diff: number[] = [];
+
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff.push(i);
+  const [i, j] = diff;
+
+  return diff.length === 2 && i !== undefined && j === i + 1 && a[i] === b[j] && a[j] === b[i];
+}
+
+function guessedSuffix(candidate: string, p: string): string | null {
+  if (p.length < 3) return null;
+
+  return GUESSED_SUFFIXES.find((s) => candidate === `${p}${s}`) ?? null;
+}
+
+/** How an unscoped `bare` could be mistaken for the unscoped popular name `p`, or null. */
+function unscopedConflict(bare: string, p: string): TypoConflict | null {
+  const suffix = guessedSuffix(bare, p);
+
+  if (suffix) return { name: p, distance: 0, reason: `is "${p}" with "${suffix}" added` };
+
+  if (p.length < 4 || bare.length < 4) return null;
+
+  if (squash(p) === squash(bare)) return { name: p, distance: 0, reason: `differs from "${p}" only by separators` };
+  const dist = editDistance(bare, p);
+  // two substitutions turn one real word into another (commondir, commander), so two edits count only as two letters dropped or added
+  const twoAway = dist === 2 && p.length >= LONG_NAME && bare.length >= LONG_NAME && Math.abs(p.length - bare.length) === 2;
+
+  if (dist > 1 && !twoAway) return null;
+
+  return { name: p, distance: dist, reason: dist === 1 ? `one edit away from "${p}"` : `two edits away from "${p}"` };
+}
+
+/**
+ * How the scoped `candidate` could be mistaken for a popular name, or null. Scopes exist so names can be
+ * reused (@sentry/react, @types/node), so a popular bare name under another scope is not a lookalike.
+ * What is: a near miss of a popular scoped name (`@type/node`), and a scoped name whose bare part is a
+ * typo of a popular one (`@evil/raect`, `@evil/expressjs`). Generic bare parts one edit from a popular
+ * name (`core`/`cors`, `server`/`serve`) are real everywhere, so only swaps and added suffixes count there.
+ */
+function scopedConflict(candidate: string, p: string): TypoConflict | null {
+  const bare = bareOf(candidate);
+
+  if (isScoped(p)) {
+    if (squash(p) === squash(candidate)) return { name: p, distance: 0, reason: `differs from "${p}" only by separators` };
+    const [scope, pScope] = [scopeOf(candidate), scopeOf(p)];
+    // a short scope is one edit from many real ones (@trpc, @orpc), so only longer scopes are compared
+    const nearScope = bare === bareOf(p) && pScope.length >= 5 && editDistance(scope, pScope) === 1;
+    const nearBare = scope === pScope && bare.length >= 4 && editDistance(bare, bareOf(p)) === 1;
+
+    return nearScope || nearBare ? { name: p, distance: 1, reason: `one edit away from "${p}"` } : null;
+  }
+
+  if (bare === p) return null;
+  const suffix = guessedSuffix(bare, p);
+
+  if (suffix) return { name: p, distance: 0, reason: `is "${p}" with "${suffix}" added, under another scope` };
+
+  if (p.length >= 4 && isTransposition(bare, p)) return { name: p, distance: 1, reason: `swaps two letters of "${p}", under another scope` };
+
+  return null;
+}
+
 /** Popular names that `candidate` could be mistaken for. Empty when the name is itself popular. */
 export function typoConflicts(candidate: string, popular: readonly string[] = POPULAR_NAMES): TypoConflict[] {
-  if (isScoped(candidate)) return [];
-
   if (popular.includes(candidate)) return [];
   const out: TypoConflict[] = [];
 
   for (const p of popular) {
-    if (isScoped(p) || p.length < 4 || candidate.length < 4) continue;
+    const c = isScoped(candidate) ? scopedConflict(candidate, p) : isScoped(p) ? null : unscopedConflict(candidate, p);
 
-    if (squash(p) === squash(candidate)) {
-      out.push({ name: p, distance: 0, reason: `differs from "${p}" only by separators` });
-      continue;
-    }
-
-    const dist = editDistance(candidate, p);
-
-    if (dist === 1) out.push({ name: p, distance: 1, reason: `one edit away from "${p}"` });
+    if (c) out.push(c);
   }
 
   return out;

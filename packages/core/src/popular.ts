@@ -28,7 +28,7 @@ export const POPULAR_NAMES: readonly string[] = [
   "stripe", "firebase", "@supabase/supabase-js", "aws-sdk", "@aws-sdk/client-s3", "googleapis", "twilio",
   "nodemailer", "bull", "bullmq", "agenda", "cron", "node-cron", "ms", "bytes", "lru-cache", "keyv",
   "cache-manager", "p-limit", "p-queue", "p-map", "deepmerge", "merge", "object-assign", "extend",
-  "deep-equal", "fast-deep-equal", "lodash.merge", "lodash.get", "flat", "dot-prop", "camelcase",
+  "deep-equal", "deep-eql", "fast-deep-equal", "lodash.merge", "lodash.get", "flat", "dot-prop", "camelcase",
   "kebab-case", "slugify", "validator", "email-validator", "libphonenumber-js", "i18next", "react-i18next",
   "framer-motion", "react-hook-form", "formik", "@mui/material", "antd", "@chakra-ui/react", "bootstrap",
   "jquery", "popper.js", "@popperjs/core", "lucide-react", "react-icons", "@radix-ui/react-dialog",

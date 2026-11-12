@@ -90,6 +90,11 @@ CREATE TABLE IF NOT EXISTS staged (
   decided_by TEXT
 );
 CREATE INDEX IF NOT EXISTS staged_pkg ON staged(package, version);
+CREATE TABLE IF NOT EXISTS password_failures (
+  user TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  since INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS stepups (
   auth_user_id TEXT PRIMARY KEY,
   at INTEGER NOT NULL,
@@ -180,6 +185,9 @@ const AdvisoryRow = z.object({
   created_by: z.string(),
 });
 export type StagedStatus = "pending" | "approved" | "rejected" | "expired";
+
+/** What is waiting for approval: versions and bytes one user staged, and versions waiting for one package. */
+export type StagedLoad = { byUser: number; bytesByUser: number; byPackage: number };
 const StagedRow = z.object({
   id: z.string(),
   package: z.string(),
@@ -279,6 +287,16 @@ export class Store {
   setStepup(authUserId: string, at: number, method: string): void {
     this.db.query("INSERT OR REPLACE INTO stepups (auth_user_id, at, method) VALUES (?, ?, ?)").run(authUserId, at, method);
   }
+  /** Wrong passwords for `user` in the current window: the count and when the window started. */
+  passwordFailures(user: string): { count: number; since: number } | null {
+    const row = this.db.query("SELECT count, since FROM password_failures WHERE user = ?").get(user);
+
+    return row ? z.object({ count: z.number(), since: z.number() }).parse(row) : null;
+  }
+  setPasswordFailures(user: string, f: { count: number; since: number } | null): void {
+    if (f === null) this.db.query("DELETE FROM password_failures WHERE user = ?").run(user);
+    else this.db.query("INSERT OR REPLACE INTO password_failures (user, count, since) VALUES (?, ?, ?)").run(user, f.count, f.since);
+  }
   stepupAt(authUserId: string): number | null {
     const row = this.db.query("SELECT at FROM stepups WHERE auth_user_id = ?").get(authUserId);
     return row ? z.object({ at: z.number() }).parse(row).at : null;
@@ -315,6 +333,14 @@ export class Store {
   }
   decideStaged(id: string, d: { status: Exclude<StagedStatus, "pending">; at: number; by: string }): void {
     this.db.query("UPDATE staged SET status = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(d.status, d.at, d.by, id);
+  }
+  /** Versions still waiting for approval (not expired at `now`): how many and how many bytes `user` staged, and how many wait for `name`. */
+  pendingStagedLoad(input: { user: string; name: string; now: number }): StagedLoad {
+    const Load = z.object({ n: z.number(), bytes: z.number().nullable() });
+    const mine = Load.parse(this.db.query("SELECT COUNT(*) AS n, SUM(size) AS bytes FROM staged WHERE status = 'pending' AND expires_at > ? AND staged_by = ?").get(input.now, input.user));
+    const pkg = Load.parse(this.db.query("SELECT COUNT(*) AS n, NULL AS bytes FROM staged WHERE status = 'pending' AND expires_at > ? AND package = ?").get(input.now, input.name));
+
+    return { byUser: mine.n, bytesByUser: mine.bytes ?? 0, byPackage: pkg.n };
   }
   /** Marks pending versions past their deadline as expired; returns their ids. */
   expireStaged(now: number): string[] {

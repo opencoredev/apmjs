@@ -24,6 +24,24 @@ export function registryOf(pkg: Bun.Security.Package): string | null {
   return pkg.tarball.slice(0, i);
 }
 
+/** Packages per scan request: the registry checks at most this many without a token. */
+const BATCH = 200;
+
+/** Asks about every package, BATCH at a time in parallel. Null when any batch could not be asked. */
+async function askAll(registry: string, packages: Bun.Security.Package[]): Promise<ScanResult | null> {
+  const batches = Array.from({ length: Math.ceil(packages.length / BATCH) }, (_, i) => packages.slice(i * BATCH, (i + 1) * BATCH));
+  const parts = await Promise.all(batches.map((b) => ask(registry, b)));
+  const out: ScanResult = { advisories: [], unchecked: [] };
+
+  for (const p of parts) {
+    if (p === null) return null;
+    out.advisories.push(...p.advisories);
+    out.unchecked.push(...p.unchecked);
+  }
+
+  return out;
+}
+
 async function ask(registry: string, packages: Bun.Security.Package[]): Promise<ScanResult | null> {
   try {
     const res = await fetch(`${registry}-/apm/v1/scan`, {
@@ -59,7 +77,7 @@ export const scanner: Bun.Security.Scanner = {
     const strict = process.env.APM_SCANNER_STRICT === "1";
     const out: Bun.Security.Advisory[] = [];
     for (const [reg, list] of groups) {
-      const found = await ask(reg, list);
+      const found = await askAll(reg, list);
       if (found === null) {
         const msg = `apm scanner: could not reach ${reg}; ${list.length} package(s) not checked`;
         if (strict) throw new Error(msg);

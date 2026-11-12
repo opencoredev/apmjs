@@ -32,7 +32,7 @@ import {
   type TarEntry,
 } from "@apm/core";
 import type { VersionRecord } from "./db.ts";
-import { fail, json, splitPath, highest, servedVersions, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
+import { fail, json, splitPath, highest, servedVersions, tagTarget, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
 import { digestLabel, type Upstream, type UpstreamPackage } from "./upstream.ts";
 
 const HOUR = 3_600_000;
@@ -170,7 +170,7 @@ async function pickDependency(env: Env, dep: RegistryDependency, keep: (v: Versi
   let inRange: VersionRecord[];
   switch (dep.kind) {
     case "tag": {
-      const tagged = src.distTags[dep.tag];
+      const tagged = tagTarget(src.distTags, dep.tag);
       inRange = tagged ? src.versions.filter((v) => v.version === tagged) : [];
       break;
     }
@@ -279,10 +279,11 @@ function makeOnPublish(env: Env): PublishHook {
       }
       const conflicts = typoConflicts(name);
       if (conflicts.length > 0) {
+        const instead = name.startsWith("@") ? "Pick a more distinct name." : `Pick a more distinct name or publish under your scope (@${user}/${name}).`;
         return {
           ok: false,
           status: 422,
-          error: `Refusing to publish "${name}": ${conflicts.map((c) => c.reason).join("; ")}. Names this close are how typosquatting works. Pick a more distinct name or publish under your scope (@${user}/${name}).`,
+          error: `Refusing to publish "${name}": ${conflicts.map((c) => c.reason).join("; ")}. Names this close are how typosquatting works. ${instead}`,
           detail: conflicts,
         };
       }
@@ -768,18 +769,40 @@ export function policyBlock(ctx: Ctx, v: VersionRecord, policy: Policy): string 
   return null;
 }
 
+/** The URL prefix of the safe view: versions past the cooldown that score at or above the floor. */
+export const SAFE_PREFIX = "~safe/";
+
 function safeView(ctx: Ctx): PackumentView {
-  return { keep: (v) => policyBlock(ctx, v, DEFAULT_POLICY) === null };
+  const why = (v: VersionRecord): string | null => policyBlock(ctx, v, DEFAULT_POLICY);
+
+  return { keep: (v) => why(v) === null, why, prefix: SAFE_PREFIX };
 }
 
-function parseDuration(s: string | null, fallback: number): number {
-  if (!s) return fallback;
+/** "24h", "90m", "2d", "0" (hours by default), or null when it is not a duration of zero or more. */
+function parseDuration(s: string): number | null {
   const m = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/.exec(s.trim());
-  if (!m) return fallback;
+
+  if (!m) return null;
   const n = Number(m[1]);
   const unit = m[2] ?? "h";
   const mult = unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? HOUR : DAY;
   return n * mult;
+}
+
+type PolicyParse = { kind: "ok"; policy: Policy } | { kind: "invalid"; error: string };
+
+/** The policy a resolve asks for. A floor or cooldown apm cannot read is an error, never "no policy". */
+function parsePolicy(url: URL): PolicyParse {
+  const rawFloor = url.searchParams.get("floor");
+  const rawCooldown = url.searchParams.get("cooldown");
+  const floor = rawFloor === null ? DEFAULT_POLICY.floor : /^\d+(?:\.\d+)?$/.test(rawFloor.trim()) ? Number(rawFloor) : Number.NaN;
+
+  if (!Number.isFinite(floor) || floor < 0) return { kind: "invalid", error: `floor must be a number of 0 or more (got "${rawFloor ?? ""}")` };
+  const cooldownMs = rawCooldown === null ? DEFAULT_POLICY.cooldownMs : parseDuration(rawCooldown);
+
+  if (cooldownMs === null) return { kind: "invalid", error: `cooldown must be a duration of 0 or more, like 24h, 90m or 2d (got "${rawCooldown ?? ""}")` };
+
+  return { kind: "ok", policy: { floor, cooldownMs } };
 }
 
 type TreeBlock = { name: string; version: string; reason: string; via: string[] };
@@ -794,7 +817,7 @@ const MAX_UNCHECKED_LISTED = 50;
  * or score below the floor. Bounded: at most `maxNodes` packages and `maxAnalyses` tarball analyses.
  * Everything it could not score is counted and listed, never dropped.
  */
-async function treeBlocks(env: Env, root: VersionRecord, floor: number, limits = { maxNodes: 300, maxAnalyses: 40 }): Promise<Tree> {
+async function treeBlocks(env: Env, root: VersionRecord, policy: Policy, limits = { maxNodes: 300, maxAnalyses: 40 }): Promise<Tree> {
   const blocks: TreeBlock[] = [];
   const uncheckedDeps: UncheckedDep[] = [];
   let unchecked = 0;
@@ -834,9 +857,14 @@ async function treeBlocks(env: Env, root: VersionRecord, floor: number, limits =
       analyses++;
       v = await ensureAnalyzed(env, picked.src, v);
     }
+
+    const age = env.ctx.now() - v.published_at;
     const r = reportFor(env.ctx, v, { ignoreRecent: true });
-    if (!r) miss(key, "could not be analyzed", item.via);
-    else if (r.score < floor) blocks.push({ name: dep.name, version: v.version, reason: `score ${r.score}/100 (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`, via: item.via });
+
+    // the package manager installs this version whatever its age, so a fresh one blocks the tree like a low score
+    if (age < policy.cooldownMs) blocks.push({ name: dep.name, version: v.version, reason: `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`, via: item.via });
+    else if (!r) miss(key, "could not be analyzed", item.via);
+    else if (r.score < policy.floor) blocks.push({ name: dep.name, version: v.version, reason: `score ${r.score}/100 (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`, via: item.via });
     if (item.via.length < 12) for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
   }
   return { blocks, unchecked, uncheckedDeps };
@@ -846,13 +874,13 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
   const ctx = env.ctx;
   const name = url.searchParams.get("name") ?? "";
   const range = url.searchParams.get("range") || "latest";
-  const policy: Policy = {
-    cooldownMs: parseDuration(url.searchParams.get("cooldown"), DEFAULT_POLICY.cooldownMs),
-    floor: Number(url.searchParams.get("floor") ?? DEFAULT_POLICY.floor),
-  };
+  const parsedPolicy = parsePolicy(url);
+
+  if (parsedPolicy.kind === "invalid") return fail(400, parsedPolicy.error);
+  const policy = parsedPolicy.policy;
   const src = await lookup(env, name);
   if (!src) return fail(404, `No package named ${name}.`);
-  const tagged = src.distTags[range];
+  const tagged = tagTarget(src.distTags, range);
   // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
   // below it, but a stable tag never falls back to a prerelease.
   const base = (v: string): string => v.split("-")[0] ?? v;
@@ -869,7 +897,7 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
     const block = policyBlock(ctx, v, policy);
     if (block === null) {
       const report = reportFor(ctx, v);
-      const tree: Tree = policy.floor > 0 ? await treeBlocks(env, v, policy.floor) : { blocks: [], unchecked: 0, uncheckedDeps: [] };
+      const tree: Tree = policy.floor > 0 || policy.cooldownMs > 0 ? await treeBlocks(env, v, policy) : { blocks: [], unchecked: 0, uncheckedDeps: [] };
       if (tree.blocks.length > 0) {
         const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
         return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);
@@ -886,47 +914,97 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
 
 const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })) });
 
-const MAX_SCAN = 2000;
+/** Packages one scan checks: signed in, and without a token. Each may mean an upstream packument and tarball. */
+export const MAX_SCAN = 2000;
+export const MAX_SCAN_ANONYMOUS = 200;
 
-async function scanResponse(req: Request, env: Env): Promise<Response> {
+/** Upstream lookups and downloads one scan runs at once. */
+const SCAN_CONCURRENCY = 8;
+
+type ScanAdvisory = { package: string; version: string; level: "fatal" | "warn"; description: string; url: string | null };
+
+type ScanUnchecked = { package: string; version: string; reason: string };
+
+type ScanOne = { kind: "clean" } | { kind: "advisory"; advisory: ScanAdvisory } | { kind: "unchecked"; unchecked: ScanUnchecked };
+
+/** Runs `fn` over `items` with at most `limit` running at once; results keep the input order. */
+async function pool<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) {
+      const item = items[i];
+
+      if (item !== undefined) out[i] = await fn(item);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+
+  return out;
+}
+
+async function scanOne(env: Env, p: { name: string; version: string }): Promise<ScanOne> {
   const ctx = env.ctx;
+  const unchecked = (reason: string): ScanOne => ({ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } });
+  const src = await lookupOrUnknown(env, p.name);
+
+  if (src === "unknown") return unchecked("the upstream registry could not be asked");
+
+  if (src === null) return unchecked("not on this registry or upstream");
+  const v0 = src.versions.find((x) => x.version === p.version);
+
+  if (!v0) return unchecked("no such version");
+  const url = `${ctx.baseUrl()}package/${p.name}`;
+
+  if (v0.status === "revoked" || v0.status === "revoke-pending") {
+    return { kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url } };
+  }
+
+  // a stored analysis of these exact bytes is reused; only a version never analyzed is downloaded
+  const v = await ensureAnalyzed(env, src, v0);
+  const r = reportFor(ctx, v, { ignoreRecent: true });
+
+  if (!r) return unchecked("could not be analyzed");
+
+  if (r.score >= SCORE_FLOOR) return { kind: "clean" };
+  const why = r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ");
+
+  return { kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} has apm score ${r.score}/100 (${why}). Review it, then allow it with apm add ${p.name} --force.`, url } };
+}
+
+async function scanResponse(req: Request, env: Env, auth: Auth): Promise<Response> {
   const parsed = await parseBody(req, ScanBody);
   if (!parsed.ok) return parsed.res;
-  const advisories: { package: string; version: string; level: "fatal" | "warn"; description: string; url: string | null }[] = [];
+  const signedIn = auth.kind === "user";
+  const cap = signedIn ? MAX_SCAN : MAX_SCAN_ANONYMOUS;
+  const seen = new Set<string>();
+
+  const packages = parsed.value.packages.filter((p) => {
+    const key = `${p.name}@${p.version}`;
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+
+    return true;
+  });
+
+  const advisories: ScanAdvisory[] = [];
   // Versions the scan could not judge. Missing from `advisories` is not the same as clean.
-  const unchecked: { package: string; version: string; reason: string }[] = [];
-  for (const p of parsed.value.packages.slice(MAX_SCAN)) unchecked.push({ package: p.name, version: p.version, reason: `a scan checks at most ${MAX_SCAN} packages` });
-  for (const p of parsed.value.packages.slice(0, MAX_SCAN)) {
-    const src = await lookupOrUnknown(env, p.name);
-    if (src === "unknown") {
-      unchecked.push({ package: p.name, version: p.version, reason: "the upstream registry could not be asked" });
-      continue;
-    }
-    if (src === null) {
-      unchecked.push({ package: p.name, version: p.version, reason: "not on this registry or upstream" });
-      continue;
-    }
-    const v0 = src.versions.find((x) => x.version === p.version);
-    if (!v0) {
-      unchecked.push({ package: p.name, version: p.version, reason: "no such version" });
-      continue;
-    }
-    const url = `${ctx.baseUrl()}package/${p.name}`;
-    if (v0.status === "revoked" || v0.status === "revoke-pending") {
-      advisories.push({ package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url });
-      continue;
-    }
-    const v = await ensureAnalyzed(env, src, v0);
-    const r = reportFor(ctx, v, { ignoreRecent: true });
-    if (!r) {
-      unchecked.push({ package: p.name, version: p.version, reason: "could not be analyzed" });
-      continue;
-    }
-    if (r.score < SCORE_FLOOR) {
-      const why = r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ");
-      advisories.push({ package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} has apm score ${r.score}/100 (${why}). Review it, then allow it with apm add ${p.name} --force.`, url });
-    }
+  const unchecked: ScanUnchecked[] = [];
+  const results = await pool(packages.slice(0, cap), SCAN_CONCURRENCY, (p) => scanOne(env, p));
+
+  for (const r of results) {
+    if (r.kind === "advisory") advisories.push(r.advisory);
+    else if (r.kind === "unchecked") unchecked.push(r.unchecked);
   }
+
+  const over = signedIn
+    ? `a scan checks at most ${MAX_SCAN} packages; send the rest in another request`
+    : `a scan without a token checks at most ${MAX_SCAN_ANONYMOUS} packages; sign in (apm login) to check up to ${MAX_SCAN}, or send the rest in another request`;
+
+  for (const p of packages.slice(cap)) unchecked.push({ package: p.name, version: p.version, reason: over });
   return json({ advisories, unchecked });
 }
 
@@ -990,7 +1068,7 @@ async function auditResponse(req: Request, env: Env): Promise<Response> {
 const ABBREV = ["name", "version", "dependencies", "optionalDependencies", "devDependencies", "bundleDependencies", "peerDependencies", "peerDependenciesMeta", "bin", "directories", "engines", "os", "cpu", "libc", "_hasShrinkwrap", "hasInstallScript", "deprecated"];
 
 function upstreamPackument(env: Env, src: Extract<Source, { kind: "upstream" }>, abbreviated: boolean, view: PackumentView | null): Record<string, unknown> {
-  const base = env.ctx.baseUrl();
+  const base = `${env.ctx.baseUrl()}${view?.prefix ?? ""}`;
   const kept = view ? src.versions.filter(view.keep) : src.versions;
   const versions: Record<string, unknown> = {};
   const time: Record<string, string> = {};
@@ -1049,7 +1127,13 @@ async function upstreamRoute(req: Request, url: URL, env: Env, viaSafe: boolean)
       }
     }
     const v = src.versions.find((x) => x.version === version);
-    if (v) await ensureAnalyzed(env, src, v);
+    const analyzed = v ? await ensureAnalyzed(env, src, v) : null;
+
+    if (viaSafe) {
+      const block = analyzed ? policyBlock(env.ctx, analyzed, DEFAULT_POLICY) : "not listed upstream";
+
+      if (block !== null) return fail(404, `${src.name}@${version} is not in this view: ${block}.`);
+    }
     return new Response(got.bytes, { headers: { "content-type": "application/octet-stream" } });
   }
   if (sp.rest.length > 0) return null;
@@ -1085,7 +1169,8 @@ function makeRoutes(env: Env, scoreOf: (v: VersionRecord) => unknown): NonNullab
       if (rest === "yank" || rest === "unyank" || rest === "revoke" || rest === "restore") return handleState(req, ctx, auth, rest);
       if (rest === "incident") return handleIncident(req, ctx, auth);
       if (rest === "owners") return handleOwners(req, ctx, auth);
-      if (rest === "scan") return scanResponse(req, env);
+
+      if (rest === "scan") return scanResponse(req, env, auth);
       if (rest === "audit") return auditResponse(req, env);
     }
     if (req.method === "DELETE" && rest === "owners") return handleOwners(req, ctx, auth);
@@ -1105,7 +1190,7 @@ function makeRoutes(env: Env, scoreOf: (v: VersionRecord) => unknown): NonNullab
       const src = await lookup(env, sp.name);
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];
-      const version = spec ? (src.distTags[spec] ?? spec) : src.distTags.latest;
+      const version = spec ? (tagTarget(src.distTags, spec) ?? spec) : tagTarget(src.distTags, "latest");
       const v = src.versions.find((x) => x.version === version);
       if (!v) return fail(404, "No such version");
       return scoreResponse(env, src, v);

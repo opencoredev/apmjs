@@ -62,7 +62,7 @@
       "anti-slop/no-unsafe-dictionary-type": 3
     },
     "packages/core/src/score.ts": {
-      "anti-slop/no-known-value-widening": 3,
+      "anti-slop/no-known-value-widening": 2,
       "anti-slop/no-runtime-typeof": 9,
       "anti-slop/no-unknown-parameters": 4,
       "anti-slop/no-unsafe-dictionary-type": 7
@@ -74,7 +74,7 @@
       "anti-slop/no-unknown-returns": 1
     },
     "packages/registry/src/access.ts": {
-      "anti-slop/require-readable-spacing": 21
+      "anti-slop/require-readable-spacing": 20
     },
     "packages/registry/src/account.ts": {
       "anti-slop/no-known-value-widening": 3,
@@ -91,7 +91,7 @@
       "anti-slop/no-unknown-parameters": 3,
       "anti-slop/no-unknown-returns": 4,
       "anti-slop/no-unsafe-dictionary-type": 16,
-      "anti-slop/require-readable-spacing": 279
+      "anti-slop/require-readable-spacing": 262
     },
     "packages/registry/src/auth.ts": {
       "anti-slop/no-conditional-empty-object-spread": 2,
@@ -121,7 +121,7 @@
       "anti-slop/no-unknown-parameters": 1,
       "anti-slop/no-unknown-returns": 2,
       "anti-slop/no-unsafe-dictionary-type": 12,
-      "anti-slop/require-readable-spacing": 156,
+      "anti-slop/require-readable-spacing": 149,
       "eslint/no-control-regex": 1,
       "unicorn/no-useless-fallback-in-spread": 1
     },

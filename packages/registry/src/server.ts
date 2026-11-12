@@ -3,8 +3,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, linkSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve, sep } from "node:path";
 import { z } from "zod";
-import { editDistance, isValidVersion } from "@apm/core";
+import { editDistance, isValidTagName, isValidVersion } from "@apm/core";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
+import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 
 export type NamePolicy = "scoped" | "open";
 export type Refusal = { status: number; error: string };
@@ -35,6 +36,13 @@ export type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: s
 
 /** A staged version waits this long for approval. */
 export const STAGE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Versions one account may have waiting for approval at once, and their total size. */
+export const MAX_STAGED_PER_USER = 20;
+export const MAX_STAGED_BYTES_PER_USER = 256 * 1024 * 1024;
+
+/** Versions of one package that may wait for approval at once. */
+export const MAX_STAGED_PER_PACKAGE = 5;
 
 // ---------- responses ----------
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -142,7 +150,13 @@ export function servedVersions(versions: VersionRecord[]): VersionRecord[] {
   return versions.filter((v) => v.status === "active");
 }
 
-export type PackumentView = { keep: (v: VersionRecord) => boolean };
+/** A filtered registry view (`~safe`): which versions it serves, why it hides the others, and the URL prefix it lives under. */
+export type PackumentView = { keep: (v: VersionRecord) => boolean; why: (v: VersionRecord) => string | null; prefix: string };
+
+/** The version a dist-tag points to. Own keys only: `toString` or `__proto__` is never a tag. */
+export function tagTarget(tags: Record<string, string>, tag: string): string | undefined {
+  return Object.hasOwn(tags, tag) ? tags[tag] : undefined;
+}
 
 /** Highest stable version, or highest prerelease when there is no stable one. */
 export function highest(versions: string[]): string | undefined {
@@ -161,14 +175,15 @@ export function retag(tags: Record<string, string>, kept: string[]): Record<stri
   return out;
 }
 
-export function versionDoc(ctx: Ctx, pkg: PackageRecord, v: VersionRecord, ext: Extensions = {}): Record<string, unknown> {
+export function versionDoc(ctx: Ctx, pkg: PackageRecord, v: VersionRecord, ext: Extensions = {}, view?: PackumentView): Record<string, unknown> {
   const doc: Record<string, unknown> = {
     ...v.manifest,
     name: pkg.name,
     version: v.version,
     _id: `${pkg.name}@${v.version}`,
     dist: {
-      tarball: tarballUrl(ctx.baseUrl(), pkg.name, v.version),
+      // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
+      tarball: tarballUrl(`${ctx.baseUrl()}${view?.prefix ?? ""}`, pkg.name, v.version),
       shasum: v.shasum,
       integrity: v.integrity,
       unpackedSize: v.size,
@@ -193,7 +208,7 @@ export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean, ex
   const versions: Record<string, unknown> = {};
   const time: Record<string, string> = { created: iso(pkg.created_at), modified: iso(pkg.modified_at) };
   for (const v of live) {
-    const full = versionDoc(ctx, pkg, v, ext);
+    const full = versionDoc(ctx, pkg, v, ext, view);
     if (abbreviated) {
       const slim: Record<string, unknown> = {};
       for (const k of ABBREV_FIELDS) if (k in full) slim[k] = full[k];
@@ -330,6 +345,12 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
 
   const entries = Object.entries(body.versions);
   if (entries.length !== 1) return fail(400, "Publish exactly one version at a time.");
+  const tags = Object.keys(body["dist-tags"]);
+
+  if (tags.length > 1) return fail(400, "Publish with one dist-tag at a time.");
+  const bad = tags.find((t) => !isValidTagName(t));
+
+  if (bad !== undefined) return fail(400, tagNameError(bad));
   const [version, manifest] = entries[0] ?? ["", {}];
   if (!isValidVersion(version)) return fail(400, `Invalid version "${version}": apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
   const attachment = Object.values(body._attachments)[0];
@@ -348,6 +369,9 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     }
     const noFactor = ctx.access.stageRefusal(auth.user);
     if (noFactor) return fail(noFactor.status, noFactor.error);
+    const over = stageQuotaRefusal(ctx, { user: auth.user, name, size: tarball.length });
+
+    if (over) return fail(429, over);
   }
 
   let score: unknown = null;
@@ -401,6 +425,20 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   const done = commitVersion(ctx, { name, version, manifest: cleanManifest, tarball, shasum, integrity, tag, readme, score, publisher: auth.user, detail: {} });
   if (done.kind === "refused") return fail(done.status, done.error);
   return json({ ok: true, id: name, rev: `${ctx.now()}`, success: true, score, warnings }, 201, warningText ? { "npm-notice": warningText } : {});
+}
+
+/** Why one more staged upload of `size` bytes would go over a quota, or null. */
+function stageQuotaRefusal(ctx: Ctx, input: { user: string; name: string; size: number }): string | null {
+  const load = ctx.store.pendingStagedLoad({ user: input.user, name: input.name, now: ctx.now() });
+  const where = `Approve or reject them at ${ctx.access.webUrl()}publish, or wait for them to expire (24h).`;
+
+  if (load.byPackage >= MAX_STAGED_PER_PACKAGE) return `${input.name} already has ${load.byPackage} versions waiting for approval, the most one package may have. ${where}`;
+
+  if (load.byUser >= MAX_STAGED_PER_USER) return `You already have ${load.byUser} versions waiting for approval, the most one account may have. ${where}`;
+
+  if (load.bytesByUser + input.size > MAX_STAGED_BYTES_PER_USER) return `Your versions waiting for approval would take more than ${MAX_STAGED_BYTES_PER_USER / (1024 * 1024)} MB. ${where}`;
+
+  return null;
 }
 
 export function approvalUrl(ctx: Ctx, id: string): string {
@@ -530,12 +568,20 @@ function commitRows(ctx: Ctx, v: CommitInput, m: { at: number; size: number }): 
   ctx.store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
 }
 
+/** A publish-shaped PUT without a tarball: npm deprecate. Answers with the versions it changed; a missing version changes nothing. */
 function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: string): Response {
   const pkg = ctx.store.getPackage(name);
   if (!pkg) return fail(404, "Not found");
+  const asked = Object.entries(body.versions);
+
+  if (asked.length === 0) return fail(400, "Nothing to update: the request names no versions. Publishing needs a tarball in _attachments.");
+  const missing = asked.map(([version]) => version).filter((version) => !ctx.store.getVersion(name, version));
+
+  if (missing.length > 0) return fail(404, `${name} has no version ${missing.join(", ")}. Nothing was changed.`, { missing });
   const at = ctx.now();
+  const updated: string[] = [];
   ctx.store.tx(() => {
-    for (const [version, manifest] of Object.entries(body.versions)) {
+    for (const [version, manifest] of asked) {
       const v = ctx.store.getVersion(name, version);
       if (!v) continue;
       const dep = manifest.deprecated;
@@ -543,11 +589,14 @@ function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: s
       if (next !== v.deprecated) {
         ctx.store.setDeprecated(name, version, next);
         ctx.store.addEvent({ package: name, kind: next ? "deprecate" : "undeprecate", actor: user, at, detail: { version, message: next } });
+        updated.push(version);
       }
     }
-    ctx.store.updatePackageMeta(name, { modifiedAt: at });
+
+    if (updated.length > 0) ctx.store.updatePackageMeta(name, { modifiedAt: at });
   });
-  return json({ ok: true });
+
+  return json({ ok: true, updated });
 }
 
 // ---------- dist-tags ----------
@@ -560,14 +609,27 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
   if (!tag) return fail(400, "Tag required");
   const tags = { ...pkg.distTags };
   if (req.method === "PUT" || req.method === "POST") {
-    const raw: unknown = await req.json();
-    const version = z.string().parse(raw);
+    if (!isValidTagName(tag)) return fail(400, tagNameError(tag));
+    let raw: unknown;
+
+    try {
+      raw = await req.json();
+    } catch {
+      return fail(400, 'The body must be a JSON string naming a version, like "1.2.3".');
+    }
+
+    const parsed = z.string().safeParse(raw);
+
+    if (!parsed.success) return fail(400, 'The body must be a JSON string naming a version, like "1.2.3".');
+    const version = parsed.data;
     if (!isValidVersion(version)) return fail(400, `Invalid version "${version}"`);
     const v = ctx.store.getVersion(name, version);
     if (!v || v.status !== "active") return fail(404, `Version ${version} not found or not active`);
     tags[tag] = version;
   } else if (req.method === "DELETE") {
     if (tag === "latest") return fail(400, "Cannot delete latest");
+
+    if (tagTarget(tags, tag) === undefined) return fail(404, `No dist-tag ${tag} on ${name}.`);
     delete tags[tag];
   } else {
     return fail(405, "Method not allowed");
@@ -576,6 +638,10 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
   ctx.store.setDistTags(name, tags, at);
   ctx.store.addEvent({ package: name, kind: "dist-tag", actor: auth.user, at, detail: { tag, version: tags[tag] ?? null } });
   return json({ ok: true, ...tags });
+}
+
+function tagNameError(tag: string): string {
+  return `Invalid dist-tag "${tag.slice(0, 64)}": a tag starts with a letter, uses letters, digits, ".", "-" and "_", and must not read as a version or range (1.2.3, v1, ^1).`;
 }
 
 // ---------- users ----------
@@ -597,13 +663,95 @@ async function handleAddUser(req: Request, ctx: Ctx, rawName: string): Promise<R
   if (!USER_RE.test(name)) return fail(400, "Usernames are lowercase letters, digits and dashes.");
   const existing = ctx.store.getUser(name);
   if (existing) {
-    const ok = await Bun.password.verify(body.password, existing.password_hash);
-    if (!ok) return fail(401, "Incorrect username or password.");
+    const check = await checkPassword({ store: ctx.store, user: name, password: body.password, hash: existing.password_hash, now: ctx.now() });
+
+    if (check === "locked") return fail(429, LOCKED_MESSAGE);
+
+    if (check === "bad") return fail(401, "Incorrect username or password.");
     return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "legacy" }) }, 201);
   }
   if (body.password.length < 8) return fail(400, "Password must be at least 8 characters.");
   ctx.store.createUser({ name, password_hash: await Bun.password.hash(body.password), email: body.email ?? "", created_at: ctx.now() });
   return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "legacy" }) }, 201);
+}
+
+// ---------- npm owner and unpublish ----------
+// npm owner add/rm reads GET /-/user/org.couchdb.user:<name>, then PUTs the packument's maintainers to
+// /<pkg>/-rev/<rev>. apm applies that as an owner change behind the same second factor as apm's own owner
+// route: npm sends it as --otp. npm unpublish PUTs or DELETEs under -rev too; apm never deletes versions.
+
+export const UNPUBLISH_REFUSED =
+  'apm never deletes a published version, so lockfiles and mirrors cannot be pointed at different bytes later. To hide a version from new installs run `apm yank <pkg>@<version>`; to pull a malicious version from everyone run `apm revoke <pkg>@<version> --reason "..."`.';
+
+function handleUserLookup(ctx: Ctx, rawName: string): Response {
+  const name = rawName.replace(/^org\.couchdb\.user:/, "");
+  const u = ctx.store.getUser(name);
+
+  if (!u) return fail(404, `No user ${name}.`);
+
+  return json({ _id: `org.couchdb.user:${name}`, name });
+}
+
+const RevBody = z.object({ maintainers: z.array(z.object({ name: z.string() }).loose()).optional(), versions: z.unknown().optional() }).loose();
+
+function otpRequired(error: string): Response {
+  return json({ error }, 401, { "www-authenticate": "OTP" });
+}
+
+async function handleRevPut(req: Request, ctx: Ctx, name: string, auth: Auth): Promise<Response> {
+  if (auth.kind !== "user") return fail(401, "Log in first (apm login).");
+
+  if (!ctx.store.getPackage(name)) return fail(404, "Not found");
+  let raw: unknown;
+
+  try {
+    raw = await req.json();
+  } catch {
+    return fail(400, "Invalid JSON body");
+  }
+
+  const body = RevBody.safeParse(raw);
+
+  if (!body.success) return fail(400, "Invalid body: expected { maintainers: [{ name }] }");
+
+  // npm unpublish of one version sends the packument minus that version
+  if (body.data.versions !== undefined) return fail(405, UNPUBLISH_REFUSED);
+  const wanted = body.data.maintainers;
+
+  if (!wanted) return fail(400, "Nothing to change: apm takes owner changes ({ maintainers }) on this route.");
+  const owners = ctx.store.owners(name);
+
+  if (!owners.includes(auth.user)) return fail(403, `Only owners of ${name} can change its owners. Owners: ${owners.join(", ")}`);
+  const names = [...new Set(wanted.map((m) => m.name))];
+  const add = names.filter((n) => !owners.includes(n));
+  const remove = owners.filter((n) => !names.includes(n));
+
+  if (add.length === 0 && remove.length === 0) return json({ ok: true, owners });
+  const unknown = add.find((n) => !ctx.store.getUser(n));
+
+  if (unknown !== undefined) return fail(404, `No user ${unknown}.`);
+
+  if (remove.length >= owners.length + add.length) return fail(409, `${name} would have no owners. Add another owner first.`);
+  const otp = req.headers.get("npm-otp")?.trim();
+
+  if (!otp) return otpRequired(`Changing owners needs a code from your authenticator app: run it again with --otp=<code>.`);
+  const refused = await ctx.access.secondFactor({ user: auth.user, otp });
+
+  if (refused) return refused.status === 401 ? otpRequired(refused.error) : fail(refused.status, refused.error);
+  const at = ctx.now();
+  ctx.store.tx(() => {
+    for (const u of add) {
+      ctx.store.addOwner(name, u);
+      ctx.store.addEvent({ package: name, kind: "owner-add", actor: auth.user, at, detail: { user: u, via: "npm owner" } });
+    }
+
+    for (const u of remove) {
+      ctx.store.removeOwner(name, u);
+      ctx.store.addEvent({ package: name, kind: "owner-remove", actor: auth.user, at, detail: { user: u, via: "npm owner" } });
+    }
+  });
+
+  return json({ ok: true, owners: ctx.store.owners(name) });
 }
 
 // ---------- search ----------
@@ -711,8 +859,13 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
 
   if (path === "/-/ping") return json({});
   if (path === "/-/whoami") return auth.kind === "user" ? json({ username: auth.user }) : fail(401, "Not logged in");
-  if (path.startsWith("/-/user/") && req.method === "PUT") {
+
+  if (path.startsWith("/-/user/org.couchdb.user:") && req.method === "PUT") {
     return handleAddUser(req, ctx, decodeURIComponent(path.slice("/-/user/".length)));
+  }
+
+  if (path.startsWith("/-/user/org.couchdb.user:") && (req.method === "GET" || req.method === "HEAD")) {
+    return handleUserLookup(ctx, decodeURIComponent(path.slice("/-/user/".length)));
   }
   if (path.startsWith("/-/user/token/") && req.method === "DELETE") {
     if (auth.kind === "user") ctx.store.db.query("UPDATE tokens SET revoked_at = ? WHERE token_hash = ?").run(ctx.now(), auth.tokenHash);
@@ -732,7 +885,11 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
   const { name, rest } = sp;
 
   if (req.method === "PUT" && rest.length === 0) return handlePublish(req, ctx, name, auth, ext);
-  if (req.method === "PUT" && rest[0] === "-rev") return handlePublish(req, ctx, name, auth, ext);
+
+  if (req.method === "PUT" && rest[0] === "-rev") return handleRevPut(req, ctx, name, auth);
+
+  // npm unpublish: DELETE /<pkg>/-rev/<rev> for the package, DELETE <tarball>/-rev/<rev> for one version
+  if (req.method === "DELETE" && rest.includes("-rev")) return fail(405, UNPUBLISH_REFUSED);
 
   if (req.method !== "GET" && req.method !== "HEAD") return fail(405, "Method not allowed");
 
@@ -747,6 +904,8 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
     if (v.status === "revoked") {
       return fail(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`, { revoked: true });
     }
+
+    if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
     const bytes = readVersionTarball(ctx, v);
     if (!bytes) return fail(404, "Tarball missing");
     return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
@@ -770,8 +929,15 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
   }
   // GET /:name/:versionOrTag
   const spec = rest[0] ?? "";
-  const resolved = pkg.distTags[spec] ?? spec;
+  // in a view, tags point at what the view serves (latest moves back to the newest kept version)
+  const tags = view ? retag(pkg.distTags, servedVersions(ctx.store.listVersions(name)).filter(view.keep).map((x) => x.version)) : pkg.distTags;
+  const resolved = tagTarget(tags, spec) ?? spec;
+
+  if (!isValidVersion(resolved)) return fail(404, "Version not found");
   const v = ctx.store.getVersion(name, resolved);
   if (!v || v.status === "revoked") return fail(404, "Version not found");
-  return json(versionDoc(ctx, pkg, v, ext));
+
+  if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
+
+  return json(versionDoc(ctx, pkg, v, ext, view));
 }
