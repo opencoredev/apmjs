@@ -4,7 +4,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export const DEFAULT_REGISTRY = "https://apmjs.dev/";
+export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
 /** `withheld` names the registry APM_TOKEN belongs to when apm talks to a different one and so sends no token. */
 export type Config = { registry: string; token: string | null; userconfig: string; withheld: string | null };

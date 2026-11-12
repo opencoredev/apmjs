@@ -9,7 +9,7 @@ import { analyze, describeSkip, finalize, findSecrets, missingEntries, readTarba
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { lockedEntry } from "./lockfile.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
 
@@ -894,7 +894,7 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
 
 Flags: --pm bun|npm|pnpm|yarn, --force, --no-cooldown, --json, --otp <code>, --no-browser
-Registry: APM_REGISTRY or registry= in .npmrc (default ${"https://apmjs.dev/"})`;
+Registry: APM_REGISTRY or registry= in .npmrc (default ${DEFAULT_REGISTRY})`;
 
 // Commands that run package install scripts: their env gets no credentials. `apm run` keeps the env, as `bun run` would.
 const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebuild", "add", "remove", "rm", "uninstall", "link"]);

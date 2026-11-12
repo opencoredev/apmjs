@@ -64,7 +64,7 @@ export default function Docs() {
         <Block id="bun" note="recommended">
           <Text>Point Bun at apm and add the scanner. Stock bun install then refuses revoked versions and packages scoring under 40.</Text>
           <Code label="bunfig.toml">{`[install]
-registry = "https://apmjs.dev/"
+registry = "https://registry.apmjs.dev/"
 
 [install.security]
 scanner = "@apm/bun-scanner"`}</Code>
@@ -79,7 +79,7 @@ scanner = "@apm/bun-scanner"`}</Code>
             The <code className="rounded-md bg-surface px-1.5 py-0.5 font-mono text-[15px] text-foreground">~safe</code> view skips versions younger than 24 hours and versions scoring under 40.
             No new tools needed.
           </Text>
-          <Code label=".npmrc">{`registry=https://apmjs.dev/~safe/`}</Code>
+          <Code label=".npmrc">{`registry=https://registry.apmjs.dev/~safe/`}</Code>
         </Block>
 
         <Block id="cli">

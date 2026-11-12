@@ -5,7 +5,7 @@ Makes stock `bun install` and `bun add` ask the apm registry about every package
 ```toml
 # bunfig.toml
 [install]
-registry = "https://apmjs.dev/"
+registry = "https://registry.apmjs.dev/"
 
 [install.security]
 scanner = "@apm/bun-scanner"

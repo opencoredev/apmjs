@@ -4,6 +4,7 @@
 //   bun packages/infra/deploy.ts plan    --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage production
+//   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -117,9 +118,15 @@ const bundle = await buildWorker("worker");
 process.stdout.write(`registry bundle: ${bundle}\n`);
 
 const subdomain = await workersSubdomain(token, accountId);
+const alchemyFlags: string[] = [];
+
+if (args.action === "deploy") alchemyFlags.push("--yes");
+
+// adopts existing resources when the local Alchemy state was lost (docs/DEPLOY.md, "State")
+if (process.argv.includes("--adopt")) alchemyFlags.push("--adopt");
 
 const child = Bun.spawn(
-  ["bun", join(INFRA, "node_modules", ".bin", "alchemy"), args.action, "--stage", args.stage, "--no-input", ...(args.action === "deploy" ? ["--yes"] : [])],
+  ["bun", join(INFRA, "node_modules", ".bin", "alchemy"), args.action, "--stage", args.stage, "--no-input", ...alchemyFlags],
   {
     cwd: INFRA,
     stdout: "inherit",

@@ -1,6 +1,6 @@
 # apm
 
-> Early and moving fast. The registry, CLI and score engine work and are tested; sign-in, GitHub-scoped names and hosting at apmjs.dev are in progress.
+> Early and moving fast. The registry, CLI and score engine work and are tested. The registry and website run on Cloudflare; see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `apm`, a thin CLI that checks before your package manager installs, runs or publishes. apm never manages the runtime.
 
@@ -19,22 +19,29 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 
 ## Layout
 
-- `packages/registry`: Bun + SQLite registry (npm wire protocol, apm API, upstream proxy)
+- `packages/registry`: the registry, a Cloudflare Worker (npm wire protocol, apm API, upstream proxy) written as Effect services over Postgres (Neon via Hyperdrive), R2 and a queue
+- `packages/infra`: the Alchemy stack that deploys the registry and the website, plus the deploy and smoke scripts
 - `packages/core`: score engine, secret scanner, typo distance, tarball reader
 - `packages/cli`: `apm`
 - `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and low-scoring versions
-- `apps/web`: Next.js + shadcn UI (search with name check, package pages)
-- `tests/acceptance`: over 100 tests that drive real bun, npm and pnpm against an in-process registry
+- `apps/web`: Next.js + shadcn UI (search with name check, package pages), deployed as a Worker through OpenNext
+- `tests/acceptance`: over 180 tests that drive real bun, npm and pnpm against the registry's Worker build in Miniflare, on Postgres 18
+
+How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Run it
 
+The registry needs Postgres installed locally (`initdb` on PATH or under `/usr/lib/postgresql`), or a server in `APM_TEST_DATABASE_URL`.
+
 ```sh
 bun install
-APM_PORT=4873 APM_DATA_DIR=.data/dev bun packages/registry/src/main.ts   # APM_UPSTREAM=off to disable the npm proxy
+bun run registry                                                         # the Worker in Miniflare on :4873; APM_UPSTREAM=off disables the npm proxy
+APM_LEGACY_AUTH=1 APM_NAME_POLICY=open bun run registry                  # what tools/seed-demo.ts needs
 APM_REGISTRY=http://127.0.0.1:4873/ bun tools/seed-demo.ts               # optional demo data
-cd apps/web && bun run build && APM_REGISTRY=http://127.0.0.1:4873/ bun run start -p 3410
+cd apps/web && APM_REGISTRY=http://127.0.0.1:4873/ bun run dev
 bun packages/cli/src/main.ts help
 bun scripts/score.ts                                                     # acceptance suite; prints failing count
+bun run typecheck && bun run lint
 ```
 
 Research, plan and council reviews: `research/`.
