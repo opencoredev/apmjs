@@ -229,6 +229,8 @@ export class Store {
       if (!cols.includes(c.column)) this.db.exec(`ALTER TABLE ${c.table} ADD COLUMN ${c.column} ${c.decl}`);
     }
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_auth_user ON users(auth_user_id) WHERE auth_user_id IS NOT NULL");
+    // Tokens from npm's password login predate sign-in; mark them so they lose direct publish when legacy auth is off.
+    this.db.exec("UPDATE tokens SET scope = 'legacy' WHERE scope = 'publish' AND label = 'cli login'");
   }
 
   close(): void {

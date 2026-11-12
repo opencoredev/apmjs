@@ -25,6 +25,12 @@ export type Access = {
 export type Ctx = { store: Store; now: () => number; baseUrl: () => string; access: Access };
 /** "publish" tokens go live at once (legacy logins, test tokens, later CI trusted publishing); "stage" tokens need approval. */
 export type TokenScope = "publish" | "stage";
+/** What a token row's scope means today. "legacy" tokens came from password logins: direct publish only while legacy auth is on. */
+export function effectiveScope(stored: string, legacyAuth: boolean): TokenScope {
+  if (stored === "stage") return "stage";
+  if (stored === "legacy") return legacyAuth ? "publish" : "stage";
+  return "publish";
+}
 export type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: string; scope: TokenScope };
 
 /** A staged version waits this long for approval. */
@@ -87,9 +93,9 @@ function authOf(req: Request, ctx: Ctx): Auth {
   const tok = ctx.store.getToken(tokenHash);
   if (!tok || tok.revoked_at !== null) return { kind: "anon" };
   if (tok.expires_at !== null && tok.expires_at < ctx.now()) return { kind: "anon" };
-  return { kind: "user", user: tok.user, tokenHash, scope: tok.scope === "stage" ? "stage" : "publish" };
+  return { kind: "user", user: tok.user, tokenHash, scope: effectiveScope(tok.scope, ctx.access.legacyAuth) };
 }
-export function issueToken(ctx: Ctx, input: { user: string; label: string; scope: TokenScope; ttlMs?: number }): string {
+export function issueToken(ctx: Ctx, input: { user: string; label: string; scope: TokenScope | "legacy"; ttlMs?: number }): string {
   const token = newToken();
   const at = ctx.now();
   ctx.store.insertToken({
@@ -486,11 +492,11 @@ async function handleAddUser(req: Request, ctx: Ctx, rawName: string): Promise<R
   if (existing) {
     const ok = await Bun.password.verify(body.password, existing.password_hash);
     if (!ok) return fail(401, "Incorrect username or password.");
-    return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "publish" }) }, 201);
+    return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "legacy" }) }, 201);
   }
   if (body.password.length < 8) return fail(400, "Password must be at least 8 characters.");
   ctx.store.createUser({ name, password_hash: await Bun.password.hash(body.password), email: body.email ?? "", created_at: ctx.now() });
-  return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "publish" }) }, 201);
+  return json({ ok: true, id: `org.couchdb.user:${name}`, token: issueToken(ctx, { user: name, label: "cli login", scope: "legacy" }) }, 201);
 }
 
 // ---------- search ----------

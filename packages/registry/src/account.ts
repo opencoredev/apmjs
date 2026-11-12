@@ -185,8 +185,11 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
           }))
         : [];
       const stepup = ctx.store.stepupAt(s.authUserId);
+      const githubName = auth.gitHubNameOf(s.authUserId);
       return json({
         scope: user?.name ?? null,
+        // GitHub is linked but its login is already an older apm account's name: needs a name dispute.
+        scopeTaken: user === null && githubName !== null ? githubName : null,
         github: user?.github_login ?? null,
         name: profile?.name ?? "",
         email: profile?.email ?? "",

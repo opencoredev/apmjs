@@ -57,6 +57,8 @@ export type ApmAuth = {
   sessionOf: (req: Request) => Promise<SignedIn | null>;
   /** The apm user bound to this account, binding it from the GitHub login the first time. Null for accounts without GitHub. */
   apmUserOf: (authUserId: string) => User | null;
+  /** The lowercased GitHub login linked to this account, whether or not it became the apm name. */
+  gitHubNameOf: (authUserId: string) => string | null;
   profileOf: (authUserId: string) => { name: string; email: string; image: string | null } | null;
   linked: (authUserId: string) => Linked[];
   factors: (authUserId: string) => { totp: boolean; passkeys: number };
@@ -182,11 +184,11 @@ export async function createAuth(input: { store: Store; options: AuthOptions; ba
       const profile = db.query("SELECT email FROM user WHERE id = ?").get(authUserId);
       const email = profile ? z.object({ email: z.string() }).parse(profile).email : "";
       store.createUser({ name, password_hash: "", email, created_at: now(), auth_user_id: authUserId, github_id: github.accountId, github_login: login });
-    } else if (existing.auth_user_id === null && (existing.github_id === null || existing.github_id === github.accountId)) {
-      // A name made before sign-in existed (demo data, test tokens): the GitHub account with that login claims it.
+    } else if (existing.auth_user_id === null && existing.password_hash === "" && (existing.github_id === null || existing.github_id === github.accountId)) {
+      // A passwordless name made outside sign-in (an operator's minted token): the GitHub account with that login claims it.
       store.bindUser(name, link);
     } else {
-      // The name belongs to another account (for example a renamed GitHub login that someone else took).
+      // The name belongs to someone else: an older password account, or a renamed GitHub login another account took.
       return null;
     }
     return store.getUserByAuthId(authUserId);
@@ -223,6 +225,11 @@ export async function createAuth(input: { store: Store; options: AuthOptions; ba
       return { authUserId: s.data.user.id, sessionToken: s.data.session.token, signedInAt: s.data.session.createdAt.getTime() };
     },
     apmUserOf,
+    gitHubNameOf(authUserId) {
+      const github = accountsOf(authUserId).find((a) => a.provider === "github");
+      const login = github ? store.gitHubLogin(github.accountId) : null;
+      return login ? login.toLowerCase() : null;
+    },
     profileOf(authUserId) {
       const row = db.query("SELECT name, email, image FROM user WHERE id = ?").get(authUserId);
       return row ? z.object({ name: z.string(), email: z.string(), image: z.string().nullable() }).parse(row) : null;
