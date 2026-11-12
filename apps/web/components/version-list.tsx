@@ -56,7 +56,7 @@ export function VersionList({ rows, packageHref, current }: { rows: VersionRow[]
               <TableCell className="hidden py-3 text-muted-foreground sm:table-cell">{v.when}</TableCell>
               <TableCell className="hidden py-3 font-mono text-[13px] text-muted-foreground sm:table-cell">{v.publishedBy}</TableCell>
               <TableCell className="py-3 pr-4 text-right">
-                <ScoreBadge score={v.score} grade={v.grade} />
+                <ScoreBadge score={v.score} grade={v.grade} unscorable={Boolean(v.unscorable)} />
               </TableCell>
             </TableRow>
           ))}

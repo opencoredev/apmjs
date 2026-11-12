@@ -4,7 +4,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Cause, Effect, Exit, Layer } from "effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
-import { Analysis, type AnalysisJob } from "./analysis.ts";
+import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
 import { matureRevocations } from "./apm.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
@@ -282,7 +282,11 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
 
 const Job = z.object({ name: z.string(), version: z.string() });
 
-/** Scores queued upstream versions. A failed job, or one whose upstream may answer later, is retried by the queue. */
+/**
+ * Scores queued upstream versions, one message per invocation (the consumer's batch size is 1, so one analysis has the
+ * whole CPU limit). A failed job, or one whose upstream may answer later, is retried by the queue; one another run may
+ * still be working on comes back once that run must have ended.
+ */
 export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
@@ -303,6 +307,7 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
       logFailure("analysis", { name: job.data.name, version: job.data.version }, Cause.pretty(exit.cause));
       message.retry();
     } else if (exit.value === "retry") message.retry();
+    else if (exit.value === "busy") message.retry({ delaySeconds: RUN_WINDOW_MS / 1000 });
     else message.ack();
   }
 }

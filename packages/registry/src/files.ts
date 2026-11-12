@@ -19,7 +19,7 @@ import { sha256Hex, sha512 } from "./hash.ts";
 import { json } from "./http.ts";
 import { countLines, ExcerptLine, isUtf8, pickReadme, sliceLines } from "./file-text.ts";
 import { splitPath, versionOf } from "./server.ts";
-import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
+import { digestLabel, digestOf, tooLargeText, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { isWithheld } from "./withheld.ts";
 
 /** The largest file the view returns. Larger files are reported with their size, not sent. */
@@ -128,6 +128,8 @@ const entriesOf = (found: Found) =>
           return yield* Effect.fail(refuse(404, `${found.pkg.name}@${found.v.version} is not published upstream.`));
         case "unavailable":
           return yield* Effect.fail(refuse(502, `Upstream tarball unavailable: ${got.reason}.`));
+        case "too-large":
+          return yield* Effect.fail(refuse(502, `Upstream tarball unavailable: ${tooLargeText(got.bytes)}.`));
         case "ok":
           bytes = got.bytes;
           break;

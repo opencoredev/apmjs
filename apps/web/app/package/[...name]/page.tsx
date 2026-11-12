@@ -29,6 +29,7 @@ import { cutReadme, EXTERNAL_REL, renderReadme } from "@/lib/readme";
 import { githubRepo } from "@/lib/repository";
 import { ReadmeView } from "@/components/readme-view";
 import { scoreLine, scoreLineText } from "@/lib/score-summary";
+import { unscoredNotice } from "@/lib/unscored";
 import { describeEvent } from "@/lib/package-events";
 import type { Metadata } from "next";
 import { JsonLd } from "@/components/json-ld";
@@ -441,12 +442,12 @@ function NoReadme({ name, source, links }: { name: string; source: NoReadmeSourc
 const SCORE_QUALIFIER = "Heuristic score; runtime behavior and dependency code not checked.";
 
 /** Phones only: the score in one line near the top, naming the signal that cost the most, linking down to the full report. */
-function ScoreSummary({ score, className }: { score: PackageInfo["score"]; className?: string }) {
-  const line = scoreLine(score ? score.signals : null);
+function ScoreSummary({ score, unscorable, className }: { score: PackageInfo["score"]; unscorable: boolean; className?: string }) {
+  const line = scoreLine(score ? score.signals : null, unscorable);
 
   return (
     <a href="#score" className={`flex min-h-12 items-center gap-3 rounded-xl border px-4 py-2.5 transition-colors hover:bg-surface/60 ${className ?? ""}`}>
-      <ScoreBadge score={score?.score} grade={score?.grade} />
+      <ScoreBadge score={score?.score} grade={score?.grade} unscorable={unscorable} />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="text-[15px] leading-6 text-pretty">
           {line.kind === "lost" ? (
@@ -661,6 +662,8 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
   const score = isLatest ? pkg.score : versionScore.kind === "ok" ? versionScore.value : null;
+  const unscored = score ? null : unscoredNotice({ pkg, version });
+  const unscorable = unscored?.kind === "unscorable";
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
   const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
@@ -687,7 +690,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>
           {version && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{version}</span>}
-          <ScoreBadge score={score?.score} grade={score?.grade} className="h-8" />
+          <ScoreBadge score={score?.score} grade={score?.grade} unscorable={unscorable} className="h-8" />
           <Suspense fallback={null}>
             <AiNotice review={review} />
           </Suspense>
@@ -723,7 +726,11 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
           <section aria-labelledby="score" className="order-4 lg:order-none">
             <SectionTitle id="score">Security score</SectionTitle>
-            {score ? <ScorePanel score={score} name={pkg.name} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
+            {score ? (
+              <ScorePanel score={score} name={pkg.name} version={version} />
+            ) : (
+              <p className={`rounded-xl px-5 py-4 text-pretty ${unscorable ? "bg-warn-soft text-foreground" : "bg-surface text-muted-foreground"}`}>{unscored?.text ?? "Not scored yet."}</p>
+            )}
           </section>
 
           {score && (score.capabilities.length > 0 || score.scorer === "apm-score-v10") && (
@@ -757,7 +764,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
         </div>
 
         <div className="contents lg:flex lg:flex-col lg:gap-12">
-          <ScoreSummary score={score} className="order-2 lg:hidden" />
+          <ScoreSummary score={score} unscorable={unscorable} className="order-2 lg:hidden" />
           <section aria-labelledby="facts" className="order-3 lg:order-none">
             <SectionTitle id="facts">At a glance</SectionTitle>
             <div className="border-t">

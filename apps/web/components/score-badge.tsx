@@ -24,16 +24,17 @@ export function scoreTone(score: number | null | undefined): string {
   return SOFT[toneOf(score)];
 }
 
-export function ScoreBadge({ score, grade, className }: { score: number | null | undefined; grade?: string | null; className?: string }) {
+/** `unscorable`: the registry decided the version can never be scored (too large, unreadable, over its limits). */
+export function ScoreBadge({ score, grade, unscorable = false, className }: { score: number | null | undefined; grade?: string | null; unscorable?: boolean; className?: string }) {
   const unscored = score === null || score === undefined;
 
   return (
     <span
-      className={cn("inline-flex h-7 min-w-[3.75rem] shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-mono text-[13px] tabular-nums", scoreTone(score), className)}
-      title={unscored ? "Not scored yet" : `apm score ${score}/100`}
+      className={cn("inline-flex h-7 min-w-[3.75rem] shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-mono text-[13px] tabular-nums", unscored && unscorable ? SOFT.warn : scoreTone(score), className)}
+      title={unscored ? (unscorable ? "Cannot be scored" : "Not scored yet") : `apm score ${score}/100`}
     >
       {unscored ? (
-        <span aria-label="Not scored">n/a</span>
+        <span aria-label={unscorable ? "Cannot be scored" : "Not scored"}>n/a</span>
       ) : (
         <>
           <span className="font-semibold">{grade ?? ""}</span>

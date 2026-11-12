@@ -81,6 +81,14 @@ const PackageInfo = z.object({
   distTags: z.record(z.string(), z.string()),
   maintainers: z.array(z.string()),
   latest: z.string().nullable(),
+  // why the latest version has no score; added with the analysis outcomes, an older registry leaves it out
+  unscored: z
+    .discriminatedUnion("kind", [
+      z.object({ kind: z.literal("unscorable"), reason: z.string(), text: z.string() }),
+      z.object({ kind: z.literal("queued"), text: z.string() }),
+      z.object({ kind: z.literal("unreadable"), text: z.string() }),
+    ])
+    .nullish(),
   facts: Facts.nullable(),
   score: PackageScore.nullable(),
   versions: z.array(
@@ -93,6 +101,8 @@ const PackageInfo = z.object({
       deprecated: z.string().nullable(),
       score: z.number().nullable(),
       grade: z.string().nullable(),
+      // why apm can never score this version, when it decided so
+      unscorable: z.string().nullish(),
     }),
   ),
 });

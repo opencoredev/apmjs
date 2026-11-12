@@ -640,6 +640,11 @@ export type AnalyzeInput = {
   maxCrossFileSteps?: number;
   /** Milliseconds one analysis may run before it stops reading files. Defaults to MAX_ANALYSIS_MS. */
   maxAnalysisMs?: number;
+  /**
+   * Limits the caller hit before this analysis ran, each said as evidence of `incomplete`: the registry re-runs an
+   * analysis the platform stopped on a smaller budget, and says so, since the reading it can afford is not the whole.
+   */
+  incompleteBecause?: readonly string[];
 };
 
 /** What each dependency installs: the registry name behind an npm: alias, the key for anything else. */
@@ -1220,6 +1225,8 @@ export function analyze(input: AnalyzeInput): Analysis {
   if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
   for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
+
+  for (const why of input.incompleteBecause ?? []) add("incomplete", why);
 
   for (const list of [unanalyzed, v3.unanalyzed]) {
     if (list.length === 0) continue;

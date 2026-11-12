@@ -39,7 +39,7 @@ import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { digestLabel, digestOf } from "./digest.ts";
-import { Store, type PackageRecord, type VersionRecord } from "./db.ts";
+import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, parseBody } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
@@ -64,7 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
-import { Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
+import { tooLargeText, Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -872,9 +872,22 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
     const report = reportFor(v, at);
 
     if (!report) {
-      if (src.kind === "upstream") return fail(503, "This version is not scored yet: its tarball is queued for analysis. Try again in a minute.", { pending: true });
+      const why = notScored(src, v);
 
-      return fail(404, "No score for this version (the tarball could not be read).");
+      switch (why.kind) {
+        case "queued":
+          return fail(503, "This version is not scored yet: its tarball is queued for analysis. Try again in a minute.", { pending: true });
+        case "unscorable":
+          // decided, not waiting: asking again gives the same answer, and installs stay refused
+          return fail(422, `${why.text}. It is not installed through apm.`, { unscorable: { reason: why.reason, text: why.text } });
+        case "unreadable":
+          return fail(404, "No score for this version (the tarball could not be read).");
+        default: {
+          const _exhaustive: never = why;
+
+          return _exhaustive;
+        }
+      }
     }
 
     const prev0 = previousOf(src, v);
@@ -957,6 +970,8 @@ const packageResponse = (name: string) =>
       createdAt: local ? new Date(local.created_at).toISOString() : null,
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
+      // why the latest version has no score, when it has none: queued, or decided never (with the reason)
+      unscored: latest && !latestReport ? notScored(src, latest) : null,
       facts: latestFree?.facts ?? null,
       score:
         latest && latestReport && latestFree
@@ -978,6 +993,7 @@ const packageResponse = (name: string) =>
             deprecated: isWithheld(v.status) ? null : v.deprecated,
             score: r?.score ?? null,
             grade: r?.grade ?? null,
+            unscorable: !r && v.unscorable ? notScored(src, v).text : null,
           };
         }),
     });
@@ -1069,7 +1085,7 @@ const popularScoresResponse = (url: URL) =>
           const store = yield* Store;
 
           // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
-          if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).size === 0) return none;
+          if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).scores.size === 0) return none;
           const src = yield* lookup(name);
           const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
           // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
@@ -1357,6 +1373,30 @@ const recentPackagesResponse = (url: URL) =>
     return json({ packages: rows.map((r) => ({ name: r.package, at: new Date(r.at).toISOString() })) });
   });
 
+// ---------- versions without a score ----------
+/** What a decided reason means, in the words every surface uses (score endpoint, install refusals, scan, website). */
+const UNSCORABLE_LEAD: Record<Unscorable["reason"], string> = {
+  "too-large": "it is too large for apm to analyze",
+  unavailable: "the upstream registry does not serve it in a form apm can check",
+  unreadable: "its tarball is not a package apm can read",
+  "analysis-limit": "its analysis runs past the registry's limits",
+};
+
+/**
+ * Why a version has no score: "unscorable" when the registry decided it never will be (and why), "queued" when an
+ * upstream version is waiting for the analysis queue, "unreadable" for a local version whose tarball was not read.
+ * None of them is ever installed as if it passed.
+ */
+export type NotScored = { kind: "unscorable"; reason: Unscorable["reason"]; text: string } | { kind: "queued"; text: string } | { kind: "unreadable"; text: string };
+
+export function notScored(src: Pick<Source, "kind">, v: VersionRecord): NotScored {
+  if (v.unscorable) return { kind: "unscorable", reason: v.unscorable.reason, text: `apm cannot score this version: ${UNSCORABLE_LEAD[v.unscorable.reason]} (${v.unscorable.detail})` };
+
+  if (src.kind === "upstream") return { kind: "queued", text: "not scored yet: queued for analysis" };
+
+  return { kind: "unreadable", text: "could not be analyzed" };
+}
+
 // ---------- policy: ~safe view, resolve, scan ----------
 export type Policy = { cooldownMs: number; floor: number };
 
@@ -1377,7 +1417,7 @@ export function policyBlock(v: VersionRecord, policy: Policy, at: number): strin
   if (age < policy.cooldownMs) return `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`;
   const r = reportFor(v, at, { ignoreRecent: true });
 
-  if (!r) return "not scored yet";
+  if (!r) return v.unscorable ? notScored({ kind: "upstream" }, v).text : "not scored yet";
 
   if (r.score < policy.floor) {
     return `score ${r.score}/100 is below ${policy.floor} (${r.signals
@@ -1757,7 +1797,7 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
 
-    if (!r) return unchecked(src.kind === "upstream" ? "not scored yet: queued for analysis" : "could not be analyzed");
+    if (!r) return unchecked(notScored(src, v).text);
 
     if (r.score >= SCORE_FLOOR) return { kind: "clean" } satisfies ScanOne;
 
@@ -1994,6 +2034,8 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
           return fail(404, `${src.name}@${version} is not published upstream.`);
         case "unavailable":
           return fail(502, `Upstream tarball unavailable: ${got.reason}.`);
+        case "too-large":
+          return fail(502, `Upstream tarball unavailable: ${tooLargeText(got.bytes)}.`);
         case "ok":
           break;
         default: {

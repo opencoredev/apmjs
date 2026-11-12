@@ -4,7 +4,7 @@ import { Context, Effect, Layer, Option } from "effect";
 import { z } from "zod";
 import { Blobs } from "./blobs.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
-import { Store, type VersionRecord } from "./db.ts";
+import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
 import { readCapped } from "./http.ts";
@@ -78,11 +78,22 @@ function matches(bytes: Uint8Array, d: Digest): boolean {
 export const MAX_UPSTREAM_TARBALL_BYTES = 32 * 1024 * 1024;
 
 /**
- * "absent": the upstream does not list that version (now). "unavailable": it does, but apm could not get verified
- * bytes; `retryable` when asking again later may work (a network error, a 5xx, a 429, bytes that failed their
- * checksum), not when it cannot (no checksum, too large, a URL apm will not fetch).
+ * "absent": the upstream does not list that version (now). "too-large": the tarball is over
+ * MAX_UPSTREAM_TARBALL_BYTES; `bytes` is the size the upstream declared, null when it declared none and the download
+ * passed the cap. "unavailable": apm could not get verified bytes; `retryable` when asking again later may work (a
+ * network error, a 5xx, a 429, bytes that failed their checksum), not when it cannot (no checksum, a URL apm will not
+ * fetch).
  */
-export type UpstreamTarball = { kind: "ok"; bytes: Uint8Array; digest: Digest } | { kind: "absent" } | { kind: "unavailable"; reason: string; retryable: boolean };
+export type UpstreamTarball =
+  | { kind: "ok"; bytes: Uint8Array; digest: Digest }
+  | { kind: "absent" }
+  | { kind: "too-large"; bytes: number | null }
+  | { kind: "unavailable"; reason: string; retryable: boolean };
+
+/** "a 43.7 MB tarball" or "a tarball", for a refusal that names the size when it is known. */
+export function tooLargeText(bytes: number | null): string {
+  return `the tarball${bytes === null ? "" : ` (${(bytes / 1_000_000).toFixed(1)} MB)`} is larger than the ${MAX_UPSTREAM_TARBALL_BYTES / (1024 * 1024)} MiB apm downloads`;
+}
 
 /** Upstream answers that may succeed when asked again. */
 function isTransientStatus(status: number): boolean {
@@ -229,7 +240,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         const origins: ReadonlySet<string> = new Set([new URL(baseUrl).origin, NPM_ORIGIN]);
 
         /** GET from the upstream's own origin (or npm's) only; each redirect hop is checked before it is followed. */
-        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | Extract<UpstreamTarball, { kind: "unavailable" }>> => {
+        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | Extract<UpstreamTarball, { kind: "unavailable" | "too-large" }>> => {
           let current: URL;
 
           try {
@@ -274,12 +285,12 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             if (declared > MAX_UPSTREAM_TARBALL_BYTES) {
               await res.body?.cancel();
 
-              return { kind: "unavailable", reason: "the tarball is too large", retryable: false };
+              return { kind: "too-large", bytes: declared };
             }
 
             const bytes = await readCapped(res, MAX_UPSTREAM_TARBALL_BYTES);
 
-            if (!bytes) return { kind: "unavailable", reason: "the tarball is too large", retryable: false };
+            if (!bytes) return { kind: "too-large", bytes: null };
 
             return { kind: "ok", bytes };
           }
@@ -461,15 +472,18 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return fresh;
           });
 
-        // an analysis counts only for the exact bytes it read, by the current scorer
-        const scored = (pkg: CachedPackage, scores: ReadonlyMap<string, unknown>): Probe => ({
+        // an analysis counts only for the exact bytes it read, by the current scorer; a version it decided it can never
+        // score says why
+        const scored = (pkg: CachedPackage, { scores, unscorable }: UpstreamAnalyses): Probe => ({
           kind: "found",
           pkg: {
             ...pkg,
             versions: pkg.versions.map((v) => {
               const d = digestOf(v);
+              const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
+              const why = score === null ? unscorable.get(v.version) : undefined;
 
-              return { ...v, score: d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null };
+              return why ? { ...v, score, unscorable: why } : { ...v, score };
             }),
           },
         });
@@ -489,7 +503,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const listed = yield* Effect.forEach(wanted, (name) => Effect.map(listing(name), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
             const found = listed.flatMap(([name, l]) => (l.kind === "found" ? [name] : []));
             const scores = yield* store.upstreamAnalysesOf(found);
-            const none = new Map<string, unknown>();
+            const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
 
             return new Map(listed.map(([name, l]) => [name, l.kind === "found" ? scored(l.pkg, scores.get(name) ?? none) : l]));
           });

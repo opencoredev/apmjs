@@ -171,7 +171,20 @@ const PackageOut = PackageRow.transform(({ dist_tags, ...rest }) => ({ ...rest, 
 
 export type PackageRecord = z.output<typeof PackageOut>;
 
-export type VersionRecord = z.infer<typeof VersionRow>;
+/**
+ * Why the current scorer will never score an upstream version (migration 0010): its tarball is over the download or
+ * unpack cap (too-large), the upstream serves it in no form apm can check (unavailable), it is not a package apm can
+ * read (unreadable), or its analysis kept running past the platform's CPU limit (analysis-limit).
+ */
+export const UnscorableReason = z.enum(["too-large", "unavailable", "unreadable", "analysis-limit"]);
+
+export type Unscorable = { readonly reason: z.infer<typeof UnscorableReason>; readonly detail: string };
+
+/** A version as stored; an upstream one also carries why it can never be scored, when that is decided. */
+export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: Unscorable };
+
+/** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
+export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, Unscorable> };
 
 export type Advisory = z.infer<typeof AdvisoryRow>;
 
@@ -341,10 +354,10 @@ export type StoreApi = {
   /** Versions `user` published after `since` that are not revoked, across every package. */
   readonly publishedSince: (user: string, since: number) => Effect.Effect<VersionRecord[], StoreError>;
 
-  /** The current scorer's analyses of this package, keyed by `${version} ${digest}`. */
-  readonly upstreamAnalyses: (name: string) => Effect.Effect<Map<string, unknown>, StoreError>;
-  /** upstreamAnalyses for several packages in two statements, keyed by package name; a package with none is left out. */
-  readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, Map<string, unknown>>, StoreError>;
+  /** The current scorer's analyses of this package and the versions it decided it cannot score, in one query. */
+  readonly upstreamAnalyses: (name: string) => Effect.Effect<UpstreamAnalyses, StoreError>;
+  /** upstreamAnalyses for several packages in three statements, keyed by package name; a package with neither is left out. */
+  readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
   /**
    * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
    * keyed `"<name> <version>"`, in one query however many versions are asked for.
@@ -355,6 +368,15 @@ export type StoreApi = {
   readonly claimAnalysisJob: (name: string, version: string, now: number, staleMs: number) => Effect.Effect<boolean, StoreError>;
   /** Drops the reservation claimAnalysisJob made at `claimedAt` (when the queue refused the job); a newer claim stays. */
   readonly releaseAnalysisJob: (name: string, version: string, claimedAt: number) => Effect.Effect<void, StoreError>;
+  /** Records that the current scorer will never score this version, and why. */
+  readonly setUnscorable: (input: { name: string; version: string; unscorable: Unscorable; at: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * Counts an analysis run of this version as begun and returns how many have begun, this one included. Null when
+   * another run began less than `runMs` ago (it may still be running) or the version was decided unscorable.
+   */
+  readonly startAnalysis: (input: { name: string; version: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
+  /** Takes back the start `startAnalysis` counted, for a run that ended with an error it reported (not a platform stop). */
+  readonly abandonAnalysis: (name: string, version: string) => Effect.Effect<void, StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -825,34 +847,58 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
                 (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
                    FROM upstream_analysis u WHERE u.package = ${name} AND u.scorer = ${SCORER}) AS analyses,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
-                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals`,
-          one(z.object({ analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })), dismissals: z.array(DismissalRow) })),
+                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS unscorable`,
+          one(
+            z.object({
+              analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
+              dismissals: z.array(DismissalRow),
+              unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
+            }),
+          ),
         );
 
         const analyses = row?.analyses ?? [];
         const dismissals = row?.dismissals ?? [];
 
-        return new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))]));
+        return {
+          scores: new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))])),
+          unscorable: new Map((row?.unscorable ?? []).map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "" }] as const)),
+        };
       }),
     upstreamAnalysesOf: (names) =>
       Effect.gen(function* () {
-        const out = new Map<string, Map<string, unknown>>();
+        const out = new Map<string, UpstreamAnalyses>();
 
         if (names.length === 0) return out;
+        const wanted = [...new Set(names)];
+
+        const of = (name: string): UpstreamAnalyses => {
+          const got = out.get(name) ?? { scores: new Map<string, unknown>(), unscorable: new Map<string, Unscorable>() };
+
+          out.set(name, got);
+
+          return got;
+        };
 
         const rows = yield* run(
           "upstreamAnalysesOf",
-          sql`SELECT package, version, digest, analysis FROM upstream_analysis WHERE package = ANY(${[...new Set(names)]}) AND scorer = ${SCORER}`,
+          sql`SELECT package, version, digest, analysis FROM upstream_analysis WHERE package = ANY(${wanted}) AND scorer = ${SCORER}`,
           all(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
+        );
+
+        const decided = yield* run(
+          "upstreamOutcomesOf",
+          sql`SELECT package, version, outcome, detail FROM analysis_outcomes WHERE package = ANY(${wanted}) AND scorer = ${SCORER} AND outcome IS NOT NULL`,
+          all(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
         );
 
         const dismissals = yield* dismissalsOf([...new Set(rows.map((r) => r.package))]);
 
-        for (const r of rows) {
-          const forPackage = out.get(r.package) ?? new Map<string, unknown>();
-          forPackage.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
-          out.set(r.package, forPackage);
-        }
+        for (const r of rows) of(r.package).scores.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
+
+        for (const d of decided) of(d.package).unscorable.set(d.version, { reason: d.outcome, detail: d.detail ?? "" });
 
         return out;
       }),
@@ -899,6 +945,29 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
 
     releaseAnalysisJob: (name, version, claimedAt) =>
       run("releaseAnalysisJob", sql`DELETE FROM analysis_jobs WHERE package = ${name} AND version = ${version} AND queued_at = ${claimedAt}`, none),
+
+    setUnscorable: ({ name, version, unscorable, at }) =>
+      run(
+        "setUnscorable",
+        sql`INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES (${name}, ${version}, ${SCORER}, ${unscorable.reason}, ${unscorable.detail}, ${at})
+            ON CONFLICT (package, version, scorer) DO UPDATE SET outcome = EXCLUDED.outcome, detail = EXCLUDED.detail, decided_at = EXCLUDED.decided_at`,
+        none,
+      ),
+    startAnalysis: ({ name, version, now, runMs }) =>
+      run(
+        "startAnalysis",
+        sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
+            ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
+            WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
+            RETURNING starts`,
+        one(z.object({ starts: Int })).transform((row) => row?.starts ?? null),
+      ),
+    abandonAnalysis: (name, version) =>
+      run(
+        "abandonAnalysis",
+        sql`UPDATE analysis_outcomes SET starts = GREATEST(starts - 1, 0), started_at = NULL WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL`,
+        none,
+      ),
 
     deleteAdvisoriesFor: (name, version) =>
       run("deleteAdvisoriesFor", sql`DELETE FROM advisories WHERE package = ${name} AND versions ? ${version}`, none),

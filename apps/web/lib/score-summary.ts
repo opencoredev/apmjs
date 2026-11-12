@@ -4,6 +4,7 @@ import type { Signal } from "./registry";
 
 export type ScoreLine =
   | { kind: "unscored" }
+  | { kind: "unscorable" }
   | { kind: "clean" }
   | { kind: "lost"; name: string; points: number; possible: boolean; more: number };
 
@@ -24,8 +25,9 @@ function biggest(lost: readonly Signal[]): Signal | null {
   }, null);
 }
 
-export function scoreLine(signals: readonly Signal[] | null): ScoreLine {
-  if (signals === null) return { kind: "unscored" };
+/** `unscorable`: the registry decided this version can never be scored, which is not the same as not yet. */
+export function scoreLine(signals: readonly Signal[] | null, unscorable = false): ScoreLine {
+  if (signals === null) return unscorable ? { kind: "unscorable" } : { kind: "unscored" };
   const lost = signals.filter((s) => s.points < 0);
   const top = biggest(lost);
 
@@ -42,6 +44,8 @@ export function scoreLineText(line: ScoreLine): string {
   switch (line.kind) {
     case "unscored":
       return "Not scored yet";
+    case "unscorable":
+      return "Cannot be scored; installs refuse it";
     case "clean":
       return "No points lost";
     case "lost":
