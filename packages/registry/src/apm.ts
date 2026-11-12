@@ -72,6 +72,18 @@ async function lookup(env: Env, name: string): Promise<Source | null> {
   return { kind: "upstream", name, distTags: up.distTags, versions: up.versions, pkg: up };
 }
 
+/** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
+async function lookupOrUnknown(env: Env, name: string): Promise<Source | null | "unknown"> {
+  const pkg = env.ctx.store.getPackage(name);
+  if (pkg) return { kind: "local", name, distTags: pkg.distTags, versions: env.ctx.store.listVersions(name) };
+  if (!env.upstream) return null;
+  const probe = await env.upstream.probe(env.ctx, name);
+  if (probe.kind === "unknown") return "unknown";
+  if (probe.kind === "absent") return null;
+  const up = probe.pkg;
+  return { kind: "upstream", name, distTags: up.distTags, versions: up.versions, pkg: up };
+}
+
 /** Makes sure an upstream version has a stored analysis; returns the version with it. */
 async function ensureAnalyzed(env: Env, src: Source, v: VersionRecord): Promise<VersionRecord> {
   if (src.kind === "local" || isAnalysis(v.score) || !env.upstream) return v;
@@ -525,7 +537,10 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
   const ctx = env.ctx;
   const query = q.trim().toLowerCase();
   const valid = isValidPackageName(query);
-  const src = valid ? await lookup(env, query) : null;
+  const found = valid ? await lookupOrUnknown(env, query) : null;
+  // When npm can't be asked, the name is neither taken nor available: say so instead of "available".
+  const unknown = found === "unknown";
+  const src = found === "unknown" ? null : found;
   const conflicts = valid && !src ? typoConflicts(query) : [];
   const similar = valid ? registryNeighbours(ctx, query) : [];
   const bare = query.startsWith("@") ? query.slice(query.indexOf("/") + 1) : query;
@@ -534,9 +549,10 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
     candidates
       .filter((c) => isValidPackageName(c))
       .map(async (c) => {
-        const taken = (await lookup(env, c)) !== null;
+        const hit = await lookupOrUnknown(env, c);
+        const taken = hit !== null && hit !== "unknown";
         const cc = taken ? [] : typoConflicts(c);
-        return { name: c, available: !taken && cc.length === 0, taken };
+        return { name: c, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown" };
       }),
   );
   const latestRaw = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
@@ -549,7 +565,8 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
     valid,
     taken: src !== null,
     source: src?.kind ?? null,
-    available: valid && src === null && conflicts.length === 0,
+    unknown,
+    available: valid && !unknown && src === null && conflicts.length === 0,
     owners: src ? (src.kind === "local" ? ctx.store.owners(query) : src.pkg.maintainers) : [],
     latest: latest0 ? { version: latest0.version, score: latestReport?.score ?? null, grade: latestReport?.grade ?? null } : null,
     description: src ? (src.kind === "local" ? (ctx.store.getPackage(query)?.description ?? "") : src.pkg.description) : null,

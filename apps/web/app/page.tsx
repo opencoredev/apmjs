@@ -65,7 +65,9 @@ function TopResults({ check }: { check: NameCheck }) {
   const alternatives = check.suggestions.filter((s) => !s.name.startsWith("@") && s.available).slice(0, 4);
   const exactNote = check.taken
     ? check.description || (check.source === "upstream" ? "On the public npm registry." : "")
-    : check.valid
+    : check.unknown
+      ? "The public npm registry didn't answer, so this can't be confirmed free yet. Try again in a moment."
+      : check.valid
       ? "Nobody has published this name."
       : "Not a valid package name.";
   return (
@@ -82,6 +84,8 @@ function TopResults({ check }: { check: NameCheck }) {
                 <Status kind="taken">taken{check.owners.length ? ` by ${check.owners.slice(0, 2).join(", ")}` : ""}</Status>
                 <ScoreBadge score={check.latest?.score} grade={check.latest?.grade} />
               </>
+            ) : check.unknown ? (
+              <Status kind="warn">couldn&apos;t check npm</Status>
             ) : check.available ? (
               <Status kind="free">available</Status>
             ) : (

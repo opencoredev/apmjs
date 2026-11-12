@@ -8,12 +8,14 @@ import type { VersionRecord } from "./db.ts";
 import type { Ctx } from "./server.ts";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
-const UpVersion = z.object({ name: z.string(), version: z.string(), dist: Dist, deprecated: z.string().optional(), _npmUser: z.object({ name: z.string() }).loose().optional() }).loose();
+// Real packuments carry `deprecated: false` and other odd shapes on old versions (react does),
+// so the field is read loosely and one malformed version is skipped, not fatal to the package.
+const UpVersion = z.object({ name: z.string(), version: z.string(), dist: Dist, deprecated: z.unknown().optional(), _npmUser: z.object({ name: z.string() }).loose().optional() }).loose();
 const UpPackument = z
   .object({
     name: z.string(),
     "dist-tags": z.record(z.string(), z.string()).default({}),
-    versions: z.record(z.string(), UpVersion).default({}),
+    versions: z.record(z.string(), z.unknown()).default({}),
     time: z.record(z.string(), z.string()).default({}),
     description: z.string().optional(),
     readme: z.string().optional(),
@@ -86,7 +88,10 @@ export class Upstream {
     const raw = parsed.data;
     const tarballs = new Map<string, string>();
     const versions: VersionRecord[] = [];
-    for (const [v, doc] of Object.entries(raw.versions)) {
+    for (const [v, rawDoc] of Object.entries(raw.versions)) {
+      const one = UpVersion.safeParse(rawDoc);
+      if (!one.success) continue;
+      const doc = one.data;
       tarballs.set(v, doc.dist.tarball);
       const manifest: Record<string, unknown> = { ...doc };
       delete manifest.dist;
@@ -99,7 +104,7 @@ export class Upstream {
         size: 0,
         published_at: Date.parse(raw.time[v] ?? "") || 0,
         published_by: doc._npmUser?.name ?? "upstream",
-        deprecated: doc.deprecated ?? null,
+        deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
         status: "active",
         status_reason: null,
         status_at: null,
