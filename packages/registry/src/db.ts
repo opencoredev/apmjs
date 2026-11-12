@@ -314,6 +314,11 @@ export type StoreApi = {
   readonly removeOwner: (name: string, user: string) => Effect.Effect<"removed" | "not-owner" | "last-owner", StoreError>;
 
   readonly listVersions: (name: string) => Effect.Effect<VersionRecord[], StoreError>;
+  /**
+   * Several packages' catalogs in a fixed number of statements (packages, versions, dismissals): each name this
+   * registry has, with its dist-tags and its versions as listVersions gives them. Names it does not have are left out.
+   */
+  readonly catalogsOf: (names: readonly string[]) => Effect.Effect<Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>, StoreError>;
   readonly activeVersionsOf: (names: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
   /**
    * Every version of each package that has a revoked or revoke-pending version, with only what packageTextShown reads
@@ -338,6 +343,8 @@ export type StoreApi = {
 
   /** The current scorer's analyses of this package, keyed by `${version} ${digest}`. */
   readonly upstreamAnalyses: (name: string) => Effect.Effect<Map<string, unknown>, StoreError>;
+  /** upstreamAnalyses for several packages in two statements, keyed by package name; a package with none is left out. */
+  readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, Map<string, unknown>>, StoreError>;
   /**
    * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
    * keyed `"<name> <version>"`, in one query however many versions are asked for.
@@ -704,6 +711,28 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "removeOwner", cause })))),
 
     listVersions: (name) => Effect.flatMap(run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
+    catalogsOf: (names) =>
+      Effect.gen(function* () {
+        const out = new Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>();
+
+        if (names.length === 0) return out;
+        const wanted = [...new Set(names)];
+        const pkgs = yield* run("catalogsOf: packages", sql`SELECT * FROM packages WHERE name = ANY(${wanted})`, all(PackageOut));
+
+        if (pkgs.length === 0) return out;
+
+        const rows = yield* run(
+          "catalogsOf: versions",
+          sql`SELECT * FROM versions WHERE package = ANY(${pkgs.map((p) => p.name)}) ORDER BY package, published_at, seq`,
+          all(VersionRow),
+        ).pipe(Effect.flatMap(withDismissals));
+
+        for (const p of pkgs) out.set(p.name, { pkg: p, versions: [] });
+
+        for (const v of rows) out.get(v.package)?.versions.push(v);
+
+        return out;
+      }),
     activeVersionsOf: (names) =>
       names.length === 0
         ? Effect.succeed([])
@@ -804,6 +833,28 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         const dismissals = row?.dismissals ?? [];
 
         return new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))]));
+      }),
+    upstreamAnalysesOf: (names) =>
+      Effect.gen(function* () {
+        const out = new Map<string, Map<string, unknown>>();
+
+        if (names.length === 0) return out;
+
+        const rows = yield* run(
+          "upstreamAnalysesOf",
+          sql`SELECT package, version, digest, analysis FROM upstream_analysis WHERE package = ANY(${[...new Set(names)]}) AND scorer = ${SCORER}`,
+          all(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
+        );
+
+        const dismissals = yield* dismissalsOf([...new Set(rows.map((r) => r.package))]);
+
+        for (const r of rows) {
+          const forPackage = out.get(r.package) ?? new Map<string, unknown>();
+          forPackage.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
+          out.set(r.package, forPackage);
+        }
+
+        return out;
       }),
     latestUpstreamAnalyses: (versions) =>
       Effect.gen(function* () {

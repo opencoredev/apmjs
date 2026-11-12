@@ -106,6 +106,9 @@ export type UpstreamListing = CachedProbe | { kind: "unknown" };
 
 /** How long an upstream answer is trusted before it is fetched again. */
 export const DEFAULT_TTL_MS = 60_000;
+
+/** Packuments probeMany asks npm for at once (the resolve walk's batches); the isolate cache answers the rest. */
+const PROBE_CONCURRENCY = 6;
 const MAX_ENTRIES = 500;
 
 /**
@@ -195,6 +198,8 @@ export type UpstreamApi = {
   readonly probe: (name: string) => Effect.Effect<Probe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string) => Effect.Effect<UpstreamListing>;
+  /** probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. */
+  readonly probeMany: (names: readonly string[]) => Effect.Effect<Map<string, Probe>, StoreError>;
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   readonly get: (name: string) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
@@ -438,6 +443,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now })),
           );
 
+        /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
         const listing = (name: string): Effect.Effect<UpstreamListing> =>
           Effect.gen(function* () {
             const t = yield* now;
@@ -455,26 +461,37 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return fresh;
           });
 
+        // an analysis counts only for the exact bytes it read, by the current scorer
+        const scored = (pkg: CachedPackage, scores: ReadonlyMap<string, unknown>): Probe => ({
+          kind: "found",
+          pkg: {
+            ...pkg,
+            versions: pkg.versions.map((v) => {
+              const d = digestOf(v);
+
+              return { ...v, score: d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null };
+            }),
+          },
+        });
+
         const probe = (name: string): Effect.Effect<Probe, StoreError> =>
           Effect.gen(function* () {
-            const cached = yield* listing(name);
+            const listed = yield* listing(name);
 
-            if (cached.kind !== "found") return cached;
-            const scores = yield* store.upstreamAnalyses(name);
-            const pkg = cached.pkg;
+            if (listed.kind !== "found") return listed;
 
-            return {
-              kind: "found",
-              // an analysis counts only for the exact bytes it read, by the current scorer
-              pkg: {
-                ...pkg,
-                versions: pkg.versions.map((v) => {
-                  const d = digestOf(v);
+            return scored(listed.pkg, yield* store.upstreamAnalyses(name));
+          });
 
-                  return { ...v, score: d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null };
-                }),
-              },
-            } satisfies Probe;
+        const probeMany = (names: readonly string[]): Effect.Effect<Map<string, Probe>, StoreError> =>
+          Effect.gen(function* () {
+            const wanted = [...new Set(names)];
+            const listed = yield* Effect.forEach(wanted, (name) => Effect.map(listing(name), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
+            const found = listed.flatMap(([name, l]) => (l.kind === "found" ? [name] : []));
+            const scores = yield* store.upstreamAnalysesOf(found);
+            const none = new Map<string, unknown>();
+
+            return new Map(listed.map(([name, l]) => [name, l.kind === "found" ? scored(l.pkg, scores.get(name) ?? none) : l]));
           });
 
         const api: UpstreamApi = {
@@ -519,6 +536,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }),
           probe,
           listing,
+          probeMany,
           get: (name) => Effect.map(probe(name), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {

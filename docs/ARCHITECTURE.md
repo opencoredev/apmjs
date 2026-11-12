@@ -125,7 +125,7 @@ Limits:
 
 - yarn gets steps 1 and 2 only. apm does not read `yarn.lock`, so yarn installs run their scripts as usual.
 - `apm x` (bunx, npx, pnpm dlx) gets step 1 only. Those tools install into their own cache with no project lockfile to verify.
-- The tree walk stops after 300 packages; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it.
+- The tree walk stops after 300 packages, 400 dependency lookups (failed ones included) or 32 levels, whichever comes first; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it. Each name is read once per walk, and a level's names in one batch.
 
 ## Tests
 

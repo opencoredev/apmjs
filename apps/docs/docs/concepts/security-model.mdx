@@ -54,7 +54,7 @@ A check means nothing if the package manager then installs other bytes. `apm add
 4. reads the lockfile the install wrote and compares every package's integrity with what the checked registry serves;
 5. runs the held-back scripts only when everything matches. Otherwise it restores `package.json` and the lockfile, removes the unverified packages and exits non-zero.
 
-Limits: with yarn, apm does steps 1 and 2 only. `apm x` does step 1 only, because `bunx` and `npx` install into their own cache. The tree walk stops at 300 packages; the rest is listed as not checked.
+Limits: with yarn, apm does steps 1 and 2 only. `apm x` does step 1 only, because `bunx` and `npx` install into their own cache. The tree walk stops at 300 packages, 400 dependency lookups or 32 levels, whichever comes first; the rest is listed as not checked.
 
 ## What apm does not protect against
 

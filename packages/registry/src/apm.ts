@@ -42,7 +42,7 @@ import { digestLabel, digestOf } from "./digest.ts";
 import { Store, type PackageRecord, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, parseBody } from "./http.ts";
-import { DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
+import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
   highest,
@@ -64,7 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
-import { Upstream, type UpstreamPackage } from "./upstream.ts";
+import { Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -266,37 +266,105 @@ type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missin
 const missing = (reason: string): Picked => ({ kind: "missing", reason });
 const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, v });
 
+/** A package's catalog as a lookup finds it: here or upstream, nowhere (null), or upstream could not be asked. */
+type Lookup = Source | null | "unknown";
+
 /** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
-const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean) =>
-  Effect.gen(function* () {
-    const src = yield* lookupOrUnknown(dep.name);
+const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean) => Effect.map(lookupOrUnknown(dep.name), (src) => pickFrom(src, dep, keep));
 
-    if (src === "unknown") return missing("the upstream registry could not be asked");
+/** pickDependency on a catalog already read. */
+function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Picked {
+  if (src === "unknown") return missing("the upstream registry could not be asked");
 
-    if (src === null) return missing("not on this registry or upstream");
-    let inRange: VersionRecord[];
+  if (src === null) return missing("not on this registry or upstream");
+  let inRange: VersionRecord[];
 
-    switch (dep.kind) {
-      case "tag": {
-        const tagged = tagTarget(src.distTags, dep.tag);
-        inRange = tagged ? src.versions.filter((v) => v.version === tagged) : [];
-        break;
-      }
-
-      case "registry":
-        inRange = src.versions.filter((v) => satisfies(v.version, dep.range));
-        break;
-      default: {
-        const _exhaustive: never = dep;
-
-        return _exhaustive;
-      }
+  switch (dep.kind) {
+    case "tag": {
+      const tagged = tagTarget(src.distTags, dep.tag);
+      inRange = tagged ? src.versions.filter((v) => v.version === tagged) : [];
+      break;
     }
 
-    const best = inRange.filter(keep).sort((a, b) => newestFirst(a.version, b.version))[0];
+    case "registry":
+      inRange = src.versions.filter((v) => satisfies(v.version, dep.range));
+      break;
+    default: {
+      const _exhaustive: never = dep;
 
-    return best ? found(src, best) : missing(`no installable version matches ${describeDependency(dep)}`);
-  });
+      return _exhaustive;
+    }
+  }
+
+  const best = inRange.filter(keep).sort((a, b) => newestFirst(a.version, b.version))[0];
+
+  return best ? found(src, best) : missing(`no installable version matches ${describeDependency(dep)}`);
+}
+
+/** An upstream probe as a lookup; a name the batch has no answer for counts as "upstream could not be asked". */
+function lookupOf(p: Probe | undefined): Lookup {
+  if (p === undefined) return "unknown";
+
+  switch (p.kind) {
+    case "found":
+      return upstreamSource(p.pkg);
+    case "absent":
+      return null;
+    case "unknown":
+      return "unknown";
+    default: {
+      const _exhaustive: never = p;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * The catalogs one request reads, each name once. `load` reads a batch of names in a fixed number of statements
+ * (this registry's packages, versions and dismissals, then npm's packuments and their analyses); `get` reads a name
+ * no batch has.
+ */
+function catalogMemo() {
+  const known = new Map<string, Lookup>();
+
+  const load = (names: readonly string[]) =>
+    Effect.gen(function* () {
+      const wanted = [...new Set(names)].filter((n) => !known.has(n));
+
+      if (wanted.length === 0) return;
+      const at = yield* now;
+      const local = yield* (yield* Store).catalogsOf(wanted);
+
+      for (const [name, c] of local) {
+        known.set(name, localSource(c.pkg, c.versions.map((v) => atTime(v, at))));
+      }
+
+      const rest = wanted.filter((n) => !local.has(n));
+      const upstream = yield* upstreamOrNull;
+
+      if (rest.length === 0) return;
+
+      if (!upstream) {
+        for (const n of rest) known.set(n, null);
+
+        return;
+      }
+
+      const probes = yield* upstream.probeMany(rest);
+
+      for (const n of rest) known.set(n, lookupOf(probes.get(n)));
+    });
+
+  const get = (name: string) =>
+    Effect.gen(function* () {
+      if (!known.has(name)) yield* load([name]);
+
+      return known.get(name) ?? "unknown";
+    });
+
+  return { load, get };
+}
 
 /** Each checked dependency may mean an upstream download and analysis, so publish checks a bounded number. */
 const MAX_PUBLISH_DEPS = 50;
@@ -1360,12 +1428,30 @@ type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDe
 const MAX_UNCHECKED_LISTED = 50;
 
 /**
+ * Dependency lookups (a name and a range to pick a version for) one resolve walk makes at most, failed ones included:
+ * the 300 packages it checks plus room for ranges that match nothing, git specs and repeats under another range. A
+ * walk past it, which only a tree built to waste the registry's work reaches, reports the rest as unchecked.
+ */
+export const MAX_WALK_LOOKUPS = 400;
+
+/**
+ * Levels of the tree the walk reads, one batch of catalogs each, so a long chain of single dependencies can't make
+ * one request a long run of sequential reads. Real trees, read breadth-first with each package once, are far shallower.
+ */
+export const MAX_WALK_LEVELS = 32;
+
+export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number };
+
+const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40 };
+
+/**
  * Walks the dependency tree the package manager would install (newest active version matching each
  * range, npm: aliases followed to the package they install) and returns the versions that are revoked
- * or score below the floor. Bounded: at most `maxNodes` packages and `maxAnalyses` tarball analyses.
- * Everything it could not score is counted and listed, never dropped.
+ * or score below the floor. Bounded: at most `maxNodes` packages, `maxLookups` lookups, `maxLevels` levels and
+ * `maxAnalyses` tarball analyses. Each name's catalog is read once per walk, a level's names in one batch, and each
+ * name and range is resolved once. Everything it could not score is counted and listed, never dropped.
  */
-const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 300, maxAnalyses: 40 }) =>
+const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WALK_LIMITS) =>
   Effect.gen(function* () {
     const at = yield* now;
     const blocks: TreeBlock[] = [];
@@ -1381,9 +1467,41 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
     };
 
     const seen = new Set<string>();
+    const catalogs = catalogMemo();
+    // what the package manager would pick: the newest active version in range (pulled versions are hidden)
+    const resolved = new Map<string, Picked>();
+    const active = (v: VersionRecord): boolean => v.status === "active";
+    // what decides the pick: the package and the range or tag, not the alias it is installed under
+    const lookupKey = (dep: RegistryDependency): string => `${dep.name}\u0000${dep.kind === "tag" ? `tag:${dep.tag}` : dep.range}`;
+    let lookups = 0;
     let analyses = 0;
+    let loadedLevel = 0;
     const rootId = `${root.package}@${root.version}`;
-    const queue = dependencySpecs(root.manifest).map((dep) => ({ dep, via: [rootId] }));
+    const queue = dependencySpecs(root.manifest).map((dep) => ({ dep, via: [rootId], level: 1 }));
+
+    const stop = (qi: number, reason: string): void => {
+      const rest = queue.length - qi;
+      unchecked += rest;
+      uncheckedDeps.push({ dependency: `${rest} more`, reason, via: [rootId] });
+    };
+
+    /** The names a level still needs, from `qi` on, for at most as many new lookups as the budget has left. */
+    const levelNames = (qi: number, level: number): string[] => {
+      const names = new Set<string>();
+      const keys = new Set<string>();
+
+      for (let j = qi; j < queue.length && keys.size < limits.maxLookups - lookups; j++) {
+        const next = queue[j];
+
+        if (!next || next.level !== level) break;
+
+        if (!isRegistryDependency(next.dep) || resolved.has(lookupKey(next.dep))) continue;
+        keys.add(lookupKey(next.dep));
+        names.add(next.dep.name);
+      }
+
+      return [...names];
+    };
 
     for (let qi = 0; qi < queue.length; qi++) {
       const item = queue[qi];
@@ -1391,9 +1509,12 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
       if (!item) break;
 
       if (seen.size >= limits.maxNodes) {
-        const rest = queue.length - qi;
-        unchecked += rest;
-        uncheckedDeps.push({ dependency: `${rest} more`, reason: `the check stops after ${limits.maxNodes} packages`, via: [rootId] });
+        stop(qi, `the check stops after ${limits.maxNodes} packages`);
+        break;
+      }
+
+      if (item.level > limits.maxLevels) {
+        stop(qi, `the check stops after ${limits.maxLevels} levels of dependencies`);
         break;
       }
 
@@ -1404,8 +1525,24 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
         continue;
       }
 
-      // what the package manager would pick: the newest active version in range (pulled versions are hidden)
-      const picked = yield* pickDependency(dep, (v) => v.status === "active");
+      let picked = resolved.get(lookupKey(dep));
+
+      if (picked === undefined) {
+        if (lookups >= limits.maxLookups) {
+          stop(qi, `the check stops after ${limits.maxLookups} dependency lookups`);
+          break;
+        }
+
+        // the first lookup of a level reads every catalog the level needs in one batch
+        if (item.level > loadedLevel) {
+          yield* catalogs.load(levelNames(qi, item.level));
+          loadedLevel = item.level;
+        }
+
+        lookups++;
+        picked = pickFrom(yield* catalogs.get(dep.name), dep, active);
+        resolved.set(lookupKey(dep), picked);
+      }
 
       if (picked.kind !== "found") {
         miss(describeDependency(dep), picked.reason, item.via);
@@ -1444,9 +1581,9 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
           via: item.via,
         });
 
-      // no depth limit: every package is checked once (seen) and the walk stops at maxNodes, counting the rest as
-      // unchecked; a depth cut-off would drop a deep subtree without saying so
-      for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
+      // every package is checked once (seen), every name and range looked up once (resolved), and the walk stops at
+      // its limits, counting the rest as unchecked: a cut-off never drops part of the tree without saying so
+      for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key], level: item.level + 1 });
     }
 
     const tree: Tree = { blocks, unchecked, uncheckedDeps, packages, digests };
@@ -1504,7 +1641,8 @@ const treeReviews = (tree: Tree) =>
 /** The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. */
 const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({ blocks: tree.blocks, unchecked: tree.unchecked, uncheckedDeps: tree.uncheckedDeps, packages: tree.packages, reviews });
 
-const resolveResponse = (url: URL) =>
+/** GET /-/apm/v1/resolve: the newest version in range that passes the policy, and its dependency walk. */
+export const resolveResponse = (url: URL) =>
   Effect.gen(function* () {
     const at = yield* now;
     const name = url.searchParams.get("name") ?? "";
