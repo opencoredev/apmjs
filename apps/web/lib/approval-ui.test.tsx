@@ -65,6 +65,16 @@ describe("the approval page", () => {
     expect(order).toEqual([...order].sort((a, b) => a - b));
   });
 
+  test("a signal found only as text shows the scorer's own label and says where the text sits (apm-score-v9)", () => {
+    const label = "Mentions a network call (fetch, http, a socket); apm did not see a request made";
+    const evidence = "index.js:1: // fetch('https://example.invalid') is how the README calls it (text match in a comment)";
+    const s = StagedDetail.parse({ ...staged, score: { score: 90, grade: "A", signals: [{ id: "network", label, points: -10, evidence: [evidence] }], notChecked: [] } });
+    const html = renderToStaticMarkup(<StagedReview s={s} account={account} config={config} onDecided={() => {}} />);
+
+    expect(html).toContain(label);
+    expect(html).toContain("(text match in a comment)");
+  });
+
   test("an expired upload shows the evidence and no approve controls", () => {
     const html = renderToStaticMarkup(<StagedReview s={{ ...staged, expiresAt: new Date(Date.now() - 1000).toISOString() }} account={account} config={config} onDecided={() => {}} />);
 

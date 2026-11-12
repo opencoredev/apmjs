@@ -125,6 +125,10 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
             A heuristic read of the tarball and publish history: install scripts, shell and network calls, credential access, eval, obfuscation, new publishers, risky new dependencies, typosquat
             names. It cannot see code that downloads a second stage at run time. Popularity is never an input.
           </Text>
+          <Text>
+            Every file is read as text, comments, regular expressions and TypeScript types included, because code can read that text back and run it. A signal found only as text says so: &ldquo;Mentions a
+            credential file&rdquo; rather than &ldquo;Reads credential files&rdquo;, with the same points, and each line of evidence says when the text sits in a comment, a regex or a type.
+          </Text>
         </Block>
 
         <Block id="appeals">

@@ -1,6 +1,12 @@
 // The text rules every reader shares: what each code signal matches, how sure a match is in each place it can sit,
 // where a position is (line and snippet), and the names that count when a string is built or decoded. Pure.
-import type { Region } from "./lexer.ts";
+
+/**
+ * Text a parsed program does not run as written, where a text match can still sit and still counts (apm-score-v9):
+ * a comment, a regex literal's body, TypeScript that emits no code, or a JSON file. `String(fn)`, `re.source` and a
+ * file reading itself give such text back at runtime, so it is cited, and named in the evidence, never left out.
+ */
+export type Hidden = "comment" | "regex" | "type" | "json";
 
 export type CodeSignal = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated";
 
@@ -19,8 +25,11 @@ export type Confidence = "confirmed" | "possible";
  */
 export type How = "as written" | "after joining strings" | "decoded" | "run from a string" | "joined, then run" | "decoded, then run";
 
-/** `tree`: the parsed program itself showed it (a call, a load, a string's role); otherwise only a text rule matched. */
-type FindingAt = { id: CodeSignal; line: number; snippet: string; how: How; tree?: true };
+/**
+ * `tree`: the parsed program itself showed it (a call, a load, a string's role); otherwise only a text rule matched.
+ * `hidden`: the text match sits in a comment, a regex body, a type or a JSON file.
+ */
+type FindingAt = { id: CodeSignal; line: number; snippet: string; how: How; tree?: true; hidden?: Hidden };
 
 /** One rule match: the signal, where it is, whether the text had to be joined or decoded first, and how sure it is (with why, when only possible). */
 export type TextFinding = FindingAt & ({ confidence: "confirmed" } | { confidence: "possible"; why: string });
@@ -39,18 +48,13 @@ const NOT_RETURN_THIS = String.raw`(?!['"\x60]return this['"\x60]\s*\))['"\x60]`
 const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"), "g");
 
 /**
- * How a pattern's match is read, by where it sits (see `Region` in lexer.ts):
- * - `code`: a call or construct. Confirmed in code or a kept string. Inside an ordinary string it is text that
- *   only runs if something evaluates it, and eval, Function, vm and string timers are rules of their own.
- * - `name`: a module name. Confirmed where it is loaded (`require('child_process')`); possible anywhere else.
- * - `text`: shell command text (`curl ... | sh`). Only strings hold it: confirmed when a call runs the string,
- *   possible otherwise. In code, `a || sh` is not a pipe.
- * - `alias`: a reference that gives the power without using it (`r = require`). Possible where a parsed program's
- *   tree says it sits in code; confirmed in raw text, as apm-score-v3 counted it.
- * Raw text (a shell script, an install command, a C, Python or other file) and JavaScript no parser could hold as a
- * tree (`unparsed`) confirm every kind, aliases too, as apm-score-v3 read every file.
- * JavaScript and TypeScript are not matched with these patterns as code: js.ts reads them from the parsed program,
- * and uses the `name` and `text` patterns on the strings it finds.
+ * What a pattern matches. Over text (every file, every install command) every kind counts, as apm-score-v3 counted
+ * it. The parsed program's tree also reads strings with the `name` and `text` patterns, to say what a string it saw
+ * used holds:
+ * - `code`: a call or construct.
+ * - `name`: a module name (`child_process`).
+ * - `text`: shell command text (`curl ... | sh`).
+ * - `alias`: a reference that gives the power without using it (`r = require`).
  */
 export type Kind = "code" | "name" | "text" | "alias";
 
@@ -247,8 +251,8 @@ export function hexIdentifierRun(text: string): number {
   return -1;
 }
 
-/** A line number and the text around a position, trimmed to about 80 characters. */
-export type Where = { line: number; snippet: string };
+/** A line number and the text around a position, trimmed to about 80 characters, and the left-out text it sits in. */
+export type Where = { line: number; snippet: string; hidden?: Hidden };
 
 /**
  * Where `index` is. Lines are counted by `\n`, the way the file view numbers them. A carriage return or a Unicode
@@ -291,81 +295,44 @@ export function printable(s: string): boolean {
   return ok / s.length >= 0.95;
 }
 
-/**
- * What a match at `index` means, by where it sits. A judge that knows the program also gets the match's end, the
- * signal it would raise and the rule kind (`decoded` for text found by decoding a string), so it can tell which
- * token the match rests on and whether that token is proven harmless for that signal.
- */
-export type RegionOf = (index: number, end?: number, id?: CodeSignal, kind?: Kind | "decoded") => Region;
-
-/** A file read raw: no parser could follow it, so nothing is known and every match counts, aliases too. */
-export const RAW: RegionOf = () => "raw";
-
-/** JavaScript with no tree: read raw, and every pattern counts as apm-score-v3 counted it, aliases included. */
-export const UNPARSED: RegionOf = () => "unparsed";
-
-/** What a match of each kind means in each region; a region a kind does not list is not a match. */
-const CONFIDENCE: Record<Kind, Partial<Record<Region, Confidence>>> = {
-  code: { code: "confirmed", kept: "confirmed", raw: "confirmed", unparsed: "confirmed" },
-  name: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", code: "possible", string: "possible" },
-  text: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", string: "possible" },
-  alias: { code: "possible", kept: "possible", raw: "confirmed", unparsed: "confirmed" },
-};
-
-export const IN_STRING = "only inside an ordinary string, not in code apm saw run";
+const IN_STRING = "only inside an ordinary string, not in code apm saw run";
 
 /**
- * The first confirmed match of each rule, or its first possible one, with `region` saying where each match sits.
- * Every match is looked at; there is no budget to run out. Raw text is matched as it is: nothing is taken for a
- * definition or a type, so a file no parser could read cannot hide a call that way. `place` says where a match is
- * cited (text that was joined first is cited where the original text has it).
+ * The first match of each rule, every one confirmed: text is read as it is, as apm-score-v3 read every file, and
+ * nothing in it is taken for a definition, a type, a comment or a string that does not run. Every match is looked at;
+ * there is no budget to run out. `place` says where a match is cited (text that was joined first is cited where the
+ * original text has it) and what left-out text it sits in.
  */
-export function ruleHits(text: string, how: How, skip: ReadonlySet<CodeSignal>, region: RegionOf, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
+export function ruleHits(text: string, how: How, skip: ReadonlySet<CodeSignal>, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
   const out: TextFinding[] = [];
 
   for (const rule of RULES) {
     if (skip.has(rule.id)) continue;
-    let confirmed: TextFinding | null = null;
-    let possible: TextFinding | null = null;
 
     for (const p of rule.patterns) {
-      if (confirmed) break;
-
-      // an alias can only ever be possible
-      if (possible && p.kind === "alias") continue;
       p.re.lastIndex = 0;
+      const m = firstMatch(p.re, text);
 
-      for (let m = p.re.exec(text); m; m = p.re.exec(text)) {
-        if (m[0].length === 0) {
-          p.re.lastIndex++;
-          continue;
-        }
-
-        const r = region(m.index, m.index + m[0].length, rule.id, p.kind);
-        const confidence = CONFIDENCE[p.kind][r];
-
-        if (!confidence || r === "excluded") continue;
-
-        if (confidence === "confirmed") {
-          confirmed = { id: rule.id, ...place(m.index), how, confidence };
-          break;
-        }
-
-        if (!possible) {
-          const why = p.why ?? IN_STRING;
-          possible = { id: rule.id, ...place(m.index), how, confidence, why };
-        }
-
-        if (p.kind === "alias") break;
+      if (m >= 0) {
+        out.push({ id: rule.id, ...place(m), how, confidence: "confirmed" });
+        break;
       }
     }
-
-    const best = confirmed ?? possible;
-
-    if (best) out.push(best);
   }
 
   return out;
+}
+
+/** The index of the first non-empty match of the global `re` in `text`, or -1. */
+function firstMatch(re: RegExp, text: string): number {
+  re.lastIndex = 0;
+
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (m[0].length > 0) return m.index;
+    re.lastIndex++;
+  }
+
+  return -1;
 }
 
 /** The `why` a possible match of this rule and kind gives, for text that sits in a string. */
@@ -400,62 +367,47 @@ export function stringMatches(value: string): StringMatch[] {
 
 const NETWORK_NEAR = RULES.filter((r) => r.id === "network").flatMap((r) => r.patterns.filter((p) => p.kind !== "alias").map((p) => new RegExp(p.re.source)));
 
-/** An environment dump with a network call within NEAR characters of it, in text read raw. */
-export function envExfil(text: string, region: RegionOf): { index: number; confidence: Confidence } | null {
+/** An environment dump with a network call within NEAR characters of it: the index of the dump, or -1. */
+export function envExfil(text: string): number {
   let tries = 0;
 
   for (const m of text.matchAll(WHOLE_ENV)) {
-    const r = region(m.index, m.index + m[0].length, "credential-access", "code");
+    const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
 
-    if (r !== "excluded") {
-      const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
-
-      if (NETWORK_NEAR.some((re) => re.test(window))) return { index: m.index, confidence: r === "string" ? "possible" : "confirmed" };
-    }
+    if (NETWORK_NEAR.some((re) => re.test(window))) return m.index;
 
     if (++tries >= 50) break;
   }
 
-  return null;
+  return -1;
 }
 
 /**
- * Text hidden in a literal: 40 or more `\x` escapes in a row, or a base64 string of 2000+ characters. Each counts
- * only when it decodes to readable text; data tables, images, fonts and WebAssembly (`\0asm`) are binary data,
- * which apm lists or skips like the files that hold them. Escapes spelling out text have no honest use, so they
- * are confirmed; a long base64 text is confirmed only when code loads or runs it.
+ * Text hidden in a literal: 40 or more `\x` escapes in a row, or a base64 string of 2000+ characters. Escapes or base64
+ * that decode to readable text are cited first; when there are none, apm-score-v3's rule counts escapes and base64
+ * whatever they decode to (data tables, images, fonts and WebAssembly included), as v3 did.
  */
-export function encodedLiterals(text: string, region: RegionOf, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
-  const out: TextFinding[] = [];
+export function encodedLiterals(text: string, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
   const escapes = escapedTextAt(text);
 
-  if (escapes >= 0 && region(escapes, escapes + 1, "obfuscated", "code") !== "excluded") out.push({ id: "obfuscated", ...place(escapes), how: "as written", confidence: "confirmed" });
+  if (escapes >= 0) return [{ id: "obfuscated", ...place(escapes), how: "as written", confidence: "confirmed" }];
 
   for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
-    const r = region(m.index, m.index + 1, "obfuscated", "code");
-
-    if (r === "excluded" || !longBase64Text(m[1] ?? "")) continue;
-    const confidence: Confidence = r === "string" ? "possible" : "confirmed";
-    out.push(judged({ id: "obfuscated", ...place(m.index), how: "as written" }, confidence, "a long base64 string decodes to text, but apm did not see code load or run it"));
-    break;
+    if (longBase64Text(m[1] ?? "")) return [{ id: "obfuscated", ...place(m.index), how: "as written", confidence: "confirmed" }];
   }
 
-  if (out.length > 0) return out;
+  const v3 = v3Encoded(text);
 
-  // apm-score-v3's rule, which counts escapes and base64 whatever they decode to
-  for (const m of text.matchAll(V3_ENCODED)) {
-    const r = region(m.index, m.index + 1, "obfuscated", "code");
-
-    if (r === "excluded") continue;
-    out.push(judged({ id: "obfuscated", ...place(m.index), how: "as written" }, r === "string" ? "possible" : "confirmed", "a long run of escapes or base64 sits in an ordinary string, and apm did not see code load or run it"));
-    break;
-  }
-
-  return out;
+  return v3 >= 0 ? [{ id: "obfuscated", ...place(v3), how: "as written", confidence: "confirmed" }] : [];
 }
 
 /** apm-score-v3's `obfuscated` rule, verbatim: 40 `\x` escapes in a row, or a quoted base64 run of 2000+ characters. */
 const V3_ENCODED = /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/g;
+
+/** Where apm-score-v3's `obfuscated` rule first matches `text`, or -1. */
+export function v3Encoded(text: string): number {
+  return firstMatch(V3_ENCODED, text);
+}
 
 /** Where 40 or more `\x` escapes in a row spell readable text, or -1. */
 export function escapedTextAt(text: string): number {

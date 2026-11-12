@@ -1,29 +1,31 @@
-// Static reading of one file's text. JavaScript and TypeScript are parsed (js.ts); a file no parser accepts, install
-// commands, shell scripts and other languages are read with the text rules (rules.ts), after a pass that joins strings
-// split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char codes). Pure.
+// Static reading of one file's text. Every file is read with the text rules (rules.ts) over its whole text, after a
+// pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
+// codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
 import { scanJs, type Imports } from "./js.ts";
 import type { Dialect, Range } from "./parse.ts";
 import { parseEach } from "./parse.ts";
 import { joinStrings, scanTextRules } from "./textrules.ts";
 import { tokenText } from "./tokens.ts";
-import { lineOf, type TextFinding } from "./rules.ts";
+import { lineOf, type Hidden, type TextFinding } from "./rules.ts";
 
 export { decodedStrings, joinStrings, type Built, type Decoded, type Joined } from "./textrules.ts";
 
-export { namedSignal, type CodeSignal, type Confidence, type TextFinding, type Where } from "./rules.ts";
+export { namedSignal, type CodeSignal, type Confidence, type Hidden, type TextFinding, type Where } from "./rules.ts";
 
 export type { Imports } from "./js.ts";
 
 /**
- * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed; `c` and `python` are read raw like `plain`;
- * `data` is JSON and type declarations (node parses JSON and never runs it, and a `.d.ts` file only describes code);
- * anything else is `plain`, read raw with every match counted.
+ * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed, and read whole with the text rules too; everything else
+ * is read whole with the text rules. `json` and `declaration` (a `.d.ts` file) load nothing, and their matches say
+ * they sit in a JSON file or a type; `c`, `python` and `plain` are read as apm-score-v3 read them.
  */
-export type Lang = Dialect | "c" | "python" | "data" | "plain";
+export type Lang = Dialect | "c" | "python" | "json" | "declaration" | "plain";
 
 /** The language a file is read as: by extension, then by a node/bun/deno shebang. */
 export function langOf(path: string, text: string): Lang {
-  if (/\.(?:json|d\.[cm]?ts)$/i.test(path)) return "data";
+  if (/\.json$/i.test(path)) return "json";
+
+  if (/\.d\.[cm]?ts$/i.test(path)) return "declaration";
 
   if (/\.[cm]?ts$/i.test(path)) return "ts";
 
@@ -67,11 +69,11 @@ export function commentRanges(text: string, dialect: Dialect = "js"): Range[] {
  * statement ends, or past a token in a file without one (tokens.ts); each window also reaches TOKEN_OVERLAP back.
  */
 function scanUnparsed(text: string): FileScan {
-  const raw = scanTextRules(text, "unparsed");
+  const raw = scanTextRules(text);
   const rawImports = importsOf(joinStrings(text).text);
   const tokens = tokenText(text);
 
-  if (tokens === null || tokens.text === text) return { findings: raw, imports: rawImports, read: "raw", rejected: false, notes: [], sinkOnly: [], patches: null };
+  if (tokens === null || tokens.text === text) return { findings: raw, imports: rawImports, read: "raw", rejected: false, notes: [] };
   const plain = tokens.text;
   const sure = new Set(raw.filter((f) => f.confidence === "confirmed").map((f) => f.id));
   const more: TextFinding[] = [];
@@ -81,7 +83,7 @@ function scanUnparsed(text: string): FileScan {
   for (const w of tokenWindows(plain.length, tokens.cuts)) {
     const piece = plain.slice(w.from, w.end);
 
-    for (const f of scanTextRules(piece, "unparsed", { shown: text, origin: (i) => tokens.origin(i + w.from) })) if (!sure.has(f.id)) more.push(f);
+    for (const f of scanTextRules(piece, { shown: text, origin: (i) => tokens.origin(i + w.from) })) if (!sure.has(f.id)) more.push(f);
     const found = importsOf(joinStrings(piece).text);
 
     for (const p of found.paths) paths.add(p);
@@ -91,7 +93,7 @@ function scanUnparsed(text: string): FileScan {
 
   const imports: Imports = { paths: [...paths].slice(0, 500), loads: [...loads].slice(0, 500), dynamic: rawImports.dynamic };
 
-  return { findings: [...raw, ...more], imports, read: "raw", rejected: false, notes: [], sinkOnly: [], patches: null };
+  return { findings: [...raw, ...more], imports, read: "raw", rejected: false, notes: [] };
 }
 
 /** How much of a file's tokens one pass of the text rules reads, and how far each window reaches back into the last. */
@@ -175,45 +177,34 @@ export function importsOf(text: string): Imports {
 export type FileScan = {
   findings: TextFinding[];
   imports: Imports;
-  read: "parsed" | "raw" | "lexed";
+  read: "parsed" | "raw";
   rejected: boolean;
-  /** Limits the reading ran into; what was past them was judged by the text rules alone. */
+  /** Limits the tree's reading ran into; what was past them was judged by the text rules alone. */
   notes: string[];
-  /**
-   * What the text rules found that only a proof resting on a global or builtin module being what its name says
-   * (fetch, path.join, an Error) removed. The package adds these back when any of its files could change one.
-   */
-  sinkOnly: TextFinding[];
-  /** Where and why this file could change what a global or builtin module is (a write to one, or one handed to code apm cannot follow); null when it cannot. */
-  patches: string | null;
 };
 
+/** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
+const WHOLE_FILE_HIDDEN: Partial<Record<Lang, Hidden>> = { json: "json", declaration: "type" };
+
 /**
- * Reads one file as `lang`. JavaScript and TypeScript go to the parser; when no parser accepts the file, or it is
- * too large to hold as a tree, it is read raw (fail closed): every match counts, as in apm-score-v3, and its tokens
- * are read too, so escapes and comments cannot hide a name from the raw rules.
+ * Reads one file as `lang`. JavaScript and TypeScript go to the parser, and the text rules read the whole file (the
+ * floor, js.ts); when no parser accepts the file, or it is too large to hold as a tree, it is read raw: every match
+ * counts, as in apm-score-v3, and its tokens are read too, so escapes and comments cannot hide a name from the rules.
  */
 export function scanFile(text: string, lang: Lang): FileScan {
   if (isDialect(lang)) {
     const js = scanJs(text, lang);
 
-    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, sinkOnly: js.sinkOnly, patches: js.patches };
+    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes };
 
     return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
   }
 
+  const kind = WHOLE_FILE_HIDDEN[lang];
   // JSON and type declarations never run, so nothing in them is a load
-  const imports = lang === "data" ? { paths: [], loads: [], dynamic: [] } : importsOf(joinStrings(text).text);
+  const imports = kind ? { paths: [], loads: [], dynamic: [] } : importsOf(joinStrings(text).text);
 
-  return { findings: scanTextRules(text, lang), imports, read: lang === "data" ? "lexed" : "raw", rejected: false, notes: [], sinkOnly: [], patches: null };
-}
-
-/**
- * apm-score-v3's rules over the whole of a parsed file, comments, regex bodies and TypeScript types included: what
- * the floor leaves out, read for a package that runs code built from text (see `RUNS_TEXT` in score.ts).
- */
-export function scanWholeText(text: string): TextFinding[] {
-  return scanTextRules(text, "unparsed");
+  return { findings: scanTextRules(text, kind ? { hidden: () => kind } : {}), imports, read: "raw", rejected: false, notes: [] };
 }
 
 /** The rule findings for one text read as `lang`. */

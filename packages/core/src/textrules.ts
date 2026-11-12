@@ -1,28 +1,9 @@
 // The text rules read over a whole text, the way apm-score-v3 read every file: the rules as written, then with split
 // strings joined (`'chi' + 'ld_process'`, `x['ex' + 'ec']`, `\x63hild`), then on strings decoded from base64, hex, char
-// codes and URI escapes. A dangerous name that had to be built or decoded also counts as obfuscation. Who reads the
-// text decides what each match means through `region`: install commands, shell scripts, C, Python and JavaScript with
-// no tree count every match as v3 counted it, JSON and type declarations name things at most, and a parsed program
-// passes its own judge, which leaves out only what sits wholly in erased TypeScript types (the floor, js.ts). Pure.
-import { lex, type Lang as LexLang, type Lexed } from "./lexer.ts";
-import {
-  encodedLiterals,
-  envExfil,
-  hexIdentifierRun,
-  IN_STRING,
-  judged,
-  lineOf,
-  namedSignal,
-  printable,
-  RAW,
-  ruleHits,
-  type CodeSignal,
-  type Confidence,
-  type RegionOf,
-  type TextFinding,
-  UNPARSED,
-  type Where,
-} from "./rules.ts";
+// codes and URI escapes. A dangerous name that had to be built or decoded also counts as obfuscation. Every match is
+// confirmed wherever it sits, comments, regex bodies, types and JSON included (apm-score-v9); a parsed program only
+// says which of those a match sits in, so the evidence can name it. Pure.
+import { encodedLiterals, envExfil, hexIdentifierRun, lineOf, namedSignal, printable, ruleHits, type Hidden, type TextFinding, v3Encoded, type Where } from "./rules.ts";
 
 // ---------- joining split strings ----------
 const LIT = String.raw`(?:'[^'\\\n]*'|"[^"\\\n]*"|\x60[^\x60\\$\n]*\x60)`;
@@ -180,65 +161,60 @@ export function decodedStrings(text: string): Decoded[] {
   return out;
 }
 
-// ---------- reading text without a parser ----------
-
-/** How a file read with the text rules is read: as data (JSON, type declarations), raw, or JavaScript that has no tree. */
-export type TextLang = LexLang | "unparsed";
-
-function regionsOf(text: string, lang: TextLang): RegionOf {
-  if (lang === "unparsed") return UNPARSED;
-
-  // C, Python and any other text are read raw, as apm-score-v3 read them: a hand-written lexer is not a parse, and
-  // an install script can run either, so nothing in them is left out or made possible by where the lexer puts it
-  if (lang !== "data") return RAW;
-  let lexed: Lexed | null = null;
-
-  // lexed once, and only when something matched: JSON and type declarations never run, so what they name stays
-  // possible at most
-  return (index) => (lexed ??= lex(text, lang)).region(index);
-}
+// ---------- reading text ----------
 
 /**
  * How one text is read. `shown` and `origin`: `text` is a window of `shown` (the file as written), and `origin` maps
- * a position in `text` to `shown`, so findings cite `shown`. `region` overrides what `lang` says each match means
- * (a parsed program's judge). `encoded`: also look for long escape runs, long base64 and `_0x` identifier runs,
- * which are read on the file as written (by default, only when `text` is the file itself).
+ * a position in `text` to `shown`, so findings cite `shown`. `hidden` says what left-out text a position of `shown`
+ * sits in (a comment, a regex body, a type), for the evidence line; it never changes what counts. `encoded`: also look
+ * for long escape runs, long base64 and `_0x` identifier runs, which are read on the file as written (by default, only
+ * when `text` is the file itself).
  */
-export type TextRead = { shown?: string; origin?: (index: number) => number; region?: RegionOf; encoded?: boolean };
+export type TextRead = { shown?: string; origin?: (index: number) => number; hidden?: (index: number) => Hidden | undefined; encoded?: boolean };
 
 /**
- * The text rules on a whole text: install commands and shell scripts (`plain`), C and Python (comments and strings
- * told apart), JavaScript that no parser accepted (read raw, as apm-score-v3 read every file), and a parsed program's
- * floor (its own `region`). The rules run on the text as written, then with split strings joined, then on readable
- * strings decoded from base64, hex and char codes; a dangerous name that had to be built or decoded also counts as
- * obfuscation. Every finding cites where it is in the file as written, traced back through the joining. A region
- * is asked about each match with its span, signal and rule kind, so a judge can tell which token a match rests on.
+ * The text rules on a whole text, as apm-score-v3 read every file: install commands, shell scripts, C and Python,
+ * JavaScript with or without a tree, JSON and type declarations. The rules run on the text as written, then with split
+ * strings joined, then on readable strings decoded from base64, hex and char codes; a dangerous name that had to be
+ * built or decoded also counts as obfuscation. Every match counts, confirmed. Every finding cites where it is in the
+ * file as written, traced back through the joining. Each pass is at least what v3's `scanText` ran on the same text
+ * (`test/v3/source.ts`): its patterns are in `RULES`, and its `obfuscated` rule runs on the joined text and on each
+ * decoded string here too.
  */
-export function scanTextRules(text: string, lang: TextLang, read: TextRead = {}): TextFinding[] {
-  const region = read.region ?? regionsOf(text, lang);
+export function scanTextRules(text: string, read: TextRead = {}): TextFinding[] {
   const shown = read.shown;
   const origin = read.origin ?? ((index: number) => index);
-  const place = (index: number): Where => (shown !== undefined ? lineOf(shown, origin(index)) : lineOf(text, index));
-  const out = ruleHits(text, "as written", new Set(), region, place);
-  const confirmed = (): Set<CodeSignal> => new Set(out.filter((f) => f.confidence === "confirmed").map((f) => f.id));
+  const hidden = read.hidden;
+
+  const place = (index: number): Where => {
+    const at = origin(index);
+    const where = lineOf(shown ?? text, at);
+    const kind = hidden?.(at);
+
+    return kind ? { ...where, hidden: kind } : where;
+  };
+
+  const out = ruleHits(text, "as written", new Set(), place);
+  const have = (): Set<TextFinding["id"]> => new Set(out.map((f) => f.id));
 
   // escapes and identifier runs are read on the file as written; its tokens in plain form have them decoded
   if (read.encoded ?? shown === undefined) {
     const hex = hexIdentifierRun(text);
 
     if (hex >= 0) out.push({ id: "obfuscated", ...place(hex), how: "as written", confidence: "confirmed" });
-    out.push(...encodedLiterals(text, region, place));
+    out.push(...encodedLiterals(text, place));
   }
 
   const joined = joinStrings(text);
   const at = (index: number): Where => place(joined.origin(index));
-  const jregion: RegionOf = (index, end, id, kind) => region(joined.origin(index), end === undefined ? undefined : joined.origin(Math.max(index, end - 1)) + 1, id, kind);
 
   if (joined.text !== text) {
-    const found = new Set(out.map((f) => f.id));
+    out.push(...ruleHits(joined.text, "after joining strings", have(), at));
 
-    // joining can confirm what the text as written only suggested, but a second "possible" adds nothing
-    for (const f of ruleHits(joined.text, "after joining strings", confirmed(), jregion, at)) if (f.confidence === "confirmed" || !found.has(f.id)) out.push(f);
+    // v3's obfuscated rule also ran on the joined text: base64 split into pieces is one run once joined
+    const encoded = have().has("obfuscated") ? -1 : v3Encoded(joined.text);
+
+    if (encoded >= 0) out.push({ id: "obfuscated", ...at(encoded), how: "after joining strings", confidence: "confirmed" });
   }
 
   for (const b of joined.built) {
@@ -246,51 +222,32 @@ export function scanTextRules(text: string, lang: TextLang, read: TextRead = {})
 
     if (!id) continue;
     const where = place(b.index);
-    const why = `builds "${b.value.slice(0, 40)}" from pieces, but apm did not see it loaded or called`;
 
-    for (const signal of [id, "obfuscated"] as const) {
-      const r = region(b.index, b.index + 1, signal, "name");
-
-      if (r === "excluded") continue;
-      const confidence: Confidence = r === "string" ? "possible" : "confirmed";
-      const snippet = signal === "obfuscated" ? `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}` : where.snippet;
-
-      out.push(judged({ id: signal, line: where.line, snippet, how: "after joining strings" }, confidence, why));
-    }
+    out.push({ id, ...where, how: "after joining strings", confidence: "confirmed" });
+    out.push({ id: "obfuscated", ...where, snippet: `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings", confidence: "confirmed" });
   }
 
   for (const d of decodedStrings(joined.text)) {
     const where = at(d.index);
     const named = namedSignal(d.value);
-    const hits = ruleHits(d.value, "decoded", new Set(), RAW);
+    const hits = ruleHits(d.value, "decoded", new Set());
 
-    if (named) hits.push({ id: named, line: where.line, snippet: d.value.slice(0, 80), how: "decoded", confidence: "confirmed" });
+    if (named) hits.push({ id: named, line: 0, snippet: "", how: "decoded", confidence: "confirmed" });
+
+    // v3's obfuscated rule also ran on each decoded string
+    if (v3Encoded(d.value) >= 0) hits.push({ id: "obfuscated", line: 0, snippet: "", how: "decoded", confidence: "confirmed" });
 
     if (hits.length === 0) continue;
-    const hidden = `decoded from ${d.how} in an ordinary string that apm did not see code load or run`;
-    let shownAny = false;
+    const snippet = `${d.how} "${d.value.slice(0, 60)}" at ${where.snippet}`.slice(0, 120);
 
-    for (const h of hits) {
-      const r = jregion(d.index, d.index + 1, h.id, "decoded");
-
-      if (r === "excluded") continue;
-      const outer: Confidence = r === "string" ? "possible" : "confirmed";
-      const confidence: Confidence = outer === "possible" || h.confidence === "possible" ? "possible" : "confirmed";
-      const snippet = `${d.how} "${d.value.slice(0, 60)}" at ${where.snippet}`.slice(0, 120);
-
-      out.push(judged({ id: h.id, line: where.line, snippet, how: "decoded" }, confidence, h.confidence === "possible" ? h.why : hidden));
-      shownAny = true;
-    }
-
-    const r = jregion(d.index, d.index + 1, "obfuscated", "decoded");
-
-    if (shownAny && r !== "excluded") out.push(judged({ id: "obfuscated", line: where.line, snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded" }, r === "string" ? "possible" : "confirmed", hidden));
+    for (const h of hits) out.push({ ...where, id: h.id, snippet, how: "decoded", confidence: "confirmed" });
+    out.push({ ...where, id: "obfuscated", snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded", confidence: "confirmed" });
   }
 
-  if (!confirmed().has("credential-access") && out.some((f) => f.id === "network")) {
-    const hit = envExfil(text, region);
+  if (!have().has("credential-access") && have().has("network")) {
+    const dump = envExfil(text);
 
-    if (hit) out.push(judged({ id: "credential-access", ...place(hit.index), how: "as written" }, hit.confidence, IN_STRING));
+    if (dump >= 0) out.push({ id: "credential-access", ...place(dump), how: "as written", confidence: "confirmed" });
   }
 
   return out;

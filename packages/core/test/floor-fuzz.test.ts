@@ -1,14 +1,17 @@
-// The floor, tested as a property: whatever the code is wrapped in, apm-score-v8 never scores a package above
-// apm-score-v3 (test/v3, copied from git history), the last scorer that read every file as raw text. There are no
-// exceptions. Each case nests two or three wrapper shapes taken from the five independent reviews (template tags,
-// Function subclasses and constructor chains, generators, Symbol keys, bind/apply/call/Reflect, Proxies, getters,
-// namespaces, logical, ternary and comma callees, shadowing decoys, `with`, exports wildcards, comments ended by every
-// line terminator, HTML comments, JSX text, padding past the parse limit, token-window boundaries) around an inert
-// payload, and scores the same package with both. The v7 review's seven families are here too: conversion hooks,
-// `with` writes to an outer binding, default-parameter scope, reflected names and keys, a locally bound eval, a custom
-// fetch handed a data: URL, and a builtin replaced from a file with no tree. Scoring runs nothing: the payloads only
-// name example.invalid, child_process and a token. Separately, each new shape is run once in a node:vm context
-// against recording stubs, to check it really runs its payload.
+// The floor, tested as a property: whatever the code is wrapped in, apm-score-v9's findings include every finding
+// apm-score-v3 makes (test/v3, copied from git history, the last scorer that read every file as raw text), so it never
+// scores a package above v3. There are no exceptions; `supersetGaps` (test/superset.ts) says what a finding is. Each
+// case nests two or three wrapper shapes taken from the six independent reviews (template tags, Function subclasses
+// and constructor chains, generators, Symbol keys, bind/apply/call/Reflect, Proxies, getters, namespaces, logical,
+// ternary and comma callees, shadowing decoys, `with`, exports wildcards, comments ended by every line terminator, HTML
+// comments, JSX text, padding past the parse limit, token-window boundaries) around an inert payload, and scores the
+// same package with both. The v7 review's seven families are here too: conversion hooks, `with` writes to an outer
+// binding, default-parameter scope, reflected names and keys, a locally bound eval, a custom fetch handed a data:
+// URL, and a builtin replaced from a file with no tree. So are the v8 review's: text in a comment or a regex body read
+// back and run, by eval or by `new Worker(code, { eval: true })`; a comment, a regex body or a TypeScript type read
+// back and used as data (an environment variable's name, a path, a URL); and a computed load in a file no entry
+// reaches. Scoring runs nothing: the payloads only name example.invalid, child_process and a token. Separately, each
+// new shape is run once in a node:vm context against recording stubs, to check it really runs its payload.
 //
 //   bun test packages/core/test/floor-fuzz.test.ts                                   fixed seed, CI size
 //   APM_FUZZ_CASES=10000 APM_FUZZ_SEED=random bun test packages/core/test/floor-fuzz.test.ts   long run
@@ -16,11 +19,14 @@
 // A failure prints the seed, the case number and the shapes, so `APM_FUZZ_SEED=<seed>` replays it.
 import { describe, expect, test } from "bun:test";
 import vm from "node:vm";
-import { analyze, finalize, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { z } from "zod";
+import { analyze, finalize, SCORE_FLOOR, type Analysis, type ScoreReport, type TarEntry } from "../src/index.ts";
 import lexerData from "./fixtures/sol-lexer.json";
 import v5Data from "./fixtures/sol-parser-v5.json";
 import v6Data from "./fixtures/sol-parser-v6.json";
-import { analyze as analyzeV3, finalize as finalizeV3 } from "./v3/score.ts";
+import { scoreOfV3, supersetGaps, type SupersetInput } from "./superset.ts";
+import v7Data from "./fixtures/sol-v7.json";
+import v8Data from "./fixtures/sol-v8.json";
 
 const STATE = { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null } as const;
 
@@ -43,12 +49,25 @@ function tarOf(p: Pkg): TarEntry[] {
   return [entry("package.json", JSON.stringify(p.manifest)), ...Object.entries(p.files).map(([path, text]) => entry(path, text))];
 }
 
-function scoreV8(p: Pkg): ScoreReport {
-  return finalize(analyze({ name: "probe-pkg", manifest: p.manifest, files: tarOf(p), publisher: "a", previousPublishers: [] }), STATE);
+function inputOf(p: Pkg): SupersetInput {
+  return { name: "probe-pkg", manifest: p.manifest, files: tarOf(p), publisher: "a", previousPublishers: [] };
+}
+
+function analyzeV9(p: Pkg): Analysis {
+  return analyze(inputOf(p));
+}
+
+function scoreV9(p: Pkg): ScoreReport {
+  return finalize(analyzeV9(p), STATE);
 }
 
 function scoreV3(p: Pkg): number {
-  return finalizeV3(analyzeV3({ name: "probe-pkg", manifest: p.manifest, files: tarOf(p), publisher: "a", previousPublishers: [] }), STATE).score;
+  return scoreOfV3(inputOf(p));
+}
+
+/** The v3 findings v9 lacks on `p`, and a line if it scores above v3: empty when the property holds. */
+function gapsOf(p: Pkg): string[] {
+  return supersetGaps(inputOf(p), analyzeV9(p));
 }
 
 function single(file: string, src: string): Pkg {
@@ -127,27 +146,33 @@ const NOT_TS: readonly Lang[] = ["script", "module"];
 // ---------- the v7 review's families: proofs v7 took that the code did not honour ----------
 
 /** A family a shape belongs to, so the coverage check can ask that each one is drawn. */
-type Family = "conversion" | "with" | "default-parameter" | "reflected" | "local-eval" | "custom-fetch" | "unparsed-patch" | "text-runtime";
+type Family = "conversion" | "with" | "default-parameter" | "reflected" | "local-eval" | "custom-fetch" | "unparsed-patch" | "text-runtime" | "worker-eval" | "text-as-data" | "off-graph-load";
 
 type FamilyWrapper = CodeWrapper & { family: Family };
 
 /** Line terminators: a regex literal cannot hold one, and a line comment ends at each. */
 const LINE_BREAK = /[\n\r\u2028\u2029]/;
 
+/** Runs the source expression `src` as JavaScript with eval. */
+const byEval = (src: string): string => `eval(${src});`;
+
+/** Runs the source expression `src` as JavaScript in a Worker thread: `{ eval: true }` takes it for code, not a path. */
+const byWorker = (src: string): string => `new (require('worker_threads').Worker)(${src},{eval:true});`;
+
 /** `code` in a function's comment, read back with `String(f)` and run: node's function source keeps its comments. */
-function commentSource(code: string): string {
-  if (!code.includes("*/")) return `function txt_(){/*${code}*/}eval(String(txt_).slice(18,-3));`;
+function commentSource(code: string, run: (src: string) => string = byEval): string {
+  if (!code.includes("*/")) return `function txt_(){/*${code}*/}${run("String(txt_).slice(18,-3)")}`;
 
-  if (!LINE_BREAK.test(code)) return `function txt_(){//${code}\n}eval(String(txt_).slice(18,-2));`;
+  if (!LINE_BREAK.test(code)) return `function txt_(){//${code}\n}${run("String(txt_).slice(18,-2)")}`;
 
-  return `eval(${q(code)});`;
+  return run(q(code));
 }
 
 /** `code` as a regex body, every special character escaped, read back with `re.source`, unescaped and run. */
-function regexSource(code: string): string {
-  if (LINE_BREAK.test(code)) return commentSource(code);
+function regexSource(code: string, run: (src: string) => string = byEval): string {
+  if (LINE_BREAK.test(code)) return commentSource(code, run);
 
-  return `const re_=/${code.replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&")}/;eval(re_.source.replace(/\\\\(.)/g,'$1'));`;
+  return `const re_=/${code.replace(/[\\^$.*+?()[\]{}|/]/g, "\\$&")}/;${run("re_.source.replace(/\\\\(.)/g,'$1')")}`;
 }
 
 /** Indirect eval of an object's own `s`, from inside a conversion hook. */
@@ -178,8 +203,14 @@ const FAMILY_WRAPPERS: readonly FamilyWrapper[] = [
   // a fetch apm cannot identify, handed a data: URL, can turn it into anything
   { family: "custom-fetch", name: "data-local-method", wrap: (c) => `function run(send){const o={fetch(u){return send(u.slice(5))}};o.fetch('data:'+${q(c)})}run(globalThis.eval);` },
   // text the floor leaves out (a comment, a regex body) read back as text and run: the evaluator lets it count
-  { family: "text-runtime", name: "comment-function-source", wrap: commentSource },
-  { family: "text-runtime", name: "regex-source", wrap: regexSource },
+  { family: "text-runtime", name: "comment-function-source", wrap: (c) => commentSource(c) },
+  { family: "text-runtime", name: "regex-source", wrap: (c) => regexSource(c) },
+  // the v8 review's: a Worker started with eval: true runs its source, as a string or as text read back from a comment or a regex
+  { family: "worker-eval", name: "worker-eval", wrap: (c) => byWorker(q(c)) },
+  { family: "worker-eval", name: "worker-destructured", wrap: (c) => `const {Worker:W_}=require('node:worker_threads');new W_(${q(c)},{eval:true});` },
+  { family: "worker-eval", name: "worker-options-constant", wrap: (c) => `const o_={eval:true};new (require('worker_threads').Worker)(${q(c)},o_);` },
+  { family: "worker-eval", name: "worker-comment-source", wrap: (c) => commentSource(c, byWorker) },
+  { family: "worker-eval", name: "worker-regex-source", wrap: (c) => regexSource(c, byWorker) },
   { family: "custom-fetch", name: "data-global-replaced", wrap: (c) => `const original=globalThis.fetch;globalThis.fetch=function(u){globalThis.fetch=original;return (0,eval)(u.slice(5))};fetch('data:'+${q(c)});` },
 ];
 
@@ -199,6 +230,25 @@ const REFLECTED: readonly { name: string; langs?: readonly Lang[]; src: string }
   { name: "function-source-module", src: "function f(){function g(){child_process}process.getBuiltinModule(String(g).slice(13,26))}f();" },
   { name: "namespace-keys-token", langs: ["ts"], src: "namespace N{export const NPM_TOKEN=1}process.env[Object.keys(N)[0]];" },
   { name: "parameter-property-token", langs: ["ts"], src: "class C{constructor(public NPM_TOKEN=1){}}process.env[Object.keys(new C())[0]];" },
+];
+
+/**
+ * The v8 review's text used as data: a comment, a regex body or a TypeScript type read back at runtime and used as an
+ * environment variable's name, a path, a module name or a URL, with no evaluator anywhere. Like REFLECTED, each is its
+ * own payload.
+ */
+const TEXT_DATA: readonly { name: string; langs?: readonly Lang[]; src: string }[] = [
+  { name: "comment-env", src: "function f_(){/*NPM_TOKEN*/}process.env[String(f_).split('/*')[1].split('*/')[0]];" },
+  { name: "comment-path", src: "function f_(){/*.npmrc*/}require('fs').readFileSync(String(f_).split('/*')[1].split('*/')[0]);" },
+  { name: "comment-module", src: "function f_(){/*child_process*/}process.getBuiltinModule(String(f_).split('/*')[1].split('*/')[0]);" },
+  { name: "comment-network-key", src: String.raw`function f_(){/*fetch('https://example.invalid')*/}const s_=String(f_).split('/*')[1].split('*/')[0];globalThis[s_.split('(')[0]](s_.split("'")[1]);` },
+  { name: "regex-env", src: "const r_=/NPM_TOKEN/;process.env[String(r_).slice(1,-1)];" },
+  { name: "regex-path", src: "const r_=/.npmrc/;require('fs').readFileSync(String(r_).slice(1,-1));" },
+  { name: "regex-module", src: "const r_=/child_process/;process.getBuiltinModule(r_.source);" },
+  { name: "regex-network-key", src: String.raw`const r_=/fetch('https:\/\/example.invalid')/;const s_=r_.source.replace(/\\/g,'');globalThis[s_.split('(')[0]](s_.split("'")[1]);` },
+  { name: "type-env", langs: ["ts"], src: `type T_ = "NPM_TOKEN";\nconst s_ = require("fs").readFileSync(__filename, "utf8");\nprocess.env[s_.split('"')[1]];` },
+  { name: "type-path", langs: ["ts"], src: `type T_ = ".npmrc";\nconst s_ = require("fs").readFileSync(__filename, "utf8");\nrequire("fs").readFileSync(s_.split('"')[1]);` },
+  { name: "type-module", langs: ["ts"], src: `type T_ = "child_process";\nconst s_ = require("fs").readFileSync(__filename, "utf8");\nprocess.getBuiltinModule(s_.split('"')[1]);` },
 ];
 
 /** A package whose main file sends the payload through fetch, after a file with no tree replaced fetch with eval. */
@@ -322,7 +372,7 @@ const SURROUNDINGS: readonly Surrounding[] = [
 ];
 
 /** Shapes that change the package rather than the text: where the file lives, how large it is, or what another file replaced. */
-type Layout = "main" | "padded" | "wildcard-export" | "window" | "unparsed-patch";
+type Layout = "main" | "padded" | "wildcard-export" | "window" | "unparsed-patch" | "off-graph";
 
 // ---------- one case ----------
 
@@ -337,14 +387,15 @@ function makeCase(r: Rand): Case {
   const lang = pick(r, ["script", "script", "module", "ts"] as const);
   const fits = <S extends { langs?: readonly Lang[] }>(s: S): boolean => (s.langs ?? ALL).includes(lang);
   const names: string[] = [lang];
-  const reflected = REFLECTED.filter(fits);
-  // a reflected-name program is its own payload; in TypeScript a namespace or a parameter property must stay unwrapped
-  const reflect = r() < 0.12 ? pick(r, reflected) : null;
+  // a reflected-name or text-as-data program is its own payload; one only TypeScript holds (a namespace, a parameter
+  // property, a type) must stay unwrapped
+  const own = r();
+  const reflect = own < 0.12 ? { family: "reflected", ...pick(r, REFLECTED.filter(fits)) } : own < 0.2 ? { family: "text-as-data", ...pick(r, TEXT_DATA.filter(fits)) } : null;
   let code = reflect ? reflect.src : pick(r, PAYLOADS);
 
-  names.push(reflect ? `reflected:${reflect.name}` : `payload:${PAYLOADS.indexOf(code)}`);
+  names.push(reflect ? `${reflect.family}:${reflect.name}` : `payload:${PAYLOADS.indexOf(code)}`);
 
-  if (reflect) names.push("family:reflected");
+  if (reflect) names.push(`family:${reflect.family}`);
   // two or three shapes in all: one or two around the code, then one around the program
   const depth = reflect?.langs ? 0 : r() < 0.5 ? 1 : 2;
 
@@ -362,8 +413,12 @@ function makeCase(r: Rand): Case {
   let src = ctx.wrap(code, lang);
 
   names.push(ctx.name);
+
   const roll = r();
-  const layout: Layout = roll < 0.06 ? "padded" : roll < 0.1 ? "wildcard-export" : roll < 0.11 && lang === "ts" ? "window" : roll < 0.14 && lang !== "ts" && !jsx ? "unparsed-patch" : "main";
+
+  const layout: Layout =
+    roll < 0.06 ? "padded" : roll < 0.1 ? "wildcard-export" : roll < 0.11 && lang === "ts" ? "window" : roll < 0.14 && lang !== "ts" && !jsx ? "unparsed-patch" : roll < 0.2 && !jsx ? "off-graph" : "main";
+
   let file = jsx ? "index.jsx" : FILES[lang];
 
   names.push(layout);
@@ -386,6 +441,13 @@ function makeCase(r: Rand): Case {
     return { names, pkg: { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": main, [patch.file]: patch.text } } };
   }
 
+  if (layout === "off-graph") {
+    // a file no entry reaches that loads a module by a computed name: a consumer can still require it by its path
+    names.push("family:off-graph-load");
+
+    return { names, pkg: { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": "module.exports = 1;\n", [`bin/${file}`]: `${src}\nrequire(process.argv[2]);\n` } } };
+  }
+
   if (layout === "wildcard-export") {
     const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", exports: { ".": "./index.js", "./*": { node: { require: "./docs/*.txt" } } } };
 
@@ -395,14 +457,34 @@ function makeCase(r: Rand): Case {
   return { names, pkg: single(file, src) };
 }
 
-function describeCase(seed: number, i: number, c: Case, v3: number, v8: ScoreReport): string {
-  const signals = v8.signals.map((s) => `${s.id}:${s.confidence}`).join(", ");
+function describeCase(seed: number, i: number, c: Case, gaps: readonly string[]): string {
+  const v9 = scoreV9(c.pkg);
+  const signals = v9.signals.map((s) => `${s.id}:${s.confidence}`).join(", ");
 
   const src = Object.entries(c.pkg.files)
     .map(([p, text]) => `${p}: ${text.length > 600 ? `${text.slice(0, 120)} … ${text.slice(-400)}` : text}`)
     .join("\n");
 
-  return `seed ${seed}, case ${i}: ${c.names.join(" > ")}\nv3 ${v3}, v8 ${v8.score} (${signals})\n${src}`;
+  return `seed ${seed}, case ${i}: ${c.names.join(" > ")}\nv3 ${scoreV3(c.pkg)}, v9 ${v9.score} (${signals})\n${gaps.join("\n")}\n${src}`;
+}
+
+const PADDING = { js: "0;".repeat(240_001), ts: `/*${"x".repeat(1024 * 1024)}*/\n` } as const;
+
+/** Another file of a stored fixture: its text, or (the v7 review's) text behind padding that keeps it from being parsed. */
+const ExtraFile = z.union([z.string(), z.object({ pad: z.enum(["js", "ts"]).optional(), src: z.string() }).transform((e) => (e.pad ? PADDING[e.pad] : "") + e.src)]);
+
+/** A stored fixture of any review, as a package: its main file, any other files and manifest fields, and padding. */
+const Stored = z.object({ name: z.string(), file: z.string(), src: z.string(), extra: z.record(z.string(), ExtraFile).optional(), manifest: z.record(z.string(), z.unknown()).optional(), pad: z.enum(["js", "ts"]).optional() });
+
+type Stored = z.infer<typeof Stored>;
+
+/** The v8 review's fixtures name their main file and hold every file. */
+const StoredV8 = z.object({ name: z.string(), main: z.string(), files: z.record(z.string(), z.string()) }).transform((f): Stored => ({ name: f.name, file: f.main, src: f.files[f.main] ?? "", extra: f.files }));
+
+function storedPkg(f: Stored): Pkg {
+  const files = { [f.file]: (f.pad ? PADDING[f.pad] : "") + f.src, ...f.extra };
+
+  return { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: f.file, ...f.manifest }, files };
 }
 
 // ---------- the tests ----------
@@ -416,7 +498,21 @@ describe("the v3 reference is apm-score-v3", () => {
   });
 });
 
-describe("the floor: no shape lifts a package above apm-score-v3", () => {
+describe("every review's fixtures hold every finding apm-score-v3 makes", () => {
+  const stored = [...z.array(Stored).parse([...lexerData, ...v5Data, ...v6Data, ...v7Data]), ...z.array(StoredV8).parse(v8Data)];
+
+  test(`all ${stored.length} stored fixtures`, () => {
+    const failures = stored.flatMap((f) => {
+      const gaps = gapsOf(storedPkg(f));
+
+      return gaps.length > 0 ? [`${f.name}: ${gaps.join("; ")}`] : [];
+    });
+
+    expect(failures).toEqual([]);
+  }, 60_000);
+});
+
+describe("the floor: no shape takes away a finding of apm-score-v3's", () => {
   const cases = Number(process.env.APM_FUZZ_CASES ?? CI_CASES);
   const seedEnv = process.env.APM_FUZZ_SEED;
   const seed = seedEnv === "random" ? Math.floor(Math.random() * 2 ** 31) : Number(seedEnv ?? CI_SEED);
@@ -430,17 +526,16 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
 
       for (let i = 0; i < cases; i++) {
         const c = makeCase(r);
-        const v3 = scoreV3(c.pkg);
-        const v8 = scoreV8(c.pkg);
+        const gaps = gapsOf(c.pkg);
 
-        if (v3 < SCORE_FLOOR) refused++;
+        if (scoreV3(c.pkg) < SCORE_FLOOR) refused++;
 
-        if (v8.score > v3) failures.push(describeCase(seed, i, c, v3, v8));
+        if (gaps.length > 0) failures.push(describeCase(seed, i, c, gaps));
 
         if (failures.length >= 5) break;
       }
 
-      if (process.env.APM_FUZZ_CASES) console.log(`floor fuzz: seed ${seed}, ${cases} cases, ${refused} refused by v3, ${failures.length} above v3`);
+      if (process.env.APM_FUZZ_CASES) console.log(`floor fuzz: seed ${seed}, ${cases} cases, ${refused} refused by v3, ${failures.length} missing a v3 finding or above v3`);
 
       expect(failures, failures.join("\n\n")).toEqual([]);
     },
@@ -453,8 +548,9 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
 
     for (let i = 0; i < CI_CASES; i++) for (const n of makeCase(r).names) seen.add(n);
 
-    const families: Family[] = ["conversion", "with", "default-parameter", "reflected", "local-eval", "custom-fetch", "unparsed-patch", "text-runtime"];
-    const missing = [...SURROUNDINGS.map((s) => s.name), ...PAYLOADS.map((_, i) => `payload:${i}`), "padded", "wildcard-export", "unparsed-patch", ...families.map((f) => `family:${f}`)].filter((n) => !seen.has(n));
+    const families: Family[] = ["conversion", "with", "default-parameter", "reflected", "local-eval", "custom-fetch", "unparsed-patch", "text-runtime", "worker-eval", "text-as-data", "off-graph-load"];
+    const layouts: Layout[] = ["padded", "wildcard-export", "unparsed-patch", "off-graph"];
+    const missing = [...SURROUNDINGS.map((s) => s.name), ...PAYLOADS.map((_, i) => `payload:${i}`), ...layouts, ...families.map((f) => `family:${f}`)].filter((n) => !seen.has(n));
 
     expect(missing).toEqual([]);
   });
@@ -463,38 +559,39 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
   // draw a shape rarely, so each is also scored on its own
   for (const s of CODE_WRAPPERS) {
     test(`alone: ${s.name}`, () => {
-      for (const lang of s.langs ?? ALL) {
-        const pkg = single(FILES[lang], s.wrap(FULL));
-        const v3 = scoreV3(pkg);
-        const v8 = scoreV8(pkg);
-
-        expect(v8.score, `${lang}: v3 ${v3}`).toBeLessThanOrEqual(v3);
-      }
+      for (const lang of s.langs ?? ALL) expect(gapsOf(single(FILES[lang], s.wrap(FULL))), lang).toEqual([]);
     });
   }
 
-  for (const s of REFLECTED) {
+  for (const s of [...REFLECTED, ...TEXT_DATA]) {
     test(`alone: ${s.name}`, () => {
-      for (const lang of s.langs ?? ALL) {
-        const pkg = single(FILES[lang], s.src);
-
-        expect(scoreV8(pkg).score, lang).toBeLessThanOrEqual(scoreV3(pkg));
-      }
+      for (const lang of s.langs ?? ALL) expect(gapsOf(single(FILES[lang], s.src)), lang).toEqual([]);
     });
   }
 
   for (const p of UNPARSED_PATCHES) {
     test(`alone: ${p.name}`, () => {
       const pkg: Pkg = { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": `require('./${p.file}');fetch(${q(FULL)});`, [p.file]: p.text } };
-      const v3 = scoreV3(pkg);
 
-      expect(v3).toBeLessThan(SCORE_FLOOR);
-      expect(scoreV8(pkg).score).toBeLessThanOrEqual(v3);
+      expect(scoreV3(pkg)).toBeLessThan(SCORE_FLOOR);
+      expect(gapsOf(pkg)).toEqual([]);
     });
   }
+
+  test("alone: the payload in a file no entry reaches, beside a computed load", () => {
+    for (const s of FAMILY_WRAPPERS) {
+      const pkg: Pkg = { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": "module.exports = 1;\n", "bin/run.js": `${s.wrap(FULL)}\nrequire(process.argv[2]);\n` } };
+
+      expect(gapsOf(pkg), s.name).toEqual([]);
+      expect(scoreV9(pkg).signals.find((x) => x.id === "dynamic-require")?.evidence[0], s.name).toStartWith("bin/run.js:");
+    }
+  });
 });
 
 // ---------- the new shapes run what they wrap ----------
+
+/** What a recording stub of a builtin module offers the code it runs. */
+type StubModule = { Worker?: (code: string, options?: { eval?: boolean }) => void; readFileSync?: (path: string) => string; runInThisContext?: (code: string) => void };
 
 /**
  * Runs `src` as a classic script in a fresh node:vm context whose process, fetch and module loading only record what
@@ -505,8 +602,25 @@ function trace(src: string): string[] {
   const env = new Proxy({}, { get: (_t, k) => (calls.push(`env:${String(k)}`), undefined) });
   const process = { env, getBuiltinModule: (m: string) => (calls.push(`module:${m}`), {}) };
   const fetch = (u: string) => (calls.push(`fetch:${u}`), Promise.resolve());
-  const context = vm.createContext({ process, fetch, require: (m: string) => (calls.push(`module:${m}`), {}) });
+  const context = vm.createContext({});
 
+  // a Worker started with eval: true runs its source; here it runs in the same recording context
+  const Worker = function Worker(code: string, options?: { eval?: boolean }): void {
+    if (options?.eval) vm.runInContext(code, context, { timeout: 1000 });
+  };
+
+  const fs = { readFileSync: (p: string) => (calls.push(`read:${p}`), "") };
+
+  const require = (m: string): StubModule => {
+    if (m === "worker_threads" || m === "node:worker_threads") return { Worker };
+
+    if (m === "fs") return fs;
+    calls.push(`module:${m}`);
+
+    return {};
+  };
+
+  Object.assign(context, { process, fetch, require });
   vm.runInContext(src, context, { timeout: 1000 });
 
   return calls;
@@ -525,6 +639,13 @@ describe("each new shape runs its payload (liveness, under recording stubs)", ()
     test(`runs: ${s.name}`, () => {
       expect(trace(s.src).length).toBeGreaterThan(0);
       expect(trace(s.src).every((c) => all.includes(c))).toBe(true);
+    });
+  }
+
+  // the TypeScript ones read their own source, and run in test/sol-v8.test.ts with the review's own programs
+  for (const s of TEXT_DATA.filter((x) => !x.langs)) {
+    test(`runs: ${s.name}`, () => {
+      expect(trace(s.src)).toEqual([expect.stringMatching(/^(?:env:NPM_TOKEN|read:\.npmrc|module:child_process|fetch:https:\/\/example\.invalid)$/)]);
     });
   }
 });

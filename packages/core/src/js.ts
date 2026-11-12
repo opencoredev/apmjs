@@ -6,7 +6,6 @@
 // is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
-import type { Region } from "./lexer.ts";
 import { scanTextRules } from "./textrules.ts";
 import {
   escapedTextAt,
@@ -16,15 +15,14 @@ import {
   namedSignal,
   NEAR,
   printable,
-  RAW,
   ruleHits,
   stringMatches,
   TOKEN_NAMES,
   whyOf,
   type Capability,
   type CodeSignal,
-  type Kind,
   type Confidence,
+  type Hidden,
   type How,
   type TextFinding,
   type Where,
@@ -764,6 +762,11 @@ const COMMAND_ARGS: ReadonlySet<string> = new Set(["exec", "execSync", "execFile
 
 const VM_EVAL: ReadonlySet<string> = new Set(["runInThisContext", "runInNewContext", "runInContext", "compileFunction", "Script", "SourceTextModule"]);
 
+const INSPECTOR = /^(?:node:)?inspector(?:\/promises)?$/;
+
+/** Inspector protocol methods that run code they are handed. */
+const INSPECTOR_EVAL = /^(?:Runtime\.(?:evaluate|compileScript|runScript|callFunctionOn)|Debugger\.evaluateOnCallFrame)$/;
+
 const READS: ReadonlySet<string> = new Set(["readFile", "readFileSync", "createReadStream", "open", "openSync", "copyFile", "copyFileSync", "cp", "cpSync", "readTextFile", "readTextFileSync"]);
 
 const NET_CTORS: ReadonlySet<string> = new Set(["XMLHttpRequest", "WebSocket", "EventSource", "RTCPeerConnection"]);
@@ -1037,169 +1040,39 @@ const ROLE_RANK: Record<Role, number> = { none: 0, plain: 1, request: 2, read: 3
 type Plan = { roles: Role[]; rest: Role | "inherit" };
 
 
-// ---------- the floor: the text rules, and what the tree can prove ----------
+// ---------- the floor: the text rules over the whole program ----------
 //
-// Every parsed program is also read by the text rules, over its code with only comments and regex literals blanked:
-// what apm-score-v3 found there is the floor, and every match stands, confirmed, unless it lies wholly inside
-// TypeScript syntax that emits nothing (an annotation, an interface, a type alias, `import type`, a `declare`).
-// Those three (comments, regex bodies, erased types) are the only text the floor leaves out, because the parse says
-// none of it is code the program runs. The tree adds what it sees and chooses citations; it removes nothing.
+// Every parsed program is also read by the text rules over its whole text, as apm-score-v3 read every file: comments,
+// regex bodies and TypeScript types included, because `String(fn)`, `re.source` and a file reading its own source give
+// that text back at runtime, and it can be run or used as data from there (apm-score-v9). Every match stands,
+// confirmed. The tree adds what it sees and chooses citations; it removes nothing. The parse only says which matches sit
+// in a comment, a regex body or erased TypeScript, so the evidence line can name it.
 
-/**
- * The proofs that rest on what the code does with a token rather than on how it is read: a definition's name or a
- * written key, a binding that never changes, a value that goes nowhere, an argument a callee ignores, a builtin
- * sink, a `data:` fetch, calling a Promise or generator. An independent review of apm-score-v7 built 39 programs
- * where one of them removed a finding whose operation still ran (conversion hooks, a local `eval`, `with` writes,
- * default-parameter scope, reflected names and keys, a builtin replaced from a file with no tree, a custom `fetch`).
- * They are off and nothing turns them on. Each needs its own review and fuzz coverage before it can come back.
- */
-const PRECISION_PROOFS: boolean = false;
+/** The text of one program that does not run as written: its comments, regex literal bodies and erased TypeScript. */
+type LeftOut = { comments: readonly Range[]; regexes: Range[]; types: Range[] };
 
-/** Each code signal as a bit, so a proof can say which signals it clears. */
-const SIGNAL_BIT: Record<CodeSignal, number> = { "shell-exec": 1, network: 2, "credential-access": 4, eval: 8, obfuscated: 16 };
-
-const ALL_SIGNALS = 31;
-
-/**
- * A proof that a token is harmless for the signals in `mask`. `sink`: the proof rests on a global or builtin module
- * being what its name says (fetch sends what it is given; path.join only builds a string), which holds only while
- * nothing in the package could replace it; when something could, the package adds back what such proofs removed.
- */
-type Proof = { mask: number; sink: boolean };
-
-const HARMLESS: Proof = { mask: ALL_SIGNALS, sink: false };
-
-function both(a: Proof | null, b: Proof | null): Proof | null {
-  return a && b ? { mask: a.mask & b.mask, sink: a.sink || b.sink } : null;
-}
-
-/** What the floor found in one program: what stands with every proof, and what only proofs resting on a builtin kept out. */
-type Floor = { stands: TextFinding[]; sinkOnly: TextFinding[] };
-
-/** A node seen past the casts, chains and parentheses around it (`node`), and the node that holds that (`parent`). */
-type Context = { node: AnyNode; parent: AnyNode | undefined };
-
-/** A leaf a text rule can match inside: a name, a string, template text or JSX text. */
-type Atom = { start: number; end: number; node: AnyNode };
-
-/**
- * One program, indexed for the floor: each node's parent; the leaves in source order; the ranges of type-only syntax
- * and of regex literals; whether it has a `with`; the functions whose `this` can be the global object (sloppy-mode
- * functions); the `this`, member and call nodes the patch check looks at; and the names it exports.
- */
-type Index = {
-  parentOf: Map<AnyNode, AnyNode>;
-  atoms: Atom[];
-  types: Range[];
-  regexes: Range[];
-  withs: boolean;
-  sloppy: Set<AnyNode>;
-  thisNodes: AnyNode[];
-  members: MemberExpression[];
-  calls: (CallExpression | NewExpression)[];
-  tags: TaggedTemplateExpression[];
-  exported: Set<string>;
-};
-
-function hasUseStrict(body: readonly AnyNode[]): boolean {
-  for (const st of body) {
-    if (st.type !== "ExpressionStatement" || !("directive" in st) || st.directive === undefined) return false;
-
-    if (st.directive === "use strict") return true;
-  }
-
-  return false;
-}
-
-function isStringAtom(n: AnyNode): boolean {
-  return n.type === "Literal" || n.type === "TemplateElement" || n.type === "JSXText";
-}
-
-function indexProgram(program: Program, strict: boolean): Index {
-  const ix: Index = { parentOf: new Map(), atoms: [], types: [], regexes: [], withs: false, sloppy: new Set(), thisNodes: [], members: [], calls: [], tags: [], exported: new Set() };
-  const stack: [AnyNode, boolean][] = [[program, strict || hasUseStrict(program.body)]];
+function leftOutOf(program: Program, comments: readonly Range[]): LeftOut {
+  const out: LeftOut = { comments, regexes: [], types: [] };
+  const stack: [AnyNode, AnyNode | null][] = [[program, null]];
 
   for (let item = stack.pop(); item; item = stack.pop()) {
-    const [n, inStrict] = item;
+    const [n, parent] = item;
 
     if (n !== program && isTypeOnly(n)) {
-      ix.types.push([n.start, n.end]);
+      out.types.push([n.start, n.end]);
       continue;
     }
 
-    let childStrict = inStrict;
+    // `await /x/` is a regex in a module and a division in a script, where `await` is a name: that text is code
+    if (n.type === "Literal" && "regex" in n && n.regex && parent?.type !== "AwaitExpression") out.regexes.push([n.start, n.end]);
 
-    switch (n.type) {
-      case "Identifier":
-      case "PrivateIdentifier":
-      case "TemplateElement":
-      case "JSXText":
-        ix.atoms.push({ start: n.start, end: n.end, node: n });
-        break;
-      case "Literal":
-        // `await /x/` is a regex in a module and a division in a script, where `await` is a name: a program run
-        // under the other goal reads that text as code, so it is not left out
-        if ("regex" in n && n.regex) {
-          if (ix.parentOf.get(n)?.type !== "AwaitExpression") ix.regexes.push([n.start, n.end]);
-        } else if (stringValue(n) !== null) ix.atoms.push({ start: n.start, end: n.end, node: n });
-        break;
-      case "WithStatement":
-        ix.withs = true;
-        break;
-      case "ThisExpression":
-        ix.thisNodes.push(n);
-        break;
-      case "MemberExpression":
-        ix.members.push(n);
-        break;
-      case "CallExpression":
-      case "NewExpression":
-        ix.calls.push(n);
-        break;
-      case "TaggedTemplateExpression":
-        ix.tags.push(n);
-        break;
-      case "FunctionDeclaration":
-      case "FunctionExpression":
-      case "ArrowFunctionExpression":
-        childStrict = inStrict || (n.body.type === "BlockStatement" && hasUseStrict(n.body.body));
-
-        if (!childStrict && n.type !== "ArrowFunctionExpression") ix.sloppy.add(n);
-        break;
-      case "ClassDeclaration":
-      case "ClassExpression":
-        childStrict = true;
-        break;
-      case "ExportNamedDeclaration":
-      case "ExportDefaultDeclaration": {
-        const d = n.declaration;
-
-        if (d?.type === "VariableDeclaration") {
-          const ids: Identifier[] = [];
-
-          for (const v of d.declarations) assignedNames(v.id, ids);
-
-          for (const id of ids) ix.exported.add(id.name);
-        } else if (d && (d.type === "FunctionDeclaration" || d.type === "ClassDeclaration") && d.id) ix.exported.add(d.id.name);
-
-        break;
-      }
-
-      default:
-        break;
-    }
-
-    for (const c of childNodes(n)) {
-      ix.parentOf.set(c, n);
-      stack.push([c, childStrict]);
-    }
+    for (const c of childNodes(n)) stack.push([c, n]);
   }
 
-  ix.atoms.sort((a, b) => a.start - b.start || a.end - b.end);
-  ix.types.sort((a, b) => a[0] - b[0]);
-  ix.regexes.sort((a, b) => a[0] - b[0]);
+  out.types.sort((a, b) => a[0] - b[0]);
+  out.regexes.sort((a, b) => a[0] - b[0]);
 
-  return ix;
+  return out;
 }
 
 /** Whether all of `[start, end)` sits inside one of the sorted ranges (which may nest). */
@@ -1226,162 +1099,29 @@ function withinOne(ranges: readonly Range[], start: number, end: number): boolea
   return false;
 }
 
-/** `text` with `ranges` blanked (line breaks kept), so offsets and line numbers stay those of the file. */
-function blanked(text: string, ranges: readonly Range[]): string {
-  if (ranges.length === 0) return text;
-  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
-  let out = "";
-  let last = 0;
+/** The left-out text `index` sits in, in one program. */
+function hiddenIn(l: LeftOut, index: number): Hidden | undefined {
+  if (withinOne(l.comments, index, index + 1)) return "comment";
 
-  for (const [start, end] of sorted) {
-    if (end <= last) continue;
-    const from = Math.max(start, last);
-    out += text.slice(last, from) + text.slice(from, end).replace(/[^\n]/g, " ");
-    last = end;
-  }
+  if (withinOne(l.regexes, index, index + 1)) return "regex";
 
-  return out + text.slice(last);
+  return withinOne(l.types, index, index + 1) ? "type" : undefined;
 }
-
-/** Wrappers that pass a value through unchanged: TypeScript casts, `a?.b` chains, parentheses. */
-function isPassThrough(n: AnyNode): boolean {
-  return n.type === "ChainExpression" || n.type === "ParenthesizedExpression" || n.type === "TSAsExpression" || n.type === "TSSatisfiesExpression" || n.type === "TSNonNullExpression" || n.type === "TSTypeAssertion" || n.type === "TSInstantiationExpression";
-}
-
-/** Error constructors: what they are given becomes the message, and goes no further than the error does. */
-const ERROR_CTORS: ReadonlySet<string> = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError"]);
-
-/** Builtins that build a string from what they are given and do nothing else with it. */
-const STRING_BUILDERS: ReadonlySet<string> = new Set(["String", "encodeURIComponent", "encodeURI", "escape", "JSON.stringify"]);
-
-const PATH_PURE = /^(?:(?:posix|win32)\.)?(?:join|resolve|normalize|relative|dirname|basename|extname|toNamespacedPath)$/;
-
-const FS_READ_ONE: ReadonlySet<string> = new Set(["readFile", "readFileSync", "createReadStream", "open", "openSync", "promises.readFile", "promises.open"]);
-
-/** Modules whose functions a sink proof rests on. */
-const SINK_MODULES: ReadonlySet<string> = new Set(["fs", "path", "http", "https", "dns"]);
-
-/** Globals a sink proof rests on, or that run code: replacing one, or declaring one where it becomes the global, is a patch. */
-const SINK_ROOTS: ReadonlySet<string> = new Set(["fetch", "eval", "Function", "WebSocket", "EventSource", "navigator", "JSON", "String", "encodeURIComponent", "encodeURI", "escape", "require", "Reflect", "Object", "process", "module", ...ERROR_CTORS]);
-
-/** Names of the global object itself. */
-const GLOBAL_NAMES: ReadonlySet<string> = new Set([...GLOBAL_OBJECTS, "top", "parent", "frames"]);
-
-/** Why a program could replace a global or builtin module, as the not-checked list says it. */
-const PATCH = {
-  with: "a `with` statement",
-  assigns: "assigns a global that matters",
-  declares: "declares, where it becomes the global, a name that matters",
-  tag: "a template tag apm cannot name",
-  escapes: "hands the global object, a builtin module, eval or Function to code apm cannot follow, or writes one of their members",
-  writes: "writes a member a builtin looks up (or one apm cannot name) on an object apm cannot identify",
-  dynamic: "loads a module apm cannot name",
-  url: "loads code from a URL",
-  code: "runs code from a string apm could not read in full",
-  constructor: "calls a constructor apm cannot name with arguments (it may be Function)",
-  floorEval: "evaluates code at runtime",
-} as const;
-
-/** The offset where line `line` (1-based, counted by \n) starts. */
-function lineStart(text: string, line: number): number {
-  let at = 0;
-
-  for (let i = 1; i < line && at >= 0; i++) at = text.indexOf("\n", at) + 1;
-
-  return Math.max(0, at);
-}
-
-/** What a sink does with the argument in position `i`: sends it, reads it as a path, builds a string from it (and that string goes where the call's value goes), or nothing apm can vouch for. */
-type SinkEffect = "terminal" | "read" | "transparent" | null;
-
-function sinkEffect(r: Ref, i: number, isNew: boolean): SinkEffect {
-  if (r.kind === "global") {
-    const p = r.path;
-
-    if (p === "fetch" && !isNew) return "terminal";
-
-    if ((p === "WebSocket" || p === "EventSource") && isNew) return "terminal";
-
-    if (p === "navigator.sendBeacon" && !isNew) return "terminal";
-
-    if (ERROR_CTORS.has(p)) return "transparent";
-
-    if (STRING_BUILDERS.has(p) && !isNew) return "transparent";
-
-    // eval reads only its first argument
-    if (p === "eval" && !isNew) return i >= 1 ? "terminal" : null;
-
-    return null;
-  }
-
-  if (r.kind !== "module") return null;
-
-  if ((r.spec === "http" || r.spec === "https") && (r.path === "request" || r.path === "get")) return "terminal";
-
-  if (r.spec === "dns" && DNS_CALL.test(r.path)) return "terminal";
-
-  if (r.spec === "fs" && FS_READ_ONE.has(r.path)) return i === 0 ? "read" : "terminal";
-
-  if (r.spec === "path" && PATH_PURE.test(r.path)) return "transparent";
-
-  return null;
-}
-
-/** A global or module object a sink proof reads members of, or that runs code: handing one to code apm cannot follow could change it. */
-function isWatched(r: Ref): boolean {
-  if (r.kind === "module") return SINK_MODULES.has(r.spec);
-
-  if (r.kind !== "global") return false;
-  const root = r.path.split(".")[0] ?? "";
-
-  return r.path === "" || WATCHED_ROOTS.has(root) || ERROR_CTORS.has(root);
-}
-
-/** Globals whose members (or prototypes' members) a sink proof relies on, or that run code. */
-const WATCHED_ROOTS: ReadonlySet<string> = new Set(["navigator", "JSON", "Function", "eval", "Object", "Array", "String", "Reflect"]);
 
 /**
- * Keys a builtin looks up while it handles a value a sink proof says it only sends, reads or builds a string from:
- * conversion hooks, the members fetch reads from its options, the methods those proofs name. A getter or an object
- * with its own `toString` stored under one of these on a shared prototype would run code there.
+ * The text rules over a whole program's text, every match confirmed. A match is said to sit in a comment, a regex or
+ * a type only when every program the text parsed to puts it there (a TypeScript file that is also JavaScript runs its
+ * "types" as code where nothing strips them).
  */
-const PROTO_KEYS: ReadonlySet<string> = new Set([
-  "toString",
-  "valueOf",
-  "toJSON",
-  "toLocaleString",
-  "then",
-  "constructor",
-  "prototype",
-  "__proto__",
-  "call",
-  "apply",
-  "bind",
-  "includes",
-  "indexOf",
-  "lastIndexOf",
-  "join",
-  "prepareStackTrace",
-  "body",
-  "cache",
-  "credentials",
-  "headers",
-  "integrity",
-  "keepalive",
-  "method",
-  "mode",
-  "priority",
-  "redirect",
-  "referrer",
-  "referrerPolicy",
-  "signal",
-  "window",
-  "duplex",
-  "dispatcher",
-]);
+function floorOf(text: string, programs: readonly LeftOut[]): TextFinding[] {
+  const hidden = (index: number): Hidden | undefined => {
+    const kinds = programs.map((l) => hiddenIn(l, index));
 
-/** Calls that write members of their first argument: by the keys of their second (`assign`, `defineProperties`), by a key (`defineProperty`, `set`), or its prototype. */
-const WRITERS: ReadonlySet<string> = new Set(["Object.assign", "Object.defineProperty", "Object.defineProperties", "Object.setPrototypeOf", "Reflect.set", "Reflect.defineProperty", "Reflect.setPrototypeOf"]);
+    return kinds.every((k) => k !== undefined) ? kinds[0] : undefined;
+  };
+
+  return scanTextRules(text, { hidden, encoded: true });
+}
 
 /** One program, read once. Findings go to `hits`; module paths and loads apm cannot follow go to `paths` and `dynamic`. */
 class Reader {
@@ -1402,39 +1142,13 @@ class Reader {
   private hexCount = 0;
   private hexFirst = -1;
   private resolving = 0;
-  private readonly ix: Index;
-  private readonly directEval: boolean;
-  private readonly proofCache = new Map<AnyNode, Proof | null>();
-  /** Set when a proof resting on a global or builtin module decided a match, so the floor is read again without such proofs. */
-  private sinkUsed = false;
-  /** Why this program could change what a global or builtin module is, and where (see `checkPatches`); null when it cannot. */
-  patched: { why: string; at: number } | null = null;
-  /** What the floor of code this program evaluates found that only sink proofs kept out. */
-  readonly sinkOnlyHits: Hit[] = [];
 
   constructor(
     private readonly program: Program,
     private readonly depth: number,
     private readonly budget: Budget,
-    /** Whether the program's top level is its own (an ES module), not shared with every other script. */
-    private readonly moduleScoped: boolean,
   ) {
     this.scopes = buildScopes(program);
-    this.ix = indexProgram(program, moduleScoped);
-
-    for (const a of this.ix.atoms) {
-      if (a.node.type !== "Identifier" || this.positionOf(a.node) !== "reference") continue;
-      const b = this.bindingOf(a.node);
-
-      if (b !== null && b !== "dynamic") b.refs.push(a.node);
-    }
-
-    // a direct eval, `eval(…)` with the global eval as the callee, runs in the caller's scope and can read or assign any name there
-    this.directEval = this.ix.calls.some((c) => {
-      const callee = c.callee.type === "Super" ? null : unwrap(c.callee);
-
-      return c.type === "CallExpression" && callee?.type === "Identifier" && callee.name === "eval" && !(this.bindingOf(callee) instanceof Object);
-    });
   }
 
   read(): void {
@@ -2299,7 +2013,7 @@ class Reader {
   private decodedText(s: Str, at: number, role: Role): void {
     const found: { id: Capability; confirmed: boolean }[] = [];
 
-    for (const h of ruleHits(s.value, "decoded", new Set(), RAW)) if (h.id !== "obfuscated") found.push({ id: h.id, confirmed: h.confidence === "confirmed" });
+    for (const h of ruleHits(s.value, "decoded", new Set())) if (h.id !== "obfuscated") found.push({ id: h.id, confirmed: h.confidence === "confirmed" });
     const named = namedSignal(s.value);
 
     if (named) found.push({ id: named, confirmed: true });
@@ -2328,10 +2042,6 @@ class Reader {
     const how = ranHow(s.how);
 
     for (const h of inner.hits) this.hits.push({ ...h, at, how });
-
-    for (const h of inner.sinkOnly) this.sinkOnlyHits.push({ ...h, at, how });
-
-    if (inner.patched) this.patch(inner.patched, at);
 
     for (const p of inner.paths) {
       this.paths.add(p);
@@ -2606,7 +2316,6 @@ class Reader {
   private load(arg: AnyNode | undefined, at: number): void {
     if (!arg || arg.type === "SpreadElement") {
       this.dynamic.push(at);
-      this.patch(PATCH.dynamic, at);
 
       return;
     }
@@ -2637,16 +2346,14 @@ class Reader {
     }
 
     this.dynamic.push(at);
-    this.patch(PATCH.dynamic, at);
   }
 
   private loadAt(s: Str, at: number): void {
     const id = moduleSignal(s.value);
 
-    // code loaded from a URL is code apm never reads
-    if (/^(?:https?|data):/.test(s.value)) this.patch(PATCH.url, at);
-
     if (id) this.add(id, at, STRENGTH.load, s.how, "confirmed", "");
+    // a debugger session can run code (`Runtime.evaluate`); profilers and debuggers load it to read, not to run
+    else if (INSPECTOR.test(s.value)) this.add("eval", at, STRENGTH.load, s.how, "possible", "loads inspector, whose sessions can run code, but apm did not see one asked to");
 
     if (s.how !== "as written" && (id || namedSignal(s.value))) this.add("obfuscated", at, STRENGTH.load, s.how, "confirmed", "");
 
@@ -2696,9 +2403,6 @@ class Reader {
 
   private sinkArg(arg: AnyNode, role: Role): void {
     const s = arg.type === "SpreadElement" ? null : this.str(arg);
-
-    // code apm cannot read in full could replace any global
-    if (role === "code" && !s?.exact) this.patch(PATCH.code, arg.start);
 
     if (s && !s.numeric && (role === "code" || role === "shell" || role === "read" || role === "request")) {
       this.stringAt(s, arg, role, arg.type === "Literal" ? (arg.raw ?? null) : null);
@@ -2788,6 +2492,17 @@ class Reader {
     } else if (name === "module._compile" || name.endsWith("Module.prototype._compile") || (r.kind === "unknown" && last === "_compile" && r.owner === "module")) {
       this.add("eval", at, STRENGTH.call, "as written", "confirmed", "");
       roles = ["code"];
+    } else if (isMethod && last === "post" && firstStr?.exact && INSPECTOR_EVAL.test(firstStr.value)) {
+      // an inspector session asked to evaluate, compile or call code runs what it is handed
+      this.add("eval", at, STRENGTH.call, "as written", "confirmed", "");
+    } else if (isNew && isWorker(r)) {
+      // `new Worker(code, { eval: true })` runs its first argument as JavaScript in a new thread
+      const evals = workerEvals(call.slots[1] ?? null);
+
+      if (evals === "yes" || (evals === "unknown" && r.kind === "module")) {
+        this.add("eval", at, STRENGTH.call, "as written", evals === "yes" ? "confirmed" : "possible", "starts a Worker with options apm cannot read; with eval: true it runs its first argument as code");
+        roles = ["code"];
+      }
     } else if ((r.kind === "module" && r.spec === "child_process" && SHELL_CP.has(r.path)) || (r.kind === "global" && SHELL_GLOBALS.has(name)) || (!isLocal && r.kind !== "module" && SHELL_NAMES.has(last))) {
       this.add("shell-exec", at, STRENGTH.call, "as written", "confirmed", "");
       rest = "shell";
@@ -2815,7 +2530,6 @@ class Reader {
       effect = false;
     } else if (r.kind === "unknown" && last === "eval" && isMethod) {
       this.add("eval", at, STRENGTH.call, "as written", "possible", "calls a method named eval on an object apm cannot identify");
-      this.patch(PATCH.code, at);
     } else if (r.kind === "global" && name === "JSON.stringify" && first && nameOf(this.resolve(first)) === "process.env") {
       this.add("credential-access", at, STRENGTH.call, "as written", "confirmed", "");
     } else if (r.kind === "global" && /^Object\.(?:keys|entries|values)$/.test(name) && first && nameOf(this.resolve(first)) === "process.env") {
@@ -2827,9 +2541,6 @@ class Reader {
       rest = "inherit";
       effect = false;
     } else effect = false;
-
-    // `x.constructor(…)` may be Function, whatever apm took x for
-    if (last === "constructor" && n.arguments.length > 0) this.patch(PATCH.constructor, at);
 
     // a callee named by joining pieces (`cp['ex' + 'ec'](...)`, `g['fe' + 'tch'](...)`) and then called
     if (r.kind !== "local" && r.built) {
@@ -2992,775 +2703,6 @@ class Reader {
     return { refs: inner, isNew, slots: list.slots, others: [...others, ...list.others, ...rest.slice(1)] };
   }
 
-  // ----- the floor -----
-
-  /**
-   * The text rules over this program's code, with comments and regex literals blanked, as findings: `stands` is
-   * every match outside erased TypeScript. With PRECISION_PROOFS off nothing else is judged harmless, so `sinkOnly`
-   * stays empty; with it on, `stands` keeps what every proof left and `sinkOnly` what only proofs resting on a global
-   * or builtin module removed. An evaluator finding that stands is a patch in itself (code apm did not read can
-   * replace any global).
-   */
-  floor(text: string, comments: readonly Range[]): Floor {
-    const masked = blanked(text, [...comments, ...this.ix.regexes]);
-    const read = (allowSink: boolean): TextFinding[] => scanTextRules(masked, "unparsed", { shown: text, encoded: true, region: (start, end, id, kind) => this.judge(start, end ?? start + 1, id, kind, allowSink) });
-    const stands = read(true);
-    const strict = this.sinkUsed ? read(false) : stands;
-    const sure = new Set(stands.filter((f) => f.confidence === "confirmed").map((f) => f.id));
-
-    const evals = stands.find((f) => f.id === "eval");
-
-    if (evals) this.patch(PATCH.floorEval, lineStart(text, evals.line));
-
-    return { stands, sinkOnly: strict.filter((f) => f.confidence === "confirmed" && !sure.has(f.id)) };
-  }
-
-  /**
-   * What a text-rule match over `[start, end)` means: `excluded` when all of it sits inside one piece of type-only
-   * syntax, which TypeScript erases; otherwise it stands as apm-score-v3 counted it (`unparsed`).
-   */
-  private judge(start: number, end: number, id: CodeSignal | undefined, kind: Kind | "decoded" | undefined, allowSink: boolean): Region {
-    if (withinOne(this.ix.types, start, Math.max(end, start + 1))) return "excluded";
-
-    if (!PRECISION_PROOFS) return "unparsed";
-    const group = this.anchor(start, Math.max(end, start + 1));
-
-    if (group.length === 0) return "unparsed";
-
-    // shell text is text: in code (`a || sh`, `curl - x`) the parser says it is not a string, so nothing runs it
-    if (kind === "text" && !group.every((a) => isStringAtom(a.node))) return "excluded";
-    const bit = id ? SIGNAL_BIT[id] : ALL_SIGNALS;
-
-    let sink = false;
-
-    for (const a of group) {
-      const p = this.proofOf(a.node);
-
-      if (!p || (p.sink && !allowSink) || (p.mask & bit) !== bit) return "unparsed";
-      sink ||= p.sink;
-    }
-
-    if (sink) this.sinkUsed = true;
-
-    return "excluded";
-  }
-
-  /** The last leaf the span `[start, end)` touches, with any other leaf over the same range (a shorthand property's key and value). */
-  private anchor(start: number, end: number): Atom[] {
-    const atoms = this.ix.atoms;
-    let lo = 0;
-    let hi = atoms.length - 1;
-    let found = -1;
-
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-
-      if ((atoms[mid]?.start ?? Number.POSITIVE_INFINITY) < end) {
-        found = mid;
-        lo = mid + 1;
-      } else hi = mid - 1;
-    }
-
-    const last = atoms[found];
-
-    if (!last || last.end <= start) return [];
-    const out = [last];
-
-    for (let i = found - 1; i >= 0; i--) {
-      const a = atoms[i];
-
-      if (!a || a.start !== last.start || a.end !== last.end) break;
-      out.push(a);
-    }
-
-    return out;
-  }
-
-  private parentOf(n: AnyNode): AnyNode | undefined {
-    return this.ix.parentOf.get(n);
-  }
-
-  /** The node above `n` past casts, chains and parentheses, and the child of it that holds `n`. */
-  private contextOf(n: AnyNode): Context {
-    let cur = n;
-    let p = this.parentOf(cur);
-
-    while (p && isPassThrough(p)) {
-      cur = p;
-      p = this.parentOf(p);
-    }
-
-    return { node: cur, parent: p };
-  }
-
-  /** How an identifier is used: declared, a property name, a member of something, a write target, or read. */
-  private positionOf(id: Identifier): "definition" | "member" | "write" | "reference" {
-    const p = this.parentOf(id);
-
-    if (!p) return "reference";
-
-    switch (p.type) {
-      case "VariableDeclarator":
-        return p.id === id ? "definition" : "reference";
-      case "FunctionDeclaration":
-      case "FunctionExpression":
-      case "ArrowFunctionExpression":
-        return p.body === id ? "reference" : "definition";
-      case "ClassDeclaration":
-      case "ClassExpression":
-        return p.id === id ? "definition" : "reference";
-      case "Property": {
-        const owner = this.parentOf(p);
-
-        if (owner?.type === "ObjectPattern") return p.key === id && p.value !== id && !p.computed ? "definition" : "write";
-
-        return p.key === id && !p.computed && p.value !== id ? "definition" : "reference";
-      }
-
-      case "MethodDefinition":
-      case "PropertyDefinition":
-        return p.key === id && !p.computed ? "definition" : "reference";
-      case "MemberExpression":
-        return p.property === id && !p.computed ? "member" : "reference";
-      case "AssignmentPattern":
-        return p.left === id ? "write" : "reference";
-      case "ArrayPattern":
-      case "RestElement":
-        return "write";
-      case "AssignmentExpression":
-        return p.left === id ? "write" : "reference";
-      case "ForInStatement":
-      case "ForOfStatement":
-        return p.left === id ? "write" : "reference";
-      case "CatchClause":
-      case "ImportSpecifier":
-      case "ImportDefaultSpecifier":
-      case "ImportNamespaceSpecifier":
-      case "LabeledStatement":
-      case "BreakStatement":
-      case "ContinueStatement":
-      case "MetaProperty":
-      case "TSModuleDeclaration":
-      case "TSEnumDeclaration":
-      case "TSParameterProperty":
-        return "definition";
-      case "ExportSpecifier":
-        return p.local === id ? "reference" : "definition";
-      default:
-        return "reference";
-    }
-  }
-
-  /** Whether `n` sits inside a function (or class code), not at its program's top level. */
-  private inFunction(n: AnyNode): boolean {
-    for (let p = this.parentOf(n); p; p = this.parentOf(p)) if (p.type === "FunctionDeclaration" || p.type === "FunctionExpression" || p.type === "ArrowFunctionExpression" || p.type === "StaticBlock" || p.type === "PropertyDefinition") return true;
-
-    return false;
-  }
-
-  /** What makes a leaf harmless, if anything does. */
-  private proofOf(n: AnyNode): Proof | null {
-    const cached = this.proofCache.get(n);
-
-    if (cached !== undefined) return cached;
-    this.proofCache.set(n, null);
-    const p = this.proofOfNode(n);
-    this.proofCache.set(n, p);
-
-    return p;
-  }
-
-  private proofOfNode(n: AnyNode): Proof | null {
-    switch (n.type) {
-      case "Identifier":
-        return this.nameProof(n);
-      case "PrivateIdentifier": {
-        // `#fetch() {}` and `#fetch = …` name a member; `this.#fetch(…)` uses one, which may hold anything
-        const p = this.parentOf(n);
-
-        return p && (p.type === "MethodDefinition" || p.type === "PropertyDefinition") && p.key === n ? HARMLESS : null;
-      }
-
-      case "Literal":
-        return this.valueProof(n, 0);
-      case "TemplateElement": {
-        const t = this.parentOf(n);
-
-        return t ? this.valueProof(t, 0) : null;
-      }
-
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * A name is harmless where it is declared or names a property, and where it reads a binding in scope that never
-   * holds anything but a value this file makes (`const fetch = () => 1`, `function eval() {}`): then it is not the
-   * global it is spelled like. A call to `fetch` with a constant `data:` URL reads inline data, whatever `fetch` is.
-   */
-  private nameProof(id: Identifier): Proof | null {
-    const position = this.positionOf(id);
-
-    if (position === "definition" || position === "write") return HARMLESS;
-    const data = this.dataFetch(id) ?? this.typeBinding(id);
-
-    if (position === "member") return data;
-
-    return this.shadowProof(id) ?? data;
-  }
-
-  /**
-   * `process.binding('util')`, `internalBinding('types')`: the real binding function (a global apm can name) asked for
-   * a binding that only reads type helpers and constants. A binding name apm cannot read could be any of them.
-   */
-  private typeBinding(id: Identifier): Proof | null {
-    if (id.name !== "binding" && id.name !== "_linkedBinding" && id.name !== "internalBinding") return null;
-    const p = this.parentOf(id);
-    const callee = p?.type === "MemberExpression" && p.property === id ? p : id;
-    const { node, parent } = this.contextOf(callee);
-
-    if (parent?.type !== "CallExpression" || parent.callee !== node) return null;
-    const refs = this.positiveRefs(callee, 0);
-    const first = parent.arguments[0];
-    const name = first && first.type !== "SpreadElement" ? this.str(first) : null;
-
-    if (!refs || !refs.every((r) => r.kind === "global" && (r.path === "process.binding" || r.path === "process._linkedBinding" || r.path === "internalBinding"))) return null;
-
-    return name?.exact && HARMLESS_BINDINGS.test(name.value) ? { mask: SIGNAL_BIT["shell-exec"], sink: true } : null;
-  }
-
-  /** `fetch('data:…')`, `x.fetch('data:' + y)`: a fetch of inline data, which never reaches the network. */
-  private dataFetch(id: Identifier): Proof | null {
-    if (id.name !== "fetch") return null;
-    const p = this.parentOf(id);
-    const callee = p?.type === "MemberExpression" && p.property === id ? p : id;
-    const { node, parent } = this.contextOf(callee);
-
-    if (parent?.type !== "CallExpression" || parent.callee !== node) return null;
-    const first = parent.arguments[0];
-    const s = first && first.type !== "SpreadElement" ? this.str(first) : null;
-
-    return s && s.value.trimStart().startsWith("data:") ? { mask: SIGNAL_BIT.network, sink: false } : null;
-  }
-
-  /**
-   * A binding that never changes: declared once, never assigned, and out of reach of anything that could assign it
-   * unseen (a `const` or import; otherwise not at the top level of a script, which other scripts share, and not in a
-   * program with a direct `eval`, which can assign any name in scope).
-   */
-  private stable(b: Binding): boolean {
-    if (b.count !== 1 || b.assigned) return false;
-
-    if (b.constant) return true;
-
-    return !this.directEval && (b.scope !== this.scopes.root || this.moduleScoped);
-  }
-
-  private shadowProof(id: Identifier): Proof | null {
-    const b = this.bindingOf(id);
-
-    if (b === null || b === "dynamic" || !this.stable(b)) return null;
-
-    if (b.origin.kind === "local") return HARMLESS;
-
-    if (b.origin.kind !== "value") return null;
-    const init = unwrap(b.origin.init);
-
-    switch (init.type) {
-      case "FunctionExpression":
-      case "ArrowFunctionExpression":
-      case "ClassExpression":
-      case "ObjectExpression":
-      case "ArrayExpression":
-      case "Literal":
-      case "TemplateLiteral":
-        return HARMLESS;
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * Whether a value (a string, or what holds one) only ever reaches places that do not run it: a comparison, a
-   * test, a discarded expression, a property key, a binding nothing reads, or a sink apm can name that sends, reads
-   * as a path or ignores it. Anything else, or more than 32 steps, proves nothing.
-   */
-  private valueProof(e: AnyNode, depth: number): Proof | null {
-    if (depth > 32) {
-      this.budget.notes.add(LIMIT_NOTES.flow);
-
-      return null;
-    }
-
-    const { node: cur, parent: p } = this.contextOf(e);
-
-    if (!p) return null;
-
-    switch (p.type) {
-      // a statement's value is dropped inside a function; at a program's top level it can be the program's
-      // completion value, which is what eval or vm returns when it runs that program
-      case "ExpressionStatement":
-        return this.inFunction(p) ? HARMLESS : null;
-      case "UnaryExpression":
-        return HARMLESS;
-      case "SequenceExpression":
-        return p.expressions.at(-1) === cur ? this.valueProof(p, depth + 1) : HARMLESS;
-      case "BinaryExpression":
-        return p.operator === "+" ? this.valueProof(p, depth + 1) : HARMLESS;
-      case "LogicalExpression":
-      case "AwaitExpression":
-        return this.valueProof(p, depth + 1);
-      case "ConditionalExpression":
-        return p.test === cur ? HARMLESS : this.valueProof(p, depth + 1);
-      case "IfStatement":
-      case "WhileStatement":
-      case "DoWhileStatement":
-        return p.test === cur ? HARMLESS : null;
-      case "ForStatement":
-        return p.body === cur ? null : HARMLESS;
-      case "SwitchStatement":
-        return p.discriminant === cur ? HARMLESS : null;
-      case "SwitchCase":
-        return p.test === cur ? HARMLESS : null;
-      case "TemplateLiteral": {
-        const tagged = this.parentOf(p);
-
-        return tagged?.type === "TaggedTemplateExpression" ? this.tagProof(tagged, depth) : this.valueProof(p, depth + 1);
-      }
-
-      case "TaggedTemplateExpression":
-        return p.quasi === cur ? this.tagProof(p, depth) : null;
-
-      case "Property": {
-        // a quoted key is a string like any other once something lists the object's keys, so it goes where the object goes
-        const owner = this.parentOf(p);
-
-        if (owner?.type !== "ObjectExpression") return null;
-
-        return (p.key === cur && !p.computed) || (p.value === cur && p.kind === "init" && !p.method) ? this.valueProof(owner, depth + 1) : null;
-      }
-
-      case "VariableDeclarator": {
-        if (p.init !== cur || p.id.type !== "Identifier") return null;
-        const decl = this.parentOf(p);
-
-        return decl && this.parentOf(decl)?.type === "ExportNamedDeclaration" ? null : this.bindingProof(p.id, depth + 1);
-      }
-
-      case "AssignmentExpression":
-        return p.right === cur && p.operator === "=" && p.left.type === "Identifier" ? both(this.bindingProof(p.left, depth + 1), this.valueProof(p, depth + 1)) : null;
-      case "CallExpression":
-      case "NewExpression":
-        if (p.callee === cur) return null;
-
-        // calling a Promise or a generator object throws before anything is done with the arguments
-        return this.notCallable(p) ? HARMLESS : this.argProof(p, cur, depth);
-      case "ArrayExpression": {
-        // an argument list written in place (`f.apply(that, [a, b])`) is read by position; otherwise an element goes where the array goes
-        const call = this.parentOf(p);
-        const listed = call && (call.type === "CallExpression" || call.type === "NewExpression") && call.arguments.includes(p) ? this.argProof(call, cur, depth) : null;
-
-        return listed ?? this.valueProof(p, depth + 1);
-      }
-
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * A binding whose every read leads somewhere harmless (or that nothing reads). Not one at the top level of a script,
-   * which another script can read, one an ES module exports, or one in a program a direct `eval` or `with` can reach.
-   */
-  private bindingProof(id: Identifier, depth: number): Proof | null {
-    const b = this.bindingOf(id);
-
-    if (b === null || b === "dynamic" || this.directEval || this.ix.withs) return null;
-
-    if (b.scope === this.scopes.root && (!this.moduleScoped || this.ix.exported.has(b.name))) return null;
-    let proof: Proof | null = HARMLESS;
-
-    for (const r of b.refs) {
-      proof = both(proof, this.valueProof(r, depth + 1));
-
-      if (!proof) return null;
-    }
-
-    return proof;
-  }
-
-  /**
-   * A template handed to a tag apm can name: `eval` given anything but a string returns it unrun (a tag gets an array
-   * of the template's strings), and `String.raw` builds a string. Either way the text goes where the tag's value goes.
-   */
-  private tagProof(tagged: TaggedTemplateExpression, depth: number): Proof | null {
-    const tag = this.positiveRefs(tagged.tag, 0);
-
-    if (!tag || !tag.every((r) => r.kind === "global" && (r.path === "eval" || r.path === "String.raw"))) return null;
-
-    return both({ mask: ALL_SIGNALS, sink: true }, this.valueProof(tagged, depth + 1));
-  }
-
-  /**
-   * Whether a call's callee is, for certain, a value that cannot be called: what calling an async function or a
-   * generator function this file defines (a stable binding) gives, a Promise or a generator object.
-   */
-  private notCallable(call: CallExpression | NewExpression): boolean {
-    if (call.type !== "CallExpression" || call.callee.type === "Super") return false;
-    const inner = unwrap(call.callee);
-
-    if (inner.type !== "CallExpression" || inner.callee.type === "Super") return false;
-    const fn = unwrap(inner.callee);
-
-    if (fn.type !== "Identifier") return false;
-    const b = this.bindingOf(fn);
-
-    if (b === null || b === "dynamic" || !this.stable(b)) return false;
-    const node = b.origin.kind === "local" ? b.origin.node : b.origin.kind === "value" ? unwrap(b.origin.init) : null;
-
-    return node !== null && (isAsyncFunction(node) || isGenerator(node));
-  }
-
-  /** What a call apm can name does with the argument `arg`: see `sinkEffect`. */
-  private argProof(call: CallExpression | NewExpression, arg: AnyNode, depth: number): Proof | null {
-    const site = this.sinkSite(call);
-
-    if (!site) return null;
-    const i = site.args.indexOf(arg);
-
-    if (i < 0) return null;
-    let proof: Proof | null = { mask: ALL_SIGNALS, sink: true };
-
-    for (const r of site.refs) {
-      const effect = sinkEffect(r, i, call.type === "NewExpression");
-
-      if (effect === null) return null;
-
-      if (effect === "read") proof = both(proof, { mask: ALL_SIGNALS & ~SIGNAL_BIT["credential-access"], sink: true });
-      else if (effect === "transparent") proof = both(proof, this.valueProof(call, depth + 1));
-
-      if (!proof) return null;
-    }
-
-    return proof;
-  }
-
-  /** The callee of a call when apm can name it for certain, with the arguments in their positions (`f.apply(that, [a])` too). */
-  private sinkSite(call: CallExpression | NewExpression): { refs: Ref[]; args: (AnyNode | null)[] } | null {
-    if (call.callee.type === "Super") return null;
-    const callee = unwrap(call.callee);
-
-    // positions are known up to the first spread
-    const upTo = (list: readonly (AnyNode | null)[]): (AnyNode | null)[] => {
-      const spread = list.findIndex((a) => a?.type === "SpreadElement");
-
-      return spread < 0 ? [...list] : list.slice(0, spread);
-    };
-
-    if (call.type === "CallExpression" && callee.type === "MemberExpression" && callee.object.type !== "Super") {
-      const key = this.memberKey(callee);
-
-      if (key?.name === "call" || key?.name === "apply") {
-        const fn = this.positiveRefs(callee.object, 0);
-
-        // only eval's own `.call` and `.apply` are followed; any other sink is named directly
-        if (!fn || !fn.every((r) => r.kind === "global" && r.path === "eval")) return null;
-
-        if (key.name === "call") return { refs: fn, args: upTo(call.arguments.slice(1)) };
-        const list = call.arguments[1];
-
-        return list?.type === "ArrayExpression" ? { refs: fn, args: upTo(list.elements) } : null;
-      }
-    }
-
-    const refs = this.positiveRefs(call.callee, 0);
-
-    if (!refs || !refs.every((r) => r.kind === "global" || r.kind === "module")) return null;
-
-    return { refs, args: upTo(call.arguments) };
-  }
-
-  /**
-   * What `n` is when apm can say for certain, with no guessing: a global no scope anywhere in the program declares
-   * or assigns, a module loaded by a literal specifier, a stable binding of one of those, or a member of one by a
-   * known name. Null for anything else, local values included: their members can be written through aliases.
-   */
-  private positiveRefs(n: AnyNode, depth: number): Ref[] | null {
-    if (depth > 8) return null;
-    const t = unwrap(n);
-
-    switch (t.type) {
-      case "Identifier": {
-        const b = this.bindingOf(t);
-
-        if (b === "dynamic") return null;
-
-        if (b === null) {
-          if (this.scopes.declared.has(t.name) || this.scopes.assignedFree.has(t.name)) return null;
-
-          return [{ kind: "global", path: GLOBAL_OBJECTS.has(t.name) ? "" : t.name, built: false }];
-        }
-
-        if (!this.stable(b) || b.writes.length > 0) return null;
-
-        if (b.origin.kind === "module") return [{ kind: "module", spec: b.origin.spec, path: b.origin.path, built: false }];
-
-        return b.origin.kind === "value" ? this.positiveRefs(b.origin.init, depth + 1) : null;
-      }
-
-      case "MemberExpression": {
-        if (t.object.type === "Super") return null;
-        const key = this.memberKey(t);
-        const base = key ? this.positiveRefs(t.object, depth + 1) : null;
-
-        if (!key || !base || !base.every((r) => r.kind === "global" || r.kind === "module")) return null;
-
-        return base.map((r) => member(r, key.name, key.built));
-      }
-
-      case "CallExpression": {
-        const callee = t.callee.type === "Super" ? null : this.positiveRefs(t.callee, depth + 1);
-        const arg = t.arguments[0];
-        const s = arg && arg.type !== "SpreadElement" ? this.str(arg) : null;
-
-        if (!callee || !s?.exact || t.arguments.length !== 1 || !callee.every((r) => isRequire(r))) return null;
-
-        return [{ kind: "module", ...moduleOf(s.value, ""), built: false }];
-      }
-
-      default:
-        return null;
-    }
-  }
-
-  // ----- what could change a global -----
-
-  /**
-   * Whether this program could change what a global or builtin module is, which would void every proof resting on one
-   * (see `Proof`): a `with`; assigning a global that matters, or declaring one where it becomes the global; writing a
-   * member of the global object (by a name that matters, or one apm cannot work out) or of a watched builtin
-   * (`Error.prepareStackTrace`, `fs.readFileSync`); reading the global object by a name apm cannot work out; handing
-   * the global object, a watched builtin, `eval` or `Function` to anything but a plain member read, a call or a
-   * check; a tag apm cannot name; or code run from a string apm did not read in full (set while reading).
-   */
-  checkPatches(): void {
-    if (this.ix.withs) this.patch(PATCH.with, 0);
-
-    for (const name of this.scopes.assignedFree) if (SINK_ROOTS.has(name) || GLOBAL_NAMES.has(name)) this.patch(`${PATCH.assigns} (${name})`, 0);
-
-    // a script's top-level declarations are the global's own properties, and so is every declaration of code run from a string
-    const declared = this.depth > 0 ? [...this.scopes.declared] : this.moduleScoped ? [] : [...this.scopes.root.names.keys()];
-    const shadowed = declared.find((name) => SINK_ROOTS.has(name) || GLOBAL_NAMES.has(name));
-
-    if (shadowed) this.patch(`${PATCH.declares} (${shadowed})`, 0);
-
-    for (const t of this.ix.tags) {
-      const tag = this.resolveAll(t.tag);
-
-      if (!tag.every((r) => r.kind === "global" && (r.path === "String.raw" || r.path === "eval" || SHELL_GLOBALS.has(r.path)))) this.patch(PATCH.tag, t.start);
-    }
-
-    if (this.patched) return;
-
-    for (const m of this.ix.members) {
-      // a write apm cannot place: by a name apm cannot work out, or by one a builtin consults, on an object it did not make
-      if (!this.isWriteTarget(m)) {
-        const key = this.memberKey(m);
-        const { node: cur, parent: q } = this.contextOf(m);
-
-        // `x.__defineGetter__(k, f)`: a getter by name
-        if (key && /^__define[GS]etter__$/.test(key.name) && q?.type === "CallExpression" && q.callee === cur && !this.localTarget(m.object) && !this.knownSafeKey(q.arguments[0])) return this.patch(PATCH.writes, m.start);
-        continue;
-      }
-
-      const key = this.memberKey(m);
-
-      if (!this.localTarget(m.object) && (!key || PROTO_KEYS.has(key.name))) return this.patch(PATCH.writes, m.start);
-    }
-
-    for (const c of this.ix.calls) {
-      if (c.type !== "CallExpression" || c.callee.type === "Super") continue;
-      const writer = this.resolveAll(c.callee).find((r) => r.kind === "global" && WRITERS.has(r.path));
-      const [target, second] = c.arguments;
-
-      if (!writer || writer.kind !== "global" || !target || target.type === "SpreadElement" || this.localTarget(target)) continue;
-      const path = writer.path;
-      const byKey = path === "Object.defineProperty" || path === "Reflect.defineProperty" || path === "Reflect.set";
-      const byLiteral = path === "Object.assign" || path === "Object.defineProperties";
-
-      if (byKey && this.knownSafeKey(second)) continue;
-
-      if (byLiteral && second && second.type === "ObjectExpression" && second.properties.every((pr) => pr.type === "Property" && !pr.computed && !PROTO_KEYS.has(propertyName(pr.key, false) ?? "__proto__"))) continue;
-
-      return this.patch(PATCH.writes, c.start);
-    }
-
-    for (const t of this.ix.thisNodes) if (this.thisMayBeGlobal(t) && this.escapes(t, [{ kind: "global", path: "", built: false }])) return this.patch(PATCH.escapes, t.start);
-
-    for (const a of this.ix.atoms) {
-      if (a.node.type !== "Identifier" || this.positionOf(a.node) !== "reference") continue;
-      const b = this.bindingOf(a.node);
-
-      // a free name is the global it names; a binding is checked only when it may hold one (an alias)
-      const refs = b === null ? this.positiveRefs(a.node, 0) : b === "dynamic" ? null : b.origin.kind === "opaque" ? null : this.resolveAll(a.node);
-
-      if (refs && this.escapes(a.node, refs)) return this.patch(PATCH.escapes, a.start);
-    }
-
-    for (const m of [...this.ix.members, ...this.ix.calls]) if (this.escapes(m, this.resolveAll(m))) return this.patch(PATCH.escapes, m.start);
-  }
-
-  /** A key, as an argument, apm can work out and that no builtin a sink proof relies on looks up. */
-  private knownSafeKey(arg: AnyNode | undefined): boolean {
-    const s = arg && arg.type !== "SpreadElement" ? this.str(arg) : null;
-
-    return s !== null && s.exact && !PROTO_KEYS.has(s.value);
-  }
-
-  /**
-   * An object this file makes, for certain: a stable binding of a fresh object, array, function or class (or its
-   * `prototype`), `this` in a class's code, or CommonJS's own `exports`. Writing its members cannot reach a builtin.
-   */
-  private localTarget(n: AnyNode): boolean {
-    const t = unwrap(n);
-
-    if (t.type === "ThisExpression") {
-      for (let p = this.parentOf(t); p; p = this.parentOf(p)) {
-        if (p.type === "FunctionDeclaration" || p.type === "FunctionExpression") return this.parentOf(p)?.type === "MethodDefinition";
-
-        if (p.type === "PropertyDefinition" || p.type === "StaticBlock") return true;
-      }
-
-      return false;
-    }
-
-    if (t.type === "MemberExpression" && !t.computed && t.property.type === "Identifier" && t.property.name === "prototype") return this.localTarget(t.object);
-
-    if (t.type === "ObjectExpression" || t.type === "ArrayExpression" || isFunctionNode(t)) return true;
-
-    if (t.type !== "Identifier") return false;
-    const b = this.bindingOf(t);
-
-    if (b === null) return t.name === "exports" && !this.scopes.assignedFree.has("exports") && !this.scopes.declared.has("exports");
-
-    if (b === "dynamic" || !this.stable(b)) return false;
-
-    if (b.origin.kind === "local") return true;
-
-    if (b.origin.kind !== "value") return false;
-    const init = unwrap(b.origin.init);
-
-    return init.type === "ObjectExpression" || init.type === "ArrayExpression" || isFunctionNode(init);
-  }
-
-  /** Records the first reason this program could replace a global or builtin module. */
-  private patch(why: string, at: number): void {
-    this.patched ??= { why, at };
-  }
-
-  /** Whether `this` here can be the global object: at a script's top level, in code run from a string, or in a sloppy-mode function. */
-  private thisMayBeGlobal(t: AnyNode): boolean {
-    for (let p = this.parentOf(t); p; p = this.parentOf(p)) {
-      if (p.type === "FunctionDeclaration" || p.type === "FunctionExpression") return this.ix.sloppy.has(p);
-
-      if (p.type === "ClassBody" || p.type === "PropertyDefinition" || p.type === "StaticBlock") return false;
-    }
-
-    return this.depth > 0 || !this.moduleScoped;
-  }
-
-  /** Whether `n`, which is one of `refs`, is a watched object used in a way that could change it. */
-  private escapes(n: AnyNode, refs: readonly Ref[]): boolean {
-    const watched = refs.filter(isWatched);
-
-    if (watched.length === 0) return false;
-    const evaluator = watched.some((r) => r.kind === "global" && (r.path === "eval" || r.path === "Function"));
-    const globalObject = watched.some((r) => r.kind === "global" && r.path === "");
-    const { node: cur, parent: p } = this.contextOf(n);
-
-    if (!p) return false;
-
-    switch (p.type) {
-      case "MemberExpression": {
-        if (p.object !== cur) return true;
-        const key = this.memberKey(p);
-
-        // a member read by a name apm cannot work out may be any of them
-        if (!key) return true;
-
-        if (this.isWriteTarget(p)) return !globalObject || watched.length > 1 || SINK_ROOTS.has(key.name) || GLOBAL_NAMES.has(key.name);
-        const { node: m, parent: q } = this.contextOf(p);
-
-        return /^__(?:define|lookup)[GS]etter__$/.test(key.name) && q?.type === "CallExpression" && q.callee === m;
-      }
-
-      case "CallExpression":
-      case "NewExpression":
-        return p.callee !== cur;
-      case "UnaryExpression":
-      case "BinaryExpression":
-      case "ExpressionStatement":
-        return false;
-      case "ConditionalExpression":
-        return p.test !== cur;
-      case "IfStatement":
-      case "WhileStatement":
-      case "DoWhileStatement":
-      case "SwitchCase":
-        return p.test !== cur;
-      case "SwitchStatement":
-        return p.discriminant !== cur;
-      case "TemplateLiteral":
-        return this.parentOf(p)?.type === "TaggedTemplateExpression";
-      case "VariableDeclarator": {
-        if (p.init !== cur || p.id.type !== "Identifier") return true;
-        const b = this.bindingOf(p.id);
-
-        // an alias is followed: its own reads are checked the same way
-        return b === null || b === "dynamic" || !this.stable(b);
-      }
-
-      case "ClassDeclaration":
-      case "ClassExpression":
-        return p.superClass !== cur || evaluator;
-      case "TaggedTemplateExpression":
-        // eval as a tag is handed an array, which it returns unrun; Function as a tag builds a function from it
-        return p.tag !== cur || watched.some((r) => !(r.kind === "global" && r.path === "eval"));
-      case "SpreadElement":
-        return this.parentOf(p)?.type !== "ObjectExpression";
-      default:
-        return true;
-    }
-  }
-
-  /** Whether a member expression is written: assigned, updated, deleted, or a target in a pattern or a for-in/of. */
-  private isWriteTarget(m: AnyNode): boolean {
-    const { node: cur, parent: q } = this.contextOf(m);
-
-    if (!q) return false;
-
-    switch (q.type) {
-      case "AssignmentExpression":
-        return q.left === cur;
-      case "UpdateExpression":
-        return true;
-      case "UnaryExpression":
-        return q.operator === "delete";
-      case "ForInStatement":
-      case "ForOfStatement":
-        return q.left === cur;
-      case "AssignmentPattern":
-        return q.left === cur;
-      case "ArrayPattern":
-      case "RestElement":
-        return true;
-      case "Property":
-        return this.parentOf(q)?.type === "ObjectPattern" && q.value === cur;
-      default:
-        return false;
-    }
-  }
 }
 
 function literalStr(value: string): Str {
@@ -3838,6 +2780,43 @@ function isDnsCall(r: Ref): boolean {
   return r.kind === "unknown" && (r.owner === "dns" || r.owner === "promises") && DNS_CALL.test(r.name ?? "");
 }
 
+/** node's `worker_threads.Worker`, however it is reached, or a global `Worker` (Bun, Deno and browsers have one). */
+function isWorker(r: Ref): boolean {
+  if (r.kind === "module") return r.spec === "worker_threads" && r.path === "Worker";
+
+  return r.kind === "global" ? r.path === "Worker" : r.kind === "unknown" && lastName(r) === "Worker" && r.owner === "worker_threads";
+}
+
+/**
+ * Whether a Worker's options run its first argument as code: `yes` for `{ eval: true }`, `no` for no options or an
+ * object literal with no `eval` key or a literal false one, `unknown` for anything apm cannot read.
+ */
+function workerEvals(options: AnyNode | null): "yes" | "no" | "unknown" {
+  if (options === null) return "no";
+  const o = unwrap(options);
+
+  if (o.type !== "ObjectExpression") return "unknown";
+  let out: "yes" | "no" | "unknown" = "no";
+
+  for (const p of o.properties) {
+    if (p.type === "SpreadElement" || p.computed) {
+      out = "unknown";
+      continue;
+    }
+
+    const key = p.key.type === "Identifier" ? p.key.name : p.key.type === "Literal" ? String(p.key.value) : null;
+
+    if (key !== "eval") continue;
+    const v = unwrap(p.value);
+
+    if (v.type !== "Literal") return "unknown";
+
+    return v.value ? "yes" : "no";
+  }
+
+  return out;
+}
+
 // ---------- the result ----------
 
 /**
@@ -3849,13 +2828,12 @@ export type Imports = { paths: string[]; loads: string[]; dynamic: Where[] };
 
 /**
  * A parsed file's reading: its findings (the tree's and the floor's, the stronger of each signal), what it loads,
- * the limits it ran into (`notes`), what only proofs resting on a global or builtin module kept out (`sinkOnly`), and
- * whether the file could change such a global or module (`patches`).
+ * and the limits it ran into (`notes`).
  */
-export type JsScan = { kind: "parsed"; findings: TextFinding[]; imports: Imports; notes: string[]; sinkOnly: TextFinding[]; patches: string | null } | { kind: "failed"; reason: "syntax" | "too-large" };
+export type JsScan = { kind: "parsed"; findings: TextFinding[]; imports: Imports; notes: string[] } | { kind: "failed"; reason: "syntax" | "too-large" };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
-type Read = { hits: Hit[]; floor: TextFinding[]; sinkOnly: TextFinding[]; sinkOnlyHits: Hit[]; patched: { why: string; at: number } | null; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean };
+type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean };
 
 /** Reads every program `text` parses to, one at a time. Null when no parser accepted it or a tree was too large or too deep. */
 function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: "syntax" | "too-large" } {
@@ -3863,7 +2841,7 @@ function readText(text: string, dialect: Dialect, depth: number, budget: Budget)
   let deep = false;
 
   const outcome = parseEach(text, dialect, (p) => {
-    const r = readProgram(p, text, depth, budget);
+    const r = readProgram(p, depth, budget);
 
     if (!r) {
       deep = true;
@@ -3882,16 +2860,13 @@ function readText(text: string, dialect: Dialect, depth: number, budget: Budget)
   return deep ? { outcome: "too-large" } : { outcome, reads };
 }
 
-type Inner = { hits: Hit[]; sinkOnly: Hit[]; paths: string[]; dynamic: boolean; patched: string | null };
+type Inner = { hits: Hit[]; paths: string[]; dynamic: boolean };
 
 function floorHit(f: TextFinding): Hit {
   return hitOf(f.id, 0, STRENGTH.string, f.how, f.confidence, f.confidence === "possible" ? f.why : "");
 }
 
-/**
- * Code held in a string, read as code (the tree and its floor) when it parses, and raw (every match counts) when it
- * does not. Code apm did not read as a tree could change any global, so that counts as a patch.
- */
+/** Code held in a string, read as code (the tree and its floor) when it parses, and raw (every match counts) when it does not. */
 function innerHits(code: string, depth: number, budget: Budget): Inner {
   if (depth > MAX_EVAL_DEPTH) budget.notes.add(LIMIT_NOTES.evalDepth);
   else if (budget.decoded <= 0) budget.notes.add(LIMIT_NOTES.decoded);
@@ -3902,36 +2877,23 @@ function innerHits(code: string, depth: number, budget: Budget): Inner {
 
     if (r.outcome === "parsed") {
       return {
-        hits: r.reads.flatMap((x) => [...x.hits, ...x.floor.map(floorHit)]),
-        sinkOnly: r.reads.flatMap((x) => [...x.sinkOnlyHits, ...x.sinkOnly.map(floorHit)]),
+        hits: [...r.reads.flatMap((x) => x.hits), ...floorOf(code, r.reads.map((x) => x.leftOut)).map(floorHit)],
         paths: r.reads.flatMap((x) => x.loads),
         dynamic: r.reads.some((x) => x.dynamic.length > 0),
-        patched: r.reads.find((x) => x.patched)?.patched?.why ?? null,
       };
     }
   }
 
-  return { hits: ruleHits(code, "as written", new Set(), RAW).map((f) => hitOf(f.id, 0, STRENGTH.call, "as written", f.confidence, f.confidence === "possible" ? f.why : "")), sinkOnly: [], paths: [], dynamic: false, patched: PATCH.code };
+  return { hits: ruleHits(code, "as written", new Set()).map((f) => hitOf(f.id, 0, STRENGTH.call, "as written", f.confidence, f.confidence === "possible" ? f.why : "")), paths: [], dynamic: false };
 }
 
-/** Whether a program's top level is its own: an ES module (JavaScript that parsed only as one, or any file with import or export statements). */
-function moduleScoped(p: Parsed): boolean {
-  if ((p.dialect === "js" || p.dialect === "jsx") && p.goal === "module") return true;
-
-  return p.program.body.some((st) => st.type === "ImportDeclaration" || st.type === "ExportNamedDeclaration" || st.type === "ExportDefaultDeclaration" || st.type === "ExportAllDeclaration");
-}
-
-function readProgram(p: Parsed, text: string, depth: number, budget: Budget): Read | null {
+function readProgram(p: Parsed, depth: number, budget: Budget): Read | null {
   try {
-    const r = new Reader(p.program, depth, budget, depth === 0 && moduleScoped(p));
+    const r = new Reader(p.program, depth, budget);
 
     r.read();
-    const floor = r.floor(text, p.comments);
 
-    // which builtins a file could replace matters only to proofs that rest on one
-    if (PRECISION_PROOFS) r.checkPatches();
-
-    return { hits: r.hits, floor: floor.stands, sinkOnly: floor.sinkOnly, sinkOnlyHits: r.sinkOnlyHits, patched: r.patched, paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName };
+    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName };
   } catch (e) {
     if (e instanceof RangeError) return null;
     throw e;
@@ -3975,19 +2937,16 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
   };
 
   const precise = bestPerSignal(r.reads.flatMap((x) => x.hits)).map((h): TextFinding => ({ ...toFinding(h), tree: true }));
-  const floor = r.reads.flatMap((x) => x.floor);
+  const floor = floorOf(text, r.reads.map((x) => x.leftOut));
   const findings: TextFinding[] = [];
 
   // the tree's confirmed finding cites the call; the floor's stands where the tree confirmed nothing
   for (const id of ["shell-exec", "network", "credential-access", "eval", "obfuscated"] as const) {
     const sure = (list: readonly TextFinding[]): TextFinding | undefined => list.find((f) => f.id === id && f.confidence === "confirmed");
-    const best = sure(precise) ?? sure(floor) ?? precise.find((f) => f.id === id) ?? floor.find((f) => f.id === id);
+    const best = sure(precise) ?? sure(floor) ?? precise.find((f) => f.id === id);
 
     if (best) findings.push(best);
   }
-
-  const confirmed = new Set(findings.flatMap((f) => (f.confidence === "confirmed" ? [f.id] : [])));
-  const sinkOnly = [...r.reads.flatMap((x) => x.sinkOnly), ...r.reads.flatMap((x) => x.sinkOnlyHits).map(toFinding)].filter((f) => !confirmed.has(f.id));
 
   const paths = [...new Set(r.reads.flatMap((x) => x.paths))].slice(0, 500);
   const loads = [...new Set(r.reads.flatMap((x) => x.loads))].slice(0, 500);
@@ -3997,7 +2956,5 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
     .slice(0, 5)
     .map((at) => lineOf(text, at));
 
-  const patched = r.reads.find((x) => x.patched)?.patched;
-
-  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], sinkOnly, patches: patched ? `line ${lineOf(text, patched.at).line}: ${patched.why}` : null };
+  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes] };
 }

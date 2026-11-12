@@ -851,7 +851,11 @@
   "v4": 90,
   "v5": 100,
   "signals": {},
-  "kept": "comment"
+  "v9": 90,
+  "signals9": {
+   "obfuscated": "confirmed"
+  },
+  "v9why": "the match sits in a comment; v8 left comments out, and apm-score-v9 reads all text as v3 did, because String(fn) returns a function's comments and code can run them or use them as data"
  },
  {
   "name": "false-b64-fetch",
@@ -923,7 +927,11 @@
   "v4": 100,
   "v5": 100,
   "signals": {},
-  "kept": "type"
+  "v9": 90,
+  "signals9": {
+   "network": "confirmed"
+  },
+  "v9why": "the match sits in erased TypeScript; v8 left it out, and apm-score-v9 reads all text as v3 did, because a file can read its own source and run or use the type's text"
  },
  {
   "name": "unicode-callee-escaped-fetch",

@@ -485,8 +485,8 @@ describe("blocker 6: comment handling does not hide executable code", () => {
     expect(await signalsOf("const s = '/*'; require('dns').lookup('example.invalid', () => {}); const t = '*/';\n")).toContain("network");
   });
 
-  test("an example in a real comment is still passed over", async () => {
-    expect(await signalsOf("/**\n * Usage:\n *   const es = new EventSource(url);\n */\nmodule.exports = 1;\n")).not.toContain("network");
+  test("an example in a real comment counts as apm-score-v3 counted it (apm-score-v9: String(fn) gives comments back)", async () => {
+    expect(await signalsOf("/**\n * Usage:\n *   const es = new EventSource(url);\n */\nmodule.exports = 1;\n")).toContain("network");
   });
 });
 

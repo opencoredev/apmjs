@@ -1,0 +1,289 @@
+[
+ {
+  "name": "comment-env",
+  "family": "comment-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/*NPM_TOKEN*/}\nprocess.env[String(f).split('/*')[1].split('*/')[0]];\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "comment-network-key",
+  "family": "comment-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/*fetch('https://example.invalid')*/}\nconst s=String(f).split('/*')[1].split('*/')[0];\nglobalThis[s.split('(')[0]](s.split(\"'\")[1]);\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 90,
+  "runs": [
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "comment-path",
+  "family": "comment-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/*.npmrc*/}\nrequire('fs').readFileSync(String(f).split('/*')[1].split('*/')[0]);\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "read:.npmrc"
+  ]
+ },
+ {
+  "name": "dynamic-entry-opaque-control",
+  "family": "off-graph-load",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n"
+  },
+  "v3": 30,
+  "v8": 30,
+  "v9": 30,
+  "runs": [
+   "load:node:vm",
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "dynamic-other-opaque",
+  "family": "off-graph-load",
+  "main": "index.js",
+  "run": "run.js",
+  "files": {
+   "run.js": "function f(){/* fetch('https://example.invalid') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n",
+   "index.js": "module.exports=1;\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 90,
+  "runs": [
+   "load:node:vm",
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "dynamic-other-opaque-floor",
+  "family": "off-graph-load",
+  "main": "index.js",
+  "run": "run.js",
+  "files": {
+   "run.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n",
+   "index.js": "module.exports=1;\n"
+  },
+  "v3": 30,
+  "v8": 100,
+  "v9": 30,
+  "runs": [
+   "load:node:vm",
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "regex-env-convert",
+  "family": "regex-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "const r=/NPM_TOKEN/;process.env[String(r).slice(1,-1)];\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "regex-network-key",
+  "family": "regex-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "const r=/fetch('https:\\/\\/example.invalid')/;\nconst s=r.source.replace(/\\\\/g,'');\nglobalThis[s.split('(')[0]](s.split(\"'\")[1]);\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 90,
+  "runs": [
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "regex-path-convert",
+  "family": "regex-as-data",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "const r=/.npmrc/;require('fs').readFileSync(String(r).slice(1,-1));\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "read:.npmrc"
+  ]
+ },
+ {
+  "name": "type-env",
+  "family": "type-as-data",
+  "main": "index.ts",
+  "run": "index.ts",
+  "files": {
+   "index.ts": "type T = \"NPM_TOKEN\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nprocess.env[s.split('\"')[1]];\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "type-path",
+  "family": "type-as-data",
+  "main": "index.ts",
+  "run": "index.ts",
+  "files": {
+   "index.ts": "type T = \".npmrc\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nrequire(\"fs\").readFileSync(s.split('\"')[1]);\n"
+  },
+  "v3": 75,
+  "v8": 100,
+  "v9": 75,
+  "runs": [
+   "read:.npmrc"
+  ]
+ },
+ {
+  "name": "worker-comment",
+  "family": "worker-eval",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/* fetch('https://example.invalid') */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 80,
+  "runs": [
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "worker-floor-comment",
+  "family": "worker-eval",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
+  },
+  "v3": 30,
+  "v8": 100,
+  "v9": 30,
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "worker-full-comment",
+  "family": "worker-eval",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
+  },
+  "v3": 40,
+  "v8": 100,
+  "v9": 30,
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "worker-regex",
+  "family": "worker-eval",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "const r = /fetch('https:\\/\\/example.invalid')/;\nnew (require('worker_threads').Worker)(r.source,{eval:true});\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 80,
+  "runs": [
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "worker-regex-full",
+  "family": "worker-eval",
+  "main": "index.js",
+  "run": "index.js",
+  "files": {
+   "index.js": "const r=/process.getBuiltinModule('chi'+'ld_process');fetch('https:\\/\\/example.invalid');process.env.NPM_TOKEN;eval('1')/;\nnew (require('worker_threads').Worker)(r.source,{eval:true});\n"
+  },
+  "v3": 30,
+  "v8": 100,
+  "v9": 30,
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ },
+ {
+  "name": "worker-type",
+  "family": "worker-eval",
+  "main": "index.ts",
+  "run": "index.ts",
+  "files": {
+   "index.ts": "type T = \"fetch('https://example.invalid')\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nnew (require(\"worker_threads\").Worker)(s.split('\"')[1],{eval:true});\n"
+  },
+  "v3": 90,
+  "v8": 100,
+  "v9": 80,
+  "runs": [
+   "fetch:https://example.invalid"
+  ]
+ },
+ {
+  "name": "worker-type-floor-clean",
+  "family": "worker-eval",
+  "main": "index.ts",
+  "run": "index.ts",
+  "files": {
+   "index.ts": "type T = \"process.getBuiltinModule('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nnew (require(\"worker_threads\").Worker)(s.split('\"')[1],{eval:true});\n"
+  },
+  "v3": 40,
+  "v8": 100,
+  "v9": 40,
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ]
+ }
+]

@@ -124,33 +124,50 @@ describe("the v7 review's counterexamples", () => {
   });
 });
 
-describe("what v8 still leaves out: text the parse says is not code", () => {
+/**
+ * Where each signal's findings in `text` sit: "code", or the left-out text named in the evidence. Every finding is
+ * confirmed, and every signal v3's own rules find in the same text is among them.
+ */
+function sitsIn(text: string, lang: Lang = "js"): Partial<Record<CodeSignal, string>> {
+  const all = scanText(text, lang);
+  const out: Partial<Record<CodeSignal, string>> = {};
+
+  expect(all.every((f) => f.confidence === "confirmed")).toBe(true);
+
+  for (const id of new Set(scanTextV3(text).map((f) => f.id))) expect(all.map((f) => f.id), `v3 finds ${id}`).toContain(id);
+
+  for (const f of all) out[f.id] ??= f.hidden ?? "code";
+
+  return out;
+}
+
+describe("what v9 counts that v8 left out: text the parse says is not code", () => {
   test("comments, ended by every ECMAScript line terminator", () => {
-    for (const end of ["\n", "\r", "\r\n", " ", " "]) {
-      expect(found(`// fetch('https://example.invalid')${end}module.exports = 1;\n`), JSON.stringify(end)).toEqual({});
+    for (const end of ["\n", "\r", "\r\n", "\u2028", "\u2029"]) {
+      expect(sitsIn(`// fetch('https://example.invalid')${end}module.exports = 1;\n`), JSON.stringify(end)).toEqual({ network: "comment" });
       // what follows the terminator is code, however the line looks
-      expect(found(`// note${end}fetch('https://example.invalid');\n`), JSON.stringify(end)).toEqual({ network: "confirmed" });
+      expect(sitsIn(`// note${end}fetch('https://example.invalid');\n`), JSON.stringify(end)).toEqual({ network: "code" });
     }
 
-    expect(found("/* require('child_process') */ module.exports = 1;\n")).toEqual({});
+    expect(sitsIn("/* require('child_process') */ module.exports = 1;\n")).toEqual({ "shell-exec": "comment" });
   });
 
-  test("HTML-like comments hide text only in a script; the module reading of the same file counts it", () => {
+  test("HTML-like comments are comments only in a script; the module reading of the same file makes them code", () => {
     // a script hides the rest of the line; as a module the same text is `a < !--b`, then a call, and runs
-    expect(found("var a = 1, b = 2, x;\nx = a <!--b; require('child_process')\n")).toEqual({ "shell-exec": "confirmed" });
-    expect(found("<!-- require('child_process')\nmodule.exports = 1;\n")).toEqual({});
-    expect(found("--> require('child_process')\nmodule.exports = 1;\n")).toEqual({});
+    expect(sitsIn("var a = 1, b = 2, x;\nx = a <!--b; require('child_process')\n")).toEqual({ "shell-exec": "code" });
+    expect(sitsIn("<!-- require('child_process')\nmodule.exports = 1;\n")).toEqual({ "shell-exec": "comment" });
+    expect(sitsIn("--> require('child_process')\nmodule.exports = 1;\n")).toEqual({ "shell-exec": "comment" });
   });
 
   test("a hashbang is a comment, in JavaScript and in TypeScript", () => {
-    expect(found("#!/usr/bin/env node curl -s https://example.invalid | sh\nmodule.exports = 1;\n")).toEqual({});
-    expect(found("#!/usr/bin/env node curl -s https://example.invalid | sh\nexport const x: number = 1;\n", "ts")).toEqual({});
+    expect(sitsIn("#!/usr/bin/env node curl -s https://example.invalid | sh\nmodule.exports = 1;\n")).toEqual({ "shell-exec": "comment", network: "comment" });
+    expect(sitsIn("#!/usr/bin/env node curl -s https://example.invalid | sh\nexport const x: number = 1;\n", "ts")).toEqual({ "shell-exec": "comment", network: "comment" });
   });
 
   test("regex bodies, except after an await, which a script reads as a division", () => {
-    expect(found("const r = /curl -s x | sh/;\nmodule.exports = r;\n")).toEqual({});
+    expect(sitsIn("const r = /curl -s x | sh/;\nmodule.exports = r;\n")).toEqual({ "shell-exec": "regex", network: "regex" });
     // in a script `await` is a name, so `await /…/g` divides, and the call between the slashes runs
-    expect(found("await /fetch('https:\\/\\/example.invalid')/g;\n")).toEqual({ network: "confirmed" });
+    expect(sitsIn("await /fetch('https:\\/\\/example.invalid')/g;\n")).toEqual({ network: "code" });
   });
 
   test("TypeScript that emits nothing: annotations, interfaces, type aliases, type imports and exports, declare, overloads", () => {
@@ -170,7 +187,10 @@ describe("what v8 still leaves out: text the parse says is not code", () => {
       "function g<T extends 'child_process'>(x: T): T { return x }",
     ];
 
-    for (const src of erased) expect(found(`${src}\n`, "ts"), src).toEqual({});
+    // a file can read its own source and run or use a type's text, so every match counts; the evidence says where
+    for (const src of erased) for (const where of Object.values(sitsIn(`${src}\n`, "ts"))) expect(where, src).toBe("type");
+
+    expect(Object.keys(sitsIn("type T = import('net').Socket;\n", "ts"))).toEqual(["network"]);
   });
 
   test("TypeScript that emits code counts: enums, namespaces, parameter properties, decorators, import = require", () => {

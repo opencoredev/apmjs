@@ -7,8 +7,8 @@
 // `detection` fixtures hold code that runs (or a control next to it): v6 must find what it does, with the confidence
 // and points written here, and never score above apm-score-v3. `precision` fixtures are ones where v3 confirmed more
 // than the code does; `why` says what v6 reads instead. Where apm-score-v8, which keeps only the proofs that rest on
-// how code is read, changed a result, `v8`, `signals8` and `v8why` record it; `kept` names the read-time proof
-// (a comment, a regex body, an erased type, a JSON or declaration file) of a fixture that stays above v3.
+// how code is read, changed a result, `v8`, `signals8` and `v8why` record it. apm-score-v9 keeps none of those
+// either: where that changed a result, `v9`, `signals9` and `v9why` record it, and no fixture scores above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
@@ -34,7 +34,9 @@ const Fixture = z.object({
   v8: z.number().optional(),
   signals8: z.partialRecord(CodeSignal, z.enum(["confirmed", "possible"])).optional(),
   v8why: z.string().optional(),
-  kept: z.enum(["comment", "regex", "type", "data"]).optional(),
+  v9: z.number().optional(),
+  signals9: z.partialRecord(CodeSignal, z.enum(["confirmed", "possible"])).optional(),
+  v9why: z.string().optional(),
 });
 
 type Fixture = z.infer<typeof Fixture>;
@@ -69,6 +71,8 @@ describe("the v5 review's fixtures", () => {
     expect(fixtures.length).toBe(106);
     expect(fixtures.every((f) => f.kind === "detection" || (f.why ?? "").length > 0)).toBe(true);
     expect(fixtures.every((f) => (f.v8 === undefined) === (f.v8why === undefined) && (f.v8 === undefined || f.v8 <= f.v3))).toBe(true);
+    // every result v9 changed says why, and none of them is above v3
+    expect(fixtures.every((f) => (f.v9 === undefined) === (f.v9why === undefined) && (f.v9 === undefined || f.v9 <= f.v3))).toBe(true);
   });
 
   for (const f of fixtures) {
@@ -76,7 +80,7 @@ describe("the v5 review's fixtures", () => {
       const r = score(f);
       const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
-      expect(found).toEqual(f.signals8 ?? f.signals);
+      expect(found).toEqual(f.signals9 ?? f.signals8 ?? f.signals);
 
       for (const s of r.signals) {
         if (!(s.id in POSSIBLE_POINTS)) continue;
@@ -85,19 +89,15 @@ describe("the v5 review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      const want = f.v8 ?? f.v6;
+      const want = f.v9 ?? f.v8 ?? f.v6;
 
       expect(r.score).toBe(want);
       expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
 
-      if (f.kept === undefined) expect(r.score).toBeLessThanOrEqual(f.v3);
+      // no fixture scores above v3: apm-score-v9 keeps every finding v3 makes
+      expect(r.score).toBeLessThanOrEqual(f.v3);
 
-      if (f.kind === "detection") {
-        expect(f.kept).toBeUndefined();
-        expect(r.score).toBeLessThanOrEqual(f.v3);
-
-        if (f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
-      }
+      if (f.kind === "detection" && f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
     });
   }
 

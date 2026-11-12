@@ -8,7 +8,8 @@ import { entryPoints, targetFiles } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
-import { importsOf, joinStrings, langOf, scanFile, scanText, scanWholeText, type Confidence, type TextFinding } from "./source.ts";
+import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Hidden, type Imports, type TextFinding } from "./source.ts";
+import { scanTextRules } from "./textrules.ts";
 import type { TarEntry } from "./tarball.ts";
 
 export { isInlineDownload } from "./scripts.ts";
@@ -48,9 +49,11 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * operand that can be a callee and arguments through apply, bind and spreads, reads a file with no tree token by
  * token, and reads every file an exports or imports pattern exposes. v7 starts every parsed file from what v3 read in
  * its code (comments and regex literals left out) and lets the tree remove a finding only where it proves the token
- * harmless; a limit, a value it cannot follow or syntax it does not model leaves v3's finding standing.
+ * harmless; a limit, a value it cannot follow or syntax it does not model leaves v3's finding standing. v8 keeps only
+ * the proofs that rest on how code is read (comments, regex bodies, erased types, JSON). v9 keeps none: v3's rules read
+ * all text, in every file v3 reads and every file v8 reads, and the tree can only add findings and choose citations.
  */
-export const SCORER = "apm-score-v8";
+export const SCORER = "apm-score-v9";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -103,7 +106,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -334,9 +337,9 @@ export function isTestPath(path: string): boolean {
 const SHOWN_EVIDENCE = 5;
 const KEPT_EVIDENCE = 100;
 
-/** Whether a piece of evidence is a text match only, not a call or load the parsed program showed. */
+/** Whether a piece of evidence is a text match only, not a call or load the parsed program showed (any scorer's wording). */
 export function isTextEvidence(e: string): boolean {
-  return e.includes(TEXT_MATCH) || e.includes(TEXT_MATCH_RUN);
+  return e.includes(TEXT_MATCH_MARK);
 }
 
 function labelOf(id: SignalId, confidence: Confidence, evidence: readonly string[]): string {
@@ -425,7 +428,7 @@ function joinPath(dir: string, rel: string): string {
 /** The file node would load for `raw`: exact, then each extension it tries, then a directory index. */
 const PROBES = ["", ".js", ".cjs", ".mjs", ".json", ".node", ".ts", ".cts", ".mts", "/index.js", "/index.cjs", "/index.mjs", "/index.json", "/index.node", "/index.ts"];
 
-function resolveIn(byPath: Map<string, TarEntry>, raw: string): TarEntry | undefined {
+function resolveIn(byPath: ReadonlyMap<string, TarEntry>, raw: string): TarEntry | undefined {
   const p = joinPath("", raw);
 
   for (const ext of PROBES) {
@@ -464,28 +467,41 @@ export function dependencyNames(manifest: Record<string, unknown>): string[] {
   return [...new Set(dependencySpecs(manifest).map((d) => (isRegistryDependency(d) ? d.name : d.key)))];
 }
 
+/**
+ * What a piece of evidence rests on, in the order it is cited: a call or load the parsed program showed (or a fact,
+ * such as an install script), a text match in code or a string, or a text match in a comment, a regex body, a type or
+ * a JSON file.
+ */
+type Cited = "tree" | "text" | "hidden";
+
+const CITED_RANK: Record<Cited, number> = { tree: 0, text: 1, hidden: 2 };
+
+function citedAs(f: TextFinding): Cited {
+  if (f.tree === true) return "tree";
+
+  return f.hidden ? "hidden" : "text";
+}
+
 type Found = {
-  /**
-   * Records evidence; a signal is confirmed once any of its evidence is, and then shows only confirmed evidence.
-   * `textOnly`: only a text rule matched it (the floor), so it is listed after what a parsed program showed.
-   */
-  add: (id: SignalId, ev: string, confidence?: Confidence, textOnly?: boolean) => void;
+  /** Records evidence; a signal is confirmed once any of its evidence is, and then shows only confirmed evidence. */
+  add: (id: SignalId, ev: string, confidence?: Confidence, cited?: Cited) => void;
   has: (id: SignalId) => boolean;
   get: (id: SignalId) => { evidence: string[]; confidence: Confidence; possible: string[] } | undefined;
 };
 
 function collector(): Found {
   const found = new Map<SignalId, { confirmed: string[]; possible: string[] }>();
-  const textOnly = new Set<string>();
-  // the call or load a parsed program showed comes before a text match, so it is what the shown evidence cites
-  const ranked = (list: readonly string[]): string[] => [...list].sort((a, b) => Number(textOnly.has(a)) - Number(textOnly.has(b)));
+  const rank = new Map<string, number>();
+  // the call or load a parsed program showed comes before a text match, and a text match in code before one in a
+  // comment, a regex or a type, so the shown evidence cites the most direct line
+  const ranked = (list: readonly string[]): string[] => [...list].sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
 
   return {
-    add(id, ev, confidence = "confirmed", text = false) {
+    add(id, ev, confidence = "confirmed", cited = "tree") {
       const entry = found.get(id) ?? { confirmed: [], possible: [] };
       const list = entry[confidence];
 
-      if (text) textOnly.add(ev);
+      rank.set(ev, Math.min(rank.get(ev) ?? CITED_RANK[cited], CITED_RANK[cited]));
 
       if (!list.includes(ev)) list.push(ev);
       found.set(id, entry);
@@ -504,25 +520,27 @@ function collector(): Found {
 }
 
 /**
- * What a confirmed finding only a text rule made says after its snippet, so a reader of the evidence can tell it from
- * a call or load the parsed program showed: apm counts every such match unless the parse puts it in a comment, a regex
- * literal or a TypeScript type, which is also why a definition, a written key or a string only compared counts.
+ * What a confirmed finding only a text rule made says after its snippet, so a reader can tell it from a call or load
+ * the parsed program showed: a text match, and where it sits when that is text the program does not run as written.
+ * Every one counts, wherever it sits: `String(fn)`, `re.source` and a file reading its own source give comments,
+ * regex bodies and types back at runtime, to run or to use as data.
  */
-export const TEXT_MATCH = " (text match: counted unless it sits in a comment, a regex or a type)";
+export const TEXT_MATCH = " (text match)";
 
-/**
- * What a match in a comment, a regex body or an erased type says when it counts: the package runs code built from
- * text (eval, Function, vm, a shell, a computed load), and that is how such text becomes code (`String(fn)`, `re.source`).
- */
-export const TEXT_MATCH_RUN = " (text match in a comment, a regex or a type: counted because this package runs code built from text)";
+export const HIDDEN_NOTES: Record<Hidden, string> = {
+  comment: " (text match in a comment)",
+  regex: " (text match in a regex)",
+  type: " (text match in a TypeScript type)",
+  json: " (text match in a JSON file)",
+};
 
-/** The signals that let a package turn text it holds into code: while one stands, comments, regex bodies and types count. */
-const RUNS_TEXT: readonly SignalId[] = ["eval", "shell-exec", "dynamic-require", "install-download"];
+/** What every scorer's text-match note starts with (v8 wrote "(text match: counted unless …)"). */
+const TEXT_MATCH_MARK = " (text match";
 
-function describeFinding(where: string, f: TextFinding, note: string = TEXT_MATCH): string {
+function describeFinding(where: string, f: TextFinding): string {
   const how = f.how === "as written" ? "" : ` (${f.how})`;
   const why = f.confidence === "possible" ? ` [possible: ${f.why}]` : "";
-  const text = f.confidence === "confirmed" && f.tree !== true ? note : "";
+  const text = f.confidence === "confirmed" && f.tree !== true ? (f.hidden ? HIDDEN_NOTES[f.hidden] : TEXT_MATCH) : "";
 
   return `${where}:${f.line}: ${f.snippet}${how}${text}${isTestPath(where) ? IN_TEST_FILE : ""}${why}`;
 }
@@ -564,6 +582,138 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   for (const [k, cmd] of Object.entries(otherScripts(manifest, hooks))) {
     for (const f of scanText(cmd, "plain")) if (f.id === "credential-access" || f.id === "obfuscated") found.add(f.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`, f.confidence);
   }
+}
+
+/** What the v3 walk needs from `analyze`, and what the walk there read whole (with v3's import pattern for each file). */
+type V3Walk = {
+  files: readonly TarEntry[];
+  byPath: ReadonlyMap<string, TarEntry>;
+  manifest: AnalyzeInput["manifest"];
+  installCommands: readonly { text: string }[];
+  gyp: TarEntry | undefined;
+  budget: number;
+  /** Files the text rules already read whole, each with v3's imports of it when they were worked out. */
+  readWhole: ReadonlyMap<string, Imports | null>;
+  /** `file:line` of each computed load already reported. */
+  dynamicAt: ReadonlySet<string>;
+  add: Found["add"];
+};
+
+/** What the v3 walk could not read: run code too large or past the budget, and other files past the budget. */
+type V3Skips = { skipped: SkippedFile[]; unanalyzed: SkippedFile[] };
+
+/**
+ * The floor, by construction: apm-score-v3's own walk over the tarball (`analyze` in `test/v3/score.ts`), with its
+ * order, its byte budget and its reach: install targets, binding.gyp, declared entries (not `imports`, which v3 did
+ * not read), every file v3's import pattern reaches from those, then every other file that could be code. Each file
+ * is read whole by the text rules, which hold every pattern of v3's and run every pass it ran, so every finding v3
+ * makes in a file is made here, confirmed; a file `analyze` already read whole is not read twice. Computed loads are
+ * reported for reached files as v3 reported them, and what did not fit is reported as v3 reported it.
+ */
+function readLikeV3(w: V3Walk): V3Skips {
+  const { byPath, add } = w;
+  const installTargets = new Set<string>();
+  const first: string[] = [];
+
+  for (const c of w.installCommands) {
+    for (const word of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+      const f = resolveIn(byPath, word);
+
+      if (f && f.path !== "package.json") {
+        installTargets.add(f.path);
+        first.push(f.path);
+      }
+    }
+  }
+
+  if (w.gyp) first.push(w.gyp.path);
+
+  for (const e of entryPoints(w.manifest)) {
+    if (e.field.startsWith("imports") || !(e.path.startsWith(".") || /^[\w@]/.test(e.path))) continue;
+    const f = resolveIn(byPath, e.path);
+
+    // type declarations listed under exports never run
+    if (f && !/\.d\.[cm]?ts$/.test(f.path)) first.push(f.path);
+  }
+
+  const reachable = new Set<string>(first);
+  const queue = [...reachable];
+  const seen = new Set<string>();
+  const skipped: SkippedFile[] = [];
+  const unanalyzed: SkippedFile[] = [];
+  let scanned = 0;
+  let qi = 0;
+
+  const readFile = (f: TarEntry, reached: boolean): void => {
+    if (isBinary(f)) {
+      add("binary", f.path);
+
+      return;
+    }
+
+    if (isBinaryData(f)) return;
+
+    if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
+      skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
+
+      return;
+    }
+
+    if (scanned + f.data.length > w.budget) {
+      (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-budget" });
+
+      return;
+    }
+
+    scanned += f.data.length;
+    const known = w.readWhole.get(f.path);
+    let text: string | null = null;
+    const textOf = (): string => (text ??= new TextDecoder().decode(f.data));
+
+    if (known === undefined) for (const finding of scanTextRules(textOf())) add(finding.id, describeFinding(f.path, finding), "confirmed", citedAs(finding));
+
+    if (installTargets.has(f.path) && isShellScript(f, textOf()) && isInlineDownload(textOf())) add("install-download", `${f.path}: run by an install script and downloads code`);
+
+    if (!reached) return;
+    const imports = known ?? importsOf(joinStrings(textOf()).text);
+
+    // v3's pattern takes any require(…) or import(…) whose argument is not a literal for a computed load
+    for (const d of imports.dynamic) if (!w.dynamicAt.has(`${f.path}:${d.line}`)) add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}${TEXT_MATCH}`);
+
+    for (const spec of imports.paths) {
+      const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
+
+      if (target && !seen.has(target.path) && !reachable.has(target.path)) {
+        reachable.add(target.path);
+        queue.push(target.path);
+      }
+    }
+  };
+
+  const drain = (): void => {
+    for (; qi < queue.length; qi++) {
+      const f = byPath.get(queue[qi] ?? "");
+
+      if (!f || seen.has(f.path)) continue;
+      seen.add(f.path);
+      readFile(f, true);
+    }
+  };
+
+  drain();
+
+  const rest = w.files.filter((f) => !seen.has(f.path) && !NOT_CODE.test(f.path)).sort((a, b) => Number(!CODE_EXT.test(a.path)) - Number(!CODE_EXT.test(b.path)));
+
+  for (const f of rest) {
+    seen.add(f.path);
+    readFile(f, false);
+    // anything the second pass reaches by a resolvable path is read too, even with a non-code name
+    drain();
+  }
+
+  for (const f of w.files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
+
+  return { skipped, unanalyzed };
 }
 
 /** Static analysis of one version. Run once at publish; stored with the version. */
@@ -650,12 +800,10 @@ export function analyze(input: AnalyzeInput): Analysis {
   const unanalyzed: SkippedFile[] = [];
   let scanned = 0;
   let qi = 0;
-  // proofs that rest on a global or builtin module (fetch sends, path.join builds) hold only if no file could replace one
-  const sinkOnly: { path: string; finding: TextFinding }[] = [];
-  let patched: string | null = null;
   const limits = new Map<string, string[]>();
-  // parsed files, with the signals their own reading confirmed: read again whole if the package runs code from text
-  const parsed: { file: TarEntry; sure: ReadonlySet<SignalId> }[] = [];
+  // files whose whole text the text rules read here, with v3's imports of each parsed one, for the v3 walk below
+  const readWhole = new Map<string, Imports | null>();
+  const dynamicAt = new Set<string>();
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
     if (isBinary(f)) {
@@ -684,28 +832,31 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     const named = langOf(f.path, text);
     // a type declaration code loads runs too (node strips its types, or older node runs it as JavaScript)
-    const declaration = named === "data" && /\.d\.[cm]?ts$/i.test(f.path);
-    const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : runsAsCode.has(f.path) && declaration ? "ts" : named;
+    const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : runsAsCode.has(f.path) && named === "declaration" ? "ts" : named;
     const scan = scanFile(text, lang);
 
     // a README or LICENSE a pattern exposes is not JavaScript: node would throw a SyntaxError, so nothing in it runs
     if (scan.rejected && exposedOnly.has(f.path) && NOT_CODE.test(f.path)) return;
 
-    for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, finding.tree !== true);
-
-    if (scan.read === "parsed") parsed.push({ file: f, sure: new Set(scan.findings.flatMap((x) => (x.confidence === "confirmed" ? [x.id] : []))) });
-
-    for (const finding of scan.sinkOnly) sinkOnly.push({ path: f.path, finding });
-
-    if (scan.patches) patched ??= `${f.path}, ${scan.patches}`;
+    for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, citedAs(finding));
 
     for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
 
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
     // every path apm-score-v3's pattern finds in the text is reached too, so no file v3 read goes unread
-    const imports = scan.read === "parsed" ? { ...scan.imports, paths: [...new Set([...scan.imports.paths, ...importsOf(joinStrings(text).text).paths])] } : scan.imports;
+    const v3Imports = scan.read === "parsed" ? importsOf(joinStrings(text).text) : null;
+    const imports = v3Imports ? { ...scan.imports, paths: [...new Set([...scan.imports.paths, ...v3Imports.paths])] } : scan.imports;
 
-    for (const d of imports.dynamic) if (reached) add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
+    readWhole.set(f.path, v3Imports);
+
+    // a computed load in JavaScript counts wherever it is: a file nothing here reaches can still be loaded and run by its
+    // path. In any other file it is only v3's pattern over text, reported where v3 reported it, in a reached file.
+    const javascript = lang === "js" || lang === "jsx" || lang === "ts" || lang === "tsx";
+
+    for (const d of javascript || reached ? imports.dynamic : []) {
+      add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
+      dynamicAt.add(`${f.path}:${d.line}`);
+    }
 
     for (const spec of imports.paths) {
       const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
@@ -748,23 +899,15 @@ export function analyze(input: AnalyzeInput): Analysis {
     }
   }
 
-  if (patched) for (const { path, finding } of sinkOnly) add(finding.id, describeFinding(path, finding), finding.confidence, true);
+  // the floor: every file apm-score-v3 reads, in its order and within its budget, read whole by its rules
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add });
 
-  // `String(fn)` (comments included), `re.source` and a file reading itself turn left-out text into code, but only
-  // through an evaluator: while eval, Function, vm, a shell or a computed load stands, that text counts as v3 read it
-  if (RUNS_TEXT.some((id) => found.has(id))) {
-    for (const { file, sure } of parsed) {
-      for (const finding of scanWholeText(new TextDecoder().decode(file.data))) {
-        if (!sure.has(finding.id)) add(finding.id, describeFinding(file.path, finding, TEXT_MATCH_RUN), finding.confidence, true);
-      }
-    }
-  }
+  for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
-  for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
-
-  if (unanalyzed.length > 0) {
-    const bytes = unanalyzed.reduce((n, s) => n + s.size, 0);
-    add("unanalyzed-files", `${unanalyzed.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${unanalyzed[0]?.path ?? ""})`);
+  for (const list of [unanalyzed, v3.unanalyzed]) {
+    if (list.length === 0) continue;
+    const bytes = list.reduce((n, s) => n + s.size, 0);
+    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
   }
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
@@ -812,13 +955,15 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   const notChecked = [
     ...NOT_CHECKED,
-    ...(patched && sinkOnly.length > 0 ? [`what a string sent to fetch, read as a path or built by path.join or an Error holds, because a file could replace those builtins (${patched}): it was judged by the text rules alone`] : []),
     ...[...limits].map(([note, paths]) => `${note} (${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ` and ${paths.length - 3} more files` : ""})`),
-    ...(unanalyzed.length > 0 ? [`${unanalyzed.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`] : []),
+    ...[unanalyzed, v3.unanalyzed].flatMap((list) => (list.length > 0 ? [`${list.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`] : [])),
     ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`),
   ];
 
-  return { scorer: SCORER, signals, facts, notChecked, skipped: [...skipped, ...unanalyzed] };
+  // both walks can skip the same file
+  const skippedOnce = new Map([...skipped, ...unanalyzed, ...v3.skipped, ...v3.unanalyzed].map((s) => [`${s.reason}:${s.path}`, s]));
+
+  return { scorer: SCORER, signals, facts, notChecked: [...new Set(notChecked)], skipped: [...skippedOnce.values()] };
 }
 
 export function gradeOf(score: number): Grade {

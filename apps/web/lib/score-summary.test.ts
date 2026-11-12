@@ -47,10 +47,20 @@ test("shortLabel stops at the first explanation", () => {
 });
 
 test("a signal backed only by text matches reads as a mention on the phone too", () => {
-  // the labels apm-score-v8 gives a confirmed signal the parsed program did not see happen (packages/core/src/score.ts)
+  // the labels apm-score-v8 and v9 give a confirmed signal the parsed program did not see happen (packages/core/src/score.ts)
   const credential = signal({ id: "credential-access", label: "Mentions a credential file (.npmrc, .ssh) or secret variable; apm did not see one read", points: -25 });
   const shell = signal({ id: "shell-exec", label: "Mentions a shell command or child_process; apm did not see one started", points: -15 });
 
   expect(scoreLineText(scoreLine([shell, credential]))).toBe("Mentions a credential file · −25 points +1 more");
   expect(scoreLineText(scoreLine([shell]))).toBe("Mentions a shell command or child_process · −15 points");
+
+  // v9 counts a comment, a regex or a type as v3 did, and its evidence says where the text sits; the label is the same
+  const comment = signal({
+    id: "network",
+    label: "Mentions a network call (fetch, http, a socket); apm did not see a request made",
+    points: -10,
+    evidence: ["lib/websocket.js:870: // Match curl 7.77.0 behavior (text match in a comment)"],
+  });
+
+  expect(scoreLineText(scoreLine([comment]))).toBe("Mentions a network call · −10 points");
 });

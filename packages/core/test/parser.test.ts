@@ -110,11 +110,12 @@ describe("evaluated text is read as code", () => {
 });
 
 describe("calls are read from the tree", () => {
-  test("a comment or string cannot make a call one; a definition named like a call counts as v3 counted it", () => {
+  test("a comment or string cannot make a call one for the tree; its text and a definition named like a call count as v3 counted them", () => {
     expect(found("class A { async fetch(url) { return url } }\nexport function fetch(u) { return u }\nfetch('x');\n")).toEqual({ network: "confirmed" });
     expect(found("(function () { function fetch(u) { return u } fetch('x'); })();\n")).toEqual({ network: "confirmed" });
     expect(found("function fetch(u) { return u }\nfetch('x');\n")).toEqual({ network: "confirmed" });
-    expect(found("// fetch('x')\n/* fetch('x') */\nmodule.exports = 1;\n")).toEqual({});
+    expect(found("// fetch('x')\n/* fetch('x') */\nmodule.exports = 1;\n")).toEqual({ network: "confirmed" });
+    expect(scanText("// fetch('x')\n/* fetch('x') */\nmodule.exports = 1;\n").every((f) => f.tree !== true && f.hidden === "comment")).toBe(true);
     expect(found("fetch(/* ) { */ 'https://example.invalid');\n")).toEqual({ network: "confirmed" });
     expect(found("fetch('https://example.invalid/) {');\n")).toEqual({ network: "confirmed" });
   });
@@ -156,9 +157,9 @@ describe("calls are read from the tree", () => {
 });
 
 describe("TypeScript types come from the TypeScript grammar", () => {
-  test("a type import is erased; import() in code runs", () => {
-    expect(found("type X = import('net').Socket;\nlet y: import('node:http').Agent;\n", "ts")).toEqual({});
-    expect(found("import type { ChildProcess } from 'child_process';\n", "ts")).toEqual({});
+  test("a type import is erased, and its text counts in a type; import() in code runs", () => {
+    expect(found("type X = import('net').Socket;\nlet y: import('node:http').Agent;\n", "ts")).toEqual({ network: "confirmed" });
+    expect(scanText("import type { ChildProcess } from 'child_process';\n", "ts").map((f) => [f.id, f.hidden])).toEqual([["shell-exec", "type"]]);
     expect(found("import('node:http').then((m) => m);\n", "ts")).toEqual({ network: "confirmed" });
     expect(found("import cp = require('child_process');\n", "ts")).toEqual({ "shell-exec": "confirmed" });
   });
@@ -204,9 +205,11 @@ describe("evidence cites the occurrence that matched", () => {
 });
 
 describe("module targets apm can work out", () => {
-  test("a constant import target is the module it names, not a dynamic load (hono's color helper)", () => {
+  test("a constant import target is the module it names; v3's pattern still lists it, as a text match (hono's color helper)", () => {
     const a = analyzeFiles({ "index.js": 'const cfWorkers = "cloudflare:workers";\nexport async function f() { return (await import(cfWorkers)).env; }\n' });
-    expect(a.signals.map((s) => s.id)).not.toContain("dynamic-require");
+    const d = a.signals.find((s) => s.id === "dynamic-require");
+    expect(d?.points).toBe(0);
+    expect(d?.evidence).toEqual(["index.js:2: export async function f() { return (await import(cfWorkers)).env; } (text match)"]);
   });
 
   test("a constant holding a module that does something is that module", () => {
@@ -218,9 +221,14 @@ describe("module targets apm can work out", () => {
     expect(a.signals.map((s) => s.id)).toContain("dynamic-require");
   });
 
-  test("JSON never runs, so a string in it is not a load", () => {
+  test("JSON never runs: a string in it is not a load the tree sees, and v3's pattern lists it as a text match", () => {
     const a = analyzeFiles({ "index.js": "require('./schema.json');\n", "schema.json": '{ "tsType": "import(x).Y" }' });
-    expect(a.signals.map((s) => s.id)).not.toContain("dynamic-require");
+    expect(a.signals.find((s) => s.id === "dynamic-require")?.evidence).toEqual(['schema.json:1: { "tsType": "import(x).Y" } (text match)']);
+  });
+
+  test("a computed load counts in a file no entry reaches (apm-score-v9)", () => {
+    const a = analyzeFiles({ "index.js": "module.exports = 1;\n", "run.js": "require(process.argv[2]);\n" });
+    expect(a.signals.find((s) => s.id === "dynamic-require")?.evidence).toEqual(["run.js:1: require(process.argv[2]);"]);
   });
 });
 

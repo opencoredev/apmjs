@@ -1373,7 +1373,12 @@
   "signals": {
    "shell-exec": "possible"
   },
-  "kept": "data"
+  "v9": 75,
+  "signals9": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  },
+  "v9why": "the match sits in a JSON file; v8 read JSON as data (possible at most), and apm-score-v9 counts it as v3 did, because code that loads the file can run or use what it holds"
  },
  {
   "name": "exports-condition-docs-payload-html",

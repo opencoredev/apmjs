@@ -4,10 +4,6 @@ import { describe, expect, test } from "bun:test";
 import { analyze, finalize, POINTS, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
 import { commentRanges, scanText, type Lang } from "../src/source.ts";
 
-function ids(text: string, lang: Lang = "js"): string[] {
-  return scanText(text, lang).map((f) => f.id);
-}
-
 function confirmed(text: string, lang: Lang = "js"): string[] {
   return scanText(text, lang)
     .filter((f) => f.confidence === "confirmed")
@@ -117,8 +113,13 @@ describe("docs-shaped patterns", () => {
     expect(confirmed("const n = a\n* process.binding('spawn_sync');\n")).toEqual(["shell-exec"]);
   });
 
-  test("examples in JSDoc and line comments are still passed over", () => {
-    expect(ids("/**\n * Usage:\n *   const es = new EventSource(url);\n *   process.binding('fs');\n */\nmodule.exports = 1;\n")).toEqual([]);
-    expect(ids("// e.g. require('dns').lookup(host, cb)\nmodule.exports = 1;\n")).toEqual([]);
+  test("examples in JSDoc and line comments count, and say they sit in a comment (apm-score-v9)", () => {
+    // `String(fn)` returns a function's comments, so code can run them or use them as data
+    for (const text of ["/**\n * Usage:\n *   const es = new EventSource(url);\n *   process.binding('fs');\n */\nmodule.exports = 1;\n", "// e.g. require('dns').lookup(host, cb)\nmodule.exports = 1;\n"]) {
+      const found = scanText(text, "js");
+
+      expect(found.length).toBeGreaterThan(0);
+      expect(found.every((f) => f.confidence === "confirmed" && f.hidden === "comment")).toBe(true);
+    }
   });
 });
