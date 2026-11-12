@@ -70,9 +70,15 @@ CREATE TABLE IF NOT EXISTS events (
   detail TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS events_pkg ON events(package, at);
+CREATE TABLE IF NOT EXISTS upstream_analysis (
+  package TEXT NOT NULL,
+  version TEXT NOT NULL,
+  analysis TEXT NOT NULL,
+  PRIMARY KEY (package, version)
+);
 `;
 
-export type VersionStatus = "active" | "yanked" | "revoked";
+export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
 
 const UserRow = z.object({ name: z.string(), password_hash: z.string(), email: z.string(), created_at: z.number() });
 const TokenRow = z.object({
@@ -103,7 +109,7 @@ const VersionRow = z.object({
   published_at: z.number(),
   published_by: z.string(),
   deprecated: z.string().nullable(),
-  status: z.enum(["active", "yanked", "revoked"]),
+  status: z.enum(["active", "yanked", "revoke-pending", "revoked"]),
   status_reason: z.string().nullable(),
   status_at: z.number().nullable(),
   status_by: z.string().nullable(),
@@ -254,7 +260,46 @@ export class Store {
     return row ? this.toVersion(row) : null;
   }
 
+  /** Pending revocations older than `cutoff` become final. Returns the versions that changed. */
+  matureRevocations(cutoff: number): { package: string; version: string }[] {
+    const rows = this.db
+      .query("SELECT package, version FROM versions WHERE status = 'revoke-pending' AND status_at <= ?")
+      .all(cutoff)
+      .map((r) => z.object({ package: z.string(), version: z.string() }).parse(r));
+    if (rows.length > 0) this.db.query("UPDATE versions SET status = 'revoked' WHERE status = 'revoke-pending' AND status_at <= ?").run(cutoff);
+    return rows;
+  }
+
+  /** Names of local packages whose versions depend on `name`. */
+  dependentsOf(name: string): string[] {
+    const out = new Set<string>();
+    for (const row of this.db.query("SELECT package, manifest FROM versions WHERE status = 'active'").all()) {
+      const r = z.object({ package: z.string(), manifest: z.string() }).parse(row);
+      if (r.package === name) continue;
+      const m = JsonObject.parse(parseJson(r.manifest));
+      for (const k of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+        const deps = m[k];
+        if (typeof deps === "object" && deps !== null && name in deps) out.add(r.package);
+      }
+    }
+    return [...out];
+  }
+
+  getUpstreamAnalysis(name: string, version: string): unknown {
+    const row = this.db.query("SELECT analysis FROM upstream_analysis WHERE package = ? AND version = ?").get(name, version);
+    if (!row) return null;
+    return parseJson(z.object({ analysis: z.string() }).parse(row).analysis);
+  }
+  setUpstreamAnalysis(name: string, version: string, analysis: unknown): void {
+    this.db.query("INSERT OR REPLACE INTO upstream_analysis (package, version, analysis) VALUES (?, ?, ?)").run(name, version, JSON.stringify(analysis));
+  }
+
   // advisories
+  deleteAdvisoriesFor(name: string, version: string): void {
+    for (const a of this.advisoriesFor(name)) {
+      if (a.versions.includes(version)) this.db.query("DELETE FROM advisories WHERE id = ?").run(a.id);
+    }
+  }
   addAdvisory(a: Omit<Advisory, "id">): number {
     const r = this.db
       .query("INSERT INTO advisories (package, versions, severity, title, detail, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)")

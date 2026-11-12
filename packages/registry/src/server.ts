@@ -210,7 +210,8 @@ export type PublishHook = (input: {
   tarball: Uint8Array;
   user: string;
   existing: PackageRecord | null;
-}) => { ok: true; manifest: Record<string, unknown>; score: unknown } | { ok: false; status: number; error: string; detail?: unknown };
+}) => Promise<PublishVerdict>;
+export type PublishVerdict = { ok: true; manifest: Record<string, unknown>; score: unknown } | { ok: false; status: number; error: string; detail?: unknown };
 
 export type Extensions = {
   onPublish?: PublishHook;
@@ -269,7 +270,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   let score: unknown = null;
   let storedManifest: Record<string, unknown> = manifest;
   if (ext.onPublish) {
-    const verdict = ext.onPublish({ ctx, name, version, manifest, tarball, user: auth.user, existing });
+    const verdict = await ext.onPublish({ ctx, name, version, manifest, tarball, user: auth.user, existing });
     if (!verdict.ok) return fail(verdict.status, verdict.error, verdict.detail === undefined ? {} : { detail: verdict.detail });
     score = verdict.score;
     storedManifest = verdict.manifest;

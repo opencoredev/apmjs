@@ -15,6 +15,8 @@ export type SignalId =
   | "new-publisher"
   | "no-license"
   | "typosquat"
+  | "risky-dependency"
+  | "new-dependency"
   | "recent"
   | "deprecated"
   | "yanked"
@@ -34,7 +36,13 @@ export type Facts = {
   dependencyCount: number;
 };
 
-export type Analysis = { scorer: "apm-score-v1"; signals: Signal[]; facts: Facts };
+export type Analysis = { scorer: "apm-score-v1"; signals: Signal[]; facts: Facts; notChecked: string[] };
+
+export const NOT_CHECKED: readonly string[] = [
+  "runtime behavior: code that downloads, decrypts or builds a second stage while running",
+  "the code of dependencies beyond their own scores",
+  "whether the publisher's machine or CI was compromised",
+];
 export type Grade = "A" | "B" | "C" | "D" | "F";
 export type ScoreReport = Analysis & { score: number; grade: Grade };
 
@@ -49,7 +57,10 @@ export const POINTS: Record<SignalId, number> = {
   "new-publisher": -10,
   "no-license": -3,
   typosquat: -20,
-  recent: -10,
+  "risky-dependency": -30,
+  "new-dependency": -5,
+  // informational: age is handled by the cooldown, never by the number
+  recent: 0,
   deprecated: -5,
   yanked: 0,
   revoked: -100,
@@ -66,6 +77,8 @@ const LABELS: Record<SignalId, string> = {
   "new-publisher": "Published by an account that never published this package before",
   "no-license": "No license declared",
   typosquat: "Name is one typo away from a popular package",
+  "risky-dependency": "Depends on a package that scores below the floor",
+  "new-dependency": "Adds dependencies the previous version did not have",
   recent: "Published less than 24 hours ago; most malicious versions are caught within hours",
   deprecated: "Deprecated by its maintainer",
   yanked: "Yanked: hidden from new installs by its maintainer",
@@ -82,13 +95,16 @@ const RULES: { id: "shell-exec" | "network" | "credential-access" | "eval" | "ob
   { id: "shell-exec", re: /\bchild_process\b|\bexec(?:File)?Sync\s*\(|\bspawnSync\s*\(|\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b|\bBun\.spawn\b|\bBun\.\$|\bDeno\.Command\b/ },
   {
     id: "network",
-    re: /\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\(\s*['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]\s*\)|from\s+['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]|\bXMLHttpRequest\b|\bnew\s+WebSocket\b|\bcurl\s+|\bwget\s+|\bdns\.(?:resolve|lookup)\b/,
+    re: /\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\(\s*['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]\s*\)|from\s+['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]|\bXMLHttpRequest\b|\bnew\s+WebSocket\b|\bcurl\s+|\bwget\s+|\bdns\.(?:resolve|lookup)\b|\bimport\s*\(\s*['"`]https?:\/\//,
   },
   {
     id: "credential-access",
     re: /\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|AWS_SECRET_ACCESS_KEY|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/,
   },
-  { id: "eval", re: /(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b/ },
+  {
+    id: "eval",
+    re: /(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b|\[\s*(['"`])[\w$]{0,8}\1\s*\+\s*(['"`])[\w$]{0,8}\2\s*\]|=\s*require\s*[;,\n]|\brequire\s*\(\s*String\.fromCharCode/,
+  },
   { id: "obfuscated", re: /(?:_0x[0-9a-f]{4,}[\s\S]*){20}|(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/ },
 ];
 
@@ -161,13 +177,28 @@ function signal(id: SignalId, evidence: string[]): Signal {
   return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5) };
 }
 
+export type DependencyRisk = { name: string; version: string; score: number };
+
 export type AnalyzeInput = {
   name: string;
   manifest: Record<string, unknown>;
   files: readonly TarEntry[];
   publisher: string;
   previousPublishers: readonly string[];
+  /** Dependencies (resolved) whose own score is below the floor. */
+  riskyDependencies?: readonly DependencyRisk[];
+  /** Dependency names absent from the previous version; empty for a first release. */
+  addedDependencies?: readonly string[];
 };
+
+export function dependencyNames(manifest: Record<string, unknown>): string[] {
+  const out = new Set<string>();
+  for (const k of ["dependencies", "optionalDependencies"] as const) {
+    const d = manifest[k];
+    if (isRecord(d)) for (const n of Object.keys(d)) out.add(n);
+  }
+  return [...out];
+}
 
 /** Static analysis of one version. Run once at publish; stored with the version. */
 export function analyze(input: AnalyzeInput): Analysis {
@@ -212,12 +243,15 @@ export function analyze(input: AnalyzeInput): Analysis {
     add("new-publisher", `${input.publisher} has not published this package before (previous: ${input.previousPublishers.join(", ")})`);
   }
 
-  const order: SignalId[] = ["credential-access", "shell-exec", "install-script", "network", "eval", "obfuscated", "typosquat", "new-publisher", "binary", "no-license"];
+  for (const d of input.riskyDependencies ?? []) add("risky-dependency", `${d.name}@${d.version} scores ${d.score}/100`);
+  for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
+
+  const order: SignalId[] = ["credential-access", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
   const signals = order.flatMap((id) => {
     const ev = found.get(id);
     return ev ? [signal(id, ev)] : [];
   });
-  return { scorer: "apm-score-v1", signals, facts };
+  return { scorer: "apm-score-v1", signals, facts, notChecked: [...NOT_CHECKED] };
 }
 
 export function gradeOf(score: number): Grade {
@@ -228,7 +262,7 @@ export function gradeOf(score: number): Grade {
   return "F";
 }
 
-export type VersionState = { publishedAt: number; now: number; deprecated: string | null; status: "active" | "yanked" | "revoked"; statusReason: string | null };
+export type VersionState = { publishedAt: number; now: number; deprecated: string | null; status: "active" | "yanked" | "revoke-pending" | "revoked"; statusReason: string | null };
 
 /** Applies time- and state-based signals and computes the number. */
 export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
@@ -239,10 +273,10 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   }
   if (state.deprecated) signals.push(signal("deprecated", [state.deprecated]));
   if (state.status === "yanked") signals.push(signal("yanked", [state.statusReason ?? "no reason given"]));
-  if (state.status === "revoked") signals.push(signal("revoked", [state.statusReason ?? "no reason given"]));
+  if (state.status === "revoked" || state.status === "revoke-pending") signals.push(signal("revoked", [state.statusReason ?? "no reason given"]));
   const raw = 100 + signals.reduce((n, s) => n + s.points, 0);
   const score = Math.max(0, Math.min(100, raw));
-  return { ...analysis, signals, score, grade: gradeOf(score) };
+  return { ...analysis, notChecked: analysis.notChecked ?? [...NOT_CHECKED], signals, score, grade: gradeOf(score) };
 }
 
 export function isAnalysis(v: unknown): v is Analysis {
