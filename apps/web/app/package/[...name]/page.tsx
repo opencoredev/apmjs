@@ -1,15 +1,16 @@
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
-import { ChevronDownIcon } from "lucide-react";
+import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
 import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable, packagePath } from "@/components/registry-unavailable";
-import { ScoreBadge, StatusBadge, toneOf, type Tone } from "@/components/score-badge";
+import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
 import { ago } from "@/lib/format";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { VersionList } from "@/components/version-list";
+import { REGISTRY } from "@/lib/registry-url";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -129,6 +130,24 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
   );
 }
 
+/** Phones only: the score in one line near the top, linking down to the full report. */
+function ScoreSummary({ score, className }: { score: PackageInfo["score"]; className?: string }) {
+  const lost = score ? score.signals.filter((s) => s.points < 0) : [];
+
+  return (
+    <a href="#score" className={`flex min-h-12 items-center gap-3 rounded-xl border px-4 py-2.5 transition-colors hover:bg-surface/60 ${className ?? ""}`}>
+      <ScoreBadge score={score?.score} grade={score?.grade} />
+      <span className="min-w-0 flex-1 text-[15px] text-pretty">
+        {score === null ? "Not scored yet" : lost.length === 0 ? "No points lost" : `${lost.length} signal${lost.length === 1 ? "" : "s"}, ${lost.reduce((n, s) => n - s.points, 0)} points lost`}
+      </span>
+      <span className="inline-flex shrink-0 items-center gap-1 text-sm text-muted-foreground">
+        Report
+        <ArrowDownIcon className="size-3.5" aria-hidden />
+      </span>
+    </a>
+  );
+}
+
 function describe(e: PackageEvent): string {
   const field = (k: string): string => {
     const val: unknown = typeof e.detail === "object" && e.detail !== null ? Reflect.get(e.detail, k) : undefined;
@@ -193,7 +212,7 @@ export default function PackagePage({ params, searchParams }: PageProps) {
 function SectionTitle({ id, children, aside }: { id: string; children: React.ReactNode; aside?: React.ReactNode }) {
   return (
     <div className="mb-4 flex items-baseline justify-between gap-4">
-      <h2 id={id} className="text-xl font-medium tracking-tight">
+      <h2 id={id} className="scroll-mt-24 text-xl font-medium tracking-tight">
         {children}
       </h2>
       {aside}
@@ -263,17 +282,21 @@ async function PackageContent({ params, searchParams }: PageProps) {
         )}
       </header>
 
-      <div className="grid grid-cols-[minmax(0,1fr)] gap-12 lg:grid-cols-[minmax(0,1fr)_320px] lg:gap-14">
-        <div className="flex min-w-0 flex-col gap-12">
-          <InstallTabs name={pkg.name} version={version} />
+      {/* Phones get one column in reading order: install, score summary, facts, the full report, readme,
+          versions. From lg the two wrappers become columns and the order classes stop applying. */}
+      <div className="flex flex-col gap-10 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-14">
+        <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
+          <div className="order-1 lg:order-none">
+            <InstallTabs name={pkg.name} version={version} registry={REGISTRY} />
+          </div>
 
-          <section aria-labelledby="score">
+          <section aria-labelledby="score" className="order-4 lg:order-none">
             <SectionTitle id="score">Security score</SectionTitle>
             {score ? <ScorePanel score={score} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
           </section>
 
           {review.kind === "ok" && (
-            <section aria-labelledby="ai-review">
+            <section aria-labelledby="ai-review" className="order-5 lg:order-none">
               <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{review.value.version}</span>}>
                 AI review
               </SectionTitle>
@@ -281,55 +304,8 @@ async function PackageContent({ params, searchParams }: PageProps) {
             </section>
           )}
 
-          <section aria-labelledby="versions">
-            <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>
-              Versions
-            </SectionTitle>
-            <div className="overflow-hidden rounded-xl border">
-              <Table>
-                <TableHeader className="bg-surface">
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead className="h-10 pl-4 font-normal text-muted-foreground">Version</TableHead>
-                    <TableHead className="hidden h-10 font-normal text-muted-foreground sm:table-cell">Published</TableHead>
-                    <TableHead className="hidden h-10 font-normal text-muted-foreground sm:table-cell">By</TableHead>
-                    <TableHead className="h-10 pr-4 text-right font-normal text-muted-foreground">Score</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {pkg.versions.slice(0, 12).map((v) => (
-                    <TableRow key={v.version} className="hover:bg-surface/60">
-                      <TableCell className="py-3 pl-4 whitespace-normal">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Link
-                            href={`${packagePath(pkg.name)}?v=${encodeURIComponent(v.version)}`}
-                            aria-current={v.version === version ? "page" : undefined}
-                            className={`font-mono text-[15px] underline-offset-4 hover:underline aria-[current=page]:font-semibold ${v.status === "active" ? "" : "text-muted-foreground line-through"}`}
-                          >
-                            {v.version}
-                          </Link>
-                          <StatusBadge status={v.status} />
-                          {v.deprecated && <span className="text-xs text-muted-foreground">deprecated</span>}
-                        </div>
-                        {v.statusReason && <div className="mt-1 text-sm text-muted-foreground">{v.statusReason}</div>}
-                        <div className="mt-0.5 text-xs text-muted-foreground sm:hidden">
-                          {ago(v.publishedAt)} by <span className="font-mono">{v.publishedBy}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell className="hidden py-3 text-muted-foreground sm:table-cell">{ago(v.publishedAt)}</TableCell>
-                      <TableCell className="hidden py-3 font-mono text-[13px] text-muted-foreground sm:table-cell">{v.publishedBy}</TableCell>
-                      <TableCell className="py-3 pr-4 text-right">
-                        <ScoreBadge score={v.score} grade={v.grade} />
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-              {pkg.versions.length > 12 && <p className="border-t bg-surface px-4 py-2.5 text-sm text-muted-foreground">{pkg.versions.length - 12} older versions not shown</p>}
-            </div>
-          </section>
-
           {pkg.readme && (
-            <section aria-labelledby="readme">
+            <section aria-labelledby="readme" className="order-6 lg:order-none">
               <SectionTitle id="readme">Readme</SectionTitle>
               <details className="group rounded-xl border">
                 <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-[15px] select-none hover:bg-surface/60 [&::-webkit-details-marker]:hidden">
@@ -350,23 +326,31 @@ async function PackageContent({ params, searchParams }: PageProps) {
               </details>
             </section>
           )}
+
+          <section aria-labelledby="versions" className="order-7 lg:order-none">
+            <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>
+              Versions
+            </SectionTitle>
+            <VersionList rows={pkg.versions.map((v) => ({ ...v, when: ago(v.publishedAt) }))} packageHref={packagePath(pkg.name)} current={version} />
+          </section>
         </div>
 
-        <aside className="flex flex-col gap-12">
-          <section aria-labelledby="facts">
+        <div className="contents lg:flex lg:flex-col lg:gap-12">
+          <ScoreSummary score={score} className="order-2 lg:hidden" />
+          <section aria-labelledby="facts" className="order-3 lg:order-none">
             <SectionTitle id="facts">At a glance</SectionTitle>
             <div className="border-t">
               <FactsPanel facts={pkg.facts} maintainers={pkg.maintainers} lastPublish={latest?.publishedAt ?? null} />
             </div>
           </section>
           {events.kind === "unavailable" && (
-            <section aria-labelledby="log">
+            <section aria-labelledby="log" className="order-8 lg:order-none">
               <SectionTitle id="log">Public log</SectionTitle>
               <p className="text-[15px] text-muted-foreground">Couldn&apos;t load the public log. The registry did not answer; reload to try again.</p>
             </section>
           )}
           {events.kind === "ok" && events.value.length > 0 && (
-            <section aria-labelledby="log">
+            <section aria-labelledby="log" className="order-8 lg:order-none">
               <SectionTitle id="log">Public log</SectionTitle>
               <ol className="relative flex flex-col gap-5 border-l pl-5">
                 {events.value.slice(0, 15).map((e, i) => (
@@ -379,7 +363,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
               </ol>
             </section>
           )}
-        </aside>
+        </div>
       </div>
     </div>
   );

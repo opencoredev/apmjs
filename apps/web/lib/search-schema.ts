@@ -54,6 +54,16 @@ export const LookalikePart = z.object({
 
 export type LookalikePart = z.infer<typeof LookalikePart>;
 
+/** The nearest popular name a query could be mistaken for, and the line every name check shows for it. */
+export type TypoRisk = { name: string; reason: string; summary: string };
+
+/** A look-alike outranks a merely similar name; null when nothing popular is close. */
+export function typoRisk(answer: LookalikePart): TypoRisk | null {
+  const nearest = answer.lookalikes[0] ?? answer.similar[0];
+
+  return nearest ? { ...nearest, summary: `Typo risk: similar to ${nearest.name}` } : null;
+}
+
 export const AlternativesPart = z.object({
   query: z.string(),
   valid: z.boolean(),

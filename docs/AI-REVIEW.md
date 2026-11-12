@@ -186,6 +186,20 @@ bun apps/reviewer/src/main.ts
 
 ### As a systemd user unit
 
+The reviewer runs from its own clone, `~/code/apmjs-reviewer`, on `main`. Keep it out of the working checkout: a branch switch, a half-finished edit or a deploy there would change the code a running reviewer loads on its next restart. The staging unit is `apm-reviewer-staging`.
+
+To update it to the latest `main`:
+
+```sh
+cd ~/code/apmjs-reviewer
+git fetch origin && git checkout -q main && git reset -q --hard origin/main
+bun install
+systemctl --user restart apm-reviewer-staging
+journalctl --user -u apm-reviewer-staging -n 20   # leasing resumes within a poll interval
+```
+
+Make no edits in that clone; `reset --hard` discards them.
+
 `~/.config/systemd/user/apm-reviewer.service`:
 
 ```ini
@@ -196,7 +210,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/code/apmjs
+WorkingDirectory=%h/code/apmjs-reviewer
 ExecStart=%h/.bun/bin/bun apps/reviewer/src/main.ts
 Environment=REVIEW_REGISTRY_URL=https://registry.example/
 Environment=REVIEW_SERVICE_TOKEN_FILE=%h/.config/apm/review-token

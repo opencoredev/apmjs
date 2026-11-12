@@ -17,6 +17,7 @@ import {
   SearchAnswer,
   alternativesView,
   looksLikePackageName,
+  typoRisk,
   type AlternativesView,
   type NamePart,
   type NamePartAnswer,
@@ -262,7 +263,7 @@ function ScopeSlot({ q, state }: { q: string; state: PartState<"alternatives"> }
 }
 
 function LookalikeSlot({ state }: { state: PartState<"lookalike"> }) {
-  const nearest = state.kind === "ok" ? (state.data.lookalikes[0] ?? state.data.similar[0]) : undefined;
+  const nearest = state.kind === "ok" ? typoRisk(state.data) : null;
 
   return (
     <Slot label="Look-alike" href={nearest ? packageHref(nearest.name) : undefined}>
@@ -356,21 +357,42 @@ function NamePanel({ q, states }: { q: string; states: NameStates }) {
   );
 }
 
-/** Phone: one line above the results that opens into the same four slots. */
+/** Phone: one line above the results that opens into the same four slots. A typo risk stays visible while closed. */
 function NameDisclosure({ q, states }: { q: string; states: NameStates }) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  const risk = states.lookalike.kind === "ok" ? typoRisk(states.lookalike.data) : null;
+
   return (
-    <details className="group overflow-hidden rounded-2xl border">
-      <summary className="flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-4 py-2.5 [&::-webkit-details-marker]:hidden">
+    <section aria-label={`Name check for ${q}`} className="overflow-hidden rounded-2xl border">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((o) => !o)}
+        className="flex min-h-12 w-full cursor-pointer items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors hover:bg-surface/60"
+      >
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-sm text-muted-foreground">Name check</span>
           <ExactStatus state={states.exact} />
         </span>
-        <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden />
-      </summary>
-      <div className="flex flex-col divide-y border-t">
+        <ChevronDownIcon className={cn("size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} aria-hidden />
+      </button>
+      {risk && (
+        <Link
+          href={packageHref(risk.name)}
+          prefetch={false}
+          className="group flex min-h-11 items-center gap-2 border-t bg-warn-soft px-4 py-2.5 text-sm font-medium text-warn transition-colors hover:bg-warn-soft/70"
+        >
+          <TriangleAlertIcon className="size-4 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1 text-pretty">{risk.summary}</span>
+          <ArrowRightIcon className="size-4 shrink-0 transition-transform group-hover:translate-x-0.5" aria-hidden />
+        </Link>
+      )}
+      <div id={panelId} hidden={!open} className="flex flex-col divide-y border-t">
         <NameSlots q={q} states={states} />
       </div>
-    </details>
+    </section>
   );
 }
 
