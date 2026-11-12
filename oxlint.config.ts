@@ -92,6 +92,8 @@ export default defineConfig({
     ".windsurf/**",
     ".hill-climb/**",
     "tools/oxlint/anti-slop/**",
+    // apm-score-v3 copied from git history as the fuzz test's reference; it must stay byte for byte as it was
+    "packages/core/test/v3/**",
     "apps/web/next-env.d.ts",
   ],
   jsPlugins: [

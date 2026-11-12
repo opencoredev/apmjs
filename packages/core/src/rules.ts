@@ -19,7 +19,8 @@ export type Confidence = "confirmed" | "possible";
  */
 export type How = "as written" | "after joining strings" | "decoded" | "run from a string" | "joined, then run" | "decoded, then run";
 
-type FindingAt = { id: CodeSignal; line: number; snippet: string; how: How };
+/** `tree`: the parsed program itself showed it (a call, a load, a string's role); otherwise only a text rule matched. */
+type FindingAt = { id: CodeSignal; line: number; snippet: string; how: How; tree?: true };
 
 /** One rule match: the signal, where it is, whether the text had to be joined or decoded first, and how sure it is (with why, when only possible). */
 export type TextFinding = FindingAt & ({ confidence: "confirmed" } | { confidence: "possible"; why: string });
@@ -236,7 +237,12 @@ export function printable(s: string): boolean {
   return ok / s.length >= 0.95;
 }
 
-export type RegionOf = (index: number) => Region;
+/**
+ * What a match at `index` means, by where it sits. A judge that knows the program also gets the match's end, the
+ * signal it would raise and the rule kind (`decoded` for text found by decoding a string), so it can tell which
+ * token the match rests on and whether that token is proven harmless for that signal.
+ */
+export type RegionOf = (index: number, end?: number, id?: CodeSignal, kind?: Kind | "decoded") => Region;
 
 /** A file read raw: no parser could follow it, so nothing is known and every match counts. */
 export const RAW: RegionOf = () => "raw";
@@ -281,7 +287,7 @@ export function ruleHits(text: string, how: How, skip: ReadonlySet<CodeSignal>, 
           continue;
         }
 
-        const r = region(m.index);
+        const r = region(m.index, m.index + m[0].length, rule.id, p.kind);
         const confidence = CONFIDENCE[p.kind][r];
 
         if (!confidence || r === "excluded") continue;
@@ -345,7 +351,7 @@ export function envExfil(text: string, region: RegionOf): { index: number; confi
   let tries = 0;
 
   for (const m of text.matchAll(WHOLE_ENV)) {
-    const r = region(m.index);
+    const r = region(m.index, m.index + m[0].length, "credential-access", "code");
 
     if (r !== "excluded") {
       const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
@@ -365,18 +371,18 @@ export function envExfil(text: string, region: RegionOf): { index: number; confi
  * which apm lists or skips like the files that hold them. Escapes spelling out text have no honest use, so they
  * are confirmed; a long base64 text is confirmed only when code loads or runs it.
  */
-export function encodedLiterals(text: string, region: RegionOf): TextFinding[] {
+export function encodedLiterals(text: string, region: RegionOf, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
   const out: TextFinding[] = [];
   const escapes = escapedTextAt(text);
 
-  if (escapes >= 0 && region(escapes) !== "excluded") out.push({ id: "obfuscated", ...lineOf(text, escapes), how: "as written", confidence: "confirmed" });
+  if (escapes >= 0 && region(escapes, escapes + 1, "obfuscated", "code") !== "excluded") out.push({ id: "obfuscated", ...place(escapes), how: "as written", confidence: "confirmed" });
 
   for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
-    const r = region(m.index);
+    const r = region(m.index, m.index + 1, "obfuscated", "code");
 
     if (r === "excluded" || !longBase64Text(m[1] ?? "")) continue;
     const confidence: Confidence = r === "string" ? "possible" : "confirmed";
-    out.push(judged({ id: "obfuscated", ...lineOf(text, m.index), how: "as written" }, confidence, "a long base64 string decodes to text, but apm did not see code load or run it"));
+    out.push(judged({ id: "obfuscated", ...place(m.index), how: "as written" }, confidence, "a long base64 string decodes to text, but apm did not see code load or run it"));
     break;
   }
 

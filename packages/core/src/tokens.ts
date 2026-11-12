@@ -9,6 +9,17 @@ import { tokTypes as tt, tokenizer, type Token } from "acorn";
 /** How many times the tokenizer may skip a character it cannot read (a decorator's `@`, Flow syntax) and go on. */
 const MAX_RESUMES = 64;
 
+/** How far apart the places a window may end are offered: the first statement end past each step. */
+const CUT_STEP = 256 * 1024;
+
+/**
+ * The file's tokens in plain form (`text`, the same length as the file), and `cuts`: offsets just past a `;` token,
+ * one at most every CUT_STEP characters, where a window of the text rules may end. A cut is always between two
+ * tokens, so no comment, string, template or escape is split, and never inside a statement that ends with `;`, so
+ * a call cannot be split from its arguments however much blank space or comment sits between them.
+ */
+export type TokenText = { text: string; cuts: number[] };
+
 /** A string literal as the text rules read one: single quotes, with nothing in it that would end it early. */
 function quoted(value: string): string {
   return `'${value.replace(/['\\\n\r\u2028\u2029]/g, " ")}'`;
@@ -41,14 +52,17 @@ function plainForm(t: Token, source: string): string | null {
 /**
  * The file's tokens in their plain forms, at their own offsets (same length as `text`), or null when not even one
  * token could be read. A character the tokenizer cannot read is kept as it is and reading resumes after it.
+ * `cutStep` spaces the offered cuts (a parameter so tests can make small windows).
  */
-export function tokenText(text: string): string | null {
+export function tokenText(text: string, cutStep = CUT_STEP): TokenText | null {
   let out = "";
   let last = 0;
   let resumes = 0;
   let from = 0;
   let any = false;
   let done = false;
+  const cuts: number[] = [];
+  let nextCut = cutStep;
 
   while (from < text.length) {
     try {
@@ -63,6 +77,11 @@ export function tokenText(text: string): string | null {
         out += form !== null && form.length <= source.length ? form + " ".repeat(source.length - form.length) : source;
         last = end;
         any = true;
+
+        if (t.type === tt.semi && end >= nextCut) {
+          cuts.push(end);
+          nextCut = end + cutStep;
+        }
       }
 
       done = true;
@@ -82,5 +101,5 @@ export function tokenText(text: string): string | null {
   if (!any) return null;
 
   // what follows the last token is blank space and comments once every token was read; otherwise it stays as it is
-  return out + (done ? blank(text.slice(last)) : text.slice(last));
+  return { text: out + (done ? blank(text.slice(last)) : text.slice(last)), cuts };
 }

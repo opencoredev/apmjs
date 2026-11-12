@@ -1,0 +1,411 @@
+[
+  {
+    "name": "tag-function",
+    "file": "index.js",
+    "src": "Function`process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')`();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "extends-function",
+    "file": "index.js",
+    "src": "class F extends Function{};new F(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "extends-function-super",
+    "file": "index.js",
+    "src": "class F extends Function{constructor(){super(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}}new F()();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "prototype-constructor",
+    "file": "index.js",
+    "src": "Function.prototype.constructor(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "constructor-chain",
+    "file": "index.js",
+    "src": "(()=>{}).constructor.prototype.constructor(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "return-limit",
+    "file": "index.js",
+    "src": "function get(x){if(x===0)return eval;if(x===1)return 1;if(x===2)return 2;if(x===3)return 3;return 4;}get(0)(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "computed-bind",
+    "file": "index.js",
+    "src": "eval['bind'](null,\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "symbol-key",
+    "file": "index.js",
+    "src": "const k=Symbol('k');const o={[k]:eval};o[k](\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "symbol-for",
+    "file": "index.js",
+    "src": "const o={[Symbol.for('go')]:eval};o[Symbol.for('go')](\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "generator-yield",
+    "file": "index.js",
+    "src": "function* get(){yield eval;}get().next().value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "generator-return",
+    "file": "index.js",
+    "src": "function* get(){return eval;}get().next().value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "async-generator",
+    "file": "index.mjs",
+    "src": "async function* get(){yield eval;}(await get().next()).value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "this-global",
+    "file": "index.js",
+    "src": "const g=this;g.eval(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "getter-this",
+    "file": "index.js",
+    "src": "const o={x:eval,get go(){return this.x}};o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "alias-write",
+    "file": "index.js",
+    "src": "const o={};const alias=o;alias.go=eval;o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "descriptor",
+    "file": "index.js",
+    "src": "const d={get:()=>eval};const o={};Object.defineProperty(o,'go',d);o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "proxy-target",
+    "file": "index.js",
+    "src": "const o=new Proxy({go:eval},{});o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "namespace-merge",
+    "file": "index.ts",
+    "src": "namespace X {export const go=eval;}namespace X {go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "namespace-declare",
+    "file": "index.ts",
+    "src": "declare namespace X {const unused:string;}namespace X {export const go=eval;}X.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "returned-string",
+    "file": "index.js",
+    "src": "function get(){return \"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";}eval(get());\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 82,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "parameter-function",
+    "file": "index.js",
+    "src": "function go(f,s){f(s)()}go(Function,\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 92,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "precision-async",
+    "file": "index.js",
+    "src": "async function get(){return eval;}get()(\"fetch('https://example.invalid')\");\n",
+    "kind": "precision",
+    "v3": 90,
+    "v6": 80,
+    "v7": 87,
+    "signals": {
+      "network": "confirmed",
+      "eval": "possible"
+    },
+    "why": "calling what an async function returns calls a Promise, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call"
+  },
+  {
+    "name": "precision-generator",
+    "file": "index.js",
+    "src": "function* get(){return eval;}get()(\"fetch('https://example.invalid')\");\n",
+    "kind": "precision",
+    "v3": 90,
+    "v6": 80,
+    "v7": 87,
+    "signals": {
+      "network": "confirmed",
+      "eval": "possible"
+    },
+    "why": "calling what a generator function returns calls a generator object, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call"
+  },
+  {
+    "name": "candidate-limit",
+    "file": "index.js",
+    "src": "const a=()=>1,b=()=>2,c=()=>3,d=()=>4,e=()=>5,f=()=>6;const v=[0,0,0,0,0,0];(v[0]?a:v[1]?b:v[2]?c:v[3]?d:v[4]?e:v[5]?f:eval)(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
+    "kind": "detection",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    }
+  },
+  {
+    "name": "tag-eval",
+    "file": "index.js",
+    "src": "eval`require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')`;",
+    "kind": "precision",
+    "v3": 30,
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    },
+    "why": "eval used as a tag is handed an array of the template's strings and returns it unrun. At a script's top level that array is the script's completion value, which code running the file through vm or eval receives, so v3's verdict stands; inside a function the same line proves harmless (see sol-parser-v6.test.ts)"
+  },
+  {
+    "name": "import-meta-resolve",
+    "file": "index.mjs",
+    "src": "import(import.meta.resolve('node:child_process'));",
+    "kind": "detection",
+    "v3": 85,
+    "v6": 95,
+    "v7": 85,
+    "signals": {
+      "shell-exec": "confirmed"
+    }
+  }
+]

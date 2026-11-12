@@ -45,8 +45,10 @@ describe("a string confirms only what its role allows", () => {
 
   test("a credential path is confirmed when it is read, possible when a path is only built", () => {
     expect(found("require('fs').readFileSync(require('path').join(require('os').homedir(), '.npmrc'));\n")).toEqual({ "credential-access": "confirmed" });
-    expect(found("const p = require('path').join('.npmrc');\n")).toEqual({ "credential-access": "possible" });
-    expect(found("const fake = { readFileSync(x) { return x } }; fake.readFileSync('.npmrc');\n")).toEqual({ "credential-access": "possible" });
+    expect(found("function f() { const p = require('path').join('.npmrc'); }\n")).toEqual({ "credential-access": "possible" });
+    // held at a script's top level, the path may be read by another script; through a method's parameter apm does not follow it
+    expect(found("const p = require('path').join('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
+    expect(found("const fake = { readFileSync(x) { return x } }; fake.readFileSync('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
     expect(found("const read = require('fs').readFileSync; read('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
   });
 
@@ -108,7 +110,10 @@ describe("evaluated text is read as code", () => {
 
 describe("calls are read from the tree", () => {
   test("a definition is not a call, whatever its name, and a comment or string cannot make a call one", () => {
-    expect(found("class A { async fetch(url) { return url } }\nfunction fetch(u) { return u }\nfetch('x');\n")).toEqual({});
+    expect(found("class A { async fetch(url) { return url } }\nexport function fetch(u) { return u }\nfetch('x');\n")).toEqual({});
+    expect(found("(function () { function fetch(u) { return u } fetch('x'); })();\n")).toEqual({});
+    // a script's top-level function is the global's own property, which another script can replace
+    expect(found("function fetch(u) { return u }\nfetch('x');\n")).toEqual({ network: "confirmed" });
     expect(found("fetch(/* ) { */ 'https://example.invalid');\n")).toEqual({ network: "confirmed" });
     expect(found("fetch('https://example.invalid/) {');\n")).toEqual({ network: "confirmed" });
   });
@@ -141,8 +146,9 @@ describe("calls are read from the tree", () => {
     expect(found(run)).toMatchObject({ "shell-exec": "confirmed", network: "confirmed" });
   });
 
-  test("an object's own fetch method is possible, the global one confirmed", () => {
-    expect(found("class App { fetch(r) { return r } run(x) { return this.fetch(x) } }\n")).toEqual({ network: "possible" });
+  test("a method named fetch on an object apm cannot pin down counts as apm-score-v3 counted it", () => {
+    // `this` can be a subclass instance or anything a caller binds, so the floor keeps v3's reading
+    expect(found("class App { fetch(r) { return r } run(x) { return this.fetch(x) } }\n")).toEqual({ network: "confirmed" });
     expect(found("const res = await (custom || fetch)(req);\n")).toEqual({ network: "confirmed" });
   });
 });

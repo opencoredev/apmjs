@@ -46,9 +46,11 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * reads calls, aliases and evaluated strings from the tree, and confirms what a string holds only by its role. v6
  * resolves names by lexical scope, reads members of local objects (getters, Proxy traps, writes), follows every
  * operand that can be a callee and arguments through apply, bind and spreads, reads a file with no tree token by
- * token, and reads every file an exports or imports pattern exposes.
+ * token, and reads every file an exports or imports pattern exposes. v7 starts every parsed file from what v3 read in
+ * its code (comments and regex literals left out) and lets the tree remove a finding only where it proves the token
+ * harmless; a limit, a value it cannot follow or syntax it does not model leaves v3's finding standing.
  */
-export const SCORER = "apm-score-v6";
+export const SCORER = "apm-score-v7";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -85,7 +87,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -400,19 +402,27 @@ export function dependencyNames(manifest: Record<string, unknown>): string[] {
 }
 
 type Found = {
-  /** Records evidence; a signal is confirmed once any of its evidence is, and then shows only confirmed evidence. */
-  add: (id: SignalId, ev: string, confidence?: Confidence) => void;
+  /**
+   * Records evidence; a signal is confirmed once any of its evidence is, and then shows only confirmed evidence.
+   * `textOnly`: only a text rule matched it (the floor), so it is listed after what a parsed program showed.
+   */
+  add: (id: SignalId, ev: string, confidence?: Confidence, textOnly?: boolean) => void;
   has: (id: SignalId) => boolean;
   get: (id: SignalId) => { evidence: string[]; confidence: Confidence } | undefined;
 };
 
 function collector(): Found {
   const found = new Map<SignalId, { confirmed: string[]; possible: string[] }>();
+  const textOnly = new Set<string>();
+  // the call or load a parsed program showed comes before a text match, so it is what the shown evidence cites
+  const ranked = (list: readonly string[]): string[] => [...list].sort((a, b) => Number(textOnly.has(a)) - Number(textOnly.has(b)));
 
   return {
-    add(id, ev, confidence = "confirmed") {
+    add(id, ev, confidence = "confirmed", text = false) {
       const entry = found.get(id) ?? { confirmed: [], possible: [] };
       const list = entry[confidence];
+
+      if (text) textOnly.add(ev);
 
       if (!list.includes(ev)) list.push(ev);
       found.set(id, entry);
@@ -423,7 +433,7 @@ function collector(): Found {
 
       if (!entry) return undefined;
 
-      return entry.confirmed.length > 0 ? { evidence: entry.confirmed, confidence: "confirmed" } : { evidence: entry.possible, confidence: "possible" };
+      return entry.confirmed.length > 0 ? { evidence: ranked(entry.confirmed), confidence: "confirmed" } : { evidence: ranked(entry.possible), confidence: "possible" };
     },
   };
 }
@@ -558,6 +568,10 @@ export function analyze(input: AnalyzeInput): Analysis {
   const unanalyzed: SkippedFile[] = [];
   let scanned = 0;
   let qi = 0;
+  // proofs that rest on a global or builtin module (fetch sends, path.join builds) hold only if no file could replace one
+  const sinkOnly: { path: string; finding: TextFinding }[] = [];
+  let patched: string | null = null;
+  const limits = new Map<string, string[]>();
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
     if (isBinary(f)) {
@@ -591,7 +605,13 @@ export function analyze(input: AnalyzeInput): Analysis {
     // a README or LICENSE a pattern exposes is not JavaScript: node would throw a SyntaxError, so nothing in it runs
     if (scan.rejected && exposedOnly.has(f.path) && NOT_CODE.test(f.path)) return;
 
-    for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence);
+    for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, finding.tree !== true);
+
+    for (const finding of scan.sinkOnly) sinkOnly.push({ path: f.path, finding });
+
+    if (scan.patches) patched ??= `${f.path}, ${scan.patches}`;
+
+    for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
 
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
     const imports = scan.imports;
@@ -638,6 +658,8 @@ export function analyze(input: AnalyzeInput): Analysis {
       analyzeFile(g, true);
     }
   }
+
+  if (patched) for (const { path, finding } of sinkOnly) add(finding.id, describeFinding(path, finding), finding.confidence, true);
 
   for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
@@ -691,6 +713,8 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   const notChecked = [
     ...NOT_CHECKED,
+    ...(patched && sinkOnly.length > 0 ? [`what a string sent to fetch, read as a path or built by path.join or an Error holds, because a file could replace those builtins (${patched}): it was judged by the text rules alone`] : []),
+    ...[...limits].map(([note, paths]) => `${note} (${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ` and ${paths.length - 3} more files` : ""})`),
     ...(unanalyzed.length > 0 ? [`${unanalyzed.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`] : []),
     ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`),
   ];

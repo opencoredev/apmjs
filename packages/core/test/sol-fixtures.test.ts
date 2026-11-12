@@ -1,10 +1,12 @@
-// Every fixture from the independent review of apm-score-v4 (apmjs-bughunt/sol-lexer/REPORT.md), scored by v5. Each
-// is the main file of an MIT package with no other deductions. All are inert: harmless calls to example.invalid and
-// `require('child_process')` with nothing run.
+// Every fixture from the independent review of apm-score-v4 (apmjs-bughunt/sol-lexer/REPORT.md), scored by the
+// current scorer. Each is the main file of an MIT package with no other deductions. All are inert: harmless calls to
+// example.invalid and `require('child_process')` with nothing run.
 //
-// `detection` fixtures hold code that runs (or a control next to it): v5 must find what it does, with the confidence
-// and points written here, and never score above apm-score-v3, the last scorer that read every file raw. `precision`
-// fixtures are ones where v3 confirmed more than the code does; `why` says what v5 reads instead.
+// `detection` fixtures hold code that runs (or a control next to it): they must find what it does, with the
+// confidence and points written here, and never score above apm-score-v3, the last scorer that read every file raw.
+// `precision` fixtures are ones where v3 confirmed more than the code does; `why` says what v5 read instead. Since
+// apm-score-v7 a finding v3 made stands unless the tree proves it harmless; where that proof does not exist, `v7`,
+// `signals7` and `floor` give the score, the signals and the reason, and v7 equals v3 there.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
@@ -20,6 +22,9 @@ const Fixture = z.object({
   v4: z.number(),
   v5: z.number(),
   signals: z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"])),
+  v7: z.number().optional(),
+  signals7: z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"])).optional(),
+  floor: z.string().optional(),
 });
 
 const fixtures = z.array(Fixture).parse(fixtureData);
@@ -44,6 +49,8 @@ describe("the review's fixtures", () => {
     expect(fixtures.length).toBe(104);
     expect(fixtures.filter((f) => f.kind === "detection").length).toBe(83);
     expect(fixtures.every((f) => f.kind === "detection" || (f.why ?? "").length > 0)).toBe(true);
+    // every result v7 changed is explained, and each is v3's own
+    expect(fixtures.every((f) => (f.v7 === undefined) === (f.floor === undefined) && (f.v7 === undefined || f.v7 === f.v3))).toBe(true);
   });
 
   for (const f of fixtures) {
@@ -51,7 +58,7 @@ describe("the review's fixtures", () => {
       const r = score(f);
       const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
-      expect(found).toEqual(f.signals);
+      expect(found).toEqual(f.signals7 ?? f.signals);
 
       for (const s of r.signals) {
         if (!(s.id in POSSIBLE_POINTS)) continue;
@@ -61,9 +68,11 @@ describe("the review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      expect(r.score).toBe(f.v5);
+      const want = f.v7 ?? f.v5;
+
+      expect(r.score).toBe(want);
       // which side of the refusal floor it lands on is part of the claim
-      expect(r.score < SCORE_FLOOR).toBe(f.v5 < SCORE_FLOOR);
+      expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
 
       if (f.kind === "detection") {
         expect(r.score).toBeLessThanOrEqual(f.v3);

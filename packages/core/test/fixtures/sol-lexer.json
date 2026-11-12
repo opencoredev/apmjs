@@ -422,7 +422,12 @@
   "v5": 92,
   "signals": {
    "credential-access": "possible"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "credential-access": "confirmed"
+  },
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
  },
  {
   "name": "kept-readFile-shell",
@@ -499,7 +504,13 @@
   "signals": {
    "network": "possible",
    "obfuscated": "possible"
-  }
+  },
+  "v7": 80,
+  "signals7": {
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  },
+  "floor": "the base64 text is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could decode and run it)"
  },
  {
   "name": "decoded-base64",
@@ -858,7 +869,12 @@
   "v5": 92,
   "signals": {
    "credential-access": "possible"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "credential-access": "confirmed"
+  },
+  "floor": "apm does not follow a value into a local method's parameter, and `fake` is a top-level binding another script could change, so it cannot prove `.npmrc` is never read; apm-score-v3's verdict stands"
  },
  {
   "name": "type-import-nested",
@@ -1030,7 +1046,13 @@
   "signals": {
    "shell-exec": "possible",
    "obfuscated": "confirmed"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "shell-exec": "confirmed",
+   "obfuscated": "confirmed"
+  },
+  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)"
  },
  {
   "name": "ordinary-template-eval",
@@ -1056,7 +1078,12 @@
   "v5": 92,
   "signals": {
    "credential-access": "possible"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "credential-access": "confirmed"
+  },
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
  },
  {
   "name": "credential-new-string",
@@ -1181,7 +1208,12 @@
   "v5": 92,
   "signals": {
    "credential-access": "possible"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "credential-access": "confirmed"
+  },
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
  },
  {
   "name": "false-decoded-body",
@@ -1223,7 +1255,13 @@
   "signals": {
    "shell-exec": "possible",
    "obfuscated": "confirmed"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "shell-exec": "confirmed",
+   "obfuscated": "confirmed"
+  },
+  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)"
  },
  {
   "name": "function-parenthesized",
@@ -1314,6 +1352,11 @@
   "v5": 92,
   "signals": {
    "credential-access": "possible"
-  }
+  },
+  "v7": 75,
+  "signals7": {
+   "credential-access": "confirmed"
+  },
+  "floor": "the token name is held in `help`, a top-level binding of a file that may run as a classic script, where every other script can read it; apm cannot prove nothing does, so apm-score-v3's verdict stands"
  }
 ]
