@@ -89,27 +89,82 @@ export async function pendingMigrations(url: string): Promise<string[]> {
 /** How often a run waiting for another run's lock asks again. */
 const LOCK_POLL_MS = 100;
 
+/** How long a run waits for another run's lock before it gives up, unless APM_MIGRATE_LOCK_TIMEOUT_MS says otherwise. */
+export const DEFAULT_LOCK_TIMEOUT_MS = 5 * 60_000;
+
+/** The wait for the lock, from APM_MIGRATE_LOCK_TIMEOUT_MS (whole milliseconds, at least 1); unset means the default. */
+export function lockTimeoutFrom(env: Record<string, string | undefined>): number {
+  const raw = env.APM_MIGRATE_LOCK_TIMEOUT_MS;
+
+  if (raw === undefined || raw.trim() === "") return DEFAULT_LOCK_TIMEOUT_MS;
+
+  if (!/^\d{1,10}$/.test(raw.trim()) || Number(raw) < 1) throw new Error(`APM_MIGRATE_LOCK_TIMEOUT_MS must be a whole number of milliseconds, 1 or more (got "${raw}")`);
+
+  return Number(raw);
+}
+
+const lockHex = `0x${MIGRATION_LOCK.toString(16)}`;
+
+/** Who holds the migration lock, as one line for the error: the backend's pid and what it said about itself. */
+async function lockHolder(client: Client): Promise<{ pid: number; line: string } | null> {
+  // a bigint advisory lock is stored as classid (high 32 bits) and objid (low 32 bits), with objsubid 1
+  const r = await client.query<{ pid: number; application_name: string | null; client_addr: string | null; backend_start: Date | null; state: string | null }>(
+    `SELECT l.pid, a.application_name, a.client_addr::text AS client_addr, a.backend_start, a.state
+       FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+      WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1
+        AND ((l.classid::bigint << 32) | l.objid::bigint) = $1::bigint
+      LIMIT 1`,
+    [String(MIGRATION_LOCK)],
+  );
+
+  const row = r.rows[0];
+
+  if (!row) return null;
+  const about = [row.application_name ? `application "${row.application_name}"` : null, row.client_addr ? `from ${row.client_addr}` : null, row.backend_start ? `connected ${row.backend_start.toISOString()}` : null, row.state ? `state ${row.state}` : null].filter(Boolean);
+
+  return { pid: row.pid, line: `backend pid ${row.pid}${about.length > 0 ? ` (${about.join(", ")})` : ""}` };
+}
+
 /**
  * Takes the migration lock, waiting for a run that holds it. A waiter asks with pg_try_advisory_lock between short
  * sleeps rather than blocking in pg_advisory_lock: a blocked statement holds a snapshot, and CREATE INDEX CONCURRENTLY
  * in the run holding the lock waits for every older snapshot, so the two would deadlock.
  */
-async function lockMigrations(client: Client): Promise<void> {
+async function lockMigrations(client: Client, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
   for (;;) {
     const r = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock($1) AS locked", [MIGRATION_LOCK]);
 
     if (r.rows[0]?.locked === true) return;
-    await Bun.sleep(LOCK_POLL_MS);
+
+    if (Date.now() >= deadline) {
+      const holder = await lockHolder(client).catch(() => null);
+      const who = holder ? `It is held by ${holder.line}.` : "No session holds it now; it was released as this run gave up, so run again.";
+      const clear = holder ? ` If that run is still working, let it finish. If it is gone or stuck, end its session with SELECT pg_terminate_backend(${holder.pid}); and run again.` : "";
+
+      throw new Error(
+        `migrations: gave up after ${timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}s` : `${timeoutMs} ms`} waiting for the migration lock (Postgres advisory lock ${lockHex}, "apm-migrate"). ${who}${clear} Set APM_MIGRATE_LOCK_TIMEOUT_MS to wait longer.`,
+      );
+    }
+
+    await Bun.sleep(Math.min(LOCK_POLL_MS, Math.max(1, deadline - Date.now())));
   }
 }
 
-/** Applies pending migrations; returns the ids it applied. */
-export async function migrate(url: string): Promise<string[]> {
+/**
+ * Applies pending migrations; returns the ids it applied. Waits up to `lockTimeoutMs` (APM_MIGRATE_LOCK_TIMEOUT_MS, else
+ * 5 minutes) for another run's lock, then fails naming the session that holds it.
+ */
+export async function migrate(url: string, opts: { lockTimeoutMs?: number } = {}): Promise<string[]> {
+  const lockTimeoutMs = opts.lockTimeoutMs ?? lockTimeoutFrom(process.env);
   const client = new Client({ connectionString: url });
   await client.connect();
+  let locked = false;
 
   try {
-    await lockMigrations(client);
+    await lockMigrations(client, lockTimeoutMs);
+    locked = true;
     await client.query("CREATE TABLE IF NOT EXISTS apm_migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
     const done = new Set((await client.query<{ id: string }>("SELECT id FROM apm_migrations")).rows.map((r) => r.id));
     const applied: string[] = [];
@@ -129,7 +184,7 @@ export async function migrate(url: string): Promise<string[]> {
     return applied;
   } finally {
     // ending the session releases the lock too; unlocking first frees it even if end() is slow
-    await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK]).catch(() => {});
+    if (locked) await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK]).catch(() => {});
     await client.end();
   }
 }

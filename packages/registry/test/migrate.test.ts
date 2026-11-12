@@ -3,7 +3,7 @@
 import { expect, test } from "bun:test";
 import { Client } from "pg";
 import { emptyDatabase } from "../../../tests/acceptance/postgres.ts";
-import { migrate, migrationFiles, statementsOf } from "../scripts/migrate.ts";
+import { lockTimeoutFrom, migrate, migrationFiles, statementsOf } from "../scripts/migrate.ts";
 
 test("concurrent migration runs apply each migration once and both succeed", async () => {
   const db = await emptyDatabase();
@@ -129,4 +129,39 @@ test("a migration marked no-transaction runs one statement at a time; the others
     "SET lock_timeout = '5s'",
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS a ON t (x)",
   ]);
+});
+
+// Re-review finding 6: a run waiting for the migration lock polled forever, so a run that died holding it (or a stuck
+// session) hung every later deploy with no message.
+test("a run waiting for the migration lock gives up at its deadline and names the session that holds it", async () => {
+  const db = await emptyDatabase();
+  const holder = await connect(db.url);
+
+  try {
+    const pid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]?.pid;
+    await holder.query("SELECT pg_advisory_lock($1)", [String(0x61_706d_6d69_67)]);
+    const started = Date.now();
+    const run = migrate(db.url, { lockTimeoutMs: 500 });
+    // the old code waited forever: a 10 s ceiling stands in for that
+    const outcome = await Promise.race([run.then(() => "finished", String), Bun.sleep(10_000).then(() => "still waiting after 10 s")]);
+
+    expect(outcome).toContain("gave up after 500 ms waiting for the migration lock (Postgres advisory lock 0x61706d6d6967");
+    expect(outcome).toContain(`held by backend pid ${pid}`);
+    expect(outcome).toContain(`SELECT pg_terminate_backend(${pid});`);
+    expect(outcome).toContain("APM_MIGRATE_LOCK_TIMEOUT_MS");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // once the holder lets go, a run goes through
+    await holder.query("SELECT pg_advisory_unlock($1)", [String(0x61_706d_6d69_67)]);
+    expect((await migrate(db.url, { lockTimeoutMs: 5_000 })).length).toBe(migrationFiles().length);
+  } finally {
+    await holder.end();
+    await db.drop();
+  }
+});
+
+test("APM_MIGRATE_LOCK_TIMEOUT_MS sets the wait; unset is five minutes; anything but a whole number of ms is refused", () => {
+  expect(lockTimeoutFrom({})).toBe(5 * 60_000);
+  expect(lockTimeoutFrom({ APM_MIGRATE_LOCK_TIMEOUT_MS: "1500" })).toBe(1500);
+
+  for (const bad of ["0", "-1", "1.5", "5m", "abc"]) expect(() => lockTimeoutFrom({ APM_MIGRATE_LOCK_TIMEOUT_MS: bad })).toThrow("APM_MIGRATE_LOCK_TIMEOUT_MS");
 });
