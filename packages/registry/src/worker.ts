@@ -1,5 +1,6 @@
 // The registry Worker: a thin fetch handler over the Effect program, the analysis queue consumer and the cron
 // that writes down time-based state changes. Services are built per request from the Worker's bindings.
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Cause, Effect, Exit, Layer } from "effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
@@ -17,7 +18,7 @@ import { route } from "./router.ts";
 import { legacyAuthRefusal } from "./startup.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { considerUpstream, REVIEW_DEFAULTS, ReviewConfig, reviewLocalCommit, type ReviewSettings } from "./review.ts";
-import { Timing, type TimingApi } from "./timing.ts";
+import { Timing, type TimingApi, type TimingDetail } from "./timing.ts";
 import { Upstream } from "./upstream.ts";
 
 const Method = z.instanceof(Function);
@@ -77,7 +78,25 @@ const WorkerEnv = z.object({
   APM_REVIEW_LEASE_MS: z.coerce.number().int().min(1).optional(),
   APM_REVIEW_REQUESTS_PER_HOUR: z.coerce.number().int().min(0).optional(),
   APM_REVIEW_MAX_ATTEMPTS: z.coerce.number().int().min(1).optional(),
+  /** sha256 (hex) of the operator's debug token: a request whose x-apm-debug header is that token gets the full Server-Timing (timing.ts). */
+  APM_DEBUG_TOKEN_HASH: z
+    .string()
+    .regex(/^[0-9a-fA-F]{64}$/, "APM_DEBUG_TOKEN_HASH must be a sha256 hex digest")
+    .optional(),
 });
+
+const DebugEnv = WorkerEnv.pick({ APM_DEBUG_TOKEN_HASH: true });
+
+/** "full" only when the request's x-apm-debug header hashes to APM_DEBUG_TOKEN_HASH; anyone else gets "coarse". */
+export function timingDetail(req: Request, rawEnv: RawEnv): TimingDetail {
+  const parsed = DebugEnv.safeParse(rawEnv);
+  const token = req.headers.get("x-apm-debug");
+
+  if (!parsed.success || parsed.data.APM_DEBUG_TOKEN_HASH === undefined || token === null || token.trim() === "") return "coarse";
+  const expected = Buffer.from(parsed.data.APM_DEBUG_TOKEN_HASH, "hex");
+
+  return timingSafeEqual(createHash("sha256").update(token.trim()).digest(), expected) ? "full" : "coarse";
+}
 
 /** What the Workers runtime hands the entry: the bindings and vars as declared, before they are checked. */
 export type RawEnv = z.input<typeof WorkerEnv>;
@@ -207,7 +226,7 @@ export async function handle(
   const timing = Timing.make();
   const res = await respond({ req, rawEnv, clock, ctx, faults, timing });
 
-  return withServerTiming(req, withPrivacyHeaders(req, res), timing.header(performance.now() - start));
+  return withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail: timingDetail(req, rawEnv) }));
 }
 
 type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: ExecutionContext | null; faults: ReadonlySet<StoreFault>; timing: TimingApi };

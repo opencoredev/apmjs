@@ -49,6 +49,9 @@ export default Alchemy.Stack(
     const reviewTokenHash = yield* Config.withDefault(Config.String("REVIEW_TOKEN_HASH"), "");
     const admins = yield* Config.withDefault(Config.String("APM_ADMINS"), "");
     const review = Object.fromEntries(reviewTokenHash === "" ? [] : [["APM_REVIEW_TOKEN_HASH", reviewTokenHash], ["APM_ADMINS", admins]]);
+    // the full Server-Timing is on when deploy.ts found this stage's debug token; only its sha256 is sent
+    const debugTokenHash = yield* Config.withDefault(Config.String("DEBUG_TOKEN_HASH"), "");
+    const debug = Object.fromEntries(debugTokenHash === "" ? [] : [["APM_DEBUG_TOKEN_HASH", debugTokenHash]]);
 
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
@@ -68,6 +71,7 @@ export default Alchemy.Stack(
         APM_GITHUB_CLIENT_ID: yield* Config.String("GITHUB_CLIENT_ID"),
         APM_GITHUB_CLIENT_SECRET: yield* Config.Redacted("GITHUB_CLIENT_SECRET"),
         ...review,
+        ...debug,
       },
       // Writes down pending revokes past 24h and expired staged versions; reads already treat them as final.
       crons: ["*/10 * * * *"],

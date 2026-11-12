@@ -73,6 +73,14 @@ function reviewSettings(stage: string) {
   return { hash: createHash("sha256").update(secretFile(`review-token-${stage}`)).digest("hex"), admins };
 }
 
+/**
+ * The sha256 of debug-token-<stage>, or "" when the file is absent. A request whose x-apm-debug header is that token
+ * gets the registry's full Server-Timing; only the hash reaches Cloudflare.
+ */
+function debugTokenHash(stage: string): string {
+  return existsSync(join(SECRETS, `debug-token-${stage}`)) ? createHash("sha256").update(secretFile(`debug-token-${stage}`)).digest("hex") : "";
+}
+
 /** The stage's database on the Neon endpoint, with TLS verified (Neon serves a public certificate). */
 function databaseUrl(neonUrl: string, database: string): string {
   const u = new URL(neonUrl);
@@ -115,6 +123,7 @@ const token = secretFile("cloudflare-token");
 const accountId = required(cloudflare, "CLOUDFLARE_ACCOUNT_ID", "cloudflare.env");
 const neonUrl = secretFile("neon-url");
 const review = reviewSettings(args.stage);
+const debugHash = debugTokenHash(args.stage);
 const database = DATABASES[args.stage];
 
 process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"})\n`);
@@ -168,6 +177,7 @@ const child = Bun.spawn(
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
       REVIEW_TOKEN_HASH: review.hash,
       APM_ADMINS: review.admins,
+      DEBUG_TOKEN_HASH: debugHash,
       // the website's registry URL for anything it renders at build time
       APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
       ALCHEMY_TELEMETRY_DISABLED: "1",

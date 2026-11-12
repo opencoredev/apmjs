@@ -4,9 +4,16 @@
 // data center's cache, "analysis" an upstream version scored on read. A Worker's clock moves only on I/O, so these are
 // waits, and CPU work (parsing a packument, scoring) shows only as the gap before `total`. Optional everywhere: tests
 // and the queue consumer run without it.
+//
+// Anyone gets the coarse header: the database's time and the total, in whole milliseconds, with no counts and nothing
+// about npm or its cache (whether a package was cached tells what others asked for). The full one goes only to a
+// request whose x-apm-debug header is the operator's debug token (worker.ts, APM_DEBUG_TOKEN_HASH).
 import { Context, Effect, Option } from "effect";
 
 export type TimingMetric = "db" | "npm" | "npm-cache" | "analysis";
+
+/** "coarse": `db` and `total` durations only. "full": every metric with its count. */
+export type TimingDetail = "coarse" | "full";
 
 type Entry = { ms: number; count: number };
 
@@ -14,7 +21,7 @@ export type TimingApi = {
   /** Adds one operation of `ms` to `metric`. */
   readonly add: (metric: TimingMetric, ms: number) => void;
   /** The Server-Timing header value, with `total` ms for the whole answer. */
-  readonly header: (total: number) => string;
+  readonly header: (input: { total: number; detail: TimingDetail }) => string;
 };
 
 export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/Timing") {
@@ -26,8 +33,19 @@ export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/
         const e = entries.get(metric) ?? { ms: 0, count: 0 };
         entries.set(metric, { ms: e.ms + ms, count: e.count + 1 });
       },
-      header: (total) =>
-        [...[...entries].map(([metric, e]) => `${metric};dur=${e.ms.toFixed(1)};desc="${e.count}"`), `total;dur=${total.toFixed(1)}`].join(", "),
+      header: ({ total, detail }) => {
+        switch (detail) {
+          case "coarse":
+            return `db;dur=${Math.round(entries.get("db")?.ms ?? 0)}, total;dur=${Math.round(total)}`;
+          case "full":
+            return [...[...entries].map(([metric, e]) => `${metric};dur=${e.ms.toFixed(1)};desc="${e.count}"`), `total;dur=${total.toFixed(1)}`].join(", ");
+          default: {
+            const _exhaustive: never = detail;
+
+            return _exhaustive;
+          }
+        }
+      },
     };
   }
 }

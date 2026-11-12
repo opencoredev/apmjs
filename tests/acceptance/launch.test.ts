@@ -612,10 +612,12 @@ describe("routes 3: README and docs describe the fresh-version revoke as it work
 describe("the registry marks per-user answers private, no-store", () => {
   let gh: FakeGitHub;
   let reg: Registry;
+  // the operator's debug token; the Worker holds only its sha256, as the deploy sets it
+  const DEBUG_TOKEN = "debug-token-for-the-timing-test";
 
   beforeAll(async () => {
     gh = startFakeGitHub();
-    reg = await startRegistry({ now: () => clock, github: gh });
+    reg = await startRegistry({ now: () => clock, github: gh, env: { APM_DEBUG_TOKEN_HASH: createHash("sha256").update(DEBUG_TOKEN).digest("hex") } });
   });
   afterAll(async () => {
     await reg?.stop();
@@ -639,21 +641,44 @@ describe("the registry marks per-user answers private, no-store", () => {
     expect(who.headers.get("vary") ?? "").toMatch(/Authorization/);
   });
 
-  test("the package page's reads say where their time went in Server-Timing; account answers do not", async () => {
-    for (const [method, path] of [
-      ["HEAD", "-/apm/v1/packages/timing-missing"],
-      ["GET", "-/apm/v1/packages/timing-missing"],
-      ["GET", "-/apm/v1/score/timing-missing/1.0.0"],
-      ["GET", "-/apm/v1/readme/timing-missing/1.0.0"],
-    ] as const) {
-      const res = await fetch(`${reg.url}${path}`, { method });
-      await res.body?.cancel();
+  const TIMED = [
+    ["HEAD", "-/apm/v1/packages/timing-missing"],
+    ["GET", "-/apm/v1/packages/timing-missing"],
+    ["GET", "-/apm/v1/score/timing-missing/1.0.0"],
+    ["GET", "-/apm/v1/readme/timing-missing/1.0.0"],
+  ] as const;
 
-      // every one reads the package row, so the database's time is named, and the whole answer's
-      expect(res.headers.get("server-timing") ?? "", `${method} ${path}`).toMatch(/^db;dur=[\d.]+;desc="\d+"(, [a-z-]+;dur=[\d.]+;desc="\d+")*, total;dur=[\d.]+$/);
+  const timingOf = async (method: string, path: string, headers: Record<string, string> = {}): Promise<string> => {
+    const res = await fetch(`${reg.url}${path}`, { method, headers });
+    await res.body?.cancel();
+
+    return res.headers.get("server-timing") ?? "";
+  };
+
+  test("the package page's reads send anyone only the database's time and the total; account answers send none", async () => {
+    for (const [method, path] of TIMED) {
+      // no query count, no npm or cache metric, whole milliseconds: a wrong debug token, a signed-in token or none
+      const callers: Record<string, string>[] = [{}, { "x-apm-debug": "not-the-token" }, { "x-apm-debug": "" }, { authorization: "Bearer npm_not_a_debug_token" }];
+
+      for (const headers of callers) {
+        expect(await timingOf(method, path, headers), `${method} ${path} ${JSON.stringify(headers)}`).toMatch(/^db;dur=\d+, total;dur=\d+$/);
+      }
     }
 
     const account = await fetch(`${reg.url}-/apm/v1/account`);
+    await account.body?.cancel();
+
+    expect(account.headers.get("server-timing")).toBeNull();
+  });
+
+  test("the operator's debug token in x-apm-debug gets every metric with its count", async () => {
+    for (const [method, path] of TIMED) {
+      // every one reads the package row, so the database's time is named, and the whole answer's
+      expect(await timingOf(method, path, { "x-apm-debug": DEBUG_TOKEN }), `${method} ${path}`).toMatch(/^db;dur=[\d.]+;desc="\d+"(, [a-z-]+;dur=[\d.]+;desc="\d+")*, total;dur=[\d.]+$/);
+    }
+
+    // the debug token opens nothing else: an account answer still has no timing
+    const account = await fetch(`${reg.url}-/apm/v1/account`, { headers: { "x-apm-debug": DEBUG_TOKEN } });
     await account.body?.cancel();
 
     expect(account.headers.get("server-timing")).toBeNull();
