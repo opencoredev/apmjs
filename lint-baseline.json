@@ -134,7 +134,7 @@
     "tests/acceptance/name-check.test.ts": {
       "anti-slop/no-runtime-typeof": 1,
       "anti-slop/no-unsafe-dictionary-type": 1,
-      "anti-slop/require-readable-spacing": 2
+      "anti-slop/require-readable-spacing": 1
     },
     "tests/acceptance/protocol.test.ts": {
       "anti-slop/no-runtime-typeof": 2,

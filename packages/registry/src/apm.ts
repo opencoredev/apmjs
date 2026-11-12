@@ -34,6 +34,7 @@ import {
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
 import { Analysis, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
+import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -831,24 +832,48 @@ const lookalikePart = (query: string, valid: boolean) =>
     };
   });
 
+/** One suggested name: whether it can be had, and whether that was checked (a placeholder scope is not). */
+type Suggestion = { name: string; available: boolean; taken: boolean; unknown: boolean; checked: boolean };
+
+/**
+ * Names to try instead. Under the scoped policy only scoped names can be published (a bare name always means the
+ * npm package), so every suggestion is scoped: under the signed-in user's scope, checked, or under a placeholder
+ * `@you/` scope, unchecked, for someone not signed in. `scope` says which.
+ */
 const alternativesPart = (query: string, user: string | null) =>
   Effect.gen(function* () {
+    const { namePolicy } = yield* RegistryConfig;
     const bare = query.startsWith("@") ? query.slice(query.indexOf("/") + 1) : query;
-    const candidates = [...(user ? [`@${user}/${bare}`] : []), `${bare}-js`, `${bare}js`, `use-${bare}`, `${bare}-kit`, `${bare}-core`].filter((c) => c !== query);
+    const stems = [bare, `${bare}-js`, `${bare}js`, `use-${bare}`, `${bare}-kit`, `${bare}-core`];
+
+    const check = (name: string) =>
+      Effect.map(lookupOrUnknown(name), (hit): Suggestion => {
+        const taken = hit !== null && hit !== "unknown";
+        const cc = taken ? [] : typoConflicts(name);
+
+        return { name, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown", checked: true };
+      });
+
+    if (namePolicy === "scoped" && user === null) {
+      const suggestions = stems.flatMap((s): Suggestion[] => {
+        const name = `@you/${s}`;
+
+        return isValidPackageName(name) ? [{ name, available: false, taken: false, unknown: false, checked: false }] : [];
+      });
+
+      return { scope: null, suggestions };
+    }
+
+    const scoped = user === null ? [] : stems.map((s) => `@${user}/${s}`);
+    const candidates = namePolicy === "scoped" ? scoped : [...scoped.slice(0, 1), ...stems.slice(1)];
 
     const suggestions = yield* Effect.forEach(
-      candidates.filter((c) => isValidPackageName(c)),
-      (c) =>
-        Effect.map(lookupOrUnknown(c), (hit) => {
-          const taken = hit !== null && hit !== "unknown";
-          const cc = taken ? [] : typoConflicts(c);
-
-          return { name: c, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown" };
-        }),
+      candidates.filter((c) => c !== query && isValidPackageName(c)),
+      check,
       { concurrency: 4 },
     );
 
-    return { suggestions };
+    return { scope: user, suggestions };
   });
 
 export const nameReport = (q: string, user: string | null, part: NamePart | null = null) =>
@@ -876,6 +901,16 @@ export const nameReport = (q: string, user: string | null, part: NamePart | null
     const [exact, alternatives] = yield* Effect.all([exactPart(query, valid), alternativesPart(query, user)], { concurrency: 2 });
 
     return { ...head, ...(yield* lookalikePart(query, valid)), ...exact, ...alternatives };
+  });
+
+/** The apm account of a website session, when the request carries one; a request without cookies never builds Better Auth. */
+const sessionUser = (req: Request) =>
+  Effect.gen(function* () {
+    if (!req.headers.has("cookie")) return null;
+    const auth = yield* Auth;
+    const session = yield* auth.sessionOf(req);
+
+    return session ? ((yield* auth.apmUserOf(session.authUserId))?.name ?? null) : null;
   });
 
 // ---------- search: local packages merged with the upstream's search ----------
@@ -1545,7 +1580,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
     if (req.method !== "GET") return fail(405, "Method not allowed");
 
     if (rest === "names") {
-      const user = url.searchParams.get("user") ?? (caller.kind === "user" ? caller.user : null);
+      const user = url.searchParams.get("user") ?? (caller.kind === "user" ? caller.user : yield* sessionUser(req));
       const part = url.searchParams.get("part");
 
       if (part !== null && !isNamePart(part)) return fail(400, `part must be one of ${NAME_PARTS.join(", ")}`);

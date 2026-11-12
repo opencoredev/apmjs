@@ -2,7 +2,7 @@
 import "server-only";
 import { z } from "zod";
 import { encodeName, REGISTRY } from "./registry-url";
-import { fetchJson, logUnavailable, type Fetched } from "./registry-fetch";
+import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
 
@@ -84,8 +84,11 @@ const Recent = z.object({
 export type RecentEvent = z.infer<typeof Recent>["events"][number];
 
 /** Reads a registry path. Failures other than a 404 are logged here, once, with the path and the reason. */
-async function getJson<T>(path: string, schema: z.ZodType<T>, signal?: AbortSignal): Promise<Fetched<T>> {
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema, signal });
+async function getJson<T>(path: string, schema: z.ZodType<T>, signal?: AbortSignal, headers?: HeadersInit): Promise<Fetched<T>> {
+  const options: FetchJsonOptions<T> = { url: `${REGISTRY}${path}`, schema, signal };
+
+  if (headers !== undefined) options.headers = headers;
+  const result = await fetchJson(options);
 
   if (result.kind === "unavailable" && !signal?.aborted) logUnavailable(path.split("?")[0] ?? path, result.reason);
 
@@ -115,8 +118,10 @@ export async function getRecent(limit: number): Promise<Fetched<RecentEvent[]>> 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }
 
-export async function checkNamePart<P extends NamePart>(q: string, part: P, signal?: AbortSignal): Promise<NamePartAnswer[P] | null> {
-  const r = await getJson(`-/apm/v1/names?q=${encodeURIComponent(q)}&part=${part}`, NAME_PART_SCHEMAS[part], signal);
+/** One part of the name check. `cookie` is the visitor's session, so alternatives are checked under their own scope. */
+export async function checkNamePart<P extends NamePart>(input: { q: string; part: P; signal?: AbortSignal; cookie?: string | null }): Promise<NamePartAnswer[P] | null> {
+  const { q, part } = input;
+  const r = await getJson(`-/apm/v1/names?q=${encodeURIComponent(q)}&part=${part}`, NAME_PART_SCHEMAS[part], input.signal, input.cookie ? { cookie: input.cookie } : undefined);
 
   return r.kind === "ok" ? r.value : null;
 }

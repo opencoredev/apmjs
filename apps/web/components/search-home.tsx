@@ -15,7 +15,9 @@ import { ScoreBadge } from "@/components/score-badge";
 import {
   NAME_PART_SCHEMAS,
   SearchAnswer,
+  alternativesView,
   looksLikePackageName,
+  type AlternativesView,
   type NamePart,
   type NamePartAnswer,
   type SearchHit,
@@ -243,13 +245,18 @@ function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
   );
 }
 
-function ScopeSlot({ q }: { q: string }) {
+function ScopeSlot({ q, state }: { q: string; state: PartState<"alternatives"> }) {
   const bare = q.startsWith("@") ? q.slice(q.indexOf("/") + 1) : q;
+  const scope = state.kind === "ok" ? state.data.scope : null;
 
   return (
     <Slot label="Under your scope">
-      <span className="truncate font-mono text-[15px] text-muted-foreground">@you/{bare}</span>
-      <span className="text-sm text-muted-foreground">A scoped name is always yours. Run apm login to claim a scope.</span>
+      <span className="truncate font-mono text-[15px] text-muted-foreground">
+        @{scope ?? "you"}/{bare}
+      </span>
+      <span className="text-sm text-muted-foreground">
+        {scope === null ? "A scoped name is always yours. Sign in with GitHub to claim your scope." : "A name under your GitHub login is always yours."}
+      </span>
     </Slot>
   );
 }
@@ -285,7 +292,7 @@ function LookalikeSlot({ state }: { state: PartState<"lookalike"> }) {
 }
 
 function AlternativesSlot({ state }: { state: PartState<"alternatives"> }) {
-  const free = state.kind === "ok" ? state.data.suggestions.filter((s) => !s.name.startsWith("@") && s.available).slice(0, 4) : [];
+  const view: AlternativesView = state.kind === "ok" ? alternativesView(state.data) : { kind: "none" };
 
   return (
     <Slot label="Free alternatives">
@@ -297,15 +304,26 @@ function AlternativesSlot({ state }: { state: PartState<"alternatives"> }) {
         </>
       ) : state.kind === "error" ? (
         <span className="text-sm text-muted-foreground">Couldn&apos;t check.</span>
-      ) : free.length > 0 ? (
+      ) : view.kind === "free" ? (
         <ul className="flex flex-col gap-1">
-          {free.map((s) => (
-            <li key={s.name} className="flex items-center justify-between gap-3">
-              <span className="truncate font-mono text-[15px]">{s.name}</span>
+          {view.names.map((name) => (
+            <li key={name} className="flex items-center justify-between gap-3">
+              <span className="truncate font-mono text-[15px]">{name}</span>
               <CheckIcon className="size-4 shrink-0 text-ok" aria-label="available" />
             </li>
           ))}
         </ul>
+      ) : view.kind === "sign-in" ? (
+        <>
+          <ul className="flex flex-col gap-1">
+            {view.names.map((name) => (
+              <li key={name} className="truncate font-mono text-[15px] text-muted-foreground">
+                {name}
+              </li>
+            ))}
+          </ul>
+          <span className="text-sm text-muted-foreground">Sign in to check these under your own scope.</span>
+        </>
       ) : (
         <span className="text-sm text-muted-foreground">No free variations found.</span>
       )}
@@ -319,7 +337,7 @@ function NameSlots({ q, states }: { q: string; states: NameStates }) {
   return (
     <>
       <ExactSlot q={q} state={states.exact} />
-      <ScopeSlot q={q} />
+      <ScopeSlot q={q} state={states.alternatives} />
       <LookalikeSlot state={states.lookalike} />
       <AlternativesSlot state={states.alternatives} />
     </>

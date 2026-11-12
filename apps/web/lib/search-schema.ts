@@ -57,10 +57,31 @@ export type LookalikePart = z.infer<typeof LookalikePart>;
 export const AlternativesPart = z.object({
   query: z.string(),
   valid: z.boolean(),
-  suggestions: z.array(z.object({ name: z.string(), available: z.boolean(), taken: z.boolean(), unknown: z.boolean().default(false) })),
+  /** The signed-in user's scope the suggestions were checked under; null when nobody is signed in. */
+  scope: z.string().nullable().default(null),
+  // `checked: false` marks a placeholder (`@you/...`) nobody could check
+  suggestions: z.array(z.object({ name: z.string(), available: z.boolean(), taken: z.boolean(), unknown: z.boolean().default(false), checked: z.boolean().default(true) })),
 });
 
 export type AlternativesPart = z.infer<typeof AlternativesPart>;
+
+/** What the "Free alternatives" slot shows: checked free names, or scoped placeholders to sign in for. */
+export type AlternativesView = { kind: "free"; scope: string | null; names: string[] } | { kind: "sign-in"; names: string[] } | { kind: "none" };
+
+const MAX_ALTERNATIVES = 4;
+
+/**
+ * Picks what to suggest. Under the GitHub-scope policy the registry suggests only scoped names (a bare name always
+ * means the npm package): under the signed-in scope, checked, or under `@you/` for a visitor, unchecked.
+ */
+export function alternativesView(answer: AlternativesPart): AlternativesView {
+  const free = answer.suggestions.filter((s) => s.checked && s.available).map((s) => s.name);
+
+  if (free.length > 0) return { kind: "free", scope: answer.scope, names: free.slice(0, MAX_ALTERNATIVES) };
+  const placeholders = answer.suggestions.filter((s) => !s.checked).map((s) => s.name);
+
+  return placeholders.length > 0 ? { kind: "sign-in", names: placeholders.slice(0, MAX_ALTERNATIVES) } : { kind: "none" };
+}
 
 export type NamePart = "exact" | "lookalike" | "alternatives";
 
