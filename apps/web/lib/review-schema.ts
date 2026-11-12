@@ -47,12 +47,18 @@ export const PrivateReview = z.object({
 
 export type PrivateReview = z.infer<typeof PrivateReview>;
 
+/** A version's states on the registry (packages/registry/src/db.ts VersionStatus). */
+export const VERSION_STATUSES = ["active", "yanked", "revoke-pending", "revoked"] as const;
+
 export const ReviewAnswer = z.object({
   name: z.string(),
   version: z.string(),
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
   // the job's own state: status folds "leased" (a reviewer has it) into "queued". An older registry sends none.
   job: z.enum(["queued", "leased", "done", "failed"]).nullish(),
+  // the version's own state as the registry answered; an install verdict refuses anything but active. An older
+  // registry sends none; a state this copy does not know makes the answer unreadable, never "active".
+  versionStatus: z.enum(VERSION_STATUSES).optional(),
   review: PublicReview.nullable(),
   /**
    * The version is revoked: findings keep their file, line and sentence, with no excerpt. Required: a registry too old

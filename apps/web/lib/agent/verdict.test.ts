@@ -6,6 +6,7 @@ import cases from "../../../../tests/fixtures/explain-verdicts.json";
 import { explainFor, parsePackageSpec } from "./explain";
 import { parseResolve, type ResolveOutcome } from "./source";
 import { fakeSource, NETWORK, REVIEW_CLEAN, signal } from "./testing";
+import { ReviewAnswer } from "../review-schema";
 import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, explainInstall, reviewInput, VERDICTS, verdictText, type ReviewInput } from "./verdict";
 
 // ---------- the shared cases ----------
@@ -36,6 +37,8 @@ const Case = z.object({
   review: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("reviewed"), state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.number() }),
     z.object({ kind: z.enum(["queued", "leased", "failed", "not-reviewed", "off", "unreadable"]) }),
+    // the registry's raw GET /-/apm/v1/review answer, read through this copy's own parser
+    z.object({ kind: z.literal("answer"), status: z.number(), body: z.unknown() }),
   ]),
   expect: z.object({
     verdict: z.enum(VERDICTS),
@@ -47,6 +50,19 @@ const Case = z.object({
 });
 
 export const CASES = z.object({ cases: z.array(Case).min(20) }).parse(cases).cases;
+
+/**
+ * A case's review: given as the verdict's input, or as the registry's raw answer, read the way lib/registry.ts reads
+ * it (the ReviewAnswer schema; a 404 is missing, anything unparsable unavailable) and then through reviewInput.
+ */
+function reviewOf(r: z.infer<typeof Case>["review"]): ReviewInput {
+  if (r.kind !== "answer") return r;
+
+  if (r.status === 404) return reviewInput({ kind: "missing" });
+  const parsed = r.status === 200 ? ReviewAnswer.safeParse(r.body) : null;
+
+  return reviewInput(parsed?.success ? { kind: "ok", value: parsed.data } : { kind: "unavailable", reason: { kind: "invalid", message: "not a review answer" } });
+}
 
 const grade = (score: number): string => (score >= 90 ? "A" : score >= 75 ? "B" : "C");
 
@@ -76,7 +92,7 @@ function resolveOf(c: z.infer<typeof Case>["resolve"]): ResolveOutcome {
 describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () => {
   for (const c of CASES) {
     test(c.name, () => {
-      const review: ReviewInput = c.review;
+      const review = reviewOf(c.review);
       const v = explainInstall({ name: "x", range: null, resolve: resolveOf(c.resolve), review });
 
       expect(v.verdict).toBe(c.expect.verdict);
@@ -99,7 +115,7 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       if (c.resolve.kind !== "ok") continue;
       expect(c.resolve.unchecked).toBe(0);
       expect(c.resolve.depReviews.kind === "unknown" || (c.resolve.depReviews.kind === "on" && c.resolve.depReviews.confirmed.length + c.resolve.depReviews.underReview.length + c.resolve.depReviews.pending.length + c.resolve.depReviews.noAnswer.length > 0)).toBe(false);
-      expect(["queued", "leased", "failed", "unreadable"]).not.toContain(c.review.kind);
+      expect(["queued", "leased", "failed", "unreadable", "pulled"]).not.toContain(reviewOf(c.review).kind);
     }
   });
 });
@@ -178,6 +194,19 @@ describe("reviewInput", () => {
     expect(reviewInput(answer({ status: "failed", job: "failed" }))).toEqual({ kind: "failed" });
     expect(reviewInput(answer({ status: "not-reviewed", job: null }))).toEqual({ kind: "not-reviewed" });
     expect(reviewInput({ kind: "ok", value: REVIEW_CLEAN })).toEqual({ kind: "reviewed", state: "found-nothing", findings: 0 });
+  });
+
+  // review finding P1: the answer's redacted flag and version state were dropped, so its clean review read as install
+  test("an answer that says the version is withheld, revoked, being revoked or yanked is pulled, before its review", () => {
+    const answer = (over: Partial<typeof REVIEW_CLEAN>) => ({ kind: "ok", value: { ...REVIEW_CLEAN, ...over } }) as const;
+
+    expect(reviewInput(answer({ versionStatus: "revoke-pending", redacted: true }))).toEqual({ kind: "pulled", status: "revoke-pending" });
+    expect(reviewInput(answer({ versionStatus: "revoked", redacted: true }))).toEqual({ kind: "pulled", status: "revoked" });
+    expect(reviewInput(answer({ versionStatus: "yanked", redacted: false }))).toEqual({ kind: "pulled", status: "yanked" });
+    expect(reviewInput(answer({ redacted: true }))).toEqual({ kind: "pulled", status: "withheld" });
+    // contradictory: an active state with a redacted answer is still withheld
+    expect(reviewInput(answer({ versionStatus: "active", redacted: true }))).toEqual({ kind: "pulled", status: "withheld" });
+    expect(reviewInput(answer({ versionStatus: "active", redacted: false }))).toEqual({ kind: "reviewed", state: "found-nothing", findings: 0 });
   });
 });
 

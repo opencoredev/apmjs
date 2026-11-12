@@ -20,11 +20,19 @@ export type VerdictKind = (typeof VERDICTS)[number];
 export const CLEAN_SCORE = 75;
 
 /**
+ * Why the registry no longer offers a version its install policy picked a moment before: it was yanked or revoked,
+ * a revocation is pending, or the registry withholds it (a redacted answer that names no state).
+ */
+export type PulledStatus = "yanked" | "revoke-pending" | "revoked" | "withheld";
+
+/**
  * Where the AI review of the picked version stands. queued and leased are a review in progress; failed and a
  * no-answer result ended without one; not-reviewed means the version was never picked for review; off means the
- * registry runs none; unreadable means apm could not ask.
+ * registry runs none; unreadable means apm could not ask; pulled means the review answer said the version is no
+ * longer offered, whatever its review says.
  */
 export type ReviewInput =
+  | { kind: "pulled"; status: PulledStatus }
   | { kind: "reviewed"; state: PublicReview["state"]; findings: number }
   | { kind: "queued" }
   | { kind: "leased" }
@@ -94,6 +102,9 @@ const skippedText = (skipped: readonly { version: string; reason: string }[]): s
 /** How far the picked version's AI review got, for the coverage field. */
 export function aiReviewCoverage(review: ReviewInput): AiReviewCoverage {
   switch (review.kind) {
+    // the verdict is decided by the version's state before its review is looked at
+    case "pulled":
+      return "not-read";
     case "reviewed":
       return review.state === "no-answer" ? "no-answer" : "reviewed";
     case "queued":
@@ -138,8 +149,29 @@ function noReviewNote(coverage: AiReviewCoverage): string {
 
 const NOT_READ: Coverage = { aiReview: "not-read", dependencies: "not-read" };
 
+/** What became of a version the policy picked, as the end of "it ...". */
+function pulledText(status: PulledStatus): string {
+  switch (status) {
+    case "yanked":
+      return "was yanked";
+    case "revoke-pending":
+      return "is being revoked";
+    case "revoked":
+      return "was revoked";
+    case "withheld":
+      return "is withheld by the registry, which means it was revoked or is being revoked";
+    default: {
+      const _exhaustive: never = status;
+
+      return _exhaustive;
+    }
+  }
+}
+
 function reviewReason(review: ReviewInput): string {
   switch (review.kind) {
+    case "pulled":
+      return `The registry's answer about this version's AI review says it ${pulledText(review.status)}.`;
     case "not-reviewed":
       return "No AI review of this version.";
     case "off":
@@ -189,6 +221,7 @@ function reviewHold(review: ReviewInput): string | null {
       return "its AI review ended without an answer";
     case "reviewed":
       return review.state === "under-review" ? "the AI review flagged it and a person has not decided yet" : review.state === "no-answer" ? "its AI review ended without an answer" : null;
+    case "pulled":
     case "not-reviewed":
     case "off":
     case "unreadable":
@@ -231,6 +264,21 @@ export function explainInstall(input: { name: string; range: string | null; reso
 
   const { version, report, deps } = resolve;
   const id = `${name}@${plain(version)}`;
+
+  // 0. a version the registry stopped offering after the policy picked it: neither its review nor its score counts
+  if (review.kind === "pulled") {
+    return {
+      ...base,
+      verdict: "do-not-install",
+      version,
+      score: null,
+      summary: `Do not install ${id}: it ${pulledText(review.status)}. The registry said so after its install policy picked this version, so apm's checks of it no longer count.`,
+      reasons: [reviewReason(review)],
+      commands: null,
+      coverage: NOT_READ,
+    };
+  }
+
   const score = report ? { score: report.score, grade: report.grade } : null;
   const aiReview = aiReviewCoverage(review);
   const known = { ...base, version, score, coverage: { aiReview, dependencies: deps.unchecked > 0 ? "incomplete" : "complete" } satisfies Coverage };
@@ -320,10 +368,23 @@ export function explainInstall(input: { name: string; range: string | null; reso
 }
 
 /**
+ * Whether a review answer says the version is no longer offered: any state but active, or a redacted answer (the
+ * registry withholds a revoked version's source) even when it names no state. null when it is still offered.
+ */
+export function pulledStatus(answer: Pick<ReviewAnswer, "versionStatus" | "redacted">): PulledStatus | null {
+  const status = answer.versionStatus;
+
+  if (status !== undefined && status !== "active") return status;
+
+  return answer.redacted === true ? "withheld" : null;
+}
+
+/**
  * The review input for the verdict, from GET /-/apm/v1/review read without a cache. A 404 means this registry has AI
  * review off (the resolve answer already showed the version exists); a read that failed is unreadable, never "none".
+ * An answer that says the version was yanked, revoked or withheld is "pulled" before anything else in it is read.
  */
-export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "review" | "job">>): ReviewInput {
+export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "review" | "job" | "versionStatus" | "redacted">>): ReviewInput {
   switch (answer.kind) {
     case "unavailable":
       return { kind: "unreadable" };
@@ -339,6 +400,9 @@ export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "revie
   }
 
   const a = answer.value;
+  const pulled = pulledStatus(a);
+
+  if (pulled !== null) return { kind: "pulled", status: pulled };
 
   if (a.review !== null) return { kind: "reviewed", state: a.review.state, findings: a.review.findings.length };
 

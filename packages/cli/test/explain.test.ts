@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import cases from "../../../tests/fixtures/explain-verdicts.json";
 import type { TreeReviews } from "../src/api.ts";
+import { parseReview } from "../src/agent.ts";
 import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, EXIT, explain, VERDICTS, type ResolvedInput, type ReviewInput } from "../src/explain.ts";
 
 type TreeReviewsWire = z.input<typeof TreeReviews>;
@@ -40,6 +41,8 @@ const Case = z.object({
   review: z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("reviewed"), state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.number() }),
     z.object({ kind: z.enum(["queued", "leased", "failed", "not-reviewed", "off", "unreadable"]) }),
+    // the registry's raw GET /-/apm/v1/review answer, read through this copy's own parser
+    z.object({ kind: z.literal("answer"), status: z.number(), body: z.unknown() }),
   ]),
   expect: z.object({
     verdict: z.enum(VERDICTS),
@@ -51,6 +54,11 @@ const Case = z.object({
 });
 
 const CASES = z.object({ cases: z.array(Case).min(20) }).parse(cases).cases;
+
+/** A case's review: given as the verdict's input, or as the registry's raw answer read through the CLI's parser. */
+function reviewOf(r: z.infer<typeof Case>["review"]): ReviewInput {
+  return r.kind === "answer" ? parseReview({ status: r.status, body: r.body }) : r;
+}
 
 const grade = (score: number): string => (score >= 90 ? "A" : score >= 75 ? "B" : "C");
 
@@ -81,7 +89,7 @@ function resolvedOf(c: z.infer<typeof Case>["resolve"]): ResolvedInput {
 describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () => {
   for (const c of CASES) {
     test(c.name, () => {
-      const review: ReviewInput = c.review;
+      const review = reviewOf(c.review);
       const v = explain({ name: "x", range: null, resolved: resolvedOf(c.resolve), review });
 
       expect(v.verdict).toBe(c.expect.verdict);
@@ -116,7 +124,7 @@ describe("the CLI against a stand-in registry", () => {
           const clean: TreeReviewsWire = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
           const ok = (reviews: TreeReviewsWire) => Response.json({ name, range: "latest", source: "local", version: "1.2.3", report: { score: 95, grade: "A", signals: [] }, skipped: [], tree: { unchecked: 0, uncheckedDeps: [], packages: [], reviews } });
 
-          if (name === "good" || name === "reviewdown") return ok(clean);
+          if (name === "good" || name === "reviewdown" || name === "revoking") return ok(clean);
 
           if (name === "baddep") return ok({ ...clean, confirmed: [{ name: "evil-dep", version: "6.6.6" }] });
 
@@ -137,6 +145,12 @@ describe("the CLI against a stand-in registry", () => {
         }
 
         if (url.pathname.startsWith("/-/apm/v1/review/reviewdown/")) return new Response("upstream timeout", { status: 502 });
+
+        // a revoke that started after the resolve read: the review answer is redacted and names the state, and the
+        // clean review it still carries must not count
+        if (url.pathname.startsWith("/-/apm/v1/review/revoking/")) {
+          return Response.json({ name: "revoking", version: "1.2.3", status: "reviewed", job: "done", versionStatus: "revoke-pending", redacted: true, review: { state: "found-nothing", findings: [] } });
+        }
 
         if (url.pathname.startsWith("/-/apm/v1/review/")) return Response.json({ name: "good", version: "1.2.3", status: "reviewed", job: "done", review: { state: "found-nothing", findings: [] } });
 
@@ -167,6 +181,18 @@ describe("the CLI against a stand-in registry", () => {
 
     return { code, out };
   }
+
+  // review finding P1: the review answer said the version was being revoked, the CLI dropped the flag and exited 0
+  test("apm explain refuses a version the review answer says is being revoked, whatever its review says", async () => {
+    const r = await apm(["explain", "revoking"]);
+
+    expect(r.code).toBe(1);
+    expect(r.json).toMatchObject({ ok: false, verdict: "do-not-install", version: "1.2.3", score: null, commands: null, coverage: { aiReview: "not-read", dependencies: "not-read" } });
+    const text = await apmText(["explain", "revoking"]);
+
+    expect(text.code).toBe(1);
+    expect(text.out).not.toContain("run: ");
+  });
 
   // re-review finding 2: publisher text (a yank reason) in the verdict was a live Markdown link and HTML
   test("apm explain quotes a yank reason written as a Markdown link and HTML; the verdict line stays apm's own", async () => {

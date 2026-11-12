@@ -2,6 +2,7 @@
 // confirmed malicious or yanked kept its old answer. Decisions are never stored; views for seconds at most.
 import { describe, expect, test } from "bun:test";
 import { AGENT_CACHE, explainResponse, markdownResponse } from "./agent-http";
+import type { ReviewAnswer } from "../review-schema";
 import type { Message } from "./mcp";
 import { mcpPost } from "./mcp-http";
 import type { ResolveOutcome } from "./source";
@@ -43,6 +44,29 @@ describe("GET /api/explain is never stored", () => {
 
     expect(limited.status).toBe(429);
     expect(limited.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+// Review finding P1: resolve picked an active version, a revoke started before the review read, and the review
+// answer said so (redacted, revoke-pending); the web dropped the flag and its clean review gave "install".
+describe("a revoke that starts between the resolve and the review read", () => {
+  const revoking: ReviewAnswer = { ...REVIEW_CLEAN, versionStatus: "revoke-pending", redacted: true };
+
+  test("GET /api/explain answers do-not-install with no commands", async () => {
+    const source = fakeSource({ resolve: () => clean, reviews: { "left-pad@1.3.0": revoking } });
+    const body = await (await explainResponse(new URL("https://apmjs.dev/api/explain?package=left-pad"), { source, take: allow })).json();
+
+    expect(body).toMatchObject({ verdict: "do-not-install", version: "1.3.0", score: null, commands: null, coverage: { aiReview: "not-read", dependencies: "not-read" } });
+  });
+
+  test("the explain_install MCP tool answers do-not-install with no commands", async () => {
+    const source = fakeSource({ resolve: () => clean, reviews: { "left-pad@1.3.0": revoking } });
+    const req = new Request("https://apmjs.dev/mcp", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "explain_install", arguments: { name: "left-pad" } } }) });
+    const body = await (await mcpPost(req, { source, take: allow })).json();
+
+    expect(body.result.structuredContent).toMatchObject({ verdict: "do-not-install", commands: null });
+    expect(body.result.content[0].text).toStartWith("Verdict: do-not-install\nDo not install left-pad@1.3.0: it is being revoked.");
+    expect(body.result.content[0].text).not.toContain("Run: ");
   });
 });
 

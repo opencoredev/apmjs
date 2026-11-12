@@ -790,6 +790,9 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
         status,
         // a revoked version's findings keep their file, line and sentence, not the quoted source
         redacted,
+        // the version's own state as this answer was made: a version yanked or revoked after a client's resolve read
+        // must stop that client from installing it (the install verdict checks this before the review)
+        versionStatus: v.status,
         // `status` folds a leased job into "queued"; `job` keeps them apart for clients that act on the difference
         job: job?.state ?? null,
         review: review ? publicView(review) : null,

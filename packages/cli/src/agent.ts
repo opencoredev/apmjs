@@ -1,7 +1,7 @@
 // `apm explain` and `apm search`, the commands agents lean on. main.ts hands in its output functions, so with
 // --json each prints one document on stdout and everything else goes to stderr, like every apm command.
 import { z } from "zod";
-import { Api, ResolveFail, ResolveOk, encodeName, parseSpec } from "./api.ts";
+import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, type RawAnswer } from "./api.ts";
 import { EXIT, explain, type ResolvedInput, type ReviewInput } from "./explain.ts";
 
 type Paint = (s: string) => string;
@@ -18,6 +18,10 @@ const ReviewWire = z.object({
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
   // the job's own state: status folds "leased" into "queued"; an older registry sends none
   job: z.enum(["queued", "leased", "done", "failed"]).nullish(),
+  // the version's own state as the registry answered, and whether it withholds the version's source; an older
+  // registry sends neither. A state this copy does not know makes the answer unreadable, never "active".
+  versionStatus: z.enum(["active", "yanked", "revoke-pending", "revoked"]).optional(),
+  redacted: z.boolean().optional(),
   review: z.object({ state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.array(z.unknown()) }).nullable(),
 });
 
@@ -26,24 +30,21 @@ const ErrorWire = z.object({ error: z.string() });
 const UNREADABLE = "the registry sent an answer apm could not read";
 
 /**
- * The AI review of one version as the verdict reads it. A 404 means the registry runs no AI review (the resolve answer
- * already showed the version exists). A read that failed, or an answer apm cannot read, is "unreadable": the verdict
- * then says it cannot tell, never that there is nothing to see.
+ * The AI review of one version as the verdict reads it, from GET /-/apm/v1/review's answer. A 404 means the
+ * registry runs no AI review (the resolve answer already showed the version exists). An answer apm cannot read is
+ * "unreadable": the verdict then says it cannot tell, never that there is nothing to see. An answer that says the
+ * version was yanked, revoked or withheld is "pulled" before anything else in it is read.
  */
-async function reviewOf(api: Api, name: string, version: string): Promise<ReviewInput> {
-  let r: { status: number; body: unknown };
-
-  try {
-    r = await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`);
-  } catch {
-    return { kind: "unreadable" };
-  }
-
-  if (r.status === 404) return { kind: "off" };
-  const parsed = r.status === 200 ? ReviewWire.safeParse(r.body) : null;
+export function parseReview(answer: RawAnswer): ReviewInput {
+  if (answer.status === 404) return { kind: "off" };
+  const parsed = answer.status === 200 ? ReviewWire.safeParse(answer.body) : null;
 
   if (!parsed?.success) return { kind: "unreadable" };
   const a = parsed.data;
+
+  if (a.versionStatus !== undefined && a.versionStatus !== "active") return { kind: "pulled", status: a.versionStatus };
+
+  if (a.redacted === true) return { kind: "pulled", status: "withheld" };
 
   if (a.review) return { kind: "reviewed", state: a.review.state, findings: a.review.findings.length };
 
@@ -63,6 +64,15 @@ async function reviewOf(api: Api, name: string, version: string): Promise<Review
 
       return _exhaustive;
     }
+  }
+}
+
+/** The AI review of one version, read from the registry; a read that failed is "unreadable". */
+async function reviewOf(api: Api, name: string, version: string): Promise<ReviewInput> {
+  try {
+    return parseReview(await api.raw(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`));
+  } catch {
+    return { kind: "unreadable" };
   }
 }
 

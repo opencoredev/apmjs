@@ -1,5 +1,5 @@
 {
-  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it.",
+  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here.",
   "cases": [
     {
       "name": "clean, scored, every dependency reviewed clean or not picked: install",
@@ -964,6 +964,357 @@
         ],
         "coverage": {
           "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "the registry's review answer, read through each copy's own parser: active and clean still installs",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "reviewed",
+          "job": "done",
+          "review": {
+            "state": "found-nothing",
+            "model": "test-model",
+            "reviewedAt": "2026-11-12T00:00:00.000Z",
+            "coverage": {
+              "mode": "files",
+              "previousVersion": null,
+              "filesInScope": 1,
+              "filesRead": 1
+            },
+            "read": [
+              "index.js"
+            ],
+            "notRead": [],
+            "findings": [],
+            "decidedAt": null,
+            "note": null
+          },
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "active",
+          "redacted": false
+        }
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "x@1.0.0 passes apm's checks: it scores 92/100 (A), is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "a revoke that starts between the resolve read and the review read: the redacted, revoke-pending answer wins over its clean review: do-not-install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "reviewed",
+          "job": "done",
+          "review": {
+            "state": "found-nothing",
+            "model": "test-model",
+            "reviewedAt": "2026-11-12T00:00:00.000Z",
+            "coverage": {
+              "mode": "files",
+              "previousVersion": null,
+              "filesInScope": 1,
+              "filesRead": 1
+            },
+            "read": [
+              "index.js"
+            ],
+            "notRead": [],
+            "findings": [],
+            "decidedAt": null,
+            "note": null
+          },
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "revoke-pending",
+          "redacted": true
+        }
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it is being revoked. The registry said so after its install policy picked this version, so apm's checks of it no longer count.",
+        "reasons": [
+          "The registry's answer about this version's AI review says it is being revoked."
+        ],
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
+        }
+      }
+    },
+    {
+      "name": "a redacted review answer that names no version state still means withheld: do-not-install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "reviewed",
+          "job": "done",
+          "review": {
+            "state": "found-nothing",
+            "model": "test-model",
+            "reviewedAt": "2026-11-12T00:00:00.000Z",
+            "coverage": {
+              "mode": "files",
+              "previousVersion": null,
+              "filesInScope": 1,
+              "filesRead": 1
+            },
+            "read": [
+              "index.js"
+            ],
+            "notRead": [],
+            "findings": [],
+            "decidedAt": null,
+            "note": null
+          },
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "redacted": true
+        }
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it is withheld by the registry, which means it was revoked or is being revoked. The registry said so after its install policy picked this version, so apm's checks of it no longer count.",
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
+        }
+      }
+    },
+    {
+      "name": "a version revoked outright after the resolve read: do-not-install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "not-reviewed",
+          "job": null,
+          "review": null,
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "revoked",
+          "redacted": true
+        }
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it was revoked. The registry said so after its install policy picked this version, so apm's checks of it no longer count.",
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
+        }
+      }
+    },
+    {
+      "name": "a version yanked after the resolve read: do-not-install, as the policy would now refuse it",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "reviewed",
+          "job": "done",
+          "review": {
+            "state": "found-nothing",
+            "model": "test-model",
+            "reviewedAt": "2026-11-12T00:00:00.000Z",
+            "coverage": {
+              "mode": "files",
+              "previousVersion": null,
+              "filesInScope": 1,
+              "filesRead": 1
+            },
+            "read": [
+              "index.js"
+            ],
+            "notRead": [],
+            "findings": [],
+            "decidedAt": null,
+            "note": null
+          },
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "yanked",
+          "redacted": false
+        }
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it was yanked. The registry said so after its install policy picked this version, so apm's checks of it no longer count.",
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
+        }
+      }
+    },
+    {
+      "name": "a review answer naming a version state apm does not know is unreadable: unknown, never install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "reviewed",
+          "job": "done",
+          "review": {
+            "state": "found-nothing",
+            "model": "test-model",
+            "reviewedAt": "2026-11-12T00:00:00.000Z",
+            "coverage": {
+              "mode": "files",
+              "previousVersion": null,
+              "filesInScope": 1,
+              "filesRead": 1
+            },
+            "read": [
+              "index.js"
+            ],
+            "notRead": [],
+            "findings": [],
+            "decidedAt": null,
+            "note": null
+          },
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "quarantined",
+          "redacted": false
+        }
+      },
+      "expect": {
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm could not read the AI review of x@1.0.0, so it cannot say. Nothing was decided; try again.",
+        "coverage": {
+          "aiReview": "unreadable",
           "dependencies": "complete"
         }
       }

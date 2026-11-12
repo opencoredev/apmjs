@@ -81,6 +81,9 @@ function errorText(body: unknown, status: number): string {
   return `HTTP ${status}`;
 }
 
+/** A registry answer before it is parsed: its HTTP status and its JSON body (null when it had none). */
+export type RawAnswer = { status: number; body: unknown };
+
 export class Api {
   constructor(readonly cfg: Config) {}
 
@@ -92,7 +95,7 @@ export class Api {
     };
   }
 
-  async raw(path: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: unknown }> {
+  async raw(path: string, init: { method?: string; body?: unknown } = {}): Promise<RawAnswer> {
     const res = await fetch(`${this.cfg.registry}${path}`, {
       method: init.method ?? "GET",
       headers: this.headers(init.body !== undefined),
