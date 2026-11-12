@@ -36,6 +36,8 @@ export type WorkerRegistry = {
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
   /** Runs the cron's sweep (matured revokes, expired staged versions) at the test clock. */
   sweep: () => Promise<void>;
+  /** Puts npm's packument for `url` in the shared Cache API as another isolate would have, sent at `fetchedAt` (null: no time). */
+  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null }) => Promise<void>;
   /** The registry's Postgres, for tests that hold a lock or change rows from another connection. */
   databaseUrl: string;
   /** Runs the analysis queue's consumer on one job, as the queue would deliver it; says whether it acked or asked for a retry. */
@@ -160,6 +162,11 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
       });
 
       if (res.status !== 200) throw new Error(`sweep failed: ${res.status}`);
+    },
+    seedUpstreamCache: async (input) => {
+      const res = await fetch(`${target}__test/upstream-cache`, { method: "POST", headers: { "content-type": "application/json", "x-apm-test-control": CONTROL }, body: JSON.stringify(input) });
+
+      if (res.status !== 200) throw new Error(`upstream cache seed failed: ${res.status}`);
     },
     databaseUrl: database.url,
     analysisJob: async (job) => {

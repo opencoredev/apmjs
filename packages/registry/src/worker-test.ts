@@ -2,7 +2,8 @@
 // x-apm-test-now sets the registry clock for one request and x-apm-test-totp-now the wall clock authenticator
 // codes are checked against; POST /__test/mint issues a token without a login flow.
 // /__test/blobs lists the blob store's keys (GET) and overwrites one (PUT /__test/blobs/<key>), so tests can
-// tamper with stored bytes. POST /__test/sweep runs the cron's sweep at the test clock. POST /__test/analysis-job runs
+// tamper with stored bytes. POST /__test/upstream-cache puts a packument in the shared cache as another isolate would
+// have, with the fetch time the test names. POST /__test/sweep runs the cron's sweep at the test clock. POST /__test/analysis-job runs
 // the queue consumer on one job and says whether it acked the message or asked for a retry. x-apm-test-queue: fail
 // makes the analysis queue refuse every send for that request, and x-apm-test-fault: event-insert makes every
 // public-log insert fail inside Postgres for that request. All of it answers only to a caller holding
@@ -13,6 +14,7 @@ import { Clock } from "./clock.ts";
 import { Store, type StoreFault } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
+import { FETCHED_AT_HEADER, packumentKey } from "./upstream.ts";
 import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
 
 /** A positive millisecond time from a test header, or null. */
@@ -86,6 +88,21 @@ async function blobControl(req: Request, env: TestEnv, path: string): Promise<Re
   return fail(405, "Method not allowed");
 }
 
+const SeedBody = z.object({ url: z.string().url(), packument: z.string(), fetchedAt: z.number().nullable() });
+
+/** Puts npm's answer for `url` in the data center's cache, sent at `fetchedAt` (null: a copy from before copies carried a time). */
+async function seedUpstreamCache(req: Request): Promise<Response> {
+  const body = SeedBody.safeParse(await req.json());
+
+  if (!body.success) return fail(400, body.error.message);
+  const headers = new Headers({ "content-type": "application/json", "cache-control": "public, max-age=600" });
+
+  if (body.data.fetchedAt !== null) headers.set(FETCHED_AT_HEADER, String(body.data.fetchedAt));
+  await caches.default.put(packumentKey(body.data.url), new Response(body.data.packument, { headers }));
+
+  return json({ ok: true });
+}
+
 const JobBody = z.object({ name: z.string().min(1), version: z.string().min(1) });
 
 /** Runs the consumer on a one-message batch, the way the queue delivers it, and reports what it did with the message. */
@@ -145,6 +162,8 @@ export default {
     if (path === "/__test/mint") return trusted ? mint(req, env, clock) : fail(404, "Not found");
 
     if (path === "/__test/blobs" || path.startsWith("/__test/blobs/")) return trusted ? blobControl(req, env, path) : fail(404, "Not found");
+
+    if (path === "/__test/upstream-cache") return trusted && req.method === "POST" ? seedUpstreamCache(req) : fail(404, "Not found");
 
     if (path === "/__test/analysis-job") return trusted && req.method === "POST" ? analysisJob(req, env) : fail(404, "Not found");
 

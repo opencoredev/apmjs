@@ -25,3 +25,11 @@ export function excerptApiPath(input: { name: string; version: string; path: str
 export function readmeApiPath(input: { name: string; version: string }): string {
   return `-/apm/v1/readme/${encodeName(input.name)}/${encodeURIComponent(input.version)}`;
 }
+
+/**
+ * The edge-cache key for whether a version's files, excerpts and readme may be shown right now (lib/registry-fetch.ts).
+ * It names an entry only; this URL is never fetched.
+ */
+export function servableKey(input: { name: string; version: string }): string {
+  return `${REGISTRY}-/apm/v1/servable/${encodeName(input.name)}/${encodeURIComponent(input.version)}`;
+}

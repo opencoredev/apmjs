@@ -1,7 +1,7 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
 import { z } from "zod";
-import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY } from "./registry-url";
+import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY, servableKey } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
 import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
@@ -151,7 +151,7 @@ const FILE_TIMEOUT_MS = 20_000;
 /** One file of one version, as text, or why it isn't shown. */
 export async function getFile(input: { name: string; version: string; path: string }): Promise<Fetched<FileAnswer>> {
   const path = fileApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
 
   if (result.kind === "unavailable") logUnavailable(path.split("?")[0] ?? path, result.reason);
 
@@ -161,7 +161,7 @@ export async function getFile(input: { name: string; version: string; path: stri
 /** Lines around one line of a file of any size (the file view's excerpt of a file over 1 MB). */
 export async function getExcerpt(input: { name: string; version: string; path: string; line: number; context: number }): Promise<Fetched<ExcerptAnswer>> {
   const path = excerptApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
 
   // a line past the end (416) is an answer the view explains, not an outage
   if (result.kind === "unavailable" && !(result.reason.kind === "status" && result.reason.status === 416)) logUnavailable(path.split("?")[0] ?? path, result.reason);
@@ -172,7 +172,7 @@ export async function getExcerpt(input: { name: string; version: string; path: s
 /** The README npm would pick from a version's tarball, for packages whose packument has no readme. "missing" when there is none. */
 export async function getTarballReadme(input: { name: string; version: string }): Promise<Fetched<FileAnswer>> {
   const path = readmeApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
 
   if (result.kind === "unavailable") logUnavailable(path, result.reason);
 

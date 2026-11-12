@@ -164,15 +164,19 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
  * cold isolate then reads a packument another one fetched a moment ago instead of asking npm again. Only npm's own
  * 200 answer is kept, as the text npm sent, and parsed on every read exactly as a fresh one is. The Cache API works
  * on custom domains (production); on workers.dev its calls do nothing, and under Miniflare it works as in production.
- * A TTL under a second (the tests that move an upstream between requests) turns it off.
+ * Each copy carries when npm sent it, and both layers count one TTL from then, so a copy read near the end of its TTL
+ * is not trusted for a whole new one. A TTL under a second (the tests that move an upstream between requests) turns it off.
  */
 const SHARED_MIN_TTL_MS = 1_000;
+
+/** When npm sent a shared packument (ms since the epoch): its TTL counts from then, in every isolate that reads it. */
+export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 
 /** The data center's cache. Call it only inside a Worker request: Bun (the unit tests) has no `caches`. */
 const workerCache = (): Cache => caches.default;
 
 /** The Cache API key of a packument. This host is never fetched; it only names the entry. */
-const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v1/${encodeURIComponent(url)}`);
+export const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v1/${encodeURIComponent(url)}`);
 
 function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
@@ -314,99 +318,111 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         // `background` is set only inside a Worker request, where `caches` always exists
         const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
 
-        /** npm's packument, from the shared cache when another isolate fetched it within the TTL. */
-        const fetchPackument = (url: string): Effect.Effect<{ status: number; body: unknown }, unknown> =>
+        /**
+         * npm's packument, from the shared cache when another isolate fetched it within the TTL. `fetchedAt` is when npm
+         * sent it: `now` for a fresh fetch, the copy's own time for a shared one.
+         */
+        const fetchPackument = (url: string, now: number): Effect.Effect<{ status: number; body: unknown; fetchedAt: number }, unknown> =>
           Effect.tryPromise({
-            try: async (): Promise<{ status: number; body: unknown }> => {
+            try: async (): Promise<{ status: number; body: unknown; fetchedAt: number }> => {
               const key = packumentKey(url);
               const shared = sharing ? workerCache() : null;
               const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
+              // a copy with no time (written before copies carried one) or past its TTL is not used
+              const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
-              if (hit) {
+              if (hit && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
                 const body: unknown = JSON.parse(await hit.text());
 
-                return { status: 200, body };
+                return { status: 200, body, fetchedAt: sentAt };
               }
 
+              await hit?.body?.cancel();
               const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
 
               if (res.status !== 200) {
                 await res.body?.cancel();
 
-                return { status: res.status, body: null };
+                return { status: res.status, body: null, fetchedAt: now };
               }
 
               const text = await res.text();
               const body: unknown = JSON.parse(text);
 
               if (shared && background) {
-                const copy = new Response(text, { headers: { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}` } });
-                background(shared.put(key, copy).catch(() => undefined));
+                const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(now) };
+                background(shared.put(key, new Response(text, { headers })).catch(() => undefined));
               }
 
-              return { status: 200, body };
+              return { status: 200, body, fetchedAt: now };
             },
             catch: (cause) => cause,
           });
 
-        const fetchPackage = (name: string): Effect.Effect<CachedProbe | { kind: "unknown" }> =>
-          fetchPackument(`${baseUrl}${encodeName(name)}`).pipe(
-            Effect.map(({ status, body }): CachedProbe | { kind: "unknown" } => {
-              if (status === 404) return { kind: "absent" };
+        /** A packument answer read into the package apm caches. */
+        const packageOf = (input: { name: string; status: number; body: unknown }): CachedProbe | { kind: "unknown" } => {
+          const { name, status, body } = input;
 
-              if (status !== 200) return { kind: "unknown" };
-              const parsed = UpPackument.safeParse(body);
+          if (status === 404) return { kind: "absent" };
 
-              if (!parsed.success) return { kind: "unknown" };
-              const raw = parsed.data;
-              const tarballs = new Map<string, string>();
-              const versions: Omit<VersionRecord, "score">[] = [];
+          if (status !== 200) return { kind: "unknown" };
+          const parsed = UpPackument.safeParse(body);
 
-              for (const [v, rawDoc] of Object.entries(raw.versions)) {
-                const one = UpVersion.safeParse(rawDoc);
+          if (!parsed.success) return { kind: "unknown" };
+          const raw = parsed.data;
+          const tarballs = new Map<string, string>();
+          const versions: Omit<VersionRecord, "score">[] = [];
 
-                if (!one.success) continue;
-                const doc = one.data;
-                tarballs.set(v, doc.dist.tarball);
-                const manifest: Record<string, unknown> = { ...doc };
-                delete manifest.dist;
-                const shasum = doc.dist.shasum ?? "";
-                const integrity = doc.dist.integrity ?? "";
-                const digest = digestOf({ integrity, shasum });
-                versions.push({
-                  package: name,
-                  version: v,
-                  manifest,
-                  shasum,
-                  integrity,
-                  size: 0,
-                  tarball_key: digest ? upstreamBlobKey(digest) : "",
-                  published_at: Date.parse(raw.time[v] ?? "") || 0,
-                  published_by: doc._npmUser?.name ?? "upstream",
-                  deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
-                  status: "active",
-                  status_reason: null,
-                  status_at: null,
-                  status_by: null,
-                });
-              }
+          for (const [v, rawDoc] of Object.entries(raw.versions)) {
+            const one = UpVersion.safeParse(rawDoc);
 
-              versions.sort((a, b) => a.published_at - b.published_at);
+            if (!one.success) continue;
+            const doc = one.data;
+            tarballs.set(v, doc.dist.tarball);
+            const manifest: Record<string, unknown> = { ...doc };
+            delete manifest.dist;
+            const shasum = doc.dist.shasum ?? "";
+            const integrity = doc.dist.integrity ?? "";
+            const digest = digestOf({ integrity, shasum });
+            versions.push({
+              package: name,
+              version: v,
+              manifest,
+              shasum,
+              integrity,
+              size: 0,
+              tarball_key: digest ? upstreamBlobKey(digest) : "",
+              published_at: Date.parse(raw.time[v] ?? "") || 0,
+              published_by: doc._npmUser?.name ?? "upstream",
+              deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
+              status: "active",
+              status_reason: null,
+              status_at: null,
+              status_by: null,
+            });
+          }
 
-              return {
-                kind: "found",
-                pkg: {
-                  name,
-                  distTags: raw["dist-tags"],
-                  description: raw.description ?? "",
-                  readme: raw.readme ?? "",
-                  maintainers: (raw.maintainers ?? []).map((m) => m.name),
-                  versions,
-                  tarballs,
-                },
-              };
-            }),
-            Effect.orElseSucceed(() => ({ kind: "unknown" as const })),
+          versions.sort((a, b) => a.published_at - b.published_at);
+
+          return {
+            kind: "found",
+            pkg: {
+              name,
+              distTags: raw["dist-tags"],
+              description: raw.description ?? "",
+              readme: raw.readme ?? "",
+              maintainers: (raw.maintainers ?? []).map((m) => m.name),
+              versions,
+              tarballs,
+            },
+          };
+        };
+
+        /** The package as npm lists it, and when npm said so. */
+        const fetchPackage = (name: string, now: number): Effect.Effect<{ probe: CachedProbe | { kind: "unknown" }; fetchedAt: number }> =>
+          fetchPackument(`${baseUrl}${encodeName(name)}`, now).pipe(
+            Effect.map(({ status, body, fetchedAt }) => ({ probe: packageOf({ name, status, body }), fetchedAt })),
+            Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now })),
           );
 
         const probe = (name: string): Effect.Effect<Probe, StoreError> =>
@@ -415,10 +431,11 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             let cached = caches.probes.get(name, t);
 
             if (cached === undefined) {
-              const fresh = yield* fetchPackage(name);
+              const { probe: fresh, fetchedAt } = yield* fetchPackage(name, t);
 
               if (fresh.kind === "unknown") return fresh;
-              caches.probes.set(name, fresh, t);
+              // the TTL counts from when npm answered, which for a shared copy is before this request
+              caches.probes.set(name, fresh, fetchedAt);
               cached = fresh;
 
               if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });

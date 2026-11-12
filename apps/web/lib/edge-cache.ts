@@ -173,7 +173,12 @@ export const POLICIES = {
   events: { freshMs: 10_000, staleMs: 60_000 },
   /** An older version's full score report: it changes only when evidence is dismissed or restored. */
   versionScore: { freshMs: 60_000, staleMs: 10 * 60_000 },
-  /** Files, excerpts and readmes of one version: the bytes of a published version never change. */
+  /**
+   * Files, excerpts and readmes of one version: the bytes of a published version never change. Whether they may be
+   * shown can (a revoke), so a cached copy is served only while `servable` says yes (lib/registry-fetch.ts).
+   */
   versionFile: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
+  /** That a version's files may be shown: a revoke hides them within these few seconds, and nothing is served stale. */
+  servable: { freshMs: 5_000, staleMs: 0 },
   search: { freshMs: 60_000, staleMs: 5 * 60_000 },
 } as const satisfies Record<string, CachePolicy>;

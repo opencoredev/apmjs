@@ -81,6 +81,8 @@ export type Registry = {
   databaseUrl: string;
   /** Test-only: runs the analysis queue's consumer on one job; "retry" when it handed the message back to the queue. */
   analysisJob: (job: { name: string; version: string }) => Promise<"ack" | "retry">;
+  /** Test-only: puts npm's packument for `url` in the shared Cache API as another isolate would have, sent at `fetchedAt` (null: no time). */
+  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null }) => Promise<void>;
 };
 
 export type TokenScope = "publish" | "stage";
@@ -146,7 +148,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
 
-  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep, databaseUrl: srv.databaseUrl, analysisJob: srv.analysisJob };
+  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep, databaseUrl: srv.databaseUrl, analysisJob: srv.analysisJob, seedUpstreamCache: srv.seedUpstreamCache };
 }
 
 /** The Worker variables that turn the AI review on, as the deploy sets them; none when it is off. */

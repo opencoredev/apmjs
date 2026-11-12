@@ -614,8 +614,10 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
     const job = got.digest ? yield* jobByKey(name, v.version, got.digest) : null;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 
-    if (review) status = "reviewed";
-    else if (job?.state === "queued" || job?.state === "leased") status = "queued";
+    // a waiting job comes first: a retry after no answer is queued while the older result is still stored, and the
+    // card keeps polling only while the answer says queued
+    if (job?.state === "queued" || job?.state === "leased") status = "queued";
+    else if (review) status = "reviewed";
     else if (job?.state === "failed") status = "failed";
 
     return json(

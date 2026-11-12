@@ -415,6 +415,29 @@ describe("AI review", () => {
     expect(dig((await review("ai-review-flip-demo", "1.0.0", alice)).body, "private", "reason")).toBe("unsettled");
   });
 
+  test("a requested retry of a review with no answer reads as queued until it finishes, next to the older result", async () => {
+    await publish(reg, alice, { name: "ai-review-flip-retry", version: "1.0.0", license: "MIT", main: "index.js" }, {
+      "index.js": "const https = require('https');\nhttps.request({ host: 'collector.example.invalid' });\n",
+    });
+    expect(await runOnce(reviewer(), 4)).toBe(1);
+    expect(dig((await review("ai-review-flip-retry", "1.0.0", alice)).body, "private", "outcome")).toBe("no-answer");
+    const carol = await reg.mintToken({ user: "carol", scope: "publish" });
+    const asked = await getJson(`${reg.url}-/apm/v1/review/ai-review-flip-retry/1.0.0/request`, { method: "POST", headers: { authorization: `Bearer ${carol}` } });
+
+    expect(asked.status).toBe(202);
+    // the card polls while the answer says queued: the older result is still shown, and the retry is not offered again
+    const waiting = await review("ai-review-flip-retry", "1.0.0", carol);
+
+    expect(dig(waiting.body, "status")).toBe("queued");
+    expect(dig(waiting.body, "review", "state")).toBe("under-review");
+    expect(dig(waiting.body, "canRequest")).toBe(false);
+    expect(await runOnce(reviewer(), 4)).toBe(1);
+    const done = await review("ai-review-flip-retry", "1.0.0");
+
+    expect(dig(done.body, "status")).toBe("reviewed");
+    expect(dig(done.body, "review", "state")).toBe("found-nothing");
+  });
+
   test("leases expire, and a result needs the current lease", async () => {
     await publish(reg, alice, { name: "ai-review-lease-demo", version: "1.0.0", license: "MIT", main: "index.js" });
     const lease = async (): Promise<LeaseResponse["jobs"]> => LeaseResponse.parse((await getJson(`${reg.url}-/apm/v1/review-jobs?max=1`, { headers: { authorization: `Bearer ${SERVICE_TOKEN}` } })).body).jobs;

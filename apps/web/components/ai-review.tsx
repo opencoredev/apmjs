@@ -108,10 +108,11 @@ function Result({ r, name, version }: { r: PublicReview; name: string; version: 
 /** Whether the card is still asking about a queued review, or stopped after three minutes. */
 type Watch = "idle" | "watching" | "gave-up";
 
-function Pending({ status, watch }: { status: ReviewAnswer["status"]; watch: Watch }) {
+/** `again`: a retry is queued while an older result is shown above. */
+function Pending({ status, watch, again }: { status: ReviewAnswer["status"]; watch: Watch; again: boolean }) {
   const text: Record<ReviewAnswer["status"], string> = {
     reviewed: "",
-    queued: watch === "gave-up" ? "Still queued; reload later." : "Queued for AI review. Results usually arrive in under a minute.",
+    queued: watch === "gave-up" ? "Still queued; reload later." : `Queued for ${again ? "another AI review" : "AI review"}. Results usually arrive in under a minute.`,
     failed: "The AI reviewer could not read this version's tarball.",
     "not-reviewed": "Not reviewed by AI. apm reviews every new apm publish, and new releases of npm packages with 10,000 or more weekly downloads.",
   };
@@ -238,7 +239,12 @@ export function AiReviewSection({ initial, signInHref }: { initial: ReviewAnswer
   return (
     <div className="flex flex-col gap-3">
       <div className="overflow-hidden rounded-xl border" aria-live="polite">
-        {answer.review ? <Result r={answer.review} name={answer.name} version={answer.version} /> : <Pending status={answer.status} watch={watch} />}
+        {answer.review ? <Result r={answer.review} name={answer.name} version={answer.version} /> : <Pending status={answer.status} watch={watch} again={false} />}
+        {answer.review && answer.status === "queued" && (
+          <div className="border-t">
+            <Pending status="queued" watch={watch} again />
+          </div>
+        )}
         {answer.private && answer.viewer !== "public" && <PrivateFindings p={answer.private} viewer={answer.viewer} name={answer.name} version={answer.version} />}
         {offersRequest(answer) && (
           <RequestReview
