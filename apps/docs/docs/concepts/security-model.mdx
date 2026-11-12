@@ -1,0 +1,70 @@
+---
+title: Security model
+description: What apm protects against, how accounts, tokens and second factors work, and how apm makes your package manager install exactly what it checked.
+---
+
+apm assumes three things go wrong: a publishing token leaks, an account is taken over, and a package is malicious from the start. It answers each in a different place:
+
+| Threat | apm's answer |
+| --- | --- |
+| A token leaks | A login token can upload but not release. A person approves every version with a passkey or an authenticator code. |
+| An account is taken over | Revoking, restoring, incident response and owner changes need a fresh second factor. `apm incident` revokes every token and recent version at once. |
+| A package is malicious | The score, the cooldown and the AI review flag it before install; yank and revoke pull it after. |
+| A config file or lockfile points elsewhere | `apm add` pins every scope to the registry it checked and verifies what was installed. |
+
+## Accounts and scopes
+
+You sign in with GitHub. Your scope is your GitHub login, bound to GitHub's numeric account id, and permanent once claimed. A GitHub rename does not move or free it. See [Names and scopes](/guides/names).
+
+## Tokens
+
+The token `apm login` gives you is a staging token:
+
+- A version it uploads is staged. It goes live only when you approve it on apmjs.dev.
+- Moving dist-tags, deprecating, yanking and unyanking need a fresh code with it (`--otp`).
+- Revoke, restore, incident response and owner changes need a fresh second factor with any token.
+
+apm stores the token in your user `.npmrc` with mode `0600`, and sends `APM_TOKEN` only to the registry it was issued for. It removes credentials from the environment of install scripts and package binaries it runs.
+
+## Second factors
+
+Codes and passkeys protect every action that changes what people install or how you sign in.
+
+- **One action, once.** A code or passkey check on the website is bound to your browser session, the action and every parameter of it: which upload, which CLI command, which review decision and note, which evidence item and reason, which sign-in setting. It confirms that action once, within 5 minutes, and nothing else. Signing in with a passkey confirms nothing.
+- **CLI commands.** Revoke, restore, incident response and owner changes take `--otp <code>`. Without it, the error links to a page that approves exactly that command, once, for 10 minutes.
+- **Codes.** A code is six digits and works once. Wrong codes and recovery codes share one budget per account: five failures lock checks for 15 minutes, on the website and the CLI together.
+- **Changing factors.** Turning off 2FA, adding a passkey or linking another sign-in needs your current code, a recovery code, or a passkey check made for that change. The authenticator secret is never shown again after setup. Recovery codes are shown once and each works once.
+- **Website changes come from the website.** Every change a website session can make is refused with 403 unless the request carries the website's `Origin`, before any code is checked. Requests made with a CLI or CI token are not affected.
+
+## What the registry serves
+
+- Package metadata comes from the `package.json` inside the tarball, not from the publish request, so a request cannot hide install scripts the tarball has.
+- Versions are immutable. A tarball is checked against its published sha512 before it is served, including npm tarballs apm caches.
+- Answers that belong to one user (account, sessions, staged uploads, tokens, login) are marked `Cache-Control: private, no-store`, so no shared cache keeps them.
+- Revoked versions answer 410 and appear as critical advisories to `bun audit` and `npm audit`.
+
+## How `apm add` installs what it checked
+
+A check means nothing if the package manager then installs other bytes. `apm add`:
+
+1. pins every scope in the checked dependency tree to the checked registry, and refuses if an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere;
+2. refuses if the lockfile already pins an added package to a different tarball;
+3. installs with every install script held back (`--ignore-scripts`);
+4. reads the lockfile the install wrote and compares every package's integrity with what the checked registry serves;
+5. runs the held-back scripts only when everything matches. Otherwise it restores `package.json` and the lockfile, removes the unverified packages and exits non-zero.
+
+Limits: with yarn, apm does steps 1 and 2 only. `apm x` does step 1 only, because `bunx` and `npx` install into their own cache. The tree walk stops at 300 packages; the rest is listed as not checked.
+
+## What apm does not protect against
+
+- Code that only shows what it does at runtime. See [what the score cannot catch](/concepts/score#what-it-cannot-catch).
+- A compromised build machine that publishes clean-looking code with a backdoor, and a person who approves it.
+- Packages installed with a stock client pointed at another registry, or with no apm settings at all.
+
+## Self-hosting
+
+A self-hosted registry can turn on npm password accounts with `APM_LEGACY_AUTH=1`. It refuses to start when its public URL is a public https address, unless you also set `APM_ALLOW_LEGACY_IN_PROD=1`. See [Configuration](/reference/configuration#registry).
+
+## Reporting
+
+Report a vulnerability in apm privately; see [Report a vulnerability in apm](/guides/appeals-and-reports#report-a-vulnerability-in-apm).

@@ -1,0 +1,70 @@
+---
+title: CI and trusted publishing
+description: What works in CI today (checked installs, audits, staged publishes) and what does not exist yet (OIDC trusted publishing and provenance).
+---
+
+You can run apm's checks in CI today. Publishing from CI works too, but every version still waits for a person to approve it: apm has no tokens that publish live, and no trusted publishing.
+
+## What exists today
+
+| In CI you want to | Use | Status |
+| --- | --- | --- |
+| Fail the install on revoked or low-scoring versions | Bun scanner with `APM_SCANNER_STRICT=1` | Works |
+| Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works |
+| Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
+| Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
+| Publish live from CI with no person | OIDC trusted publishing | Does not exist |
+| Attach build provenance | Sigstore provenance | Does not exist |
+
+## Check installs in CI
+
+With Bun, use the [scanner in strict mode](/guides/bun-scanner#strict-mode-for-ci) so any package it could not check cancels the install:
+
+```bash
+APM_SCANNER_STRICT=1 bun install --frozen-lockfile
+```
+
+With npm or pnpm, commit an `.npmrc` that points at the `~safe` view:
+
+```ini title=".npmrc"
+registry=https://registry.apmjs.dev/~safe/
+```
+
+Then, after the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:
+
+```bash
+apm audit --json
+```
+
+## Upload from CI
+
+Every token the registry gives out on apmjs.dev is a staging token. A version uploaded with one is not live until a person approves it with a passkey or an authenticator code. A token leaked from CI can therefore upload, but not release.
+
+1. Run `apm login` on your own machine and copy the token for `registry.apmjs.dev` from your user `.npmrc` into a CI secret, for example `NODE_AUTH_TOKEN`.
+2. Commit an `.npmrc` that reads the token from the environment. apm and your package manager both read it:
+
+   ```ini title=".npmrc"
+   //registry.apmjs.dev/:_authToken=${NODE_AUTH_TOKEN}
+   ```
+
+3. Publish with `--json` and send the approval link somewhere a person sees it:
+
+   ```bash
+   apm publish --json > publish.json
+   ```
+
+   `publish.json` holds `"status": "staged"` and an `"approval"` URL. Post that URL to your team's chat or the pull request. Someone with publish rights on the package approves it within 24 hours.
+
+apm removes credentials from the environment of the install scripts and package binaries it runs. During `apm publish`, credential variables reach only your package manager's `publish` command, which runs no package code.
+
+:::warning
+The token also identifies you for `apm login`'s other powers, such as uploading to any of your packages. Revoke it from your account page at `https://apmjs.dev/account` when it is no longer needed, or all at once with [`apm incident`](/guides/pull-a-version#respond-to-a-compromised-account).
+:::
+
+## What is missing
+
+- **Trusted publishing (OIDC).** There is no way yet for a GitHub Actions run to publish without a stored token, and no way to publish live without a person. The registry's code has a token type that publishes live, kept for legacy password accounts and tests; apmjs.dev does not issue it.
+- **Provenance.** apm does not create or verify Sigstore provenance statements.
+- **Long-lived automation tokens with narrow scopes.** A login token covers every package you own.
+
+If you need any of these, say so in an issue on [GitHub](https://github.com/opencoredev/apmjs/issues).

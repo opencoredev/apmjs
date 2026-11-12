@@ -1,0 +1,21 @@
+{
+  "name": "docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "preview": "blume preview",
+    "validate": "blume validate --strict",
+    "doctor": "blume doctor"
+  },
+  "devDependencies": {
+    "blume": "2.2.7"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opencoredev/apmjs.git"
+  }
+}

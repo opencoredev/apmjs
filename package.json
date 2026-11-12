@@ -9,7 +9,7 @@
   "scripts": {
     "registry": "bun scripts/dev-registry.ts",
     "test": "bun test tests",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/registry/tsconfig.json && tsc -p packages/infra/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/registry/tsconfig.json && tsc -p packages/infra/tsconfig.json && tsc -p apps/docs/tsconfig.json",
     "lint": "bun scripts/lint.ts",
     "lint:baseline": "bun scripts/lint.ts --update",
     "build:registry": "bun packages/registry/scripts/build.ts",

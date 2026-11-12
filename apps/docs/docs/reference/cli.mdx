@@ -1,0 +1,158 @@
+---
+title: CLI reference
+description: Every apm command, its flags, its output with --json, and its exit codes.
+sidebar:
+  label: CLI
+---
+
+`apm` 0.1.0 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
+
+To install it, see [Quick start](/quickstart#2-get-the-apm-cli).
+
+## Global flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then bun if it is installed, else npm. |
+| `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
+| `--otp <code>` | A six-digit code from your authenticator app, for commands that need a fresh second factor. |
+| `--help`, `-h` | Print the command list. |
+| `--version`, `-v` | Print the version. |
+
+Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A passed-through command exits with the package manager's code.
+
+## apm add
+
+```bash
+apm add <package>[@range]... [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D]
+```
+
+Resolves each package to the newest version that passes the policy, checks its dependency tree, installs the exact version with install scripts held back, verifies every installed package against the registry, then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
+
+| Flag | Meaning |
+| --- | --- |
+| `--cooldown <duration>` | Skip versions younger than this. `24h` (default), `90m`, `2d`, `0`. A bare number is hours. |
+| `--no-cooldown` | Same as `--cooldown 0`. |
+| `--floor <n>` | Refuse versions scoring below `n`. Default `40`. Dependencies are always checked at 40 or the stricter floor you ask for. |
+| `--force` | Lift the floor and the cooldown for the named packages only. Revoked and yanked versions, unknown names and dangerous dependencies stay blocked. |
+| `-D`, `--dev` | Add as a dev dependency. |
+
+With `--json`:
+
+```json
+{ "ok": true, "pm": "bun", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 90, "grade": "A", "signals": [{ "id": "eval", "points": -10 }], "skipped": [], "unchecked": [], "blocked": false, "reason": null, "forceable": false }] }
+```
+
+## apm x
+
+```bash
+apm x <package>[@version] [args...]
+```
+
+Shows the package's score card, then runs it with `bunx` (bun), `pnpm dlx` (pnpm) or `npx --yes` (npm and yarn). Aliases: `apm exec`, `apm dlx`. Takes the same `--force`, `--no-cooldown`, `--cooldown` and `--floor` flags as `add`. Scopes are pinned to the checked registry, but the tool's own cache is not verified afterwards.
+
+## apm score
+
+```bash
+apm score <package>[@version] [--json]
+```
+
+Prints a version's score: every signal with its points and evidence, the publisher, the previous version's score, and the list of what was not checked. Without a version, it scores `latest`.
+
+## apm name
+
+```bash
+apm name <name> [--json]
+```
+
+Says whether a name is free, taken, or free but refused (with the reason), plus similar names and available alternatives. When you are logged in it also says whether you already own it. See [Names and scopes](/guides/names).
+
+## apm audit
+
+```bash
+apm audit [--json]
+```
+
+Checks every installed version against apm's revocations and the upstream advisories. Exits `1` on any finding and also when anything could not be checked.
+
+```json
+{ "ok": false, "checked": 412, "findings": [{ "id": "some-package@1.0.3", "severity": "critical", "text": "..." }], "unchecked": [] }
+```
+
+## apm publish
+
+```bash
+apm publish [--bump patch|minor|major|<version>] [--dry-run] [--tag <tag>]
+```
+
+Checks, packs with your package manager, previews the score, then uploads. With a login token the version is staged and the command prints the approval link. See [Publish a package](/guides/publishing).
+
+| Flag | Meaning |
+| --- | --- |
+| `--bump` | `patch`, `minor`, `major` or an exact version. Writes the new version to `package.json` (not with `--dry-run`). |
+| `--dry-run` | Run every check and print the preview. Upload nothing. |
+| `--tag <tag>` | The dist-tag. Default: `latest`, or `next` for a prerelease. |
+
+`--json` prints `status` as `dry-run`, `staged` (with `approval`, the link) or `published`, plus `name`, `version`, `registry`, `files`, `score` and `grade`.
+
+## apm yank, apm unyank
+
+```bash
+apm yank <package>@<version> [--reason "..."] [--otp <code>]
+apm unyank <package>@<version> [--otp <code>]
+```
+
+Hide a version from new installs, or show it again. Lockfiles that pin it keep working. A login token needs `--otp`.
+
+## apm revoke
+
+```bash
+apm revoke <package>@<version> --reason "..." [--otp <code>]
+```
+
+Pulls a malicious version. `--reason` is required. Needs a fresh second factor: `--otp`, a code typed at the prompt, or a website approval of this exact command within the last 10 minutes. A version under 72 hours old is revoked at once; an older one is `revoke-pending` for 24 hours unless a second owner runs the same command. See [Yank, revoke and incident response](/guides/pull-a-version).
+
+## apm restore
+
+```bash
+apm restore <package>@<version> [--reason "..."] [--otp <code>]
+```
+
+Undoes a mistaken revoke. The version goes back to `yanked`. Needs a fresh second factor.
+
+## apm incident
+
+```bash
+apm incident --since <ISO time> [--reason "..."] [--dry-run] [--otp <code>]
+```
+
+Revokes every version you published since `--since` (at most 30 days back) and every token on your account. `--dry-run` lists what it would do and changes nothing. `--reason` defaults to `account compromised`. Needs a fresh second factor.
+
+## apm login
+
+```bash
+apm login [--no-browser]
+apm login --username <name> --password-stdin [--email <address>]
+```
+
+The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+
+## apm whoami
+
+```bash
+apm whoami [--json]
+```
+
+Prints the user the current token belongs to, and the registry.
+
+## Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `APM_REGISTRY` | The registry to use. Wins over every config file. |
+| `APM_TOKEN` | A token to use instead of the one in `.npmrc`. Sent only to the registry it was issued for: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else the default. |
+| `npm_config_registry` | Used when `APM_REGISTRY` is not set. |
+| `npm_config_userconfig` | Path of the user `.npmrc`. Default `~/.npmrc`. |
+| `NO_COLOR` | Turn off colors. |
+
+Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.

@@ -7,7 +7,8 @@ import { cn } from "cn";
 const LINKS = [
   { href: "/publish", label: "Publish" },
   { href: "/compare", label: "Compare" },
-  { href: "/docs", label: "Docs" },
+  // the docs site (apps/docs); /docs stays as a short overview that links into it
+  { href: "https://docs.apmjs.dev", label: "Docs" },
 ] as const;
 
 function Links({ current }: { current: string | null }) {

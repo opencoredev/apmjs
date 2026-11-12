@@ -1,0 +1,94 @@
+---
+title: How the score works
+description: What apm's 0 to 100 score reads, what costs points, how evidence is cited, and what the score cannot catch.
+---
+
+Every version on apm gets a number from 0 to 100. It starts at 100, and every point it loses is a named signal with the file and line that caused it. Below 40, the floor, `apm add`, the `~safe` view and the Bun scanner refuse the version.
+
+The score is a static read of the package's text. It catches most of what npm malware does today, because a dropper has to download, run a shell or read credentials somewhere in its files. It is weak against an author who knows the rules and writes code that only shows what it does at runtime. Read a high score as "nothing on this list was found", not as "safe".
+
+## What goes in
+
+The score is computed once per version, from three things:
+
+- the tarball's files;
+- its `package.json`, as it is inside the tarball;
+- the publish history: who published earlier versions, and which dependencies are new.
+
+Popularity and download counts are never inputs.
+
+## What it reads, in order
+
+1. **Install scripts.** `preinstall`, `install` and `postinstall` run on every install; `prepare`, `prepack` and `postpack` run when someone installs from git. apm follows each script the way the package managers do, into `npm run x`, `sh -c '...'`, base64 handed to `node -e`, and the files those commands name.
+2. **`binding.gyp`**, and a `Makefile` or `CMakeLists.txt` when an install script builds with it.
+3. **Entry points**: `bin`, `main`, `module`, `browser`, `exports` and `imports`, then every file they load by a path apm can work out.
+4. **Every other file that could be code**, whatever its extension. A file called `lib/payload.dat` is read too.
+
+Every file is read whole, as text, including comments, regular expressions and TypeScript types, because code can read that text back and run it. JavaScript and TypeScript are also parsed, and the parse can only add findings.
+
+Images, fonts, archives and WebAssembly are recognised by their bytes and skipped. Executables and native `.node` modules are listed as `binary`. A file over 32 MB, or code past the 200 MB total, is not read and marks the analysis `incomplete`, which on its own puts the version below the floor.
+
+## How text tricks are undone
+
+Each file is read three times: as written; with split strings joined (`'chi' + 'ld_' + 'process'` becomes `'child_process'`) and `\x63`-style escapes decoded; and on strings decoded from base64, hex, character codes and URI escapes. A dangerous name that only shows up after joining or decoding also counts as `obfuscated`.
+
+## Signals
+
+| Signal | Points | Fires on |
+| --- | ---: | --- |
+| `revoked` | -100 | Pulled as malicious. |
+| `incomplete` | -61 | Code that runs could not be read. |
+| `install-download` | -40 | An install command that downloads (`curl`, `wget`), pipes into a shell, or runs `npx` for a package that is not a dependency. |
+| `risky-dependency` | -30 | A dependency whose resolved version scores below the floor. |
+| `credential-access` | -25 | `.npmrc`, `.ssh`, cloud credential paths, token variable names, dumping `process.env`. |
+| `typosquat` | -20 | A name one edit from a popular package, or the same name with different separators or a `.js` suffix. |
+| `unanalyzed-files` | -20 | Files nothing was seen loading were left out because the byte budget ran out. |
+| `install-script` | -15 | Has `preinstall`, `install`, `postinstall` or `binding.gyp`. |
+| `shell-exec` | -15 | `child_process`, `execSync`, `Bun.spawn`, `\| sh`, `curl`, `powershell`. |
+| `network` | -10 | `fetch`, `http.request`, socket and DNS modules, HTTP client libraries, `WebSocket`. |
+| `eval` | -10 | `eval`, `new Function`, `vm`, string timers, `new Worker(code, { eval: true })`. |
+| `obfuscated` | -10 | Many `_0x` names, long escape or base64 runs, or anything the decoding passes had to undo. |
+| `git-install-script` | -10 | A git-install script (`prepare`, `prepack`, `postpack`) with shell, network, credential or eval content. |
+| `new-publisher` | -10 | An account that never published this package before. |
+| `binary` | -5 | Executables and native modules. |
+| `new-dependency` | -5 | Dependencies the previous version did not have. |
+| `deprecated` | -5 | Deprecated by its maintainer. |
+| `no-license` | -3 | No `license` field. |
+| `dynamic-require` | 0 | `require(x)` with a value apm cannot work out. Shown, not scored. |
+| `recent`, `yanked` | 0 | Published under 24 hours ago (the cooldown handles that); hidden by its maintainer. |
+
+Grades: A is 90 and up, B 75, C 60, D 40, F below 40.
+
+## Confirmed and possible
+
+Each code signal is **confirmed** or **possible**.
+
+- **Confirmed**: apm saw the code do it, or a text rule matched it in a file apm read. Full points.
+- **Possible**: only the parsed program suggests it, for example a loaded `inspector` module, and no text rule matched. About a third of the points, labelled "Possible ...".
+
+A confirmed signal made only of text matches says so in its label: "Mentions a credential file (.npmrc, .ssh) or secret variable; apm did not see one read" instead of "Reads credential files". Each evidence line also says where the match sits: "(text match in a comment)", "(text match in a regex)", "(text match in a TypeScript type)" or "(text match in a JSON file)". The points are the same either way.
+
+## Evidence
+
+Every signal cites the place it came from: `file:line` and the line itself. A joined string is cited where its first piece is, a decoded payload where the decoder is called. A file in a test folder says `(in a test file)`. On apmjs.dev every citation links to the file, opened at that line.
+
+## What it cannot catch
+
+Every score carries this list as "not checked":
+
+- **Runtime behaviour.** Code that downloads, decrypts or assembles a second stage while running. Its loader still needs `fetch`, `eval`, `vm` or `child_process`, so it usually scores low, but the score cannot say what the second stage does.
+- **Other encodings.** XOR, compression, a custom alphabet, or base64 inside base64.
+- **Names built some other way**: array lookups, computed indexes, values read from a file at runtime, or values passed through a function.
+- **Files only a computed path loads.** Docs, JSON and style files are read only when code reaches them by a path apm can work out. `require(name)` pointing elsewhere shows up as `dynamic-require`.
+- **Native code and WebAssembly.** Listed, never read.
+- **A popular name under another scope**, such as `@someone/react`. Scopes exist so names can be reused.
+- **Dependencies' own code.** Each dependency has its own score, which `risky-dependency` uses.
+- **The publisher's machine or CI.** A compromised build that ships a quiet backdoor in clean-looking code scores well.
+
+## Why it has false positives, and what fixes them
+
+The score has no exclusions: every attempt to skip "harmless" text, such as comments, was beaten by a review that hid a payload there. So the score reads everything, and that has a price. On a hand-checked set of 70 popular packages, 28 of the 102 confirmed code signals are false, mostly words like `curl` in a comment or `sh` in a regular expression.
+
+Precision comes from people instead of rules: an apm reviewer can [dismiss one evidence item](/guides/appeals-and-reports#appeal-a-score) for one version's exact tarball. The [AI release review](/concepts/ai-review) adds a second reading next to the score, never inside it.
+
+The full rules, the review history and the test corpus are in [`docs/SCORE.md`](https://github.com/opencoredev/apmjs/blob/main/docs/SCORE.md).

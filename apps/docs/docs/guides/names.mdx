@@ -1,0 +1,50 @@
+---
+title: Names and scopes
+description: Your scope is your GitHub login. The rules for new package names, and how to check a name before you publish.
+---
+
+Every new package on apm is published under your own scope, and the registry refuses names that could be mistaken for a popular package. This page lists the rules and how to check a name first.
+
+## Check a name
+
+```bash
+apm name @your-github-login/my-lib
+```
+
+```text
+✓ @your-github-login/my-lib is available
+```
+
+`apm name` says whether a name is free, taken (and by whom, with its latest version and score), or free but refused, with the reason and a few available alternatives. The search box on apmjs.dev runs the same check.
+
+## Your scope
+
+- Your scope is your GitHub login in lower case, taken when you first sign in.
+- It is bound to GitHub's numeric account id, not to the login text.
+- It is permanent. Renaming your GitHub account does not move or free it, and someone who later takes your old login on GitHub does not get it. Your account page shows the new login.
+- To move packages to a scope that matches a new login, open a [name dispute](https://github.com/opencoredev/apmjs/issues/new?template=name-dispute.yml).
+
+## Rules for a first publish
+
+A name is checked when its first version is published. After that, only its owners can publish to it.
+
+| Rule | Example | Refused because |
+| --- | --- | --- |
+| New packages are scoped to you. | `my-lib` | A bare name always means the npm package, so apm does not hand out bare names. Publish `@you/my-lib`. |
+| Only your own scope. | `@someone-else/my-lib` | New packages go under your own scope. |
+| Names that exist on npm cannot be taken. | `@you/tool`, when npm already has `@you/tool` | apm shares one namespace with npm, so the name keeps meaning the npm package. |
+| Look-alikes of popular packages are refused. | `@you/raect`, `@you/expressjs` | Names this close are how typosquatting works. |
+| Valid npm names only. | `@you/My-Lib` | Lowercase letters, digits, `.`, `-`, `_` and `~`; at most 214 characters. |
+
+The look-alike check compares against about 300 widely used npm packages. For a scoped name, it refuses a bare part that swaps two neighbouring letters of a popular name (`@you/raect`), or adds `.js`, `js`, `-js` or `.mjs` to one (`@you/expressjs`), and a near miss of a popular scoped name (`@type/node`). A popular name under your own scope, like `@you/react`, is allowed: scopes exist so names can be reused.
+
+When npm is unreachable, a first publish that needs an npm check is refused with a 503 rather than allowed. Try again shortly.
+
+## Look-alikes on install
+
+The same check warns on the install side. `apm score` and `apm add` mark a package whose name is one edit from a popular one with the `typosquat` signal (minus 20 points), and the search on apmjs.dev shows look-alikes next to your query.
+
+## Related
+
+- [Publish a package](/guides/publishing)
+- [How the score works](/concepts/score)

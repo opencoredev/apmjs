@@ -1,0 +1,71 @@
+---
+title: Configuration
+description: Every setting that points a client at apm, configures the CLI and the Bun scanner, and runs a self-hosted registry.
+---
+
+This page lists every setting apm reads, grouped by where you set it. The first three sections are for people using apm; the last two are for running a registry.
+
+## Package manager files
+
+| File | Setting | Effect |
+| --- | --- | --- |
+| `.npmrc` | `registry=https://registry.apmjs.dev/` | npm, pnpm and yarn 1 install through apm. |
+| `.npmrc` | `registry=https://registry.apmjs.dev/~safe/` | The same, with the [`~safe` view](/guides/safe-view) filter. |
+| `.npmrc` | `//registry.apmjs.dev/:_authToken=<token>` | The token `apm login` writes to your user `.npmrc`. `${VAR}` reads it from the environment. |
+| `bunfig.toml` | `[install] registry = "https://registry.apmjs.dev/"` | Bun installs through apm. |
+| `bunfig.toml` | `[install.security] scanner = "@apm/bun-scanner"` | Turns on the [Bun scanner](/guides/bun-scanner). |
+
+A scoped registry line, such as `@acme:registry=https://elsewhere/`, sends that scope somewhere apm did not check. `apm add` and `apm publish` refuse to run while one applies to a package they handle.
+
+## apm CLI
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APM_REGISTRY` | none | The registry. Wins over every file. |
+| `APM_TOKEN` | none | A token to use instead of the `.npmrc` one. Sent only to the registry it was issued for. |
+| `npm_config_registry` | none | Used when `APM_REGISTRY` is not set. |
+| `npm_config_userconfig` | `~/.npmrc` | Where `apm login` saves the token. |
+| `NO_COLOR` | unset | Turn off colors. |
+
+Registry order: `APM_REGISTRY`, `npm_config_registry`, the nearest project `.npmrc`, your user `.npmrc`, then `https://registry.apmjs.dev/`. The [CLI reference](/reference/cli) has every flag.
+
+## Bun scanner
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APM_REGISTRY` | none | The registry the scanner asks. Otherwise `[install] registry` from the project's `bunfig.toml`, then your global one. |
+| `APM_SCANNER_STRICT` | unset | `1` cancels the install when any package could not be checked. |
+
+## Registry
+
+The registry Worker reads these settings (`packages/registry/src/worker.ts` parses them). Deployment is described in [`docs/DEPLOY.md`](https://github.com/opencoredev/apmjs/blob/main/docs/DEPLOY.md).
+
+| Variable | Meaning |
+| --- | --- |
+| `HYPERDRIVE`, `BLOBS`, `ANALYSIS_QUEUE` | The Postgres (through Hyperdrive), R2 and queue bindings. |
+| `APM_REGISTRY_URL` | The registry's public URL, used in tarball links. |
+| `APM_PUBLIC_URL` | The website's URL: sign-in callbacks, approval links, the device page. |
+| `APM_UPSTREAM` | The registry to proxy, or `off`. Production uses `https://registry.npmjs.org/`. |
+| `APM_UPSTREAM_TTL_MS` | How long an upstream answer is trusted. Default `60000`. |
+| `APM_NAME_POLICY` | `scoped` (new packages under the publisher's scope; production) or `open`. |
+| `APM_LEGACY_AUTH` | `1` turns on npm password accounts. Off in production. |
+| `APM_ALLOW_LEGACY_IN_PROD` | Required with `APM_LEGACY_AUTH=1` when `APM_PUBLIC_URL` is a public https address; without it every request answers 503. |
+| `APM_AUTH_SECRET` | Secret. Signs sessions and encrypts authenticator secrets. Changing it signs everyone out and breaks every authenticator app set up so far. |
+| `APM_GITHUB_CLIENT_ID`, `APM_GITHUB_CLIENT_SECRET` | The GitHub OAuth app. Without them the GitHub sign-in button is hidden. |
+| `APM_VERCEL_CLIENT_ID`, `APM_VERCEL_CLIENT_SECRET` | The Vercel OAuth app. Not set on apmjs.dev. |
+| `APM_ADMINS` | GitHub logins of apm's reviewers, comma-separated. They confirm or dismiss AI review flags and dismiss score evidence. |
+| `APM_REVIEW_TOKEN_HASH` | sha256 (hex) of the AI reviewer's service token. Turns the AI review on. |
+| `APM_REVIEW_POPULAR_WEEKLY` | Weekly npm downloads that put a package in the AI review's scope. Default `10000`. |
+| `APM_NPM_DOWNLOADS_URL` | The download-count API. Default `https://api.npmjs.org/downloads/point/last-week/`. |
+| `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning. |
+
+Fixed limits, not settings: a 24-hour cooldown and a floor of 40 for `~safe` and the scanner; 24 hours for a staged upload to be approved; 5 staged uploads per package, 20 per account, 256 MB per account; 32 MB publish bodies; 1 MB `package.json` and readme.
+
+## Running a registry locally
+
+```bash
+bun install
+bun run registry
+```
+
+`bun run registry` runs the registry Worker bundle in Miniflare on `http://127.0.0.1:4873/` against a throwaway Postgres (from `initdb`, or `APM_TEST_DATABASE_URL`). `APM_UPSTREAM=off` turns off the npm proxy. Nothing persists between runs. Point the CLI at it with `APM_REGISTRY=http://127.0.0.1:4873/`.

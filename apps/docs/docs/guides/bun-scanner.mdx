@@ -1,0 +1,78 @@
+---
+title: Bun scanner
+description: Make stock bun install and bun add ask apm about every package, and cancel the install on revoked or low-scoring versions. Strict mode for CI.
+---
+
+`@apm/bun-scanner` plugs into Bun's security scanner hook. Before `bun install` or `bun add` installs anything, Bun hands the scanner the package list, the scanner asks the apm registry about each package, and Bun cancels the install when a version is:
+
+- revoked, or waiting to be revoked;
+- scored below 40.
+
+You keep using plain `bun`. No wrapper, no alias.
+
+## Install it
+
+:::note
+`@apm/bun-scanner` is not published to a registry yet. Until it is, install it from a clone of apm as a file dependency. See the [limit this causes in strict mode](#strict-mode-for-ci).
+:::
+
+```bash
+git clone https://github.com/opencoredev/apmjs.git ~/src/apmjs
+bun add -d ~/src/apmjs/packages/bun-scanner
+```
+
+Bun needs the scanner in the project's own dependencies; a global install is not enough.
+
+Then point Bun at apm and turn the scanner on:
+
+```toml title="bunfig.toml"
+[install]
+registry = "https://registry.apmjs.dev/"
+
+[install.security]
+scanner = "@apm/bun-scanner"
+```
+
+Run `bun install`. A refused install stops with the package, the version and the reason.
+
+## Which registry it asks
+
+The scanner asks exactly one registry:
+
+1. `APM_REGISTRY`, when it is set;
+2. otherwise `[install] registry` from `bunfig.toml`, the project's first, then your global one.
+
+It never takes a registry from package data, so a tarball URL in a lockfile cannot choose who checks it or who sees your package list.
+
+## What it cannot check
+
+The scanner prints one warning per package it could not check:
+
+- no registry is configured;
+- the registry is unreachable, or is not an apm registry;
+- Bun downloads the package from a different host than the configured registry;
+- the version is a git, file or link dependency, which no registry serves.
+
+By default those installs go ahead, so a registry outage does not stop your work. Prereleases (`1.0.0-beta.1`) are checked like any other version.
+
+## Strict mode for CI
+
+In CI, set `APM_SCANNER_STRICT=1`. Any package the scanner could not check then cancels the install:
+
+```bash
+APM_SCANNER_STRICT=1 bun install --frozen-lockfile
+```
+
+```text
+apm scanner: not checked: my-tool@file:../my-tool: not a registry version (git, file or link dependency), so no registry can check it
+error: Security scanner failed: apm scanner: 1 package(s) not checked and APM_SCANNER_STRICT=1, so the install is cancelled
+```
+
+:::warning
+While the scanner itself is installed from a path, strict mode reports it as a file dependency it cannot check, and cancels every install. Strict mode becomes usable once `@apm/bun-scanner` is on the registry. Until then, use strict mode only in projects that list no git, file or link dependencies, which rules out this way of installing the scanner.
+:::
+
+## Related
+
+- [The ~safe view](/guides/safe-view) gives npm and pnpm a similar filter.
+- [CI and trusted publishing](/guides/ci)

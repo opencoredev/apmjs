@@ -25,6 +25,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 - `packages/cli`: `apm`
 - `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and low-scoring versions
 - `apps/web`: Next.js + shadcn UI (search with name check, package pages), deployed as a Worker through OpenNext
+- `apps/docs`: the documentation site at https://docs.apmjs.dev, built with [Blume](https://useblume.dev) and served as static assets (`cd apps/docs && bun run dev`)
 - `tests/acceptance`: over 180 tests that drive real bun, npm and pnpm against the registry's Worker build in Miniflare, on Postgres 18
 
 How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

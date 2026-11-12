@@ -9,7 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../registry/scripts/compat.ts";
 
-const PRODUCTION = { registry: "registry.apmjs.dev", web: "apmjs.dev" } as const;
+const PRODUCTION = { registry: "registry.apmjs.dev", web: "apmjs.dev", docs: "docs.apmjs.dev" } as const;
 
 export default Alchemy.Stack(
   "apmjs",
@@ -22,6 +22,8 @@ export default Alchemy.Stack(
     const webName = `apmjs-web-${stage}`;
     const registryUrl = production ? `https://${PRODUCTION.registry}/` : `https://${registryName}.${subdomain}.workers.dev/`;
     const webUrl = production ? `https://${PRODUCTION.web}/` : `https://${webName}.${subdomain}.workers.dev/`;
+    const docsName = `apmjs-docs-${stage}`;
+    const docsUrl = production ? `https://${PRODUCTION.docs}/` : `https://${docsName}.${subdomain}.workers.dev/`;
 
     const neon = new URL(Redacted.value(yield* Config.Redacted("NEON_URL")));
     const database = yield* Config.String("APM_DATABASE");
@@ -92,6 +94,18 @@ export default Alchemy.Stack(
       domain: production ? PRODUCTION.web : undefined,
     });
 
-    return { registry: registryUrl, web: webUrl, registryWorker: registry.url, webWorker: website.url };
+    // The docs (apps/docs, Blume): static HTML served by an assets-only Worker, so no Worker code is uploaded.
+    // drop-trailing-slash serves /quickstart without redirecting to /quickstart/, as Blume's deployment guide asks.
+    const docs = yield* Cloudflare.Website.StaticSite("Docs", {
+      name: docsName,
+      cwd: resolve(import.meta.dirname, "../../apps/docs"),
+      command: "bun run build",
+      outdir: "dist",
+      assets: { htmlHandling: "drop-trailing-slash", notFoundHandling: "404-page" },
+      observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
+      domain: production ? PRODUCTION.docs : undefined,
+    });
+
+    return { registry: registryUrl, web: webUrl, docs: docsUrl, registryWorker: registry.url, webWorker: website.url, docsWorker: docs.url };
   }),
 );

@@ -1,0 +1,52 @@
+---
+title: apm documentation
+description: apm is a package registry in front of npm. It scores every version, can pull a bad version at any time, and waits for a person to approve each publish.
+sidebar:
+  label: Overview
+---
+
+apm is an open-source registry that stock `bun`, `npm` and `pnpm` talk to unchanged, plus `apm`, a small CLI that checks a package before your package manager installs, runs or publishes it. It proxies the public npm registry, so every package you already use has an apm score.
+
+- Install through apm in two minutes: [Quick start](/quickstart).
+- Publish your first package: [Publish a package](/guides/publishing).
+- Find out what the score can and cannot see: [How the score works](/concepts/score).
+
+:::note
+apm is early. The registry, CLI and score engine work and are tested, and the registry runs at `https://registry.apmjs.dev/`. Trusted publishing from CI and provenance do not exist yet. The `apm` CLI and the Bun scanner are not on a registry yet, so you run them from a clone of the repository.
+:::
+
+## What apm changes
+
+| On npm today | With apm |
+| --- | --- |
+| A hacked version stays installable unless it is under 72 hours old and nothing depends on it. | `yank` hides a version from new installs. `revoke` returns 410 for its tarball and a critical advisory in `bun audit` and `npm audit`, at any time. |
+| A stolen account means rotating tokens and hunting versions by hand. | `apm incident --since <time>` revokes every token and every version published since then. |
+| No safety signal. | Every version gets a score from 0 to 100. Every point lost cites a file and line. Popularity is never an input. |
+| A leaked token can publish. | A version uploaded with a login token waits until a person approves it with a passkey or an authenticator code. |
+| New versions install the minute they appear. | `apm add` and the `~safe` view skip versions under 24 hours old and versions scoring under 40. |
+| Unscoped names are first come, first served. | New packages are scoped to your GitHub login. Names one edit from a popular package are refused. |
+
+## The parts
+
+| Part | What it does | Where |
+| --- | --- | --- |
+| Registry | npm-compatible registry, upstream proxy for npm, scores, yank and revoke, staged publishing. | `https://registry.apmjs.dev/` |
+| `~safe` view | The same registry with young and low-scoring versions hidden. Works with any client. | `https://registry.apmjs.dev/~safe/` |
+| Website | Package search, version pages with evidence, publish approvals, your account. | `https://apmjs.dev` |
+| `apm` CLI | Checks before it hands the work to bun, npm, pnpm or yarn. | [CLI reference](/reference/cli) |
+| Bun scanner | Makes plain `bun install` refuse revoked and low-scoring versions. | [Bun scanner](/guides/bun-scanner) |
+| AI release review | A language model reads each new release and reports cited findings next to the score. | [AI review](/concepts/ai-review) |
+
+## Where to go next
+
+<CardGroup cols={3}>
+  <Card title="Quick start" href="/quickstart" icon="rocket">
+    Point your package manager at apm and add a package.
+  </Card>
+  <Card title="Guides" href="/guides/publishing" icon="book-open">
+    Publishing, pulling a version, CI, the scanner, names.
+  </Card>
+  <Card title="Reference" href="/reference/cli" icon="terminal">
+    Every CLI command, HTTP route and setting.
+  </Card>
+</CardGroup>

@@ -49,6 +49,9 @@ jobs:
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web
+      - name: Docs site (Blume build, then a strict link check that fails on any navigation warning)
+        run: bun run build && bun run validate
+        working-directory: apps/docs
       - name: Acceptance suite (real bun, npm and pnpm against the registry Worker build in Miniflare and Postgres 18)
         run: |
           bun scripts/score.ts | tee score.txt
