@@ -4,13 +4,11 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { z } from "zod";
 import { finalize, parseAnalysis, readTarball, SCORE_FLOOR, type ScoreReport, type TarEntry } from "@apm/core";
 import { actionKey, commandLine, LiveAction } from "./actions.ts";
-import type { ApmAuth, FactorProof, ProofCheck, SignedIn } from "./auth.ts";
+import type { ApmAuth, SignedIn } from "./auth.ts";
 import type { StagedRecord, User } from "./db.ts";
-import { GRANT_MS, parseSixDigits } from "./factors.ts";
+import { GRANT_MS } from "./factors.ts";
 import { commitVersion, fail, issueToken, json, publishRefusal, stagedTarballPath, type Ctx } from "./server.ts";
-
-/** A second factor sent by the website: a TOTP code typed now, or the passkey check this session just made. */
-const ProofFields = { code: z.string().optional(), passkey: z.literal(true).optional() };
+import { ProofFields, secondFactor } from "./step-up.ts";
 const ApproveBody = z.object({ ...ProofFields, confirmName: z.string().optional() });
 const VerifyBody = z.object({ ...ProofFields, command: LiveAction });
 const DeviceTokenBody = z.object({ deviceCode: z.string().min(1) });
@@ -29,19 +27,6 @@ export function typedConfirmationReason(input: { report: Pick<ScoreReport, "scor
   if (input.report.score < SCORE_FLOOR) return `The score is ${input.report.score}, under the floor of ${SCORE_FLOOR}.`;
 
   return null;
-}
-
-/** The website's proof fields as a proof: a malformed code is an error, not "no code". */
-function proofOf(body: { code?: string | undefined; passkey?: true | undefined }): { kind: "ok"; proof: FactorProof } | { kind: "missing" } | { kind: "malformed" } {
-  if (body.code !== undefined) {
-    const code = parseSixDigits(body.code);
-
-    return code ? { kind: "ok", proof: { kind: "totp", code } } : { kind: "malformed" };
-  }
-
-  if (body.passkey) return { kind: "ok", proof: { kind: "passkey" } };
-
-  return { kind: "missing" };
 }
 
 function looksBinary(data: Uint8Array): boolean {
@@ -163,36 +148,6 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
     };
   }
 
-  function refused(check: Exclude<ProofCheck, { kind: "ok" }>): Response {
-    switch (check.kind) {
-      case "bad":
-        return fail(401, "That code is not valid. Use the current 6-digit code from your authenticator app.");
-      case "reused":
-        return fail(401, "That code was already used. Wait for the next code from your authenticator app.");
-      case "locked":
-        return fail(429, "Too many wrong codes. Wait 15 minutes and try again.");
-      case "none":
-        return fail(401, "Confirm it's you: enter the code from your authenticator app, or use your passkey.");
-      default: {
-        const _exhaustive: never = check;
-
-        return _exhaustive;
-      }
-    }
-  }
-
-  /** A second factor for one action, from this session: a code typed now, or this session's own passkey check. */
-  async function secondFactor(s: SignedIn, body: { code?: string | undefined; passkey?: true | undefined }, purpose: string): Promise<Response | null> {
-    const p = proofOf(body);
-
-    if (p.kind === "malformed") return fail(400, "Send the 6-digit code from your authenticator app.");
-
-    if (p.kind === "missing") return fail(401, "Confirm it's you: enter the code from your authenticator app, or use your passkey.");
-    const check = await auth.checkProof({ authUserId: s.authUserId, sessionToken: s.sessionToken, proof: p.proof, purpose });
-
-    return check.kind === "ok" ? null : refused(check);
-  }
-
   return async (req, url) => {
     const p = url.pathname;
     if (!p.startsWith("/-/apm/v1/")) return null;
@@ -300,7 +255,7 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
       const body = await readBody(req, VerifyBody);
       if (!body.ok) return body.res;
       const command = body.value.command;
-      const denied = await secondFactor(who.s, body.value, `confirm:${actionKey(command)}`);
+      const denied = await secondFactor({ auth, session: who.s, body: body.value, purpose: `confirm:${actionKey(command)}` });
       if (denied) return denied;
       const { expiresAt } = auth.ledger.grant({ authUserId: who.s.authUserId, action: actionKey(command), at: ctx.now() });
 
@@ -368,7 +323,7 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
         return fail(400, `${typed} Type the package name, ${row.package}, to approve it anyway.`);
       }
 
-      const denied = await secondFactor(who.s, body.value, `approve:${id}`);
+      const denied = await secondFactor({ auth, session: who.s, body: body.value, purpose: `approve:${id}` });
       if (denied) return denied;
       if (ctx.store.getVersion(row.package, row.version)) return fail(409, `${row.package}@${row.version} already exists. Versions are immutable; bump the version.`);
       const perm = await publishRefusal(ctx, row.package, row.staged_by);

@@ -96,7 +96,7 @@ Every state shows what was not read and has a "Files read" list. The page never 
 
 ## The second stage
 
-Phase 1 is a person. Every flagged or unanswered review waits in the queue at `/admin/reviews` until someone whose GitHub login is in `APM_ADMINS` confirms or dismisses it. Only a confirmed result is labeled in public. Blocking installs on a confirmed result is not wired yet: use apm's existing revoke for local packages.
+Phase 1 is a person. Every flagged or unanswered review waits in the queue at `/admin/reviews` until someone whose GitHub login is in `APM_ADMINS` confirms or dismisses it. The queue and its decisions need a website session: no token opens them, not even the reviewer's own `apm login` or CI token, and each decision needs a fresh code from an authenticator app or a passkey check. Only a confirmed result is labeled in public. Blocking installs on a confirmed result is not wired yet: use apm's existing revoke for local packages.
 
 The stronger-model step is an interface, `SecondStage` in `apps/reviewer/src/second-stage.ts`. `configuredSecondStage()` returns `null`. When one is configured, the reviewer runs it on non-benign results and posts its opinion with the result; the queue shows it. The eval suggests giving it the full package with no 16,000-token cap.
 

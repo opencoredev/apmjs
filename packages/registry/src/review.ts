@@ -5,9 +5,10 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
-import type { ApmAuth } from "./auth.ts";
+import type { ApmAuth, SignedIn } from "./auth.ts";
 import type { User, VersionRecord } from "./db.ts";
 import { fail, json, splitPath, tarballUrl, type Auth, type Ctx } from "./server.ts";
+import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, type Upstream, type UpstreamPackage } from "./upstream.ts";
 
 export type ReviewOptions = {
@@ -197,7 +198,8 @@ function tarballPath(name: string, version: string): string {
 
 const DownloadsAnswer = z.object({ downloads: z.number() });
 
-type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: "token" | "session" };
+/** Who is asking. A website session carries its sign-in, which review decisions check a fresh factor against. */
+type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: { kind: "token" } | { kind: "session"; session: SignedIn } };
 
 export type ReviewModule = {
   routes: (req: Request, url: URL, auth: Auth) => Promise<Response | null>;
@@ -434,7 +436,7 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
     if (a.kind === "user") {
       const user = ctx.store.getUser(a.user);
 
-      return user ? { kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: "token" } : { kind: "anon" };
+      return user ? { kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: { kind: "token" } } : { kind: "anon" };
     }
 
     const s = await auth.sessionOf(req);
@@ -442,11 +444,15 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
     if (!s) return { kind: "anon" };
     const user = auth.apmUserOf(s.authUserId);
 
-    return user ? { kind: "user", user, githubLogin: auth.gitHubNameOf(s.authUserId), via: "session" } : { kind: "anon" };
+    return user ? { kind: "user", user, githubLogin: auth.gitHubNameOf(s.authUserId), via: { kind: "session", session: s } } : { kind: "anon" };
   }
 
-  function isAdmin(v: Viewer): boolean {
-    return v.kind === "user" && v.githubLogin !== null && admins.has(v.githubLogin);
+  /**
+   * One of apm's reviewers, signed in on the website. A token never counts, not even the reviewer's own:
+   * a stolen `apm login` or CI token must not read the private queue or clear a flag.
+   */
+  function isAdmin(v: Viewer): v is Extract<Viewer, { kind: "user" }> & { via: { kind: "session"; session: SignedIn } } {
+    return v.kind === "user" && v.via.kind === "session" && v.githubLogin !== null && admins.has(v.githubLogin);
   }
 
   function isMaintainer(v: Viewer, name: string): boolean {
@@ -457,7 +463,7 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
   function badOrigin(req: Request, v: Viewer): Response | null {
     const origin = req.headers.get("origin");
 
-    if (v.kind !== "user" || v.via !== "session" || origin === null) return null;
+    if (v.kind !== "user" || v.via.kind !== "session" || origin === null) return null;
     const allowed = new Set([new URL(ctx.access.webUrl()).origin, new URL(ctx.baseUrl()).origin]);
 
     return allowed.has(origin) ? null : fail(403, "Cross-site request refused.");
@@ -712,6 +718,7 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
     digest: z.string().min(1).max(200),
     decision: z.enum(["confirm", "dismiss"]),
     note: z.string().max(2000).default(""),
+    ...ProofFields,
   });
 
   function queueResponse(): Response {
@@ -735,17 +742,21 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
     );
   }
 
-  async function decideResponse(req: Request, viewer: Viewer): Promise<Response> {
+  async function decideResponse(req: Request, viewer: Extract<Viewer, { kind: "user" }>, session: SignedIn): Promise<Response> {
     const body = await readBody(req, DecideBody);
 
     if (!body.ok) return body.res;
     const d = body.value;
+    // a decision changes what the public sees: a fresh code or passkey check for exactly this one
+    const denied = await secondFactor({ auth, session, body: d, purpose: `review:${JSON.stringify([d.name, d.version, d.digest, d.decision])}` });
+
+    if (denied) return denied;
     const r = reviewFor(d.name, d.version, d.digest);
 
     if (!r) return fail(404, "No such review.");
 
     if (r.human_state === "none") return fail(409, "This review found nothing; there is no flag to confirm or dismiss.");
-    const by = viewer.kind === "user" ? (viewer.githubLogin ?? viewer.user.name) : "unknown";
+    const by = viewer.githubLogin ?? viewer.user.name;
 
     db.query("UPDATE reviews SET human_state = ?, human_by = ?, human_at = ?, human_note = ? WHERE package = ? AND version = ? AND digest = ?").run(
       d.decision === "confirm" ? "confirmed" : "dismissed",
@@ -780,11 +791,11 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
 
       if (viewer.kind !== "user") return fail(401, "Sign in first.");
 
-      if (!isAdmin(viewer)) return fail(403, "Only apm's reviewers can see this queue.");
+      if (!isAdmin(viewer)) return fail(403, viewer.via.kind === "token" ? "The review queue is on the website only: sign in there. Tokens cannot read it or decide." : "Only apm's reviewers can see this queue.");
 
       if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return queueResponse();
 
-      if (p === "/-/apm/v1/review-admin/decide" && req.method === "POST") return badOrigin(req, viewer) ?? decideResponse(req, viewer);
+      if (p === "/-/apm/v1/review-admin/decide" && req.method === "POST") return badOrigin(req, viewer) ?? decideResponse(req, viewer, viewer.via.session);
 
       return fail(404, "Not found");
     }

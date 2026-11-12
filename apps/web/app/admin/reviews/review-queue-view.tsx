@@ -11,7 +11,7 @@ import { packagePath } from "@/components/registry-unavailable";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { call } from "@/lib/account";
+import { authClient, call } from "@/lib/account";
 import { ago } from "@/lib/format";
 import { coverageText, notReadText, PrivateReview, PublicReview } from "@/lib/review-schema";
 
@@ -39,18 +39,40 @@ function label(i: Item): string {
   return i.private.reason === "unsettled" ? "Flagged, then cleared on retry" : "No answer";
 }
 
+// Each decision needs a fresh second factor: a code typed now, or a passkey check made for it.
+type Factor = { kind: "code"; code: string } | { kind: "passkey" };
+
 function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
   const [note, setNote] = useState("");
+  const [code, setCode] = useState("");
+  const [usePasskey, setUsePasskey] = useState(false);
   const [busy, setBusy] = useState<"confirm" | "dismiss" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const files = item.public.notRead.flatMap((n) => (n.kind === "file" ? [notReadText(n)] : []));
 
+  async function factor(): Promise<Factor | string> {
+    if (!usePasskey) return /^\d{6}$/.test(code) ? { kind: "code", code } : "Enter the 6-digit code from your authenticator app.";
+    const p = await authClient().signIn.passkey();
+
+    return p.error ? (p.error.message ?? "The passkey check did not finish.") : { kind: "passkey" };
+  }
+
   async function decide(decision: "confirm" | "dismiss") {
     setBusy(decision);
     setError(null);
-    const r = await call("review-admin/decide", z.object({ ok: z.boolean() }), { method: "POST", body: { name: item.name, version: item.version, digest: item.digest, decision, note } });
+    const f = await factor();
+
+    if (typeof f === "string") {
+      setBusy(null);
+
+      return setError(f);
+    }
+
+    const proof = f.kind === "code" ? { code: f.code } : { passkey: true };
+    const r = await call("review-admin/decide", z.object({ ok: z.boolean() }), { method: "POST", body: { name: item.name, version: item.version, digest: item.digest, decision, note, ...proof } });
 
     setBusy(null);
+    setCode("");
 
     if (r.kind === "ok") return onDone();
     setError(r.kind === "error" ? r.message : "Sign in again.");
@@ -80,6 +102,18 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
       </p>
       <div className="flex flex-wrap items-center gap-2 border-t pt-4">
         <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note (shown in public on a confirmed result)" className="h-9 min-w-0 flex-1 basis-64" />
+        {!usePasskey && (
+          <Input
+            value={code}
+            onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            spellCheck={false}
+            placeholder="2FA code"
+            aria-label="Code from your authenticator app"
+            className="h-9 w-28 font-mono tracking-widest"
+          />
+        )}
         <Button size="lg" variant="destructive" disabled={busy !== null} onClick={() => void decide("confirm")}>
           {busy === "confirm" ? "Confirming…" : "Confirm malicious"}
         </Button>
@@ -87,6 +121,16 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
           {busy === "dismiss" ? "Dismissing…" : "Dismiss flag"}
         </Button>
       </div>
+      <button
+        type="button"
+        className="self-start text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
+        onClick={() => {
+          setUsePasskey(!usePasskey);
+          setError(null);
+        }}
+      >
+        {usePasskey ? "Use a code from your authenticator app instead" : "Use your passkey instead"}
+      </button>
       {error && (
         <p role="alert" className="text-sm text-bad">
           {error}
@@ -124,7 +168,7 @@ export function ReviewQueueView() {
         <h1 className="text-[28px] leading-tight font-medium tracking-tight sm:text-4xl">AI review queue</h1>
         <p className="text-[17px] leading-7 text-pretty text-muted-foreground">
           Versions the AI review flagged or could not answer. The public sees &ldquo;Under review&rdquo; until you decide. Confirming makes the findings and your note public; dismissing says a
-          person checked it. Stronger-model check: {secondStage ?? "not configured"}.
+          person checked it. Each decision needs a fresh code from your authenticator app, or your passkey. Stronger-model check: {secondStage ?? "not configured"}.
         </p>
       </header>
       <section aria-labelledby="pending" className="flex flex-col gap-4">
