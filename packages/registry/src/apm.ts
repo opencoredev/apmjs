@@ -64,6 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
+import { isWithheld, readmeShown, scoreWithoutSource } from "./withheld.ts";
 
 const HOUR = 3_600_000;
 
@@ -94,13 +95,12 @@ export function reportFor(v: VersionRecord, at: number, opts: { ignoreRecent?: b
  */
 function reviewable(v: VersionRecord, r: ScoreReport) {
   const d = digestOf(v);
+  const signals = r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s);
+  const dismissed = r.dismissed ?? [];
+  // a revoked version's evidence names the file and line, not the line itself (withheld.ts)
+  const redacted = isWithheld(v.status);
 
-  return {
-    scorer: r.scorer,
-    digest: d ? digestLabel(d) : null,
-    signals: r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s),
-    dismissed: r.dismissed ?? [],
-  };
+  return { scorer: r.scorer, digest: d ? digestLabel(d) : null, redacted, ...(redacted ? scoreWithoutSource({ signals, dismissed }) : { signals, dismissed }) };
 }
 
 function compact(r: ScoreReport): CompactScore {
@@ -815,7 +815,7 @@ const packageResponse = (name: string) =>
       source: src.kind,
       description: local?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
       keywords: local?.keywords ?? [],
-      readme: local?.readme ?? (src.kind === "upstream" ? src.pkg.readme : ""),
+      readme: local ? readmeShown(local.readme, src.versions) : src.kind === "upstream" ? src.pkg.readme : "",
       repository: repositoryOf(latest0),
       ...linksOf(latest0),
       distTags: src.distTags,

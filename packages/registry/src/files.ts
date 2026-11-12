@@ -20,6 +20,7 @@ import { json } from "./http.ts";
 import { countLines, ExcerptLine, isUtf8, pickReadme, sliceLines } from "./file-text.ts";
 import { splitPath, versionOf } from "./server.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
+import { isWithheld } from "./withheld.ts";
 
 /** The largest file the view returns. Larger files are reported with their size, not sent. */
 export const MAX_FILE_VIEW_BYTES = 1024 * 1024;
@@ -162,7 +163,7 @@ const open = (input: { found: Found; name: string }) =>
     const { found, name } = input;
     const v = found.v;
 
-    if (v.status === "revoked" || v.status === "revoke-pending") return yield* Effect.fail(refuse(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`));
+    if (isWithheld(v.status)) return yield* Effect.fail(refuse(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`));
     const digest = digestOf(v);
 
     if (!digest) return yield* Effect.fail(refuse(422, "This version has no checksum, so its tarball cannot be verified."));

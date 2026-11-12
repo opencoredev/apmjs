@@ -18,6 +18,7 @@ import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 import { fail, json, MAX_PUBLISH_BODY_BYTES, parseBody } from "./http.ts";
 import { atTime } from "./lifecycle.ts";
 import { order } from "./semver.ts";
+import { readmeShown } from "./withheld.ts";
 
 export type { NamePolicy };
 
@@ -309,7 +310,7 @@ export const packument = (pkg: PackageRecord, abbreviated: boolean, ext: Extensi
       versions,
       time,
       maintainers: owners.map((name) => ({ name })),
-      readme: pkg.readme,
+      readme: readmeShown(pkg.readme, all),
       keywords: pkg.keywords,
     };
   });

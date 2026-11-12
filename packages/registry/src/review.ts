@@ -21,6 +21,7 @@ import { order } from "./semver.ts";
 import { splitPath, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
+import { isWithheld } from "./withheld.ts";
 
 export type ReviewSettings = {
   /** sha256 (hex) of the reviewer's service token. The token itself stays with the reviewer. */
@@ -552,6 +553,19 @@ function publicState(r: StoredReview): PublicState {
   }
 }
 
+/** A finding without the package's text: the file, line, sentence and severity stay, the quote and excerpt go. */
+const findingWithoutSource = (f: WireFinding): WireFinding => ({ ...f, quote: "", excerpt: "" });
+
+/** A review of a revoked version (withheld.ts): every finding, the second opinion's too, without the lines it quoted. */
+function reviewWithoutSource(r: StoredReview): StoredReview {
+  const res = r.result;
+  const secondOpinion = res.secondOpinion ? { ...res.secondOpinion, findings: res.secondOpinion.findings.map(findingWithoutSource) } : null;
+
+  if (res.outcome === "benign") return { ...r, result: { ...res, secondOpinion } };
+
+  return { ...r, result: { ...res, findings: res.findings.map(findingWithoutSource), secondOpinion } };
+}
+
 function findingsOf(r: ReviewResult): WireFinding[] {
   return r.outcome === "benign" ? [] : r.findings;
 }
@@ -610,7 +624,9 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
 
     if (isAdmin(viewer, settings)) role = "admin";
     else if (yield* isMaintainer(viewer, name)) role = "maintainer";
-    const review = got.digest ? yield* reviewFor(name, v.version, got.digest) : null;
+    const stored = got.digest ? yield* reviewFor(name, v.version, got.digest) : null;
+    const redacted = isWithheld(v.status);
+    const review = stored && redacted ? reviewWithoutSource(stored) : stored;
     const job = got.digest ? yield* jobByKey(name, v.version, got.digest) : null;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 
@@ -625,6 +641,8 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
         name,
         version: v.version,
         status,
+        // a revoked version's findings keep their file, line and sentence, not the quoted source
+        redacted,
         review: review ? publicView(review) : null,
         viewer: role,
         private: review && role !== "public" ? privateView(review) : null,
