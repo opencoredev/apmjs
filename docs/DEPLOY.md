@@ -19,6 +19,8 @@ The deploy reads its secrets from `~/.config/apmjs` (set `APM_SECRETS_DIR` to us
 | `cloudflare.env` | `CLOUDFLARE_ACCOUNT_ID=...` |
 | `neon-url` | The Neon connection string (the direct endpoint, not `-pooler`). The role needs `CREATEDB` for the staging database. |
 | `github-oauth.env` | `APM_GITHUB_CLIENT_ID=...` and `APM_GITHUB_CLIENT_SECRET=...` |
+| `review-token-<stage>` | Optional. The AI reviewer's service token for that stage; when the file exists the deploy turns the AI review on and sends only its sha256 (`APM_REVIEW_TOKEN_HASH`). The reviewer process gets the same token. See `docs/AI-REVIEW.md`. |
+| `review.env` | Optional. `APM_ADMINS=login,login`: GitHub logins that may confirm or dismiss flagged reviews. |
 | `auth-secret-<stage>` | Made by the first deploy of a stage. It signs sessions and encrypts TOTP secrets: changing it signs everyone out and breaks every authenticator app set up so far. Back it up. |
 
 The GitHub OAuth app needs each stage's callback URL: `<website>/api/auth/callback/github`, so `https://apmjs.dev/api/auth/callback/github` and `https://apmjs-web-staging.<subdomain>.workers.dev/api/auth/callback/github`.
@@ -79,5 +81,8 @@ The registry Worker reads these (`packages/registry/src/worker.ts` parses them):
 | `APM_AUTH_SECRET` | Secret. See `auth-secret-<stage>` above. |
 | `APM_GITHUB_CLIENT_ID`, `APM_GITHUB_CLIENT_SECRET` | The GitHub OAuth app. Without them the GitHub button is hidden. |
 | `APM_VERCEL_CLIENT_ID`, `APM_VERCEL_CLIENT_SECRET` | The Vercel OAuth app. Not set yet, so the Vercel button stays hidden. |
+| `APM_REVIEW_TOKEN_HASH` | sha256 (hex) of the AI reviewer's service token. Turns the AI review on. |
+| `APM_ADMINS` | GitHub logins that may confirm or dismiss flagged reviews. |
+| `APM_REVIEW_POPULAR_WEEKLY`, `APM_NPM_DOWNLOADS_URL`, `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning; defaults in `review.ts`. |
 
 The website Worker gets `REGISTRY` (a service binding to the registry Worker) and `APM_REGISTRY`.

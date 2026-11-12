@@ -13,6 +13,7 @@ apm runs on Cloudflare: two Workers, one Postgres on Neon, one R2 bucket and one
                                             ├─ Blobs ────▶ R2 bucket (tarballs by sha512)
                                             ├─ Upstream ─▶ registry.npmjs.org
                                             ├─ Analysis ─▶ analysis queue ──▶ same Worker's queue()
+                                            ├─ Review ◀── apps/reviewer (pulls AI review jobs over HTTPS)
                                             └─ cron every 10 min: write down matured revokes, expire staged versions
 ```
 
@@ -28,7 +29,7 @@ apm runs on Cloudflare: two Workers, one Postgres on Neon, one R2 bucket and one
 
 1. `worker.ts` parses the Worker's environment with a zod schema (bindings, vars, secrets). A misconfigured Worker answers 500 and logs why; legacy password auth on a public https URL without `APM_ALLOW_LEGACY_IN_PROD` answers 503 to every request.
 2. It builds the request's services as Effect layers (`servicesFor`) and runs `router.ts`.
-3. The router picks a route module: `account.ts` (sign-in, device login, confirmations, staged approvals), `apm.ts` (scores, resolve, scan, audit, yank and revoke, the upstream proxy), and `server.ts` (the npm protocol: packuments, tarballs, publish, dist-tags, search).
+3. The router picks a route module: `review.ts` (the AI review queue and views, when it is on), `account.ts` (sign-in, device login, confirmations, staged approvals), `apm.ts` (scores, resolve, scan, audit, yank and revoke, the upstream proxy), and `server.ts` (the npm protocol: packuments, tarballs, publish, dist-tags, search).
 4. A route returns a `Response` or fails with a typed error. `HttpFailure` becomes its JSON error body; `StoreError`, `BlobError`, `AuthError` and `QueueError` become a 500 and one structured log line with the operation that failed.
 
 The layers live for one request. `Store` opens one Postgres connection through Hyperdrive and closes it when the request ends; Hyperdrive pools the connections to Neon. Better Auth is built on first use, so routes that never touch sign-in never pay for it.
@@ -44,6 +45,8 @@ The layers live for one request. `Store` opens one Postgres connection through H
 | `Auth` | `auth.ts` | Better Auth (GitHub, Vercel, TOTP, passkeys, device flow) on the same Postgres, with apm's own route allow-list and second-factor checks. |
 | `Clock` | `clock.ts` | The registry's time (`now`) and the wall clock codes are checked against (`wallNow`). |
 | `RegistryConfig` | `config.ts` | Public URLs, the upstream, the name policy and legacy auth. |
+| `ReviewConfig` | `review.ts` | Present only when `APM_REVIEW_TOKEN_HASH` is set: the AI review's service token hash, admins and limits. Its routes and hooks do nothing without it. |
+| `ReleaseHooks` | `hooks.ts` | Listeners for "a version went live" and "an upstream packument was fetched". `worker.ts` wires the AI review queue to them. |
 
 ### Data
 
@@ -63,6 +66,12 @@ A Worker has 128 MB of memory, so the registry caps what it reads: upstream down
 
 Analyses of npm versions are keyed by tarball digest and scorer version, so a re-published tarball or a new scorer never reuses an old answer.
 
+### AI release review
+
+`review.ts` keeps the review-job queue and results in Postgres (`0004_reviews_and_password_lockout.sql`). The model never runs on Cloudflare: the reviewer process (`apps/reviewer`) runs next to the model on the owner's tailnet, leases jobs with a service token (`SELECT ... FOR UPDATE SKIP LOCKED`, so two reviewers never get the same job), downloads tarballs from the registry, and posts results back. The Worker stores only the token's sha256.
+
+Two hooks fill the queue. After a publish or an approval commits, the version is queued on the request's own connection. When an upstream packument is fetched (not on a cache hit), the enqueue policy runs after the response through `ctx.waitUntil`, on its own Postgres connection, because the request's connection closes with the request. The `review_seen` high-water mark is claimed in one statement, so two isolates that fetched the same packument queue its new versions once. See `docs/AI-REVIEW.md`.
+
 ### Sign-in and second factors
 
 Better Auth handles OAuth, sessions, TOTP enrolment, passkeys and the device flow. The registry exposes only the Better Auth routes the website uses, and gates the ones that change how someone signs in behind the existing factor (the `x-apm-second-factor` header). apm checks codes itself, against a ledger in Postgres: one attempt budget per account across TOTP and recovery codes, each TOTP time step accepted once, a passkey check spent on one action from the session that made it, and a website confirmation of one named CLI command used once within ten minutes. Because the ledger is in Postgres, every Worker isolate sees the same budget.
@@ -73,7 +82,7 @@ The website is Next.js 16 with shadcn, built by OpenNext through Alchemy's `Webs
 
 ## Tests
 
-The acceptance suite (`tests/acceptance`, 187 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
+The acceptance suite (`tests/acceptance`, 220 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
 
 - `packages/registry/scripts/build.ts` bundles the Worker with rolldown and the Cloudflare plugin set Alchemy uses. The deploy uploads `dist/worker.js` as built (`bundle: false`); the suite runs `dist/worker-test.js`, which imports that entry and adds three test controls.
 - Miniflare runs the bundle in workerd with R2, the analysis queue and its consumer, and Hyperdrive simulated locally. Hyperdrive points at a real Postgres 18 cluster the suite starts with `initdb` (`tests/acceptance/postgres.ts`), or at `APM_TEST_DATABASE_URL`. Each registry gets a copy of one migrated template database.

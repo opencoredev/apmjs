@@ -8,7 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Client } from "pg";
 import { z } from "zod";
 import { buildWorker } from "../registry/scripts/build.ts";
@@ -51,6 +51,17 @@ function required(map: Map<string, string>, key: string, file: string): string {
   if (!value) throw new Error(`${file} has no ${key}.`);
 
   return value;
+}
+
+/**
+ * The AI review is on for a stage when review-token-<stage> exists; the reviewer process holds the same token.
+ * Only the token's sha256 reaches Cloudflare. review.env may name the admins (APM_ADMINS=login,login).
+ */
+function reviewSettings(stage: string) {
+  if (!existsSync(join(SECRETS, `review-token-${stage}`))) return { hash: "", admins: "" };
+  const admins = existsSync(join(SECRETS, "review.env")) ? (envFile("review.env").get("APM_ADMINS") ?? "") : "";
+
+  return { hash: createHash("sha256").update(secretFile(`review-token-${stage}`)).digest("hex"), admins };
 }
 
 /** The auth secret signs sessions and encrypts TOTP secrets, so it is made once per stage and kept. */
@@ -103,9 +114,10 @@ const github = envFile("github-oauth.env");
 const token = secretFile("cloudflare-token");
 const accountId = required(cloudflare, "CLOUDFLARE_ACCOUNT_ID", "cloudflare.env");
 const neonUrl = secretFile("neon-url");
+const review = reviewSettings(args.stage);
 const database = DATABASES[args.stage];
 
-process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database})\n`);
+process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"})\n`);
 
 await ensureDatabase(neonUrl, database);
 
@@ -143,6 +155,8 @@ const child = Bun.spawn(
       AUTH_SECRET: authSecret(args.stage),
       GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
+      REVIEW_TOKEN_HASH: review.hash,
+      APM_ADMINS: review.admins,
       // the website's registry URL for anything it renders at build time
       APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
       ALCHEMY_TELEMETRY_DISABLED: "1",

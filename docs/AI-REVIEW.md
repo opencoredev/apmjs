@@ -103,7 +103,7 @@ The stronger-model step is an interface, `SecondStage` in `apps/reviewer/src/sec
 ## Architecture
 
 ```
-  registry (Bun today; Workers later)                 owner's machine (on the tailnet)
+  registry (Cloudflare Worker)                        owner's machine (on the tailnet)
   ┌───────────────────────────────────┐   HTTPS   ┌──────────────────────────────────┐
   │ review_jobs, reviews, ... tables  │ ◀──────── │ apps/reviewer (Bun daemon)       │
   │ GET  /-/apm/v1/review-jobs        │  lease    │  lease → download both tarballs  │
@@ -120,10 +120,10 @@ The model endpoint is on the owner's private tailnet, which Cloudflare Workers c
 
 ### Registry side
 
-`packages/registry/src/review.ts`, on only when `StartOptions.review` is set (`APM_REVIEW_TOKEN_FILE`).
+`packages/registry/src/review.ts`, on only when the Worker has `APM_REVIEW_TOKEN_HASH` (the deploy sets it from `~/.config/apmjs/review-token-<stage>`, see `docs/DEPLOY.md`).
 
-- **Tables.** `review_jobs` (unique on package, version and tarball digest; state `queued`, `leased`, `done` or `failed`; lease id and expiry; attempts), `reviews` (keyed on package, version and digest; the result JSON; `human_state` `none`, `pending`, `confirmed` or `dismissed`), `review_seen` (newest publish time seen per upstream package), `review_downloads` (cache) and `review_requests` (rate limit).
-- **Leases.** `GET /-/apm/v1/review-jobs?max=N` (at most 16) leases jobs for 15 minutes. Expired leases go back to the queue on the next lease call. A job leased 5 times without a result is marked failed. A result or release must carry the current lease id, else 409.
+- **Tables** (Postgres, `migrations/0004_reviews_and_password_lockout.sql`). `review_jobs` (unique on package, version and tarball digest; state `queued`, `leased`, `done` or `failed`; lease id and expiry; attempts), `reviews` (keyed on package, version and digest; the result JSON; `human_state` `none`, `pending`, `confirmed` or `dismissed`), `review_seen` (newest publish time seen per upstream package), `review_downloads` (cache) and `review_requests` (rate limit).
+- **Leases.** `GET /-/apm/v1/review-jobs?max=N` (at most 16) leases jobs for 15 minutes, in one transaction with `FOR UPDATE SKIP LOCKED`. Expired leases go back to the queue on the next lease call. A job leased 5 times without a result is marked failed. A result or release must carry the current lease id, else 409.
 - **Service token.** The reviewer sends `Authorization: Bearer <token>`; the registry keeps only its sha256 and compares in constant time. User tokens and sessions are refused on these routes.
 - **Jobs** carry the tarball path relative to the registry root (`debug/-/debug-4.4.3.tgz`) and the digest. The reviewer joins the path to its own configured registry URL, so a job can never point it at another host.
 - **The previous version** is the highest lower version still served, stable unless the release is a prerelease. If its tarball cannot be fetched, the review reads the files instead.
@@ -147,18 +147,18 @@ umask 077
 head -c 32 /dev/urandom | base64 | tr -d '/+=' > ~/.config/apm/review-token
 ```
 
-The registry needs the file at `APM_REVIEW_TOKEN_FILE`. The reviewer needs the same token at `REVIEW_SERVICE_TOKEN_FILE`. Never put it in an environment variable or a repo.
+The registry Worker needs only its sha256: put the token in `~/.config/apmjs/review-token-<stage>` and deploy, and `deploy.ts` sets `APM_REVIEW_TOKEN_HASH`. The reviewer needs the token itself at `REVIEW_SERVICE_TOKEN_FILE`. Never put the token in an environment variable or a repo.
 
 ### 2. The registry
 
 | Variable | Meaning |
 |---|---|
-| `APM_REVIEW_TOKEN_FILE` | Turns the AI review on; path to the service token |
+| `APM_REVIEW_TOKEN_HASH` | Turns the AI review on; sha256 (hex) of the service token |
 | `APM_ADMINS` | Comma-separated GitHub logins that may confirm or dismiss flags |
 | `APM_REVIEW_POPULAR_WEEKLY` | Weekly downloads that put an upstream package in scope (default 10000) |
 | `APM_NPM_DOWNLOADS_URL` | Download-count API (default `https://api.npmjs.org/downloads/point/last-week/`) |
 
-The startup line ends with `AI review on` when it is configured.
+`bun run deploy:staging` prints `AI review on` when it found the token file.
 
 ### 3. The reviewer
 
@@ -239,7 +239,7 @@ Files are read with `lstat` as bytes; symlinks are skipped and nothing is instal
 
 ## Operating it
 
-- **Is it keeping up?** `job.done` lines per minute against the queue: `sqlite3 registry.sqlite "select state, count(*) from review_jobs group by state"`.
+- **Is it keeping up?** `job.done` lines per minute against the queue: `psql "$NEON_URL" -c "select state, count(*) from review_jobs group by state"` against the stage's database.
 - **Budget spent today:** `cat ~/.local/state/apm-reviewer/budget.json`. `budget.exhausted` in the log means it paused until midnight UTC.
 - **Model trouble:** `model.rate_limited` and `model.retry` lines; `job.give_back` with `retryable: true` means the job went back to the queue.
 - **Failed jobs** (`state = 'failed'`, reason in `last_error`): the tarball was gone, did not match its checksum, or was unreadable. A user's "Request AI review" reopens a failed job.
@@ -258,14 +258,11 @@ Real model, local registry on port 4961, web on 3561:
 | debug 4.4.2 | offline `review-files` from the eval's cached copy, diff from 4.4.1 | flagged malicious on both asks, citing `src/index.js:7` (the obfuscated payload) and `package.json:3` |
 | apm-demo-padder 1.0.1 (a harmless stand-in that posts `process.env` to an `.invalid` host) | diff from 1.0.0 | flagged on both asks, 3 cited lines; rule score 90/100 |
 
-## Carrying it to Cloudflare Workers
+## On Cloudflare Workers
 
-The registry side is the part to port; the reviewer and `packages/ai-review` stay as they are.
+The registry side runs in the registry Worker; the reviewer and `packages/ai-review` are unchanged.
 
-- The five tables in `review.ts` as Neon migrations, with the same keys and the unique index on `(package, version, digest)`.
-- Lease and ack inside one transaction each (`SELECT ... FOR UPDATE SKIP LOCKED` on Postgres), and expired leases returned to the queue in the lease query.
-- The routes and their auth: service token by sha256 and constant-time compare; sessions and bearer tokens for the public, owner and admin views; the origin check on cookie writes.
-- The two hooks: after a version commits, and after an upstream packument is fetched (not on cache hits). On Workers, run `considerUpstream` with `ctx.waitUntil`.
-- The download-count cache and the `review_seen` high-water mark.
-- `@apm/ai-review`'s wire schemas (`ReviewJob`, `ResultBody`, `ReleaseBody`) as the contract; both sides parse with them.
-- Tarballs keep being served at `<name>/-/<file>.tgz`, which is what jobs point at.
+- The five tables are a Postgres migration with the same keys and the unique index on `(package, version, digest)`.
+- Lease, result and release each run in one transaction; the lease query returns expired leases to the queue and skips rows another reviewer holds.
+- After a version commits, it is queued on the request's connection. After an upstream packument is fetched, `considerUpstream` runs through `ctx.waitUntil` on its own connection.
+- `@apm/ai-review`'s wire schemas (`ReviewJob`, `ResultBody`, `ReleaseBody`) stay the contract; both sides parse with them.

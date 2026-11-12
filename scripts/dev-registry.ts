@@ -28,7 +28,18 @@ const bindings = new Map([
   ["APM_AUTH_SECRET", process.env.APM_AUTH_SECRET ?? randomBytes(32).toString("base64url")],
 ]);
 
-for (const key of ["APM_GITHUB_CLIENT_ID", "APM_GITHUB_CLIENT_SECRET", "APM_VERCEL_CLIENT_ID", "APM_VERCEL_CLIENT_SECRET"]) {
+const PASSED_THROUGH = [
+  "APM_GITHUB_CLIENT_ID",
+  "APM_GITHUB_CLIENT_SECRET",
+  "APM_VERCEL_CLIENT_ID",
+  "APM_VERCEL_CLIENT_SECRET",
+  "APM_REVIEW_TOKEN_HASH",
+  "APM_ADMINS",
+  "APM_REVIEW_POPULAR_WEEKLY",
+  "APM_NPM_DOWNLOADS_URL",
+];
+
+for (const key of PASSED_THROUGH) {
   const value = process.env[key];
 
   if (value) bindings.set(key, value);
@@ -50,7 +61,7 @@ const mf = new Miniflare({
 
 await mf.ready;
 
-process.stdout.write(`apm registry listening on ${url} (upstream ${bindings.get("APM_UPSTREAM")}, names ${bindings.get("APM_NAME_POLICY")})\n`);
+process.stdout.write(`apm registry listening on ${url} (upstream ${bindings.get("APM_UPSTREAM")}, names ${bindings.get("APM_NAME_POLICY")}, AI review ${bindings.has("APM_REVIEW_TOKEN_HASH") ? "on" : "off"})\n`);
 
 const stop = async (): Promise<void> => {
   await mf.dispose();

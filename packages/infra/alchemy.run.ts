@@ -43,6 +43,11 @@ export default Alchemy.Stack(
       caching: { disabled: true },
     });
 
+    // the AI review (docs/AI-REVIEW.md) is on when deploy.ts found this stage's reviewer token; only its sha256 is sent
+    const reviewTokenHash = yield* Config.withDefault(Config.String("REVIEW_TOKEN_HASH"), "");
+    const admins = yield* Config.withDefault(Config.String("APM_ADMINS"), "");
+    const review = Object.fromEntries(reviewTokenHash === "" ? [] : [["APM_REVIEW_TOKEN_HASH", reviewTokenHash], ["APM_ADMINS", admins]]);
+
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
       main: resolve(import.meta.dirname, "../registry/dist/worker.js"),
@@ -60,6 +65,7 @@ export default Alchemy.Stack(
         APM_AUTH_SECRET: yield* Config.Redacted("AUTH_SECRET"),
         APM_GITHUB_CLIENT_ID: yield* Config.String("GITHUB_CLIENT_ID"),
         APM_GITHUB_CLIENT_SECRET: yield* Config.Redacted("GITHUB_CLIENT_SECRET"),
+        ...review,
       },
       // Writes down pending revokes past 24h and expired staged versions; reads already treat them as final.
       crons: ["*/10 * * * *"],
