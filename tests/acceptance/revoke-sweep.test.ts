@@ -68,7 +68,9 @@ const VERSIONS = [CLEAN, PENDING, REVOKED] as const;
 const STALE_TAGS = { "stale-revoked": REVOKED, "stale-pending": PENDING } as const;
 
 // ---------- the marked package ----------
-const INDEX_JS = ['// LEAKMARK-js-comment', 'module.exports = "LEAKMARK-js-string";', 'eval("LEAKMARK-js-eval");', ""].join("\n");
+// the last line names a credential file, so apm-score-v10 (where eval is a capability, not a signal) has a risk signal
+// whose evidence quotes a marker for the admin to dismiss
+const INDEX_JS = ['// LEAKMARK-js-comment', 'module.exports = "LEAKMARK-js-string";', 'eval("LEAKMARK-js-eval");', 'const rc = "~/.npmrc LEAKMARK-js-npmrc";', ""].join("\n");
 
 /** Binary-ish: NUL bytes around a marker, so a text check that stops at NUL would miss it. */
 const BLOB = new Uint8Array([0, 1, 2, 0, ...new TextEncoder().encode("LEAKMARK-binary"), 0, 255, 0]);
@@ -357,14 +359,15 @@ function headersFor(caller: CallerName): Headers {
 const Score = z.object({ digest: z.string(), scorer: z.string(), signals: z.array(z.object({ id: z.string(), evidence: z.array(z.string()) })) });
 const Queue = z.object({ pending: z.array(z.object({ name: z.string(), version: z.string(), digest: z.string() })) });
 
-/** Dismisses the eval evidence of one version, as an admin on the website. */
+/** Dismisses one evidence line of one version (eval under apm-score-v9, the credential mention since v10), as an admin. */
 async function dismissEval(version: string): Promise<void> {
   const s = Score.parse((await getJson(`${reg.url}-/apm/v1/score/${NAME}/${version}`)).body);
-  const line = s.signals.find((x) => x.id === "eval")?.evidence[0] ?? "";
+  const signal = s.signals.find((x) => x.id === "eval") ?? s.signals.find((x) => x.id === "credential-mention");
+  const line = signal?.evidence.find((e) => /^[^:]+:\d+:/.test(e)) ?? "";
   const m = /^([^:]+):(\d+):/.exec(line);
 
-  if (!m?.[1] || !m[2]) throw new Error(`no eval evidence on ${version}: ${JSON.stringify(s)}`);
-  const item = { name: NAME, version, digest: s.digest, scorer: s.scorer, signal: "eval", file: m[1], line: Number(m[2]) };
+  if (!signal || !m?.[1] || !m[2]) throw new Error(`no dismissable evidence on ${version}: ${JSON.stringify(s)}`);
+  const item = { name: NAME, version, digest: s.digest, scorer: s.scorer, signal: signal.id, file: m[1], line: Number(m[2]) };
   const r = await admin.json("-/apm/v1/evidence-admin/dismiss", { method: "POST", body: { ...item, reason: "A fixture line, not a threat.", code: totp(adminSecret) } });
 
   if (r.status !== 200) throw new Error(`dismiss ${version}: ${r.status} ${JSON.stringify(r.body)}`);
