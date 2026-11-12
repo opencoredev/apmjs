@@ -2,7 +2,10 @@
   "name": "apm-monorepo",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*", "apps/*"],
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "registry": "bun packages/registry/src/main.ts",
     "test": "bun test tests",
@@ -12,5 +15,10 @@
     "@types/bun": "^1.4.4",
     "pnpm": "10.18.3",
     "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opencoredev/apmjs.git"
   }
 }

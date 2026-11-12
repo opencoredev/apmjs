@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck and acceptance suite
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit -p .
+      - run: bunx tsc --noEmit
+        working-directory: apps/web
+      - name: Acceptance suite (real bun, npm and pnpm against an in-process registry)
+        run: |
+          bun scripts/score.ts | tee score.txt
+          test "$(tail -n 1 score.txt)" = "0"

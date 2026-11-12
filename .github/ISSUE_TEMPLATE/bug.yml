@@ -1,0 +1,14 @@
+name: Bug or request
+description: Something in apm is broken, or you want something added
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, or what you want
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The command you ran, the package manager and its version, and the output.

@@ -3,19 +3,19 @@
 ## The request, in the user's words (lightly cleaned from speech-to-text)
 "I have this thing called apmjs and this domain. I want you to talk to agents and find all the problems that humans have with npm. One of my big ones is that it's really really annoying to publish something. It's really annoying to revoke a package if it's hacked or something. It would be cool to have a security score and everything. Check Theo's YouTube channel (T3 Chat / T3 Code). In the council have the swarm find them. The council will go ahead and validate. Just talk. It'd be cool if you had the council just as agents. What issues do they have with npm? I want to see what the issues are. Build this entire thing from scratch. Don't focus on the UI that much. Default shadcn, good layout. I like Vercel domains search. I want it to feel modern and remove a bunch of issues. Preferably make it Bun compatible. We can also make it npm compatible but you won't get all the best parts. Maybe have some CLI on top that wraps around Bun or npm, and you just use that. We don't manage the runtime; it does the same commands but adds the security score and everything. I could be 100% wrong."
 
-## Artifacts (absolute paths; read them)
+## Artifacts (paths relative to the repo root)
 Research swarm reports (each fact has a source URL):
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/01-publishing.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/02-compromise-revocation.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/03-security-scoring.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/04-theo.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/05-everyday-complaints.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/06-alternatives-and-search-ux.md
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/07-registry-protocol.md
+- research/01-publishing.md
+- research/02-compromise-revocation.md
+- research/03-security-scoring.md
+- research/04-theo.md
+- research/05-everyday-complaints.md
+- research/06-alternatives-and-search-ux.md
+- research/07-registry-protocol.md
 Candidate plan:
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/research/PLAN.md
+- research/PLAN.md
 Acceptance tests that encode the plan (read for detail; do not run them):
-- /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/tests/acceptance/*.test.ts
+- tests/acceptance/*.test.ts
 
 ## Your job (three parts)
 

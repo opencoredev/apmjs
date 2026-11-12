@@ -4,7 +4,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | Claude Opus 5.5 | 6 | 6 | 7 | 4 | 8 | 6 |
 | GPT-6.1 Sol | 6.5 | 7 | 8 | 4 | 7 | 6 |
-| Grok 4.7 | empty seat (Cursor provider disabled on evo-1) | | | | | |
+| Grok 4.7 | empty seat (provider unavailable) | | | | | |
 | Kimi K3.1 | 6.5 | 9 | 8 | 4 | 6 | 6 |
 | DeepSeek V4.1 Flash | 6 | 7 | 7 | 5 | 8 | 5 |
 

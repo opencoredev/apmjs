@@ -3,8 +3,8 @@
 ## The request, in the user's words (lightly cleaned from speech-to-text)
 "I have this thing called apmjs and this domain. Find all the problems that humans have with npm. One of my big ones is that it's really annoying to publish something. It's really annoying to revoke a package if it's hacked. It would be cool to have a security score. Build this entire thing from scratch. Don't focus on the UI that much: default shadcn, good layout; I like Vercel domains search. I want it to feel modern and remove a bunch of issues. Preferably Bun compatible; npm compatible too but you won't get all the best parts. Maybe a CLI on top that wraps Bun or npm; we don't manage the runtime; it does the same commands but adds the security score and everything."
 
-## Candidate (absolute paths; read them)
-- Repository: /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13 (git branch climb/apm)
+## Candidate (paths relative to the repo root)
+- Repository: this repo (branch climb/apm)
   - packages/registry/src (server.ts protocol, apm.ts extensions, upstream.ts proxy, db.ts)
   - packages/core/src (score.ts, secrets.ts, names.ts, tarball.ts, entries.ts)
   - packages/cli/src (main.ts, pm.ts, config.ts, api.ts)
@@ -12,8 +12,8 @@
   - apps/web/app, apps/web/components, apps/web/lib
   - tests/acceptance/*.test.ts (92 tests driving real bun, npm and pnpm)
   - research/PLAN.md and research/council/ROUND1.md (what an earlier review asked for and what was accepted or rejected)
-- Screenshots of the web UI (desktop 1440px and mobile 390px): /home/leo/.t3/scratch/2026-11-12-hill-climb-council-swarm-screendrop-11ee2f13/shots/*.png
-- Live web UI (if reachable): http://evo-1.tail0e7628.ts.net:3410/?q=tiny
+- Screenshots of the web UI (desktop 1440px and mobile 390px): shots/*.png
+- Live web UI: a private demo deployment
 
 You may run read-only commands. You may run the test suite: `cd <repo> && bun scripts/score.ts` (prints failing count last; takes about 2 minutes). Do not edit files.
 

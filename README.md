@@ -1,5 +1,7 @@
 # apm
 
+> Early and moving fast. The registry, CLI and score engine work and are tested; sign-in, GitHub-scoped names and hosting at apmjs.dev are in progress.
+
 A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `apm`, a thin CLI that checks before your package manager installs, runs or publishes. apm never manages the runtime.
 
 ## What it fixes
@@ -22,7 +24,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 - `packages/cli`: `apm`
 - `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and low-scoring versions
 - `apps/web`: Next.js + shadcn UI (search with name check, package pages)
-- `tests/acceptance`: 92 tests that drive real bun, npm and pnpm against an in-process registry
+- `tests/acceptance`: over 100 tests that drive real bun, npm and pnpm against an in-process registry
 
 ## Run it
 
@@ -36,3 +38,12 @@ bun scripts/score.ts                                                     # accep
 ```
 
 Research, plan and council reviews: `research/`.
+
+## Reporting
+
+- A malicious or unsafe package: [open a package report](../../issues/new?template=report-package.yml).
+- A vulnerability in apm itself: report it privately, as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE). Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).

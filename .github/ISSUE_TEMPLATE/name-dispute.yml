@@ -1,0 +1,18 @@
+name: Name or scope dispute
+description: Ask for a package name or scope held by someone else
+title: "[name] <name or @scope>"
+labels: ["name-dispute"]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Name or scope
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it should be yours
+      description: For example, you own the GitHub org or trademark, or the current holder impersonates your project.
+    validations:
+      required: true

@@ -5,8 +5,22 @@
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
-  "exports": { ".": "./src/index.ts" },
-  "files": ["src", "README.md"],
-  "keywords": ["bun", "security", "scanner", "apm"],
-  "private": true
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "bun",
+    "security",
+    "scanner",
+    "apm"
+  ],
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opencoredev/apmjs.git"
+  }
 }

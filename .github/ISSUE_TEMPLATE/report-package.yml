@@ -1,0 +1,36 @@
+name: Report a package
+description: A package or version that looks malicious, compromised or unsafe
+title: "[report] <package>@<version>"
+labels: ["package-report"]
+body:
+  - type: input
+    id: package
+    attributes:
+      label: Package and version
+      placeholder: color-helper-pro@1.0.3
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is wrong
+      options:
+        - Malicious code (steals data, downloads and runs code, backdoor)
+        - Compromised account (a version the owner didn't publish)
+        - Typosquat or impersonation
+        - Something else unsafe
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Files and lines, network calls, install scripts, or a link to an analysis.
+    validations:
+      required: true
+  - type: checkboxes
+    id: npm
+    attributes:
+      label: Source
+      options:
+        - label: This package is also on the public npm registry

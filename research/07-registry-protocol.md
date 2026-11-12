@@ -201,7 +201,7 @@ content-type: application/json
 `201` with:
 
 ```json
-{ "token": "29bfaaaa-46c5-aaee-ba6f-92bedeadbeef", "ok": true,
+{ "token": "npm_EXAMPLEtoken", "ok": true,
   "id": "org.couchdb.user:alice", "rev": "_we_dont_use_revs_any_more" }
 ```
 

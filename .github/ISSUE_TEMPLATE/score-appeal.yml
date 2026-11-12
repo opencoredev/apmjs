@@ -1,0 +1,18 @@
+name: Appeal a score
+description: A security score you think is wrong
+title: "[score] <package>@<version>"
+labels: ["score-appeal"]
+body:
+  - type: input
+    id: package
+    attributes:
+      label: Package and version
+    validations:
+      required: true
+  - type: textarea
+    id: signal
+    attributes:
+      label: Which signal is wrong, and why
+      description: Paste the signal and evidence line from the package page or from `apm score <package> --json`.
+    validations:
+      required: true

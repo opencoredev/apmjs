@@ -3,10 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "bin": { "apm": "./src/main.ts" },
-  "exports": { ".": "./src/index.ts" },
+  "bin": {
+    "apm": "./src/main.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "dependencies": {
     "@apm/core": "workspace:*",
     "zod": "^4.6.7"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opencoredev/apmjs.git"
   }
 }
