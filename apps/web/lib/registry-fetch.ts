@@ -1,6 +1,7 @@
 // Reads one JSON document from the registry with a time budget and a size cap, and says why it failed.
 // No "server-only" here so the unit tests can import it; lib/registry.ts is the server entry point.
 import type { z } from "zod";
+import { registryFetch } from "./registry-transport";
 
 /** Every registry call gives up after this long, so a stalled registry can't pin a render. */
 export const REGISTRY_TIMEOUT_MS = 8_000;
@@ -83,7 +84,7 @@ export async function fetchJson<T>(opts: FetchJsonOptions<T>): Promise<Fetched<T
   const signal = withTimeout(timeoutMs, opts.signal);
 
   try {
-    const res = await fetch(opts.url, { cache: "no-store", headers: { accept: "application/json", ...opts.headers }, signal });
+    const res = await registryFetch(opts.url, { cache: "no-store", headers: { accept: "application/json", ...opts.headers }, signal });
     const kind = classifyStatus(res.status);
 
     if (kind !== "ok") {

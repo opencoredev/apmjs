@@ -1,6 +1,7 @@
 // Forwards /api/auth/* and /-/apm/v1/* to the registry, so sign-in and the account routes keep their
 // session cookie on this origin. This replaces next.config.ts rewrites, which can't set response headers
 // on a proxied response: these answers belong to one signed-in user and must say so to every cache.
+import { registryFetch } from "./registry-transport";
 import { PRIVATE_HEADERS, securityHeaders } from "./security-headers";
 
 export const REGISTRY_PREFIXES = ["/api/auth/", "/-/apm/v1/"] as const;
@@ -54,7 +55,7 @@ export async function forwardToRegistry(request: Request, opts: ForwardOptions):
   };
 
   try {
-    upstream = await fetch(target, init);
+    upstream = await registryFetch(target, init);
   } catch {
     return withSiteHeaders(Response.json({ error: "The registry did not answer." }, { status: 502 }), opts.dev);
   }

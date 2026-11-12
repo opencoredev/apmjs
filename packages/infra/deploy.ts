@@ -116,6 +116,8 @@ const bundle = await buildWorker("worker");
 
 process.stdout.write(`registry bundle: ${bundle}\n`);
 
+const subdomain = await workersSubdomain(token, accountId);
+
 const child = Bun.spawn(
   ["bun", join(INFRA, "node_modules", ".bin", "alchemy"), args.action, "--stage", args.stage, "--no-input", ...(args.action === "deploy" ? ["--yes"] : [])],
   {
@@ -128,12 +130,14 @@ const child = Bun.spawn(
       CI: "1",
       CLOUDFLARE_API_TOKEN: token,
       CLOUDFLARE_ACCOUNT_ID: accountId,
-      WORKERS_SUBDOMAIN: await workersSubdomain(token, accountId),
+      WORKERS_SUBDOMAIN: subdomain,
       NEON_URL: neonUrl,
       APM_DATABASE: database,
       AUTH_SECRET: authSecret(args.stage),
       GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
+      // the website's registry URL for anything it renders at build time
+      APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
       ALCHEMY_TELEMETRY_DISABLED: "1",
       DO_NOT_TRACK: "1",
     },

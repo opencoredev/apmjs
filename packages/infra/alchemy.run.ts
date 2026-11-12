@@ -74,6 +74,18 @@ export default Alchemy.Stack(
       settings: { batchSize: 5, maxRetries: 3, maxWaitTimeMs: 1000, retryDelay: 30 },
     });
 
-    return { registry: registryUrl, web: webUrl, registryWorker: registry.url };
+    // The website: Next.js through OpenNext. Its route handlers forward /api/auth/* and /-/apm/v1/* to the registry,
+    // so sign-in cookies live on the website's origin.
+    const website = yield* Cloudflare.Website.Nextjs("Web", {
+      name: webName,
+      rootDir: resolve(import.meta.dirname, "../../apps/web"),
+      // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs
+      env: { REGISTRY: registry, APM_REGISTRY: registryUrl },
+      openNext: { buildCommand: "bun run build" },
+      observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
+      domain: production ? PRODUCTION.web : undefined,
+    });
+
+    return { registry: registryUrl, web: webUrl, registryWorker: registry.url, webWorker: website.url };
   }),
 );

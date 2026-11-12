@@ -8,6 +8,8 @@
 // script makes a check identity directly in the stage's database (user "apm-staging-check" with a GitHub account
 // row) and signs a session cookie with the stage's AUTH_SECRET. Everything after that runs the deployed code:
 // TOTP enrolment, the device login, npm publish, the approval and the install. It never runs against production.
+// Browser steps go to the website (which forwards them to the registry over a service binding); npm and the
+// CLI's steps go to the registry.
 import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -169,13 +171,14 @@ class Jar {
   }
 }
 
-async function call(path: string, init: { method?: string; jar?: Jar; body?: unknown; origin?: string } = {}): Promise<{ status: number; body: unknown }> {
+/** A request the way a browser (to the website) or the CLI (to the registry) sends it. */
+async function call(path: string, init: { method?: string; jar?: Jar; body?: unknown; origin?: string; via?: "web" | "registry" } = {}): Promise<{ status: number; body: unknown }> {
   const headers = new Headers({ origin: init.origin ?? new URL(web).origin });
 
   if (init.jar) headers.set("cookie", init.jar.header());
 
   if (init.body !== undefined) headers.set("content-type", "application/json");
-  const res = await fetch(`${registry}${path}`, { method: init.method ?? "GET", headers, body: init.body === undefined ? undefined : JSON.stringify(init.body) });
+  const res = await fetch(`${init.via === "registry" ? registry : web}${path}`, { method: init.method ?? "GET", headers, body: init.body === undefined ? undefined : JSON.stringify(init.body) });
   init.jar?.take(res);
   const text = await res.text();
   let body: unknown = text;
@@ -220,13 +223,13 @@ async function stagedPublish(): Promise<void> {
       writeFileSync(totpFile, `${secret}\n`, { mode: 0o600 });
     }
 
-    const start = DeviceStart.parse((await call("-/apm/v1/login/device", { method: "POST", body: {} })).body);
+    const start = DeviceStart.parse((await call("-/apm/v1/login/device", { method: "POST", body: {}, via: "registry" })).body);
     const claim = await call(`api/auth/device?user_code=${encodeURIComponent(start.userCode)}`, { jar });
     const approveDevice = await call("api/auth/device/approve", { method: "POST", jar, body: { userCode: start.userCode } });
 
     if (claim.status !== 200 || approveDevice.status !== 200) throw new Error(`device approval: ${claim.status}/${approveDevice.status} ${JSON.stringify(approveDevice.body)}`);
     await Bun.sleep(1_200);
-    const login = DeviceToken.parse((await call("-/apm/v1/login/device/token", { method: "POST", body: { deviceCode: start.deviceCode } })).body);
+    const login = DeviceToken.parse((await call("-/apm/v1/login/device/token", { method: "POST", body: { deviceCode: start.deviceCode }, via: "registry" })).body);
     record(login.username === CHECK.login, "apm login's device flow issues a token for the signed-in account", `user ${login.username}`);
 
     const name = `@${CHECK.login}/smoke-${Date.now().toString(36)}`;
@@ -237,12 +240,12 @@ async function stagedPublish(): Promise<void> {
     writeFileSync(join(pkg, ".npmrc"), `registry=${registry}\n//${new URL(registry).host}/:_authToken=${login.token}\n`);
     const pub = await run(["npm", "publish", "--registry", registry], pkg);
     const id = /\/approve\/([A-Za-z0-9_-]+)/.exec(pub.out)?.[1] ?? null;
-    const hidden = await call(`${name.replace("/", "%2F")}`);
+    const hidden = await call(`${name.replace("/", "%2F")}`, { via: "registry" });
     record(pub.code === 0 && id !== null && hidden.status === 404, "npm publish with a login token stages the version and prints the approval link", `exit ${pub.code}, link ${id !== null}, packument ${hidden.status}`);
 
     if (id === null) return;
     const approved = await call(`-/apm/v1/staged/${id}/approve`, { method: "POST", jar, body: { code: totp(secret) } });
-    const live = await call(`${name.replace("/", "%2F")}`);
+    const live = await call(`${name.replace("/", "%2F")}`, { via: "registry" });
     record(approved.status === 200 && live.status === 200, "a TOTP approval makes the staged version live", `approve ${approved.status}, packument ${live.status}`);
     const consumer = project("consumer");
     const install = await run(["npm", "install", "--no-audit", "--no-fund", `${name}@1.0.0`], consumer);
