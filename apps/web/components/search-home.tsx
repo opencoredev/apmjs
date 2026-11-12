@@ -443,6 +443,7 @@ function Results({
   active,
   setActive,
   retry,
+  updating,
 }: {
   done: SearchDone;
   q: string;
@@ -450,6 +451,8 @@ function Results({
   active: number;
   setActive: (i: number) => void;
   retry: () => void;
+  /** The typed query, when the results on screen still belong to the previous one. */
+  updating: string | null;
 }) {
   const again = (
     <button type="button" onClick={retry} className="font-medium text-foreground underline underline-offset-4 hover:no-underline">
@@ -466,10 +469,10 @@ function Results({
   const reserveScore = hits.some((h) => h.score !== null);
 
   return (
-    <section aria-label="Search results" className="min-w-0">
+    <section aria-label="Search results" aria-busy={updating !== null} className="min-w-0">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-sm text-muted-foreground">
         <span className="tabular-nums">
-          {hits.length === 0 ? "No results" : total > hits.length ? `Top ${hits.length} of ${total.toLocaleString("en")}` : `${hits.length} ${hits.length === 1 ? "result" : "results"}`}
+          {updating !== null ? `Updating results for ${updating} …` : hits.length === 0 ? "No results" : total > hits.length ? `Top ${hits.length} of ${total.toLocaleString("en")}` : `${hits.length} ${hits.length === 1 ? "result" : "results"}`}
         </span>
         {upstreamFailed && (
           <span className="inline-flex items-center gap-1.5 text-warn">
@@ -514,7 +517,12 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
   const [selection, setSelection] = useState<{ query: string; index: number }>({ query: "", index: -1 });
   // Only a non-empty query has navigable results; after Esc the old answer must not open.
   const hits = q !== "" && current?.kind === "ok" ? current.answer.hits : [];
-  const active = selection.query === shownQuery ? Math.min(selection.index, hits.length - 1) : -1;
+  // Results on screen can belong to the previous query while the next answer loads. Only an answer for
+  // exactly what is typed can be navigated or opened; Enter before it arrives waits for it.
+  const fresh = shownQuery === q;
+  const actionable = fresh ? hits : [];
+  const [enterFor, setEnterFor] = useState<string | null>(null);
+  const active = fresh && selection.query === shownQuery ? Math.min(selection.index, hits.length - 1) : -1;
   const setActive = (index: number) => setSelection({ query: shownQuery, index });
   const showName = q !== "" && looksLikePackageName(q);
   const nameQuery = showName ? q : null;
@@ -559,6 +567,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
   function update(next: string) {
     setValue(next);
+    setEnterFor(null);
 
     if (normalize(next) === "") setSelection({ query: "", index: -1 });
     const url = urlFor(normalize(next));
@@ -571,19 +580,35 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     clearRef.current = () => update("");
   });
 
+  // Enter pressed while the answer for the typed query was still loading: open its first hit once it lands.
+  useEffect(() => {
+    if (enterFor === null || enterFor !== q || !fresh || current?.kind !== "ok") return;
+    setEnterFor(null);
+    const first = current.answer.hits[0];
+
+    if (first) router.push(packageHref(first.name));
+  }, [enterFor, q, fresh, current, router]);
+
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      if (hits.length === 0) return;
+      if (actionable.length === 0) return;
       e.preventDefault();
       const step = e.key === "ArrowDown" ? 1 : -1;
       const next = active + step;
-      setActive(next < -1 ? hits.length - 1 : next >= hits.length ? hits.length - 1 : next);
+      setActive(next < -1 ? actionable.length - 1 : next >= actionable.length ? actionable.length - 1 : next);
     } else if (e.key === "Enter") {
-      const hit = hits[active >= 0 ? active : 0];
-
-      if (!hit) return;
+      if (q === "") return;
       e.preventDefault();
-      router.push(packageHref(hit.name));
+
+      if (!fresh) {
+        setEnterFor(q);
+
+        return;
+      }
+
+      const hit = actionable[active >= 0 ? active : 0];
+
+      if (hit) router.push(packageHref(hit.name));
     } else if (e.key === "Escape") {
       e.preventDefault();
       update("");
@@ -662,7 +687,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
           )}
           <div className={cn("min-w-0 transition-opacity duration-200", pending && current ? "opacity-70" : "")}>
             {current ? (
-              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} retry={retry} />
+              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} retry={retry} updating={fresh ? null : q} />
             ) : (
               <div aria-hidden className="flex flex-col">
                 <Line className="mb-4 w-24" />
