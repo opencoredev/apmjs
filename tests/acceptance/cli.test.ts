@@ -80,6 +80,27 @@ describe("apm: runtime detection and pass-through", () => {
     expect(r.out).toContain("hello-from-script");
   });
 
+  test("apm add in a pnpm project installs through pnpm", async () => {
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice, {});
+    writeFileSync(join(app, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n");
+    const r = await apm(["add", "nice-dep"], { cwd: app, env: { ...sb.env, npm_config_store_dir: join(sb.home, ".pnpm-store") } });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out.toLowerCase()).toContain("pnpm");
+    expect(installedVersion(app, "nice-dep")).toBe("1.1.0");
+  });
+
+  test("apm add --json prints one machine-readable result and never prompts", async () => {
+    const sb = makeSandbox(reg, alice);
+    const app = bunProject({}, alice);
+    const r = await apm(["add", "evil-dep", "--json"], { cwd: app, env: sb.env });
+    expect(r.code).not.toBe(0);
+    const body: unknown = JSON.parse(r.stdout);
+    expect(dig(body, "ok")).toBe(false);
+    expect(dig(body, "packages", 0, "name")).toBe("evil-dep");
+    expect(typeof dig(body, "packages", 0, "score")).toBe("number");
+  });
+
   test("--pm overrides detection", async () => {
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
@@ -157,7 +178,7 @@ describe("apm: score, name, audit", () => {
     expect(add.code, add.out).toBe(0);
     const clean = await apm(["audit"], { cwd: app, env: sb.env });
     expect(clean.code, clean.out).toBe(0);
-    const rv = await apm(["revoke", "to-revoke@1.0.0", "--reason", "leaked secrets"], { cwd: app, env: sb.env });
+    const rv = await apm(["revoke", "to-revoke@1.0.0", "--reason", "leaked secrets", "--password-stdin"], { cwd: app, env: sb.env, stdin: "correct-horse-battery\n" });
     expect(rv.code, rv.out).toBe(0);
     const audit = await apm(["audit"], { cwd: app, env: sb.env });
     expect(audit.code).not.toBe(0);

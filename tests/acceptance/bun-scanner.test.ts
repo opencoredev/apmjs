@@ -87,10 +87,11 @@ describe("@apm/bun-scanner with stock bun", () => {
     const rv = await fetch(`${reg.url}-/apm/v1/revoke`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${alice}` },
-      body: JSON.stringify({ name: "soon-revoked", version: "1.0.0", reason: "compromised publish token" }),
+      body: JSON.stringify({ name: "soon-revoked", version: "1.0.0", reason: "compromised publish token", password: "correct-horse-battery" }),
     });
     expect(rv.status).toBe(200);
-    const r = await run(["bun", "install", "--force"], { cwd: app, env: sb.env });
+    // a 10-day-old version goes to revoke-pending first; the scanner treats pending as fatal too
+    const r = await run(["bun", "install"], { cwd: app, env: sb.env });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("compromised publish token");
   });

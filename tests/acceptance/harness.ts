@@ -14,7 +14,7 @@ export type Registry = {
 };
 
 type RegistryModule = {
-  startRegistry: (opts: { dataDir: string; port: number; hostname?: string; now?: () => number }) => Promise<{
+  startRegistry: (opts: { dataDir: string; port: number; hostname?: string; now?: () => number; upstream?: string }) => Promise<{
     url: string;
     stop: () => Promise<void>;
   }>;
@@ -24,11 +24,11 @@ function isRegistryModule(m: unknown): m is RegistryModule {
   return typeof m === "object" && m !== null && "startRegistry" in m && typeof m.startRegistry === "function";
 }
 
-export async function startRegistry(opts: { now?: () => number } = {}): Promise<Registry> {
+export async function startRegistry(opts: { now?: () => number; upstream?: string } = {}): Promise<Registry> {
   const mod: unknown = await import(join(ROOT, "packages", "registry", "src", "index.ts"));
   if (!isRegistryModule(mod)) throw new Error("@apm/registry must export startRegistry");
   const dataDir = mkdtempSync(join(tmpdir(), "apm-reg-"));
-  const srv = await mod.startRegistry({ dataDir, port: 0, hostname: "127.0.0.1", ...(opts.now ? { now: opts.now } : {}) });
+  const srv = await mod.startRegistry({ dataDir, port: 0, hostname: "127.0.0.1", ...(opts.now ? { now: opts.now } : {}), ...(opts.upstream ? { upstream: opts.upstream } : {}) });
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
   return { url, dataDir, stop: srv.stop };
 }
