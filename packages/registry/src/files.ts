@@ -396,7 +396,8 @@ export const fileRoute = (req: Request, url: URL) => {
       answer = yield* readmeFor({ found: yield* versionNamed(t), name: t.name });
     }
 
-    // the bytes behind a digest never change; a version can still be revoked, so shared caches recheck soon
-    return bodyless(json(answer, 200, { "cache-control": "public, max-age=300" }));
+    // the bytes behind a digest never change and are kept in the blob store; whether they may be shown is read from
+    // the database on every request, so no cache downstream keeps the answer (a revoke refuses the very next one)
+    return bodyless(json(answer, 200, { "cache-control": "no-store" }));
   }).pipe(Effect.catchTag("HttpFailure", (f) => Effect.succeed(bodyless(json({ error: f.error, ...f.extra }, f.status)))));
 };

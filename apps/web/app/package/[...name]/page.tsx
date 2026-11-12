@@ -252,6 +252,7 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
           <div className={`h-full rounded-full ${tone.bar}`} style={{ width: `${Math.max(2, score.score)}%` }} />
         </div>
         {notChecked.length > 0 && <LimitationsLine notChecked={notChecked} />}
+        {score.redacted && <p className="w-full text-sm text-inverse-muted">This version was revoked, so its evidence lines are not shown.</p>}
       </div>
       <EvidenceAdminProvider>
       <ul className="border-t border-inverse-border">

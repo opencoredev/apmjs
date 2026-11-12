@@ -64,7 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
-import { isWithheld, readmeShown, scoreWithoutSource } from "./withheld.ts";
+import { isWithheld, readmeShown, withheldDismissal, withheldSignal } from "./withheld.ts";
 
 const HOUR = 3_600_000;
 
@@ -91,16 +91,22 @@ export function reportFor(v: VersionRecord, at: number, opts: { ignoreRecent?: b
 
 /**
  * What a page needs to name one evidence item for a reviewer's dismissal (the scorer and these bytes' digest), the
- * items already dismissed, and the signals without the evidence kept only for dismissals.
+ * items already dismissed, and the signals without the evidence kept only for dismissals. A withheld version's signals
+ * and dismissed items are rebuilt from allowed fields (withheld.ts), so none of its evidence lines is sent.
  */
 function reviewable(v: VersionRecord, r: ScoreReport) {
   const d = digestOf(v);
-  const signals = r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s);
-  const dismissed = r.dismissed ?? [];
-  // a revoked version's evidence names the file and line, not the line itself (withheld.ts)
-  const redacted = isWithheld(v.status);
+  const head = { scorer: r.scorer, digest: d ? digestLabel(d) : null };
 
-  return { scorer: r.scorer, digest: d ? digestLabel(d) : null, redacted, ...(redacted ? scoreWithoutSource({ signals, dismissed }) : { signals, dismissed }) };
+  if (isWithheld(v.status)) return { ...head, redacted: true, signals: r.signals.map(withheldSignal), dismissed: (r.dismissed ?? []).map(withheldDismissal) };
+  const signals = r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s);
+
+  return { ...head, redacted: false, signals, dismissed: r.dismissed ?? [] };
+}
+
+/** The parts of a score report that never quote the package: numbers, enums, fixed wording and paths. */
+function sourceFreeReport(r: ScoreReport) {
+  return { score: r.score, grade: r.grade, facts: r.facts, notChecked: r.notChecked, skipped: r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })) };
 }
 
 function compact(r: ScoreReport): CompactScore {
@@ -765,7 +771,8 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
       status: v.status,
       publishedAt: new Date(v.published_at).toISOString(),
       publishedBy: v.published_by,
-      ...report,
+      // spelled out, not `...report`: a field added to the report later is not sent until it is named here
+      ...sourceFreeReport(report),
       ...reviewable(v, report),
       previous: prev && prevReport ? { version: prev.version, score: prevReport.score, grade: prevReport.grade } : null,
       changes: prev && prevReport ? signalChanges(prevReport.signals, report.signals) : [],
@@ -798,6 +805,13 @@ const linksOf = (v: VersionRecord | null) => {
   return { homepage: homepage.success ? homepage.data : null, bugs: bugs.success ? bugs.data : null };
 };
 
+/** The readme a package answer shows, and the version whose publish wrote it (null when unknown or hidden). */
+function readmeOf(pkg: { readme: string; readme_version: string | null }, versions: readonly VersionRecord[]) {
+  const shown = readmeShown(pkg, versions);
+
+  return { readme: shown.text, readmeVersion: shown.version };
+}
+
 const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -815,7 +829,7 @@ const packageResponse = (name: string) =>
       source: src.kind,
       description: local?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
       keywords: local?.keywords ?? [],
-      readme: local ? readmeShown(local.readme, src.versions) : src.kind === "upstream" ? src.pkg.readme : "",
+      ...readmeOf(local ?? { readme: src.kind === "upstream" ? src.pkg.readme : "", readme_version: null }, src.versions),
       repository: repositoryOf(latest0),
       ...linksOf(latest0),
       distTags: src.distTags,
@@ -1545,7 +1559,8 @@ function upstreamPackument(base: string, src: Extract<Source, { kind: "upstream"
     "dist-tags": distTags,
     versions,
     time,
-    readme: src.pkg.readme,
+    // npm's readme has no known owner here, so it is hidden while any version is withheld (withheld.ts)
+    readme: readmeShown({ readme: src.pkg.readme, readme_version: null }, src.versions).text,
     maintainers: src.pkg.maintainers.map((name) => ({ name })),
   };
 }

@@ -553,18 +553,50 @@ function publicState(r: StoredReview): PublicState {
   }
 }
 
-/** A finding without the package's text: the file, line, sentence and severity stay, the quote and excerpt go. */
-const findingWithoutSource = (f: WireFinding): WireFinding => ({ ...f, quote: "", excerpt: "" });
+// A withheld version's review (withheld.ts) is rebuilt from allowed fields: paths, lines, the reviewer's sentence,
+// severities, verdict enums and counts. The model's summaries and every quote and excerpt are left out, and a field
+// added to the wire format later is not sent until it is named here.
 
-/** A review of a revoked version (withheld.ts): every finding, the second opinion's too, without the lines it quoted. */
-function reviewWithoutSource(r: StoredReview): StoredReview {
-  const res = r.result;
-  const secondOpinion = res.secondOpinion ? { ...res.secondOpinion, findings: res.secondOpinion.findings.map(findingWithoutSource) } : null;
+/** A finding of a withheld version: where, what the reviewer said, and how bad; no quote or excerpt. */
+const withheldFinding = (f: WireFinding): WireFinding => ({ file: f.file, line: f.line, issue: f.issue, severity: f.severity, quote: "", excerpt: "" });
 
-  if (res.outcome === "benign") return { ...r, result: { ...res, secondOpinion } };
+/** The result fields every outcome shares, from allowed fields only. */
+function withheldFields(res: ReviewResult) {
+  const so = res.secondOpinion;
 
-  return { ...r, result: { ...res, findings: res.findings.map(findingWithoutSource), secondOpinion } };
+  return {
+    model: res.model,
+    reviewedAt: res.reviewedAt,
+    summary: "",
+    coverage: { mode: res.coverage.mode, previousVersion: res.coverage.previousVersion, filesInScope: res.coverage.filesInScope, filesRead: res.coverage.filesRead },
+    read: [...res.read],
+    notRead: res.notRead.map((n) => (n.kind === "file" ? { kind: "file" as const, path: n.path, reason: n.reason } : { kind: "dependency" as const, name: n.name })),
+    attempts: res.attempts.map((a) => ({ result: a.result, kept: a.kept, dropped: a.dropped, promptTokens: a.promptTokens, completionTokens: a.completionTokens, latencyMs: a.latencyMs })),
+    secondOpinion: so ? { reviewer: so.reviewer, verdict: so.verdict, summary: "", findings: so.findings.map(withheldFinding) } : null,
+  };
 }
+
+/** A withheld version's review result, built from allowed fields only. */
+function withheldResult(res: ReviewResult): ReviewResult {
+  const fields = withheldFields(res);
+
+  switch (res.outcome) {
+    case "benign":
+      return { outcome: "benign", ...fields };
+    case "flagged":
+      return { outcome: "flagged", verdict: res.verdict, findings: res.findings.map(withheldFinding), ...fields };
+    case "no-answer":
+      return { outcome: "no-answer", reason: res.reason, findings: res.findings.map(withheldFinding), ...fields };
+    default: {
+      const _exhaustive: never = res;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** A stored review of a withheld version: its result rebuilt from allowed fields; the person's decision and note stay. */
+const withheldReview = (r: StoredReview): StoredReview => ({ ...r, result: withheldResult(r.result) });
 
 function findingsOf(r: ReviewResult): WireFinding[] {
   return r.outcome === "benign" ? [] : r.findings;
@@ -626,7 +658,7 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
     else if (yield* isMaintainer(viewer, name)) role = "maintainer";
     const stored = got.digest ? yield* reviewFor(name, v.version, got.digest) : null;
     const redacted = isWithheld(v.status);
-    const review = stored && redacted ? reviewWithoutSource(stored) : stored;
+    const review = stored && redacted ? withheldReview(stored) : stored;
     const job = got.digest ? yield* jobByKey(name, v.version, got.digest) : null;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 

@@ -7,6 +7,14 @@
 //   bun packages/infra/deploy.ts deploy  --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage production
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
+//
+// Order: migrations, then the registry Worker, then the website. The website binds the registry (REGISTRY in
+// alchemy.run.ts), and Alchemy starts a resource only after every resource it depends on has finished, and not at all
+// when one failed (Apply.ts, waitForDeps on readyStable). Keep that binding: the registry is the only gate for a
+// version's source, so it must redact before a website that expects redaction goes live. A website deployed on its own
+// (wrangler, a dashboard rollback) against an older registry fails closed: it requires the `redacted` and
+// `readmeVersion` fields that registry does not send, and shows "registry unavailable" instead of the answer
+// (apps/web/lib/registry.ts). packages/infra/test/deploy-order.test.ts checks the binding.
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";

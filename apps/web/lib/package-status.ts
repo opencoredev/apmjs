@@ -1,13 +1,12 @@
 // Does this package (or this file of a version) exist, and can the registry be read? Asked by proxy.ts before a
-// package page renders, because the page's status code is decided before its content streams. Both answers come from
-// the edge cache once known: packages are never deleted and a version's files never change, so a yes is kept, and a
-// package the proxy had to look up is left in the cache for the page that renders next. A version can still be
-// revoked, so a file's cached yes counts only while the version's permission to be shown is a few seconds old.
+// package page renders, because the page's status code is decided before its content streams. Only that something
+// exists is kept in the edge cache: packages are never deleted and a version's paths never change. Whether a version's
+// source may be shown is never kept: the page reads it from the registry on every view, and the registry refuses a
+// revoked version then (a 410 the page explains).
 import { z } from "zod";
 import { lookup, POLICIES, store } from "./edge-cache";
-import { askServable, confirmServable, fetchJson, logUnavailable, REGISTRY_TIMEOUT_MS, type Fetched } from "./registry-fetch";
-import { fileApiPath, packageApiPath, REGISTRY, servableKey } from "./registry-url";
-import { packageQuotes } from "./source-gates";
+import { fetchJson, headStatus, logUnavailable, REGISTRY_TIMEOUT_MS, type Fetched } from "./registry-fetch";
+import { fileApiPath, packageApiPath, REGISTRY } from "./registry-url";
 
 /** "refused": the registry deliberately won't show it (a revoked version's 410, an unreadable tarball's 422); the page explains why. */
 export type Status = "ok" | "missing" | "refused" | "unavailable";
@@ -22,9 +21,7 @@ export async function packageStatus(name: string, signal?: AbortSignal): Promise
   const known = `${url}#exists`;
 
   if (await lookup(known, POLICIES.exists)) return "ok";
-  // the same URL and cache entry as the page's getPackage: the page renders from this answer
-  // the answer holds no source, but the page's copy does: this read records the version's permission like the page's would
-  const result = await fetchJson({ url, schema: Exists, signal, cache: POLICIES.package, gate: { quotes: packageQuotes, withoutSource: (v) => v } });
+  const result = await fetchJson({ url, schema: Exists, signal });
 
   if (result.kind === "ok") store(known, YES, POLICIES.exists);
   else if (result.kind === "unavailable" && !signal?.aborted) logUnavailable(packageApiPath(name), result.reason);
@@ -39,18 +36,19 @@ function statusOf(result: Fetched<null>): Status {
   return result.reason.kind === "status" && (result.reason.status === 410 || result.reason.status === 422) ? "refused" : "unavailable";
 }
 
-/** Does this version have this file? A HEAD request: the registry answers with the status and no body. A 404 also means the package or the version is not there. */
+/**
+ * Does this version have this file? A HEAD request: the registry answers with the status and no body. A 404 also
+ * means the package or the version is not there. A path known to exist is not asked about again; the page's own read
+ * of the file is what the registry refuses when the version was revoked since.
+ */
 export async function fileStatus(input: { name: string; version: string; path: string }, signal?: AbortSignal): Promise<Status> {
   const url = `${REGISTRY}${fileApiPath(input)}`;
   const known = `${url}#exists`;
-  // that the file exists never changes, so it is kept; that the version may be shown is asked with a HEAD unless one
-  // said yes in the last few seconds. A file not yet known to exist is always asked about: the version's permission
-  // says nothing about this path.
-  const exists = await lookup(known, POLICIES.versionFile);
-  const check = { url, servable: servableKey(input), signal, timeoutMs: REGISTRY_TIMEOUT_MS * 2 };
-  const status = statusOf(exists ? await confirmServable(check) : await askServable(check));
 
-  if (status === "ok" && !exists) store(known, YES, POLICIES.versionFile);
+  if (await lookup(known, POLICIES.fileExists)) return "ok";
+  const status = statusOf(await headStatus({ url, signal, timeoutMs: REGISTRY_TIMEOUT_MS * 2 }));
+
+  if (status === "ok") store(known, YES, POLICIES.fileExists);
 
   return status;
 }

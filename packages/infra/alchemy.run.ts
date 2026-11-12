@@ -87,7 +87,8 @@ export default Alchemy.Stack(
     const website = yield* Cloudflare.Website.Nextjs("Web", {
       name: webName,
       rootDir: resolve(import.meta.dirname, "../../apps/web"),
-      // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs
+      // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs. It also makes the
+      // registry deploy first: Alchemy starts the website only once the registry has finished (deploy.ts, "Order")
       env: { REGISTRY: registry, APM_REGISTRY: registryUrl },
       openNext: { buildCommand: "bun run build" },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },

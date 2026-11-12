@@ -1,11 +1,10 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
 import { z } from "zod";
-import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY, servableKey } from "./registry-url";
+import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
-import { fetchJson, logUnavailable, MAX_REGISTRY_TIMEOUT_MS, type Fetched, type FetchJsonOptions, type SourceGate } from "./registry-fetch";
-import { packageGate, reviewGate, scoreGate } from "./source-gates";
+import { fetchCachedJson, fetchJson, FILE_TIMEOUT_MS, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
 import { RepositoryField } from "./repository";
@@ -23,8 +22,9 @@ const Dismissed = z.object({ signal: z.string(), file: z.string(), line: z.numbe
 export type Dismissed = z.infer<typeof Dismissed>;
 
 // what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out.
-// `redacted`: the version is revoked and its evidence names files and lines only; added with that redaction.
-const Reviewable = { scorer: z.string().optional(), digest: z.string().nullish(), dismissed: z.array(Dismissed).default([]), redacted: z.boolean().default(false) };
+// `redacted`: the version is revoked and its signals carry no evidence lines. Required: a registry too old to send it
+// may not redact either, so its answer is refused as unreadable rather than shown (packages/infra/deploy.ts).
+const Reviewable = { scorer: z.string().optional(), digest: z.string().nullish(), dismissed: z.array(Dismissed).default([]), redacted: z.boolean() };
 
 const Facts = z.object({
   moduleFormat: z.enum(["esm", "cjs", "dual"]),
@@ -44,6 +44,9 @@ const PackageInfo = z.object({
   source: z.enum(["local", "upstream"]),
   description: z.string(),
   readme: z.string(),
+  // the version whose publish wrote the readme, null when unknown or hidden. Required, like `redacted`: a registry that
+  // does not send it does not know whose readme it is, so it can't hide one a revoke took (packages/infra/deploy.ts)
+  readmeVersion: z.string().nullable(),
   // added after apm-score-v5; an older registry leaves it out
   repository: RepositoryField.nullish(),
   // added with the readme fallback; raw manifest strings, made safe by package-links.ts before they are links
@@ -103,25 +106,23 @@ const Recent = z.object({
 export type RecentEvent = z.infer<typeof Recent>["events"][number];
 
 /**
- * Reads a registry path. Failures other than a 404 are logged here, once, with the path and the reason. With `cache`,
- * the answer comes from the edge cache when it has one; a read that sends `headers` (a visitor's cookie) never does.
+ * Reads a registry path. Failures other than a 404 are logged here, once, with the path and the reason. Read from the
+ * registry every time unless `cache` is set, which only source-free answers may set (fetchCachedJson); a read that
+ * sends `headers` (a visitor's cookie) is never cached.
  */
-async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: CachePolicy; gate?: SourceGate<T> } = {}): Promise<Fetched<T>> {
+async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: CachePolicy } = {}): Promise<Fetched<T>> {
   const options: FetchJsonOptions<T> = { url: `${REGISTRY}${path}`, schema, signal: opts.signal };
 
   if (opts.headers !== undefined) options.headers = opts.headers;
-  else if (opts.cache !== undefined) options.cache = opts.cache;
+  const result = opts.cache !== undefined && opts.headers === undefined ? await fetchCachedJson({ ...options, cache: opts.cache }) : await fetchJson(options);
 
-  if (opts.gate !== undefined) options.gate = opts.gate;
-  const signal = opts.signal;
-  const result = await fetchJson(options);
-
-  if (result.kind === "unavailable" && !signal?.aborted) logUnavailable(path.split("?")[0] ?? path, result.reason);
+  if (result.kind === "unavailable" && !opts.signal?.aborted) logUnavailable(path.split("?")[0] ?? path, result.reason);
 
   return result;
 }
 
-export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo, { cache: POLICIES.package, gate: packageGate() });
+/** A package's answer, with its readme and its latest score's evidence: read from the registry on every view. */
+export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo);
 
 export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> {
   const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: POLICIES.events });
@@ -129,14 +130,17 @@ export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }
 
-/** The public AI review of one version. "missing" when the registry has AI review off or does not know the version. */
-export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer, { cache: POLICIES.review, gate: reviewGate() });
+/**
+ * The public AI review of one version, read from the registry on every view (its findings quote the package). "missing"
+ * when the registry has AI review off or does not know the version.
+ */
+export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer);
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
 
-/** One version's full score, for a version other than latest. */
+/** One version's full score, for a version other than latest, read from the registry on every view (its evidence quotes the package). */
 export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>
-  getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore, { cache: POLICIES.versionScore, gate: scoreGate() });
+  getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore);
 
 const FileHead = { name: z.string(), version: z.string(), path: z.string(), size: z.number() };
 
@@ -148,14 +152,13 @@ const FileAnswer = z.discriminatedUnion("kind", [
 
 export type FileAnswer = z.infer<typeof FileAnswer>;
 
-/** A 1 MB file is at most a few MB as JSON (escapes), and the first read of a big upstream tarball takes a while. */
+/** A 1 MB file is at most a few MB as JSON (escapes). */
 const FILE_MAX_BYTES = 8 * 1024 * 1024;
-const FILE_TIMEOUT_MS = MAX_REGISTRY_TIMEOUT_MS;
 
-/** One file of one version, as text, or why it isn't shown. */
+/** One file of one version, as text, or why it isn't shown. Read from the registry on every view, which refuses a revoked version. */
 export async function getFile(input: { name: string; version: string; path: string }): Promise<Fetched<FileAnswer>> {
   const path = fileApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS });
 
   if (result.kind === "unavailable") logUnavailable(path.split("?")[0] ?? path, result.reason);
 
@@ -165,7 +168,7 @@ export async function getFile(input: { name: string; version: string; path: stri
 /** Lines around one line of a file of any size (the file view's excerpt of a file over 1 MB). */
 export async function getExcerpt(input: { name: string; version: string; path: string; line: number; context: number }): Promise<Fetched<ExcerptAnswer>> {
   const path = excerptApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS });
 
   // a line past the end (416) is an answer the view explains, not an outage
   if (result.kind === "unavailable" && !(result.reason.kind === "status" && result.reason.status === 416)) logUnavailable(path.split("?")[0] ?? path, result.reason);
@@ -176,7 +179,7 @@ export async function getExcerpt(input: { name: string; version: string; path: s
 /** The README npm would pick from a version's tarball, for packages whose packument has no readme. "missing" when there is none. */
 export async function getTarballReadme(input: { name: string; version: string }): Promise<Fetched<FileAnswer>> {
   const path = readmeApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS, cache: POLICIES.versionFile, servable: servableKey(input) });
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS });
 
   if (result.kind === "unavailable") logUnavailable(path, result.reason);
 

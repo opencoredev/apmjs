@@ -310,7 +310,7 @@ export const packument = (pkg: PackageRecord, abbreviated: boolean, ext: Extensi
       versions,
       time,
       maintainers: owners.map((name) => ({ name })),
-      readme: readmeShown(pkg.readme, all),
+      readme: readmeShown(pkg, all).text,
       keywords: pkg.keywords,
     };
   });
@@ -673,7 +673,8 @@ export const commitVersion = (v: {
           modifiedAt: at,
           ...(description !== undefined ? { description } : {}),
           ...(keywords !== undefined ? { keywords } : {}),
-          ...(v.readme !== null ? { readme: v.readme } : {}),
+          // the readme's owner is recorded with it, so revoking that version hides it (withheld.ts)
+          ...(v.readme !== null ? { readme: { text: v.readme, version: v.version } } : {}),
         });
         yield* store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
 

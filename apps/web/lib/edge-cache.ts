@@ -1,10 +1,11 @@
 // A short cache for public registry answers, so a page view does not wait on the registry for data it read a moment
 // ago. Two layers:
 //  1. This isolate's memory, shared through globalThis: proxy.ts and the page are bundled apart by OpenNext but run
-//     in the same isolate, so the package the proxy looked up is the one the page renders.
+//     in the same isolate, so what the proxy learned (that a package or a file exists) the page's next view reuses.
 //  2. The Workers Cache API (caches.default), shared by every isolate in a data center. It works on custom domains
 //     (production); on workers.dev and under `next dev` its calls are no-ops or missing, and layer 1 still holds.
-// Only answers that are the same for everyone go in here: callers never pass a cookie or a token with a cached read.
+// Only answers that are the same for everyone and carry no version source go in here: callers never pass a cookie or a
+// token with a cached read, and lib/registry-fetch.ts refuses to cache a source-bearing path.
 // An entry is fresh for `freshMs`, then served for up to `staleMs` more while one background refresh replaces it.
 // No "server-only": the unit tests import it.
 import { getCloudflareContext } from "@opennextjs/cloudflare";
@@ -175,31 +176,20 @@ export function evict(key: string): void {
   if (shared) inBackground(shared.delete(cacheRequest(key)));
 }
 
-/** How long each kind of public answer is kept. */
+/**
+ * How long each kind of public answer is kept. Only answers that carry no source: a version's files, excerpts,
+ * readmes, reviews, scores and package answers are read from the registry on every view (lib/registry-fetch.ts), so a
+ * revoke refuses the very next one.
+ */
 export const POLICIES = {
-  /** A package's versions, statuses and latest score. A yank or revoke shows within about 10 seconds of the next view. */
-  package: { freshMs: 10_000, staleMs: 60_000 },
   /** That a package exists, for proxy.ts's 404 check. Packages are never deleted, so a yes holds. */
   exists: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
-  /** The public AI review: the review card polls for the live state. */
-  review: { freshMs: 5_000, staleMs: 30_000 },
+  /**
+   * That a version has a file at a path, for proxy.ts's 404 check. A version's paths never change. Whether the file
+   * may be shown is not kept here: the page reads the file from the registry, which refuses a revoked version.
+   */
+  fileExists: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
+  /** A package's public log. */
   events: { freshMs: 10_000, staleMs: 60_000 },
-  /** An older version's full score report: it changes only when evidence is dismissed or restored. */
-  versionScore: { freshMs: 60_000, staleMs: 10 * 60_000 },
-  /**
-   * Files, excerpts and readmes of one version: the bytes of a published version never change. Whether they may be
-   * shown can (a revoke), so a cached copy is served only while `servable` says yes (lib/registry-fetch.ts).
-   */
-  versionFile: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
-  /**
-   * That a version's source may be shown: a revoke hides it within these few seconds, and nothing is served stale. The
-   * seconds count from when the request that asked the registry started (lib/registry-fetch.ts).
-   */
-  servable: { freshMs: 5_000, staleMs: 0 },
-  /**
-   * How long the registry's last word on a version is kept: a yes for `servable` above, and a no (a 410 or 404) for
-   * longer than any registry request may run, so an older yes still in flight can't replace it (MAX_REGISTRY_TIMEOUT_MS).
-   */
-  servableRecord: { freshMs: 60_000, staleMs: 0 },
   search: { freshMs: 60_000, staleMs: 5 * 60_000 },
 } as const satisfies Record<string, CachePolicy>;

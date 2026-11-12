@@ -41,6 +41,7 @@ Codes and passkeys protect every action that changes what people install or how 
 - Package metadata comes from the `package.json` inside the tarball, not from the publish request, so a request cannot hide install scripts the tarball has.
 - Versions are immutable. A tarball is checked against its published sha512 before it is served, including npm tarballs apm caches.
 - Answers that belong to one user (account, sessions, staged uploads, tokens, login) are marked `Cache-Control: private, no-store`, so no shared cache keeps them.
+- Answers that can carry a version's source (file views, excerpts, readmes, scores, package answers, AI reviews) are marked `Cache-Control: private, no-store` too, and the website never caches them. The registry checks the version's status on every such request, so a revoke refuses the next one. A revoked version's score and review keep only what was found: paths, lines, rule ids, the reviewer's sentence and the revoke's reason.
 - Revoked versions answer 410 and appear as critical advisories to `bun audit` and `npm audit`.
 
 ## How `apm add` installs what it checked

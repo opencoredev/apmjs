@@ -38,6 +38,10 @@ bun packages/infra/smoke.ts --stage staging              # check it with stock c
 
 `deploy` prints the stage's URLs. The smoke check runs `bun add` and `npm install` of real npm packages through the registry, `apm add` against a low-score package (it must refuse) and a clean one, a staged `npm publish` approved with a TOTP code and then installed, and `bun audit`. On staging it signs in as a check account (`apm-staging-check`) that it creates in the staging database, because GitHub sign-in needs a person at a browser; everything after sign-in runs the deployed code. It never makes that account on production.
 
+### Order
+
+Migrations run first, then Alchemy updates the registry Worker, then the website. The website's `REGISTRY` service binding makes it depend on the registry, and Alchemy starts a resource only after everything it depends on has finished, and not at all when one failed. The order matters for revocation: the registry is the only thing that decides whether a version's source (files, excerpts, readmes, review quotes, score evidence) may be shown, and the website shows whatever it answers. A website deployed on its own against an older registry fails closed: it requires the `redacted` and `readmeVersion` fields that only a registry with the allowlist redaction sends, and shows "registry unavailable" where it would have shown the answer.
+
 ## Production cutover
 
 1. Confirm the zone is on Cloudflare: `dig NS apmjs.dev +short` must print `etta.ns.cloudflare.com` and `norman.ns.cloudflare.com`.

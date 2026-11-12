@@ -22,6 +22,7 @@ const noAnswer = ReviewAnswer.parse({
     decidedAt: null,
     note: null,
   },
+  redacted: false,
   viewer: "public",
   private: null,
   canRequest: false,

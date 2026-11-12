@@ -1,16 +1,17 @@
-// A revoked version's files through the site's edge cache and proxy.ts, against a real local server standing in for
+// A revoked version's files through the site's file reads and proxy.ts, against a real local server standing in for
 // the registry. REGISTRY is fixed when lib/registry-url.ts first loads (another test file may load it first), so the
-// fetch spy only moves REGISTRY's origin onto this server; the requests and answers are real.
-import { afterAll, afterEach, beforeAll, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+// fetch spy only moves REGISTRY's origin onto this server; the requests and answers are real. The site keeps no copy
+// of a file, so every view is the registry's answer at that moment.
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { NextRequest } from "next/server";
-import { z } from "zod";
 import { proxy } from "../proxy";
-import { POLICIES } from "./edge-cache";
 import { fileStatus } from "./package-status";
-import { fetchJson } from "./registry-fetch";
-import { fileApiPath, REGISTRY, servableKey } from "./registry-url";
+import { fileApiPath, REGISTRY } from "./registry-url";
 
-const FileDoc = z.object({ kind: z.literal("text"), text: z.string() });
+// lib/registry.ts is the server entry point; outside Next its marker import would throw
+void mock.module("server-only", () => ({}));
+
+const { getFile } = await import("./registry");
 
 /** The registry's answer status per path and query; 200 when unset. */
 const answers = new Map<string, number>();
@@ -44,15 +45,13 @@ beforeAll(() => {
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(moved, { preconnect: realFetch.preconnect }));
 });
 
-afterEach(() => {
-  setSystemTime();
-});
-
 afterAll(() => {
   void server.stop(true);
+  mock.restore();
 });
 
-const T0 = Date.parse("2026-11-12T12:00:00Z");
+const SHOWN = { kind: "ok", value: { name: "x", version: "1.0.0", path: "index.js", size: 5, kind: "text", text: "hello" } } as const;
+const GONE = { kind: "unavailable", reason: { kind: "status", status: 410 } } as const;
 
 function fileOf(name: string) {
   const target = { name, version: "1.0.0", path: "index.js" };
@@ -61,7 +60,7 @@ function fileOf(name: string) {
 
   return {
     target,
-    view: () => fetchJson({ url: `${REGISTRY}${fileApiPath(target)}`, schema: FileDoc, cache: POLICIES.versionFile, servable: servableKey(target) }),
+    view: () => getFile(target),
     answer: (status: number) => answers.set(path, status),
     reads,
   };
@@ -69,68 +68,56 @@ function fileOf(name: string) {
 
 const viewOf = (name: string) => proxy(new NextRequest(`https://apmjs.dev/package/${name}/v/1.0.0/file/index.js`));
 
-describe("a cached file of a version that gets revoked", () => {
-  test("the next view after the revoke does not show the cached file", async () => {
-    const f = fileOf("revoke-after-cache");
-    setSystemTime(T0);
-    expect(await f.view()).toEqual({ kind: "ok", value: { kind: "text", text: "hello" } });
+describe("a file of a version that gets revoked", () => {
+  test("the view right after the revoke does not show the file", async () => {
+    const f = fileOf("revoke-after-view");
+    expect(await f.view()).toEqual(SHOWN);
 
     f.answer(410);
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    expect(await f.view()).toEqual({ kind: "unavailable", reason: { kind: "status", status: 410 } });
-    // the bytes were dropped as well: a restore is read again, not served from before
+    expect(await f.view()).toEqual(GONE);
+    // a restore shows it again on the next view
     f.answer(200);
-    expect((await f.view()).kind).toBe("ok");
-    expect(f.reads("GET")).toBe(2);
+    expect(await f.view()).toEqual(SHOWN);
+    expect(f.reads("GET")).toBe(3);
   });
 
-  test("proxy.ts's cached yes does not outlive the revoke", async () => {
+  test("proxy.ts's cached 'this file exists' lets the page through, and the page's own read is refused", async () => {
     const f = fileOf("revoke-after-exists");
-    setSystemTime(T0);
     expect(await fileStatus(f.target)).toBe("ok");
-    expect((await f.view()).kind).toBe("ok");
+    expect(await f.view()).toEqual(SHOWN);
 
     f.answer(410);
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    expect(await fileStatus(f.target)).toBe("refused");
-    expect((await f.view()).kind).toBe("unavailable");
+    const res = await viewOf("revoke-after-exists");
+    expect(res.headers.get("x-middleware-next")).toBe("1");
+    expect(await f.view()).toEqual(GONE);
   });
 
-  test("the bytes stay cached: within a few seconds nothing is asked, after that only a HEAD", async () => {
-    const f = fileOf("cached-and-allowed");
-    setSystemTime(T0);
-    await f.view();
-    setSystemTime(T0 + 1_000);
-    expect((await f.view()).kind).toBe("ok");
-    expect([f.reads("GET"), f.reads("HEAD")]).toEqual([1, 0]);
+  test("every view asks the registry with one GET; a path known to exist sends no HEAD", async () => {
+    const f = fileOf("every-view-asks");
+    expect(await fileStatus(f.target)).toBe("ok");
+    expect(f.reads("HEAD")).toBe(1);
 
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    expect((await f.view()).kind).toBe("ok");
-    expect([f.reads("GET"), f.reads("HEAD")]).toEqual([1, 1]);
+    for (let i = 0; i < 3; i++) {
+      expect(await fileStatus(f.target)).toBe("ok");
+      expect(await f.view()).toEqual(SHOWN);
+    }
+
+    expect([f.reads("GET"), f.reads("HEAD")]).toEqual([3, 1]);
   });
 
-  test("a file the version does not have is still a 404 while the version's permission is fresh", async () => {
-    const shown = fileOf("permission-fresh");
-    setSystemTime(T0);
-    expect((await shown.view()).kind).toBe("ok");
-    const target = { name: "permission-fresh", version: "1.0.0", path: "nope.js" };
+  test("a file the version does not have is a 404", async () => {
+    const target = { name: "no-such-file", version: "1.0.0", path: "nope.js" };
     answers.set(`/${fileApiPath(target)}`, 404);
 
     expect(await fileStatus(target)).toBe("missing");
+    expect(await getFile(target)).toEqual({ kind: "missing" });
   });
 
-  test("a registry that can't confirm the version is not answered from the cache", async () => {
-    const f = fileOf("cached-registry-down");
-    setSystemTime(T0);
-    await f.view();
+  test("a registry that can't be read shows no file, however recently it was shown", async () => {
+    const f = fileOf("registry-down");
+    expect(await f.view()).toEqual(SHOWN);
     f.answer(503);
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
     expect(await f.view()).toEqual({ kind: "unavailable", reason: { kind: "status", status: 503 } });
-  });
-
-  test("the permission to serve is kept for a few seconds at most, with no stale window", () => {
-    expect(POLICIES.servable.freshMs).toBeLessThanOrEqual(5_000);
-    expect(POLICIES.servable.staleMs).toBe(0);
   });
 });
 

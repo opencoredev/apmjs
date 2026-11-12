@@ -38,17 +38,24 @@ export function routePath(pathname: string): RoutedPath {
 // Answers that belong to whoever asked: the account, sessions, staged versions, tokens, step-ups and login.
 const PER_USER_PATHS = ["/api/auth/", "/-/whoami", "/-/user/", "/-/npm/v1/", "/-/apm/v1/account", "/-/apm/v1/staged", "/-/apm/v1/verify", "/-/apm/v1/login/", "/-/apm/v1/review", "/-/apm/v1/evidence-admin"];
 
+// Answers that can carry a version's source (file text, excerpts, readmes, score evidence, review quotes). Whether a
+// version may be shown is decided on every request from the database, so no cache downstream may keep the answer.
+const SOURCE_PATHS = ["/-/apm/v1/file/", "/-/apm/v1/readme/", "/-/apm/v1/score/", "/-/apm/v1/packages/"];
+
 /**
  * Marks per-user answers `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`, so no shared
  * cache keeps one: every answer on a per-user path, and any other /-/ answer to a request that carried
- * credentials. Packuments and tarballs are the same for everyone and keep their own caching. The path is
+ * credentials, and every answer that can carry a version's source (SOURCE_PATHS). Packuments and tarballs are the
+ * same for everyone and keep their own caching. The path is
  * classified as the router dispatches it, so /~safe/-/whoami is as private as /-/whoami.
  */
 export function withPrivacyHeaders(req: Request, res: Response): Response {
   const { path } = routePath(new URL(req.url).pathname);
   const credentialed = req.headers.has("authorization") || req.headers.has("cookie");
 
-  if (!PER_USER_PATHS.some((p) => path.startsWith(p)) && !(credentialed && path.startsWith("/-/"))) return res;
+  const sourceBearing = SOURCE_PATHS.some((p) => path.startsWith(p));
+
+  if (!sourceBearing && !PER_USER_PATHS.some((p) => path.startsWith(p)) && !(credentialed && path.startsWith("/-/"))) return res;
   // some answers (redirects, fetched responses) have immutable headers, so the answer is rebuilt around a copy
   const headers = new Headers(res.headers);
 

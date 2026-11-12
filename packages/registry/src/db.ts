@@ -55,6 +55,8 @@ const PackageRow = z.object({
   description: z.string(),
   keywords: z.array(z.string()),
   readme: z.string(),
+  /** The version whose publish wrote `readme`; null on rows written before migration 0008 (owner unknown). */
+  readme_version: z.string().nullable(),
 });
 
 const VersionRow = z.object({
@@ -291,7 +293,7 @@ export type StoreApi = {
   readonly createPackage: (name: string, at: number, owner: string) => Effect.Effect<boolean, StoreError>;
   readonly updatePackageMeta: (
     name: string,
-    meta: { modifiedAt: number; description?: string; keywords?: string[]; readme?: string },
+    meta: { modifiedAt: number; description?: string; keywords?: string[]; readme?: { text: string; version: string } },
   ) => Effect.Effect<void, StoreError>;
   readonly setDistTags: (name: string, tags: Record<string, string>, at: number) => Effect.Effect<void, StoreError>;
   readonly owners: (name: string) => Effect.Effect<string[], StoreError>;
@@ -642,7 +644,8 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         sql`UPDATE packages SET modified_at = ${meta.modifiedAt},
               description = COALESCE(${meta.description ?? null}, description),
               keywords = COALESCE(${meta.keywords === undefined ? null : JSON.stringify(meta.keywords)}::jsonb, keywords),
-              readme = COALESCE(${meta.readme ?? null}, readme)
+              readme = COALESCE(${meta.readme?.text ?? null}, readme),
+              readme_version = COALESCE(${meta.readme?.version ?? null}, readme_version)
             WHERE name = ${name}`,
         none,
       ),
