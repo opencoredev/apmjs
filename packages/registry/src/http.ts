@@ -78,11 +78,11 @@ export function withPrivacyHeaders(req: Request, res: Response): Response {
 // The read answers the website's package page makes; each says where its time went (timing.ts).
 const TIMED_PATHS = ["/-/apm/v1/packages/", "/-/apm/v1/score/", "/-/apm/v1/review/", "/-/apm/v1/readme/", "/-/apm/v1/file/"];
 
-/** Adds `Server-Timing` to a GET or HEAD of a TIMED_PATHS answer; any other answer is returned as it is. */
-export function withServerTiming(req: Request, res: Response, value: string): Response {
+/** Adds `Server-Timing` to a GET or HEAD of a TIMED_PATHS answer; any other answer, or a null value, is returned as it is. */
+export function withServerTiming(req: Request, res: Response, value: string | null): Response {
   const { path } = routePath(new URL(req.url).pathname);
 
-  if ((req.method !== "GET" && req.method !== "HEAD") || !TIMED_PATHS.some((p) => path.startsWith(p))) return res;
+  if (value === null || (req.method !== "GET" && req.method !== "HEAD") || !TIMED_PATHS.some((p) => path.startsWith(p))) return res;
   const headers = new Headers(res.headers);
   headers.set("server-timing", value);
 

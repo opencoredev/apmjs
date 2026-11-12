@@ -5,23 +5,23 @@
 // waits, and CPU work (parsing a packument, scoring) shows only as the gap before `total`. Optional everywhere: tests
 // and the queue consumer run without it.
 //
-// Anyone gets the coarse header: the database's time and the total, in whole milliseconds, with no counts and nothing
-// about npm or its cache (whether a package was cached tells what others asked for). The full one goes only to a
-// request whose x-apm-debug header is the operator's debug token (worker.ts, APM_DEBUG_TOKEN_HASH).
+// Only a request whose x-apm-debug header is the operator's debug token (worker.ts, APM_DEBUG_TOKEN_HASH) gets the
+// header. Anyone else gets none: even the database's time against the total shows whether npm's answer was cached,
+// which tells what others asked for.
 import { Context, Effect, Option } from "effect";
 
 export type TimingMetric = "db" | "npm" | "npm-cache" | "analysis";
 
-/** "coarse": `db` and `total` durations only. "full": every metric with its count. */
-export type TimingDetail = "coarse" | "full";
+/** "none": no header. "full": every metric with its count. */
+export type TimingDetail = "none" | "full";
 
 type Entry = { ms: number; count: number };
 
 export type TimingApi = {
   /** Adds one operation of `ms` to `metric`. */
   readonly add: (metric: TimingMetric, ms: number) => void;
-  /** The Server-Timing header value, with `total` ms for the whole answer. */
-  readonly header: (input: { total: number; detail: TimingDetail }) => string;
+  /** The Server-Timing header value, with `total` ms for the whole answer; null when none is sent. */
+  readonly header: (input: { total: number; detail: TimingDetail }) => string | null;
 };
 
 export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/Timing") {
@@ -35,8 +35,8 @@ export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/
       },
       header: ({ total, detail }) => {
         switch (detail) {
-          case "coarse":
-            return `db;dur=${Math.round(entries.get("db")?.ms ?? 0)}, total;dur=${Math.round(total)}`;
+          case "none":
+            return null;
           case "full":
             return [...[...entries].map(([metric, e]) => `${metric};dur=${e.ms.toFixed(1)};desc="${e.count}"`), `total;dur=${total.toFixed(1)}`].join(", ");
           default: {

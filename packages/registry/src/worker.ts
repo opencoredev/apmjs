@@ -87,15 +87,15 @@ const WorkerEnv = z.object({
 
 const DebugEnv = WorkerEnv.pick({ APM_DEBUG_TOKEN_HASH: true });
 
-/** "full" only when the request's x-apm-debug header hashes to APM_DEBUG_TOKEN_HASH; anyone else gets "coarse". */
+/** "full" only when the request's x-apm-debug header hashes to APM_DEBUG_TOKEN_HASH; anyone else gets "none". */
 export function timingDetail(req: Request, rawEnv: RawEnv): TimingDetail {
   const parsed = DebugEnv.safeParse(rawEnv);
   const token = req.headers.get("x-apm-debug");
 
-  if (!parsed.success || parsed.data.APM_DEBUG_TOKEN_HASH === undefined || token === null || token.trim() === "") return "coarse";
+  if (!parsed.success || parsed.data.APM_DEBUG_TOKEN_HASH === undefined || token === null || token.trim() === "") return "none";
   const expected = Buffer.from(parsed.data.APM_DEBUG_TOKEN_HASH, "hex");
 
-  return timingSafeEqual(createHash("sha256").update(token.trim()).digest(), expected) ? "full" : "coarse";
+  return timingSafeEqual(createHash("sha256").update(token.trim()).digest(), expected) ? "full" : "none";
 }
 
 /** What the Workers runtime hands the entry: the bindings and vars as declared, before they are checked. */

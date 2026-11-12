@@ -602,8 +602,9 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   // Each section below waits only for its own answer inside a Suspense boundary, so the header, the install box and
   // the score render without waiting for the slowest call.
-  // a version the package answer reports revoked or revoke-pending is shown only from a redacted answer
-  const shown = version ? shownOf(pkg.versions, version) : null;
+  // a version the package answer reports revoked or revoke-pending, or does not list, is shown only from a redacted
+  // answer or a fresh read of that version
+  const shown = version ? shownOf(pkg.versions, version, isLatest && pkg.score?.redacted === true) : null;
   const review = shown ? reads.review(shown) : Promise.resolve<Fetched<ReviewAnswer>>(none);
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
   const tarballReadme = version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null);

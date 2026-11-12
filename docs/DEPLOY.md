@@ -20,7 +20,7 @@ The deploy reads its secrets from `~/.config/apmjs` (set `APM_SECRETS_DIR` to us
 | `neon-url` | The Neon connection string (the direct endpoint, not `-pooler`). The role needs `CREATEDB` for the staging database. |
 | `github-oauth.env` | `APM_GITHUB_CLIENT_ID=...` and `APM_GITHUB_CLIENT_SECRET=...` |
 | `review-token-<stage>` | Optional. The AI reviewer's service token for that stage; when the file exists the deploy turns the AI review on and sends only its sha256 (`APM_REVIEW_TOKEN_HASH`). The reviewer process gets the same token. See `docs/AI-REVIEW.md`. |
-| `debug-token-<stage>` | Optional. A token for reading the registry's full `Server-Timing` (every metric with its count): send it as the `x-apm-debug` header. The deploy sends only its sha256 (`APM_DEBUG_TOKEN_HASH`); without the file every caller gets the coarse header. |
+| `debug-token-<stage>` | Optional. A token for reading the registry's full `Server-Timing` (every metric with its count): send it as the `x-apm-debug` header. The deploy sends only its sha256 (`APM_DEBUG_TOKEN_HASH`); without the file no caller gets the header. |
 | `review.env` | Optional. `APM_ADMINS=login,login`: GitHub logins that may confirm or dismiss flagged reviews. |
 | `auth-secret-<stage>` | Made by the first deploy of a stage. It signs sessions and encrypts TOTP secrets: changing it signs everyone out and breaks every authenticator app set up so far. Back it up. |
 

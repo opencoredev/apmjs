@@ -275,7 +275,7 @@ describe("a revoke between the page's early reads and its package answer", () =>
       if (found.kind !== "ok") throw new Error(`package answer: ${found.kind}`);
       const shown = shownOf(found.value.versions, "1.0.0");
 
-      expect(shown).toEqual({ version: "1.0.0", withheld: true });
+      expect(shown).toEqual({ version: "1.0.0", status: "withheld" });
       const [review, score] = await Promise.all([reads.review(shown), reads.score(shown)]);
 
       expect(review.kind === "ok" && review.value.redacted).toBe(true);

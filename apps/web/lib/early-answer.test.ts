@@ -7,8 +7,8 @@ type Answer = { version: string; status: string; redacted: boolean };
 
 const ok = (version: string): Fetched<Answer> => ({ kind: "ok", value: { version, status: "reviewed", redacted: false } });
 const redacted = (version: string): Fetched<Answer> => ({ kind: "ok", value: { version, status: "reviewed", redacted: true } });
-const active = (version: string): Shown => ({ version, withheld: false });
-const withheld = (version: string): Shown => ({ version, withheld: true });
+const active = (version: string): Shown => ({ version, status: "active" });
+const withheld = (version: string): Shown => ({ version, status: "withheld" });
 const missing: Fetched<Answer> = { kind: "missing" };
 const down: Fetched<Answer> = { kind: "unavailable", reason: { kind: "timeout" } };
 
@@ -85,10 +85,22 @@ describe("answerFor", () => {
 });
 
 describe("shownOf", () => {
-  test("revoked and revoke-pending are withheld; active and yanked are not; a version not listed is not", () => {
+  test("revoked and revoke-pending are withheld; active and yanked are active; a version not listed is unknown", () => {
     const versions = ["active", "yanked", "revoke-pending", "revoked"].map((status, i) => ({ version: `1.0.${i}`, status }));
 
-    expect(["1.0.0", "1.0.1", "1.0.2", "1.0.3", "9.9.9"].map((v) => shownOf(versions, v).withheld)).toEqual([false, false, true, true, false]);
+    expect(["1.0.0", "1.0.1", "1.0.2", "1.0.3", "9.9.9"].map((v) => shownOf(versions, v).status)).toEqual(["active", "active", "withheld", "withheld", "unknown"]);
+  });
+
+  test("the package answer's own redacted score makes the version withheld, listed or not", () => {
+    expect(shownOf([{ version: "1.0.0", status: "active" }], "1.0.0", true).status).toBe("withheld");
+    expect(shownOf([], "1.0.0", true).status).toBe("withheld");
+  });
+
+  test("an unredacted early answer about a version the list does not include is read again", async () => {
+    const r = reader(redacted("1.0.0"));
+
+    expect(await answerFor({ early: Promise.resolve(ok("1.0.0")), asked: "latest", shown: shownOf([], "1.0.0"), read: r.read("1.0.0") })).toEqual(redacted("1.0.0"));
+    expect(r.calls).toEqual(["1.0.0"]);
   });
 });
 

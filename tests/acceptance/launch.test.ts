@@ -655,13 +655,13 @@ describe("the registry marks per-user answers private, no-store", () => {
     return res.headers.get("server-timing") ?? "";
   };
 
-  test("the package page's reads send anyone only the database's time and the total; account answers send none", async () => {
+  test("without the debug token the package page's reads send no timing at all, nor do account answers", async () => {
     for (const [method, path] of TIMED) {
-      // no query count, no npm or cache metric, whole milliseconds: a wrong debug token, a signed-in token or none
+      // even db against total would show whether npm's answer was cached: a wrong debug token, a signed-in token or none
       const callers: Record<string, string>[] = [{}, { "x-apm-debug": "not-the-token" }, { "x-apm-debug": "" }, { authorization: "Bearer npm_not_a_debug_token" }];
 
       for (const headers of callers) {
-        expect(await timingOf(method, path, headers), `${method} ${path} ${JSON.stringify(headers)}`).toMatch(/^db;dur=\d+, total;dur=\d+$/);
+        expect(await timingOf(method, path, headers), `${method} ${path} ${JSON.stringify(headers)}`).toBe("");
       }
     }
 
