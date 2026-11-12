@@ -1,10 +1,12 @@
 // Scores the AI review evaluation's 40 malicious samples, the 70-package corpus and any extra tarballs with one copy
 // of packages/core, and writes every score and signal to a JSON file. Bytes only: nothing is installed or run.
+// The `held-out` set is every other malicious candidate fetch-malicious.ts downloaded and the index did not pick:
+// known-malicious samples the scorer's rules were not developed against, reported apart from the 40.
 // Usage, from the repo root:
 //   bun tools/score-eval/eval.ts <core src dir> <out.json> [extra .tgz ...]
 // Compare two scorers by running it on a checkout of each (`git worktree add /tmp/apm-v9 origin/main`) and then
 //   bun tools/score-eval/compare.ts <before.json> <after.json>
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
@@ -41,11 +43,22 @@ function run(set: string, id: string, s: SampleFiles): void {
 }
 
 const samples = join(homedir(), ".cache", "apm-ai-review-samples", "malicious", "index.json");
+const picked = MalIndex.parse(JSON.parse(readFileSync(samples, "utf8")));
 
-for (const m of MalIndex.parse(JSON.parse(readFileSync(samples, "utf8")))) {
+for (const m of picked) {
   const s = loadDir(m.root);
 
   if (s) run("malicious", m.id, s);
+}
+
+const candidates = join(homedir(), ".cache", "apm-ai-review-samples", "malicious", "candidates.json");
+const pickedIds = new Set(picked.map((m) => m.id));
+
+for (const m of existsSync(candidates) ? MalIndex.parse(JSON.parse(readFileSync(candidates, "utf8"))) : []) {
+  if (pickedIds.has(m.id)) continue;
+  const s = loadDir(m.root);
+
+  if (s) run("held-out", m.id, s);
 }
 
 const corpus = join(homedir(), ".cache", "apm-corpus", "tgz");

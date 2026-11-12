@@ -10,7 +10,7 @@ Since `apm-score-v10`, the [score](/concepts/score) counts what looks like malwa
 | Capability | What apm looks for |
 | --- | --- |
 | `network` | `fetch`, `http`/`https` requests, sockets, DNS, HTTP client libraries, `WebSocket` |
-| `env` | `process.env.X`, `process.env['X']`, `const { X } = process.env`, `Bun.env`, `Deno.env.get`, reads by a computed name, and reads of the whole environment |
+| `env` | `process.env.X`, `process.env['X']`, `const { X } = process.env`, `Bun.env`, `Deno.env.get`, reads by a computed name, reads through an alias (`const e = process.env`) or `globalThis.process.env`, and uses of the whole environment (`{ ...process.env }`, `JSON.stringify(Bun.env)`, `Deno.env.toObject()`) |
 | `filesystem` | loading `fs`, `fs/promises`, `fs-extra` or `graceful-fs`, `Bun.file`, `Deno` file calls |
 | `shell` | `child_process` and its calls, `Bun.spawn`, `Bun.$`, `Deno.Command`, shell text in commands |
 | `eval` | `eval`, `Function`, `vm`, string timers, a `Worker` run from a string |
@@ -19,7 +19,7 @@ Since `apm-score-v10`, the [score](/concepts/score) counts what looks like malwa
 
 Each one lists the lines that show it, linked to the file. When every line is only text, such as a variable name in help output or `curl` in a comment, the capability says "Text mention only". For `env`, the variable names it reads are listed too.
 
-The version page shows capabilities in their own section, under the score. `apm score`, `apm add` and `apm publish` print them under the score.
+The version page shows capabilities in their own section, under the score. `apm score`, `apm add` and `apm publish` print them under the score, with what the declaration says for each and the variables read outside it.
 
 ## Declaring capabilities
 
@@ -52,7 +52,7 @@ apm compares the declaration with the code:
 
 For `env`, the list is variable names, where `*` stands for any run of characters. Variables the code reads outside the list are shown under the capability; they are not scored. Network hosts are shown as declared and not checked against the URLs in the code, because most URLs in code are documentation links.
 
-A declaration never cancels a risk signal. An install-time download, a credential file read or a request bin costs the same whether or not the package declares the network.
+A declaration never cancels a risk signal. An install-time download, a credential file read, a request bin, or the environment sent in a request costs the same whether or not the package declares the network and `env`.
 
 A package without a declaration, which is most of npm, is scored on risk signals alone. An `apm` field without `capabilities`, or one apm cannot read, counts as no declaration, so a typo cannot cost points; the version page says when apm could not read it.
 

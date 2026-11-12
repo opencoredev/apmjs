@@ -21,12 +21,24 @@ Popularity and download counts are never inputs.
 
 ## What it reads, in order
 
-1. **Install scripts.** `preinstall`, `install` and `postinstall` run on every install; `prepare`, `prepack` and `postpack` run when someone installs from git. apm follows each script the way the package managers do, into `npm run x`, `sh -c '...'`, base64 handed to `node -e`, and the files those commands name.
+1. **Install scripts.** `preinstall`, `install` and `postinstall` run on every install; `prepare`, `prepack` and `postpack` run when someone installs from git. Both run on the installing machine, so the files they run count as install time. apm follows each script the way the package managers do, into `npm run x`, `sh -c '...'`, base64 handed to `node -e`, and the files those commands name.
 2. **`binding.gyp`**, and a `Makefile` or `CMakeLists.txt` when an install script builds with it.
 3. **Entry points**: `bin`, `main`, `module`, `browser`, `exports` and `imports`, then every file they load by a path apm can work out.
 4. **Every other file that could be code**, whatever its extension. A file called `lib/payload.dat` is read too.
 
 Every file is read whole, as text, including comments, regular expressions and TypeScript types, because code can read that text back and run it. JavaScript and TypeScript are also parsed, and the parse can only add findings.
+
+## Where values go
+
+In JavaScript and TypeScript, apm follows values to the calls that use them. It knows where a value came from: the whole environment, a credential file's path or contents, a network response, or the program's own source. It follows that value through variables, aliases, callbacks, function calls and returns, string building, and into other files of the package that import it. The calls it watches are the ones that run code (`eval` under any name, `Function`, `vm`, a `Worker` from a string), start a process, send a request or read a file.
+
+That is what makes the heaviest signals sure:
+
+- the environment, a credential file's contents or three kinds of tokens reaching a request is `exfiltration`, enough to refuse on its own;
+- a download reaching an evaluator, or reaching a process as the whole command (`exec(body)`), is `remote-shell`, also enough to refuse on its own;
+- a credential path reaching a file read is `credential-read`.
+
+Code a file keeps as text is read as a program too: a string it runs, a comment or regex it turns back into code with `String(fn)` or `.source` and runs, or a string that holds a program. What that code does counts where the file holds it, so code an install script runs still counts as install time.
 
 Images, fonts, archives and WebAssembly are recognised by their bytes and skipped. Executables and native `.node` modules are listed as `binary`. A file over 32 MB, or code past the 200 MB total, is not read and marks the analysis `incomplete`, which on its own puts the version below the floor.
 
@@ -40,14 +52,14 @@ Each file is read three times: as written; with split strings joined (`'chi' + '
 | --- | ---: | --- |
 | `revoked` | -100 | Pulled as malicious. |
 | `incomplete` | -61 | Code that runs could not be read. |
-| `remote-shell` | -50 | A command the code runs that opens a shell to another machine, or downloads a program and runs it (`/dev/tcp/`, `nc -e`, `curl … \| sh`), or code run straight from a network response. |
+| `remote-shell` | -61 | A command the code runs that opens a shell to another machine, or downloads a program and runs it (`/dev/tcp/`, `nc -e`, `curl … \| sh`), or a download apm follows into an evaluator or a process. -50 when an evaluator only sits next to a network call. |
 | `capture-endpoint` | -50 | A request bin, out-of-band host, or chat webhook with its secret in the URL (`webhook.site`, Burp Collaborator, `pipedream.net`, a Discord webhook). |
 | `install-download` | -40 | An install command that downloads (`curl`, `wget`), pipes into a shell, or runs `npx` for a package that is not a dependency. |
-| `exfiltration` | -35 | The whole environment, a credential file or tokens of three services, with a network call beside them; at install, also the machine's name or user. |
-| `credential-read` | -30 | A credential file read: `.npmrc`, SSH keys, cloud credentials, browser profiles, wallets. |
+| `exfiltration` | -61 | The whole environment, a credential file's contents or tokens of three services that apm follows into a request. -35 when they only sit beside a network call; at install, also the machine's name or user. |
+| `credential-read` | -30 | A credential file read: a path to `.npmrc`, SSH keys, cloud credentials, browser profiles or wallets that reaches a file read. |
 | `risky-dependency` | -30 | A dependency whose resolved version scores below the floor. |
-| `install-network` | -25 | Code that runs at install uses the network. |
-| `runs-decoded-code` | -25 | Code run from a string that was decoded or joined, or a network call kept inside a string the code runs. |
+| `install-network` | -25 | Code that runs at install, or from `prepare`, `prepack` or `postpack`, uses the network. |
+| `runs-decoded-code` | -25 | Code run from a string that was decoded or joined, a network call kept inside a string the code runs, or code the program hid in its own comments or regexes and runs. |
 | `obfuscated` | -20 | Obfuscator output, escapes or base64 that decode to text, or a dangerous name hidden by joining or decoding. |
 | `typosquat` | -20 | A name one edit from a popular package, or the same name with different separators or a `.js` suffix. |
 | `unanalyzed-files` | -20 | Files nothing was seen loading were left out because the byte budget ran out. |
@@ -59,7 +71,7 @@ Each file is read three times: as written; with split strings joined (`'chi' + '
 | `new-publisher` | -10 | An account that never published this package before. |
 | `yanked` | -10 | Hidden by its maintainer. |
 | `new-dependency`, `deprecated` | -5 | Dependencies the previous version did not have; deprecated by its maintainer. |
-| `credential-mention` | -3 | Text that names a credential file or token, with no read: a deny list, help text. |
+| `credential-mention` | -3 | Text that names a credential file or token, with no read: a deny list, help text. -10 when the name sits next to a file read that apm did not see it reach. |
 | `encoded-data` | -2 | Long base64 or escape runs that decode to data, such as WebAssembly. |
 | `dynamic-require`, `recent`, `no-license` | 0 | Shown, not scored. |
 
@@ -85,7 +97,7 @@ Every score carries this list as "not checked":
 - **Runtime behaviour.** Code that downloads, decrypts or assembles a second stage while running. A loader that runs what it fetched scores low, but the score cannot say what the second stage does.
 - **Where data goes.** A request to an API and one to an attacker look the same, so code that only uses the network costs nothing outside install time. It is listed under [capabilities](/concepts/capabilities), and the [AI review](/concepts/ai-review) reads it.
 - **Other encodings.** XOR, compression, a custom alphabet, or base64 inside base64.
-- **Names built some other way**: array lookups, computed indexes, values read from a file at runtime, or values passed through a function.
+- **Names and values built some other way**: array lookups, computed indexes, values read from a file at runtime, and strings built by an obfuscator's lookup tables. apm follows values through functions in the same file and through other files' exports, but treats every call of one function alike.
 - **Files only a computed path loads.** Docs, JSON and style files are read only when code reaches them by a path apm can work out. `require(name)` pointing elsewhere shows up as `dynamic-require`.
 - **Native code and WebAssembly.** Listed, never read.
 - **A popular name under another scope**, such as `@someone/react`. Scopes exist so names can be reused.
