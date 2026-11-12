@@ -84,8 +84,15 @@ export function notReadText(n: Extract<NotRead, { kind: "file" }>): string {
 /** The one-line result. */
 export function headline(r: PublicReview): string {
   switch (r.state) {
-    case "found-nothing":
+    case "found-nothing": {
+      // A partial read must not sound like full coverage: say what was read, and that it was partial.
+      const partial = r.coverage.filesRead < r.coverage.filesInScope;
+
+      if (partial) return `Partial AI review: no findings in the ${r.coverage.filesRead} of ${r.coverage.filesInScope} files it read`;
+
       return r.coverage.mode === "diff" && r.coverage.previousVersion !== null ? `AI review found nothing in the change from ${r.coverage.previousVersion}` : "AI review found nothing in this version's files";
+    }
+
     case "under-review":
       return "Under review";
     case "no-answer":

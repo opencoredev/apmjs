@@ -32,3 +32,19 @@ describe("header notice for the AI review", () => {
     for (const state of PUBLIC_STATES) expect(() => headerNotice(review(state))).not.toThrow();
   });
 });
+
+describe("headline for a partial AI review", () => {
+  test("a review that read only some files says so", async () => {
+    const { headline } = await import("./review-schema");
+    const r: PublicReview = { state: "found-nothing", model: "m", reviewedAt: "2026-11-12T00:00:00Z", coverage: { mode: "diff", previousVersion: "8.3.7", filesInScope: 3, filesRead: 1 }, read: [], notRead: [], findings: [], decidedAt: null, note: null };
+
+    expect(headline(r)).toBe("Partial AI review: no findings in the 1 of 3 files it read");
+  });
+
+  test("a full read keeps the plain headline", async () => {
+    const { headline } = await import("./review-schema");
+    const r: PublicReview = { state: "found-nothing", model: "m", reviewedAt: "2026-11-12T00:00:00Z", coverage: { mode: "diff", previousVersion: "4.6.6", filesInScope: 4, filesRead: 4 }, read: [], notRead: [], findings: [], decidedAt: null, note: null };
+
+    expect(headline(r)).toBe("AI review found nothing in the change from 4.6.6");
+  });
+});
