@@ -11,6 +11,7 @@ import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
+import { capabilityLines } from "./capabilities.ts";
 import { bunKeyNames, findLockfile, isLockPm, lockedEntry, type LockNode, type LockPm } from "./lockfile.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
 import { bunInstallDir, removeInstalled, restore, snapshot, verifyTree } from "./verify.ts";
@@ -106,25 +107,9 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
   printCapabilities(report.capabilities);
 }
 
-/** How a capability compares with the package's declaration, and what its evidence rests on, in a few words. */
-function capabilityNote(c: Capability): string {
-  const status = c.status === "declared" ? green("declared") : c.status === "undeclared" ? yellow("not in its declaration") : c.status === "unused" ? dim("declared, not seen used") : "";
-  const basis = c.basis === "text" ? dim("text mention") : c.basis === "possible" ? dim("possible") : "";
-
-  return [status, basis].filter((x) => x !== "").join(", ");
-}
-
-/** What the package can do: one line each, with its first evidence. Never scored on its own. */
+/** What the package can do, with its declaration and the variables read outside it. Never scored on its own. */
 function printCapabilities(list: readonly Capability[]): void {
-  if (list.length === 0) return;
-  say(`  ${bold("capabilities")} ${dim("(what it can do; not scored)")}`);
-
-  for (const c of list) {
-    const note = capabilityNote(c);
-    say(`    ${c.id.padEnd(11)} ${dim(c.label.replace(/^[^:]+: /, ""))}${note ? `  ${note}` : ""}`);
-
-    if (c.evidence[0]) say(`        ${dim(c.evidence[0])}`);
-  }
+  for (const line of capabilityLines(list, { bold, dim, green, yellow })) say(line);
 }
 
 // ---------- shared ----------
