@@ -2,11 +2,15 @@ import { notFound } from "next/navigation";
 import { Suspense } from "react";
 import { ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
-import { getEvents, getPackage, type Facts, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getEvents, getPackage, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { RegistryUnavailable, packagePath } from "@/components/registry-unavailable";
 import { ScoreBadge, StatusBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
 import { ago } from "@/lib/format";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+
+// The page shows this much of a readme; the rest is one click away at /api/readme.
+const README_PREVIEW_CHARS = 20_000;
 
 function size(n: number): string {
   return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1048576).toFixed(1)} MB`;
@@ -196,10 +200,15 @@ function SectionTitle({ id, children, aside }: { id: string; children: React.Rea
 async function PackageContent({ params }: { params: Promise<{ name: string[] }> }) {
   const parts = (await params).name.map(decodeURIComponent);
   const name = parts.join("/");
-  const pkg = await getPackage(name);
+  const found = await getPackage(name);
 
-  if (!pkg) notFound();
-  const events = pkg.source === "local" ? await getEvents(name) : [];
+  // proxy.ts already answered 404 or 503 before the shell went out; this covers a registry that
+  // fails between that check and this read.
+  if (found.kind === "missing") notFound();
+
+  if (found.kind === "unavailable") return <RegistryUnavailable what={`the package ${name}`} retryHref={packagePath(name)} />;
+  const pkg = found.value;
+  const events: Fetched<PackageEvent[]> = pkg.source === "local" ? await getEvents(name) : { kind: "ok", value: [] };
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
 
@@ -283,7 +292,15 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
                   </span>
                   <ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden />
                 </summary>
-                <pre className="overflow-x-auto border-t bg-surface p-4 font-mono text-[13px] leading-relaxed whitespace-pre-wrap">{pkg.readme.slice(0, 20_000)}</pre>
+                <pre className="overflow-x-auto border-t bg-surface p-4 font-mono text-[13px] leading-relaxed whitespace-pre-wrap">{pkg.readme.slice(0, README_PREVIEW_CHARS)}</pre>
+                {pkg.readme.length > README_PREVIEW_CHARS && (
+                  <p className="border-t px-4 py-3 text-sm text-muted-foreground">
+                    Showing the first {Math.round(README_PREVIEW_CHARS / 1000)} kB.{" "}
+                    <a href={`/api/readme?name=${encodeURIComponent(pkg.name)}`} className="text-foreground underline underline-offset-4">
+                      Open the full readme
+                    </a>
+                  </p>
+                )}
               </details>
             </section>
           )}
@@ -296,11 +313,17 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
               <FactsPanel facts={pkg.facts} maintainers={pkg.maintainers} lastPublish={latest?.publishedAt ?? null} />
             </div>
           </section>
-          {events.length > 0 && (
+          {events.kind === "unavailable" && (
+            <section aria-labelledby="log">
+              <SectionTitle id="log">Public log</SectionTitle>
+              <p className="text-[15px] text-muted-foreground">Couldn&apos;t load the public log. The registry did not answer; reload to try again.</p>
+            </section>
+          )}
+          {events.kind === "ok" && events.value.length > 0 && (
             <section aria-labelledby="log">
               <SectionTitle id="log">Public log</SectionTitle>
               <ol className="relative flex flex-col gap-5 border-l pl-5">
-                {events.slice(0, 15).map((e, i) => (
+                {events.value.slice(0, 15).map((e, i) => (
                   <li key={`${e.at}-${i}`} className="relative text-[15px] leading-6">
                     <span className="absolute top-2 -left-[25px] size-2 rounded-full bg-faint ring-4 ring-background" aria-hidden />
                     <span className="font-mono text-[13px] text-muted-foreground">{e.actor}</span> {describe(e)}

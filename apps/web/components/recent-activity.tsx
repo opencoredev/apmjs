@@ -1,5 +1,6 @@
 // What happened on this registry lately: publishes with their score, yanks and revokes with the reason.
 import Link from "next/link";
+import { connection } from "next/server";
 import { ArrowUpFromLineIcon, BanIcon, RotateCcwIcon, Undo2Icon } from "lucide-react";
 import { getRecent, type RecentEvent } from "@/lib/registry";
 import { ago } from "@/lib/format";
@@ -44,7 +45,9 @@ function Row({ e, now }: { e: RecentEvent; now: number }) {
 }
 
 export async function RecentActivity() {
-  const events = await getRecent(8);
+  // Request time only: a build-time prerender would abort this fetch and log a false outage.
+  await connection();
+  const recent = await getRecent(8);
   const now = Date.now();
 
   return (
@@ -52,11 +55,19 @@ export async function RecentActivity() {
       <h2 id="recent" className="mb-2 text-[15px] font-medium">
         Recently on this registry
       </h2>
-      {events.length === 0 ? (
+      {recent.kind !== "ok" ? (
+        <p role="status" className="border-t py-5 text-sm text-muted-foreground">
+          Couldn&apos;t load recent activity. The registry did not answer;{" "}
+          <a href="/" className="text-foreground underline underline-offset-4">
+            reload
+          </a>{" "}
+          to try again. Search above may still work for npm packages.
+        </p>
+      ) : recent.value.length === 0 ? (
         <p className="border-t py-5 text-sm text-muted-foreground">Nothing published here yet. Search above covers npm too.</p>
       ) : (
         <ul className="border-t">
-          {events.map((e) => (
+          {recent.value.map((e) => (
             <Row key={`${e.package}@${e.version}:${e.kind}:${e.at}`} e={e} now={now} />
           ))}
         </ul>

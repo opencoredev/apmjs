@@ -5,6 +5,7 @@
 import { createAuthClient } from "better-auth/react";
 import { passkeyClient } from "@better-auth/passkey/client";
 import { z } from "zod";
+import "./zod-csp";
 
 function makeClient() {
   return createAuthClient({ baseURL: window.location.origin, plugins: [passkeyClient()] });

@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { CopyIcon, CheckIcon } from "lucide-react";
 import { z } from "zod";
+import "@/lib/zod-csp";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const CLIENTS = ["apm", "bun", "npm", "pnpm"] as const;

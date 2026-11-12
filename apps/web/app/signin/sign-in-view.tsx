@@ -2,11 +2,7 @@
 
 import { useSearchParams } from "next/navigation";
 import { SignInPanel } from "@/components/sign-in-panel";
-
-/** Only same-site paths are allowed as the place to come back to. */
-export function safeNext(raw: string | null): string {
-  return raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/account";
-}
+import { safeNext } from "@/lib/safe-next";
 
 export function SignInView() {
   const params = useSearchParams();

@@ -1,6 +1,7 @@
 // Shapes the web app's own /api routes return. The route handlers build them from registry
 // answers on the server; the browser parses them again with the same schemas.
 import { z } from "zod";
+import "./zod-csp";
 
 const Score = z.object({ score: z.number(), grade: z.string() });
 
