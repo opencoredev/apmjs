@@ -210,3 +210,43 @@ describe("P2: a decoder that hits its limit makes the analysis incomplete", () =
     expect(a.signals.some((s) => s.id === "dynamic-require")).toBe(true);
   });
 });
+
+describe("flow reading has a work budget of its own", () => {
+  /**
+   * Helpers imported from other files, each level passing every helper's result to the next: labels multiply with
+   * every level. Eight helpers four levels deep took 59 million steps and 8.6 s before the budget; one more level is
+   * minutes.
+   */
+  function imported(helpers: number, levels: number): string {
+    const vars = Array.from({ length: helpers }, (_, i) => `v${i}`);
+    const lines = ["import {spawn} from 'node:child_process';", ...vars.map((_, i) => `import {m${i}} from './m${i}.js';`)];
+
+    lines.push(`const s0=(${vars.join(",")})=>({${vars.map((v, i) => `${v}:m${i}(${v})`).join(",")}});`);
+
+    for (let i = 1; i < levels; i++) {
+      const renamed = vars.map((v) => `${v}:w${v}`).join(",");
+      const passed = vars.map((v, j) => `m${j}(${v},${vars[(j + 1) % helpers] ?? v})`).join(",");
+
+      lines.push(`const s${i}=(${vars.join(",")})=>{const {${renamed}}=s${i - 1}(${passed});return s${i - 1}(${vars.map((v) => `w${v}`).join(",")})};`);
+    }
+
+    lines.push(`export const run=(a)=>spawn(s${levels - 1}(${vars.map(() => "a").join(",")}));`);
+
+    return lines.join("\n");
+  }
+
+  test("a 1 KB file that multiplies labels stops at the budget, and the analysis is incomplete", async () => {
+    const index = imported(8, 5);
+    const files = Object.fromEntries([["index.js", index], ...Array.from({ length: 8 }, (_, i) => [`m${i}.js`, `export const m${i}=(a,b)=>[a,b];`])]);
+
+    expect(index.length).toBeLessThan(2_000);
+    const { results } = await runBounded([{ files }], 60_000);
+    const r = results[0];
+    const incomplete = r?.signals.find((s) => s.id === "incomplete");
+
+    expect(incomplete?.evidence.join("\n") ?? "").toContain("stopped following where values go at its work budget");
+    expect(r?.score ?? 100).toBeLessThan(SCORE_FLOOR);
+    expect(r?.ms ?? Infinity).toBeLessThan(20_000);
+  }, 90_000);
+});
+

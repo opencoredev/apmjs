@@ -164,6 +164,18 @@ const NODE_LIKE = /^(?:.*[/\\])?(?:node|nodejs|bun|deno|tsx|ts-node)(?:\.exe)?$/
 const PARAM = /^param:(\d+):(\d+)((?:\|[^|]*)*)$/;
 const PARAMISH = /^(?:read:)*param:/;
 
+/**
+ * Work one program's flow reading may do, counted in labels handled: a taint asked, and each label a member read or a
+ * call's substitution goes through. Calls of imported helpers that pass each other's results can multiply labels with
+ * every level, so a 1 KB file could take minutes without it. The most any file in the 70-package corpus takes is
+ * 5.7 million (execa's lib/methods/main-async.js, 1.3 s); past this budget apm stops following values in the file,
+ * and the analysis is incomplete (js.ts).
+ */
+export const MAX_FLOW_WORK = 16_000_000;
+
+/** Thrown when a program's flow reading spends MAX_FLOW_WORK. */
+export class FlowExhausted extends Error {}
+
 /** How many members one parameter label records before it stops adding them. */
 const MAX_PARAM_PATH = 4;
 
@@ -258,6 +270,8 @@ type RunTarget = { path: PathRef; kind: "js" | "program" };
 /** Reads where values go in one program. Built once per program, after the reader has visited it. */
 export class Flow {
   private readonly memo = new Map<AnyNode, Labels>();
+  /** Work done so far, against MAX_FLOW_WORK. */
+  private work = 0;
   private readonly bindingMemo = new Map<Binding, Labels>();
   private readonly returnMemo = new Map<AnyNode, Labels>();
   private readonly assigns = new Map<Binding, AnyNode[]>();
@@ -288,6 +302,13 @@ export class Flow {
   constructor(private readonly host: FlowHost) {
     for (const site of host.calls) this.siteOf.set(site.node, site);
     this.index();
+  }
+
+  /** Charges `n` units of work; past the budget the reading stops. */
+  private spend(n: number): void {
+    this.work += n;
+
+    if (this.work > MAX_FLOW_WORK) throw new FlowExhausted();
   }
 
   read(): FlowRead {
@@ -671,6 +692,7 @@ export class Flow {
     const cached = this.memo.get(node);
 
     if (cached) return cached;
+    this.spend(1);
 
     if (this.depth > MAX_DEPTH) {
       this.host.limit();
@@ -944,6 +966,7 @@ export class Flow {
    * path or text; an element taken by index or in a loop is. The rest stays with the value (`res.data`).
    */
   private memberOf(base: Labels, name: string | null, key: Labels): Set<Label> {
+    this.spend(1 + base.size);
     const named = name !== null && !/^\d+$/.test(name);
     // a named entry of what a credential file holds (`rc['//registry.npmjs.org/:_authToken']`) is one token, sent the
     // way a CLI sends its own: the file's whole contents, or a line of it taken by index, stay `cred`
@@ -1074,6 +1097,8 @@ export class Flow {
 
   /** `labels` with every parameter label resolved by `param` (null keeps it): the members on it taken in turn. */
   private substitute(labels: Labels, param: (fn: number, index: number) => Labels | null): Labels {
+    this.spend(1 + labels.size);
+
     if (![...labels].some((l) => PARAMISH.test(l))) return labels;
     const out = new Set<Label>();
 

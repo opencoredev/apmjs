@@ -7,7 +7,7 @@
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
 import { MAX_DECODER_STEPS, runDecoder, type Known } from "./decode.ts";
-import { Flow, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
+import { Flow, FlowExhausted, MAX_FLOW_WORK, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
 import {
@@ -1177,11 +1177,11 @@ class Reader {
       // text the program writes to a file and then loads runs as code
       for (const w of this.flow.ranWritten) this.hold(w.at, w.code, "run");
     } catch (e) {
-      // a value chain deep enough to exhaust the stack is not followed: the text rules still read the file, and the
-      // analysis says it did not follow where values go here
-      if (!(e instanceof RangeError)) throw e;
+      // a value chain deep enough to exhaust the stack, or more work than the budget, is not followed: the text rules
+      // still read the file, and the analysis says it did not follow where values go here
+      if (!(e instanceof RangeError) && !(e instanceof FlowExhausted)) throw e;
       this.budget.notes.add(LIMIT_NOTES.flow);
-      this.unread.push({ at: 0, why: "values nested too deep for apm to follow where they go" });
+      this.unread.push({ at: 0, why: e instanceof FlowExhausted ? `apm stopped following where values go at its work budget (${MAX_FLOW_WORK / 1_000_000} million steps)` : "values nested too deep for apm to follow where they go" });
     }
   }
 
