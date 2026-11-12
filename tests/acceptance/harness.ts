@@ -3,6 +3,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { createHmac, randomBytes } from "node:crypto";
 
 export const ROOT = join(import.meta.dir, "..", "..");
 export const CLI = join(ROOT, "packages", "cli", "src", "main.ts");
@@ -11,26 +12,63 @@ export type Registry = {
   url: string; // always ends with "/"
   dataDir: string;
   stop: () => Promise<void>;
+  /** Test-only: a token for `user` without any login flow. "publish" goes live at once (the CI trusted-publishing path); "stage" needs approval. */
+  mintToken: (input: { user: string; scope: TokenScope }) => string;
 };
 
+export type TokenScope = "publish" | "stage";
+export type NamePolicy = "scoped" | "open";
+export type GitHubEndpoints = { authorize: string; token: string; user: string; emails: string };
+
+type StartedRegistry = { url: string; stop: () => Promise<void>; mintToken: Registry["mintToken"] };
 type RegistryModule = {
-  startRegistry: (opts: { dataDir: string; port: number; hostname?: string; now?: () => number; upstream?: string }) => Promise<{
-    url: string;
-    stop: () => Promise<void>;
-  }>;
+  startRegistry: (opts: {
+    dataDir: string;
+    port: number;
+    hostname?: string;
+    now?: () => number;
+    upstream?: string;
+    legacyAuth?: boolean;
+    namePolicy?: NamePolicy;
+    auth?: { secret: string; github?: { clientId: string; clientSecret: string; endpoints?: GitHubEndpoints } };
+  }) => Promise<StartedRegistry>;
 };
 
 function isRegistryModule(m: unknown): m is RegistryModule {
   return typeof m === "object" && m !== null && "startRegistry" in m && typeof m.startRegistry === "function";
 }
 
-export async function startRegistry(opts: { now?: () => number; upstream?: string } = {}): Promise<Registry> {
+export type StartOptions = {
+  now?: () => number;
+  upstream?: string;
+  /** npm's password adduser and password re-auth. On by default here so the older suites keep their meaning; off in production. */
+  legacyAuth?: boolean;
+  /** "open" lets bare names through (the older suites); "scoped" is production: new names live under your GitHub login. */
+  namePolicy?: NamePolicy;
+  /** A fake GitHub to sign in through. */
+  github?: FakeGitHub;
+};
+
+export async function startRegistry(opts: StartOptions = {}): Promise<Registry> {
   const mod: unknown = await import(join(ROOT, "packages", "registry", "src", "index.ts"));
   if (!isRegistryModule(mod)) throw new Error("@apm/registry must export startRegistry");
   const dataDir = mkdtempSync(join(tmpdir(), "apm-reg-"));
-  const srv = await mod.startRegistry({ dataDir, port: 0, hostname: "127.0.0.1", ...(opts.now ? { now: opts.now } : {}), ...(opts.upstream ? { upstream: opts.upstream } : {}) });
+  const srv = await mod.startRegistry({
+    dataDir,
+    port: 0,
+    hostname: "127.0.0.1",
+    ...(opts.now ? { now: opts.now } : {}),
+    ...(opts.upstream ? { upstream: opts.upstream } : {}),
+    legacyAuth: opts.legacyAuth ?? true,
+    namePolicy: opts.namePolicy ?? "open",
+    auth: {
+      secret: `test-only-secret-${randomBytes(24).toString("hex")}`,
+      ...(opts.github ? { github: { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints } } : {}),
+    },
+  });
+  if (typeof srv.mintToken !== "function") throw new Error("startRegistry must return mintToken for tests");
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
-  return { url, dataDir, stop: srv.stop };
+  return { url, dataDir, stop: srv.stop, mintToken: srv.mintToken };
 }
 
 export function hostKey(registryUrl: string): string {
@@ -180,4 +218,195 @@ export function dig(v: unknown, ...path: (string | number)[]): unknown {
     cur = Reflect.get(cur, k);
   }
   return cur;
+}
+
+// ---------- sign-in: a fake GitHub, a cookie jar, TOTP and the device login ----------
+
+export type FakeGitHub = { url: string; endpoints: GitHubEndpoints; stop: () => Promise<void> };
+
+/**
+ * A stand-in for github.com: /login/oauth/authorize signs in whoever the test names with `login=`
+ * (default "octocat") and redirects straight back; the token and /user endpoints answer for that login.
+ */
+export function startFakeGitHub(): FakeGitHub {
+  const ids = new Map<string, number>();
+  const idOf = (login: string): number => {
+    const known = ids.get(login);
+    if (known !== undefined) return known;
+    const id = 5000 + ids.size;
+    ids.set(login, id);
+    return id;
+  };
+  const loginOf = (req: Request): string => (req.headers.get("authorization") ?? "").replace(/^(Bearer|token)\s+gho_/i, "");
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(req) {
+      const u = new URL(req.url);
+      if (u.pathname === "/login/oauth/authorize") {
+        const back = new URL(u.searchParams.get("redirect_uri") ?? "");
+        back.searchParams.set("code", `code_${u.searchParams.get("login") ?? "octocat"}`);
+        back.searchParams.set("state", u.searchParams.get("state") ?? "");
+        return Response.redirect(back.toString(), 302);
+      }
+      if (u.pathname === "/login/oauth/access_token" && req.method === "POST") {
+        const form = new URLSearchParams(await req.text());
+        const code = form.get("code") ?? "";
+        if (!code.startsWith("code_")) return Response.json({ error: "bad_verification_code" });
+        return Response.json({ access_token: `gho_${code.slice(5)}`, token_type: "bearer", scope: "read:user,user:email" });
+      }
+      const login = loginOf(req);
+      if (!login) return Response.json({ message: "Requires authentication" }, { status: 401 });
+      if (u.pathname === "/user") return Response.json({ id: idOf(login), login, name: login, email: null, avatar_url: `https://avatars.example.test/${login}` });
+      if (u.pathname === "/user/emails") return Response.json([{ email: `${login.toLowerCase()}@users.example.test`, primary: true, verified: true }]);
+      return Response.json({ message: "Not Found" }, { status: 404 });
+    },
+  });
+  const url = server.url.toString().replace(/\/$/, "");
+  return {
+    url,
+    endpoints: { authorize: `${url}/login/oauth/authorize`, token: `${url}/login/oauth/access_token`, user: `${url}/user`, emails: `${url}/user/emails` },
+    stop: () => server.stop(true),
+  };
+}
+
+/** A browser: a cookie jar plus the Origin header Better Auth checks on state-changing requests. */
+export class Browser {
+  private jar = new Map<string, string>();
+  constructor(readonly reg: Registry) {}
+
+  cookie(): string {
+    return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+
+  take(res: Response): void {
+    for (const line of res.headers.getSetCookie()) {
+      const pair = line.split(";")[0] ?? "";
+      const eq = pair.indexOf("=");
+      if (eq <= 0) continue;
+      const key = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      if (value === "" || /max-age=0(;|$)/i.test(line)) this.jar.delete(key);
+      else this.jar.set(key, value);
+    }
+  }
+
+  async fetch(pathOrUrl: string, init: { method?: string; body?: unknown; redirect?: "manual" | "follow" } = {}): Promise<Response> {
+    const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${this.reg.url}${pathOrUrl.replace(/^\//, "")}`;
+    const res = await fetch(url, {
+      method: init.method ?? "GET",
+      redirect: init.redirect ?? "manual",
+      headers: {
+        origin: new URL(this.reg.url).origin,
+        cookie: this.cookie(),
+        ...(init.body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+    });
+    this.take(res);
+    return res;
+  }
+
+  async json(pathOrUrl: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: unknown }> {
+    const res = await this.fetch(pathOrUrl, init);
+    const text = await res.text();
+    let body: unknown = text;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // keep text
+    }
+    return { status: res.status, body };
+  }
+}
+
+/** Signs in with "GitHub" (the fake) the way the website's button does, and returns the signed-in browser. */
+export async function signInWithGitHub(reg: Registry, gh: FakeGitHub, login: string): Promise<Browser> {
+  const b = new Browser(reg);
+  const start = await b.json("api/auth/sign-in/social", { method: "POST", body: { provider: "github", callbackURL: "/", disableRedirect: true } });
+  const authorizeUrl = dig(start.body, "url");
+  if (start.status !== 200 || typeof authorizeUrl !== "string") throw new Error(`sign-in start failed: ${start.status} ${JSON.stringify(start.body)}`);
+  const authorize = new URL(authorizeUrl);
+  if (!authorize.toString().startsWith(gh.url)) throw new Error(`sign-in went to ${authorize.origin}, not the fake GitHub`);
+  authorize.searchParams.set("login", login);
+  const atGitHub = await fetch(authorize, { redirect: "manual" });
+  const callback = atGitHub.headers.get("location");
+  if (!callback) throw new Error("fake GitHub did not redirect back");
+  const done = await b.fetch(callback);
+  if (done.status >= 400) throw new Error(`sign-in callback failed: ${done.status} ${await done.text()}`);
+  const session = await b.json("api/auth/get-session");
+  if (session.status !== 200 || dig(session.body, "user") === undefined) throw new Error(`no session after sign-in: ${JSON.stringify(session.body)}`);
+  return b;
+}
+
+function base32Decode(text: string): Uint8Array {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = "";
+  for (const ch of text.replace(/=+$/, "").toUpperCase()) {
+    const i = alphabet.indexOf(ch);
+    if (i < 0) throw new Error(`not base32: ${ch}`);
+    bits += i.toString(2).padStart(5, "0");
+  }
+  const out: number[] = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) out.push(parseInt(bits.slice(i, i + 8), 2));
+  return new Uint8Array(out);
+}
+
+/** RFC 6238 TOTP (SHA-1, 6 digits, 30s), what an authenticator app shows for this base32 secret. */
+export function totp(secret: string, at: number = Date.now()): string {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(at / 30_000)));
+  const h = createHmac("sha1", base32Decode(secret)).update(counter).digest();
+  const offset = (h[h.length - 1] ?? 0) & 0x0f;
+  return String((h.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
+}
+
+/** A six-digit code that is not valid for this secret now (nor one step either side). */
+export function wrongTotp(secret: string): string {
+  const valid = new Set([-30_000, 0, 30_000].map((d) => totp(secret, Date.now() + d)));
+  for (let n = 0; ; n++) {
+    const c = String(n).padStart(6, "0");
+    if (!valid.has(c)) return c;
+  }
+}
+
+/** Turns on authenticator-app 2FA for the signed-in account; returns the base32 secret. */
+export async function enableTotp(b: Browser): Promise<string> {
+  const en = await b.json("api/auth/two-factor/enable", { method: "POST", body: {} });
+  const uri = dig(en.body, "totpURI");
+  if (en.status !== 200 || typeof uri !== "string") throw new Error(`2FA enable failed: ${en.status} ${JSON.stringify(en.body)}`);
+  const secret = new URL(uri).searchParams.get("secret");
+  if (!secret) throw new Error("totpURI has no secret");
+  const v = await b.json("api/auth/two-factor/verify-totp", { method: "POST", body: { code: totp(secret) } });
+  if (v.status !== 200) throw new Error(`2FA verify failed: ${v.status} ${JSON.stringify(v.body)}`);
+  return secret;
+}
+
+/** `apm login`'s device flow, with the signed-in browser approving the code. Returns the CLI token. */
+export async function deviceLogin(b: Browser): Promise<{ token: string; username: string }> {
+  const reg = b.reg;
+  const start = await getJson(`${reg.url}-/apm/v1/login/device`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  const userCode = dig(start.body, "userCode");
+  const deviceCode = dig(start.body, "deviceCode");
+  const verificationUrl = dig(start.body, "verificationUrl");
+  if (start.status !== 200 || typeof userCode !== "string" || typeof deviceCode !== "string" || typeof verificationUrl !== "string") {
+    throw new Error(`device login start failed: ${start.status} ${JSON.stringify(start.body)}`);
+  }
+  const pending = await getJson(`${reg.url}-/apm/v1/login/device/token`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode }) });
+  if (pending.status === 200) throw new Error("device token was issued before anyone approved it");
+  const claim = await b.json(`api/auth/device?user_code=${encodeURIComponent(userCode)}`);
+  if (claim.status !== 200) throw new Error(`device claim failed: ${claim.status} ${JSON.stringify(claim.body)}`);
+  const ok = await b.json("api/auth/device/approve", { method: "POST", body: { userCode } });
+  if (ok.status !== 200) throw new Error(`device approve failed: ${ok.status} ${JSON.stringify(ok.body)}`);
+  await Bun.sleep(1_100); // the CLI polls no faster than the interval
+  const done = await getJson(`${reg.url}-/apm/v1/login/device/token`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode }) });
+  const token = dig(done.body, "token");
+  const username = dig(done.body, "username");
+  if (done.status !== 200 || typeof token !== "string" || typeof username !== "string") throw new Error(`device token failed: ${done.status} ${JSON.stringify(done.body)}`);
+  return { token, username };
+}
+
+/** The approval id in an approval link printed by a publish, or null. */
+export function approvalId(output: string): string | null {
+  return /\/approve\/([A-Za-z0-9_-]+)/.exec(output)?.[1] ?? null;
 }
