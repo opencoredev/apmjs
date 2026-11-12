@@ -30,6 +30,7 @@ import {
   type Browser,
   type RawManifest,
 } from "./harness";
+import { scanPackages } from "../../packages/bun-scanner/src/index.ts";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -48,7 +49,9 @@ async function publishOk(reg: Registry, token: string, manifest: RawManifest, op
   if (r.status !== 201) throw new Error(`publish ${manifest.name}@${manifest.version}: ${r.status} ${JSON.stringify(r.body)}`);
 }
 
-function bearer(method: string, body: unknown, token: string): RequestInit {
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+function bearer(method: string, body: Json, token: string): RequestInit {
   return { method, headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) };
 }
 
@@ -76,12 +79,13 @@ function filesContaining(dir: string, needle: string): string[] {
 // ---------- blocker 1: the whole installed tree comes from the registry apm checked ----------
 describe("blocker 1: transitive dependencies install only from the registry apm checked", () => {
   type Pm = "bun" | "npm" | "pnpm";
+
   let reg: Registry;
   let other: Registry;
   let token: string;
 
   // the leaf's install script leaves a marker naming the copy that ran
-  const leafFiles = (tag: string): Record<string, string> => ({
+  const leafFiles = (tag: string) => ({
     "index.js": `module.exports = '${tag}_BYTES';\n`,
     "post.js": `require('fs').writeFileSync(require('path').join(process.env.APM_TEST_MARKS, 'leaf-${tag}'), 'ran');\n`,
   });
@@ -104,7 +108,7 @@ describe("blocker 1: transitive dependencies install only from the registry apm 
   });
 
   /** A consumer that lets the leaf's install script run under bun and pnpm too, as a project that trusts it would. */
-  function consumer(): { app: string; marks: string; env: Record<string, string> } {
+  function consumer() {
     const sb = makeSandbox(reg, token);
     const app = writeConsumer(work, reg, token);
     const marks = mkdtempSync(join(work, "marks-"));
@@ -182,16 +186,9 @@ describe("blocker 1: transitive dependencies install only from the registry apm 
 describe("blocker 2: the bun scanner checks prerelease versions", () => {
   let reg: Registry;
 
-  type ScanInput = { packages: { name: string; version: string; tarball: string; requestedRange: string }[]; env: Record<string, string>; cwd: string; warn: (line: string) => void };
+  type ScanInput = Parameters<typeof scanPackages>[0];
 
-  async function scan(input: ScanInput): Promise<unknown> {
-    const mod: unknown = await import(join(ROOT, "packages", "bun-scanner", "src", "index.ts"));
-    const fn = dig(mod, "scanPackages");
-
-    if (typeof fn !== "function") throw new Error("scanPackages missing");
-
-    return fn(input);
-  }
+  const scan = (input: ScanInput): ReturnType<typeof scanPackages> => scanPackages(input);
 
   beforeAll(async () => {
     reg = await startRegistry({ now: () => clock });
@@ -209,6 +206,7 @@ describe("blocker 2: the bun scanner checks prerelease versions", () => {
   test("a revoked prerelease is reported as fatal in strict mode", async () => {
     const warnings: string[] = [];
     const tarball = `${reg.url}revoked-prerelease-probe/-/revoked-prerelease-probe-1.0.0-beta.1.tgz`;
+
     const advisories = await scan({
       packages: [{ name: "revoked-prerelease-probe", version: "1.0.0-beta.1", tarball, requestedRange: "next" }],
       env: { APM_REGISTRY: reg.url, APM_SCANNER_STRICT: "1" },
@@ -222,9 +220,10 @@ describe("blocker 2: the bun scanner checks prerelease versions", () => {
 
   test("a version the scanner cannot send to the registry is reported, and strict mode cancels", async () => {
     const warnings: string[] = [];
+
     const input = (strict: boolean): ScanInput => ({
       packages: [{ name: "git-dep", version: "github:someone/git-dep#abc123", tarball: "https://codeload.example.invalid/x.tgz", requestedRange: "github:someone/git-dep" }],
-      env: { APM_REGISTRY: reg.url, ...(strict ? { APM_SCANNER_STRICT: "1" } : {}) },
+      env: strict ? { APM_REGISTRY: reg.url, APM_SCANNER_STRICT: "1" } : { APM_REGISTRY: reg.url },
       cwd: work,
       warn: (l) => warnings.push(l),
     });
@@ -405,7 +404,9 @@ describe("blocker 5: a confirmed command authorizes only those exact parameters"
     await gh?.stop();
   });
 
-  async function confirm(command: Record<string, unknown>): Promise<void> {
+  type Command = { kind: "deprecate"; name: string; changes: { version: string; message: string | null }[] } | { kind: "incident"; since: string; dryRun: boolean };
+
+  async function confirm(command: Command): Promise<void> {
     const r = await b.json("-/apm/v1/verify", { method: "POST", body: { command, code: totp(secret) } });
 
     expect(r.status, JSON.stringify(r.body)).toBe(200);
@@ -416,11 +417,13 @@ describe("blocker 5: a confirmed command authorizes only those exact parameters"
 
   test("deprecate: a confirmation for one message does not authorize another", async () => {
     await confirm({ kind: "deprecate", name: "@confirm-user/dep", changes: [{ version: "1.0.0", message: "use 2.x" }] });
+
     const put = (message: string): Promise<{ status: number; body: unknown }> =>
       getJson(
         `${reg.url}${encodePkg("@confirm-user/dep")}`,
         bearer("PUT", { _id: "@confirm-user/dep", name: "@confirm-user/dep", versions: { "1.0.0": { name: "@confirm-user/dep", version: "1.0.0", deprecated: message } } }, stage),
       );
+
     const swapped = await put("install @evil/replacement instead");
 
     expect(swapped.status).toBe(401);
@@ -507,8 +510,10 @@ describe("7: concurrent wrong passwords are all counted", () => {
 
   test("12 wrong passwords sent at once lock the account", async () => {
     await addUser(reg, "racer", PASSWORD);
+
     const login = (password: string): Promise<{ status: number; body: unknown }> =>
       getJson(`${reg.url}-/user/org.couchdb.user:racer`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ _id: "org.couchdb.user:racer", name: "racer", password, type: "user", roles: [] }) });
+
     const wrong = await Promise.all(Array.from({ length: 12 }, (_, i) => login(`wrong-${i}-password`)));
 
     expect(wrong.every((r) => r.status === 401 || r.status === 429)).toBe(true);

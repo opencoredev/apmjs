@@ -229,6 +229,7 @@ let clock = Date.parse("2026-11-12T10:00:00Z");
 let alice: string;
 let bob: string;
 let gh: FakeGitHub;
+
 // apm's reviewer: a website session with an authenticator app, and the same person's CLI tokens
 let adminBrowser: Browser;
 let adminSecret: string;
@@ -372,6 +373,7 @@ describe("AI review", () => {
 
     expect((await getJson(queue)).status).toBe(401);
     expect((await getJson(queue, { headers: { authorization: `Bearer ${bob}` } })).status).toBe(403);
+
     // the queue and its decisions are for the website: no token of the reviewer's opens them
     for (const t of [adminStageToken, adminPublishToken]) expect((await getJson(queue, { headers: { authorization: `Bearer ${t}` } })).status).toBe(403);
     const q = await adminBrowser.json("-/apm/v1/review-admin/queue");
@@ -382,6 +384,7 @@ describe("AI review", () => {
     const digest = dig(q.body, "pending", 0, "digest");
 
     const decision = { name: "ai-review-telemetry-demo", version: "1.0.0", digest, decision: "confirm", note: "Checked by hand." };
+
     const decide = (token: string): Promise<{ status: number; body: unknown }> =>
       getJson(`${reg.url}-/apm/v1/review-admin/decide`, {
         method: "POST",
