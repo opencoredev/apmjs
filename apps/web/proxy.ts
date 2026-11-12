@@ -3,12 +3,13 @@
 //     limit trusts an address the client made up.
 //  2. Registry routes: /api/auth/* and /-/apm/v1/* are forwarded to the registry from here, with the
 //     security headers and a private, no-store cache policy on every answer.
-//  3. Package pages: with Cache Components the page shell is sent before the page can look the package
-//     up, so the response status is decided here: a rewrite to an unmatched path for a registry 404
-//     (Next.js renders its not-found page with a 404), and a standalone 503 page when it can't be read.
+//  3. Package pages and file views: with Cache Components the page shell is sent before the page can look
+//     the package up, so the response status is decided here: a rewrite to an unmatched path for a registry
+//     404 (Next.js renders its not-found page with a 404), and a standalone 503 page when it can't be read.
 import { NextResponse, type NextRequest } from "next/server";
 import { CLIENT_FORWARDING_HEADERS, edgeClientIp } from "@/lib/client-ip";
-import { packageStatus } from "@/lib/package-status";
+import { fileStatus, packageStatus } from "@/lib/package-status";
+import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
 import { forwardToRegistry, isRegistryPath } from "@/lib/registry-proxy";
 import { REGISTRY } from "@/lib/registry-url";
 import { securityHeaders } from "@/lib/security-headers";
@@ -27,16 +28,14 @@ function forwardedHeaders(request: NextRequest): Headers {
   return headers;
 }
 
-function packageName(pathname: string): string | null {
-  const rest = pathname.slice("/package/".length);
+/** The package route a /package/... path names; null when it names none. */
+function packageRoute(pathname: string): PackageRoute | null {
+  const segs = pathname.slice("/package/".length).split("/");
 
-  if (!rest) return null;
+  // "/package/zod/" is the same page as "/package/zod"
+  if (segs.length > 1 && segs.at(-1) === "") segs.pop();
 
-  try {
-    return rest.split("/").map(decodeURIComponent).join("/");
-  } catch {
-    return null;
-  }
+  return parsePackageRoute(segs);
 }
 
 export async function proxy(request: NextRequest): Promise<Response> {
@@ -45,12 +44,20 @@ export async function proxy(request: NextRequest): Promise<Response> {
 
   if (isRegistryPath(pathname)) return forwardToRegistry(request, { registry: REGISTRY, headers, dev: process.env.NODE_ENV === "development" });
   const prefetch = request.headers.has("next-router-prefetch") || request.headers.get("purpose") === "prefetch";
-  const name = pathname.startsWith("/package/") && (request.method === "GET" || request.method === "HEAD") && !prefetch ? packageName(pathname) : null;
+  const checked = pathname.startsWith("/package/") && (request.method === "GET" || request.method === "HEAD") && !prefetch;
+  const route = checked ? packageRoute(pathname) : undefined;
+  const missing = () => NextResponse.rewrite(new URL("/package-missing", request.url), { status: 404, request: { headers } });
 
-  if (name) {
+  if (route === null) return missing();
+
+  if (route) {
+    const name = route.name;
     const status = await packageStatus(name, request.signal);
 
-    if (status.kind === "missing") return NextResponse.rewrite(new URL("/package-missing", request.url), { status: 404, request: { headers } });
+    if (status.kind === "missing") return missing();
+
+    // a file of a version: a 404 when the version or the file isn't there; any other answer renders the page
+    if (status.kind === "ok" && route.kind === "file" && (await fileStatus(route, request.signal)) === "missing") return missing();
 
     if (status.kind === "unavailable") {
       const html = unavailablePage({ name, retryPath: `${pathname}${request.nextUrl.search}` });

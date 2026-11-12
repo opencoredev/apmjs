@@ -229,3 +229,10 @@
 html[data-q] [data-recent] {
   visibility: hidden;
 }
+
+/* The file view: a block of 200 lines off screen skips layout and paint. Every line is one 20px row, so its
+   reserved height is exact and a line's scroll position does not move as blocks render. */
+.file-chunk {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 4000px;
+}

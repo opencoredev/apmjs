@@ -357,13 +357,13 @@ function tarHeader(path: string, size: number): Uint8Array {
   return h;
 }
 
-/** A gzip'd package tarball: package.json from `manifest` plus `files`. */
-export function pkgTgz(manifest: RawManifest, files: Record<string, string> = { "index.js": "module.exports = 1;\n" }): Uint8Array {
+/** A gzip'd package tarball: package.json from `manifest` plus `files` (text, or raw bytes). */
+export function pkgTgz(manifest: RawManifest, files: Record<string, string | Uint8Array> = { "index.js": "module.exports = 1;\n" }): Uint8Array {
   const entries = [{ path: "package.json", data: JSON.stringify(manifest) }, ...Object.entries(files).map(([path, data]) => ({ path, data }))];
   const parts: Uint8Array[] = [];
 
   for (const f of entries) {
-    const data = new TextEncoder().encode(f.data);
+    const data = f.data instanceof Uint8Array ? f.data : new TextEncoder().encode(f.data);
     parts.push(tarHeader(`package/${f.path}`, data.length), data, new Uint8Array((512 - (data.length % 512)) % 512));
   }
 
@@ -384,7 +384,7 @@ export async function putPublish(
   reg: Registry,
   token: string,
   manifest: RawManifest,
-  opts: { files?: Record<string, string>; tags?: Record<string, string> } = {},
+  opts: { files?: Record<string, string | Uint8Array>; tags?: Record<string, string> } = {},
 ): Promise<{ status: number; body: unknown }> {
   const tgz = pkgTgz(manifest, opts.files);
 

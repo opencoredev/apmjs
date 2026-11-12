@@ -17,8 +17,3 @@ export function RegistryUnavailable({ what, retryHref }: { what: string; retryHr
     </div>
   );
 }
-
-/** The /package/... path for a name, one encoded segment per name part. */
-export function packagePath(name: string): string {
-  return `/package/${name.split("/").map(encodeURIComponent).join("/")}`;
-}

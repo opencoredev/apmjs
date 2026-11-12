@@ -1,7 +1,7 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
 import { z } from "zod";
-import { encodeName, REGISTRY } from "./registry-url";
+import { encodeName, fileApiPath, REGISTRY } from "./registry-url";
 import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
@@ -111,6 +111,30 @@ const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z
 /** One version's full score, for a version other than latest. */
 export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>
   getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore);
+
+const FileHead = { name: z.string(), version: z.string(), path: z.string(), size: z.number() };
+
+const FileAnswer = z.discriminatedUnion("kind", [
+  z.object({ ...FileHead, kind: z.literal("text"), text: z.string() }),
+  z.object({ ...FileHead, kind: z.literal("binary") }),
+  z.object({ ...FileHead, kind: z.literal("too-large"), limit: z.number() }),
+]);
+
+export type FileAnswer = z.infer<typeof FileAnswer>;
+
+/** A 1 MB file is at most a few MB as JSON (escapes), and the first read of a big upstream tarball takes a while. */
+const FILE_MAX_BYTES = 8 * 1024 * 1024;
+const FILE_TIMEOUT_MS = 20_000;
+
+/** One file of one version, as text, or why it isn't shown. */
+export async function getFile(input: { name: string; version: string; path: string }): Promise<Fetched<FileAnswer>> {
+  const path = fileApiPath(input);
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS });
+
+  if (result.kind === "unavailable") logUnavailable(path.split("?")[0] ?? path, result.reason);
+
+  return result;
+}
 
 export async function getRecent(limit: number): Promise<Fetched<RecentEvent[]>> {
   const r = await getJson(`-/apm/v1/recent?limit=${limit}`, Recent);

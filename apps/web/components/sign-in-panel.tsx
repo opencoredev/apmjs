@@ -20,6 +20,15 @@ function VercelMark() {
   );
 }
 
+type Provider = "github" | "vercel";
+
+/** The line under the title. Vercel is only mentioned when its button is shown (the same `providers` flags). */
+export function signInIntro(providers: readonly Provider[]): string {
+  const scope = "Your apm scope is your GitHub login.";
+
+  return providers.includes("vercel") ? `${scope} You can sign in with Vercel, but you need to link GitHub before you can publish.` : scope;
+}
+
 /** GitHub and Vercel buttons, each shown only when the registry has that OAuth app configured. */
 export function SignInPanel({ next, title = "Sign in to apm", children }: { next: string; title?: string; children?: React.ReactNode }) {
   const [config, setConfig] = useState<AuthConfig | null>(null);
@@ -50,11 +59,7 @@ export function SignInPanel({ next, title = "Sign in to apm", children }: { next
     <section className="flex max-w-md flex-col gap-5 rounded-2xl border p-6 sm:p-8">
       <div className="flex flex-col gap-2">
         <h1 className="text-2xl font-medium tracking-tight">{title}</h1>
-        {children ?? (
-          <p className="text-[15px] leading-6 text-muted-foreground">
-            Your apm scope is your GitHub login. You can sign in with Vercel, but you need to link GitHub before you can publish.
-          </p>
-        )}
+        {children ?? <p className="text-[15px] leading-6 text-pretty text-muted-foreground">{signInIntro(providers)}</p>}
       </div>
       <div className="flex flex-col gap-2.5">
         {config === null && error === null && <div className="h-10 animate-pulse rounded-lg bg-muted" />}
@@ -66,7 +71,7 @@ export function SignInPanel({ next, title = "Sign in to apm", children }: { next
         ))}
         {config !== null && providers.length === 0 && (
           <p className="rounded-lg bg-surface px-4 py-3 text-sm leading-6 text-muted-foreground">
-            Sign-in is not set up on this registry yet: no GitHub or Vercel OAuth app is configured.
+            Sign-in is not set up on this registry yet: no sign-in provider is configured.
           </p>
         )}
       </div>

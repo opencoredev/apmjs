@@ -5,19 +5,18 @@ import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
 import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { AiReviewSection } from "@/components/ai-review";
-import { RegistryUnavailable, packagePath } from "@/components/registry-unavailable";
+import { RegistryUnavailable } from "@/components/registry-unavailable";
+import { FileView } from "@/components/file-view";
+import { citeEvidence } from "@/lib/evidence";
+import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
-import { ago } from "@/lib/format";
+import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { REGISTRY } from "@/lib/registry-url";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
-
-function size(n: number): string {
-  return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1048576).toFixed(1)} MB`;
-}
 
 function FactRow({ label, value, bad = false }: { label: string; value: string; bad?: boolean }) {
   return (
@@ -37,7 +36,7 @@ function FactsPanel({ facts, maintainers, lastPublish }: { facts: Facts | null; 
           <FactRow label="Types" value={facts.types === "bundled" ? "included" : "none"} />
           <FactRow label="Install scripts" value={facts.installScripts ? "yes" : "none"} bad={facts.installScripts} />
           <FactRow label="Dependencies" value={String(facts.dependencyCount)} />
-          <FactRow label="Unpacked size" value={size(facts.unpackedSize)} />
+          <FactRow label="Unpacked size" value={formatSize(facts.unpackedSize)} />
           <FactRow label="License" value={facts.license ?? "none"} bad={!facts.license} />
         </>
       )}
@@ -54,8 +53,49 @@ const INVERSE_TONE: Record<Tone, { text: string; bar: string }> = {
   bad: { text: "text-inverse-bad", bar: "bg-inverse-bad" },
 };
 
+/** Where one piece of evidence opens, when it cites a file and the version is known. */
+function evidenceLink(input: { signal: string; evidence: string; name: string; version: string | null }) {
+  const cited = input.version ? citeEvidence(input.signal, input.evidence) : null;
+  const href = cited && input.version ? fileHref({ name: input.name, version: input.version, ...cited.citation }) : null;
+
+  return cited && href ? { ...cited, href } : null;
+}
+
+/** One cited line under a signal. When it names a file, the whole row opens that file at the line. */
+function Evidence(props: { signal: string; evidence: string; name: string; version: string | null }) {
+  const link = evidenceLink(props);
+  const row = "mt-2 border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted [overflow-wrap:anywhere]";
+
+  if (!link) return <div className={row}>{props.evidence}</div>;
+
+  return (
+    // a full page load: the file view reads the #L anchor when it starts
+    <a href={link.href} className={`group -mr-2 block rounded-r-md py-1 pr-2 transition-colors hover:border-inverse-muted hover:bg-inverse-raised ${row}`}>
+      <span className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] group-hover:decoration-inverse-foreground">{link.cite}</span>
+      {link.rest}
+    </a>
+  );
+}
+
+/** The evidence after an informational signal, in brackets; the file part links when there is one. */
+function NoteEvidence(props: { signal: string; evidence: string; name: string; version: string | null }) {
+  const link = evidenceLink(props);
+
+  if (!link) return <> ({props.evidence})</>;
+
+  return (
+    <>
+      {" ("}
+      <a href={link.href} className="font-mono text-[12.5px] text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground [overflow-wrap:anywhere]">
+        {link.cite}
+      </a>
+      <span className="[overflow-wrap:anywhere]">{link.rest})</span>
+    </>
+  );
+}
+
 /** The page's one dark panel: score, meter, and every signal with its file:line evidence. */
-function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"]>; version: string | null }) {
+function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["score"]>; name: string; version: string | null }) {
   const tone = INVERSE_TONE[toneOf(score.score)];
   const lost = score.signals.filter((s) => s.points < 0);
   const notes = score.signals.filter((s) => s.points >= 0);
@@ -99,9 +139,7 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
                 <span className="font-mono">{s.id}</span> <span className="text-inverse-muted">{s.label}</span>
               </div>
               {s.evidence.slice(0, 3).map((ev) => (
-                <div key={ev} className="mt-2 border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted [overflow-wrap:anywhere]">
-                  {ev}
-                </div>
+                <Evidence key={ev} signal={s.id} evidence={ev} name={name} version={version} />
               ))}
             </div>
           </li>
@@ -111,7 +149,7 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
             <span className="w-9 shrink-0 text-right font-mono tabular-nums">0</span>
             <span className="min-w-0">
               <span className="font-mono text-inverse-foreground">{s.id}</span> {s.label}
-              {s.evidence[0] ? ` (${s.evidence[0]})` : ""}
+              {s.evidence[0] ? <NoteEvidence signal={s.id} evidence={s.evidence[0]} name={name} version={version} /> : null}
             </span>
           </li>
         ))}
@@ -228,8 +266,12 @@ function shownVersion(pkg: PackageInfo, v: string | string[] | undefined): strin
 }
 
 async function PackageContent({ params, searchParams }: PageProps) {
-  const parts = (await params).name.map(decodeURIComponent);
-  const name = parts.join("/");
+  const route = parsePackageRoute((await params).name);
+
+  if (!route) notFound();
+
+  if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} />;
+  const name = route.name;
   const found = await getPackage(name);
 
   // proxy.ts already answered 404 or 503 before the shell went out; this covers a registry that
@@ -292,7 +334,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
           <section aria-labelledby="score" className="order-4 lg:order-none">
             <SectionTitle id="score">Security score</SectionTitle>
-            {score ? <ScorePanel score={score} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
+            {score ? <ScorePanel score={score} name={pkg.name} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
           </section>
 
           {review.kind === "ok" && (

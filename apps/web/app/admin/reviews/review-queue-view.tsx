@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { z } from "zod";
 import { FindingList } from "@/components/finding-list";
-import { packagePath } from "@/components/registry-unavailable";
+import { packagePath } from "@/lib/package-route";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -94,7 +94,7 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
           {item.private.summary}
         </p>
       )}
-      {item.private.findings.length > 0 && <FindingList findings={item.private.findings} />}
+      {item.private.findings.length > 0 && <FindingList findings={item.private.findings} name={item.name} version={item.version} />}
       <p className="text-sm leading-6 text-pretty text-muted-foreground">
         {coverageText(item.public.coverage)}
         {item.public.coverage.previousVersion ? ` from ${item.public.coverage.previousVersion}` : ""} · {item.public.model} · answers: {item.private.attempts.map((a) => a.result).join(", ")}

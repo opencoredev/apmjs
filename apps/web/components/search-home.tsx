@@ -419,12 +419,17 @@ function ResultRow({ hit, q, id, active, reserveScore, onHover }: { hit: SearchH
             <SourceTag source={hit.source} />
           </span>
           <span className="truncate text-sm text-muted-foreground">{hit.description || "No description"}</span>
+          {/* Phones: version, downloads and score on one line under the description, so the name keeps the row's width. */}
+          <span className="mt-1 flex min-w-0 items-center gap-2 font-mono text-[12.5px] text-muted-foreground tabular-nums sm:hidden">
+            {hit.score && <ScoreBadge score={hit.score.score} grade={hit.score.grade} className="h-5 min-w-0 gap-1 rounded-md px-1.5 text-[12px]" />}
+            <span className="truncate">{[hit.version, hit.weeklyDownloads !== null ? `${compact.format(hit.weeklyDownloads)}/wk` : null].filter(Boolean).join(" · ")}</span>
+          </span>
         </span>
         <span className="hidden shrink-0 flex-col items-end gap-0.5 text-right font-mono text-[13px] text-muted-foreground tabular-nums sm:flex">
           <span>{hit.version}</span>
           {hit.weeklyDownloads !== null && <span>{compact.format(hit.weeklyDownloads)}/wk</span>}
         </span>
-        {hit.score ? <ScoreBadge score={hit.score.score} grade={hit.score.grade} /> : reserveScore ? <span className="hidden w-[3.75rem] shrink-0 sm:block" aria-hidden /> : null}
+        {hit.score ? <ScoreBadge score={hit.score.score} grade={hit.score.grade} className="hidden sm:inline-flex" /> : reserveScore ? <span className="hidden w-[3.75rem] shrink-0 sm:block" aria-hidden /> : null}
         <CornerDownLeftIcon className={cn("hidden size-4 shrink-0 text-muted-foreground sm:block", active ? "opacity-100" : "opacity-0")} aria-hidden />
       </Link>
     </li>

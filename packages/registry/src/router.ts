@@ -4,6 +4,7 @@ import { accountRoute } from "./account.ts";
 import { apmExtensions, apmRoute, safeView, upstreamRoute } from "./apm.ts";
 import { Auth } from "./auth.ts";
 import { Clock } from "./clock.ts";
+import { fileRoute } from "./files.ts";
 import { routePath } from "./http.ts";
 import { reviewRoute } from "./review.ts";
 import { callerOf, protocolRoute, type PackumentView } from "./server.ts";
@@ -29,6 +30,9 @@ export const route = (req: Request) =>
     const account = yield* accountRoute(req, url);
 
     if (account) return account;
+    const file = yield* fileRoute(req, url);
+
+    if (file) return file;
     const apm = yield* apmRoute(req, url, caller);
 
     if (apm) return apm;

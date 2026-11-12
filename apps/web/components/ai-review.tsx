@@ -53,7 +53,7 @@ function Coverage({ r }: { r: PublicReview }) {
   );
 }
 
-function Result({ r }: { r: PublicReview }) {
+function Result({ r, name, version }: { r: PublicReview; name: string; version: string }) {
   const Icon = ICON[r.state];
   const bad = r.state === "confirmed";
   const why = explanation(r);
@@ -80,7 +80,7 @@ function Result({ r }: { r: PublicReview }) {
       </div>
       {r.findings.length > 0 && (
         <div className="border-t px-5 py-4 sm:px-6">
-          <FindingList findings={r.findings} />
+          <FindingList findings={r.findings} name={name} version={version} />
           {r.note && <p className="mt-4 text-sm text-muted-foreground">Reviewer note: {r.note}</p>}
         </div>
       )}
@@ -111,7 +111,7 @@ export function AiReviewSection({ answer }: { answer: ReviewAnswer }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="overflow-hidden rounded-xl border">
-        {answer.review ? <Result r={answer.review} /> : <Pending status={answer.status} />}
+        {answer.review ? <Result r={answer.review} name={answer.name} version={answer.version} /> : <Pending status={answer.status} />}
         <AiReviewViewer name={answer.name} version={answer.version} />
       </div>
       <p className="text-sm leading-6 text-pretty text-muted-foreground">

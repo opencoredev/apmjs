@@ -13,7 +13,7 @@ import { FindingList } from "./finding-list";
 
 const Requested = z.object({ status: z.literal("queued") });
 
-function PrivateFindings({ p, viewer }: { p: PrivateReview; viewer: "maintainer" | "admin" }) {
+function PrivateFindings({ p, viewer, name, version }: { p: PrivateReview; viewer: "maintainer" | "admin"; name: string; version: string }) {
   if (p.findings.length === 0 && p.outcome !== "no-answer") return null;
   const who = viewer === "admin" ? "apm's reviewers" : "this package's owners and apm's reviewers";
 
@@ -33,7 +33,7 @@ function PrivateFindings({ p, viewer }: { p: PrivateReview; viewer: "maintainer"
           </>
         )}
       </p>
-      {p.findings.length > 0 && <FindingList findings={p.findings} />}
+      {p.findings.length > 0 && <FindingList findings={p.findings} name={name} version={version} />}
     </div>
   );
 }
@@ -68,7 +68,7 @@ export function AiReviewViewer({ name, version }: { name: string; version: strin
 
   return (
     <>
-      {priv && viewer !== "public" && <PrivateFindings p={priv} viewer={viewer} />}
+      {priv && viewer !== "public" && <PrivateFindings p={priv} viewer={viewer} name={name} version={version} />}
       {answer.canRequest && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t px-5 py-3 sm:px-6">
           {request.kind === "done" ? (

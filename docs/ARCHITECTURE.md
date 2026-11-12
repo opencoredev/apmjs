@@ -29,7 +29,7 @@ apm runs on Cloudflare: two Workers, one Postgres on Neon, one R2 bucket and one
 
 1. `worker.ts` parses the Worker's environment with a zod schema (bindings, vars, secrets). A misconfigured Worker answers 500 and logs why; legacy password auth on a public https URL without `APM_ALLOW_LEGACY_IN_PROD` answers 503 to every request.
 2. It builds the request's services as Effect layers (`servicesFor`) and runs `router.ts`.
-3. The router picks a route module: `review.ts` (the AI review queue and views, when it is on), `account.ts` (sign-in, device login, confirmations, staged approvals), `apm.ts` (scores, resolve, scan, audit, yank and revoke, the upstream proxy), and `server.ts` (the npm protocol: packuments, tarballs, publish, dist-tags, search).
+3. The router picks a route module: `review.ts` (the AI review queue and views, when it is on), `account.ts` (sign-in, device login, confirmations, staged approvals), `files.ts` (one file of a version as text, for the website's file view), `apm.ts` (scores, resolve, scan, audit, yank and revoke, the upstream proxy), and `server.ts` (the npm protocol: packuments, tarballs, publish, dist-tags, search).
 4. A route returns a `Response` or fails with a typed error. `HttpFailure` becomes its JSON error body; `StoreError`, `BlobError`, `AuthError` and `QueueError` become a 500 and one structured log line with the operation that failed.
 
 The layers live for one request. `Store` opens one Postgres connection through Hyperdrive and closes it when the request ends; Hyperdrive pools the connections to Neon. Better Auth is built on first use, so routes that never touch sign-in never pay for it.
@@ -65,6 +65,10 @@ The score endpoint, `~safe`, resolve and scan need a score now. A request analyz
 A Worker has 128 MB of memory, so the registry caps what it reads: upstream downloads at 32 MB, inflated tarballs at 48 MB, publish bodies at 32 MB and JSON API bodies at 5 MB. Request bodies are read through a counting reader that cancels the stream at the cap, so a body with no or a false `Content-Length` is not buffered first. A tarball's `package.json`, which is the manifest apm stores and serves, is capped at 1 MB. A local tarball is checked against its published sha512 before it is served. A package over those caps is refused (publish) or left unscored (upstream), never passed.
 
 Analyses of npm versions are keyed by tarball digest and scorer version, so a re-published tarball or a new scorer never reuses an old answer.
+
+### The file view
+
+Every score citation and AI review finding on the website links to the file it names, opened at the cited line. `files.ts` answers `GET /-/apm/v1/file/<name>/<version>?path=...` from the same verified tarball the install routes serve (a local blob checked against its sha512 integrity, an upstream one through `Upstream.tarball`). The path is matched against the parsed entry list, never joined onto a directory, so `../` names nothing. Files over 1 MB and files that are not valid UTF-8 are reported with their size and not sent; a revoked version answers 410. Answers are cached in R2 under the tarball's digest: one index of paths and sizes, and one object per path read. The website renders the text as text only, in blocks of 200 lines that skip layout while off screen, and shows bidi controls and other hidden characters as visible markers.
 
 ### AI release review
 
@@ -105,7 +109,7 @@ Limits:
 
 ## Tests
 
-The acceptance suite (`tests/acceptance`, 269 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
+The acceptance suite (`tests/acceptance`, 277 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
 
 - `packages/registry/scripts/build.ts` bundles the Worker with rolldown and the Cloudflare plugin set Alchemy uses. The deploy uploads `dist/worker.js` as built (`bundle: false`); the suite runs `dist/worker-test.js`, which imports that entry and adds test-only controls.
 - Miniflare runs the bundle in workerd with R2, the analysis queue and its consumer, and Hyperdrive simulated locally. Hyperdrive points at a real Postgres 18 cluster the suite starts with `initdb` (`tests/acceptance/postgres.ts`), or at `APM_TEST_DATABASE_URL`. Each registry gets a copy of one migrated template database.
