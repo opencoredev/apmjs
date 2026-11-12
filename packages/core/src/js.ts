@@ -1120,13 +1120,16 @@ function hiddenIn(l: LeftOut, index: number): Hidden | undefined {
  * "types" as code where nothing strips them).
  */
 function floorOf(text: string, programs: readonly LeftOut[]): TextFinding[] {
-  const hidden = (index: number): Hidden | undefined => {
+  return scanTextRules(text, { hidden: hiddenOf(programs), encoded: true });
+}
+
+/** What left-out text `index` sits in: a comment, a regex or a type only when every program the text parsed to puts it there. */
+function hiddenOf(programs: readonly LeftOut[]): (index: number) => Hidden | undefined {
+  return (index) => {
     const kinds = programs.map((l) => hiddenIn(l, index));
 
     return kinds.every((k) => k !== undefined) ? kinds[0] : undefined;
   };
-
-  return scanTextRules(text, { hidden, encoded: true });
 }
 
 /** One program, read once. Findings go to `hits`; module paths and loads apm cannot follow go to `paths` and `dynamic`. */
@@ -1135,6 +1138,8 @@ class Reader {
   readonly paths = new Set<string>();
   readonly loads = new Set<string>();
   readonly dynamic: number[] = [];
+  /** Strings the program passes to exec, spawn and the like, as it builds them. */
+  readonly commands: { at: number; value: string }[] = [];
   private readonly scopes: Scopes;
   private readonly strCache = new Map<AnyNode, Str | null>();
   private readonly bindingCache = new Map<Binding, Ref[]>();
@@ -1962,6 +1967,9 @@ class Reader {
     }
 
     const sure = role === "shell";
+
+    // what the program hands a shell or a process, for the risk signals that read commands (apm-score-v10)
+    if (role === "shell" && this.commands.length < MAX_COMMANDS) this.commands.push({ at, value: s.value.slice(0, MAX_COMMAND_CHARS) });
 
     // a dangerous name built from pieces or decoded: `'chi' + 'ld_process'`, `'\x65xec'`
     if (s.exact && s.how !== "as written") {
@@ -2836,10 +2844,19 @@ export type Imports = { paths: string[]; loads: string[]; dynamic: Where[] };
  * A parsed file's reading: its findings (the tree's and the floor's, the stronger of each signal), what it loads,
  * and the limits it ran into (`notes`).
  */
-export type JsScan = { kind: "parsed"; findings: TextFinding[]; imports: Imports; notes: string[] } | { kind: "failed"; reason: "syntax" | "too-large" };
+/** A string a parsed program passes to a process: what it holds, and the line it is cited at. */
+export type Command = { line: number; snippet: string; value: string };
+
+export type JsScan =
+  | { kind: "parsed"; findings: TextFinding[]; imports: Imports; notes: string[]; hidden: (index: number) => Hidden | undefined; commands: Command[] }
+  | { kind: "failed"; reason: "syntax" | "too-large" };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
-type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean };
+type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[] };
+
+/** At most this many commands per program, each cut to this many characters: enough to read what a command does. */
+const MAX_COMMANDS = 200;
+const MAX_COMMAND_CHARS = 4000;
 
 /** Reads every program `text` parses to, one at a time. Null when no parser accepted it or a tree was too large or too deep. */
 function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: "syntax" | "too-large" } {
@@ -2899,7 +2916,7 @@ function readProgram(p: Parsed, depth: number, budget: Budget): Read | null {
 
     r.read();
 
-    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName };
+    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands };
   } catch (e) {
     if (e instanceof RangeError) return null;
     throw e;
@@ -2962,5 +2979,8 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
     .slice(0, 5)
     .map((at) => lineOf(text, at));
 
-  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes] };
+  // a script read as a module too gives each command twice
+  const commands = [...new Map(r.reads.flatMap((x) => x.commands).map((c) => [`${c.at} ${c.value}`, c])).values()].map((c) => ({ ...lineOf(text, c.at), value: c.value }));
+
+  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands };
 }

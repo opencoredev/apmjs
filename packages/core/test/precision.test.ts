@@ -6,7 +6,7 @@
 // dismissal of that exact evidence, not from a rule. The second half checks that the reading cannot be steered into
 // hiding code. Payloads are inert stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, type Analysis, type TarEntry } from "../src/index.ts";
+import { analyze, CAPABILITY_LABELS, finalize, POINTS, POSSIBLE_POINTS, type Analysis, type TarEntry, findingsOf } from "../src/index.ts";
 import { scanText, type CodeSignal, type Confidence, type Hidden, type Lang } from "../src/source.ts";
 
 type Found = Partial<Record<CodeSignal, Confidence>>;
@@ -49,10 +49,12 @@ describe("text the program does not run as written counts, and says where it sit
   test("hono's SVG attribute regex counts as v3 counted it, and its evidence says it is in a regex", () => {
     expect(found(HONO_BASE_10)).toEqual({ "shell-exec": "confirmed" });
     expect(sitsIn(HONO_BASE_10)).toEqual({ "shell-exec": "regex" });
-    const s = analyzeFiles({ "dist/jsx/base.js": HONO_BASE_10 }, "dist/jsx/base.js").signals.find((x) => x.id === "shell-exec");
+    const s = findingsOf(analyzeFiles({ "dist/jsx/base.js": HONO_BASE_10 }, "dist/jsx/base.js")).find((x) => x.id === "shell-exec");
 
-    expect(s?.points).toBe(POINTS["shell-exec"]);
-    expect(s?.label).toBe("Mentions a shell command or child_process; apm did not see one started");
+    // a capability since apm-score-v10: listed with its evidence, on text only, at no cost
+    expect(s?.points).toBe(0);
+    expect(s?.label).toBe(CAPABILITY_LABELS.shell);
+    expect(analyzeFiles({ "dist/jsx/base.js": HONO_BASE_10 }, "dist/jsx/base.js").capabilities.find((c) => c.id === "shell")?.basis).toBe("text");
     expect(s?.evidence[0]).toEndWith("(text match in a regex)");
   });
 
@@ -100,9 +102,9 @@ describe("text the program does not run as written counts, and says where it sit
   });
 
   test("a call the tree confirmed is cited before a comment that names the same thing", () => {
-    const s = analyzeFiles({ "index.js": "// fetch(u) sends it\nfetch('https://example.invalid');\n" }).signals.find((x) => x.id === "network");
+    const s = findingsOf(analyzeFiles({ "index.js": "// fetch(u) sends it\nfetch('https://example.invalid');\n" })).find((x) => x.id === "network");
 
-    expect(s?.label).toBe("Uses the network: fetch, http, sockets, or a module that makes requests");
+    expect(s?.label).toBe(CAPABILITY_LABELS.network);
     expect(s?.evidence[0]).toStartWith("index.js:2: ");
   });
 });
@@ -139,17 +141,18 @@ describe("confirmed versus possible", () => {
   test("a possible signal costs fewer points and says so in its label", () => {
     // possible is left for what the tree sees and v3's rules did not: here a braced escape only the parser decodes
     const a = analyzeFiles({ "index.js": 'module.exports = function () { const names = ["\\u{63}hild_process"]; };\n' });
-    const s = a.signals.find((x) => x.id === "shell-exec");
+    const s = findingsOf(a).find((x) => x.id === "shell-exec");
     expect(s?.confidence).toBe("possible");
-    expect(s?.points).toBe(POSSIBLE_POINTS["shell-exec"]);
-    expect(s?.points).toBeGreaterThan(POINTS["shell-exec"]);
-    expect(s?.label).toMatch(/^Possible/);
-    expect(finalize(a, { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null }).score).toBe(100 + POSSIBLE_POINTS["shell-exec"] + POSSIBLE_POINTS.obfuscated);
+    // a capability since apm-score-v10: possible, and free; the evidence still says why it is only possible
+    expect(s?.points).toBe(0);
+    expect(a.capabilities.find((c) => c.id === "shell")?.basis).toBe("possible");
+    expect(POSSIBLE_POINTS["shell-exec"]).toBeGreaterThan(POINTS["shell-exec"]);
+    expect(finalize(a, { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null }).score).toBe(100 + POSSIBLE_POINTS["encoded-data"]);
   });
 
   test("one confirmed finding makes the signal confirmed and shows only confirmed evidence", () => {
     const a = analyzeFiles({ "index.js": 'const names = ["child_process"];\nrequire("./run");\n', "run.js": "require('child_process').execSync('id');\n" });
-    const s = a.signals.find((x) => x.id === "shell-exec");
+    const s = findingsOf(a).find((x) => x.id === "shell-exec");
     expect(s?.confidence).toBe("confirmed");
     expect(s?.evidence.every((e) => !e.includes("possible"))).toBe(true);
   });
@@ -180,7 +183,7 @@ describe("the lexer cannot be steered into hiding code", () => {
 
   test("JSX text cannot open a fake comment or string", () => {
     const a = analyzeFiles({ "index.jsx": "const a = <p>see http://x and it's here</p>; require('child_process').execSync(c);\n" }, "index.jsx");
-    expect(a.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
   });
 
   test("a payload passed to eval stays confirmed", () => {

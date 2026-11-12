@@ -1,40 +1,45 @@
 [
  {
   "name": "with-closure-mutation",
-  "group": "with",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "with",
   "file": "index.js",
   "src": "function f(){let fetch=()=>{};with({}){fetch=globalThis.fetch}fetch('https://example.invalid')}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "default-param-scope",
-  "group": "default-parameter",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "default-parameter",
   "file": "index.js",
   "src": "function f(go=()=>fetch('https://example.invalid')){const fetch=()=>{};go()}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "indirect-coerce-unary",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};+o;}f();",
   "runs": [
@@ -42,7 +47,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -51,12 +55,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "indirect-coerce-compare",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};o == 0;}f();",
   "runs": [
@@ -64,7 +71,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -73,12 +79,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "indirect-coerce-lt",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};o < 0;}f();",
   "runs": [
@@ -86,7 +95,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -95,12 +103,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "indirect-coerce-template",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};`${o}`;}f();",
   "runs": [
@@ -108,7 +119,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -117,151 +127,170 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "with-all-mutated",
-  "group": "with",
+  "v3": 65,
   "kind": "runs-all",
+  "group": "with",
   "file": "index.js",
   "src": "function f(){let fetch=()=>{},require=()=>{},eval=()=>{};with({}){fetch=globalThis.fetch;require=process.getBuiltinModule;eval=globalThis.eval}require('child_process');fetch('https://example.invalid');eval('1')}f();",
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid"
   ],
-  "v3": 65,
   "v7": 82,
   "v8": 65,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "param-default-all",
-  "group": "default-parameter",
+  "v3": 65,
   "kind": "runs-all",
+  "group": "default-parameter",
   "file": "index.js",
   "src": "function f(go=()=>{require('child_process');fetch('https://example.invalid');eval('1')}){const require=()=>{},fetch=()=>{},eval=()=>{};go()}f();",
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid"
   ],
-  "v3": 65,
   "v7": 85,
   "v8": 65,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "conversion-primitive",
-  "group": "conversion",
+  "v3": 80,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"fetch('https://example.invalid')\",[Symbol.toPrimitive](){(0,eval)(this.s);return 0}};+o}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 80,
   "v7": 90,
   "v8": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-conversion",
-  "group": "conversion",
+  "v3": 80,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"fetch('https://example.invalid')\",toString(){(0,eval)(this.s);return ''}};`${o}`}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 80,
   "v7": 90,
   "v8": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-param-default-scope",
-  "group": "default-parameter",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "default-parameter",
   "file": "index.ts",
   "src": "function f(go=()=>fetch('https://example.invalid')){const fetch=()=>{};go()}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "eval-local-alias",
-  "group": "eval-binding",
+  "v3": 80,
   "kind": "runs-all",
+  "group": "eval-binding",
   "file": "index.js",
   "src": "function f(){let fetch=()=>{};const eval=globalThis.eval;eval('fetch=globalThis.fetch');fetch('https://example.invalid')}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 80,
   "v7": 90,
   "v8": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "eval-parameter",
-  "group": "eval-binding",
+  "v3": 80,
   "kind": "runs-all",
+  "group": "eval-binding",
   "file": "index.js",
   "src": "function f(eval){let fetch=()=>{};eval('fetch=globalThis.fetch');fetch('https://example.invalid')}f(globalThis.eval);",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 80,
   "v7": 90,
   "v8": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "eval-nested-alias",
-  "group": "eval-binding",
+  "v3": 80,
   "kind": "runs-all",
+  "group": "eval-binding",
   "file": "index.js",
   "src": "function f(){let fetch=()=>{};function set(){const eval=globalThis.eval;eval('fetch=globalThis.fetch')}set();fetch('https://example.invalid')}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 80,
   "v7": 90,
   "v8": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "eval-read-dead",
-  "group": "eval-binding",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "eval-binding",
   "file": "index.js",
   "src": "function f(){const s=\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";const eval=globalThis.eval;eval('eval(s)')}f();",
   "runs": [
@@ -269,7 +298,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -278,252 +306,285 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 12,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: remote-shell -50, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "with-loop",
-  "group": "with",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "with",
   "file": "index.js",
   "src": "function f(){let fetch=()=>{};with({}){for(fetch of [globalThis.fetch]){}}fetch('https://example.invalid')}f();",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "key-identifier-token",
-  "group": "reflected-name",
+  "v3": 75,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={NPM_TOKEN:0};process.env[Object.keys(o)[0]];",
   "runs": [
    "env:NPM_TOKEN"
   ],
-  "v3": 75,
   "v7": 92,
   "v8": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "method-key-token",
-  "group": "reflected-name",
+  "v3": 75,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={NPM_TOKEN(){}};process.env[Object.keys(o)[0]];",
   "runs": [
    "env:NPM_TOKEN"
   ],
-  "v3": 75,
   "v7": 92,
   "v8": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "class-key-token",
-  "group": "reflected-name",
+  "v3": 75,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "class X{static NPM_TOKEN(){}};process.env[Object.getOwnPropertyNames(X)[3]];",
   "runs": [
    "env:NPM_TOKEN"
   ],
-  "v3": 75,
   "v7": 92,
   "v8": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "key-child",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={child_process:0};require(Object.keys(o)[0]);",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "method-child",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={child_process(){}};require(Object.keys(o)[0]);",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "namespace-keys-token",
-  "group": "reflected-name",
+  "v3": 75,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.ts",
   "src": "namespace N {export const NPM_TOKEN=0};process.env[Object.keys(N)[0]];",
   "runs": [
    "env:NPM_TOKEN"
   ],
-  "v3": 75,
   "v7": 92,
   "v8": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "param-prop-key-token",
-  "group": "reflected-name",
+  "v3": 75,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.ts",
   "src": "class X {constructor(public NPM_TOKEN=1){}};process.env[Object.keys(new X())[0]];",
   "runs": [
    "env:NPM_TOKEN"
   ],
-  "v3": 75,
   "v7": 92,
   "v8": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "function-fetch-name",
-  "group": "reflected-name",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "function fetch(){};globalThis[fetch.name]('https://example.invalid');",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "method-fetch-key",
-  "group": "reflected-name",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={fetch(){}};globalThis[Object.keys(o)[0]]('https://example.invalid');",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "method-fetch-name",
-  "group": "reflected-name",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const o={fetch(){}};globalThis[o.fetch.name]('https://example.invalid');",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "function-child-local",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "function f(){function child_process(){};require(child_process.name)}f();",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "arrow-inferred-child",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "const child_process=()=>{};require(child_process.name);",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "class-child-local",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "function f(){class child_process{};require(child_process.name)}f();",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "function-constructor-source",
-  "group": "reflected-name",
+  "v3": 85,
   "kind": "runs-all",
+  "group": "reflected-name",
   "file": "index.js",
   "src": "function f(){function child_process(){};require(child_process.toString().split(' ')[1].split('(')[0])}f();",
   "runs": [
    "module:child_process"
   ],
-  "v3": 85,
   "v7": 100,
   "v8": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "eval-alias-not-callable",
-  "group": "eval-binding",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "eval-binding",
   "file": "index.js",
   "src": "function f(){async function g(){};const eval=globalThis.eval;eval('g=()=>globalThis.eval');g()(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}f();",
   "runs": [
@@ -531,7 +592,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -540,12 +600,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "with-not-callable",
-  "group": "with",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "with",
   "file": "index.js",
   "src": "function f(){async function g(){};with({}){g=()=>globalThis.eval}g()(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}f();",
   "runs": [
@@ -553,7 +616,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 92,
   "v8": 30,
   "signals": {
@@ -562,12 +624,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "raw-js-mutation",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.js');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -581,7 +646,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -590,12 +654,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "raw-ts-mutation",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.ts');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -609,7 +676,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -618,12 +684,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "raw-txt-mutation",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.txt');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -637,7 +706,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -646,12 +714,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "conversion-in",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",[Symbol.toPrimitive](){(0,eval)(this.s);return 'x'}};o in {}}f();",
   "runs": [
@@ -659,7 +730,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -668,12 +738,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "conversion-instanceof",
-  "group": "conversion",
+  "v3": 30,
   "kind": "runs-all",
+  "group": "conversion",
   "file": "index.js",
   "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",[Symbol.hasInstance](){(0,eval)(this.s);return false}};1 instanceof o}f();",
   "runs": [
@@ -681,7 +754,6 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v3": 30,
   "v7": 82,
   "v8": 30,
   "signals": {
@@ -690,44 +762,51 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "data-url-local-method",
-  "group": "data-fetch",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "data-fetch",
   "file": "index.js",
   "src": "function run(send){const o={fetch(u){return send(u.replace('data:','https:'))}};o.fetch('d\\x61ta://example.invalid')}run(globalThis.fetch);",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "data-url-global-patched",
-  "group": "data-fetch",
+  "v3": 90,
   "kind": "runs-all",
+  "group": "data-fetch",
   "file": "index.js",
   "src": "function run(send){globalThis.fetch=(u)=>send(u.replace('data:','https:'));fetch('d\\x61ta://example.invalid')}run(globalThis.fetch);",
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v3": 90,
   "v7": 100,
   "v8": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "padded-js-patch",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-then-throws",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.js');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -739,7 +818,6 @@
   "runs": [
    "module:child_process"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -748,12 +826,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "padded-ts-patch",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-then-throws",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.ts');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -765,7 +846,6 @@
   "runs": [
    "module:child_process"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -774,12 +854,15 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "padded-txt-patch",
-  "group": "unparsed-builtin",
+  "v3": 30,
   "kind": "runs-then-throws",
+  "group": "unparsed-builtin",
   "file": "index.js",
   "src": "require('./patch.txt');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
   "extra": {
@@ -791,7 +874,6 @@
   "runs": [
    "module:child_process"
   ],
-  "v3": 30,
   "v7": 72,
   "v8": 30,
   "signals": {
@@ -800,6 +882,8 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  }
 ]

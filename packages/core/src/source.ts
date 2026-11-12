@@ -1,7 +1,7 @@
 // Static reading of one file's text. Every file is read with the text rules (rules.ts) over its whole text, after a
 // pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
 // codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
-import { scanJs, type Imports } from "./js.ts";
+import { scanJs, type Command, type Imports } from "./js.ts";
 import type { Dialect, Range } from "./parse.ts";
 import { parseEach } from "./parse.ts";
 import { joinStrings, scanTextRules } from "./textrules.ts";
@@ -12,7 +12,7 @@ export { decodedStrings, joinStrings, type Built, type Decoded, type Joined } fr
 
 export { namedSignal, type CodeSignal, type Confidence, type Hidden, type TextFinding, type Where } from "./rules.ts";
 
-export type { Imports } from "./js.ts";
+export type { Command, Imports } from "./js.ts";
 
 /**
  * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed, and read whole with the text rules too; everything else
@@ -83,7 +83,15 @@ function scanUnparsed(text: string): FileScan {
   for (const w of tokenWindows(plain.length, tokens.cuts)) {
     const piece = plain.slice(w.from, w.end);
 
-    for (const f of scanTextRules(piece, { shown: text, origin: (i) => tokens.origin(i + w.from) })) if (!sure.has(f.id)) more.push(f);
+    for (const f of scanTextRules(piece, { shown: text, origin: (i) => tokens.origin(i + w.from) })) {
+      if (sure.has(f.id)) continue;
+      more.push(f);
+
+      // a name only the tokenizer reads (escaped, or split by comments) was hidden from the text as written, as the
+      // tree reports it: obfuscation (apm-score-v10 weighs a hidden dangerous name as obfuscated)
+      if (f.id !== "obfuscated" && f.confidence === "confirmed" && !sure.has("obfuscated")) more.push({ ...f, id: "obfuscated", how: "after joining strings" });
+    }
+
     const found = importsOf(joinStrings(piece).text);
 
     for (const p of found.paths) paths.add(p);
@@ -181,6 +189,10 @@ export type FileScan = {
   rejected: boolean;
   /** Limits the tree's reading ran into; what was past them was judged by the text rules alone. */
   notes: string[];
+  /** For a parsed file: the comment, regex body or type a position sits in, if any. */
+  hidden?: (index: number) => Hidden | undefined;
+  /** For a parsed file: the strings it passes to a process. */
+  commands?: Command[];
 };
 
 /** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
@@ -195,7 +207,7 @@ export function scanFile(text: string, lang: Lang): FileScan {
   if (isDialect(lang)) {
     const js = scanJs(text, lang);
 
-    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes };
+    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands };
 
     return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
   }

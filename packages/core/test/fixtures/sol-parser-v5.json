@@ -1,63 +1,71 @@
 [
  {
   "name": "scope-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "function unused(){const fetch=()=>{};} fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "scope-require",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "function unused(){const require=()=>{};} require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 95,
   "v6": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "scope-eval",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "function unused(){const eval=()=>{};} eval(\"fetch('https://example.invalid')\");",
-  "kind": "detection",
-  "v3": 80,
   "v4": 80,
   "v5": 100,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "scope-process",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "function unused(){const process={};} process.env.NPM_TOKEN;",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 100,
   "v6": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "scope-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "function unused(){const fetch=()=>{}; const require=()=>{}; const process={}; const eval=()=>{};} require('chi'+'ld_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -67,384 +75,442 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "with-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const fetch=()=>{}; with(globalThis){fetch('https://example.invalid');}",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "getter-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={ get fetch(){return globalThis.fetch;} }; obj.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "getter-eval",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={ get run(){return eval;} }; obj.run(\"fetch('https://example.invalid')\");",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "proxy-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj=new Proxy({}, {get(){return globalThis.fetch;}});obj.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 97,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "reflect-get",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "Reflect.get(globalThis,'fetch')('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "reflect-apply-control",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "Reflect.apply(fetch,null,['https://example.invalid']);",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "reflect-apply-constant",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "const args=['https://example.invalid']; Reflect.apply(fetch,null,args);",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "destructuring-computed",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "const {['fe'+'tch']: send}=globalThis; send('https://example.invalid');",
-  "kind": "detection",
-  "v3": 80,
   "v4": 94,
   "v5": 94,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "destructuring-default",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "const {send=fetch}={}; send('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "destructuring-array",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "const [send]=[fetch]; send('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "object-property-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={fetch:globalThis.fetch};obj.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "global-function-return",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "Function('return this')().fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 97,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-enum",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "enum E { X=fetch('https://example.invalid') as any }",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-namespace",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "namespace X { export const r=fetch('https://example.invalid'); }",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-param",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "class X { constructor(public x=fetch('https://example.invalid')){} }new X();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-shadow-ambient",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "declare namespace X { function fetch(x:string):void; } fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-shadow-type",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "type X = (fetch: any) => void; fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-decorator",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "@((target:any)=>{ fetch('https://example.invalid');return target;}) class X {}",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-decorator-escaped",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "@((target:any)=>{ f\\u0065tch('https://example.invalid');return target;}) class X {}",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-abstract-runtime",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "abstract class X { static y=fetch('https://example.invalid'); }",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "cjs-await",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.cjs",
   "src": "await (fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "mjs-await",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.mjs",
   "src": "await (fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "noext-await",
+  "v3": 100,
+  "kind": "detection",
   "file": "index",
   "src": "await (fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "mjs-html",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.mjs",
   "src": "let x=1,y=1; x <!-- y; fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "global-computed-control",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "globalThis['fe'+'tch']('https://example.invalid');",
-  "kind": "detection",
-  "v3": 80,
   "v4": 80,
   "v5": 80,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "eval-args-spread",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval(...[\"fetch('https://example.invalid')\"]);",
-  "kind": "detection",
-  "v3": 80,
   "v4": 80,
   "v5": 80,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "function-bound",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "Function.bind(null,\"fetch('https://example.invalid')\")()();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "eval-array-apply",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const args=[\"fetch('https://example.invalid')\"];eval.apply(null,args);",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "eval-apply-holes",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval.apply(null,[,\"fetch('https://example.invalid')\"]);",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "v6": 90,
@@ -456,28 +522,32 @@
    "network": "confirmed",
    "eval": "confirmed"
   },
-  "v8why": "the skipped-slot proof is off, so the string's fetch( counts as v3 counted it; the tree also confirms the eval.apply call, which v3's rules did not match, so it scores below v3"
+  "v8why": "the skipped-slot proof is off, so the string's fetch( counts as v3 counted it; the tree also confirms the eval.apply call, which v3's rules did not match, so it scores below v3",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "function-data-params",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "Function('fetch', 'return 1');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "data-nonliteral-tail",
+  "v3": 90,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('data:' + url);",
-  "kind": "precision",
   "why": "'data:' + url is a data: URL whatever follows, which fetch reads without the network",
-  "v3": 90,
   "v4": 100,
   "v5": 100,
   "v6": 100,
@@ -486,40 +556,46 @@
   "signals8": {
    "network": "confirmed"
   },
-  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review), so fetch( counts as v3 counted it"
+  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review), so fetch( counts as v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "data-upper",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('DATA:,hello');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "local-mutation",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={fetch:()=>{}};obj.fetch=globalThis.fetch;obj.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "fallback-plain",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 30,
   "v6": 30,
@@ -529,14 +605,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 35,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-ts",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 30,
   "v6": 30,
@@ -546,15 +624,17 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 35,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-ts-padded",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
   "pad": "ts",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 30,
@@ -564,15 +644,17 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 35,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-js-padded",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
   "pad": "js",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 30,
@@ -582,80 +664,92 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 35,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "scope-type-declaration",
+  "v3": 65,
+  "kind": "detection",
   "file": "index.ts",
   "src": "declare namespace X { const fetch: (x:string)=>void; const process: any; } fetch('https://example.invalid'); process.env.NPM_TOKEN;",
-  "kind": "detection",
-  "v3": 65,
   "v4": 65,
   "v5": 90,
   "v6": 65,
   "signals": {
    "credential-access": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "scope-in-namespace",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.ts",
   "src": "namespace X { export const fetch=()=>{}; } fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "scope-block",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "{const fetch=()=>{};}fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "with-require",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const require=()=>{};with(globalThis){require('child_process');}",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 95,
   "v6": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "local-proto",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g={__proto__:globalThis};g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "local-getter-eval",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={get run(){return eval;}};obj.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
-  "kind": "detection",
-  "v3": 40,
   "v4": 40,
   "v5": 92,
   "v6": 30,
@@ -665,94 +759,108 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "local-spread",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g={...globalThis};g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "local-reflect",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g={};Reflect.set(g,'fetch',globalThis.fetch);g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "local-objectassign",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g={};Object.assign(g,globalThis);g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "computed-constant",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "const key='fe'+'tch'; const {[key]:send}=globalThis;send('https://example.invalid');",
-  "kind": "detection",
-  "v3": 80,
   "v4": 94,
   "v5": 94,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "destructure-literal",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "const {fetch:send}=globalThis;send('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "reflect-get-eval",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "Reflect.get(globalThis,'eval')(\"fetch('https://example.invalid')\");",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 100,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "reflect-get-floor",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "Reflect.get(globalThis,'eval')(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -762,28 +870,32 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "bind-eval",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval.bind(null,\"fetch('https://example.invalid')\")();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "bind-eval-floor",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval.bind(null,\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\")();",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 82,
   "v6": 30,
@@ -793,14 +905,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "const-apply-eval-floor",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "const args=[\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\"];Reflect.apply(eval,null,args);",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 82,
   "v6": 30,
@@ -810,29 +924,33 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "spread-eval-default",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "const args=[\"fetch('https://example.invalid')\"];eval(...args);",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 90,
   "v6": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 25,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: remote-shell -50, runs-decoded-code -25"
  },
  {
   "name": "apply-hole-precision",
+  "v3": 50,
+  "kind": "precision",
   "file": "index.js",
   "src": "eval.apply(null,[,\"require('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN\"]);",
-  "kind": "precision",
   "why": "the hole passes undefined as eval's first argument; the payload is its second, which eval ignores",
-  "v3": 50,
   "v4": 95,
   "v5": 77,
   "v6": 77,
@@ -848,14 +966,16 @@
    "network": "confirmed",
    "eval": "confirmed"
   },
-  "v8why": "the proof that eval.apply's skipped first slot passes undefined is off, so the string's names count as v3 counted them; the tree still confirms the eval.apply call, which v3's rules did not match, so it scores below v3"
+  "v8why": "the proof that eval.apply's skipped first slot passes undefined is off, so the string's names count as v3 counted them; the tree still confirms the eval.apply call, which v3's rules did not match, so it scores below v3",
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "local-call-precision",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={call(...args){return args;}};obj.call(null, 'https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 100,
@@ -863,49 +983,55 @@
  },
  {
   "name": "logical-or",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "(null || fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "logical-and",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "(true && fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "logical-conditional",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "(true ? fetch : ()=>{})('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "logical-eval-floor",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "(null || eval)(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -915,27 +1041,31 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "logical-global",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g = null || globalThis;g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "conditional-eval-floor",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "(true ? eval : ()=>{})(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -945,14 +1075,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "default-destructure-eval",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "const {run=eval}={};run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
-  "kind": "detection",
-  "v3": 40,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -962,27 +1094,31 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "data-uri-path",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('da\\nta:,');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "decorator-full",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "@((target:any)=>target)\nclass X {}\nrequ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 30,
@@ -992,14 +1128,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 35,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "logical-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "(null || eval)(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -1009,14 +1147,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "getter-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const obj={get run(){return eval;}};obj.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1026,14 +1166,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "bound-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval.bind(null,\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 82,
   "v6": 30,
@@ -1043,14 +1185,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "apply-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const args=[\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\"];Reflect.apply(eval,null,args);",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 82,
   "v6": 30,
@@ -1060,36 +1204,44 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "scope-esm",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.mjs",
   "src": "function unused(){const fetch=()=>{};}fetch('https://example.invalid');export {};",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "with-no-call",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const fetch=()=>{};with(globalThis){fetch('https://example.invalid');}",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "wildcard-export",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "module.exports=1;",
   "extra": {
@@ -1105,8 +1257,6 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 30,
@@ -1116,81 +1266,95 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "mode-cjs-cr",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.cjs",
   "src": "// note\rrequire('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "v6": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "mode-mjs-await",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.mjs",
   "src": "await (fetch)('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "mode-type-module-await-2",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "await (fetch)('https://example.invalid');",
   "manifest": {
    "type": "module"
   },
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "mode-type-module-await",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "await (fetch)('https://example.invalid');",
   "manifest": {
    "type": "module"
   },
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "mode-noextension-cr",
+  "v3": 85,
+  "kind": "detection",
   "file": "index",
   "src": "// note\rrequire('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "v6": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "mode-nested-type-module",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "import './sub/entry.js';",
   "extra": {
@@ -1200,17 +1364,19 @@
   "manifest": {
    "type": "module"
   },
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-payload-mjs",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1227,18 +1393,20 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-payload-cjs",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1255,18 +1423,20 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-payload",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1283,18 +1453,20 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-docs-payload-txt",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1311,18 +1483,20 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-docs-payload-d-ts",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1339,8 +1513,6 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 100,
@@ -1348,6 +1520,8 @@
  },
  {
   "name": "exports-condition-docs-payload-json",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1364,9 +1538,7 @@
     }
    }
   },
-  "kind": "precision",
   "why": "node reads a .json target as JSON and never runs it, so what it names is possible",
-  "v3": 75,
   "v4": 95,
   "v5": 95,
   "v6": 95,
@@ -1378,10 +1550,14 @@
    "shell-exec": "confirmed",
    "network": "confirmed"
   },
-  "v9why": "the match sits in a JSON file; v8 read JSON as data (possible at most), and apm-score-v9 counts it as v3 did, because code that loads the file can run or use what it holds"
+  "v9why": "the match sits in a JSON file; v8 read JSON as data (possible at most), and apm-score-v9 counts it as v3 did, because code that loads the file can run or use what it holds",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "exports-condition-docs-payload-html",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "export {};",
   "extra": {
@@ -1398,22 +1574,22 @@
     }
    }
   },
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "instance-getter",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "class A { get run(){ return eval; } } new A().run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1423,14 +1599,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "instance-constructor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "class A { constructor(){ this.run = eval; } } const a = new A(); a.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1440,14 +1618,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "instance-field",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "class A { run = eval } new A().run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1457,14 +1637,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "static-getter",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "class A { static get run(){ return eval; } } A.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1474,14 +1656,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "define-property-getter",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const o = {}; Object.defineProperty(o, 'run', { get: () => eval }); o.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 30,
   "v5": 92,
   "v6": 30,
@@ -1491,27 +1675,31 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "object-create-global",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const g = Object.create(globalThis); g.fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 97,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "function-returns-eval",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const get = () => eval; get()(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -1521,14 +1709,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "eval-passed-on",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "function run(f, c){ return f(c); } run(eval, \"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -1538,14 +1728,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "param-default-eval",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "function f(go = eval){ go(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\"); } f();",
-  "kind": "detection",
-  "v3": 30,
   "v4": 82,
   "v5": 92,
   "v6": 30,
@@ -1555,14 +1747,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "proxy-trap-eval",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const p = new Proxy({}, { get: () => eval }); p.anything(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
-  "kind": "detection",
-  "v3": 30,
   "v4": 92,
   "v5": 92,
   "v6": 30,
@@ -1572,67 +1766,77 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "block-function-call",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "{ function fetch(){} } fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-decorator-legacy-param",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "class A { constructor(@((t: any) => t) private x: number) {} }\nrequ\\u0069re('ch\\u{69}ld_process');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 75,
   "signals": {
    "shell-exec": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "ts-decorator-standard",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.ts",
   "src": "export @((t: any) => t) class A {}\nf\\u0065tch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "js-decorator",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "@((t) => t) class A {}\nf\\u0065tch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "typeof-eval-control",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "if (typeof eval === 'function') {}",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 100,
   "v6": 100,
@@ -1640,11 +1844,11 @@
  },
  {
   "name": "hoisted-local-control",
+  "v3": 90,
+  "kind": "precision",
   "file": "index.js",
   "src": "function f(){ var fetch = () => 1; return fetch('https://example.invalid'); }",
-  "kind": "precision",
   "why": "the fetch called is the function's own `var fetch`, which covers the call; the global is never reached",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "v6": 100,
@@ -1653,6 +1857,8 @@
   "signals8": {
    "network": "confirmed"
   },
-  "v8why": "the proof that a local var fetch is the function's own is off (shadowing proofs failed in findings 2 to 4 of the v7 review), so fetch( counts as v3 counted it"
+  "v8why": "the proof that a local var fetch is the function's own is off (shadowing proofs failed in findings 2 to 4 of the v7 review), so fetch( counts as v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  }
 ]

@@ -17,6 +17,7 @@ import {
   readTarball,
   SCORE_FLOOR,
   type TarEntry,
+  findingsOf,
 } from "../src/index.ts";
 
 type TarFile = { path: string; data: string; sizeField?: string; checksum?: string };
@@ -158,14 +159,14 @@ describe("incomplete analysis", () => {
     const padded = `${EXFIL}/*${" ".repeat(MAX_ANALYZED_FILE_BYTES)}*/`;
     const a = analyze({ name: "padded", manifest: { name: "padded", version: "1.0.0", license: "MIT", main: "index.js" }, files: [entry("index.js", padded)], publisher: "a", previousPublishers: [] });
     expect(a.skipped.map((s) => s.path)).toEqual(["index.js"]);
-    expect(a.signals.map((s) => s.id)).toContain("incomplete");
+    expect(findingsOf(a).map((s) => s.id)).toContain("incomplete");
     const r = finalize(a, { publishedAt: 0, now: Date.now(), deprecated: null, status: "active", statusReason: null });
     expect(r.score).toBeLessThan(SCORE_FLOOR);
   });
 
   test("a NUL byte no longer hides code from the score", () => {
     const a = analyze({ name: "nul", manifest: { name: "nul", version: "1.0.0", license: "MIT", main: "index.js" }, files: [entry("index.js", `/*\0*/${EXFIL}`)], publisher: "a", previousPublishers: [] });
-    expect(a.signals.map((s) => s.id)).toContain("shell-exec");
+    expect(findingsOf(a).map((s) => s.id)).toContain("shell-exec");
   });
 
   test("the obfuscation check stays linear on a large file with few hex identifiers", () => {
@@ -173,9 +174,9 @@ describe("incomplete analysis", () => {
     const t0 = performance.now();
     const a = analyze({ name: "big", manifest: { name: "big", version: "1.0.0", license: "MIT", main: "index.js" }, files: [entry("index.js", text)], publisher: "a", previousPublishers: [] });
     expect(performance.now() - t0).toBeLessThan(5_000);
-    expect(a.signals.map((s) => s.id)).not.toContain("obfuscated");
+    expect(findingsOf(a).map((s) => s.id)).not.toContain("obfuscated");
     const many = analyze({ name: "obf", manifest: { name: "obf", version: "1.0.0", license: "MIT", main: "index.js" }, files: [entry("index.js", "var _0xabcd = 1;\n".repeat(20))], publisher: "a", previousPublishers: [] });
-    expect(many.signals.map((s) => s.id)).toContain("obfuscated");
+    expect(findingsOf(many).map((s) => s.id)).toContain("obfuscated");
   });
 
   test("the secret scan lists files it was too large to read", () => {

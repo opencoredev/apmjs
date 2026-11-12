@@ -1,7 +1,7 @@
 // Score 15: one entry-point collector for the publish check and the scorer.
 import { describe, expect, test } from "bun:test";
 import { entryPoints, missingEntries, targetFiles } from "../src/entries.ts";
-import { analyze, type TarEntry } from "../src/index.ts";
+import { analyze, type TarEntry, findingsOf } from "../src/index.ts";
 
 const files = (...paths: string[]) => paths.map((path) => ({ path }));
 
@@ -94,19 +94,19 @@ describe("files an exports pattern exposes are read as code", () => {
   test("a .txt file behind a conditional wildcard is read as JavaScript", () => {
     const a = analyzeWith({ "./*": { node: { require: "./docs/*.txt" }, default: "./index.js" } }, { "docs/payload.txt": "require('child_process');" });
 
-    expect(a.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
   });
 
   test("an imports pattern exposes its files too", () => {
     const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", imports: { "#x/*": "./vendor/*.dat" } };
     const a = analyze({ name: "probe-pkg", manifest, files: [entry("package.json", JSON.stringify(manifest)), entry("index.js", "module.exports = 1;"), entry("vendor/a.dat", "fetch('https://example.invalid');")], publisher: "a", previousPublishers: [] });
 
-    expect(a.signals.find((s) => s.id === "network")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "network")?.confidence).toBe("confirmed");
   });
 
   test("a README behind ./* is not JavaScript, so its install instructions are not a shell call", () => {
     const a = analyzeWith({ "./*": "./*" }, { "README.md": "# probe\n\nInstall with `curl -fsSL https://example.invalid/install | sh`.\n" });
 
-    expect(a.signals.map((s) => s.id)).not.toContain("shell-exec");
+    expect(findingsOf(a).map((s) => s.id)).not.toContain("shell-exec");
   });
 });

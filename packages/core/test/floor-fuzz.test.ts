@@ -20,7 +20,7 @@
 import { describe, expect, test } from "bun:test";
 import vm from "node:vm";
 import { z } from "zod";
-import { analyze, finalize, SCORE_FLOOR, type Analysis, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, SCORE_FLOOR, type Analysis, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import lexerData from "./fixtures/sol-lexer.json";
 import v5Data from "./fixtures/sol-parser-v5.json";
 import v6Data from "./fixtures/sol-parser-v6.json";
@@ -459,7 +459,7 @@ function makeCase(r: Rand): Case {
 
 function describeCase(seed: number, i: number, c: Case, gaps: readonly string[]): string {
   const v9 = scoreV9(c.pkg);
-  const signals = v9.signals.map((s) => `${s.id}:${s.confidence}`).join(", ");
+  const signals = findingsOf(v9).map((s) => `${s.id}:${s.confidence}`).join(", ");
 
   const src = Object.entries(c.pkg.files)
     .map(([p, text]) => `${p}: ${text.length > 600 ? `${text.slice(0, 120)} … ${text.slice(-400)}` : text}`)
@@ -535,7 +535,7 @@ describe("the floor: no shape takes away a finding of apm-score-v3's", () => {
         if (failures.length >= 5) break;
       }
 
-      if (process.env.APM_FUZZ_CASES) console.log(`floor fuzz: seed ${seed}, ${cases} cases, ${refused} refused by v3, ${failures.length} missing a v3 finding or above v3`);
+      if (process.env.APM_FUZZ_CASES) console.log(`floor fuzz: seed ${seed}, ${cases} cases, ${refused} refused by v3, ${failures.length} missing a v3 finding`);
 
       expect(failures, failures.join("\n\n")).toEqual([]);
     },
@@ -583,7 +583,7 @@ describe("the floor: no shape takes away a finding of apm-score-v3's", () => {
       const pkg: Pkg = { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": "module.exports = 1;\n", "bin/run.js": `${s.wrap(FULL)}\nrequire(process.argv[2]);\n` } };
 
       expect(gapsOf(pkg), s.name).toEqual([]);
-      expect(scoreV9(pkg).signals.find((x) => x.id === "dynamic-require")?.evidence[0], s.name).toStartWith("bin/run.js:");
+      expect(findingsOf(scoreV9(pkg)).find((x) => x.id === "dynamic-require")?.evidence[0], s.name).toStartWith("bin/run.js:");
     }
   });
 });

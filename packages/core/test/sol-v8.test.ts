@@ -13,8 +13,9 @@
 import { describe, expect, test } from "bun:test";
 import vm from "node:vm";
 import { z } from "zod";
-import { analyze, finalize, HIDDEN_NOTES, SCORE_FLOOR, TEXT_MATCH, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, CAPABILITY_LABELS, finalize, HIDDEN_NOTES, SCORE_FLOOR, TEXT_MATCH, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import fixtureData from "./fixtures/sol-v8.json";
+import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
 import { scoreOfV3, supersetGaps, type SupersetInput } from "./superset.ts";
 
 const Fixture = z.object({
@@ -29,6 +30,8 @@ const Fixture = z.object({
   v9: z.number(),
   /** What running it does, under recording stubs, in order of first use. */
   runs: z.array(z.string()),
+  v10: z.number().optional(),
+  v10why: z.string().optional(),
 });
 
 type Fixture = z.infer<typeof Fixture>;
@@ -111,9 +114,17 @@ describe("the v8 review's fixtures", () => {
       const r = score(f);
 
       expect(scoreOfV3(inputOf(f))).toBe(f.v3);
-      expect(r.score).toBe(f.v9);
       expect(supersetGaps(inputOf(f), analyze(inputOf(f)))).toEqual([]);
-      expect(r.score < SCORE_FLOOR).toBe(f.v3 < SCORE_FLOOR || f.v9 < SCORE_FLOOR);
+      recordV10("sol-v8", f.name, r);
+
+      if (RECORDING) return;
+      const want = f.v10 ?? f.v9;
+
+      expect(r.score).toBe(want);
+      expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
+
+      // v3 refused it: v10 refuses it too, unless the fixture holds capabilities and no malware pattern, and says so
+      if (f.v3 < SCORE_FLOOR && r.score >= SCORE_FLOOR) expect(f.v10why ?? "").toStartWith(ABOVE_FLOOR);
     });
 
     test(`${f.name}: runs what it holds (liveness, under recording stubs)`, () => {
@@ -123,10 +134,10 @@ describe("the v8 review's fixtures", () => {
 
   test("a Worker run with eval: true is an evaluator the tree confirms, cited at the call", () => {
     for (const f of fixtures.filter((x) => x.family === "worker-eval")) {
-      const ev = score(f).signals.find((s) => s.id === "eval");
+      const ev = findingsOf(score(f)).find((s) => s.id === "eval");
 
       expect(ev?.confidence, f.name).toBe("confirmed");
-      expect(ev?.label, f.name).toBe("Evaluates code built at runtime (eval, Function, vm)");
+      expect(ev?.label, f.name).toBe(CAPABILITY_LABELS.eval);
       expect(ev?.evidence.some((e) => e.includes("Worker") && !e.includes(TEXT_MATCH.trim().slice(0, -1))), f.name).toBe(true);
     }
   });
@@ -138,7 +149,7 @@ describe("the v8 review's fixtures", () => {
       const family = f.family;
 
       if (family === "worker-eval" || family === "off-graph-load") continue;
-      const evidence = score(f).signals.flatMap((s) => s.evidence);
+      const evidence = findingsOf(score(f)).flatMap((s) => s.evidence);
 
       expect(evidence.some((e) => e.endsWith(where[family])), f.name).toBe(true);
     }
@@ -147,7 +158,7 @@ describe("the v8 review's fixtures", () => {
   test("a computed load counts in a file no entry reaches, as it does in the declared entry", () => {
     for (const name of ["dynamic-other-opaque", "dynamic-other-opaque-floor", "dynamic-entry-opaque-control"]) {
       const f = fixtures.find((x) => x.name === name);
-      const d = f ? score(f).signals.find((s) => s.id === "dynamic-require") : undefined;
+      const d = f ? findingsOf(score(f)).find((s) => s.id === "dynamic-require") : undefined;
 
       expect(d?.evidence[0], name).toStartWith(`${f?.run}:2: require(process.argv[2])`);
     }
@@ -156,7 +167,7 @@ describe("the v8 review's fixtures", () => {
 
 describe("evaluators v3 did not know: Worker and inspector", () => {
   const scored = (src: string) => finalize(analyze(inputOf({ name: "x", family: "worker-eval", main: "index.js", run: "index.js", files: { "index.js": src }, v3: 0, v8: 0, v9: 0, runs: [] })), STATE);
-  const evalOf = (src: string) => scored(src).signals.find((s) => s.id === "eval")?.confidence;
+  const evalOf = (src: string) => findingsOf(scored(src)).find((s) => s.id === "eval")?.confidence;
 
   test("options in a constant or a spread may hold eval: true", () => {
     expect(evalOf("const { Worker } = require('worker_threads');\nconst o = { eval: true };\nnew Worker(code, o);\n")).toBe("possible");
@@ -170,8 +181,8 @@ describe("evaluators v3 did not know: Worker and inspector", () => {
   test("the source a Worker evaluates is read as code", () => {
     const r = scored("const { Worker } = require('worker_threads');\nnew Worker(\"process.getBuiltinModule('child_process')\", { eval: true });\n");
 
-    expect(r.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
-    expect(r.signals.find((s) => s.id === "eval")?.confidence).toBe("confirmed");
+    expect(findingsOf(r).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(findingsOf(r).find((s) => s.id === "eval")?.confidence).toBe("confirmed");
   });
 
   test("loading inspector is a possible evaluator; asking a session to evaluate is one", () => {

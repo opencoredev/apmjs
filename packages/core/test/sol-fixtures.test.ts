@@ -13,8 +13,10 @@
 // above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry, findingsOf } from "../src/index.ts";
 import fixtureData from "./fixtures/sol-lexer.json";
+import { supersetGaps } from "./superset.ts";
+import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
 
 const Fixture = z.object({
   name: z.string(),
@@ -35,6 +37,8 @@ const Fixture = z.object({
   v9: z.number().optional(),
   signals9: z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"])).optional(),
   v9why: z.string().optional(),
+  v10: z.number().optional(),
+  v10why: z.string().optional(),
 });
 
 const fixtures = z.array(Fixture).parse(fixtureData);
@@ -47,9 +51,14 @@ function entry(path: string, text: string): TarEntry {
   return { path, size: data.length, mode: 0o644, data };
 }
 
-function score(f: z.infer<typeof Fixture>) {
+function inputOf(f: z.infer<typeof Fixture>) {
   const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: f.file };
-  const a = analyze({ name: "probe-pkg", manifest, files: [entry("package.json", JSON.stringify(manifest)), entry(f.file, f.src)], publisher: "a", previousPublishers: [] });
+
+  return { name: "probe-pkg", manifest, files: [entry("package.json", JSON.stringify(manifest)), entry(f.file, f.src)], publisher: "a", previousPublishers: [] };
+}
+
+function score(f: z.infer<typeof Fixture>) {
+  const a = analyze(inputOf(f));
 
   return finalize(a, { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null });
 }
@@ -65,12 +74,14 @@ describe("the review's fixtures", () => {
     expect(fixtures.every((f) => (f.v8 === undefined) === (f.v8why === undefined) && (f.v8 === undefined || f.v8 <= f.v3))).toBe(true);
     // every result v9 changed says why, and none of them is above v3
     expect(fixtures.every((f) => (f.v9 === undefined) === (f.v9why === undefined) && (f.v9 === undefined || f.v9 <= f.v3))).toBe(true);
+    // every result apm-score-v10 changed says why
+    expect(fixtures.every((f) => (f.v10 === undefined) === (f.v10why === undefined))).toBe(true);
   });
 
   for (const f of fixtures) {
     test(`${f.kind}: ${f.name}`, () => {
       const r = score(f);
-      const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
+      const found = Object.fromEntries(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
       expect(found).toEqual(f.signals9 ?? f.signals8 ?? f.signals7 ?? f.signals);
 
@@ -82,27 +93,35 @@ describe("the review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      const want = f.v9 ?? f.v8 ?? f.v7 ?? f.v5;
+      // apm-score-v10 keeps every finding v3 makes, as a risk signal or a capability
+      expect(supersetGaps(inputOf(f), r)).toEqual([]);
+      recordV10("sol-lexer", f.name, r);
+
+      if (RECORDING) return;
+      const want = f.v10 ?? f.v9 ?? f.v8 ?? f.v7 ?? f.v5;
 
       expect(r.score).toBe(want);
       // which side of the refusal floor it lands on is part of the claim
       expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
 
-      // only a proof that rests on how the code is read can put a fixture above v3
-      // no fixture scores above v3: apm-score-v9 keeps every finding v3 makes
-      expect(r.score).toBeLessThanOrEqual(f.v3);
-
-      if (f.kind === "detection" && f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
+      // v3 refused it: v10 refuses it too, unless the fixture holds capabilities and no malware pattern, and says so
+      if (f.kind === "detection" && f.v3 < SCORE_FLOOR && r.score >= SCORE_FLOOR) expect(f.v10why ?? "").toStartWith(ABOVE_FLOOR);
     });
   }
 
-  test("the floor-crossing wrappers are refused again", () => {
+  test("the floor-crossing wrappers hide nothing: each keeps every v3 finding and scores no higher than the control payload with them", () => {
+    // v3 refused these at 30; apm-score-v10 scores their capabilities at 0, so the claim is that the wrapper is no help
+    const bare = score({ name: "bare", file: "index.js", src: "require('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');", kind: "detection", v3: 30, v4: 30, v5: 30, signals: {} });
+
     for (const name of ["floor-bypass-cr", "floor-bypass-of", "floor-bypass-html", "joined-floor"]) {
       const f = fixtures.find((x) => x.name === name);
 
       expect(f, name).toBeDefined();
 
-      if (f) expect(score(f).score, name).toBeLessThan(SCORE_FLOOR);
+      if (f) {
+        expect(supersetGaps(inputOf(f), score(f)), name).toEqual([]);
+        expect(score(f).score, name).toBeLessThanOrEqual(bare.score);
+      }
     }
   });
 });

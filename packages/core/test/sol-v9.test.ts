@@ -9,7 +9,7 @@
 //    helper compares them instead of skipping the check.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { AmbiguousPathsError, analyze, finalize, type TarEntry } from "../src/index.ts";
+import { AmbiguousPathsError, analyze, finalize, type TarEntry, findingsOf } from "../src/index.ts";
 import fixtureData from "./fixtures/sol-v9.json";
 import { scoreOfV3, supersetGaps, type SupersetInput } from "./superset.ts";
 
@@ -97,11 +97,11 @@ describe("duplicate paths", () => {
 describe("evidence past the kept cap", () => {
   const f = fixture("evidence-overflow");
 
-  test("scores 90 in both, and the network signal still names index.js", () => {
+  test("v3 scores 90, v10 100 (network is a capability), and the network finding still names index.js", () => {
     const analysis = analyze(inputOf(f));
-    const network = analysis.signals.find((s) => s.id === "network");
+    const network = findingsOf(analysis).find((s) => s.id === "network");
 
-    expect(finalize(analysis, STATE).score).toBe(90);
+    expect(finalize(analysis, STATE).score).toBe(100);
     expect(scoreOfV3(inputOf(f))).toBe(f.v3);
     expect(network?.uncounted).toBe(1);
     expect([...(network?.evidence ?? []), ...(network?.more ?? [])].some((e) => e.startsWith("index.js:"))).toBe(false);
@@ -115,7 +115,7 @@ describe("evidence past the kept cap", () => {
     expect(supersetGaps(inputOf(f), analysis)).toEqual([]);
 
     // without the kept sources the helper must report the file v3 cites, not skip the check
-    const stripped = { ...analysis, signals: analysis.signals.map(({ sources: _sources, ...s }) => s) };
+    const stripped = { ...analysis, signals: analysis.signals.map(({ sources: _sources, ...s }) => s), capabilities: analysis.capabilities.map(({ sources: _sources, ...c }) => c) };
 
     expect(supersetGaps(inputOf(f), stripped)).toEqual([expect.stringContaining("network: v3 cites index.js")]);
   });

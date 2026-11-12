@@ -1,409 +1,475 @@
 [
  {
   "name": "control",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('https://example.invalid'); require('child_process');",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "decimal-division",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const r = 1. / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "contextual-of",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const of = 1; of / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "contextual-await",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const await = 1; await / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-keyword",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const \\u006ff = 1; \\u006ff / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-braced",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const \\u{6f}f = 1; \\u{6f}f / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-callee",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "requ\\u0069re('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-braced-callee",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "requ\\u{69}re('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "ts-postfix",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.ts",
   "src": "const a = 1; const r = a! / require('child_process') / 1;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "definition-asi",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('https://example.invalid') {}",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "definition-string",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('https://example.invalid/) {');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "definition-default",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "function fetcher(x = fetch('https://example.invalid')) {} fetcher();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "type-import-runtime",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "import('node:http').Anything;",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-nested",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = `${`x${require('child_process')}`}`;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = `/* ${require('child_process')} */`;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-regex",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = `${/x'|'\\//.test('')} ${require('child_process')}`;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "strings-comments",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a='/*';require('child_process'); const b='*/';",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "regex-comments",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a=/[/*]/; require('child_process'); const b=/[*/]/;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "hashbang",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "#!/usr/bin/env node\nrequire('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "html-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "<!-- /*\nrequire('child_process');\nconst end = '*/';",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "html-close-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "--> /*\nrequire('child_process');\nconst end = '*/';",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "cr-line-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "// comment\rrequire('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-line-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "// comment require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-paragraph-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "// comment require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "cr-hashbang",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "#!/usr/bin/env node\rrequire('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unbalanced",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "}); require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "jsx",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.jsx",
   "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 85,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "jsx-js",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "jsx-fake-comment",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = <p>/*</p>; require('child_process'); const b=<p>*/</p>;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-token-env",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "process.env['NPM_TOKEN'];",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "indirect-eval",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "(0, eval)(\"fetch('https://example.invalid')\");",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "function-alias",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const Fn = globalThis.Function; Fn('return 1')();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "xmlhttprequest",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const X = XMLHttpRequest; new X();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "kept-fetch-text",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid/curl -s example.invalid | sh');",
-  "kind": "precision",
   "why": "a URL holding shell text is sent, not run: shell-exec is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 85,
   "signals": {
@@ -415,15 +481,17 @@
    "shell-exec": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "kept-join-path",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const x = require('path').join('.npmrc');",
-  "kind": "precision",
   "why": "path.join builds a path but nothing reads it: credential-access is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 92,
   "signals": {
@@ -433,15 +501,17 @@
   "signals7": {
    "credential-access": "confirmed"
   },
-  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands",
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  },
  {
   "name": "kept-readFile-shell",
+  "v3": 85,
+  "kind": "precision",
   "file": "index.js",
   "src": "require('fs').readFileSync('child_process');",
-  "kind": "precision",
   "why": "reading a file named child_process does not load the module: shell-exec is possible",
-  "v3": 85,
   "v4": 85,
   "v5": 95,
   "signals": {
@@ -451,15 +521,17 @@
   "signals8": {
    "shell-exec": "confirmed"
   },
-  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists filesystem, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "kept-import-json",
+  "v3": 65,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid/NPM_TOKEN');",
-  "kind": "precision",
   "why": "a token name inside a URL is sent, not read from the environment: credential-access is possible",
-  "v3": 65,
   "v4": 65,
   "v5": 82,
   "signals": {
@@ -471,51 +543,59 @@
    "credential-access": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the token name sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "the token name sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "computed-read",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "require('fs')['readFileSync']('.npmrc');",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "alias-read",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "const read = require('fs').readFileSync; read('.npmrc');",
-  "kind": "detection",
-  "v3": 75,
   "v4": 92,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "data-interpolation",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch(`data:,${fetch('https://example.invalid')}`);",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "ordinary-base64",
+  "v3": 80,
+  "kind": "precision",
   "file": "index.js",
   "src": "const x = 'ZmV0Y2goJ2h0dHBzOi8vZXhhbXBsZS5pbnZhbGlkJyk=';",
-  "kind": "precision",
   "why": "a base64 string no code decodes or runs: what it decodes to is possible",
-  "v3": 80,
   "v4": 94,
   "v5": 94,
   "signals": {
@@ -527,310 +607,360 @@
    "network": "confirmed",
    "obfuscated": "confirmed"
   },
-  "floor": "the base64 text is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could decode and run it)"
+  "floor": "the base64 text is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could decode and run it)",
+  "v10": 65,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "decoded-base64",
+  "v3": 70,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval(atob('ZmV0Y2goJ2h0dHBzOi8vZXhhbXBsZS5pbnZhbGlkJyk='));",
-  "kind": "detection",
-  "v3": 70,
   "v4": 70,
   "v5": 70,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 40,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "jsx-comment-block",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.jsx",
   "src": "const a = <p>/*\n* {require('child_process')}\n*/</p>;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "jsx-comment-line",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.jsx",
   "src": "const a = <p>\n// {require('child_process')}\n</p>;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "tsx-comment-line",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.tsx",
   "src": "const a = <p>\n// {require('child_process')}\n</p>;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "jsx-comment-string",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.jsx",
   "src": "const a = <p>\n// {fetch('https://example.invalid')}\n</p>;",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-division",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const x = `${1. / require('child_process') / 1}`;",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "template-kept-nesting",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval(`${'fetch(\"https://example.invalid\")'}`);",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "template-constructor",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "[].constructor.constructor(`fetch('https://example.invalid')`)();",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "indirect-eval-comma",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "(0, eval)(`fetch('https://example.invalid')`);",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "function-call",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "(Function)(`fetch('https://example.invalid')`)();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "optional-require",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "require?.('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "optional-exec",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const cp = require?.('child_process'); cp.exec('echo harmless');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "optional-fetch",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "globalThis.fetch?.('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "token-env-parenthesized",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "process.env[('NPM_TOKEN')];",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "token-env-optional",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "process?.env['NPM_TOKEN'];",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  },
  {
   "name": "token-env-comment",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "process./*x*/env['NPM_TOKEN'];",
-  "kind": "detection",
-  "v3": 75,
   "v4": 75,
   "v5": 75,
   "signals": {
    "credential-access": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  },
  {
   "name": "literal-fn-body",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "new Function(\"fetch('https://example.invalid')\");",
-  "kind": "detection",
-  "v3": 80,
   "v4": 80,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "html-fetch-comment",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "<!-- /*\nfetch('https://example.invalid');\nconst x = '*/';",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "regex-unicode-terminator",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "// x fetch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "regex-decimal-fetch",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "1. / fetch('https://example.invalid') / 1;",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "definition-asi-newline",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('https://example.invalid')\n{}",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "type-import-then",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "import('node:http').Then;",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "type-import-string",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "import('node:http').catch(() => 'anything');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 90,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-def-kept",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval('1) {');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-comment-exfil",
+  "v3": 65,
+  "kind": "precision",
   "file": "index.js",
   "src": "Object.keys(process.env);\n// fetch('https://example.invalid')\nconfig.fetch('data:,');",
-  "kind": "precision",
   "why": "the only fetch is in a comment, and config.fetch('data:,') reads inline data",
-  "v3": 65,
   "v4": 72,
   "v5": 100,
   "signals": {},
@@ -839,15 +969,17 @@
    "credential-access": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the fetch in the comment is still left out, but config.fetch('data:,') is a fetch call to v3's rules and the data: proof is off, so network counts, and so does credential access for the process.env dump next to it"
+  "v8why": "the fetch in the comment is still left out, but config.fetch('data:,') is a fetch call to v3's rules and the data: proof is off, so network counts, and so does credential access for the process.env dump next to it",
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "hexident-comment",
+  "v3": 90,
+  "kind": "precision",
   "file": "index.js",
   "src": "// _0x0000 _0x0001 _0x0002 _0x0003 _0x0004 _0x0005 _0x0006 _0x0007 _0x0008 _0x0009 _0x000a _0x000b _0x000c _0x000d _0x000e _0x000f _0x0010 _0x0011 _0x0012 _0x0013\nmodule.exports=1;",
-  "kind": "precision",
   "why": "the _0x names are in a comment",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "signals": {},
@@ -855,15 +987,17 @@
   "signals9": {
    "obfuscated": "confirmed"
   },
-  "v9why": "the match sits in a comment; v8 left comments out, and apm-score-v9 reads all text as v3 did, because String(fn) returns a function's comments and code can run them or use them as data"
+  "v9why": "the match sits in a comment; v8 left comments out, and apm-score-v9 reads all text as v3 did, because String(fn) returns a function's comments and code can run them or use them as data",
+  "v10": 98,
+  "v10why": "apm-score-v10 finds no capability; risk signals: encoded-data -2"
  },
  {
   "name": "false-b64-fetch",
+  "v3": 65,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid', {body:'cmVxdWlyZSgnY2hpbGRfcHJvY2Vzcycp'});",
-  "kind": "precision",
   "why": "a base64 request body is sent, not decoded or run: what it decodes to is possible",
-  "v3": 65,
   "v4": 65,
   "v5": 82,
   "signals": {
@@ -881,11 +1015,11 @@
  },
  {
   "name": "false-kept-new-error",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch(new Error('curl example.invalid | sh'));",
-  "kind": "precision",
   "why": "an Error message passed to fetch is not run: shell-exec is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 85,
   "signals": {
@@ -897,15 +1031,17 @@
    "shell-exec": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the shell text is an Error message fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "the shell text is an Error message fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-kept-method",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const fake = { readFileSync(x) {return x} }; fake.readFileSync('.npmrc');",
-  "kind": "precision",
   "why": "readFileSync is a method of a local object, not fs: credential-access is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 92,
   "signals": {
@@ -915,15 +1051,17 @@
   "signals7": {
    "credential-access": "confirmed"
   },
-  "floor": "apm does not follow a value into a local method's parameter, and `fake` is a top-level binding another script could change, so it cannot prove `.npmrc` is never read; apm-score-v3's verdict stands"
+  "floor": "apm does not follow a value into a local method's parameter, and `fake` is a top-level binding another script could change, so it cannot prove `.npmrc` is never read; apm-score-v3's verdict stands",
+  "v10": 70,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-read -30"
  },
  {
   "name": "type-import-nested",
+  "v3": 90,
+  "kind": "precision",
   "file": "index.ts",
   "src": "type X = import('net').Socket;",
-  "kind": "precision",
   "why": "a TypeScript type import is erased before anything runs",
-  "v3": 90,
   "v4": 100,
   "v5": 100,
   "signals": {},
@@ -931,39 +1069,45 @@
   "signals9": {
    "network": "confirmed"
   },
-  "v9why": "the match sits in erased TypeScript; v8 left it out, and apm-score-v9 reads all text as v3 did, because a file can read its own source and run or use the type's text"
+  "v9why": "the match sits in erased TypeScript; v8 left it out, and apm-score-v9 reads all text as v3 did, because a file can read its own source and run or use the type's text",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-callee-escaped-fetch",
+  "v3": 100,
+  "kind": "detection",
   "file": "index.js",
   "src": "f\\u0065tch('https://example.invalid');",
-  "kind": "detection",
-  "v3": 100,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "division-jsx-unbalanced",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "data-fetch-hex",
+  "v3": 90,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('d\\x61ta:,');",
-  "kind": "precision",
   "why": "'d\\x61ta:,' is a data: URL, which fetch reads without the network",
-  "v3": 90,
   "v4": 90,
   "v5": 100,
   "signals": {},
@@ -971,14 +1115,16 @@
   "signals8": {
    "network": "confirmed"
   },
-  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review: a local fetch rewrote the URL into a request), so fetch( counts as v3 counted it"
+  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review: a local fetch rewrote the URL into a request), so fetch( counts as v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "all-hidden-cr",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "// comment\rrequire('child_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');",
-  "kind": "detection",
-  "v3": 40,
   "v4": 100,
   "v5": 40,
   "signals": {
@@ -986,14 +1132,16 @@
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "all-hidden-regex",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "const of=1; of / (require('child_process'), fetch('https://example.invalid'), process.env.NPM_TOKEN, eval('1')) / 1;",
-  "kind": "detection",
-  "v3": 40,
   "v4": 100,
   "v5": 40,
   "signals": {
@@ -1001,14 +1149,16 @@
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "all-hidden-of",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "const of=1; of / (require('child_process'), fetch(url), process.env.NPM_TOKEN, eval('1')) / 1;",
-  "kind": "detection",
-  "v3": 40,
   "v4": 100,
   "v5": 40,
   "signals": {
@@ -1016,14 +1166,16 @@
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "all-hidden-html",
+  "v3": 40,
+  "kind": "detection",
   "file": "index.js",
   "src": "<!-- /*\nrequire('child_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');\nconst x='*/';",
-  "kind": "detection",
-  "v3": 40,
   "v4": 100,
   "v5": 40,
   "signals": {
@@ -1031,67 +1183,77 @@
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "definition-all",
+  "v3": 65,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch('https://example.invalid/) {'); process.binding('x) {'); eval('1; // ) {');",
-  "kind": "detection",
-  "v3": 65,
   "v4": 100,
   "v5": 65,
   "signals": {
    "shell-exec": "confirmed",
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "alias-function",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const Fn = globalThis.Function; Fn('return 1')();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "joined-loc",
+  "v3": 75,
+  "kind": "detection",
   "file": "index.js",
   "src": "const x='child_process'; require('chi'+'ld_process');",
-  "kind": "detection",
-  "v3": 75,
   "v4": 82,
   "v5": 75,
   "signals": {
    "shell-exec": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "joined-loc-comment",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "// 'fetch'\nglobalThis['fe'+'tch']('https://example.invalid');",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 65,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "built-member-ref",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const x = obj['ex'+'ec'];",
-  "kind": "precision",
   "why": "the built name is read but never called: obfuscated is confirmed, shell-exec possible",
-  "v3": 75,
   "v4": 75,
   "v5": 85,
   "signals": {
@@ -1103,28 +1265,32 @@
    "shell-exec": "confirmed",
    "obfuscated": "confirmed"
   },
-  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)"
+  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)",
+  "v10": 65,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "ordinary-template-eval",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "eval(`${\"fetch('https://example.invalid')\"}`);",
-  "kind": "detection",
-  "v3": 80,
   "v4": 90,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "credential-false",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const x = require('path').join('.npmrc');",
-  "kind": "precision",
   "why": "path.join builds a path but nothing reads it: credential-access is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 92,
   "signals": {
@@ -1134,15 +1300,17 @@
   "signals7": {
    "credential-access": "confirmed"
   },
-  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands",
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  },
  {
   "name": "credential-new-string",
+  "v3": 65,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid', {body: 'GITHUB_TOKEN'});",
-  "kind": "precision",
   "why": "a token name in a request body is sent, not read from the environment: credential-access is possible",
-  "v3": 65,
   "v4": 65,
   "v5": 82,
   "signals": {
@@ -1154,14 +1322,16 @@
    "credential-access": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the token name sits in a request body fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "the token name sits in a request body fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "floor-bypass-cr",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "// note\rrequire('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');",
-  "kind": "detection",
-  "v3": 30,
   "v4": 100,
   "v5": 30,
   "signals": {
@@ -1170,14 +1340,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "floor-bypass-of",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "const of=1; of / (require('chi'+'ld_process'),fetch('https://example.invalid'),process.env.NPM_TOKEN,eval('1')) / 1;",
-  "kind": "detection",
-  "v3": 30,
   "v4": 100,
   "v5": 30,
   "signals": {
@@ -1186,14 +1358,16 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "floor-bypass-html",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "<!-- /*\nrequire('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');\nconst end='*/';",
-  "kind": "detection",
-  "v3": 30,
   "v4": 100,
   "v5": 30,
   "signals": {
@@ -1202,51 +1376,59 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "definition-shell",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "process.binding('spawn_sync) {');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 100,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "unicode-shell-loader",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "requ\\u0069re('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "optional-shell-loader",
+  "v3": 85,
+  "kind": "detection",
   "file": "index.js",
   "src": "require?.('child_process');",
-  "kind": "detection",
-  "v3": 85,
   "v4": 95,
   "v5": 85,
   "signals": {
    "shell-exec": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-shell-fetch",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid/curl -s example.invalid | sh');",
-  "kind": "precision",
   "why": "a URL holding shell text is sent, not run: shell-exec is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 85,
   "signals": {
@@ -1258,15 +1440,17 @@
    "shell-exec": "confirmed",
    "network": "confirmed"
   },
-  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-credentials",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const x = require('path').join('.npmrc');",
-  "kind": "precision",
   "why": "path.join builds a path but nothing reads it: credential-access is possible",
-  "v3": 75,
   "v4": 75,
   "v5": 92,
   "signals": {
@@ -1276,15 +1460,17 @@
   "signals7": {
    "credential-access": "confirmed"
   },
-  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands"
+  "floor": "the path `path.join('.npmrc')` builds is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands",
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  },
  {
   "name": "false-decoded-body",
+  "v3": 65,
+  "kind": "precision",
   "file": "index.js",
   "src": "fetch('https://example.invalid', {body:'cmVxdWlyZSgnY2hpbGRfcHJvY2Vzcycp'});",
-  "kind": "precision",
   "why": "a base64 request body is sent, not decoded or run: what it decodes to is possible",
-  "v3": 65,
   "v4": 65,
   "v5": 82,
   "signals": {
@@ -1302,11 +1488,11 @@
  },
  {
   "name": "false-builtin-read",
+  "v3": 85,
+  "kind": "precision",
   "file": "index.js",
   "src": "require('fs').readFileSync('child_process');",
-  "kind": "precision",
   "why": "reading a file named child_process does not load the module: shell-exec is possible",
-  "v3": 85,
   "v4": 85,
   "v5": 95,
   "signals": {
@@ -1316,15 +1502,17 @@
   "signals8": {
    "shell-exec": "confirmed"
   },
-  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
+  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it",
+  "v10": 100,
+  "v10why": "apm-score-v10 lists filesystem, shell as capabilities at no cost; no risk signal"
  },
  {
   "name": "false-member-ref",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const obj={exec:1}; const x=obj['ex'+'ec'];",
-  "kind": "precision",
   "why": "the built name is read from a local object and never called: obfuscated is confirmed, shell-exec possible",
-  "v3": 75,
   "v4": 75,
   "v5": 85,
   "signals": {
@@ -1336,76 +1524,88 @@
    "shell-exec": "confirmed",
    "obfuscated": "confirmed"
   },
-  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)"
+  "floor": "the member the built name reads is held in `x` is a top-level binding of a file that may run as a classic script, where every other script on the page can read it; apm sees no read of it, but cannot prove there is none, so apm-score-v3's verdict stands (another script could call it)",
+  "v10": 65,
+  "v10why": "apm-score-v10 lists shell as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "function-parenthesized",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "(Function)(`fetch('https://example.invalid')`)();",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "function-alias-original",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "const Fn = globalThis.Function; Fn('globalThis.x = 1')();\n",
-  "kind": "detection",
-  "v3": 90,
   "v4": 97,
   "v5": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "function-alias-fetch",
+  "v3": 80,
+  "kind": "detection",
   "file": "index.js",
   "src": "const Fn = globalThis.Function; Fn(\"fetch('https://example.invalid')\")();",
-  "kind": "detection",
-  "v3": 80,
   "v4": 97,
   "v5": 80,
   "signals": {
    "network": "confirmed",
    "eval": "confirmed"
-  }
+  },
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "isDefinition-comment",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "fetch(/* ) { */'https://example.invalid');",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "isTypeImport-url",
+  "v3": 90,
+  "kind": "detection",
   "file": "index.js",
   "src": "import('https://example.invalid/module.js').Anything;",
-  "kind": "detection",
-  "v3": 90,
   "v4": 100,
   "v5": 90,
   "signals": {
    "network": "confirmed"
-  }
+  },
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "joined-floor",
+  "v3": 30,
+  "kind": "detection",
   "file": "index.js",
   "src": "// 'fetch'\nrequire('child_process');process.env.NPM_TOKEN;eval('1');globalThis['fe'+'tch']('https://example.invalid');",
-  "kind": "detection",
-  "v3": 30,
   "v4": 40,
   "v5": 30,
   "signals": {
@@ -1414,15 +1614,17 @@
    "network": "confirmed",
    "eval": "confirmed",
    "obfuscated": "confirmed"
-  }
+  },
+  "v10": 62,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "token-string",
+  "v3": 75,
+  "kind": "precision",
   "file": "index.js",
   "src": "const help='NPM_TOKEN';",
-  "kind": "precision",
   "why": "a token name in a string that nothing reads from the environment: credential-access is possible",
-  "v3": 75,
   "v4": 100,
   "v5": 92,
   "signals": {
@@ -1432,6 +1634,8 @@
   "signals7": {
    "credential-access": "confirmed"
   },
-  "floor": "the token name is held in `help`, a top-level binding of a file that may run as a classic script, where every other script can read it; apm cannot prove nothing does, so apm-score-v3's verdict stands"
+  "floor": "the token name is held in `help`, a top-level binding of a file that may run as a classic script, where every other script can read it; apm cannot prove nothing does, so apm-score-v3's verdict stands",
+  "v10": 97,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
  }
 ]

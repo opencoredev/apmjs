@@ -11,6 +11,10 @@ import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts,
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { ambiguousPaths, type TarEntry } from "./tarball.ts";
+import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
+import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
+
+export { CAPABILITY_IDS, declarationOf, type CapabilityId, type Declaration } from "./declare.ts";
 
 export { isInlineDownload } from "./scripts.ts";
 
@@ -36,6 +40,20 @@ export const SIGNAL_IDS = [
   "git-install-script",
   "dynamic-require",
   "unanalyzed-files",
+  // apm-score-v10's risk signals; the code signals above (shell-exec, network, eval, binary, credential-access) are
+  // capabilities since v10, and stay here so analyses stored by earlier scorers still read
+  "install-network",
+  "install-shell",
+  "install-eval",
+  "credential-read",
+  "credential-mention",
+  "encoded-data",
+  "exfiltration",
+  "capture-endpoint",
+  "remote-shell",
+  "runs-decoded-code",
+  "suspicious-combination",
+  "undeclared-capability",
 ] as const;
 
 export type SignalId = (typeof SIGNAL_IDS)[number];
@@ -52,8 +70,12 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * harmless; a limit, a value it cannot follow or syntax it does not model leaves v3's finding standing. v8 keeps only
  * the proofs that rest on how code is read (comments, regex bodies, erased types, JSON). v9 keeps none: v3's rules read
  * all text, in every file v3 reads and every file v8 reads, and the tree can only add findings and choose citations.
+ * v10 changes what costs points: what a package can do (network, environment, filesystem, processes, dynamic code,
+ * native code, install scripts) is listed as a capability for nothing, each with v9's evidence, and points go to what
+ * malware does (install-time network and processes, credential files read, the environment sent out, capture
+ * endpoints, remote shells, obfuscation, look-alike names) and to capabilities a package's own declaration leaves out.
  */
-export const SCORER = "apm-score-v9";
+export const SCORER = "apm-score-v10";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -99,6 +121,30 @@ const FactsSchema = z.object({
 const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(SKIP_REASONS) });
 
 /**
+ * A capability (apm-score-v10): something the package can do, shown with its evidence and never scored on its own.
+ * `status` compares it with the package's declaration: `declared` and `undeclared` when the package declares
+ * capabilities, `not-declared` when it declares none, `unused` for a declared capability apm saw no use of. `basis`
+ * says what the evidence rests on: a call or load the parsed program showed (or a command, a file, a script), only
+ * text matches, or only possible evidence.
+ */
+const CapabilitySchema = z.object({
+  id: z.enum(CAPABILITY_IDS),
+  label: z.string(),
+  status: z.enum(["declared", "undeclared", "not-declared", "unused"]),
+  basis: z.enum(["code", "text", "possible", "none"]),
+  /** What the declaration says for this capability, as written. */
+  declared: z.string().optional(),
+  evidence: z.array(z.string()),
+  more: z.array(z.string()).optional(),
+  uncounted: z.number().optional(),
+  sources: z.array(z.string()).optional(),
+  /** For `env`: the variable names read (`*` for a name built at runtime). */
+  names: z.array(z.string()).optional(),
+  /** Names read that a declared list does not cover. Shown, not scored. */
+  outside: z.array(z.string()).optional(),
+});
+
+/**
  * What a static read of the tarball cannot see, in plain words. Shown with every score; docs/SCORE.md explains each.
  * The website shows this list as written and folds the per-file reading limits (LIMIT_NOTES in js.ts) into one line.
  */
@@ -106,18 +152,23 @@ export const NOT_CHECKED: readonly string[] = [
   "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
   "code hidden by a custom encoding, compression or encryption",
   "the code of its dependencies, beyond their own scores",
+  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone costs nothing",
   "native binaries and WebAssembly: listed, not read",
   "whether the publisher's machine or CI was compromised",
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", "apm-score-v9", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
   skipped: z.array(SkippedSchema).default([]),
   /** Evidence an apm reviewer dismissed for these exact bytes and this scorer; the score leaves it out. */
   dismissed: z.array(DismissedSchema).optional(),
+  /** What the package can do (apm-score-v10); empty for earlier scorers. */
+  capabilities: z.array(CapabilitySchema).default([]),
+  /** Whether the package declares its capabilities, and what apm could not use in the declaration. */
+  declaration: z.object({ kind: z.enum(["none", "declared"]), notes: z.array(z.string()) }).optional(),
 });
 
 export type Signal = z.infer<typeof SignalSchema>;
@@ -130,6 +181,8 @@ export type Analysis = z.infer<typeof AnalysisSchema>;
 
 export type DismissedEvidence = z.infer<typeof DismissedSchema>;
 
+export type Capability = z.infer<typeof CapabilitySchema>;
+
 export type Grade = "A" | "B" | "C" | "D" | "F";
 
 export type ScoreReport = Analysis & { score: number; grade: Grade };
@@ -137,42 +190,75 @@ export type ScoreReport = Analysis & { score: number; grade: Grade };
 export const SCORE_FLOOR = 40;
 export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * What each signal costs (apm-score-v10). docs/SCORE.md gives the reason for each weight. The code signals v9 scored
+ * (shell-exec, network, eval, binary, credential-access) keep their v9 points here only so a stored v9 analysis reads
+ * the same; v10 never raises them, it lists those as capabilities.
+ */
 export const POINTS: Record<SignalId, number> = {
-  "install-script": -15,
-  "shell-exec": -15,
-  network: -10,
-  "credential-access": -25,
-  eval: -10,
-  obfuscated: -10,
-  binary: -5,
-  "new-publisher": -10,
-  "no-license": -3,
-  typosquat: -20,
+  // install time: what runs on `npm install`, by what it does there
+  "install-script": -10,
+  "install-network": -25,
+  "install-shell": -15,
+  "install-eval": -15,
   "install-download": -40,
+  "git-install-script": -10,
+  // what stealers and droppers do
+  "credential-read": -30,
+  exfiltration: -35,
+  "capture-endpoint": -50,
+  "remote-shell": -50,
+  "runs-decoded-code": -25,
+  obfuscated: -20,
+  "suspicious-combination": -15,
+  // weak evidence: text that only names a credential, data that only looks encoded
+  "credential-mention": -3,
+  "encoded-data": -2,
+  // who and what
+  typosquat: -20,
+  "new-publisher": -10,
   "risky-dependency": -30,
   "new-dependency": -5,
+  // a declaring package's first undeclared capability; each further one costs UNDECLARED_MORE, to UNDECLARED_MAX
+  "undeclared-capability": -10,
+  // status
+  deprecated: -5,
+  yanked: -10,
+  revoked: -100,
   // an analysis that did not read every file that runs can never pass the floor on its own
   incomplete: -(100 - SCORE_FLOOR + 1),
-  // informational: age is handled by the cooldown, never by the number
-  recent: 0,
-  deprecated: -5,
-  yanked: 0,
-  revoked: -100,
-  "git-install-script": -10,
-  // informational: plugin loaders do this honestly, and every file is read anyway; it marks code apm could not follow
-  "dynamic-require": 0,
   "unanalyzed-files": -20,
+  // informational: age is handled by the cooldown; plugin loaders compute requires honestly; a license is not a risk
+  recent: 0,
+  "dynamic-require": 0,
+  "no-license": 0,
+  // apm-score-v9 and earlier only (capabilities since v10)
+  "shell-exec": -15,
+  network: -10,
+  eval: -10,
+  binary: -5,
+  "credential-access": -25,
 };
 
-/** Signals the source rules can only suspect, and what each costs then: a third or so of the confirmed points. */
-type CodeSignalId = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated";
+const UNDECLARED_MORE = -5;
+const UNDECLARED_MAX = -20;
+
+/** Each unusual combination past the first adds this, to COMBINATION_MAX. */
+const COMBINATION_MORE = -10;
+const COMBINATION_MAX = -30;
+
+/** Signals whose evidence a text rule can only suspect, and what each costs then: a third or so of the confirmed points. */
+type CodeSignalId = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated" | "credential-read" | "credential-mention" | "encoded-data";
 
 export const POSSIBLE_POINTS: Record<CodeSignalId, number> = {
   "shell-exec": -5,
   network: -3,
   "credential-access": -8,
   eval: -3,
-  obfuscated: -3,
+  obfuscated: -7,
+  "credential-read": -10,
+  "credential-mention": -1,
+  "encoded-data": -1,
 };
 
 const POSSIBLE_LABELS: Record<CodeSignalId, string> = {
@@ -181,13 +267,16 @@ const POSSIBLE_LABELS: Record<CodeSignalId, string> = {
   "credential-access": "Possible credential access: names a credential file or token, but apm did not see it read",
   eval: "Possible eval: keeps a way to run code built at runtime, but apm did not see it used",
   obfuscated: "Possibly obfuscated: holds encoded or assembled text that apm did not see run",
+  "credential-read": "Possible credential read: names a credential file near a read, but apm did not see it read",
+  "credential-mention": "Possibly names a credential file or token variable",
+  "encoded-data": "Possibly holds encoded data",
 };
 
 /**
- * A confirmed code signal whose every piece of evidence is a text match (no call or load the parsed program showed)
+ * A confirmed v9 code signal whose every piece of evidence is a text match (no call or load the parsed program showed)
  * says what was found, not what the code does. The points are the same: v3's rules count the match.
  */
-const TEXT_LABELS: Record<CodeSignalId, string> = {
+const TEXT_LABELS: Partial<Record<CodeSignalId, string>> = {
   "shell-exec": "Mentions a shell command or child_process; apm did not see one started",
   network: "Mentions a network call (fetch, http, a socket); apm did not see a request made",
   "credential-access": "Mentions a credential file (.npmrc, .ssh) or secret variable; apm did not see one read",
@@ -205,7 +294,7 @@ const LABELS: Record<SignalId, string> = {
   network: "Uses the network: fetch, http, sockets, or a module that makes requests",
   "credential-access": "Reads credential files or secret environment variables",
   eval: "Evaluates code built at runtime (eval, Function, vm)",
-  obfuscated: "Contains obfuscated code",
+  obfuscated: "Obfuscated: obfuscator output, or dangerous names hidden by joining or encoding strings",
   binary: "Ships compiled binaries that cannot be reviewed as source",
   "new-publisher": "Published by an account that never published this package before",
   "no-license": "No license declared",
@@ -221,6 +310,29 @@ const LABELS: Record<SignalId, string> = {
   "git-install-script": "Runs shell or network commands when installed from git (prepare, prepack)",
   "dynamic-require": "Loads code by a name built at runtime, so apm could not tell which file runs",
   "unanalyzed-files": "Some files were not analyzed: the package is larger than the analysis reads",
+  "install-network": "Uses the network at install time",
+  "install-shell": "Starts processes at install time",
+  "install-eval": "Runs code built at runtime at install time",
+  "credential-read": "Reads credential files (.npmrc, .ssh, cloud credentials, browser profiles)",
+  "credential-mention": "Names a credential file or token variable; apm did not see a credential file read",
+  "encoded-data": "Holds long encoded data (base64 or \\x runs) that decodes to no readable text",
+  exfiltration: "Collects the environment, secrets or machine details and uses the network in the same code",
+  "capture-endpoint": "Sends to a data-capture endpoint (a request bin, a webhook with its key, a raw tunnel)",
+  "remote-shell": "Opens a remote shell, or downloads code and runs it",
+  "runs-decoded-code": "Runs code it decoded or assembled from strings, or keeps a network, process or credential call inside a string it runs",
+  "suspicious-combination": "Combines capabilities the way malware does",
+  "undeclared-capability": "Uses a capability its own package.json declaration leaves out",
+};
+
+/** What each capability is, in the words the version page and the CLI use. */
+export const CAPABILITY_LABELS: Record<CapabilityId, string> = {
+  network: "Network: makes requests or opens sockets",
+  env: "Environment variables: reads process.env",
+  filesystem: "Filesystem: loads fs to read or write files",
+  shell: "Processes and shell: starts commands or loads child_process",
+  eval: "Dynamic code: eval, Function, vm or a Worker from a string",
+  native: "Native code: ships compiled binaries or builds an addon",
+  install: "Install scripts: runs code when the package is installed",
 };
 
 /** Files that run by name: node, bun, deno, shells, PowerShell and Python. */
@@ -351,8 +463,9 @@ function labelOf(id: SignalId, confidence: Confidence, evidence: readonly string
   if (!isCodeSignal(id)) return LABELS[id];
 
   if (confidence === "possible") return POSSIBLE_LABELS[id];
+  const text = TEXT_LABELS[id];
 
-  return evidence.length > 0 && evidence.every(isTextEvidence) ? TEXT_LABELS[id] : LABELS[id];
+  return text !== undefined && evidence.length > 0 && evidence.every(isTextEvidence) ? text : LABELS[id];
 }
 
 /** Past the shown evidence: what is kept for a reviewer's dismissal, and how many more were not kept. */
@@ -380,6 +493,21 @@ function signal(id: SignalId, all: string[], confidence: Confidence = "confirmed
   if (isCodeSignal(id) && fallback.length > 0) out.fallback = fallback.slice(0, SHOWN_EVIDENCE);
 
   return out;
+}
+
+/** The files install commands run or read, as `analyze` reads them first. */
+function installRunsOf(commands: readonly { text: string }[], byPath: ReadonlyMap<string, TarEntry>): string[] {
+  const out = new Set<string>();
+
+  for (const c of commands) {
+    for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+      const f = resolveIn(byPath, w);
+
+      if (f && f.path !== "package.json") out.add(f.path);
+    }
+  }
+
+  return [...out];
 }
 
 /** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
@@ -485,6 +613,8 @@ type Cited = "tree" | "text" | "hidden";
 
 const CITED_RANK: Record<Cited, number> = { tree: 0, text: 1, hidden: 2 };
 
+const CITED_BY_RANK: readonly Cited[] = ["tree", "text", "hidden"];
+
 function citedAs(f: TextFinding): Cited {
   if (f.tree === true) return "tree";
 
@@ -496,6 +626,8 @@ type Found = {
   add: (id: SignalId, ev: string, confidence?: Confidence, cited?: Cited) => void;
   has: (id: SignalId) => boolean;
   get: (id: SignalId) => { evidence: string[]; confidence: Confidence; possible: string[] } | undefined;
+  /** Every confirmed piece of evidence, with what it rests on. */
+  confirmed: (id: SignalId) => { evidence: string; cited: Cited }[];
 };
 
 function collector(): Found {
@@ -516,6 +648,7 @@ function collector(): Found {
       found.set(id, entry);
     },
     has: (id) => found.has(id),
+    confirmed: (id) => (found.get(id)?.confirmed ?? []).map((evidence) => ({ evidence, cited: CITED_BY_RANK[rank.get(evidence) ?? 0] ?? "tree" })),
     get: (id) => {
       const entry = found.get(id);
 
@@ -558,8 +691,12 @@ function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[])
   return new Set(fields.flatMap((f) => (isRecord(manifest[f]) ? Object.keys(manifest[f]) : [])));
 }
 
-/** Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. */
-function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[]): void {
+/**
+ * Signals from the lifecycle scripts: what runs at install, at a git install, and on the publisher's machine. Returns
+ * the evidence it cited from commands that run at install, so the risk signals can tell install-time use apart.
+ */
+function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: readonly ExpandedHook[]): Set<string> {
+  const atInstall = new Set<string>();
   const installed = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies"]);
   // a git install also installs devDependencies before it runs prepare
   const gitInstalled = depNames(manifest, ["dependencies", "optionalDependencies", "peerDependencies", "devDependencies"]);
@@ -579,7 +716,11 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
       }
 
       for (const f of scanText(c.text, "plain")) {
-        found.add(f.id, `${label}${f.how === "as written" ? "" : ` (${f.how})`}`, f.confidence);
+        const ev = `${label}${f.how === "as written" ? "" : ` (${f.how})`}`;
+        found.add(f.id, ev, f.confidence);
+
+        // a git install runs prepare on the installing machine too: its commands count as install-time
+        if (h.kind !== "publish") atInstall.add(ev);
         risky = true;
       }
     }
@@ -591,6 +732,8 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
   for (const [k, cmd] of Object.entries(otherScripts(manifest, hooks))) {
     for (const f of scanText(cmd, "plain")) if (f.id === "credential-access" || f.id === "obfuscated") found.add(f.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`, f.confidence);
   }
+
+  return atInstall;
 }
 
 /** What the v3 walk needs from `analyze`, and what the walk there read whole (with v3's import pattern for each file). */
@@ -606,6 +749,8 @@ type V3Walk = {
   /** `file:line` of each computed load already reported. */
   dynamicAt: ReadonlySet<string>;
   add: Found["add"];
+  /** Called with the text of each file this walk reads that the first walk did not. */
+  read: (f: TarEntry, text: string) => void;
 };
 
 /** What the v3 walk could not read: run code too large or past the budget, and other files past the budget. */
@@ -680,7 +825,10 @@ function readLikeV3(w: V3Walk): V3Skips {
     let text: string | null = null;
     const textOf = (): string => (text ??= new TextDecoder().decode(f.data));
 
-    if (known === undefined) for (const finding of scanTextRules(textOf())) add(finding.id, describeFinding(f.path, finding), "confirmed", citedAs(finding));
+    if (known === undefined) {
+      for (const finding of scanTextRules(textOf())) add(finding.id, describeFinding(f.path, finding), "confirmed", citedAs(finding));
+      w.read(f, textOf());
+    }
 
     if (installTargets.has(f.path) && isShellScript(f, textOf()) && isInlineDownload(textOf())) add("install-download", `${f.path}: run by an install script and downloads code`);
 
@@ -754,8 +902,10 @@ export function analyze(input: AnalyzeInput): Analysis {
   const add = found.add;
   const byPath = new Map(files.map((f) => [f.path, f]));
   const hooks = expandHooks(manifest);
-  analyzeHooks(found, manifest, hooks);
+  const hookEvidence = analyzeHooks(found, manifest, hooks);
   const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
+  // what runs on every install (not only a git install), for the install-time risk signals
+  const everyInstall = hooks.filter((h) => h.kind === "install").flatMap((h) => h.commands);
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");
@@ -766,7 +916,10 @@ export function analyze(input: AnalyzeInput): Analysis {
     for (const cmd of gypCommands(new TextDecoder().decode(gyp.data))) {
       if (isInlineDownload(cmd)) add("install-download", `binding.gyp: ${cmd.slice(0, 80)}`);
 
-      for (const f of scanText(cmd, "plain")) add(f.id, `binding.gyp: ${cmd.slice(0, 80)}`, f.confidence);
+      for (const f of scanText(cmd, "plain")) {
+        add(f.id, `binding.gyp: ${cmd.slice(0, 80)}`, f.confidence);
+        hookEvidence.add(`binding.gyp: ${cmd.slice(0, 80)}`);
+      }
     }
   }
 
@@ -835,6 +988,9 @@ export function analyze(input: AnalyzeInput): Analysis {
   // files whose whole text the text rules read here, with v3's imports of each parsed one, for the v3 walk below
   const readWhole = new Map<TarEntry, Imports | null>();
   const dynamicAt = new Set<string>();
+  // what each file shows beyond the code signals, and which files each one loads, for the v10 risk signals
+  const fileFacts = new Map<string, Fact[]>();
+  const edges = new Map<string, Set<string>>();
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
     if (isBinary(f)) {
@@ -873,6 +1029,17 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
 
+    if (lang !== "json" && lang !== "declaration") fileFacts.set(f.path, readFacts(text, scan.hidden, scan.commands));
+
+    // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does
+    for (const c of scan.commands ?? []) {
+      for (const word of [...scriptTargets(c.value), ...commandWords(c.value)]) {
+        const target = resolveIn(byPath, joinPath(dirOf(f.path), word)) ?? resolveIn(byPath, word);
+
+        if (target && target.path !== f.path && target.path !== "package.json") edges.set(f.path, (edges.get(f.path) ?? new Set()).add(target.path));
+      }
+    }
+
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
     // every path apm-score-v3's pattern finds in the text is reached too, so no file v3 read goes unread
     const v3Imports = scan.read === "parsed" ? importsOf(joinStrings(text).text) : null;
@@ -891,6 +1058,8 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     for (const spec of imports.paths) {
       const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
+
+      if (target) edges.set(f.path, (edges.get(f.path) ?? new Set()).add(target.path));
 
       if (!target || seen.has(target.path)) continue;
 
@@ -931,7 +1100,11 @@ export function analyze(input: AnalyzeInput): Analysis {
   }
 
   // the floor: every file apm-score-v3 reads, in its order and within its budget, read whole by its rules
-  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add });
+  const readRaw = (f: TarEntry, text: string): void => {
+    if (!NEVER_RUN.test(f.path) && !fileFacts.has(f.path)) fileFacts.set(f.path, readFacts(text));
+  };
+
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
 
   for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
@@ -958,31 +1131,24 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
-  const order: SignalId[] = [
-    "incomplete",
-    "credential-access",
-    "install-download",
-    "shell-exec",
-    "install-script",
-    "git-install-script",
-    "risky-dependency",
-    "network",
-    "eval",
-    "obfuscated",
-    "unanalyzed-files",
-    "dynamic-require",
-    "typosquat",
-    "new-publisher",
-    "new-dependency",
-    "binary",
-    "no-license",
-  ];
+  const assessed = assess({
+    found,
+    fileFacts,
+    edges,
+    installRoots: [...installRunsOf(everyInstall, byPath), ...(gyp ? [gyp.path] : [])],
+    installBinaries: installRunsOf(everyInstall, byPath).filter((p) => {
+      const f = byPath.get(p);
 
-  const signals = order.flatMap((id) => {
-    const got = found.get(id);
-
-    return got ? [signal(id, got.evidence, got.confidence, got.possible)] : [];
+      return f !== undefined && isBinary(f);
+    }),
+    reached: reachable,
+    hookEvidence,
+    gyp: gyp !== undefined,
+    binPaths: new Set(entryPoints(manifest).flatMap((e) => (e.field.startsWith("bin") ? [joinPath("", e.path)] : []))),
+    declaration: declarationOf(manifest),
   });
+
+  const signals = assessed.signals;
 
   const notChecked = [
     ...NOT_CHECKED,
@@ -994,7 +1160,358 @@ export function analyze(input: AnalyzeInput): Analysis {
   // both walks can skip the same file
   const skippedOnce = new Map([...skipped, ...unanalyzed, ...v3.skipped, ...v3.unanalyzed].map((s) => [`${s.reason}:${s.path}`, s]));
 
-  return { scorer: SCORER, signals, facts, notChecked: [...new Set(notChecked)], skipped: [...skippedOnce.values()] };
+  return {
+    scorer: SCORER,
+    signals,
+    facts,
+    notChecked: [...new Set(notChecked)],
+    skipped: [...skippedOnce.values()],
+    capabilities: assessed.capabilities,
+    declaration: assessed.declaration,
+  };
+}
+
+// ---------- apm-score-v10: capabilities and risk signals ----------
+
+type AssessInput = {
+  found: Found;
+  fileFacts: ReadonlyMap<string, readonly Fact[]>;
+  /** The files each file loads by a path apm resolved. */
+  edges: ReadonlyMap<string, ReadonlySet<string>>;
+  /** What install hooks and binding.gyp run directly. */
+  installRoots: readonly string[];
+  installBinaries: readonly string[];
+  /** Files an entry point or an install hook reaches. */
+  reached: ReadonlySet<string>;
+  /** Evidence cited from install-time commands (hooks and binding.gyp). */
+  hookEvidence: ReadonlySet<string>;
+  gyp: boolean;
+  /** What package.json's `bin` names: programs the package ships on purpose. */
+  binPaths: ReadonlySet<string>;
+  declaration: Declaration;
+};
+
+type Assessed = { signals: Signal[]; capabilities: Capability[]; declaration: { kind: Declaration["kind"]; notes: string[] } };
+
+/** The order risk signals are listed in: the heaviest and most specific first. */
+const RISK_ORDER: readonly SignalId[] = [
+  "incomplete",
+  "remote-shell",
+  "capture-endpoint",
+  "credential-read",
+  "exfiltration",
+  "install-download",
+  "runs-decoded-code",
+  "install-network",
+  "install-shell",
+  "install-eval",
+  "obfuscated",
+  "suspicious-combination",
+  "risky-dependency",
+  "typosquat",
+  "undeclared-capability",
+  "install-script",
+  "git-install-script",
+  "unanalyzed-files",
+  "new-publisher",
+  "new-dependency",
+  "credential-mention",
+  "encoded-data",
+  "dynamic-require",
+  "no-license",
+];
+
+/** v9 evidence that a dangerous name was hidden: joined from pieces, decoded, or run from such a string. */
+const HIDDEN_NAME = /\((?:after joining strings|decoded|joined, then run|decoded, then run)\)|: builds "|: hides code in /;
+
+/** v9 evidence of code that ran from a decoded or joined string. */
+const DECODED_RUN = /\((?:decoded, then run|joined, then run)\)/;
+
+/** v9 evidence of a call found inside a string the program runs (`Function("fetch(u)")()`). */
+const STRING_RUN = /\(run from a string\)/;
+
+function factLine(path: string, f: Fact, note = ""): string {
+  return `${path}:${f.line}: ${f.snippet}${note}${f.text ? TEXT_MATCH : ""}${isTestPath(path) ? IN_TEST_FILE : ""}`;
+}
+
+/** What evidence rests on: a call, load, command or file (`code`), only text matches, or only possible evidence. */
+function basisOf(evidence: readonly string[], confidence: Confidence): Capability["basis"] {
+  if (evidence.length === 0) return "none";
+
+  if (confidence === "possible") return "possible";
+
+  return evidence.some((e) => !isTextEvidence(e)) ? "code" : "text";
+}
+
+/** The files `roots` load, directly or through other files, by paths apm resolved. */
+function closure(roots: readonly string[], edges: ReadonlyMap<string, ReadonlySet<string>>): Set<string> {
+  const out = new Set(roots);
+  const queue = [...roots];
+
+  for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
+    for (const to of edges.get(next) ?? []) {
+      if (out.has(to)) continue;
+      out.add(to);
+      queue.push(to);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * apm-score-v10's reading of everything `analyze` found: what the package can do (capabilities, never scored on their
+ * own) and what in it looks like malware (risk signals). Every v9 finding lands in one of the two, with its evidence:
+ * shell-exec, network, eval, binary and install-script are capabilities (install-script is also a risk signal), and
+ * credential-access and obfuscated become the risk signals that say how strong their evidence is.
+ */
+function assess(input: AssessInput): Assessed {
+  const { found, fileFacts, declaration } = input;
+  const installFiles = closure(input.installRoots, input.edges);
+  // a test file counts toward a risk only when code that runs loads it
+  const counts = (path: string): boolean => !isTestPath(path) || input.reached.has(path) || installFiles.has(path);
+  const factsIn = (path: string, kind: Fact["kind"]): Fact[] => (counts(path) ? (fileFacts.get(path) ?? []).filter((f) => f.kind === kind) : []);
+  const allFacts = (kind: Fact["kind"]): { path: string; fact: Fact }[] => [...fileFacts.keys()].flatMap((path) => factsIn(path, kind).map((fact) => ({ path, fact })));
+  // files where a code signal stands outside comments, regex bodies and types
+  const filesWith = (id: SignalId): Set<string> => new Set(found.confirmed(id).flatMap((e) => (e.cited === "hidden" ? [] : [citedSource(e.evidence)])));
+  const netFiles = filesWith("network");
+  const shellFiles = filesWith("shell-exec");
+  const atInstall = (id: SignalId): string[] => found.confirmed(id).flatMap((e) => (e.cited !== "hidden" && (input.hookEvidence.has(e.evidence) || installFiles.has(citedSource(e.evidence))) ? [e.evidence] : []));
+
+  const risks = new Map<SignalId, Signal>();
+
+  const put = (id: SignalId, evidence: string[], confidence: Confidence = "confirmed", fallback: readonly string[] = []): void => {
+    if (evidence.length > 0) risks.set(id, signal(id, evidence, confidence, fallback));
+  };
+
+  // v9's non-code signals keep their ids; their points are v10's
+  for (const id of ["incomplete", "install-download", "git-install-script", "risky-dependency", "typosquat", "install-script", "unanalyzed-files", "new-publisher", "new-dependency", "dynamic-require", "no-license"] as const) {
+    const got = found.get(id);
+
+    if (got) put(id, got.evidence, got.confidence, got.possible);
+  }
+
+  // install time, by what runs there
+  put("install-network", atInstall("network"));
+  put("install-shell", [...atInstall("shell-exec"), ...input.installBinaries.map((p) => `${p}: an install script runs this compiled program`)]);
+  put("install-eval", atInstall("eval"));
+
+  // credentials: a credential file read is heavy; a name in text is weak evidence
+  const reads = allFacts("credential-read").map(({ path, fact }) => factLine(path, fact, " (a credential path next to a file read)"));
+  // a credential path or token name an install command names, or one the code hid by joining or encoding it
+  const hookCredentials = found.confirmed("credential-access").flatMap((e) => (input.hookEvidence.has(e.evidence) ? [e.evidence] : []));
+  const hiddenCredentials = found.confirmed("credential-access").flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) && counts(citedSource(e.evidence)) ? [e.evidence] : []));
+  const credential = found.get("credential-access");
+
+  if (reads.length > 0 || hookCredentials.length > 0 || hiddenCredentials.length > 0) {
+    put("credential-read", [...new Set([...reads, ...hookCredentials, ...hiddenCredentials.map((e) => `${e} (a credential name hidden by joining or encoding)`), ...(credential?.evidence ?? [])])]);
+  }
+  else if (credential) put("credential-mention", credential.evidence, credential.confidence, credential.possible);
+
+  // obfuscation: obfuscator output or a hidden dangerous name is heavy; long encoded data alone is weak evidence
+  const obfuscator = allFacts("obfuscator");
+  const obfuscation = found.get("obfuscated");
+  const hiddenNames = found.confirmed("obfuscated").flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) ? [e.evidence] : []));
+
+  if (obfuscator.length > 0 || hiddenNames.length > 0) {
+    put("obfuscated", [...new Set([...obfuscator.map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "obfuscator output"})`)), ...hiddenNames, ...(obfuscation?.evidence ?? [])])]);
+  } else if (obfuscation) put("encoded-data", obfuscation.evidence, obfuscation.confidence, obfuscation.possible);
+
+  // code decoded or joined and then run, or a network, process or credential call kept in a string the program runs
+  const decodedRuns = (["shell-exec", "network", "credential-access", "eval", "obfuscated"] as const).flatMap((id) =>
+    found.confirmed(id).flatMap((e) => (DECODED_RUN.test(e.evidence) || (id !== "eval" && id !== "obfuscated" && STRING_RUN.test(e.evidence)) ? [e.evidence] : [])),
+  );
+
+  put("runs-decoded-code", [...new Set(decodedRuns)]);
+
+  put("capture-endpoint", allFacts("capture-endpoint").map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "endpoint"})`)));
+  put("remote-shell", [
+    ...allFacts("remote-shell").flatMap(({ path, fact }) => (shellFiles.has(path) || installFiles.has(path) ? [factLine(path, fact)] : [])),
+    ...allFacts("fetched-code").map(({ path, fact }) => factLine(path, fact, " (runs a value right after a network call)")),
+  ]);
+
+  // exfiltration: what a stealer collects, and the network, in one file or in the code that runs at install
+  const exfil: string[] = [];
+
+  for (const path of fileFacts.keys()) {
+    if (!counts(path)) continue;
+    const list = fileFacts.get(path) ?? [];
+    const secrets = list.filter((f) => f.kind === "env" && f.name !== undefined && secretFamily(f.name) !== null);
+    const families = new Set(secrets.map((f) => secretFamily(f.name ?? "")));
+    const install = installFiles.has(path);
+    const dump = list.find((f) => f.kind === "env-dump");
+    const credentialRead = list.find((f) => f.kind === "credential-read");
+    const host = install ? list.find((f) => f.kind === "host-info") : undefined;
+
+    const harvest: [Fact, string] | undefined = dump
+      ? [dump, "reads the whole environment"]
+      : credentialRead
+        ? [credentialRead, "reads a credential file"]
+        : families.size >= 3 && secrets[0]
+          ? [secrets[0], `reads ${[...families].join(", ")} tokens`]
+          : host
+            ? [host, "collects the machine's identity at install"]
+            : install && secrets[0]
+              ? [secrets[0], `reads ${secrets[0].name ?? "a token"} at install`]
+              : undefined;
+
+    if (!harvest) continue;
+    const sends = (netFiles.has(path) && harvest[0].near) || list.some((f) => f.kind === "capture-endpoint") || (install && atInstall("network").length > 0);
+
+    if (sends) exfil.push(factLine(path, harvest[0], ` (${harvest[1]}, and ${install && !netFiles.has(path) ? "install-time code uses" : "code beside it uses"} the network)`));
+  }
+
+  if (hookCredentials.length > 0 && atInstall("network").length > 0) exfil.push(...hookCredentials.map((e) => `${e} (an install command names a credential, and install-time code uses the network)`));
+  put("exfiltration", exfil);
+
+  // capabilities, each with v9's evidence (and, for env and filesystem, the facts above)
+  const capabilities: Capability[] = [];
+  const envFacts = allFactsAnywhere(fileFacts, "env");
+  const envNames = [...new Set(envFacts.map(({ fact }) => fact.name ?? "*"))];
+
+  const fromFound = (id: SignalId): { evidence: string[]; confidence: Confidence } => {
+    const got = found.get(id);
+
+    return got ? { evidence: got.evidence, confidence: got.confidence } : { evidence: [], confidence: "confirmed" };
+  };
+
+  const used: Record<CapabilityId, { evidence: string[]; confidence: Confidence }> = {
+    network: fromFound("network"),
+    env: { evidence: [...envFacts, ...allFactsAnywhere(fileFacts, "env-dump")].map(({ path, fact }) => factLine(path, fact)), confidence: "confirmed" },
+    filesystem: { evidence: allFactsAnywhere(fileFacts, "filesystem").map(({ path, fact }) => factLine(path, fact)), confidence: "confirmed" },
+    shell: fromFound("shell-exec"),
+    eval: fromFound("eval"),
+    native: { evidence: [...fromFound("binary").evidence, ...(input.gyp ? ["binding.gyp: node-gyp builds a native addon at install"] : [])], confidence: "confirmed" },
+    install: fromFound("install-script"),
+  };
+
+  const declared = declaration.kind === "declared" ? declaration.capabilities : {};
+
+  for (const id of CAPABILITY_IDS) {
+    const u = used[id];
+    const decl = declared[id];
+
+    if (u.evidence.length === 0) {
+      if (decl) capabilities.push({ id, label: CAPABILITY_LABELS[id], status: "unused", basis: "none", declared: decl.shown, evidence: [] });
+      continue;
+    }
+
+    const shown = signal("install-script", u.evidence, u.confidence);
+    const status: Capability["status"] = declaration.kind === "none" ? "not-declared" : decl ? "declared" : "undeclared";
+    const cap: Capability = { id, label: CAPABILITY_LABELS[id], status, basis: basisOf(u.evidence, u.confidence), evidence: shown.evidence };
+
+    if (shown.more) cap.more = shown.more;
+
+    if (shown.uncounted !== undefined) cap.uncounted = shown.uncounted;
+
+    if (shown.sources) cap.sources = shown.sources;
+
+    if (decl) cap.declared = decl.shown;
+
+    if (id === "env") {
+      cap.names = envNames.slice(0, 100);
+      const outside = decl && decl.patterns.length > 0 ? envNames.filter((n) => n !== "*" && !decl.patterns.some((p) => matchesPattern(n, p))) : [];
+
+      if (outside.length > 0) cap.outside = outside.slice(0, 50);
+    }
+
+    capabilities.push(cap);
+  }
+
+  // a declaring package's undeclared capabilities, where the code (not only text) shows them
+  const undeclared = capabilities.filter((c) => c.status === "undeclared" && c.basis === "code");
+
+  if (undeclared.length > 0) {
+    const s = signal("undeclared-capability", undeclared.map((c) => `${c.id}: ${c.evidence[0] ?? ""}`));
+    s.points = Math.max(UNDECLARED_MAX, POINTS["undeclared-capability"] + UNDECLARED_MORE * (undeclared.length - 1));
+    risks.set("undeclared-capability", s);
+  }
+
+  // combinations malware has and ordinary packages rarely do
+  const combos: string[] = [];
+  const cap = (id: CapabilityId): Capability | undefined => capabilities.find((c) => c.id === id && c.basis === "code");
+  const evalCap = cap("eval");
+  const netCap = cap("network");
+
+  if (evalCap && netCap && used.install.evidence.length > 0) combos.push(`runs code built at runtime (${evalCap.evidence[0] ?? ""}), uses the network (${netCap.evidence[0] ?? ""}) and runs a script at install`);
+  const obfuscatedFiles = new Set([...obfuscator.map(({ path }) => path), ...hiddenNames.map(citedSource)]);
+
+  const computedLoads = new Set((found.get("dynamic-require")?.evidence ?? []).map(citedSource));
+
+  for (const path of obfuscatedFiles) {
+    if (netFiles.has(path) || shellFiles.has(path)) combos.push(`${path}: obfuscated code that also ${netFiles.has(path) ? "uses the network" : "starts processes"}`);
+    else if (computedLoads.has(path)) combos.push(`${path}: obfuscated code that loads modules by names built at runtime`);
+  }
+
+  for (const { path, fact } of allFacts("capture-endpoint")) {
+    if (shellFiles.has(path)) combos.push(factLine(path, fact, " (a capture endpoint in a file that starts processes)"));
+  }
+
+  for (const { path, fact } of allFacts("detached")) {
+    if (installFiles.has(path) && shellFiles.has(path)) combos.push(factLine(path, fact, " (install-time code starts a process that outlives the install)"));
+  }
+
+  const executables = fromFound("binary").evidence.filter((e) => !citedSource(e).endsWith(".node") && !input.binPaths.has(citedSource(e)));
+
+  if (atInstall("shell-exec").length > 0 && executables.length > 0) combos.push(`starts processes at install and ships a compiled program (${executables[0] ?? ""})`);
+
+  if (found.has("typosquat") && used.install.evidence.length > 0) combos.push(`a name like a popular package's that runs a script at install (${used.install.evidence[0] ?? ""})`);
+  put("suspicious-combination", combos);
+  const combined = risks.get("suspicious-combination");
+
+  if (combined) combined.points = Math.max(COMBINATION_MAX, POINTS["suspicious-combination"] + COMBINATION_MORE * (combos.length - 1));
+
+  return {
+    signals: RISK_ORDER.flatMap((id) => {
+      const s = risks.get(id);
+
+      return s ? [s] : [];
+    }),
+    capabilities,
+    declaration: { kind: declaration.kind, notes: declaration.notes },
+  };
+}
+
+/** Every fact of one kind, test files included: capabilities list what a package ships. */
+function allFactsAnywhere(fileFacts: ReadonlyMap<string, readonly Fact[]>, kind: Fact["kind"]): { path: string; fact: Fact }[] {
+  return [...fileFacts].flatMap(([path, list]) => list.filter((f) => f.kind === kind).map((fact) => ({ path, fact })));
+}
+
+/** Where each v9 code signal lives since apm-score-v10: a capability, or a risk signal that says how strong its evidence is. */
+const V9_HOME: Record<CapabilityId, SignalId | null> = { network: "network", shell: "shell-exec", eval: "eval", native: "binary", install: "install-script", env: null, filesystem: null };
+
+const V9_ID: Partial<Record<SignalId, SignalId>> = { "credential-read": "credential-access", "credential-mention": "credential-access", "encoded-data": "obfuscated" };
+
+/**
+ * Every finding of an analysis under the id apm-score-v9 gave it, whether it is scored or not: a capability (network,
+ * shell, eval, native, install) as v9's code signal, `credential-read` and `credential-mention` as
+ * `credential-access`, `encoded-data` as `obfuscated`, and every other signal as itself. A capability costs 0 points
+ * here. This is what "detection did not shrink" is checked on: v10's findings include every v3 finding.
+ */
+export function findingsOf(analysis: Analysis): Signal[] {
+  const out = new Map<SignalId, Signal>();
+
+  for (const s of analysis.signals) {
+    const id = V9_ID[s.id] ?? s.id;
+
+    if (!out.has(id)) out.set(id, { ...s, id });
+  }
+
+  for (const c of analysis.capabilities) {
+    const id = V9_HOME[c.id];
+
+    if (id === null || c.status === "unused" || out.has(id)) continue;
+    const finding: Signal = { id, label: c.label, points: 0, evidence: c.evidence, confidence: c.basis === "possible" ? "possible" : "confirmed" };
+
+    if (c.more) finding.more = c.more;
+
+    if (c.uncounted !== undefined) finding.uncounted = c.uncounted;
+
+    if (c.sources) finding.sources = c.sources;
+    out.set(id, finding);
+  }
+
+  return [...out.values()];
 }
 
 export function gradeOf(score: number): Grade {
@@ -1034,8 +1551,27 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
 /** One evidence item an apm reviewer dismissed: the scorer that cited it, the signal, and the file and line it cites. */
 export type EvidenceDismissal = { scorer: string; signal: string; file: string; line: number; reason: string; at: number };
 
-/** The signals a reviewer may dismiss evidence of: what the source rules read, never a fact like an install script. */
-export const DISMISSABLE: ReadonlySet<string> = new Set<string>(["shell-exec", "network", "credential-access", "eval", "obfuscated"]);
+/**
+ * The signals a reviewer may dismiss evidence of: what the source rules read, never a fact like an install script or a
+ * name. The first five are the v9 code signals, for analyses earlier scorers stored.
+ */
+export const DISMISSABLE: ReadonlySet<string> = new Set<string>([
+  "shell-exec",
+  "network",
+  "credential-access",
+  "eval",
+  "obfuscated",
+  "credential-read",
+  "credential-mention",
+  "encoded-data",
+  "exfiltration",
+  "capture-endpoint",
+  "remote-shell",
+  "runs-decoded-code",
+  "install-network",
+  "install-shell",
+  "install-eval",
+]);
 
 const CITED_LINE = /^([^\s:][^:\n]*?):(\d+)(?=: |$)/;
 

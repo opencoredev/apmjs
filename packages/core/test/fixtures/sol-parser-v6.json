@@ -1,10 +1,10 @@
 [
   {
     "name": "tag-function",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "Function`process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')`();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -13,14 +13,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "extends-function",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "class F extends Function{};new F(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -29,14 +31,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "extends-function-super",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "class F extends Function{constructor(){super(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}}new F()();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -45,14 +49,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "prototype-constructor",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "Function.prototype.constructor(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -61,14 +67,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "constructor-chain",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "(()=>{}).constructor.prototype.constructor(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -77,14 +85,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "return-limit",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "function get(x){if(x===0)return eval;if(x===1)return 1;if(x===2)return 2;if(x===3)return 3;return 4;}get(0)(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -93,14 +103,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 70,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
   },
   {
     "name": "computed-bind",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "eval['bind'](null,\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -109,14 +121,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "symbol-key",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const k=Symbol('k');const o={[k]:eval};o[k](\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -125,14 +139,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "symbol-for",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const o={[Symbol.for('go')]:eval};o[Symbol.for('go')](\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -141,14 +157,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "generator-yield",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "function* get(){yield eval;}get().next().value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -157,14 +175,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "generator-return",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "function* get(){return eval;}get().next().value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -173,14 +193,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "async-generator",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.mjs",
     "src": "async function* get(){yield eval;}(await get().next()).value(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -189,14 +211,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "this-global",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const g=this;g.eval(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -205,14 +229,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "getter-this",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const o={x:eval,get go(){return this.x}};o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -221,14 +247,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "alias-write",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const o={};const alias=o;alias.go=eval;o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -237,14 +265,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "descriptor",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const d={get:()=>eval};const o={};Object.defineProperty(o,'go',d);o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -253,14 +283,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "proxy-target",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const o=new Proxy({go:eval},{});o.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -269,14 +301,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "namespace-merge",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.ts",
     "src": "namespace X {export const go=eval;}namespace X {go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -285,14 +319,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "namespace-declare",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.ts",
     "src": "declare namespace X {const unused:string;}namespace X {export const go=eval;}X.go(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -301,14 +337,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "returned-string",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "function get(){return \"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";}eval(get());\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 82,
     "v7": 30,
     "signals": {
@@ -317,14 +355,16 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 12,
+    "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: remote-shell -50, obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "parameter-function",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "function go(f,s){f(s)()}go(Function,\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
     "v6": 92,
     "v7": 30,
     "signals": {
@@ -333,58 +373,48 @@
       "network": "confirmed",
       "eval": "confirmed",
       "obfuscated": "confirmed"
-    }
+    },
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "precision-async",
+    "v3": 90,
+    "kind": "precision",
     "file": "index.js",
     "src": "async function get(){return eval;}get()(\"fetch('https://example.invalid')\");\n",
-    "kind": "precision",
-    "v3": 90,
     "v6": 80,
     "v7": 87,
     "signals": {
       "network": "confirmed",
       "eval": "possible"
     },
-    "why": "calling what an async function returns calls a Promise, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call"
+    "why": "calling what an async function returns calls a Promise, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call",
+    "v10": 100,
+    "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
   },
   {
     "name": "precision-generator",
+    "v3": 90,
+    "kind": "precision",
     "file": "index.js",
     "src": "function* get(){return eval;}get()(\"fetch('https://example.invalid')\");\n",
-    "kind": "precision",
-    "v3": 90,
     "v6": 80,
     "v7": 87,
     "signals": {
       "network": "confirmed",
       "eval": "possible"
     },
-    "why": "calling what a generator function returns calls a generator object, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call"
+    "why": "calling what a generator function returns calls a generator object, which throws before eval or fetch runs, so eval is no longer confirmed (v6 confirmed it and scored 80). The string's `fetch(` still counts as v3 counted it: `get` is a script's top-level binding, which another script could replace before the call",
+    "v10": 100,
+    "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
   },
   {
     "name": "candidate-limit",
+    "v3": 30,
+    "kind": "detection",
     "file": "index.js",
     "src": "const a=()=>1,b=()=>2,c=()=>3,d=()=>4,e=()=>5,f=()=>6;const v=[0,0,0,0,0,0];(v[0]?a:v[1]?b:v[2]?c:v[3]?d:v[4]?e:v[5]?f:eval)(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");\n",
-    "kind": "detection",
-    "v3": 30,
-    "v6": 89,
-    "v7": 30,
-    "signals": {
-      "credential-access": "confirmed",
-      "shell-exec": "confirmed",
-      "network": "confirmed",
-      "eval": "confirmed",
-      "obfuscated": "confirmed"
-    }
-  },
-  {
-    "name": "tag-eval",
-    "file": "index.js",
-    "src": "eval`require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')`;",
-    "kind": "precision",
-    "v3": 30,
     "v6": 89,
     "v7": 30,
     "signals": {
@@ -394,18 +424,40 @@
       "eval": "confirmed",
       "obfuscated": "confirmed"
     },
-    "why": "eval used as a tag is handed an array of the template's strings and returns it unrun. At a script's top level that array is the script's completion value, which code running the file through vm or eval receives, so v3's verdict stands; inside a function the same line proves harmless (see sol-parser-v6.test.ts)"
+    "v10": 62,
+    "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  },
+  {
+    "name": "tag-eval",
+    "v3": 30,
+    "kind": "precision",
+    "file": "index.js",
+    "src": "eval`require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')`;",
+    "v6": 89,
+    "v7": 30,
+    "signals": {
+      "credential-access": "confirmed",
+      "shell-exec": "confirmed",
+      "network": "confirmed",
+      "eval": "confirmed",
+      "obfuscated": "confirmed"
+    },
+    "why": "eval used as a tag is handed an array of the template's strings and returns it unrun. At a script's top level that array is the script's completion value, which code running the file through vm or eval receives, so v3's verdict stands; inside a function the same line proves harmless (see sol-parser-v6.test.ts)",
+    "v10": 62,
+    "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
   },
   {
     "name": "import-meta-resolve",
+    "v3": 85,
+    "kind": "detection",
     "file": "index.mjs",
     "src": "import(import.meta.resolve('node:child_process'));",
-    "kind": "detection",
-    "v3": 85,
     "v6": 95,
     "v7": 85,
     "signals": {
       "shell-exec": "confirmed"
-    }
+    },
+    "v10": 100,
+    "v10why": "apm-score-v10 lists shell as capabilities at no cost; no risk signal"
   }
 ]

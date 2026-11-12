@@ -1,7 +1,7 @@
 // Launch review blocker 6, and the v4 review's findings 1, 3 and 4: a comment must not hide code from the rules.
 // Comments come from the parser, so they end where JavaScript ends them. Payloads are inert stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, POINTS, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, type TarEntry } from "../src/index.ts";
 import { commentRanges, scanText, type Lang } from "../src/source.ts";
 
 function confirmed(text: string, lang: Lang = "js"): string[] {
@@ -73,8 +73,11 @@ describe("a comment cannot hide code (v4 review, findings 1, 3 and 4)", () => {
       const suffix = label.startsWith("an HTML") ? "\nconst end = '*/';" : "";
       const score = scoreOf("index.js", `${prefix}${PAYLOAD}${suffix}`);
 
-      expect(score).toBe(30);
-      expect(score).toBeLessThan(SCORE_FLOOR);
+      // v3 refused this payload (30); apm-score-v10 scores capabilities at 0, so the claim is that the prefix hides
+      // nothing: the file scores as the bare payload does, with the same confirmed findings
+      expect(score).toBe(scoreOf("index.js", PAYLOAD));
+      expect(score).toBeLessThan(100);
+      expect(confirmed(`${prefix}${PAYLOAD}${suffix}`)).toEqual(expect.arrayContaining(confirmed(PAYLOAD)));
     });
   }
 
@@ -91,7 +94,7 @@ describe("a comment cannot hide code (v4 review, findings 1, 3 and 4)", () => {
     ["index.js", "const a = <p>/*</p>; require('child_process'); const b = <p>*/</p>;"],
   ] as const) {
     test(`JSX child text that looks like a comment does not hide an expression (${file}: ${JSON.stringify(text.slice(10, 30))})`, () => {
-      expect(scoreOf(file, text)).toBe(100 + POINTS["shell-exec"]);
+      expect(confirmed(text, file.endsWith("x") ? (file.endsWith("tsx") ? "tsx" : "jsx") : "js")).toContain("shell-exec");
     });
   }
 });

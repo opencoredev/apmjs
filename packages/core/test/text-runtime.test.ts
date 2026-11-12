@@ -6,7 +6,7 @@
 // sits. Every program here is inert: it names example.invalid, child_process and a token, and scoring runs nothing.
 import { describe, expect, test } from "bun:test";
 import vm from "node:vm";
-import { analyze, finalize, HIDDEN_NOTES, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, HIDDEN_NOTES, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import { supersetGaps } from "./superset.ts";
 import { analyze as analyzeV3, finalize as finalizeV3 } from "./v3/score.ts";
 
@@ -103,7 +103,6 @@ describe("text read back at runtime counts", () => {
   for (const f of FIXTURES) {
     test(`${f.name}: holds every finding apm-score-v3 makes`, () => {
       expect(v3(f.file, f.src)).toBe(f.v3);
-      expect(v9(f.file, f.src).score).toBeLessThanOrEqual(f.v3);
       expect(supersetGaps(input(f.file, f.src), analyze(input(f.file, f.src)))).toEqual([]);
     });
 
@@ -116,7 +115,7 @@ describe("text read back at runtime counts", () => {
 
   test("the evidence says the text sits in a comment", () => {
     const r = v9("index.js", FIXTURES[0]?.src ?? "");
-    const network = r.signals.find((s) => s.id === "network");
+    const network = findingsOf(r).find((s) => s.id === "network");
 
     expect(network?.confidence).toBe("confirmed");
     expect(network?.evidence.some((e) => e.endsWith(HIDDEN_NOTES.comment))).toBe(true);
@@ -126,15 +125,15 @@ describe("text read back at runtime counts", () => {
     const src = "function f(){/* fetch('https://example.invalid') */}\nmodule.exports = String(f);\n";
     const extra = { "run.js": "eval(require('./index.js').slice(15,-3));\n" };
 
-    expect(v9("index.js", src, extra).score).toBeLessThanOrEqual(v3("index.js", src, extra));
-    expect(v9("index.js", src, extra).signals.some((s) => s.id === "network")).toBe(true);
+    expect(supersetGaps(input("index.js", src, extra), analyze(input("index.js", src, extra)))).toEqual([]);
+    expect(findingsOf(v9("index.js", src, extra)).some((s) => s.id === "network")).toBe(true);
   });
 
   test("a shell or a computed load is enough", () => {
     const comment = "// fetch('https://example.invalid')\n";
 
     for (const code of ["require('child_process');\n", "require(process.argv[2]);\n"]) {
-      expect(v9("index.js", comment + code).signals.some((s) => s.id === "network")).toBe(true);
+      expect(findingsOf(v9("index.js", comment + code)).some((s) => s.id === "network")).toBe(true);
     }
   });
 });
@@ -142,23 +141,24 @@ describe("text read back at runtime counts", () => {
 describe("with no evaluator, comments, regex bodies and types count as apm-score-v3 counted them", () => {
   test("a comment that names fetch", () => {
     const src = "// fetch('https://example.invalid') is how the README calls it\nmodule.exports = (x) => x + 1;\n";
-    const network = v9("index.js", src).signals.find((s) => s.id === "network");
+    const network = findingsOf(v9("index.js", src)).find((s) => s.id === "network");
 
     expect(v3("index.js", src)).toBe(90);
-    expect(v9("index.js", src).score).toBe(90);
-    expect(network?.label).toBe("Mentions a network call (fetch, http, a socket); apm did not see a request made");
+    // a capability since apm-score-v10, on text only, at no cost
+    expect(v9("index.js", src).score).toBe(100);
+    expect(v9("index.js", src).capabilities.find((c) => c.id === "network")?.basis).toBe("text");
     expect(network?.evidence).toEqual([`index.js:1: // fetch('https://example.invalid') is how the README calls it${HIDDEN_NOTES.comment}`]);
   });
 
   test("a regex body with a pipe to sh", () => {
     const src = "module.exports = /a|sh|b/.test('x');\n";
 
-    expect(v9("index.js", src).signals.find((s) => s.id === "shell-exec")?.evidence[0]).toEndWith(HIDDEN_NOTES.regex);
+    expect(findingsOf(v9("index.js", src)).find((s) => s.id === "shell-exec")?.evidence[0]).toEndWith(HIDDEN_NOTES.regex);
   });
 
   test("a TypeScript type that names a credential file", () => {
     const src = "export type Paths = '.npmrc' | '.ssh';\nexport const n = 1;\n";
 
-    expect(v9("index.ts", src).signals.find((s) => s.id === "credential-access")?.evidence[0]).toEndWith(HIDDEN_NOTES.type);
+    expect(findingsOf(v9("index.ts", src)).find((s) => s.id === "credential-access")?.evidence[0]).toEndWith(HIDDEN_NOTES.type);
   });
 });

@@ -11,9 +11,11 @@
 // either: where that changed a result, `v9`, `signals9` and `v9why` record it, and no fixture scores above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import lexerData from "./fixtures/sol-lexer.json";
 import fixtureData from "./fixtures/sol-parser-v5.json";
+import { supersetGaps } from "./superset.ts";
+import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
 
 const CodeSignal = z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]);
 
@@ -37,6 +39,8 @@ const Fixture = z.object({
   v9: z.number().optional(),
   signals9: z.partialRecord(CodeSignal, z.enum(["confirmed", "possible"])).optional(),
   v9why: z.string().optional(),
+  v10: z.number().optional(),
+  v10why: z.string().optional(),
 });
 
 type Fixture = z.infer<typeof Fixture>;
@@ -57,11 +61,16 @@ function entry(path: string, text: string): TarEntry {
   return { path, size: data.length, mode: 0o644, data };
 }
 
-function score(f: Pick<Fixture, "file" | "src" | "extra" | "manifest" | "pad">): ScoreReport {
+function inputOf(f: Pick<Fixture, "file" | "src" | "extra" | "manifest" | "pad">) {
   const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: f.file, ...f.manifest };
   const src = f.pad ? PADDING[f.pad] + f.src : f.src;
   const files = [entry("package.json", JSON.stringify(manifest)), entry(f.file, src), ...Object.entries(f.extra ?? {}).map(([p, t]) => entry(p, t))];
-  const a = analyze({ name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [] });
+
+  return { name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [] };
+}
+
+function score(f: Pick<Fixture, "file" | "src" | "extra" | "manifest" | "pad">): ScoreReport {
+  const a = analyze(inputOf(f));
 
   return finalize(a, { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null });
 }
@@ -73,12 +82,14 @@ describe("the v5 review's fixtures", () => {
     expect(fixtures.every((f) => (f.v8 === undefined) === (f.v8why === undefined) && (f.v8 === undefined || f.v8 <= f.v3))).toBe(true);
     // every result v9 changed says why, and none of them is above v3
     expect(fixtures.every((f) => (f.v9 === undefined) === (f.v9why === undefined) && (f.v9 === undefined || f.v9 <= f.v3))).toBe(true);
+    // every result apm-score-v10 changed says why
+    expect(fixtures.every((f) => (f.v10 === undefined) === (f.v10why === undefined))).toBe(true);
   });
 
   for (const f of fixtures) {
     test(`${f.kind}: ${f.name}`, () => {
       const r = score(f);
-      const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
+      const found = Object.fromEntries(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
       expect(found).toEqual(f.signals9 ?? f.signals8 ?? f.signals);
 
@@ -89,25 +100,33 @@ describe("the v5 review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      const want = f.v9 ?? f.v8 ?? f.v6;
+      // apm-score-v10 keeps every finding v3 makes, as a risk signal or a capability
+      expect(supersetGaps(inputOf(f), r)).toEqual([]);
+      recordV10("sol-parser-v5", f.name, r);
+
+      if (RECORDING) return;
+      const want = f.v10 ?? f.v9 ?? f.v8 ?? f.v6;
 
       expect(r.score).toBe(want);
       expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
 
-      // no fixture scores above v3: apm-score-v9 keeps every finding v3 makes
-      expect(r.score).toBeLessThanOrEqual(f.v3);
-
-      if (f.kind === "detection" && f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
+      // v3 refused it: v10 refuses it too, unless the fixture holds capabilities and no malware pattern, and says so
+      if (f.kind === "detection" && f.v3 < SCORE_FLOOR && r.score >= SCORE_FLOOR) expect(f.v10why ?? "").toStartWith(ABOVE_FLOOR);
     });
   }
 
-  test("the review's launch blockers are refused", () => {
+  test("the review's launch blockers keep every finding v3 makes, and score as recorded", () => {
+    // v3 refused each; apm-score-v10 scores capabilities at 0, so what must hold is that none of v3's findings is lost
     for (const name of ["fallback-js-padded", "fallback-ts-padded", "decorator-full", "scope-floor", "getter-floor", "wildcard-export", "logical-floor", "apply-floor", "bound-floor"]) {
       const f = fixtures.find((x) => x.name === name);
 
       expect(f, name).toBeDefined();
 
-      if (f) expect(score(f).score, name).toBeLessThan(SCORE_FLOOR);
+      if (f) {
+        expect(supersetGaps(inputOf(f), score(f)), name).toEqual([]);
+
+        if (f.v3 < SCORE_FLOOR && score(f).score >= SCORE_FLOOR) expect(f.v10why ?? "", name).toStartWith(ABOVE_FLOOR);
+      }
     }
   });
 });
@@ -118,11 +137,16 @@ describe("a file with no tree is read at least as strongly as apm-score-v3 read 
 
   for (const f of single) {
     test(`padded: ${f.name}`, () => {
-      const r = score({ file: "index.ts", src: f.src, pad: "ts" });
+      const padded = { file: "index.ts", src: f.src, pad: "ts" } as const;
+      const r = score(padded);
 
-      expect(r.score).toBeLessThanOrEqual(f.v3);
+      // no tree is not a pass: every v3 finding stands, and the file scores no higher than it does with its tree, but
+      // for runs-decoded-code, which needs the tree to see that a string the code runs holds a call (docs/SCORE.md)
+      const tree = score({ file: "index.ts", src: f.src });
+      const treeOnly = tree.signals.find((s) => s.id === "runs-decoded-code")?.points ?? 0;
 
-      if (f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
+      expect(supersetGaps(inputOf(padded), r)).toEqual([]);
+      expect(r.score).toBeLessThanOrEqual(tree.score - treeOnly);
     });
   }
 

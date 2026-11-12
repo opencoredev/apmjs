@@ -8,10 +8,12 @@
 // v7 reads there. apm-score-v8 scores every one of them as v7 did, and none above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry, findingsOf } from "../src/index.ts";
 import { tokenWindows } from "../src/source.ts";
 import { tokenText } from "../src/tokens.ts";
 import fixtureData from "./fixtures/sol-parser-v6.json";
+import { supersetGaps } from "./superset.ts";
+import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
 
 const Signals = z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"]));
 
@@ -25,6 +27,8 @@ const Fixture = z.object({
   v6: z.number(),
   v7: z.number(),
   signals: Signals,
+  v10: z.number().optional(),
+  v10why: z.string().optional(),
 });
 
 const fixtures = z.array(Fixture).parse(fixtureData);
@@ -39,11 +43,15 @@ function entry(path: string, text: string): TarEntry {
   return { path, size: data.length, mode: 0o644, data };
 }
 
-function scoreFiles(files: Record<string, string>, main: string): ScoreReport {
+function inputOf(files: Record<string, string>, main: string) {
   const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main };
   const tar = [entry("package.json", JSON.stringify(manifest)), ...Object.entries(files).map(([p, t]) => entry(p, t))];
 
-  return finalize(analyze({ name: "probe-pkg", manifest, files: tar, publisher: "a", previousPublishers: [] }), STATE);
+  return { name: "probe-pkg", manifest, files: tar, publisher: "a", previousPublishers: [] };
+}
+
+function scoreFiles(files: Record<string, string>, main: string): ScoreReport {
+  return finalize(analyze(inputOf(files, main)), STATE);
 }
 
 const P = "process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')";
@@ -59,7 +67,7 @@ describe("the v6 review's fixtures", () => {
   for (const f of fixtures) {
     test(`${f.kind}: ${f.name}`, () => {
       const r = scoreFiles({ [f.file]: f.src }, f.file);
-      const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
+      const found = Object.fromEntries(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
       expect(found).toEqual(f.signals);
 
@@ -70,12 +78,18 @@ describe("the v6 review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      expect(r.score).toBe(f.v7);
-      expect(r.score < SCORE_FLOOR).toBe(f.v7 < SCORE_FLOOR);
-      // precision fixtures too: none of them rests on a comment, a regex body or an erased type
-      expect(r.score).toBeLessThanOrEqual(f.v3);
+      // apm-score-v10 keeps every finding v3 makes, as a risk signal or a capability
+      expect(supersetGaps(inputOf({ [f.file]: f.src }, f.file), r)).toEqual([]);
+      recordV10("sol-parser-v6", f.name, r);
 
-      if (f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
+      if (RECORDING) return;
+      const want = f.v10 ?? f.v7;
+
+      expect(r.score).toBe(want);
+      expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
+
+      // v3 refused it: v10 refuses it too, unless the fixture holds capabilities and no malware pattern, and says so
+      if (f.kind === "detection" && f.v3 < SCORE_FLOOR && r.score >= SCORE_FLOOR) expect(f.v10why ?? "").toStartWith(ABOVE_FLOOR);
     });
   }
 
@@ -83,14 +97,15 @@ describe("the v6 review's fixtures", () => {
     // the template's strings are returned unrun only while eval is the builtin
     const r = scoreFiles({ "index.js": `function f(){eval\`${P}\`;}f();` }, "index.js");
 
-    expect(r.signals.filter((s) => s.id in POSSIBLE_POINTS).every((s) => s.confidence === "confirmed")).toBe(true);
-    expect(r.score).toBeLessThan(SCORE_FLOOR);
+    expect(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).every((s) => s.confidence === "confirmed")).toBe(true);
+    // apm-score-v10: the template is no help, it scores as the bare payload does
+    expect(r.score).toBeLessThanOrEqual(scoreFiles({ "index.js": P }, "index.js").score);
   });
 
   test("calling a Promise inside a function: what the string names counts as v3 counted it; eval, which v3 did not match, is possible", () => {
     const r = scoreFiles({ "index.js": "function f(){async function get(){return eval;}get()(\"fetch('https://example.invalid')\");}f();" }, "index.js");
 
-    expect(Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]))).toEqual({ eval: "possible", network: "confirmed" });
+    expect(Object.fromEntries(findingsOf(r).filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]))).toEqual({ eval: "possible", network: "confirmed" });
   });
 });
 
@@ -104,7 +119,7 @@ describe("a call split across the token pass's windows is still read (finding 5)
     for (const gap of [0, 70_000, 150_000]) {
       const r = scoreFiles({ "index.ts": windowed(gap) }, "index.ts");
 
-      expect(r.signals.find((s) => s.id === "network")?.confidence, `gap ${gap}`).toBe("confirmed");
+      expect(findingsOf(r).find((s) => s.id === "network")?.confidence, `gap ${gap}`).toBe("confirmed");
     }
   });
 
@@ -136,7 +151,9 @@ describe("a limit keeps what it could not follow, and says so", () => {
     if (!fixture) return;
     const r = scoreFiles({ [fixture.file]: fixture.src }, fixture.file);
 
-    expect(r.score).toBeLessThan(SCORE_FLOOR);
+    // apm-score-v10: hitting the limit is no help, the file scores no higher than the bare payload
+    expect(supersetGaps(inputOf({ [fixture.file]: fixture.src }, fixture.file), r)).toEqual([]);
+    expect(r.score).toBeLessThanOrEqual(scoreFiles({ "index.js": P }, "index.js").score);
     expect(r.notChecked.some((n) => n.startsWith("an expression with more than 6 possible values"))).toBe(true);
   });
 
@@ -144,7 +161,7 @@ describe("a limit keeps what it could not follow, and says so", () => {
     const returns = Array.from({ length: 40 }, (_, i) => `if(x===${i})return ${i};`).join("");
     const r = scoreFiles({ "index.js": `function get(x){${returns}return eval}get(0)(${JSON.stringify(P)});` }, "index.js");
 
-    expect(r.score).toBeLessThan(SCORE_FLOOR);
+    expect(supersetGaps(inputOf({ "index.js": `function get(x){${returns}return eval}get(0)(${JSON.stringify(P)});` }, "index.js"), r)).toEqual([]);
     expect(r.notChecked.some((n) => n.startsWith("a function with more than 32 return statements"))).toBe(true);
   });
 });
@@ -156,7 +173,7 @@ describe("no proof rests on a builtin being what its name says", () => {
     const patched = scoreFiles(files, "index.js");
 
     for (const r of [alone, patched]) {
-      expect(r.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+      expect(findingsOf(r).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
       expect(r.notChecked.some((n) => n.includes("could replace those builtins"))).toBe(false);
     }
   });

@@ -1,58 +1,64 @@
 [
  {
   "name": "comment-env",
+  "v3": 75,
   "family": "comment-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/*NPM_TOKEN*/}\nprocess.env[String(f).split('/*')[1].split('*/')[0]];\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "comment-network-key",
+  "v3": 90,
   "family": "comment-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/*fetch('https://example.invalid')*/}\nconst s=String(f).split('/*')[1].split('*/')[0];\nglobalThis[s.split('(')[0]](s.split(\"'\")[1]);\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 90,
   "runs": [
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "comment-path",
+  "v3": 75,
   "family": "comment-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/*.npmrc*/}\nrequire('fs').readFileSync(String(f).split('/*')[1].split('*/')[0]);\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "read:.npmrc"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "dynamic-entry-opaque-control",
+  "v3": 30,
   "family": "off-graph-load",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n"
   },
-  "v3": 30,
   "v8": 30,
   "v9": 30,
   "runs": [
@@ -60,10 +66,13 @@
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 95,
+  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
  },
  {
   "name": "dynamic-other-opaque",
+  "v3": 90,
   "family": "off-graph-load",
   "main": "index.js",
   "run": "run.js",
@@ -71,16 +80,18 @@
    "run.js": "function f(){/* fetch('https://example.invalid') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n",
    "index.js": "module.exports=1;\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 90,
   "runs": [
    "load:node:vm",
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "dynamic-other-opaque-floor",
+  "v3": 30,
   "family": "off-graph-load",
   "main": "index.js",
   "run": "run.js",
@@ -88,7 +99,6 @@
    "run.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nrequire(process.argv[2])[process.argv[3]](String(f).slice(15,-3));\n",
    "index.js": "module.exports=1;\n"
   },
-  "v3": 30,
   "v8": 100,
   "v9": 30,
   "runs": [
@@ -96,194 +106,220 @@
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 95,
+  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
  },
  {
   "name": "regex-env-convert",
+  "v3": 75,
   "family": "regex-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "const r=/NPM_TOKEN/;process.env[String(r).slice(1,-1)];\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "regex-network-key",
+  "v3": 90,
   "family": "regex-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "const r=/fetch('https:\\/\\/example.invalid')/;\nconst s=r.source.replace(/\\\\/g,'');\nglobalThis[s.split('(')[0]](s.split(\"'\")[1]);\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 90,
   "runs": [
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
  },
  {
   "name": "regex-path-convert",
+  "v3": 75,
   "family": "regex-as-data",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "const r=/.npmrc/;require('fs').readFileSync(String(r).slice(1,-1));\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "read:.npmrc"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "type-env",
+  "v3": 75,
   "family": "type-as-data",
   "main": "index.ts",
   "run": "index.ts",
   "files": {
    "index.ts": "type T = \"NPM_TOKEN\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nprocess.env[s.split('\"')[1]];\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists env, filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "type-path",
+  "v3": 75,
   "family": "type-as-data",
   "main": "index.ts",
   "run": "index.ts",
   "files": {
    "index.ts": "type T = \".npmrc\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nrequire(\"fs\").readFileSync(s.split('\"')[1]);\n"
   },
-  "v3": 75,
   "v8": 100,
   "v9": 75,
   "runs": [
    "read:.npmrc"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "worker-comment",
+  "v3": 90,
   "family": "worker-eval",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/* fetch('https://example.invalid') */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 80,
   "runs": [
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "worker-floor-comment",
+  "v3": 30,
   "family": "worker-eval",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1') */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
   },
-  "v3": 30,
   "v8": 100,
   "v9": 30,
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 95,
+  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-full-comment",
+  "v3": 40,
   "family": "worker-eval",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "function f(){/* process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN */}\nnew (require('worker_threads').Worker)(String(f).slice(15,-3),{eval:true});\n"
   },
-  "v3": 40,
   "v8": 100,
   "v9": 30,
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 95,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-regex",
+  "v3": 90,
   "family": "worker-eval",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "const r = /fetch('https:\\/\\/example.invalid')/;\nnew (require('worker_threads').Worker)(r.source,{eval:true});\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 80,
   "runs": [
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "worker-regex-full",
+  "v3": 30,
   "family": "worker-eval",
   "main": "index.js",
   "run": "index.js",
   "files": {
    "index.js": "const r=/process.getBuiltinModule('chi'+'ld_process');fetch('https:\\/\\/example.invalid');process.env.NPM_TOKEN;eval('1')/;\nnew (require('worker_threads').Worker)(r.source,{eval:true});\n"
   },
-  "v3": 30,
   "v8": 100,
   "v9": 30,
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-type",
+  "v3": 90,
   "family": "worker-eval",
   "main": "index.ts",
   "run": "index.ts",
   "files": {
    "index.ts": "type T = \"fetch('https://example.invalid')\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nnew (require(\"worker_threads\").Worker)(s.split('\"')[1],{eval:true});\n"
   },
-  "v3": 90,
   "v8": 100,
   "v9": 80,
   "runs": [
    "fetch:https://example.invalid"
-  ]
+  ],
+  "v10": 100,
+  "v10why": "apm-score-v10 lists network, filesystem, eval as capabilities at no cost; no risk signal"
  },
  {
   "name": "worker-type-floor-clean",
+  "v3": 40,
   "family": "worker-eval",
   "main": "index.ts",
   "run": "index.ts",
   "files": {
    "index.ts": "type T = \"process.getBuiltinModule('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";\nconst s = require(\"fs\").readFileSync(__filename,\"utf8\");\nnew (require(\"worker_threads\").Worker)(s.split('\"')[1],{eval:true});\n"
   },
-  "v3": 40,
   "v8": 100,
   "v9": 40,
   "runs": [
    "module:child_process",
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
-  ]
+  ],
+  "v10": 97,
+  "v10why": "apm-score-v10 lists network, filesystem, shell, eval as capabilities at no cost; risk signals: credential-mention -3"
  }
 ]

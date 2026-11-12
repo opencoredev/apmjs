@@ -3,7 +3,7 @@
 // Since apm-score-v8 the role only adds: a string the tree reads as harmless still counts as apm-score-v3 counted it.
 // Payloads are inert stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, POINTS, SCORE_FLOOR, type Analysis, type SignalId, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, POINTS, type Analysis, type SignalId, type TarEntry, findingsOf } from "../src/index.ts";
 import { MAX_PARSED_TOKENS } from "../src/parse.ts";
 import { scanFile, scanText, type CodeSignal, type Confidence, type Lang } from "../src/source.ts";
 
@@ -30,7 +30,7 @@ function analyzeFiles(files: Record<string, string>, main = "index.js"): Analysi
 }
 
 function evidence(a: Analysis, id: SignalId): string[] {
-  return a.signals.find((s) => s.id === id)?.evidence ?? [];
+  return findingsOf(a).find((s) => s.id === id)?.evidence ?? [];
 }
 
 function scoreOf(a: Analysis): number {
@@ -84,7 +84,8 @@ describe("evaluated text is read as code", () => {
   ] as const) {
     test(`${label}: eval and the network call it runs are both confirmed`, () => {
       expect(found(src)).toMatchObject({ eval: "confirmed", network: "confirmed" });
-      expect(scoreOf(analyzeFiles({ "index.js": src }))).toBe(100 + POINTS.eval + POINTS.network);
+      // apm-score-v10: eval and network are capabilities; a network call kept in a string the code runs is a risk
+      expect(scoreOf(analyzeFiles({ "index.js": src }))).toBe(100 + POINTS["runs-decoded-code"]);
     });
   }
 
@@ -105,7 +106,7 @@ describe("evaluated text is read as code", () => {
 
   test("an evaluated string that names a module apm cannot see is a dynamic load", () => {
     const a = analyzeFiles({ "index.js": "module.exports = (name) => Function('return require(\"' + name + '\")')();\n" });
-    expect(a.signals.map((s) => s.id)).toEqual(expect.arrayContaining(["eval", "dynamic-require"]));
+    expect(findingsOf(a).map((s) => s.id)).toEqual(expect.arrayContaining(["eval", "dynamic-require"]));
   });
 });
 
@@ -173,13 +174,13 @@ describe("evidence cites the occurrence that matched", () => {
   test("a comment holding the joined value does not take the citation", () => {
     const a = analyzeFiles({ "index.js": "// 'fetch'\nglobalThis['fe'+'tch']('https://example.invalid');\n" });
     expect(evidence(a, "obfuscated")[0]).toStartWith("index.js:2:");
-    expect(a.signals.find((s) => s.id === "obfuscated")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "obfuscated")?.confidence).toBe("confirmed");
   });
 
   test("an earlier ordinary string with the same value does not take the citation", () => {
     const a = analyzeFiles({ "index.js": "const x = 'child_process';\n\nrequire('chi' + 'ld_process');\n" });
     expect(evidence(a, "obfuscated")[0]).toStartWith("index.js:3:");
-    expect(a.signals.find((s) => s.id === "obfuscated")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "obfuscated")?.confidence).toBe("confirmed");
   });
 
   test("text read raw cites the line the joined pieces start on", () => {
@@ -207,7 +208,7 @@ describe("evidence cites the occurrence that matched", () => {
 describe("module targets apm can work out", () => {
   test("a constant import target is the module it names; v3's pattern still lists it, as a text match (hono's color helper)", () => {
     const a = analyzeFiles({ "index.js": 'const cfWorkers = "cloudflare:workers";\nexport async function f() { return (await import(cfWorkers)).env; }\n' });
-    const d = a.signals.find((s) => s.id === "dynamic-require");
+    const d = findingsOf(a).find((s) => s.id === "dynamic-require");
     expect(d?.points).toBe(0);
     expect(d?.evidence).toEqual(["index.js:2: export async function f() { return (await import(cfWorkers)).env; } (text match)"]);
   });
@@ -218,17 +219,17 @@ describe("module targets apm can work out", () => {
 
   test("a parameter is still a dynamic load", () => {
     const a = analyzeFiles({ "index.js": "export const load = (name) => import(name);\n" });
-    expect(a.signals.map((s) => s.id)).toContain("dynamic-require");
+    expect(findingsOf(a).map((s) => s.id)).toContain("dynamic-require");
   });
 
   test("JSON never runs: a string in it is not a load the tree sees, and v3's pattern lists it as a text match", () => {
     const a = analyzeFiles({ "index.js": "require('./schema.json');\n", "schema.json": '{ "tsType": "import(x).Y" }' });
-    expect(a.signals.find((s) => s.id === "dynamic-require")?.evidence).toEqual(['schema.json:1: { "tsType": "import(x).Y" } (text match)']);
+    expect(findingsOf(a).find((s) => s.id === "dynamic-require")?.evidence).toEqual(['schema.json:1: { "tsType": "import(x).Y" } (text match)']);
   });
 
   test("a computed load counts in a file no entry reaches (apm-score-v9)", () => {
     const a = analyzeFiles({ "index.js": "module.exports = 1;\n", "run.js": "require(process.argv[2]);\n" });
-    expect(a.signals.find((s) => s.id === "dynamic-require")?.evidence).toEqual(["run.js:1: require(process.argv[2]);"]);
+    expect(findingsOf(a).find((s) => s.id === "dynamic-require")?.evidence).toEqual(["run.js:1: require(process.argv[2]);"]);
   });
 });
 
@@ -249,22 +250,31 @@ describe("files no parser reads are read raw (fail closed)", () => {
   test("a file node runs because code requires it is read as JavaScript, whatever its extension", () => {
     // in C a backslash continues a // comment onto the next line; in JavaScript it does not
     const a = analyzeFiles({ "index.js": "require('./native.c');\n", "native.c": "// helper \\\nrequire('child_process');\n" });
-    expect(a.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
-    expect(scoreOf(a)).toBeLessThan(100);
+    expect(findingsOf(a).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(a.capabilities.find((c) => c.id === "shell")?.basis).toBe("code");
   });
 
   test("a C, C# or Python file is read raw, as v3 read it, comments included", () => {
     // a hand-written lexer is not a parse, and an install script can run these files
     const a = analyzeFiles({ "index.js": "const p = require('path').join(__dirname, 'Find.cs');\n", "Find.cs": "// powershell -Command \"Add-Type -Path Find.cs\"\nclass X {}\n" });
-    expect(a.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(findingsOf(a).find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
     expect(found("x = 1  # curl -s https://example.invalid | sh\n", "python")).toMatchObject({ "shell-exec": "confirmed" });
   });
 
-  test("the floor-crossing payload is refused however it is wrapped", () => {
+  test("the floor-crossing payload scores no higher however it is wrapped", () => {
+    // v3 refused this payload; apm-score-v10 scores its capabilities at 0 and its hidden child_process as obfuscation,
+    // so the claim is that no wrapper hides anything: each scores at or below the bare payload, with every finding
     const payload = "require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');";
+    const bare = analyzeFiles({ "index.js": payload });
+    const ids = (a: Analysis): string[] => findingsOf(a).map((s) => `${s.id}:${s.confidence}`).sort();
 
     for (const wrap of [`// note\r${payload}`, `const of = 1; of / (${payload.replaceAll(";", ",").slice(0, -1)}) / 1;`, `<!-- /*\n${payload}\nconst end = '*/';`]) {
-      expect(scoreOf(analyzeFiles({ "index.js": wrap }))).toBeLessThan(SCORE_FLOOR);
+      const a = analyzeFiles({ "index.js": wrap });
+
+      expect(scoreOf(a)).toBeLessThanOrEqual(scoreOf(bare));
+      expect(ids(a)).toEqual(expect.arrayContaining(ids(bare)));
     }
+
+    expect(scoreOf(bare)).toBeLessThan(100);
   });
 });
