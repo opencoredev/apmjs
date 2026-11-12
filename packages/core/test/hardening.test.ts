@@ -36,7 +36,7 @@ function header(f: TarFile, size: number): Uint8Array {
   return h;
 }
 
-function tar(files: TarFile[], opts: { truncateBy?: number } = {}): Uint8Array {
+function tar(files: TarFile[], opts: { truncateBy?: number } = {}): Uint8Array<ArrayBuffer> {
   const parts: number[] = [];
   for (const f of files) {
     const data = new TextEncoder().encode(f.data);
