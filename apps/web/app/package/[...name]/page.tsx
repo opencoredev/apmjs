@@ -7,8 +7,9 @@ import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fet
 import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
+import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
-import { splitLimitation, splitPossible, summarizeLimitations } from "@/lib/limitations";
+import { splitPossible, summarizeLimitations } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
@@ -97,16 +98,16 @@ function LimitationsLine({ notChecked }: { notChecked: readonly string[] }) {
     <p className="w-full text-sm leading-6 text-pretty text-inverse-muted">
       {s.headline}
       {s.extra && <span className="text-inverse-foreground"> {s.extra}</span>}{" "}
-      <a href="#not-checked" className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground">
-        All {s.total}
-      </a>
+      <OpenDetailsLink target="not-checked" className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground">
+        See all {s.total}
+      </OpenDetailsLink>
     </p>
   );
 }
 
 function LimitationsList({ notChecked }: { notChecked: readonly string[] }) {
   return (
-    <details id="not-checked" className="group scroll-mt-24 border-t border-inverse-border bg-inverse-raised">
+    <details id="not-checked" className="group scroll-mt-44 sm:scroll-mt-24 border-t border-inverse-border bg-inverse-raised">
       <summary className="flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-5 py-3 text-sm text-inverse-foreground select-none hover:bg-inverse-border/40 sm:px-6 [&::-webkit-details-marker]:hidden">
         <span>
           What this score does not check <span className="text-inverse-muted tabular-nums">({notChecked.length})</span>
@@ -114,16 +115,9 @@ function LimitationsList({ notChecked }: { notChecked: readonly string[] }) {
         <ChevronDownIcon className="size-4 text-inverse-muted transition-transform group-open:rotate-180" aria-hidden />
       </summary>
       <ul className="flex flex-col gap-2 px-5 pb-4 text-sm leading-6 text-pretty text-inverse-muted sm:px-6">
-        {notChecked.map((n) => {
-          const { topic, detail } = splitLimitation(n);
-
-          return (
-            <li key={n}>
-              <span className="text-inverse-foreground">{topic}</span>
-              {detail && `: ${detail}`}
-            </li>
-          );
-        })}
+        {notChecked.map((n) => (
+          <li key={n}>{n}</li>
+        ))}
       </ul>
     </details>
   );

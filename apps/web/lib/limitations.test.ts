@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { splitLimitation, splitPossible, summarizeLimitations } from "./limitations";
+import { splitPossible, summarizeLimitations } from "./limitations";
 
 const BASE = [
   "runtime behavior: code that downloads, decrypts or builds a second stage while running",
@@ -24,12 +24,7 @@ describe("summarizeLimitations", () => {
   });
 });
 
-describe("splitLimitation and splitPossible", () => {
-  test("a topic before its first colon is set apart", () => {
-    expect(splitLimitation(BASE[0] ?? "")).toEqual({ topic: "runtime behavior", detail: "code that downloads, decrypts or builds a second stage while running" });
-    expect(splitLimitation(BASE[1] ?? "")).toEqual({ topic: BASE[1], detail: null });
-  });
-
+describe("splitPossible", () => {
   test("possible evidence keeps its reason apart from the cited line", () => {
     expect(splitPossible('lib/a.js:3: ".npmrc", [possible: a string names a credential file]')).toEqual({ text: 'lib/a.js:3: ".npmrc",', why: "a string names a credential file" });
     expect(splitPossible("lib/a.js:3: fetch(u)")).toEqual({ text: "lib/a.js:3: fetch(u)", why: null });

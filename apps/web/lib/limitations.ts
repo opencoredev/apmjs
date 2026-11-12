@@ -27,17 +27,6 @@ export function summarizeLimitations(notChecked: readonly string[]): LimitationS
   return { headline: HEADLINE, extra: parts.length > 0 ? `Also: ${parts.join(", ")}.` : null, total: notChecked.length };
 }
 
-/** A full list entry split at its first colon, so the topic can be set apart from the detail. */
-export type LimitationParts = { topic: string; detail: string | null };
-
-export function splitLimitation(entry: string): LimitationParts {
-  const i = entry.indexOf(": ");
-
-  if (i <= 0 || i > 60) return { topic: entry, detail: null };
-
-  return { topic: entry.slice(0, i), detail: entry.slice(i + 2) };
-}
-
 /** Evidence the scorer marked as only possible ends in ` [possible: why]`; this splits the reason off. */
 export type PossibleEvidence = { text: string; why: string | null };
 
