@@ -233,3 +233,53 @@ describe("council round 2: Sol and DeepSeek findings", () => {
     expect(installedVersion(app, "apm-only-pkg-zz9")).toBe("1.0.0");
   });
 });
+
+describe("council round 2: Kimi findings", () => {
+  let reg: Registry;
+  let alice: string;
+  beforeAll(async () => {
+    reg = await startRegistry({ now: () => clock });
+    alice = await addUser(reg, "alice", PASSWORD);
+  });
+  afterAll(async () => {
+    await reg?.stop();
+  });
+
+  test("--force also overrides the cooldown for a package that only has fresh versions, but never a revoked one", async () => {
+    const { apm, installedVersion } = await import("./harness");
+    expect((await publish(reg, alice, { name: "brand-new-thing", version: "1.0.0" })).code).toBe(0);
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice, {});
+    const blocked = await apm(["add", "brand-new-thing"], { cwd: app, env: sb.env });
+    expect(blocked.code).not.toBe(0);
+    const forced = await apm(["add", "brand-new-thing", "--force"], { cwd: app, env: sb.env });
+    expect(forced.code, forced.out).toBe(0);
+    expect(installedVersion(app, "brand-new-thing")).toBe("1.0.0");
+    expect((await publish(reg, alice, { name: "gone-for-good", version: "1.0.0" })).code).toBe(0);
+    const rv = await getJson(`${reg.url}-/apm/v1/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${alice}` },
+      body: JSON.stringify({ name: "gone-for-good", version: "1.0.0", reason: "bad", password: PASSWORD }),
+    });
+    expect(rv.status).toBe(200);
+    const app2 = writeConsumer(work, reg, alice, {});
+    const r = await apm(["add", "gone-for-good", "--force"], { cwd: app2, env: sb.env });
+    expect(r.code).not.toBe(0);
+  });
+
+  test("apm add pkg@next installs the prerelease next points to, and a prerelease-only package resolves", async () => {
+    const { apm, installedVersion } = await import("./harness");
+    expect((await publish(reg, alice, { name: "channel-lib", version: "1.0.0" })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "channel-lib", version: "2.0.0-beta.1" })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "only-beta", version: "0.1.0-beta.0" })).code).toBe(0);
+    clock += 2 * DAY;
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice, {});
+    const r = await apm(["add", "channel-lib@next"], { cwd: app, env: sb.env });
+    expect(r.code, r.out).toBe(0);
+    expect(installedVersion(app, "channel-lib")).toBe("2.0.0-beta.1");
+    const r2 = await apm(["add", "only-beta"], { cwd: app, env: sb.env });
+    expect(r2.code, r2.out).toBe(0);
+    expect(installedVersion(app, "only-beta")).toBe("0.1.0-beta.0");
+  });
+});
