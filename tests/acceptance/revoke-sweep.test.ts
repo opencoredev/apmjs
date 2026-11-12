@@ -7,6 +7,9 @@
 // plain and under /~safe/. Every answer must have the status its probe expects and a body, and no marker may come back,
 // in a body or a header, except where ALLOWED names the exact route, status, field and marker.
 //
+// The website's agent views (apps/web/lib/agent: the Markdown view, and the MCP tools check_package, search_packages
+// and get_file_excerpt) are asked too, through their real registry port against this Worker, before and after.
+//
 // The routes come from the registry's own GET table (packages/registry/src/routes.ts), which the router enforces: a
 // GET the table does not list is refused before any module sees it. The sweep probes every entry, so a new GET route
 // is either swept here or never answered.
@@ -444,6 +447,7 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
+  agent?.stop();
   await reg?.stop();
   await model?.stop(true);
   await gh?.stop();
@@ -607,6 +611,76 @@ const short = (url: string): string => url.slice(reg.url.length - 1);
 const show = (hits: readonly Hit[]): string[] => [...new Set(hits.map((h) => `${h.caller} ${h.status} ${short(h.url)} ${h.where}: ${h.marker}`))];
 const showWrong = (w: readonly Wrong[]): string[] => w.map((x) => `${x.caller} ${short(x.url)}: wanted ${x.want}, got ${x.got} with ${x.bytes} bytes`);
 
+// ---------- the website's agent views, against this registry ----------
+/**
+ * One agent answer (apps/web/scripts/agent-views.ts): which view and request, its text and structured data as sent,
+ * and the exact phrases in which it repeats the asker's own input, which are not the package's text.
+ */
+const AgentAnswers = z.array(z.object({ view: z.string(), text: z.string(), echoes: z.array(z.string()) }));
+
+type AgentAnswer = z.infer<typeof AgentAnswers>[number];
+
+const SEARCHES = [NAME, "LEAKMARK", "LEAKMARK-description", "LEAKMARK-keyword"];
+
+const WEB_DIR = join(import.meta.dir, "../../apps/web");
+
+/** What agent-views.ts reads: the package, the versions and file paths to ask about, and the searches to run. */
+type AgentViewsInput = { name: string; versions: readonly string[]; paths: readonly string[]; searches: readonly string[] };
+
+/** The website's agent views in a process of their own (apps/web/scripts/agent-views.ts), pointed at this registry. */
+type AgentProcess = { ask: (input: AgentViewsInput) => Promise<string>; stop: () => void };
+
+function startAgentViews(registryUrl: string): AgentProcess {
+  const child = Bun.spawn(["bun", "--conditions=react-server", "scripts/agent-views.ts"], { cwd: WEB_DIR, env: { ...process.env, APM_REGISTRY: registryUrl }, stdin: "pipe", stdout: "pipe", stderr: "inherit" });
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+
+  const line = async (): Promise<string> => {
+    for (;;) {
+      const nl = buffered.indexOf("\n");
+
+      if (nl >= 0) {
+        const out = buffered.slice(0, nl);
+        buffered = buffered.slice(nl + 1);
+
+        return out;
+      }
+
+      const { done, value } = await reader.read();
+
+      if (done) throw new Error(`agent-views exited ${await child.exited} before answering`);
+      buffered += decoder.decode(value, { stream: true });
+    }
+  };
+
+  return {
+    ask: async (input) => {
+      void child.stdin.write(`${JSON.stringify(input)}\n`);
+      void child.stdin.flush();
+
+      return line();
+    },
+    stop: () => child.kill(),
+  };
+}
+
+let agent: AgentProcess | null = null;
+
+/**
+ * Every agent view of the marked package, read the way the website reads it: the registry's answer now, except where
+ * the site may keep one (search), from the same process before and after the revoke, so a kept answer would show.
+ */
+async function agentViews(): Promise<AgentAnswer[]> {
+  agent ??= startAgentViews(reg.url);
+
+  return AgentAnswers.parse(JSON.parse(await agent.ask({ name: NAME, versions: [...VERSIONS], paths: FILE_PATHS, searches: SEARCHES })));
+}
+
+/** Each marker an agent answer carries, with the view it came from. */
+const agentMarkers = (answers: readonly AgentAnswer[]): { view: string; marker: string }[] =>
+  answers.flatMap((a) => markersOf(a.echoes.reduce((t, e) => t.replaceAll(e, ""), a.text)).map((marker) => ({ view: a.view, marker })));
+
 describe("a revoked or revoke-pending version's text", () => {
   test("is shown on the routes the sweep asks before the revoke, so the sweep would see a leak", async () => {
     const { hits, wrong } = await sweep("before");
@@ -659,6 +733,20 @@ describe("a revoked or revoke-pending version's text", () => {
     expect(hits.some((h) => h.route === "staged detail" && h.caller === "site-owner" && h.marker === "LEAKMARK-description")).toBe(true);
   }, 120_000);
 
+  test("is shown by the website's agent views before the revoke, so the check after it would see a leak", async () => {
+    const seen = agentMarkers(await agentViews());
+    const by = (view: string) => new Set(seen.filter((m) => m.view.startsWith(view)).map((m) => m.marker));
+
+    // the Markdown view and check_package quote the description, the deprecation, the AI finding and the cited code
+    for (const view of ["markdown 1.1.0", 'check_package {"name":"sweep-fixture","version":"1.1.0"}']) {
+      for (const m of ["LEAKMARK-description", "LEAKMARK-deprecation", "LEAKMARK-review-issue", "LEAKMARK-js-string", "LEAKMARK-license"]) expect(by(view).has(m), `${view}: ${m}`).toBe(true);
+    }
+
+    expect(by("search_packages").has("LEAKMARK-description")).toBe(true);
+    expect(by("get_file_excerpt").has("LEAKMARK-js-string")).toBe(true);
+    expect(by("get_file_excerpt").has("LEAKMARK-dts")).toBe(true);
+  }, 120_000);
+
   test("is shown on no GET route after the revoke, to anyone, except where ALLOWED says why", async () => {
     for (const [name, version, status] of [
       [NAME, PENDING, "revoke-pending"],
@@ -681,6 +769,23 @@ describe("a revoked or revoke-pending version's text", () => {
     const unused = ALLOWED.flatMap((a) => (hits.some((h) => allows(a, h)) ? [] : [a.name]));
 
     expect({ wrong: showWrong(wrong), leaks: show(leaks), unused }).toEqual({ wrong: [], leaks: [], unused: [] });
+  }, 120_000);
+
+  test("is shown by none of the website's agent views after the revoke, except the owner's revoke reason", async () => {
+    const answers = await agentViews();
+    const leaks = agentMarkers(answers).filter((m) => m.marker !== REASON);
+    const md = answers.find((a) => a.view.startsWith(`markdown ${REVOKED} `));
+    const checked = answers.find((a) => a.view === `check_package ${JSON.stringify({ name: NAME, version: REVOKED })}`);
+    const excerpt = answers.find((a) => a.view === `get_file_excerpt ${JSON.stringify({ name: NAME, version: REVOKED, path: "index.js", line: 1 })}`);
+
+    expect([...new Set(leaks.map((m) => `${m.view}: ${m.marker}`))]).toEqual([]);
+    // the views answered, and the review is the registry's withheld one: its sentence and a file reference
+    expect(md?.view).toBe(`markdown ${REVOKED} (200)`);
+    expect(md?.text).toContain(`: \`${WITHHELD_ISSUE}\``);
+    expect(md?.text).toMatch(/Finding 1 \(high\) at `file \d+:2`/);
+    expect(checked?.text).toContain(`"issue":"${WITHHELD_ISSUE}"`);
+    expect(checked?.text).toContain('"deprecated":null');
+    expect(excerpt?.text).toContain(`${NAME}@\`${REVOKED}\` is revoked: apm shows none of its files.`);
   }, 120_000);
 });
 
