@@ -67,7 +67,7 @@ describe("the dependency tree is checked the way npm installs it", () => {
     const r = await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app`);
     expect(r.status, JSON.stringify(r.body)).toBe(422);
     const blocks = JSON.stringify(dig(r.body, "tree", "blocks"));
-    expect(blocks).toContain("hot-dep@1.0.0");
+    expect(blocks).toContain('"name":"hot-dep","version":"1.0.0"');
     expect(blocks).toMatch(/cooldown/);
     expect((await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app&cooldown=0`)).status).toBe(200);
   });
