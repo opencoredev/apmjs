@@ -916,7 +916,7 @@ async function cmdPublish(a: Args): Promise<number> {
     fail(`Refusing to publish ${id}: the tarball contains secrets. Narrow the "files" allowlist in package.json.`);
     return 1;
   }
-  for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} is too large to scan for secrets; check it yourself.`));
+  for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} was not scanned for secrets; check it yourself.`));
   const missing = missingEntries(manifest, files);
   if (missing.length > 0) {
     for (const m of missing) say(red(`✗ "${m.field}" points to ${m.path}, which is not in the tarball`));

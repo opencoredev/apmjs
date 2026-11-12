@@ -253,7 +253,7 @@ function makeOnPublish(env: Env): PublishHook {
         detail: secrets.findings,
       };
     }
-    const warnings = secrets.skipped.map((s) => `${describeSkip(s)} was too large to scan for secrets; check it yourself.`);
+    const warnings = secrets.skipped.map((s) => `${describeSkip(s)} was not scanned for secrets; check it yourself.`);
 
     const missing = missingEntries(tarManifest, files);
     if (missing.length > 0) {

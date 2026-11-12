@@ -10,8 +10,12 @@ export const MAX_ANALYZED_FILE_BYTES = 32 * 1024 * 1024;
  */
 export const MAX_SCANNED_BYTES = 200 * 1024 * 1024;
 
-/** "too-large": one file over MAX_ANALYZED_FILE_BYTES. "over-budget": the analysis had read MAX_SCANNED_BYTES already. */
-export type SkipReason = "too-large" | "over-budget";
+/**
+ * "too-large": one file over MAX_ANALYZED_FILE_BYTES. "over-budget": the analysis had read MAX_SCANNED_BYTES already.
+ * "compressed": an archive (gzip, zip, bzip2, xz, 7z, zstd) whose contents the secret scan cannot read.
+ */
+export const SKIP_REASONS = ["too-large", "over-budget", "compressed"] as const;
+export type SkipReason = (typeof SKIP_REASONS)[number];
 
 /** A file an analysis did not read. Its presence makes the analysis incomplete, never clean. */
 export type SkippedFile = { path: string; size: number; reason: SkipReason };
@@ -24,6 +28,8 @@ export function describeSkip(s: SkippedFile): string {
       return `${s.path} (${mb} MB, over the ${MAX_ANALYZED_FILE_BYTES / (1024 * 1024)} MB limit)`;
     case "over-budget":
       return `${s.path} (${mb} MB, past the analysis budget)`;
+    case "compressed":
+      return `${s.path} (a compressed archive; its contents are not read)`;
     default: {
       const _exhaustive: never = s.reason;
 

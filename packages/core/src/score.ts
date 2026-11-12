@@ -4,7 +4,7 @@
 // What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
-import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, type SkippedFile } from "./limits.ts";
+import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
 import { importsOf, joinStrings, scanText, type TextFinding } from "./source.ts";
@@ -53,7 +53,7 @@ const FactsSchema = z.object({
   dependencyCount: z.number(),
 });
 
-const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large", "over-budget"]) });
+const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(SKIP_REASONS) });
 
 /** What a static read of the tarball cannot see. Shown with every score; docs/SCORE.md explains each. */
 export const NOT_CHECKED: readonly string[] = [
