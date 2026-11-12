@@ -149,15 +149,6 @@ const reviewPath = (name: string, version: string): string => `-/apm/v1/review/$
  */
 export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
 
-// ---- uncached reads, for what an agent acts on (lib/agent): an install verdict or a view that names a version's status
-// must never repeat an answer from before a yank, a revoke or a confirmed AI review ----
-
-/** The package answer, straight from the registry. */
-export const getPackageUncached = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo);
-
-/** The public AI review of one version, straight from the registry. */
-export const getReviewUncached = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
-
 const VersionInfo = z.object({ version: z.string(), status: z.string(), statusReason: z.string().nullable(), deprecated: z.string().nullable(), facts: Facts.nullable(), score: PackageScore.nullable() });
 
 /** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
@@ -199,22 +190,8 @@ export async function getExcerpt(input: { name: string; version: string; path: s
   const path = excerptApiPath(input);
   const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS });
 
-  // a line past the end (416) is an answer the view explains, not an outage
-  if (result.kind === "unavailable" && !(result.reason.kind === "status" && result.reason.status === 416)) logUnavailable(path.split("?")[0] ?? path, result.reason);
-
-  return result;
-}
-
-/**
- * Lines of one file, straight from the registry, for an agent (the get_file_excerpt MCP tool): never from the edge
- * cache, so the registry decides on every read whether the version's source may be shown. A revoked version answers
- * 410; a line past the end, 416. Neither is logged as an outage.
- */
-export async function getExcerptUncached(input: { name: string; version: string; path: string; line: number; context: number }): Promise<Fetched<ExcerptAnswer>> {
-  const path = excerptApiPath(input);
-  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS });
-
-  if (result.kind === "unavailable" && !(result.reason.kind === "status" && (result.reason.status === 410 || result.reason.status === 416))) logUnavailable(path.split("?")[0] ?? path, result.reason);
+  // a line past the end (416) and a revoked version (410) are answers the view explains, not outages
+  if (result.kind === "unavailable" && !(result.reason.kind === "status" && (result.reason.status === 416 || result.reason.status === 410))) logUnavailable(path.split("?")[0] ?? path, result.reason);
 
   return result;
 }

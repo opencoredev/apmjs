@@ -31,6 +31,13 @@ export function isWithheld(status: string): boolean {
   return status === "revoked" || status === "revoke-pending";
 }
 
+/** Whether the view must show none of the version's source: its status says so, or the registry redacted an answer. */
+export function sourceWithheld(view: PackageView): boolean {
+  const statusSays = view.status !== null && isWithheld(view.status.status);
+
+  return statusSays || view.score?.redacted === true || (view.review.kind === "ok" && view.review.value.redacted);
+}
+
 /** One piece of evidence without the package's text: the file and line (or script) it cites, or nothing at all. */
 function evidenceWithoutSource(signal: string, evidence: string): string[] {
   if (!namesFile(signal)) return [evidence];
@@ -45,7 +52,7 @@ function evidenceWithoutSource(signal: string, evidence: string): string[] {
  * view is loaded (so the MCP tool's structured answer is cut too) and again before it is written out.
  */
 export function withholdSource(view: PackageView): PackageView {
-  if (view.status === null || !isWithheld(view.status.status)) return view;
+  if (!sourceWithheld(view)) return view;
   const score = view.score ? { ...view.score, signals: view.score.signals.map((s) => ({ ...s, evidence: s.evidence.flatMap((e) => evidenceWithoutSource(s.id, e)) })), dismissed: view.score.dismissed.map((d) => ({ ...d, evidence: [] })) } : null;
   const r = view.review;
 
@@ -140,7 +147,7 @@ function statusLine(status: NonNullable<PackageView["status"]>): string {
 export function packageMarkdown(input: PackageView): string {
   const view = withholdSource(input);
   const { pkg, version, score } = view;
-  const withheld = view.status !== null && isWithheld(view.status.status);
+  const withheld = sourceWithheld(view);
   const url = siteUrl(canonicalPackagePath(pkg.name));
   const older = version !== null && version !== pkg.latest;
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];

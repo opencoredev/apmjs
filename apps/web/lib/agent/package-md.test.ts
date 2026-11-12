@@ -229,3 +229,17 @@ describe("a revoked version shows no source", () => {
     expect(JSON.stringify(loaded)).not.toContain(SOURCE_LINE);
   });
 });
+
+// fix/revoke-closure's registry marks a withheld version's answers `redacted`; the view trusts that flag on its own too
+test("an answer the registry marked redacted withholds the source even when the status read says active", () => {
+  const base = pkg();
+  const clean = REVIEW_CLEAN.review;
+
+  if (!clean) throw new Error("REVIEW_CLEAN has a review");
+  const review = { ...REVIEW_CLEAN, redacted: true, review: { ...clean, findings: [{ file: "lib/a.js", line: 2, excerpt: "REDACTED-FLAG-SOURCE", issue: "Posts the environment", severity: "high" as const }] } };
+  const md = packageMarkdown({ pkg: base, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: base.facts, score: base.score, review: { kind: "ok", value: review }, registry: REGISTRY });
+
+  expect(md).toContain("- Source: withheld.");
+  expect(md).not.toContain("REDACTED-FLAG-SOURCE");
+  expect(md).not.toContain("/file/lib/index.js");
+});

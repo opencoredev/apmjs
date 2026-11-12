@@ -6,7 +6,7 @@ import { MARK_INK, MARK_PULLED, WORD } from "@/components/logo";
 import { toneOf, type Tone } from "@/components/score-badge";
 import { AGENT_CACHE } from "@/lib/agent/agent-http";
 import { parsePackageRoute } from "@/lib/package-route";
-import { getPackageUncached } from "@/lib/registry";
+import { getPackage } from "@/lib/registry";
 
 const SIZE = { width: 1200, height: 630 };
 
@@ -95,7 +95,7 @@ export async function GET(_request: NextRequest, ctx: RouteContext<"/og/[[...nam
   if (route?.kind !== "package") return new Response("Not found", { status: 404 });
   // a package card shows a score that a yank, a revoke or a dismissal changes: stored for seconds, not an hour
   const headers = { "cache-control": AGENT_CACHE.image };
-  const found = await getPackageUncached(route.name);
+  const found = await getPackage(route.name);
 
   if (found.kind === "missing") return new Response("Not found", { status: 404, headers });
   // registry down: the card still names the package, unscored

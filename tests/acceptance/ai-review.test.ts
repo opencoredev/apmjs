@@ -598,10 +598,13 @@ describe("a revoked version", () => {
     packageStatus: z.string(),
     fileStatus: z.string(),
     apiReadme: z.object({ status: z.number(), cacheControl: z.string().nullable(), body: z.string() }),
+    agentMarkdown: z.object({ status: z.number(), cacheControl: z.string().nullable(), body: z.string() }),
+    checkPackage: z.unknown(),
+    fileExcerpt: z.unknown(),
   });
 
   /** The views that quote a version's source while it may be shown. */
-  const QUOTING = ["package", "file", "excerpt", "tarballReadme", "review", "score", "apiReadme"] as const;
+  const QUOTING = ["package", "file", "excerpt", "tarballReadme", "review", "score", "apiReadme", "agentMarkdown", "checkPackage", "fileExcerpt"] as const;
 
   /** Revokes `name@version` as its owner. */
   const revoke = (token: string, name: string, version = "1.0.0") =>
@@ -806,6 +809,13 @@ describe("a revoked version", () => {
       expect(dig(after, "package", "value", "score")).toBeNull();
       expect(dig(after, "apiReadme", "body")).toBe("");
       expect(dig(after, "apiReadme", "cacheControl")).toBe("private, no-store");
+      // what an agent reads: never stored, and after the revoke it names the reason instead of the source
+      expect(dig(warm, "agentMarkdown", "cacheControl")).toBe("private, no-store");
+      expect(dig(after, "agentMarkdown", "cacheControl")).toBe("private, no-store");
+      expect(dig(after, "agentMarkdown", "body")).toContain("- Source: withheld.");
+      expect(dig(after, "agentMarkdown", "body")).toContain("reason `posts the environment`");
+      expect(dig(after, "fileExcerpt", "result", "content", 0, "text")).toBe(`${name}@\`1.0.0\` is revoked: apm shows none of its files. Reason: \`posts the environment\`.`);
+      expect(dig(after, "checkPackage", "result", "structuredContent", "status", "status")).toBe("revoked");
     } finally {
       await site.dispose();
       rmSync(out, { recursive: true, force: true });
