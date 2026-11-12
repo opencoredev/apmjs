@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // apm: a thin layer over bun, npm, pnpm or yarn. It checks before it installs, runs or publishes,
 // then hands the real work to the package manager the project already uses.
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { z } from "zod";
@@ -521,6 +521,7 @@ async function cmdPublish(a: Args): Promise<number> {
 
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
+  process.once("exit", () => rmSync(dest, { recursive: true, force: true }));
   const packed = await runCmd(packArgs(det.pm, dest), { cwd, env: env(), quiet: true });
   const tgzName = readdirSync(dest).find((f) => f.endsWith(".tgz"));
   if (packed.code !== 0 || !tgzName) {
