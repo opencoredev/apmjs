@@ -4,6 +4,7 @@ import { z } from "zod";
 import { encodeName, REGISTRY } from "./registry-url";
 import { fetchJson, logUnavailable, type Fetched } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
+import { ReviewAnswer } from "./review-schema";
 
 export type { Fetched } from "./registry-fetch";
 
@@ -98,6 +99,15 @@ export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> 
 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }
+
+/** The public AI review of one version. "missing" when the registry has AI review off or does not know the version. */
+export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer);
+
+const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional() });
+
+/** One version's full score, for a version other than latest. */
+export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>
+  getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore);
 
 export async function getRecent(limit: number): Promise<Fetched<RecentEvent[]>> {
   const r = await getJson(`-/apm/v1/recent?limit=${limit}`, Recent);

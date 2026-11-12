@@ -2,7 +2,9 @@ import { notFound } from "next/navigation";
 import { Suspense } from "react";
 import { ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
-import { getEvents, getPackage, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import Link from "next/link";
+import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable, packagePath } from "@/components/registry-unavailable";
 import { ScoreBadge, StatusBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
@@ -164,7 +166,9 @@ function describe(e: PackageEvent): string {
   }
 }
 
-export default function PackagePage({ params }: { params: Promise<{ name: string[] }> }) {
+type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[] }> };
+
+export default function PackagePage({ params, searchParams }: PageProps) {
   return (
     <Suspense
       fallback={
@@ -181,7 +185,7 @@ export default function PackagePage({ params }: { params: Promise<{ name: string
         </div>
       }
     >
-      <PackageContent params={params} />
+      <PackageContent params={params} searchParams={searchParams} />
     </Suspense>
   );
 }
@@ -197,7 +201,14 @@ function SectionTitle({ id, children, aside }: { id: string; children: React.Rea
   );
 }
 
-async function PackageContent({ params }: { params: Promise<{ name: string[] }> }) {
+/** The version a link names with ?v=, when the package has it; else the latest. */
+function shownVersion(pkg: PackageInfo, v: string | string[] | undefined): string | null {
+  const asked = Array.isArray(v) ? v[0] : v;
+
+  return asked !== undefined && pkg.versions.some((x) => x.version === asked) ? asked : pkg.latest;
+}
+
+async function PackageContent({ params, searchParams }: PageProps) {
   const parts = (await params).name.map(decodeURIComponent);
   const name = parts.join("/");
   const found = await getPackage(name);
@@ -208,7 +219,19 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
 
   if (found.kind === "unavailable") return <RegistryUnavailable what={`the package ${name}`} retryHref={packagePath(name)} />;
   const pkg = found.value;
-  const events: Fetched<PackageEvent[]> = pkg.source === "local" ? await getEvents(name) : { kind: "ok", value: [] };
+  const version = shownVersion(pkg, (await searchParams).v);
+  const isLatest = version === pkg.latest;
+  const none: Fetched<never> = { kind: "missing" };
+
+  const [events, review, versionScore] = await Promise.all([
+    pkg.source === "local" ? getEvents(name) : Promise.resolve<Fetched<PackageEvent[]>>({ kind: "ok", value: [] }),
+    version ? getReview(name, version) : Promise.resolve(none),
+    version && !isLatest ? getVersionScore(name, version) : Promise.resolve(none),
+  ]);
+
+  let score = pkg.score;
+
+  if (!isLatest) score = versionScore.kind === "ok" ? versionScore.value : null;
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
 
@@ -217,9 +240,17 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
       <header className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>
-          {pkg.latest && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{pkg.latest}</span>}
-          <ScoreBadge score={pkg.score?.score} grade={pkg.score?.grade} className="h-8" />
+          {version && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{version}</span>}
+          <ScoreBadge score={score?.score} grade={score?.grade} className="h-8" />
         </div>
+        {!isLatest && pkg.latest && (
+          <p className="text-sm text-muted-foreground">
+            An older version.{" "}
+            <Link href={packagePath(pkg.name)} className="text-foreground underline-offset-4 hover:underline">
+              Show the latest, {pkg.latest}
+            </Link>
+          </p>
+        )}
         {pkg.description && <p className="max-w-2xl text-lg leading-8 text-pretty text-muted-foreground">{pkg.description}</p>}
         {pkg.source === "upstream" && <p className="text-sm text-muted-foreground">Proxied from the public npm registry and scored by apm.</p>}
         {pulled.length > 0 && (
@@ -234,12 +265,21 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
 
       <div className="grid grid-cols-[minmax(0,1fr)] gap-12 lg:grid-cols-[minmax(0,1fr)_320px] lg:gap-14">
         <div className="flex min-w-0 flex-col gap-12">
-          <InstallTabs name={pkg.name} version={pkg.latest} />
+          <InstallTabs name={pkg.name} version={version} />
 
           <section aria-labelledby="score">
             <SectionTitle id="score">Security score</SectionTitle>
-            {pkg.score ? <ScorePanel score={pkg.score} version={pkg.latest} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
+            {score ? <ScorePanel score={score} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
           </section>
+
+          {review.kind === "ok" && (
+            <section aria-labelledby="ai-review">
+              <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{review.value.version}</span>}>
+                AI review
+              </SectionTitle>
+              <AiReviewSection answer={review.value} />
+            </section>
+          )}
 
           <section aria-labelledby="versions">
             <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>
@@ -260,7 +300,13 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
                     <TableRow key={v.version} className="hover:bg-surface/60">
                       <TableCell className="py-3 pl-4 whitespace-normal">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className={`font-mono text-[15px] ${v.status === "active" ? "" : "text-muted-foreground line-through"}`}>{v.version}</span>
+                          <Link
+                            href={`${packagePath(pkg.name)}?v=${encodeURIComponent(v.version)}`}
+                            aria-current={v.version === version ? "page" : undefined}
+                            className={`font-mono text-[15px] underline-offset-4 hover:underline aria-[current=page]:font-semibold ${v.status === "active" ? "" : "text-muted-foreground line-through"}`}
+                          >
+                            {v.version}
+                          </Link>
                           <StatusBadge status={v.status} />
                           {v.deprecated && <span className="text-xs text-muted-foreground">deprecated</span>}
                         </div>
