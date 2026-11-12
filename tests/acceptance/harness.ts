@@ -17,16 +17,20 @@ const RUN_PREFIX = "apm-test-";
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
+
     return true;
   } catch (e) {
-    return typeof e === "object" && e !== null && "code" in e && e.code === "EPERM";
+    // EPERM: the process exists but belongs to someone else
+    return e instanceof Error && "code" in e && e.code === "EPERM";
   }
 }
 
 function sweepDeadRuns(parent: string): void {
   for (const name of readdirSync(parent)) {
     const pid = Number(/^apm-test-(\d+)-/.exec(name)?.[1] ?? Number.NaN);
+
     if (!Number.isInteger(pid) || pid === process.pid || isAlive(pid)) continue;
+
     try {
       rmSync(join(parent, name), { recursive: true, force: true });
     } catch {
@@ -36,17 +40,24 @@ function sweepDeadRuns(parent: string): void {
 }
 
 const parentTmp = tmpdir();
+
 sweepDeadRuns(parentTmp);
+
 export const RUN_DIR = mkdtempSync(join(parentTmp, `${RUN_PREFIX}${process.pid}-`));
+
 process.env.TMPDIR = RUN_DIR;
+
 const removeRunDir = (): void => rmSync(RUN_DIR, { recursive: true, force: true });
+
 process.on("exit", removeRunDir);
+
 // `bun test` ends without firing "exit" (Bun 1.4), so a watcher removes RUN_DIR once this process is gone.
 Bun.spawn(["sh", "-c", 'while kill -0 "$1" 2>/dev/null; do sleep 0.3; done; rm -rf -- "$2"', "apm-test-cleanup", String(process.pid), RUN_DIR], {
   stdin: "ignore",
   stdout: "ignore",
   stderr: "ignore",
 }).unref();
+
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.once(sig, () => {
     removeRunDir();
@@ -257,7 +268,8 @@ export function installedVersion(appDir: string, name: string): string | null {
 }
 
 // ---------- raw publishes, for tests that control every byte ----------
-type TarFile = { path: string; data: string | Uint8Array };
+/** The package.json fields raw-publish tests set. */
+export type RawManifest = { name: string; version: string; license?: string; main?: string; scripts?: Record<string, string>; dependencies?: Record<string, string> };
 
 function tarHeader(path: string, size: number): Uint8Array {
   const h = new Uint8Array(512);
@@ -273,26 +285,32 @@ function tarHeader(path: string, size: number): Uint8Array {
   put("ustar\0", 257, 6);
   put("00", 263, 2);
   let sum = 0;
+
   for (const b of h) sum += b;
   put(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8);
+
   return h;
 }
 
 /** A gzip'd package tarball: package.json from `manifest` plus `files`. */
-export function pkgTgz(manifest: Record<string, unknown>, files: Record<string, string> = { "index.js": "module.exports = 1;\n" }): Uint8Array {
-  const entries: TarFile[] = [{ path: "package.json", data: JSON.stringify(manifest) }, ...Object.entries(files).map(([path, data]) => ({ path, data }))];
+export function pkgTgz(manifest: RawManifest, files: Record<string, string> = { "index.js": "module.exports = 1;\n" }): Uint8Array {
+  const entries = [{ path: "package.json", data: JSON.stringify(manifest) }, ...Object.entries(files).map(([path, data]) => ({ path, data }))];
   const parts: Uint8Array[] = [];
+
   for (const f of entries) {
-    const data = typeof f.data === "string" ? new TextEncoder().encode(f.data) : f.data;
+    const data = new TextEncoder().encode(f.data);
     parts.push(tarHeader(`package/${f.path}`, data.length), data, new Uint8Array((512 - (data.length % 512)) % 512));
   }
+
   parts.push(new Uint8Array(1024));
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let off = 0;
+
   for (const p of parts) {
     out.set(p, off);
     off += p.length;
   }
+
   return Bun.gzipSync(out);
 }
 
@@ -300,10 +318,11 @@ export function pkgTgz(manifest: Record<string, unknown>, files: Record<string, 
 export async function putPublish(
   reg: Registry,
   token: string,
-  manifest: Record<string, unknown> & { name: string; version: string },
+  manifest: RawManifest,
   opts: { files?: Record<string, string>; tags?: Record<string, string> } = {},
 ): Promise<{ status: number; body: unknown }> {
   const tgz = pkgTgz(manifest, opts.files);
+
   const body = {
     _id: manifest.name,
     name: manifest.name,
@@ -311,6 +330,7 @@ export async function putPublish(
     versions: { [manifest.version]: manifest },
     _attachments: { [`${manifest.name}-${manifest.version}.tgz`]: { content_type: "application/octet-stream", data: Buffer.from(tgz).toString("base64"), length: tgz.length } },
   };
+
   return getJson(`${reg.url}${encodePkg(manifest.name)}`, {
     method: "PUT",
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
