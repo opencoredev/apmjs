@@ -14,4 +14,6 @@ export { POPULAR_NAMES } from "./popular.ts";
 
 export * from "./entries.ts";
 
+export { READING_LIMITS } from "./js.ts";
+
 export { expandHooks, gypCommands, LIFECYCLE, type ExpandedHook, type HookKind } from "./scripts.ts";

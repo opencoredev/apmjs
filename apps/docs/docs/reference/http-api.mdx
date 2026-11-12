@@ -13,7 +13,7 @@ The registry at `https://registry.apmjs.dev/` speaks the npm registry protocol, 
 - **Second factor.** Routes marked "factor" also need `otp` (a six-digit authenticator code) in the JSON body, or a website approval of that exact command made in the last 10 minutes.
 - **Errors.** A failure answers JSON with an `error` message and the matching status: `400` bad input, `401` no token, `403` not allowed, `404` not found, `405` wrong method, `409` conflict, `410` revoked or expired, `413` too large, `422` refused by a check, `429` over a quota, `503` an upstream check could not run.
 - **Per-user answers** (account, staged uploads, tokens, login, and any `/-/` answer to a request carrying credentials) are sent with `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`.
-- **Source-bearing answers** (`/-/apm/v1/file/`, `/-/apm/v1/readme/`, `/-/apm/v1/score/`, `/-/apm/v1/packages/` and `/-/apm/v1/review/`) are sent with `Cache-Control: private, no-store`: whether a version's source may be shown is decided on every request.
+- **Source-bearing answers** (`/-/apm/v1/file/`, `/-/apm/v1/readme/`, `/-/apm/v1/score/`, `/-/apm/v1/packages/`, `/-/apm/v1/resolve` and `/-/apm/v1/review/`) are sent with `Cache-Control: private, no-store`: whether a version's source may be shown is decided on every request.
 - **Package names** in paths are URL-encoded the npm way: `@scope%2fname`.
 - **Size limits.** Publish bodies 32 MB, JSON API bodies 5 MB, a tarball's `package.json` 1 MB.
 
@@ -50,7 +50,7 @@ Packages that are not on apm are fetched from `https://registry.npmjs.org/`, che
 What `apm add` installs. Query: `name`, `range` (default `latest`), `cooldown` (`24h`, `90m`, `2d`, `0`; a bare number is hours; default 24h), `floor` (default `40`). A lower floor applies to the named package only; its dependencies are checked at 40 or the stricter floor.
 
 - `200`: `{ name, version, report, skipped, source, tree }`. `tree.packages` lists every package the registry walked; `tree.uncheckedDeps` lists those it could not score (git and URL specs, missing packages, past the 300-package walk limit).
-- `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's reason.
+- `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's reason. When `newest` is revoked or pending revocation, its `report` is the score answer's withheld form (`redacted: true`, no evidence lines).
 - `404`: no such package.
 
 ### `GET /-/apm/v1/score/<package>[/<version or tag>]`
@@ -85,7 +85,7 @@ Body: `{ "<package>": ["<version>", ...] }`. Answers `{ advisories, unavailable 
 
 ### `GET /-/apm/v1/packages/<package>`
 
-The package as the website shows it: versions with status, scores and dist-tags. `GET /-/apm/v1/packages/<package>/events` is its public log: publishes, yanks, revokes, restores, owner changes and evidence dismissals, with who and why.
+The package as the website shows it: versions with status, scores and dist-tags. `HEAD /-/apm/v1/packages/<package>` answers only whether the package exists, here or on npm (`200`, `404`, or `503` when npm could not be asked), without building the answer. `GET /-/apm/v1/packages/<package>/events` is its public log: publishes, yanks, revokes, restores, owner changes and evidence dismissals, with who and why.
 
 ### `GET /-/apm/v1/recent?limit=<n>`
 

@@ -344,6 +344,12 @@ export type RawManifest = {
   repository?: string | { type?: string; url: string; directory?: string };
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
+  optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  keywords?: string[];
+  author?: string;
+  bin?: string | Record<string, string>;
+  types?: string;
 };
 
 function tarHeader(path: string, size: number): Uint8Array {

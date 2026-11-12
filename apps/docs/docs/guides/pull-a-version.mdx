@@ -43,6 +43,8 @@ What happens next depends on the version's age:
 - **Under 72 hours old**: revoked at once, even when other packages depend on it. Those dependents are what a malicious version would attack.
 - **Older**: yanked at once (`revoke-pending`), so new installs skip it, and fully revoked 24 hours later. Existing lockfiles keep working until then. If a second owner runs `apm revoke` on the same version, it becomes final at once.
 
+While a revoke is pending, the tarball stays downloadable for existing lockfiles; no other route shows its contents. Its manifest answers 404, and its files, readme, review quotes, score evidence and manifest text are withheld exactly as for a revoked version.
+
 ```text
 ✓ @you/my-lib@1.2.3 is now revoke-pending
   becomes a full revoke at 2026-11-13T18:00:00.000Z. Hidden from new installs now. Existing lockfiles keep working until it becomes final, or until another owner confirms.

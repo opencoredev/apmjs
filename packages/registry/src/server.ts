@@ -18,7 +18,7 @@ import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 import { fail, json, MAX_PUBLISH_BODY_BYTES, parseBody } from "./http.ts";
 import { atTime } from "./lifecycle.ts";
 import { order } from "./semver.ts";
-import { readmeShown } from "./withheld.ts";
+import { isWithheld, packageTextShown, readmeShown } from "./withheld.ts";
 
 export type { NamePolicy };
 
@@ -301,17 +301,18 @@ export const packument = (pkg: PackageRecord, abbreviated: boolean, ext: Extensi
     }
 
     const owners = yield* (yield* Store).owners(pkg.name);
+    const text = packageTextShown(pkg, all);
 
     return {
       _id: pkg.name,
       name: pkg.name,
-      description: pkg.description,
+      description: text.description,
       "dist-tags": distTags,
       versions,
       time,
       maintainers: owners.map((name) => ({ name })),
       readme: readmeShown(pkg, all).text,
-      keywords: pkg.keywords,
+      keywords: text.keywords,
     };
   });
 
@@ -983,7 +984,20 @@ export const searchPackages = (text: string): Effect.Effect<SearchHit[], StoreEr
     const now = yield* (yield* Clock).now;
     const q = text.trim().toLowerCase();
     const terms = q.split(/\s+/).filter(Boolean);
-    const ranked = (yield* store.listPackages()).map((pkg) => ({ pkg, rank: rankOf(pkg, terms) })).filter((h) => h.rank > 0);
+    // a package with a withheld version is ranked, and shown, by the text its shown versions wrote (withheld.ts)
+    const withheld = new Set(yield* store.withheldPackageNames());
+    const packages: PackageRecord[] = [];
+
+    for (const pkg of yield* store.listPackages()) {
+      packages.push(withheld.has(pkg.name) ? { ...pkg, ...packageTextShown(pkg, (yield* store.listVersions(pkg.name)).map((v) => atTime(v, now))) } : pkg);
+    }
+
+    const ranked = packages.flatMap((pkg) => {
+      const rank = rankOf(pkg, terms);
+
+      return rank > 0 ? [{ pkg, rank }] : [];
+    });
+
     const names = ranked.map((h) => h.pkg.name);
     const active = (yield* store.activeVersionsOf(names)).map((v) => atTime(v, now)).filter((v) => v.status === "active");
     const owners = yield* store.ownersOf(names);
@@ -1171,7 +1185,9 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
     if (!isValidVersion(resolved)) return fail(404, "Version not found");
     const v = yield* versionOf(name, resolved);
 
-    if (!v || v.status === "revoked") return fail(404, "Version not found");
+    // a revoke-pending version's manifest (its scripts, its dependency specs) is withheld like a revoked one's; only
+    // its tarball stays, for existing lockfiles
+    if (!v || isWithheld(v.status)) return fail(404, "Version not found");
 
     if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
     const base = `${(yield* RegistryConfig).baseUrl}${view?.prefix ?? ""}`;

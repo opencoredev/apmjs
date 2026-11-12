@@ -820,18 +820,27 @@ const releaseResponse = (req: Request, id: string) =>
 // ---------- second stage: the owner queue ----------
 const DecideBody = ReviewDecision.extend(ProofFields);
 
+const VersionStatusRow = z.object({ package: z.string(), version: z.string(), status: z.string() });
+
+/** The queue's local versions that are withheld, as "name@version", in one query; an upstream version has no row. */
+const withheldOf = (rows: readonly StoredReview[]) =>
+  Effect.gen(function* () {
+    if (rows.length === 0) return new Set<string>();
+    const sql = yield* SqlClient.SqlClient;
+    const names = [...new Set(rows.map((r) => r.package))];
+    const versions = [...new Set(rows.map((r) => r.version))];
+
+    const found = yield* query(
+      "queue: version status",
+      sql`SELECT package, version, status FROM versions WHERE package = ANY(${names}) AND version = ANY(${versions})`,
+      all(VersionStatusRow),
+    );
+
+    return new Set(found.filter((v) => isWithheld(v.status)).map((v) => `${v.package}@${v.version}`));
+  });
+
 const queueResponse = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-
-  const item = (r: StoredReview) => ({
-    name: r.package,
-    version: r.version,
-    digest: r.digest,
-    reviewedAt: iso(r.reviewed_at),
-    public: publicView(r),
-    private: privateView(r),
-    decidedBy: r.human_by,
-  });
 
   const pending = yield* query("queue: pending", sql`SELECT * FROM reviews WHERE human_state = 'pending' ORDER BY reviewed_at LIMIT 200`, all(ReviewRow));
 
@@ -840,6 +849,16 @@ const queueResponse = Effect.gen(function* () {
     sql`SELECT * FROM reviews WHERE human_state IN ('confirmed', 'dismissed') ORDER BY human_at DESC LIMIT 50`,
     all(ReviewRow),
   );
+
+  // a withheld version's review is rebuilt before any view is: the admin sees where and what, not the source
+  const withheld = yield* withheldOf([...pending, ...decided]);
+
+  const item = (stored: StoredReview) => {
+    const redacted = withheld.has(`${stored.package}@${stored.version}`);
+    const r = redacted ? withheldReview(stored) : stored;
+
+    return { name: r.package, version: r.version, digest: r.digest, reviewedAt: iso(r.reviewed_at), redacted, public: publicView(r), private: privateView(r), decidedBy: r.human_by };
+  };
 
   return json(
     {

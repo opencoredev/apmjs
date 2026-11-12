@@ -38,9 +38,10 @@ export function routePath(pathname: string): RoutedPath {
 // Answers that belong to whoever asked: the account, sessions, staged versions, tokens, step-ups and login.
 const PER_USER_PATHS = ["/api/auth/", "/-/whoami", "/-/user/", "/-/npm/v1/", "/-/apm/v1/account", "/-/apm/v1/staged", "/-/apm/v1/verify", "/-/apm/v1/login/", "/-/apm/v1/review", "/-/apm/v1/evidence-admin"];
 
-// Answers that can carry a version's source (file text, excerpts, readmes, score evidence, review quotes). Whether a
-// version may be shown is decided on every request from the database, so no cache downstream may keep the answer.
-const SOURCE_PATHS = ["/-/apm/v1/file/", "/-/apm/v1/readme/", "/-/apm/v1/score/", "/-/apm/v1/packages/"];
+// Answers that can carry a version's source (file text, excerpts, readmes, score evidence, review quotes, and the
+// score reports resolve embeds). Whether a version may be shown is decided on every request from the database, so no
+// cache downstream may keep the answer.
+const SOURCE_PATHS = ["/-/apm/v1/file/", "/-/apm/v1/readme/", "/-/apm/v1/score/", "/-/apm/v1/packages/", "/-/apm/v1/resolve"];
 
 /**
  * Marks per-user answers `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`, so no shared

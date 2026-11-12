@@ -304,6 +304,8 @@ export type StoreApi = {
 
   readonly listVersions: (name: string) => Effect.Effect<VersionRecord[], StoreError>;
   readonly activeVersionsOf: (names: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
+  /** Packages with a revoked or revoke-pending version: their row's text may be a withheld publish's (withheld.ts). */
+  readonly withheldPackageNames: () => Effect.Effect<string[], StoreError>;
   readonly getVersion: (name: string, version: string) => Effect.Effect<VersionRecord | null, StoreError>;
   /** Inserts the version; false when that version already exists. */
   readonly insertVersion: (v: NewVersion) => Effect.Effect<boolean, StoreError>;
@@ -692,6 +694,12 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             sql`SELECT * FROM versions WHERE package = ANY(${names}) AND status = 'active' ORDER BY package, published_at, seq`,
             all(VersionRow),
           ).pipe(Effect.flatMap(withDismissals)),
+    withheldPackageNames: () =>
+      run(
+        "withheldPackageNames",
+        sql`SELECT DISTINCT package FROM versions WHERE status IN ('revoke-pending', 'revoked') ORDER BY package`,
+        all(z.object({ package: z.string() }).transform((r) => r.package)),
+      ),
     getVersion: (name, version) =>
       run("getVersion", sql`SELECT * FROM versions WHERE package = ${name} AND version = ${version}`, one(VersionRow)).pipe(
         Effect.flatMap((v) => (v === null ? Effect.succeed(null) : Effect.map(withDismissals([v]), (got) => got[0] ?? null))),

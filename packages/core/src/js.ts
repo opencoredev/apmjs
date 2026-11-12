@@ -717,6 +717,9 @@ const LIMIT_NOTES = {
   flow: "a value passed through more than 32 steps",
 } as const;
 
+/** Every reading-limit note, word for word: the fixed part of a "<limit> (<files>)" not-checked entry. */
+export const READING_LIMITS: readonly string[] = Object.values(LIMIT_NOTES);
+
 /**
  * Where a string sits, which decides what it can confirm:
  * - `code`: run as JavaScript (eval, Function, vm, string timers). It is read as code.

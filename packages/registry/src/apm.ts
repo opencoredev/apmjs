@@ -64,7 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
-import { isWithheld, readmeShown, withheldDismissal, withheldSignal } from "./withheld.ts";
+import { isWithheld, packageTextShown, readmeShown, withheldDismissal, withheldFacts, withheldLimitations, withheldSignal } from "./withheld.ts";
 
 const HOUR = 3_600_000;
 
@@ -104,9 +104,31 @@ function reviewable(v: VersionRecord, r: ScoreReport) {
   return { ...head, redacted: false, signals, dismissed: r.dismissed ?? [] };
 }
 
-/** The parts of a score report that never quote the package: numbers, enums, fixed wording and paths. */
-function sourceFreeReport(r: ScoreReport) {
-  return { score: r.score, grade: r.grade, facts: r.facts, notChecked: r.notChecked, skipped: r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })) };
+/**
+ * The parts of a score report that do not quote the package's code: numbers, enums, paths and the not-checked list.
+ * A stored not-checked entry and the license can carry manifest text (a dependency's URL, the license string), so a
+ * withheld version's are rebuilt from fixed wording and structured fields (withheld.ts).
+ */
+function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
+  const withheld = isWithheld(v.status);
+
+  return {
+    score: r.score,
+    grade: r.grade,
+    facts: withheld ? withheldFacts(r.facts) : r.facts,
+    notChecked: withheld ? withheldLimitations(r.notChecked, v.manifest) : r.notChecked,
+    skipped: r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })),
+  };
+}
+
+/**
+ * A score report inside another answer (resolve). A shown version's is sent whole, as the CLI reads it; a withheld
+ * version's is the score answer's own allowlist, so neither its evidence nor its manifest text goes out.
+ */
+function embeddedReport(v: VersionRecord, r: ScoreReport | null) {
+  if (!r) return null;
+
+  return isWithheld(v.status) ? { ...sourceFreeReport(v, r), ...reviewable(v, r) } : r;
 }
 
 function compact(r: ScoreReport): CompactScore {
@@ -772,7 +794,7 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
       publishedAt: new Date(v.published_at).toISOString(),
       publishedBy: v.published_by,
       // spelled out, not `...report`: a field added to the report later is not sent until it is named here
-      ...sourceFreeReport(report),
+      ...sourceFreeReport(v, report),
       ...reviewable(v, report),
       previous: prev && prevReport ? { version: prev.version, score: prevReport.score, grade: prevReport.grade } : null,
       changes: prev && prevReport ? signalChanges(prevReport.signals, report.signals) : [],
@@ -823,12 +845,14 @@ const packageResponse = (name: string) =>
     const latest0 = src.versions.find((v) => v.version === src.distTags.latest) ?? null;
     const latest = latest0 ? yield* ensureAnalyzed(src, latest0) : null;
     const latestReport = latest ? reportFor(latest, at) : null;
+    const latestFree = latest && latestReport ? sourceFreeReport(latest, latestReport) : null;
+    const text = local ? packageTextShown(local, src.versions) : null;
 
     return json({
       name,
       source: src.kind,
-      description: local?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
-      keywords: local?.keywords ?? [],
+      description: text?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
+      keywords: text?.keywords ?? [],
       ...readmeOf(local ?? { readme: src.kind === "upstream" ? src.pkg.readme : "", readme_version: null }, src.versions),
       repository: repositoryOf(latest0),
       ...linksOf(latest0),
@@ -837,8 +861,8 @@ const packageResponse = (name: string) =>
       createdAt: local ? new Date(local.created_at).toISOString() : null,
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
-      facts: latestReport?.facts ?? null,
-      score: latest && latestReport ? { score: latestReport.score, grade: latestReport.grade, notChecked: latestReport.notChecked, ...reviewable(latest, latestReport) } : null,
+      facts: latestFree?.facts ?? null,
+      score: latest && latestReport && latestFree ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, ...reviewable(latest, latestReport) } : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 200)
@@ -857,6 +881,23 @@ const packageResponse = (name: string) =>
           };
         }),
     });
+  });
+
+/**
+ * HEAD /-/apm/v1/packages/<name>: whether the registry knows the package, here or upstream, with no body. The website
+ * asks before a package page renders. It reads the package row or npm's packument and nothing else: no answer is
+ * built and no version is analysed. 503 when npm could not be asked.
+ */
+const packageExists = (path: string) =>
+  Effect.gen(function* () {
+    const sp = splitPath(`/${path}`);
+
+    if (!sp || sp.rest.length > 0) return new Response(null, { status: 404 });
+    const found = yield* lookupOrUnknown(sp.name);
+
+    if (found === "unknown") return new Response(null, { status: 503 });
+
+    return new Response(null, { status: found === null ? 404 : 200 });
   });
 
 const eventsResponse = (name: string) =>
@@ -880,6 +921,15 @@ export function isNamePart(s: string | null): s is NamePart {
   return NAME_PARTS.some((p) => p === s);
 }
 
+/** A package's description as an answer may show it: a withheld publish's text is not (withheld.ts). */
+const shownDescription = (src: Source) =>
+  Effect.gen(function* () {
+    if (src.kind === "upstream") return src.pkg.description;
+    const pkg = yield* (yield* Store).getPackage(src.name);
+
+    return pkg ? packageTextShown(pkg, src.versions).description : "";
+  });
+
 const exactPart = (query: string, valid: boolean) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -900,7 +950,7 @@ const exactPart = (query: string, valid: boolean) =>
       available: valid && !unknown && src === null && conflicts.length === 0,
       owners: src ? (src.kind === "local" ? yield* store.owners(query) : src.pkg.maintainers) : [],
       latest: latest0 ? { version: latest0.version, score: latestReport?.score ?? null, grade: latestReport?.grade ?? null } : null,
-      description: src ? (src.kind === "local" ? ((yield* store.getPackage(query))?.description ?? "") : src.pkg.description) : null,
+      description: src ? yield* shownDescription(src) : null,
       conflicts,
     };
   });
@@ -1300,10 +1350,10 @@ const resolveResponse = (url: URL) =>
         if (tree.blocks.length > 0) {
           const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
 
-          return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);
+          return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report: embeddedReport(v, report) }, tree }, 422);
         }
 
-        return json({ name, range, source: src.kind, version: v.version, report, skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
+        return json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
       }
 
       skipped.push({ version: v.version, reason: block });
@@ -1315,7 +1365,7 @@ const resolveResponse = (url: URL) =>
     const newestReport = newest ? reportFor(newest, at) : null;
 
     return json(
-      { error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: newestReport } : null },
+      { error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
       422,
     );
   });
@@ -1665,6 +1715,8 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
     }
 
     if (req.method === "DELETE" && rest === "owners") return yield* handleOwners(req, caller);
+
+    if (req.method === "HEAD" && rest.startsWith("packages/")) return yield* packageExists(rest.slice("packages/".length));
 
     if (req.method !== "GET") return fail(405, "Method not allowed");
 

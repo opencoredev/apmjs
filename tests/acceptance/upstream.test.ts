@@ -28,6 +28,7 @@ beforeAll(async () => {
   upAlice = await addUser(upstream, "upalice", "correct-horse-battery");
   work = mkdtempSync(join(tmpdir(), "apm-up-"));
   await publishUpstream("up-pkg", "1.0.0");
+  await publishUpstream("up-head", "1.0.0");
   clock += 10 * DAY;
   await publishUpstream("up-evil", "1.0.0", {
     scripts: { postinstall: "node i.js" },
@@ -46,6 +47,21 @@ afterAll(async () => {
 });
 
 describe("upstream proxy", () => {
+  test("HEAD of a package answer says whether it exists without building the answer or analysing a version", async () => {
+    const analyses = async (): Promise<number> =>
+      (await reg.query("SELECT 1 FROM upstream_analysis WHERE package = $1 UNION ALL SELECT 1 FROM analysis_jobs WHERE package = $1", ["up-head"])).length;
+
+    const head = await fetch(`${reg.url}-/apm/v1/packages/up-head`, { method: "HEAD" });
+
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(await analyses()).toBe(0);
+    expect((await fetch(`${reg.url}-/apm/v1/packages/no-such-package-anywhere`, { method: "HEAD" })).status).toBe(404);
+    // the full answer analyses the latest version, which is what the HEAD spares the website's proxy
+    expect((await getJson(`${reg.url}-/apm/v1/packages/up-head`)).status).toBe(200);
+    expect(await analyses()).toBeGreaterThan(0);
+  });
+
   test("packages that only exist upstream are served, with tarball URLs on apm", async () => {
     const { status, body } = await getJson(`${reg.url}up-pkg`);
     expect(status).toBe(200);
