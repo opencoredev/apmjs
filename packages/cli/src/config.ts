@@ -1,5 +1,6 @@
 // Where apm talks to and who it is: registry URL and token, read from the same files npm and bun use.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -74,11 +75,27 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   return { registry, token: token || null, userconfig };
 }
 
-/** Writes (or replaces) the auth line for `registry` in the user .npmrc, which npm, pnpm and bun all read. */
+/**
+ * Writes (or replaces) the auth line for `registry` in the user .npmrc, which npm, pnpm and bun all read.
+ * The file holds a token, so it ends up 0600 whatever its mode was, and it is replaced atomically: a temp
+ * file in the same directory, made private before the token is written, then renamed over the original.
+ */
 export function saveToken(userconfig: string, registry: string, token: string): void {
   const key = `${authKey(registry)}:_authToken`;
-  const lines = existsSync(userconfig) ? readFileSync(userconfig, "utf8").split(/\r?\n/) : [];
+  // a symlinked .npmrc (dotfiles repos) keeps its link: write next to the real file
+  const target = existsSync(userconfig) ? realpathSync(userconfig) : userconfig;
+  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/) : [];
   const kept = lines.filter((l) => !l.trim().startsWith(`${key}=`) && l.trim() !== "");
   kept.push(`${key}=${token}`);
-  writeFileSync(userconfig, `${kept.join("\n")}\n`, { mode: 0o600 });
+  const tmp = join(dirname(target), `.npmrc.${randomBytes(6).toString("hex")}.tmp`);
+  try {
+    writeFileSync(tmp, "", { mode: 0o600, flag: "wx" });
+    chmodSync(tmp, 0o600);
+    writeFileSync(tmp, `${kept.join("\n")}\n`);
+    renameSync(tmp, target);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+  chmodSync(target, 0o600);
 }

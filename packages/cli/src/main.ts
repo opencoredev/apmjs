@@ -5,8 +5,8 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { z } from "zod";
-import { analyze, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
-import { Api, ApiError, BulkResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, encodeName, parseSpec, type Report } from "./api.ts";
+import { analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
 import { loadConfig, saveToken } from "./config.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection } from "./pm.ts";
 
@@ -161,7 +161,8 @@ function pmFor(a: Args, cwd: string): Detection {
 }
 
 // ---------- add / x ----------
-type Resolved = { name: string; version: string | null; report: Report | null; skipped: { version: string; reason: string }[]; blocked: string | null; source: string };
+type UncheckedDeps = z.infer<typeof Tree>["uncheckedDeps"];
+type Resolved = { name: string; version: string | null; report: Report | null; skipped: { version: string; reason: string }[]; blocked: string | null; source: string; unchecked: UncheckedDeps };
 
 async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
@@ -175,16 +176,16 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const r = await api.raw(`-/apm/v1/resolve?${params}`);
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, source: ok.source ?? "apm" };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [] };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional() }).parse(r.body);
     const newestReport = f.newest ? (await scoreOf(api, name, f.newest.version)) : null;
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, source: "apm" };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, source: "apm", unchecked: [] };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, source: "none" };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, source: "none", unchecked: [] };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -200,6 +201,9 @@ async function scoreOf(api: Api, name: string, version: string): Promise<Report 
 function printResolved(r: Resolved): void {
   printCard(`${r.blocked ? red("✗") : green("✓")} ${r.name}@${r.version ?? "?"}`, r.report);
   for (const s of r.skipped.slice(0, 5)) say(`  ${dim(`skipped ${s.version}: ${s.reason}`)}`);
+  // dependencies apm could not score install unchecked: say which, so nobody reads silence as clean
+  for (const u of r.unchecked.slice(0, 10)) say(`  ${yellow("!")} not checked: ${u.dependency} (${u.reason})`);
+  if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);
 }
 
 async function cmdAdd(a: Args): Promise<number> {
@@ -243,6 +247,7 @@ function emitJson(ok: boolean, det: Detection, results: Resolved[]): void {
         grade: r.report?.grade ?? null,
         signals: r.report?.signals.map((s) => ({ id: s.id, points: s.points })) ?? [],
         skipped: r.skipped,
+        unchecked: r.unchecked,
         blocked: r.blocked !== null,
         reason: r.blocked,
       })),
@@ -361,10 +366,15 @@ async function cmdAudit(a: Args): Promise<number> {
   }
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
-  const bulk = await api.post("-/npm/v1/security/advisories/bulk", query, BulkResponse);
+  const audit = await api.post("-/apm/v1/audit", query, AuditResponse);
   const scan = await api.post("-/apm/v1/scan", { packages: [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version }))) }, ScanResponse);
   const findings: { id: string; severity: string; text: string }[] = [];
-  for (const [name, advisories] of Object.entries(bulk)) {
+  // checks that could not run: an audit with any of these is not a pass
+  const unchecked: { id: string; reason: string }[] = [
+    ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: "advisories could not be fetched from the upstream registry" }))),
+    ...scan.unchecked.map((u) => ({ id: `${u.package}@${u.version}`, reason: u.reason })),
+  ];
+  for (const [name, advisories] of Object.entries(audit.advisories)) {
     for (const adv of advisories) {
       for (const v of installed.get(name) ?? []) {
         if (Bun.semver.satisfies(v, adv.vulnerable_versions)) findings.push({ id: `${name}@${v}`, severity: adv.severity, text: adv.title });
@@ -374,17 +384,20 @@ async function cmdAudit(a: Args): Promise<number> {
   for (const s of scan.advisories) {
     if (!findings.some((f) => f.id === `${s.package}@${s.version}`)) findings.push({ id: `${s.package}@${s.version}`, severity: "critical", text: s.description });
   }
+  const ok = findings.length === 0 && unchecked.length === 0;
   if (has(a, "json")) {
-    process.stdout.write(`${JSON.stringify({ ok: findings.length === 0, checked: installed.size, findings })}\n`);
-    return findings.length === 0 ? 0 : 1;
+    process.stdout.write(`${JSON.stringify({ ok, checked: installed.size, findings, unchecked })}\n`);
+    return ok ? 0 : 1;
   }
-  if (findings.length === 0) {
+  if (ok) {
     say(green(`✓ ${installed.size} packages checked, no revoked or dangerous versions found`));
     return 0;
   }
   for (const f of findings) say(`${red(f.severity.padEnd(8))} ${bold(f.id)}  ${f.text}`);
+  for (const u of unchecked) say(`${yellow("unchecked".padEnd(8))} ${bold(u.id)}  ${u.reason}`);
   say();
-  say(`${findings.length} problem${findings.length === 1 ? "" : "s"} in ${installed.size} packages. Upgrade or remove them; revoked versions stop installing soon.`);
+  if (findings.length > 0) say(`${findings.length} problem${findings.length === 1 ? "" : "s"} in ${installed.size} packages. Upgrade or remove them; revoked versions stop installing soon.`);
+  if (unchecked.length > 0) say(`${unchecked.length} package version${unchecked.length === 1 ? "" : "s"} could not be checked, so this audit is not a pass.`);
   return 1;
 }
 
@@ -589,7 +602,7 @@ async function cmdPublish(a: Args): Promise<number> {
   // 1. Without a "files" allowlist, what ships depends on the package manager (npm ships .env.production,
   //    bun does not), so any secret-shaped file in the folder blocks the publish.
   if (!pj.files) {
-    const local = findSecrets(walkFiles(cwd));
+    const local = findSecrets(walkFiles(cwd)).findings;
     if (local.length > 0) {
       for (const s of local) say(red(`✗ ${s.path}: ${s.kind}`));
       say(`Refusing to publish ${id}: secret-shaped files sit in the package folder and package.json has no "files" allowlist,`);
@@ -616,11 +629,12 @@ async function cmdPublish(a: Args): Promise<number> {
   if (bumpKind && dry) manifest.version = version;
 
   const secrets = findSecrets(files);
-  if (secrets.length > 0) {
-    for (const s of secrets) say(red(`✗ ${s.path}: ${s.kind}`));
+  if (secrets.findings.length > 0) {
+    for (const s of secrets.findings) say(red(`✗ ${s.path}: ${s.kind}`));
     say(`Refusing to publish ${id}: the tarball contains secrets. Narrow the "files" allowlist in package.json.`);
     return 1;
   }
+  for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} is too large to scan for secrets; check it yourself.`));
   const missing = missingEntries(manifest, files);
   if (missing.length > 0) {
     for (const m of missing) say(red(`✗ "${m.field}" points to ${m.path}, which is not in the tarball`));

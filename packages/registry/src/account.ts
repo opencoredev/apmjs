@@ -2,7 +2,7 @@
 // website step-up checks, and staged versions waiting for a person to approve them.
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { z } from "zod";
-import { finalize, isAnalysis, readTarball } from "@apm/core";
+import { finalize, parseAnalysis, readTarball } from "@apm/core";
 import type { ApmAuth, SignedIn } from "./auth.ts";
 import type { StagedRecord, User } from "./db.ts";
 import { commitVersion, fail, issueToken, json, publishRefusal, stagedTarballPath, type Ctx } from "./server.ts";
@@ -13,7 +13,13 @@ const RevokeTokenBody = z.object({ id: z.string().min(8) });
 
 /** Marks staged versions past 24h as expired and deletes their tarballs. */
 export function sweepStaged(ctx: Ctx): void {
-  for (const id of ctx.store.expireStaged(ctx.now())) rmSync(stagedTarballPath(ctx, id), { force: true });
+  for (const id of ctx.store.expireStaged(ctx.now())) {
+    try {
+      rmSync(stagedTarballPath(ctx, id), { force: true });
+    } catch {
+      // a malformed id never names a file
+    }
+  }
 }
 
 async function readBody<T>(req: Request, schema: z.ZodType<T>): Promise<{ ok: true; value: T } | { ok: false; res: Response }> {
@@ -78,8 +84,9 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
         files = [];
       }
     }
-    const report = isAnalysis(row.score)
-      ? finalize(row.score, { publishedAt: Number.NEGATIVE_INFINITY, now: ctx.now(), deprecated: null, status: "active", statusReason: null })
+    const analysis = parseAnalysis(row.score);
+    const report = analysis
+      ? finalize(analysis, { publishedAt: Number.NEGATIVE_INFINITY, now: ctx.now(), deprecated: null, status: "active", statusReason: null })
       : null;
     const pkg = ctx.store.getPackage(row.package);
     const latest = pkg?.distTags.latest ?? null;
@@ -273,7 +280,7 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
       if (perm) return fail(perm.status, perm.error);
       const path = stagedTarballPath(ctx, id);
       if (!existsSync(path)) return fail(410, "The staged tarball is gone. Publish it again.");
-      commitVersion(ctx, {
+      const done = commitVersion(ctx, {
         name: row.package,
         version: row.version,
         manifest: row.manifest,
@@ -286,6 +293,7 @@ export function accountRoutes(input: { ctx: Ctx; auth: ApmAuth }): (req: Request
         publisher: row.staged_by,
         detail: { approvedBy: user, stagedAt: new Date(row.staged_at).toISOString() },
       });
+      if (done.kind === "refused") return fail(done.status, done.error);
       ctx.store.decideStaged(id, { status: "approved", at: ctx.now(), by: user });
       return json({ ok: true, status: "approved", package: row.package, version: row.version });
     }

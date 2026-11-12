@@ -1,9 +1,9 @@
 // HTTP routing for the npm wire protocol plus the apm extensions under /-/apm/v1.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, linkSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { join, dirname, resolve, sep } from "node:path";
 import { z } from "zod";
-import { editDistance } from "@apm/core";
+import { editDistance, isValidVersion } from "@apm/core";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 
 export type NamePolicy = "scoped" | "open";
@@ -222,12 +222,52 @@ export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean, ex
 }
 
 // ---------- tarball files ----------
-export function tarballPath(ctx: Ctx, name: string, version: string): string {
-  return join(ctx.store.tarballDir, ...name.split("/"), `${tarballBase(name)}-${version}.tgz`);
+// Published tarballs are blobs named by their sha512, so no name or version ever becomes part of a
+// path. Every path is still checked to stay inside its root.
+
+/** `segments` joined under `root`; throws when the result would leave it. */
+export function inside(root: string, ...segments: string[]): string {
+  const base = resolve(root);
+  const p = resolve(base, ...segments);
+  if (p === base || !p.startsWith(base + sep)) throw new Error(`storage path escapes ${base}`);
+  return p;
 }
+
+export function integrityOf(bytes: Uint8Array): string {
+  return `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+}
+
+/** The blob file for a "sha512-<base64>" integrity, or null when it is not one. */
+export function blobPath(ctx: Ctx, integrity: string): string | null {
+  if (!integrity.startsWith("sha512-")) return null;
+  const raw = Buffer.from(integrity.slice("sha512-".length), "base64");
+  if (raw.length !== 64 || `sha512-${raw.toString("base64")}` !== integrity) return null;
+  const hex = raw.toString("hex");
+  return inside(ctx.store.tarballDir, "blobs", hex.slice(0, 2), `${hex}.tgz`);
+}
+
+/** Where versions published before blobs were kept. Read only, as a fallback. */
+function legacyTarballPath(ctx: Ctx, name: string, version: string): string | null {
+  try {
+    return inside(ctx.store.tarballDir, ...name.split("/"), `${tarballBase(name)}-${version}.tgz`);
+  } catch {
+    return null;
+  }
+}
+
+/** The bytes of a published version, or null when the file is missing. */
+export function readVersionTarball(ctx: Ctx, v: VersionRecord): Uint8Array | null {
+  for (const p of [blobPath(ctx, v.integrity), legacyTarballPath(ctx, v.package, v.version)]) {
+    if (p && existsSync(p)) return new Uint8Array(readFileSync(p));
+  }
+  return null;
+}
+
+const STAGED_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 /** Staged tarballs sit outside the served tree until approval. */
 export function stagedTarballPath(ctx: Ctx, id: string): string {
-  return join(ctx.store.tarballDir, "..", "staged", `${id}.tgz`);
+  if (!STAGED_ID_RE.test(id)) throw new Error("malformed staged id");
+  return inside(join(ctx.store.tarballDir, "..", "staged"), `${id}.tgz`);
 }
 
 // ---------- publish ----------
@@ -251,7 +291,7 @@ export type PublishHook = (input: {
   user: string;
   existing: PackageRecord | null;
 }) => Promise<PublishVerdict>;
-export type PublishVerdict = { ok: true; manifest: Record<string, unknown>; score: unknown } | { ok: false; status: number; error: string; detail?: unknown };
+export type PublishVerdict = { ok: true; manifest: Record<string, unknown>; score: unknown; warnings: string[] } | { ok: false; status: number; error: string; detail?: unknown };
 
 export type Extensions = {
   onPublish?: PublishHook;
@@ -291,7 +331,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   const entries = Object.entries(body.versions);
   if (entries.length !== 1) return fail(400, "Publish exactly one version at a time.");
   const [version, manifest] = entries[0] ?? ["", {}];
-  if (!Bun.semver.satisfies(version, "*") && !/^\d+\.\d+\.\d+/.test(version)) return fail(400, `Invalid version ${version}`);
+  if (!isValidVersion(version)) return fail(400, `Invalid version "${version}": apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
   const attachment = Object.values(body._attachments)[0];
   if (!attachment) return fail(400, "Missing tarball");
   const tarball = new Uint8Array(Buffer.from(attachment.data, "base64"));
@@ -312,11 +352,13 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
 
   let score: unknown = null;
   let storedManifest: Record<string, unknown> = manifest;
+  let warnings: string[] = [];
   if (ext.onPublish) {
     const verdict = await ext.onPublish({ ctx, name, version, manifest, tarball, user: auth.user, existing });
     if (!verdict.ok) return fail(verdict.status, verdict.error, verdict.detail === undefined ? {} : { detail: verdict.detail });
     score = verdict.score;
     storedManifest = verdict.manifest;
+    warnings = verdict.warnings;
   }
 
   const cleanManifest: Record<string, unknown> = { ...storedManifest };
@@ -324,7 +366,9 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
   const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
   const shasum = createHash("sha1").update(tarball).digest("hex");
-  const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
+  const integrity = integrityOf(tarball);
+  // header-safe: a tar path may hold control characters
+  const warningText = warnings.length > 0 ? `Warning: ${warnings.join(" ")}`.replace(/[\x00-\x1f\x7f]/g, " ") : null;
 
   if (auth.scope === "stage") {
     const at = ctx.now();
@@ -350,19 +394,56 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     const link = approvalUrl(ctx, id);
     const expiresAt = new Date(at + STAGE_TTL_MS).toISOString();
     // bun prints this header as "note: ...", npm as "npm notice ...": that is how the link reaches a person.
-    const notice = `${name}@${version} is uploaded but NOT live. A person must approve it within 24h: ${link}`;
-    return json({ ok: true, success: true, staged: true, id, approvalUrl: link, expiresAt, message: notice }, 202, { "npm-notice": notice });
+    const notice = `${name}@${version} is uploaded but NOT live. A person must approve it within 24h: ${link}${warningText ? ` ${warningText}` : ""}`;
+    return json({ ok: true, success: true, staged: true, id, approvalUrl: link, expiresAt, message: notice, warnings }, 202, { "npm-notice": notice });
   }
 
-  commitVersion(ctx, { name, version, manifest: cleanManifest, tarball, shasum, integrity, tag, readme, score, publisher: auth.user, detail: {} });
-  return json({ ok: true, id: name, rev: `${ctx.now()}`, success: true, score }, 201);
+  const done = commitVersion(ctx, { name, version, manifest: cleanManifest, tarball, shasum, integrity, tag, readme, score, publisher: auth.user, detail: {} });
+  if (done.kind === "refused") return fail(done.status, done.error);
+  return json({ ok: true, id: name, rev: `${ctx.now()}`, success: true, score, warnings }, 201, warningText ? { "npm-notice": warningText } : {});
 }
 
 export function approvalUrl(ctx: Ctx, id: string): string {
   return `${ctx.access.webUrl()}approve/${id}`;
 }
 
-/** Makes a version live: tarball in place, version row, dist-tags, package metadata and the publish event. */
+export type CommitResult = { kind: "committed" } | { kind: "refused"; status: 403 | 409; error: string };
+
+class CommitRefusal extends Error {
+  constructor(
+    readonly status: 403 | 409,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function hasCode(e: unknown): e is { code: unknown } {
+  return typeof e === "object" && e !== null && "code" in e;
+}
+
+/** Puts the bytes at their blob path. Never replaces an existing blob; says whether this call created it. */
+function placeBlob(path: string, bytes: Uint8Array): boolean {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(tmp, bytes);
+  try {
+    linkSync(tmp, path);
+    return true;
+  } catch (e) {
+    if (hasCode(e) && e.code === "EEXIST") return false;
+    throw e;
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * Makes a version live: blob in place, version row, dist-tags, package metadata and the publish event.
+ * The version insert is the one decision: inside a single transaction it checks the version is new and
+ * the publisher still owns the package (the primary key backs this up). A losing publish gets 409 and
+ * its blob is removed unless another version uses the same bytes.
+ */
 export function commitVersion(
   ctx: Ctx,
   v: {
@@ -378,50 +459,75 @@ export function commitVersion(
     publisher: string;
     detail: Record<string, unknown>;
   },
-): void {
+): CommitResult {
   const at = ctx.now();
-  const path = tarballPath(ctx, v.name, v.version);
-  mkdirSync(dirname(path), { recursive: true });
-  if (v.tarball instanceof Uint8Array) writeFileSync(path, v.tarball);
-  else renameSync(v.tarball.stagedPath, path);
-  const size = v.tarball instanceof Uint8Array ? v.tarball.length : readFileSync(path).length;
-  const existing = ctx.store.getPackage(v.name);
+  const bytes = v.tarball instanceof Uint8Array ? v.tarball : new Uint8Array(readFileSync(v.tarball.stagedPath));
+  if (integrityOf(bytes) !== v.integrity) throw new Error(`${v.name}@${v.version}: tarball bytes do not match their integrity`);
+  const path = blobPath(ctx, v.integrity);
+  if (!path) throw new Error(`${v.name}@${v.version}: malformed integrity`);
+  const created = placeBlob(path, bytes);
+  const size = bytes.length;
 
-  ctx.store.tx(() => {
-    if (!existing) ctx.store.createPackage(v.name, at, v.publisher);
-    ctx.store.insertVersion({
-      package: v.name,
-      version: v.version,
-      manifest: v.manifest,
-      shasum: v.shasum,
-      integrity: v.integrity,
-      size,
-      published_at: at,
-      published_by: v.publisher,
-      score: v.score,
+  try {
+    ctx.store.tx(() => {
+      if (ctx.store.getVersion(v.name, v.version)) {
+        throw new CommitRefusal(409, `Cannot publish over existing version ${v.name}@${v.version}. Versions are immutable; bump the version.`);
+      }
+      if (!ctx.store.getPackage(v.name)) ctx.store.createPackage(v.name, at, v.publisher);
+      else if (!ctx.store.owners(v.name).includes(v.publisher)) {
+        throw new CommitRefusal(403, `You do not have permission to publish "${v.name}". Owners: ${ctx.store.owners(v.name).join(", ")}`);
+      }
+      commitRows(ctx, v, { at, size });
     });
-    const pkg = ctx.store.getPackage(v.name);
-    const tags = { ...(pkg?.distTags ?? {}) };
-    const isPrerelease = v.version.includes("-");
-    const currentLatest = tags.latest;
-    // a prerelease never takes `latest` once a stable release exists; it goes to `next`
-    const tag = v.tag === "latest" && isPrerelease && currentLatest ? "next" : v.tag;
-    if (tag === "latest" && currentLatest && Bun.semver.order(v.version, currentLatest) < 0) {
-      // publishing an older line (a 1.x backport) never moves latest backwards
-    } else {
-      tags[tag] = v.version;
+  } catch (e) {
+    if (created && !ctx.store.integrityInUse(v.integrity)) rmSync(path, { force: true });
+    if (e instanceof CommitRefusal) return { kind: "refused", status: e.status, error: e.message };
+    if (hasCode(e) && typeof e.code === "string" && e.code.startsWith("SQLITE_CONSTRAINT")) {
+      return { kind: "refused", status: 409, error: `Cannot publish over existing version ${v.name}@${v.version}. Versions are immutable; bump the version.` };
     }
-    ctx.store.setDistTags(v.name, tags, at);
-    const description = typeof v.manifest.description === "string" ? v.manifest.description : undefined;
-    const keywords = Array.isArray(v.manifest.keywords) ? v.manifest.keywords.filter((k): k is string => typeof k === "string") : undefined;
-    ctx.store.updatePackageMeta(v.name, {
-      modifiedAt: at,
-      ...(description !== undefined ? { description } : {}),
-      ...(keywords !== undefined ? { keywords } : {}),
-      ...(v.readme !== null ? { readme: v.readme } : {}),
-    });
-    ctx.store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
+    throw e;
+  }
+  if (!(v.tarball instanceof Uint8Array)) rmSync(v.tarball.stagedPath, { force: true });
+  return { kind: "committed" };
+}
+
+type CommitInput = Parameters<typeof commitVersion>[1];
+
+/** The rows of a publish. Runs inside commitVersion's transaction. */
+function commitRows(ctx: Ctx, v: CommitInput, m: { at: number; size: number }): void {
+  const { at, size } = m;
+  ctx.store.insertVersion({
+    package: v.name,
+    version: v.version,
+    manifest: v.manifest,
+    shasum: v.shasum,
+    integrity: v.integrity,
+    size,
+    published_at: at,
+    published_by: v.publisher,
+    score: v.score,
   });
+  const pkg = ctx.store.getPackage(v.name);
+  const tags = { ...(pkg?.distTags ?? {}) };
+  const isPrerelease = v.version.includes("-");
+  const currentLatest = tags.latest;
+  // a prerelease never takes `latest` once a stable release exists; it goes to `next`
+  const tag = v.tag === "latest" && isPrerelease && currentLatest ? "next" : v.tag;
+  if (tag === "latest" && currentLatest && Bun.semver.order(v.version, currentLatest) < 0) {
+    // publishing an older line (a 1.x backport) never moves latest backwards
+  } else {
+    tags[tag] = v.version;
+  }
+  ctx.store.setDistTags(v.name, tags, at);
+  const description = typeof v.manifest.description === "string" ? v.manifest.description : undefined;
+  const keywords = Array.isArray(v.manifest.keywords) ? v.manifest.keywords.filter((k): k is string => typeof k === "string") : undefined;
+  ctx.store.updatePackageMeta(v.name, {
+    modifiedAt: at,
+    ...(description !== undefined ? { description } : {}),
+    ...(keywords !== undefined ? { keywords } : {}),
+    ...(v.readme !== null ? { readme: v.readme } : {}),
+  });
+  ctx.store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
 }
 
 function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: string): Response {
@@ -456,6 +562,7 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
   if (req.method === "PUT" || req.method === "POST") {
     const raw: unknown = await req.json();
     const version = z.string().parse(raw);
+    if (!isValidVersion(version)) return fail(400, `Invalid version "${version}"`);
     const v = ctx.store.getVersion(name, version);
     if (!v || v.status !== "active") return fail(404, `Version ${version} not found or not active`);
     tags[tag] = version;
@@ -634,15 +741,15 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
   if (rest[0] === "-" && rest[1]) {
     const file = rest[1];
     const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(file);
-    if (!pkg || !m?.[2]) return fail(404, "Not found");
+    if (!pkg || !m?.[2] || !isValidVersion(m[2])) return fail(404, "Not found");
     const v = ctx.store.getVersion(name, m[2]);
     if (!v) return fail(404, "Not found");
     if (v.status === "revoked") {
       return fail(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`, { revoked: true });
     }
-    const p = tarballPath(ctx, name, v.version);
-    if (!existsSync(p)) return fail(404, "Tarball missing");
-    return new Response(readFileSync(p), { headers: { "content-type": "application/octet-stream" } });
+    const bytes = readVersionTarball(ctx, v);
+    if (!bytes) return fail(404, "Tarball missing");
+    return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
   }
   if (!pkg) return fail(404, "Not found");
   if (rest.length === 0) {

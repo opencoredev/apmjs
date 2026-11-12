@@ -1,14 +1,21 @@
 // apm extensions on top of the npm protocol: publish guards, scoring, version states,
 // incident response, name search, the ~safe view, server-side resolve, the scan API and
 // the upstream proxy.
-import { gunzipSync } from "node:zlib";
 import { z } from "zod";
 import {
   analyze,
+  ArchiveError,
+  dependencySpecs,
+  describeDependency,
+  describeSkip,
   finalize,
   findSecrets,
-  isAnalysis,
+  gunzipCapped,
+  httpStatusOf,
+  isRegistryDependency,
+  parseAnalysis,
   readTarball,
+  uncheckableReason,
   signalChanges,
   typoConflicts,
   editDistance,
@@ -20,12 +27,13 @@ import {
   POPULAR_NAMES,
   ambiguousPaths,
   type DependencyRisk,
+  type RegistryDependency,
   type ScoreReport,
   type TarEntry,
 } from "@apm/core";
 import type { VersionRecord } from "./db.ts";
 import { fail, json, splitPath, highest, servedVersions, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
-import type { Upstream, UpstreamPackage } from "./upstream.ts";
+import { digestLabel, type Upstream, type UpstreamPackage } from "./upstream.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -40,8 +48,9 @@ type Env = { ctx: Ctx; upstream: Upstream | null };
 
 // ---------- scoring helpers ----------
 export function reportFor(ctx: Ctx, v: VersionRecord, opts: { ignoreRecent?: boolean } = {}): ScoreReport | null {
-  if (!isAnalysis(v.score)) return null;
-  return finalize(v.score, {
+  const analysis = parseAnalysis(v.score);
+  if (!analysis) return null;
+  return finalize(analysis, {
     publishedAt: opts.ignoreRecent ? Number.NEGATIVE_INFINITY : v.published_at,
     now: ctx.now(),
     deprecated: v.deprecated,
@@ -86,12 +95,12 @@ async function lookupOrUnknown(env: Env, name: string): Promise<Source | null | 
 
 /** Makes sure an upstream version has a stored analysis; returns the version with it. */
 async function ensureAnalyzed(env: Env, src: Source, v: VersionRecord): Promise<VersionRecord> {
-  if (src.kind === "local" || isAnalysis(v.score) || !env.upstream) return v;
-  const bytes = await env.upstream.tarball(env.ctx, src.pkg, v.version);
-  if (!bytes) return v;
+  if (src.kind === "local" || parseAnalysis(v.score) || !env.upstream) return v;
+  const got = await env.upstream.tarball(env.ctx, src.pkg, v.version);
+  if (got.kind !== "ok") return v;
   let files: TarEntry[];
   try {
-    files = readTarball(bytes);
+    files = readTarball(got.bytes);
   } catch {
     return v;
   }
@@ -108,7 +117,7 @@ async function ensureAnalyzed(env: Env, src: Source, v: VersionRecord): Promise<
   const earlier = src.versions.filter((x) => x.published_at < v.published_at);
   const previousPublishers = [...new Set(earlier.map((x) => x.published_by))];
   const analysis = analyze({ name: src.name, manifest, files, publisher: v.published_by, previousPublishers });
-  env.ctx.store.setUpstreamAnalysis(src.name, v.version, analysis);
+  env.ctx.store.setUpstreamAnalysis({ name: src.name, version: v.version, digest: digestLabel(got.digest), analysis, at: env.ctx.now() });
   v.score = analysis;
   return v;
 }
@@ -151,24 +160,57 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
   return problems;
 }
 
-/** Dependencies of a manifest whose best matching version scores below the floor. */
-async function riskyDependencies(env: Env, manifest: Record<string, unknown>): Promise<DependencyRisk[]> {
-  const out: DependencyRisk[] = [];
-  const deps = { ...(isRecord(manifest.dependencies) ? manifest.dependencies : {}), ...(isRecord(manifest.optionalDependencies) ? manifest.optionalDependencies : {}) };
-  for (const [dep, rangeRaw] of Object.entries(deps).slice(0, 25)) {
-    const range = typeof rangeRaw === "string" ? rangeRaw : "*";
-    const src = await lookup(env, dep);
-    if (!src) continue;
-    const candidates = src.versions
-      .filter((v) => v.status !== "revoked" && Bun.semver.satisfies(v.version, range))
-      .sort((a, b) => Bun.semver.order(b.version, a.version));
-    const best = candidates[0];
-    if (!best) continue;
-    const analyzed = await ensureAnalyzed(env, src, best);
-    const r = reportFor(env.ctx, analyzed, { ignoreRecent: true });
-    if (r && r.score < SCORE_FLOOR) out.push({ name: dep, version: best.version, score: r.score });
+type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string };
+
+/** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
+async function pickDependency(env: Env, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Promise<Picked> {
+  const src = await lookupOrUnknown(env, dep.name);
+  if (src === "unknown") return { kind: "missing", reason: "the upstream registry could not be asked" };
+  if (src === null) return { kind: "missing", reason: "not on this registry or upstream" };
+  let inRange: VersionRecord[];
+  switch (dep.kind) {
+    case "tag": {
+      const tagged = src.distTags[dep.tag];
+      inRange = tagged ? src.versions.filter((v) => v.version === tagged) : [];
+      break;
+    }
+    case "registry":
+      inRange = src.versions.filter((v) => Bun.semver.satisfies(v.version, dep.range));
+      break;
+    default: {
+      const _exhaustive: never = dep;
+      return _exhaustive;
+    }
   }
-  return out;
+  const best = inRange.filter(keep).sort((a, b) => Bun.semver.order(b.version, a.version))[0];
+  return best ? { kind: "found", src, v: best } : { kind: "missing", reason: `no installable version matches ${describeDependency(dep)}` };
+}
+
+/** Each checked dependency may mean an upstream download and analysis, so publish checks a bounded number. */
+const MAX_PUBLISH_DEPS = 50;
+
+/** Dependencies of a manifest whose best matching version scores below the floor, and those apm could not check. */
+async function checkDependencies(env: Env, manifest: Record<string, unknown>): Promise<{ risky: DependencyRisk[]; unchecked: string[] }> {
+  const risky: DependencyRisk[] = [];
+  const unchecked: string[] = [];
+  const specs = dependencySpecs(manifest);
+  for (const dep of specs.slice(0, MAX_PUBLISH_DEPS)) {
+    if (!isRegistryDependency(dep)) {
+      unchecked.push(`${describeDependency(dep)}: ${uncheckableReason(dep)}`);
+      continue;
+    }
+    const picked = await pickDependency(env, dep, (v) => v.status !== "revoked");
+    if (picked.kind !== "found") {
+      unchecked.push(`${describeDependency(dep)}: ${picked.reason}`);
+      continue;
+    }
+    const analyzed = await ensureAnalyzed(env, picked.src, picked.v);
+    const r = reportFor(env.ctx, analyzed, { ignoreRecent: true });
+    if (!r) unchecked.push(`${dep.name}@${picked.v.version}: could not be analyzed`);
+    else if (r.score < SCORE_FLOOR) risky.push({ name: dep.name, version: picked.v.version, score: r.score });
+  }
+  if (specs.length > MAX_PUBLISH_DEPS) unchecked.push(`${specs.length - MAX_PUBLISH_DEPS} more dependencies: apm checks the first ${MAX_PUBLISH_DEPS} at publish`);
+  return { risky, unchecked };
 }
 
 function makeOnPublish(env: Env): PublishHook {
@@ -176,7 +218,8 @@ function makeOnPublish(env: Env): PublishHook {
     let files: TarEntry[];
     try {
       files = readTarball(tarball);
-    } catch {
+    } catch (e) {
+      if (e instanceof ArchiveError) return { ok: false, status: httpStatusOf(e), error: `Refusing to read the tarball: ${e.message}.` };
       return { ok: false, status: 400, error: "The tarball is not a valid gzip'd tar." };
     }
     const ambiguous = ambiguousPaths(files);
@@ -201,14 +244,15 @@ function makeOnPublish(env: Env): PublishHook {
     }
 
     const secrets = findSecrets(files);
-    if (secrets.length > 0) {
+    if (secrets.findings.length > 0) {
       return {
         ok: false,
         status: 422,
-        error: `Refusing to publish: ${secrets.map((s) => s.detail).join("; ")}. Remove the file or add a "files" allowlist to package.json, then publish again. Rotate any key that was ever committed.`,
-        detail: secrets,
+        error: `Refusing to publish: ${secrets.findings.map((s) => s.detail).join("; ")}. Remove the file or add a "files" allowlist to package.json, then publish again. Rotate any key that was ever committed.`,
+        detail: secrets.findings,
       };
     }
+    const warnings = secrets.skipped.map((s) => `${describeSkip(s)} was too large to scan for secrets; check it yourself.`);
 
     const missing = missingEntries(tarManifest, files);
     if (missing.length > 0) {
@@ -228,8 +272,9 @@ function makeOnPublish(env: Env): PublishHook {
         if (probe.kind === "found") {
           return { ok: false, status: 403, error: `"${name}" already exists on the public registry. apm shares one namespace with it, so you cannot publish over it here. Publish under your scope (@${user}/${name}) instead.` };
         }
-        if (probe.kind === "unknown" && !name.startsWith("@")) {
-          return { ok: false, status: 503, error: `Cannot check whether "${name}" exists on the public registry right now, so a first publish of this name is refused. Try again shortly, or publish under your scope (@${user}/${name}).` };
+        // scoped names too: during an outage nobody can tell whose @scope/name this is on npm
+        if (probe.kind === "unknown") {
+          return { ok: false, status: 503, error: `Cannot check whether "${name}" exists on the public registry right now, so a first publish of this name is refused. Try again shortly.` };
         }
       }
       const conflicts = typoConflicts(name);
@@ -248,11 +293,11 @@ function makeOnPublish(env: Env): PublishHook {
     const last = previous[previous.length - 1];
     const prevDeps = last ? new Set(dependencyNames(last.manifest)) : null;
     const addedDependencies = prevDeps ? dependencyNames(tarManifest).filter((d) => !prevDeps.has(d)) : [];
-    const risky = await riskyDependencies(env, tarManifest);
-    const analysis = analyze({ name, manifest: tarManifest, files, publisher: user, previousPublishers, riskyDependencies: risky, addedDependencies });
+    const deps = await checkDependencies(env, tarManifest);
+    const analysis = analyze({ name, manifest: tarManifest, files, publisher: user, previousPublishers, riskyDependencies: deps.risky, addedDependencies, uncheckedDependencies: deps.unchecked });
     const served: Record<string, unknown> = { ...tarManifest };
     if (typeof manifest.readme === "string") served.readme = manifest.readme;
-    return { ok: true, manifest: served, score: analysis };
+    return { ok: true, manifest: served, score: analysis, warnings };
   };
 }
 
@@ -317,11 +362,23 @@ const StateBody = z.object({ name: z.string(), version: z.string(), reason: z.st
 const IncidentBody = z.object({ since: z.string(), reason: z.string().optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
 const OwnerBody = z.object({ name: z.string(), user: z.string(), password: Password, otp: Otp });
 
+/** JSON bodies of the apm and audit APIs, before and after gzip. Thousands of packages fit in a fraction of it. */
+export const MAX_JSON_BODY_BYTES = 5 * 1024 * 1024;
+
+/** Reads a JSON body, gzip'd or not, within MAX_JSON_BODY_BYTES. Throws ArchiveError "too-large" past it. */
 async function readJson(req: Request): Promise<unknown> {
+  const tooLarge = (): ArchiveError => new ArchiveError("too-large", `request body over ${MAX_JSON_BODY_BYTES / (1024 * 1024)} MB`);
+  if (Number(req.headers.get("content-length") ?? 0) > MAX_JSON_BODY_BYTES) throw tooLarge();
   const enc = req.headers.get("content-encoding") ?? "";
   const buf = new Uint8Array(await req.arrayBuffer());
-  const raw = enc.includes("gzip") || (buf[0] === 0x1f && buf[1] === 0x8b) ? new Uint8Array(gunzipSync(buf)) : buf;
+  if (buf.length > MAX_JSON_BODY_BYTES) throw tooLarge();
+  const raw = enc.includes("gzip") || (buf[0] === 0x1f && buf[1] === 0x8b) ? gunzipCapped(buf, MAX_JSON_BODY_BYTES) : buf;
   return JSON.parse(new TextDecoder().decode(raw));
+}
+
+function bodyError(e: unknown): Response {
+  if (e instanceof ArchiveError) return fail(httpStatusOf(e), `Request body refused: ${e.message}`);
+  return fail(400, `Invalid request body: ${e instanceof Error ? e.message : String(e)}`);
 }
 
 type Parsed<T> = { ok: true; value: T } | { ok: false; res: Response };
@@ -329,7 +386,7 @@ async function parseBody<T>(req: Request, schema: z.ZodType<T>): Promise<Parsed<
   try {
     return { ok: true, value: schema.parse(await readJson(req)) };
   } catch (e) {
-    return { ok: false, res: fail(400, `Invalid request body: ${e instanceof Error ? e.message : String(e)}`) };
+    return { ok: false, res: bodyError(e) };
   }
 }
 
@@ -455,8 +512,21 @@ async function handleOwners(req: Request, ctx: Ctx, auth: Auth): Promise<Respons
   if (denied) return denied;
   if (!ctx.store.getUser(parsed.value.user)) return fail(404, `No user ${parsed.value.user}.`);
   const remove = req.method === "DELETE";
-  if (remove) ctx.store.removeOwner(parsed.value.name, parsed.value.user);
-  else ctx.store.addOwner(parsed.value.name, parsed.value.user);
+  if (remove) {
+    const removed = ctx.store.removeOwner(parsed.value.name, parsed.value.user);
+    switch (removed) {
+      case "removed":
+        break;
+      case "not-owner":
+        return fail(404, `${parsed.value.user} is not an owner of ${parsed.value.name}.`);
+      case "last-owner":
+        return fail(409, `${parsed.value.user} is the last owner of ${parsed.value.name}. Add another owner first: a package with no owners can never be published, yanked or revoked again.`);
+      default: {
+        const _exhaustive: never = removed;
+        return _exhaustive;
+      }
+    }
+  } else ctx.store.addOwner(parsed.value.name, parsed.value.user);
   ctx.store.addEvent({ package: parsed.value.name, kind: remove ? "owner-remove" : "owner-add", actor: who.user, at: ctx.now(), detail: { user: parsed.value.user } });
   return json({ ok: true, owners: ctx.store.owners(parsed.value.name) });
 }
@@ -613,8 +683,8 @@ export async function nameReport(env: Env, q: string, user: string | null, part:
 // ---------- search: local packages merged with the upstream's search ----------
 /** A score for an upstream search hit, only when that version was analyzed before. Never fetches a tarball. */
 function storedUpstreamScore(ctx: Ctx, name: string, version: string, date: string | null | undefined): ReturnType<typeof compact> | null {
-  const analysis = ctx.store.getUpstreamAnalysis(name, version);
-  if (!isAnalysis(analysis)) return null;
+  const analysis = parseAnalysis(ctx.store.latestUpstreamAnalysis(name, version));
+  if (!analysis) return null;
   return compact(finalize(analysis, { publishedAt: Date.parse(date ?? "") || 0, now: ctx.now(), deprecated: null, status: "active", statusReason: null }));
 }
 
@@ -636,7 +706,8 @@ async function searchResponse(env: Env, url: URL, scoreOf: (v: VersionRecord) =>
   const ctx = env.ctx;
   const { text, size, from } = searchPaging(url);
   const local = localSearchObjects(ctx, { searchScore: scoreOf }, text);
-  const up = env.upstream && text.trim() !== "" ? await env.upstream.search(text.trim(), Math.min(250, from + size)) : null;
+  // npm refuses text shorter than two characters, so asking it would only look like an outage
+  const up = env.upstream && text.trim().length >= 2 ? await env.upstream.search(text.trim(), Math.min(250, from + size)) : null;
   const upstream =
     up?.kind === "ok"
       ? up.objects.map((o) => ({ ...o, source: "npm" as const, apmScore: storedUpstreamScore(ctx, o.package.name, o.package.version, o.package.date) }))
@@ -712,57 +783,63 @@ function parseDuration(s: string | null, fallback: number): number {
 }
 
 type TreeBlock = { name: string; version: string; reason: string; via: string[] };
+/** A dependency the walk could not score: a git or URL spec, a missing package, a failed analysis or the walk's limit. */
+type UncheckedDep = { dependency: string; reason: string; via: string[] };
+type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[] };
+const MAX_UNCHECKED_LISTED = 50;
 
 /**
  * Walks the dependency tree the package manager would install (newest active version matching each
- * range) and returns the versions that are revoked or score below the floor. Bounded: at most
- * `maxNodes` packages and `maxAnalyses` tarball analyses; the rest is reported as unchecked.
+ * range, npm: aliases followed to the package they install) and returns the versions that are revoked
+ * or score below the floor. Bounded: at most `maxNodes` packages and `maxAnalyses` tarball analyses.
+ * Everything it could not score is counted and listed, never dropped.
  */
-async function treeBlocks(env: Env, root: VersionRecord, floor: number, limits = { maxNodes: 300, maxAnalyses: 40 }): Promise<{ blocks: TreeBlock[]; unchecked: number }> {
+async function treeBlocks(env: Env, root: VersionRecord, floor: number, limits = { maxNodes: 300, maxAnalyses: 40 }): Promise<Tree> {
   const blocks: TreeBlock[] = [];
+  const uncheckedDeps: UncheckedDep[] = [];
+  let unchecked = 0;
+  const miss = (dependency: string, reason: string, via: string[]): void => {
+    unchecked++;
+    if (uncheckedDeps.length < MAX_UNCHECKED_LISTED) uncheckedDeps.push({ dependency, reason, via });
+  };
   const seen = new Set<string>();
   let analyses = 0;
-  let unchecked = 0;
-  const queue: { name: string; range: string; via: string[] }[] = dependencyEntries(root.manifest).map(([name, range]) => ({ name, range, via: [`${root.package}@${root.version}`] }));
-  while (queue.length > 0) {
-    const item = queue.shift();
+  const rootId = `${root.package}@${root.version}`;
+  const queue = dependencySpecs(root.manifest).map((dep) => ({ dep, via: [rootId] }));
+  for (let qi = 0; qi < queue.length; qi++) {
+    const item = queue[qi];
     if (!item) break;
     if (seen.size >= limits.maxNodes) {
-      unchecked += queue.length + 1;
+      const rest = queue.length - qi;
+      unchecked += rest;
+      uncheckedDeps.push({ dependency: `${rest} more`, reason: `the check stops after ${limits.maxNodes} packages`, via: [rootId] });
       break;
     }
-    const src = await lookup(env, item.name);
-    if (!src) continue;
+    const dep = item.dep;
+    if (!isRegistryDependency(dep)) {
+      miss(describeDependency(dep), uncheckableReason(dep), item.via);
+      continue;
+    }
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
-    const pick = src.versions
-      .filter((v) => v.status === "active" && Bun.semver.satisfies(v.version, item.range))
-      .sort((a, b) => Bun.semver.order(b.version, a.version))[0] ?? null;
-    if (!pick) continue;
-    const key = `${item.name}@${pick.version}`;
+    const picked = await pickDependency(env, dep, (v) => v.status === "active");
+    if (picked.kind !== "found") {
+      miss(describeDependency(dep), picked.reason, item.via);
+      continue;
+    }
+    const key = `${dep.name}@${picked.v.version}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    let v = pick;
-    if (!isAnalysis(v.score)) {
-      if (analyses < limits.maxAnalyses) {
-        analyses++;
-        v = await ensureAnalyzed(env, src, v);
-      }
+    let v = picked.v;
+    if (!parseAnalysis(v.score) && analyses < limits.maxAnalyses) {
+      analyses++;
+      v = await ensureAnalyzed(env, picked.src, v);
     }
     const r = reportFor(env.ctx, v, { ignoreRecent: true });
-    if (!r) unchecked++;
-    else if (r.score < floor) blocks.push({ name: item.name, version: v.version, reason: `score ${r.score}/100 (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`, via: item.via });
-    if (item.via.length < 12) for (const [n, range] of dependencyEntries(v.manifest)) queue.push({ name: n, range, via: [...item.via, key] });
+    if (!r) miss(key, "could not be analyzed", item.via);
+    else if (r.score < floor) blocks.push({ name: dep.name, version: v.version, reason: `score ${r.score}/100 (${r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ")})`, via: item.via });
+    if (item.via.length < 12) for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
   }
-  return { blocks, unchecked };
-}
-
-function dependencyEntries(manifest: Record<string, unknown>): [string, string][] {
-  const out: [string, string][] = [];
-  for (const k of ["dependencies", "optionalDependencies"] as const) {
-    const d = manifest[k];
-    if (isRecord(d)) for (const [n, r] of Object.entries(d)) if (typeof r === "string") out.push([n, r]);
-  }
-  return out;
+  return { blocks, unchecked, uncheckedDeps };
 }
 
 async function resolveResponse(env: Env, url: URL): Promise<Response> {
@@ -792,7 +869,7 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
     const block = policyBlock(ctx, v, policy);
     if (block === null) {
       const report = reportFor(ctx, v);
-      const tree = policy.floor > 0 ? await treeBlocks(env, v, policy.floor) : { blocks: [], unchecked: 0 };
+      const tree: Tree = policy.floor > 0 ? await treeBlocks(env, v, policy.floor) : { blocks: [], unchecked: 0, uncheckedDeps: [] };
       if (tree.blocks.length > 0) {
         const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
         return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);
@@ -809,15 +886,31 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
 
 const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })) });
 
+const MAX_SCAN = 2000;
+
 async function scanResponse(req: Request, env: Env): Promise<Response> {
   const ctx = env.ctx;
   const parsed = await parseBody(req, ScanBody);
   if (!parsed.ok) return parsed.res;
   const advisories: { package: string; version: string; level: "fatal" | "warn"; description: string; url: string | null }[] = [];
-  for (const p of parsed.value.packages.slice(0, 2000)) {
-    const src = await lookup(env, p.name);
-    const v0 = src?.versions.find((x) => x.version === p.version);
-    if (!src || !v0) continue;
+  // Versions the scan could not judge. Missing from `advisories` is not the same as clean.
+  const unchecked: { package: string; version: string; reason: string }[] = [];
+  for (const p of parsed.value.packages.slice(MAX_SCAN)) unchecked.push({ package: p.name, version: p.version, reason: `a scan checks at most ${MAX_SCAN} packages` });
+  for (const p of parsed.value.packages.slice(0, MAX_SCAN)) {
+    const src = await lookupOrUnknown(env, p.name);
+    if (src === "unknown") {
+      unchecked.push({ package: p.name, version: p.version, reason: "the upstream registry could not be asked" });
+      continue;
+    }
+    if (src === null) {
+      unchecked.push({ package: p.name, version: p.version, reason: "not on this registry or upstream" });
+      continue;
+    }
+    const v0 = src.versions.find((x) => x.version === p.version);
+    if (!v0) {
+      unchecked.push({ package: p.name, version: p.version, reason: "no such version" });
+      continue;
+    }
     const url = `${ctx.baseUrl()}package/${p.name}`;
     if (v0.status === "revoked" || v0.status === "revoke-pending") {
       advisories.push({ package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url });
@@ -825,27 +918,27 @@ async function scanResponse(req: Request, env: Env): Promise<Response> {
     }
     const v = await ensureAnalyzed(env, src, v0);
     const r = reportFor(ctx, v, { ignoreRecent: true });
-    if (r && r.score < SCORE_FLOOR) {
+    if (!r) {
+      unchecked.push({ package: p.name, version: p.version, reason: "could not be analyzed" });
+      continue;
+    }
+    if (r.score < SCORE_FLOOR) {
       const why = r.signals.filter((s) => s.points < 0).map((s) => s.id).join(", ");
       advisories.push({ package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} has apm score ${r.score}/100 (${why}). Review it, then allow it with apm add ${p.name} --force.`, url });
     }
   }
-  return json({ advisories });
+  return json({ advisories, unchecked });
 }
 
-async function bulkAdvisories(req: Request, env: Env): Promise<Response> {
+const AuditBody = z.record(z.string(), z.array(z.string()));
+type Audit = { advisories: Record<string, unknown[]>; unavailable: string[] };
+
+/** Local advisories plus the upstream's for names not published here. `unavailable` names packages whose upstream advisories could not be fetched. */
+async function collectAdvisories(env: Env, query: z.infer<typeof AuditBody>): Promise<Audit> {
   const ctx = env.ctx;
-  let body: unknown;
-  try {
-    body = await readJson(req);
-  } catch {
-    return fail(400, "Invalid body");
-  }
-  const parsed = z.record(z.string(), z.array(z.string())).safeParse(body);
-  if (!parsed.success) return fail(400, "Expected { name: [versions] }");
   const out: Record<string, unknown[]> = {};
   const upstreamQuery: Record<string, string[]> = {};
-  for (const [name, versions] of Object.entries(parsed.data)) {
+  for (const [name, versions] of Object.entries(query)) {
     if (!ctx.store.getPackage(name)) upstreamQuery[name] = versions;
     const list = ctx.store.advisoriesFor(name).map((a) => ({
       id: a.id,
@@ -860,9 +953,37 @@ async function bulkAdvisories(req: Request, env: Env): Promise<Response> {
   }
   if (env.upstream && Object.keys(upstreamQuery).length > 0) {
     const up = await env.upstream.advisories(upstreamQuery);
-    for (const [name, list] of Object.entries(up)) out[name] = [...(out[name] ?? []), ...list];
+    switch (up.kind) {
+      case "ok":
+        for (const [name, list] of Object.entries(up.advisories)) out[name] = [...(out[name] ?? []), ...list];
+        break;
+      case "unavailable":
+        return { advisories: out, unavailable: Object.keys(upstreamQuery) };
+      default: {
+        const _exhaustive: never = up;
+        return _exhaustive;
+      }
+    }
   }
-  return json(out);
+  return { advisories: out, unavailable: [] };
+}
+
+/** npm's bulk advisory endpoint. When part of the answer could not be fetched it is a 503, never a clean {}. */
+async function bulkAdvisories(req: Request, env: Env): Promise<Response> {
+  const parsed = await parseBody(req, AuditBody);
+  if (!parsed.ok) return parsed.res;
+  const audit = await collectAdvisories(env, parsed.value);
+  if (audit.unavailable.length > 0) {
+    return fail(503, `The upstream advisory service did not answer for ${audit.unavailable.length} package(s), so this audit would be incomplete. Try again shortly.`);
+  }
+  return json(audit.advisories);
+}
+
+/** apm's audit: the same advisories, plus the packages whose advisories could not be fetched. */
+async function auditResponse(req: Request, env: Env): Promise<Response> {
+  const parsed = await parseBody(req, AuditBody);
+  if (!parsed.ok) return parsed.res;
+  return json(await collectAdvisories(env, parsed.value));
 }
 
 // ---------- upstream packuments and tarballs ----------
@@ -914,11 +1035,22 @@ async function upstreamRoute(req: Request, url: URL, env: Env, viaSafe: boolean)
     const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(sp.rest[1]);
     const version = m?.[2];
     if (!version) return fail(404, "Not found");
-    const bytes = await env.upstream.tarball(env.ctx, src.pkg, version);
-    if (!bytes) return fail(502, "Upstream tarball unavailable or failed its integrity check.");
+    const got = await env.upstream.tarball(env.ctx, src.pkg, version);
+    switch (got.kind) {
+      case "absent":
+        return fail(404, `${src.name}@${version} is not published upstream.`);
+      case "unavailable":
+        return fail(502, `Upstream tarball unavailable: ${got.reason}.`);
+      case "ok":
+        break;
+      default: {
+        const _exhaustive: never = got;
+        return _exhaustive;
+      }
+    }
     const v = src.versions.find((x) => x.version === version);
     if (v) await ensureAnalyzed(env, src, v);
-    return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
+    return new Response(got.bytes, { headers: { "content-type": "application/octet-stream" } });
   }
   if (sp.rest.length > 0) return null;
   const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
@@ -954,6 +1086,7 @@ function makeRoutes(env: Env, scoreOf: (v: VersionRecord) => unknown): NonNullab
       if (rest === "incident") return handleIncident(req, ctx, auth);
       if (rest === "owners") return handleOwners(req, ctx, auth);
       if (rest === "scan") return scanResponse(req, env);
+      if (rest === "audit") return auditResponse(req, env);
     }
     if (req.method === "DELETE" && rest === "owners") return handleOwners(req, ctx, auth);
     if (req.method !== "GET") return fail(405, "Method not allowed");

@@ -42,11 +42,21 @@ export function buildAccess(input: {
       }
       if (!isVerified(user) && upstream) {
         const onNpm = await upstream.scopeExists(scope);
-        if (onNpm === "found") {
-          return {
-            status: 403,
-            error: `@${scope} is a scope on npm, so apm keeps it for the GitHub account "${scope}". Sign in with GitHub as ${scope} (apm login) to publish under it.`,
-          };
+        switch (onNpm) {
+          case "found":
+            return {
+              status: 403,
+              error: `@${scope} is a scope on npm, so apm keeps it for the GitHub account "${scope}". Sign in with GitHub as ${scope} (apm login) to publish under it.`,
+            };
+          case "unknown":
+            // fail closed: during an npm outage nobody can tell whether @scope belongs to someone there
+            return { status: 503, error: `Cannot check whether @${scope} is a scope on npm right now, so a first publish under it is refused. Try again shortly, or sign in with GitHub (apm login).` };
+          case "absent":
+            break;
+          default: {
+            const _exhaustive: never = onNpm;
+            return _exhaustive;
+          }
         }
       }
       return null;

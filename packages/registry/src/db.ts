@@ -3,6 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { dependencySpecs, isRegistryDependency, SCORER } from "@apm/core";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
@@ -104,6 +105,15 @@ CREATE TABLE IF NOT EXISTS upstream_analysis (
   version TEXT NOT NULL,
   analysis TEXT NOT NULL,
   PRIMARY KEY (package, version)
+);
+CREATE TABLE IF NOT EXISTS upstream_analysis_v2 (
+  package TEXT NOT NULL,
+  version TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  scorer TEXT NOT NULL,
+  analysis TEXT NOT NULL,
+  analyzed_at INTEGER NOT NULL,
+  PRIMARY KEY (package, version, digest, scorer)
 );
 `;
 
@@ -366,8 +376,15 @@ export class Store {
   addOwner(name: string, user: string): void {
     this.db.query("INSERT OR IGNORE INTO owners (package, user) VALUES (?, ?)").run(name, user);
   }
-  removeOwner(name: string, user: string): void {
-    this.db.query("DELETE FROM owners WHERE package = ? AND user = ?").run(name, user);
+  /** Removes an owner unless that would leave the package with none. Atomic: the count is read in the same transaction. */
+  removeOwner(name: string, user: string): "removed" | "not-owner" | "last-owner" {
+    return this.tx(() => {
+      const owners = this.owners(name);
+      if (!owners.includes(user)) return "not-owner";
+      if (owners.length <= 1) return "last-owner";
+      this.db.query("DELETE FROM owners WHERE package = ? AND user = ?").run(name, user);
+      return "removed";
+    });
   }
 
   // versions
@@ -400,6 +417,10 @@ export class Store {
   setScore(name: string, version: string, score: unknown): void {
     this.db.query("UPDATE versions SET score = ? WHERE package = ? AND version = ?").run(JSON.stringify(score), name, version);
   }
+  /** Whether any version's tarball is the blob with this integrity. */
+  integrityInUse(integrity: string): boolean {
+    return this.db.query("SELECT 1 FROM versions WHERE integrity = ? LIMIT 1").get(integrity) !== null;
+  }
   shaExists(shasum: string): VersionRecord | null {
     const row = this.db.query("SELECT * FROM versions WHERE shasum = ? LIMIT 1").get(shasum);
     return row ? this.toVersion(row) : null;
@@ -422,21 +443,30 @@ export class Store {
       const r = z.object({ package: z.string(), manifest: z.string() }).parse(row);
       if (r.package === name) continue;
       const m = JsonObject.parse(parseJson(r.manifest));
-      for (const k of ["dependencies", "optionalDependencies", "peerDependencies"]) {
-        const deps = m[k];
-        if (typeof deps === "object" && deps !== null && name in deps) out.add(r.package);
-      }
+      // npm: aliases count under the package they install, not under their key
+      if (dependencySpecs(m).some((d) => isRegistryDependency(d) && d.name === name)) out.add(r.package);
+      const peers = m.peerDependencies;
+      if (typeof peers === "object" && peers !== null && name in peers) out.add(r.package);
     }
     return [...out];
   }
 
-  getUpstreamAnalysis(name: string, version: string): unknown {
-    const row = this.db.query("SELECT analysis FROM upstream_analysis WHERE package = ? AND version = ?").get(name, version);
+  /** The current scorer's analysis of exactly these bytes (`digest` names the tarball), or null. */
+  getUpstreamAnalysis(name: string, version: string, digest: string): unknown {
+    const row = this.db.query("SELECT analysis FROM upstream_analysis_v2 WHERE package = ? AND version = ? AND digest = ? AND scorer = ?").get(name, version, digest, SCORER);
     if (!row) return null;
     return parseJson(z.object({ analysis: z.string() }).parse(row).analysis);
   }
-  setUpstreamAnalysis(name: string, version: string, analysis: unknown): void {
-    this.db.query("INSERT OR REPLACE INTO upstream_analysis (package, version, analysis) VALUES (?, ?, ?)").run(name, version, JSON.stringify(analysis));
+  /** For display where the tarball digest is not known (search hits): the newest current-scorer analysis. */
+  latestUpstreamAnalysis(name: string, version: string): unknown {
+    const row = this.db.query("SELECT analysis FROM upstream_analysis_v2 WHERE package = ? AND version = ? AND scorer = ? ORDER BY analyzed_at DESC LIMIT 1").get(name, version, SCORER);
+    if (!row) return null;
+    return parseJson(z.object({ analysis: z.string() }).parse(row).analysis);
+  }
+  setUpstreamAnalysis(input: { name: string; version: string; digest: string; analysis: unknown; at: number }): void {
+    this.db
+      .query("INSERT OR REPLACE INTO upstream_analysis_v2 (package, version, digest, scorer, analysis, analyzed_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(input.name, input.version, input.digest, SCORER, JSON.stringify(input.analysis), input.at);
   }
 
   // advisories

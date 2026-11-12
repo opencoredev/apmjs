@@ -1,51 +1,72 @@
 // apm-score-v1: a per-version safety score. Pure functions, tarball and history in, report out.
 // 100 means nothing risky was found. Every deduction is a named signal with evidence.
 // Popularity is deliberately not an input: it is gameable and says nothing about compromise.
+import { z } from "zod";
+import { dependencySpecs, isRegistryDependency } from "./deps.ts";
+import { describeSkip, MAX_ANALYZED_FILE_BYTES, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import type { TarEntry } from "./tarball.ts";
 
-export type SignalId =
-  | "install-script"
-  | "shell-exec"
-  | "network"
-  | "credential-access"
-  | "eval"
-  | "obfuscated"
-  | "binary"
-  | "new-publisher"
-  | "no-license"
-  | "typosquat"
-  | "install-download"
-  | "risky-dependency"
-  | "new-dependency"
-  | "recent"
-  | "deprecated"
-  | "yanked"
-  | "revoked";
+export const SIGNAL_IDS = [
+  "install-script",
+  "shell-exec",
+  "network",
+  "credential-access",
+  "eval",
+  "obfuscated",
+  "binary",
+  "new-publisher",
+  "no-license",
+  "typosquat",
+  "install-download",
+  "risky-dependency",
+  "new-dependency",
+  "incomplete",
+  "recent",
+  "deprecated",
+  "yanked",
+  "revoked",
+] as const;
+export type SignalId = (typeof SIGNAL_IDS)[number];
 
-export type Signal = { id: SignalId; label: string; points: number; evidence: string[] };
-
-export type ModuleFormat = "esm" | "cjs" | "dual";
-export type Facts = {
-  moduleFormat: ModuleFormat;
-  types: "bundled" | "none";
-  installScripts: boolean;
-  hasBin: boolean;
-  license: string | null;
-  fileCount: number;
-  unpackedSize: number;
-  dependencyCount: number;
-};
-
-export type Analysis = { scorer: "apm-score-v1"; signals: Signal[]; facts: Facts; notChecked: string[] };
+/** v2 lists the files it could not read; v1 analyses (stored before) read as having skipped nothing. */
+export const SCORER = "apm-score-v2";
+const SignalSchema = z.object({ id: z.enum(SIGNAL_IDS), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+const FactsSchema = z.object({
+  moduleFormat: z.enum(["esm", "cjs", "dual"]),
+  types: z.enum(["bundled", "none"]),
+  installScripts: z.boolean(),
+  hasBin: z.boolean(),
+  license: z.string().nullable(),
+  fileCount: z.number(),
+  unpackedSize: z.number(),
+  dependencyCount: z.number(),
+});
+const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large"]) });
 
 export const NOT_CHECKED: readonly string[] = [
   "runtime behavior: code that downloads, decrypts or builds a second stage while running",
   "the code of dependencies beyond their own scores",
   "whether the publisher's machine or CI was compromised",
 ];
+
+const AnalysisSchema = z.object({
+  scorer: z.enum(["apm-score-v1", SCORER]),
+  signals: z.array(SignalSchema),
+  facts: FactsSchema,
+  notChecked: z.array(z.string()).default([...NOT_CHECKED]),
+  skipped: z.array(SkippedSchema).default([]),
+});
+
+export type Signal = z.infer<typeof SignalSchema>;
+export type Facts = z.infer<typeof FactsSchema>;
+export type ModuleFormat = Facts["moduleFormat"];
+export type Analysis = z.infer<typeof AnalysisSchema>;
 export type Grade = "A" | "B" | "C" | "D" | "F";
 export type ScoreReport = Analysis & { score: number; grade: Grade };
+
+export const SCORE_FLOOR = 40;
+export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export const POINTS: Record<SignalId, number> = {
   "install-script": -15,
@@ -61,6 +82,8 @@ export const POINTS: Record<SignalId, number> = {
   "install-download": -40,
   "risky-dependency": -30,
   "new-dependency": -5,
+  // an analysis that did not read every file that runs can never pass the floor on its own
+  incomplete: -(100 - SCORE_FLOOR + 1),
   // informational: age is handled by the cooldown, never by the number
   recent: 0,
   deprecated: -5,
@@ -82,14 +105,12 @@ const LABELS: Record<SignalId, string> = {
   "install-download": "Install script downloads or runs code inline (curl | sh, node -e with network)",
   "risky-dependency": "Depends on a package that scores below the floor",
   "new-dependency": "Adds dependencies the previous version did not have",
+  incomplete: "Some code was too large to analyze, so this version is unverified",
   recent: "Published less than 24 hours ago; most malicious versions are caught within hours",
   deprecated: "Deprecated by its maintainer",
   yanked: "Yanked: hidden from new installs by its maintainer",
   revoked: "Revoked: pulled as malicious or compromised",
 };
-
-export const SCORE_FLOOR = 40;
-export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh|ps1|py)$/;
 const INSTALL_SCRIPTS = ["preinstall", "install", "postinstall"] as const;
@@ -108,8 +129,21 @@ const RULES: { id: "shell-exec" | "network" | "credential-access" | "eval" | "ob
     id: "eval",
     re: /(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b|\[\s*(['"`])[\w$]{0,8}\1\s*\+\s*(['"`])[\w$]{0,8}\2\s*\]|=\s*require\s*[;,\n]|\brequire\s*\(\s*String\.fromCharCode/,
   },
-  { id: "obfuscated", re: /(?:_0x[0-9a-f]{4,}[\s\S]*){20}|(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/ },
+  { id: "obfuscated", re: /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/ },
 ];
+
+/** obfuscator.io output: twenty or more `_0x1a2b` identifiers. Counted in one linear pass (a regex with a
+ *  repeated `[\s\S]*` backtracks exponentially on large files). Returns the first one's index, or -1. */
+function hexIdentifierRun(text: string): number {
+  const re = /_0x[0-9a-f]{4,}/g;
+  let first = -1;
+  let n = 0;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    if (first < 0) first = m.index;
+    if (++n >= 20) return first;
+  }
+  return -1;
+}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -178,12 +212,6 @@ export function factsOf(manifest: Record<string, unknown>, files: readonly TarEn
 
 function signal(id: SignalId, evidence: string[]): Signal {
   return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5) };
-}
-
-function isText(data: Uint8Array): boolean {
-  const n = Math.min(data.length, 4096);
-  for (let i = 0; i < n; i++) if (data[i] === 0) return false;
-  return true;
 }
 
 /** The canonical dropper shape: an install command that fetches or evaluates remote code itself. */
@@ -257,15 +285,13 @@ export type AnalyzeInput = {
   riskyDependencies?: readonly DependencyRisk[];
   /** Dependency names absent from the previous version; empty for a first release. */
   addedDependencies?: readonly string[];
+  /** Dependencies apm could not score (git, URL, missing): listed under "not checked". */
+  uncheckedDependencies?: readonly string[];
 };
 
+/** What each dependency installs: the registry name behind an npm: alias, the key for anything else. */
 export function dependencyNames(manifest: Record<string, unknown>): string[] {
-  const out = new Set<string>();
-  for (const k of ["dependencies", "optionalDependencies"] as const) {
-    const d = manifest[k];
-    if (isRecord(d)) for (const n of Object.keys(d)) out.add(n);
-  }
-  return [...out];
+  return [...new Set(dependencySpecs(manifest).map((d) => (isRegistryDependency(d) ? d.name : d.key)))];
 }
 
 /** Static analysis of one version. Run once at publish; stored with the version. */
@@ -290,21 +316,32 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   // Files that run: every file with a code extension, plus whatever install scripts, main, bin and
   // exports point at, plus anything those reach through a relative require/import, whatever its name.
+  // Every reached file is read, whatever its bytes look like: skipping "non-text" would let a NUL byte hide code.
   const byPath = new Map(files.map((f) => [f.path, f]));
-  const queue: string[] = files.filter((f) => CODE_EXT.test(f.path)).map((f) => f.path);
-  for (const cmd of Object.values(scripts)) for (const p of scriptTargets(cmd)) queue.push(p);
-  for (const p of declaredEntries(manifest)) queue.push(p);
+  const queue: string[] = [];
+  const queued = new Set<string>();
+  const enqueue = (p: string): void => {
+    if (queued.has(p)) return;
+    queued.add(p);
+    queue.push(p);
+  };
+  for (const f of files) if (CODE_EXT.test(f.path)) enqueue(f.path);
+  for (const cmd of Object.values(scripts)) for (const p of scriptTargets(cmd)) enqueue(p);
+  for (const p of declaredEntries(manifest)) enqueue(p);
   const seen = new Set<string>();
-  while (queue.length > 0 && seen.size < 2000) {
-    const want = queue.shift() ?? "";
-    const f = resolveIn(byPath, want);
+  const skipped: SkippedFile[] = [];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const f = resolveIn(byPath, queue[qi] ?? "");
     if (!f || seen.has(f.path)) continue;
     seen.add(f.path);
     if (isBinary(f)) {
       add("binary", f.path);
       continue;
     }
-    if (f.data.length > 5_000_000 || !isText(f.data)) continue;
+    if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
+      skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
+      continue;
+    }
     const text = new TextDecoder().decode(f.data);
     for (const rule of RULES) {
       const m = rule.re.exec(text);
@@ -313,8 +350,14 @@ export function analyze(input: AnalyzeInput): Analysis {
         add(rule.id, `${f.path}:${line}: ${snippet}`);
       }
     }
-    for (const spec of relativeImports(text)) queue.push(joinPath(dirOf(f.path), spec));
+    const hex = hexIdentifierRun(text);
+    if (hex >= 0) {
+      const { line, snippet } = lineOf(text, hex);
+      add("obfuscated", `${f.path}:${line}: ${snippet}`);
+    }
+    for (const spec of relativeImports(text)) enqueue(joinPath(dirOf(f.path), spec));
   }
+  for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
 
   const facts = factsOf(manifest, files);
@@ -328,12 +371,13 @@ export function analyze(input: AnalyzeInput): Analysis {
   for (const d of input.riskyDependencies ?? []) add("risky-dependency", `${d.name}@${d.version} scores ${d.score}/100`);
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
-  const order: SignalId[] = ["credential-access", "install-download", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
+  const order: SignalId[] = ["incomplete", "credential-access", "install-download", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
   const signals = order.flatMap((id) => {
     const ev = found.get(id);
     return ev ? [signal(id, ev)] : [];
   });
-  return { scorer: "apm-score-v1", signals, facts, notChecked: [...NOT_CHECKED] };
+  const notChecked = [...NOT_CHECKED, ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`)];
+  return { scorer: SCORER, signals, facts, notChecked, skipped };
 }
 
 export function gradeOf(score: number): Grade {
@@ -358,11 +402,13 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   if (state.status === "revoked" || state.status === "revoke-pending") signals.push(signal("revoked", [state.statusReason ?? "no reason given"]));
   const raw = 100 + signals.reduce((n, s) => n + s.points, 0);
   const score = Math.max(0, Math.min(100, raw));
-  return { ...analysis, notChecked: analysis.notChecked ?? [...NOT_CHECKED], signals, score, grade: gradeOf(score) };
+  return { ...analysis, signals, score, grade: gradeOf(score) };
 }
 
-export function isAnalysis(v: unknown): v is Analysis {
-  return isRecord(v) && v.scorer === "apm-score-v1" && Array.isArray(v.signals) && isRecord(v.facts);
+/** A stored analysis (v1 or v2), or null when the value is not one. */
+export function parseAnalysis(v: unknown): Analysis | null {
+  const r = AnalysisSchema.safeParse(v);
+  return r.success ? r.data : null;
 }
 
 /** Human-readable diff of signals between two versions. */

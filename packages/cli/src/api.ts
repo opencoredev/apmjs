@@ -14,7 +14,9 @@ export type Signal = z.infer<typeof SignalSchema>;
 export type Report = z.infer<typeof ReportSchema>;
 
 const Skipped = z.array(z.object({ version: z.string(), reason: z.string() }));
-export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional() });
+const UncheckedDep = z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) });
+export const Tree = z.object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]) }).loose();
+export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional() });
 export const ResolveFail = z.object({ error: z.string(), name: z.string(), version: z.null(), skipped: Skipped });
 export type ResolveOk = z.infer<typeof ResolveOk>;
 
@@ -43,7 +45,11 @@ export const NameResponse = z.object({
 
 export const Advisory = z.object({ title: z.string(), severity: z.string(), vulnerable_versions: z.string(), url: z.string().optional() }).loose();
 export const BulkResponse = z.record(z.string(), z.array(Advisory));
-export const ScanResponse = z.object({ advisories: z.array(z.object({ package: z.string(), version: z.string(), level: z.string(), description: z.string() })) });
+export const ScanResponse = z.object({
+  advisories: z.array(z.object({ package: z.string(), version: z.string(), level: z.string(), description: z.string() })),
+  unchecked: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })).default([]),
+});
+export const AuditResponse = z.object({ advisories: BulkResponse, unavailable: z.array(z.string()) });
 
 export class ApiError extends Error {
   constructor(

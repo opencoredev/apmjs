@@ -21,6 +21,8 @@ export type StartOptions = {
   webUrl?: string;
   /** Public registry to proxy, e.g. https://registry.npmjs.org/ */
   upstream?: string;
+  /** How long an upstream packument is trusted before it is fetched again. Default 60s. */
+  upstreamTtlMs?: number;
   /** npm's password adduser and password re-auth. Default off: accounts come from GitHub or Vercel sign-in. */
   legacyAuth?: boolean;
   /** "scoped" (default): new packages live under the publisher's GitHub login. "open": bare names allowed (tests, legacy). */
@@ -72,7 +74,7 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
       ...(opts.auth?.vercel ? { vercel: opts.auth.vercel } : {}),
     },
   });
-  const upstream = opts.upstream ? new Upstream(withSlash(opts.upstream)) : null;
+  const upstream = opts.upstream ? new Upstream(withSlash(opts.upstream), opts.upstreamTtlMs) : null;
   const access = buildAccess({
     store,
     auth,
