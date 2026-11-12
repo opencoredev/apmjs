@@ -1,12 +1,58 @@
 // Acceptance-test harness: runs the real registry in-process and drives the
 // stock `bun` and `npm` clients against it as subprocesses.
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 
 export const ROOT = join(import.meta.dir, "..", "..");
 export const CLI = join(ROOT, "packages", "cli", "src", "main.ts");
+
+// ---------- one scratch directory per test process ----------
+// Every sandbox, registry data dir and package directory the suites make goes under RUN_DIR (TMPDIR points
+// there, so the suites' own mkdtempSync(tmpdir()) calls land in it too), and RUN_DIR is removed when the
+// process exits. A run that was killed leaves its directory behind; the next run removes those.
+const RUN_PREFIX = "apm-test-";
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return typeof e === "object" && e !== null && "code" in e && e.code === "EPERM";
+  }
+}
+
+function sweepDeadRuns(parent: string): void {
+  for (const name of readdirSync(parent)) {
+    const pid = Number(/^apm-test-(\d+)-/.exec(name)?.[1] ?? Number.NaN);
+    if (!Number.isInteger(pid) || pid === process.pid || isAlive(pid)) continue;
+    try {
+      rmSync(join(parent, name), { recursive: true, force: true });
+    } catch {
+      // someone else's directory: leave it
+    }
+  }
+}
+
+const parentTmp = tmpdir();
+sweepDeadRuns(parentTmp);
+export const RUN_DIR = mkdtempSync(join(parentTmp, `${RUN_PREFIX}${process.pid}-`));
+process.env.TMPDIR = RUN_DIR;
+const removeRunDir = (): void => rmSync(RUN_DIR, { recursive: true, force: true });
+process.on("exit", removeRunDir);
+// `bun test` ends without firing "exit" (Bun 1.4), so a watcher removes RUN_DIR once this process is gone.
+Bun.spawn(["sh", "-c", 'while kill -0 "$1" 2>/dev/null; do sleep 0.3; done; rm -rf -- "$2"', "apm-test-cleanup", String(process.pid), RUN_DIR], {
+  stdin: "ignore",
+  stdout: "ignore",
+  stderr: "ignore",
+}).unref();
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.once(sig, () => {
+    removeRunDir();
+    process.exit(128 + (sig === "SIGINT" ? 2 : sig === "SIGTERM" ? 15 : 1));
+  });
+}
 
 export type Registry = {
   url: string; // always ends with "/"
@@ -208,6 +254,68 @@ export function installedVersion(appDir: string, name: string): string | null {
   const parsed: unknown = JSON.parse(readFileSync(p, "utf8"));
   if (typeof parsed === "object" && parsed !== null && "version" in parsed && typeof parsed.version === "string") return parsed.version;
   return null;
+}
+
+// ---------- raw publishes, for tests that control every byte ----------
+type TarFile = { path: string; data: string | Uint8Array };
+
+function tarHeader(path: string, size: number): Uint8Array {
+  const h = new Uint8Array(512);
+  const put = (s: string, off: number, len: number): void => h.set(new TextEncoder().encode(s).subarray(0, len), off);
+  put(path, 0, 100);
+  put("0000644\0", 100, 8);
+  put("0000000\0", 108, 8);
+  put("0000000\0", 116, 8);
+  put(`${size.toString(8).padStart(11, "0")}\0`, 124, 12);
+  put("00000000000\0", 136, 12);
+  put("        ", 148, 8);
+  put("0", 156, 1);
+  put("ustar\0", 257, 6);
+  put("00", 263, 2);
+  let sum = 0;
+  for (const b of h) sum += b;
+  put(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8);
+  return h;
+}
+
+/** A gzip'd package tarball: package.json from `manifest` plus `files`. */
+export function pkgTgz(manifest: Record<string, unknown>, files: Record<string, string> = { "index.js": "module.exports = 1;\n" }): Uint8Array {
+  const entries: TarFile[] = [{ path: "package.json", data: JSON.stringify(manifest) }, ...Object.entries(files).map(([path, data]) => ({ path, data }))];
+  const parts: Uint8Array[] = [];
+  for (const f of entries) {
+    const data = typeof f.data === "string" ? new TextEncoder().encode(f.data) : f.data;
+    parts.push(tarHeader(`package/${f.path}`, data.length), data, new Uint8Array((512 - (data.length % 512)) % 512));
+  }
+  parts.push(new Uint8Array(1024));
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return Bun.gzipSync(out);
+}
+
+/** A publish request the way npm sends it. `tags` defaults to { latest: version }. */
+export async function putPublish(
+  reg: Registry,
+  token: string,
+  manifest: Record<string, unknown> & { name: string; version: string },
+  opts: { files?: Record<string, string>; tags?: Record<string, string> } = {},
+): Promise<{ status: number; body: unknown }> {
+  const tgz = pkgTgz(manifest, opts.files);
+  const body = {
+    _id: manifest.name,
+    name: manifest.name,
+    "dist-tags": opts.tags ?? { latest: manifest.version },
+    versions: { [manifest.version]: manifest },
+    _attachments: { [`${manifest.name}-${manifest.version}.tgz`]: { content_type: "application/octet-stream", data: Buffer.from(tgz).toString("base64"), length: tgz.length } },
+  };
+  return getJson(`${reg.url}${encodePkg(manifest.name)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
 }
 
 export function encodePkg(name: string): string {
