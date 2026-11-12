@@ -16,7 +16,54 @@ export const MCP_CORS = {
   "access-control-max-age": "86400",
 } satisfies Record<string, string>;
 
-const MAX_BODY_BYTES = 64 * 1024;
+/** The largest JSON-RPC message accepted, in bytes. */
+export const MAX_BODY_BYTES = 64 * 1024;
+
+export type BodyRead = { kind: "ok"; text: string } | { kind: "too-large" } | { kind: "failed" };
+
+/**
+ * The request body as text, read at most `maxBytes` bytes in: a declared Content-Length over the limit is refused
+ * before anything is read, and a stream that runs past it is cancelled at that point, so an oversized body is never
+ * buffered whole. A body that fails mid-read is "failed", never a partial message.
+ */
+export async function readCappedBody(request: Request, maxBytes: number): Promise<BodyRead> {
+  const declared = request.headers.get("content-length");
+
+  if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > maxBytes) {
+    await request.body?.cancel().catch(() => undefined);
+
+    return { kind: "too-large" };
+  }
+
+  if (request.body === null) return { kind: "ok", text: "" };
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = "";
+
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+
+      if (chunk.done) break;
+      total += chunk.value.byteLength;
+
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+
+        return { kind: "too-large" };
+      }
+
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+
+    return { kind: "failed" };
+  }
+
+  return { kind: "ok", text: text + decoder.decode() };
+}
 
 function json_(body: JsonRpcResponse | { error: string; docs: string }, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...MCP_CORS, ...extra } });
@@ -31,10 +78,12 @@ export async function mcpPost(request: Request, deps: McpDeps): Promise<Response
   const allowed = await deps.take();
 
   if (!allowed.ok) return json_(rpcError(null, RPC.internal, "Too many requests. Wait a moment and try again."), 429, { "retry-after": String(allowed.retryAfterSeconds) });
-  const raw = await request.text();
+  const body = await readCappedBody(request, MAX_BODY_BYTES);
 
-  if (raw.length > MAX_BODY_BYTES) return json_(rpcError(null, RPC.invalidRequest, "Message too large."), 413);
-  const json = parseJson(raw);
+  if (body.kind === "too-large") return json_(rpcError(null, RPC.invalidRequest, `Message too large: the limit is ${MAX_BODY_BYTES} bytes.`), 413);
+
+  if (body.kind === "failed") return json_(rpcError(null, RPC.parse, "Could not read the request body."), 400);
+  const json = parseJson(body.text);
 
   if (!json) return json_(rpcError(null, RPC.parse, "Parse error: the body is not JSON."), 400);
 
