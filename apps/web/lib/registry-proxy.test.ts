@@ -2,7 +2,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { forwardToRegistry } from "./registry-proxy";
 
-type Seen = { method: string; path: string; headers: Record<string, string>; body: string };
+type Seen = { method: string; path: string; headers: Record<string, string>; body: string; bytes: Uint8Array };
 
 let seen: Seen[] = [];
 let server: ReturnType<typeof Bun.serve>;
@@ -15,7 +15,9 @@ beforeAll(() => {
     async fetch(req) {
       const url = new URL(req.url);
 
-      seen.push({ method: req.method, path: url.pathname + url.search, headers: Object.fromEntries(req.headers), body: await req.text() });
+      const bytes = new Uint8Array(await req.arrayBuffer());
+
+      seen.push({ method: req.method, path: url.pathname + url.search, headers: Object.fromEntries(req.headers), body: new TextDecoder().decode(bytes), bytes });
 
       if (url.pathname === "/api/auth/callback/github") {
         const headers = new Headers({ location: "https://apm.example/account" });
@@ -73,6 +75,17 @@ describe("forwardToRegistry", () => {
     expect(last?.headers.origin).toBe("https://apm.example");
     expect(last?.headers["x-forwarded-host"]).toBe("apm.example");
     expect(last?.headers["x-forwarded-proto"]).toBe("https");
+  });
+
+  test("a gzip'd request body keeps its content-encoding, so the registry can read it", async () => {
+    const json = JSON.stringify({ packages: [{ name: "zod", version: "4.6.7" }] });
+    const gz = Bun.gzipSync(new TextEncoder().encode(json));
+
+    await forward("/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json", "content-encoding": "gzip" }, body: gz });
+    const last = seen.at(-1);
+
+    expect(last?.headers["content-encoding"]).toBe("gzip");
+    expect(new TextDecoder().decode(Bun.gunzipSync(last?.bytes ?? new Uint8Array()))).toBe(json);
   });
 
   test("dot segments can't climb out of the two prefixes", async () => {
