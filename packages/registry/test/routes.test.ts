@@ -29,6 +29,12 @@ describe("getRouteOf", () => {
     expect(getRouteOf("/@scope%2Fname")).toBe("packument");
   });
 
+  test("an ignored tail may hold a decoded line terminator, as it could before the table", () => {
+    expect(getRouteOf("/tail-pkg/1.0.0/%0a/extra")).toBe("version");
+    expect(getRouteOf("/tail-pkg/1.0.0/%E2%80%A8")).toBe("version");
+    expect(getRouteOf("/tail-pkg/1.0.0/%0d%0a")).toBe("version");
+  });
+
   test("reads a path under /api/auth/ against Better Auth's routes alone", () => {
     expect(getRouteOf("/api/auth/get-session")).toBe("auth get-session");
     // the registry's table would read this as package "api", version "auth"

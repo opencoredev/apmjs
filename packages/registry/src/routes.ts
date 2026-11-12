@@ -20,8 +20,9 @@ const NAME = String.raw`(?:@[^/]*%2F[^/]*|${SCOPE}/[^/]+|[^/@~-][^/]*)`;
 /** One segment that is not empty. */
 const SEG = String.raw`[^/]+`;
 
-/** Segments after the ones a route reads: its module ignores them, as it did before the table. */
-const TAIL = "(?:/.*)?";
+/** Segments after the ones a route reads: its module ignores them, as it did before the table. Any character, line
+ * terminators included: a decoded %0a or U+2028 in an ignored segment answered before the table too. */
+const TAIL = String.raw`(?:/[\s\S]*)?`;
 
 const path = (body: string): RegExp => new RegExp(`^${body}$`);
 
