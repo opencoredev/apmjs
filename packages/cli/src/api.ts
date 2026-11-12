@@ -1,0 +1,113 @@
+// Typed client for the apm registry API. Responses are parsed here, at the network boundary.
+import { z } from "zod";
+import type { Config } from "./config.ts";
+
+export const SignalSchema = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+export const ReportSchema = z.object({
+  score: z.number(),
+  grade: z.string(),
+  signals: z.array(SignalSchema),
+  notChecked: z.array(z.string()).optional(),
+  facts: z.record(z.string(), z.unknown()).optional(),
+});
+export type Signal = z.infer<typeof SignalSchema>;
+export type Report = z.infer<typeof ReportSchema>;
+
+const Skipped = z.array(z.object({ version: z.string(), reason: z.string() }));
+export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional() });
+export const ResolveFail = z.object({ error: z.string(), name: z.string(), version: z.null(), skipped: Skipped });
+export type ResolveOk = z.infer<typeof ResolveOk>;
+
+export const ScoreResponse = ReportSchema.extend({
+  name: z.string(),
+  version: z.string(),
+  status: z.string(),
+  publishedAt: z.string(),
+  publishedBy: z.string(),
+  previous: z.object({ version: z.string(), score: z.number(), grade: z.string() }).nullable(),
+  changes: z.array(z.string()),
+});
+export type ScoreResponse = z.infer<typeof ScoreResponse>;
+
+export const NameResponse = z.object({
+  query: z.string(),
+  valid: z.boolean(),
+  taken: z.boolean(),
+  available: z.boolean(),
+  owners: z.array(z.string()),
+  latest: z.object({ version: z.string(), score: z.number().nullable(), grade: z.string().nullable() }).nullable(),
+  conflicts: z.array(z.object({ name: z.string(), reason: z.string() })),
+  similar: z.array(z.object({ name: z.string(), reason: z.string() })).optional(),
+  suggestions: z.array(z.object({ name: z.string(), available: z.boolean(), taken: z.boolean() })),
+});
+
+export const Advisory = z.object({ title: z.string(), severity: z.string(), vulnerable_versions: z.string(), url: z.string().optional() }).loose();
+export const BulkResponse = z.record(z.string(), z.array(Advisory));
+export const ScanResponse = z.object({ advisories: z.array(z.object({ package: z.string(), version: z.string(), level: z.string(), description: z.string() })) });
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly body: unknown,
+  ) {
+    super(message);
+  }
+}
+
+function errorText(body: unknown, status: number): string {
+  if (typeof body === "object" && body !== null && "error" in body && typeof body.error === "string") return body.error;
+  return `HTTP ${status}`;
+}
+
+export class Api {
+  constructor(readonly cfg: Config) {}
+
+  private headers(json: boolean): Record<string, string> {
+    return {
+      accept: "application/json",
+      ...(json ? { "content-type": "application/json" } : {}),
+      ...(this.cfg.token ? { authorization: `Bearer ${this.cfg.token}` } : {}),
+    };
+  }
+
+  async raw(path: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; body: unknown }> {
+    const res = await fetch(`${this.cfg.registry}${path}`, {
+      method: init.method ?? "GET",
+      headers: this.headers(init.body !== undefined),
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const text = await res.text();
+    let body: unknown = text;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // not JSON
+    }
+    return { status: res.status, body };
+  }
+
+  async get<T>(path: string, schema: z.ZodType<T>): Promise<T> {
+    const r = await this.raw(path);
+    if (r.status !== 200) throw new ApiError(r.status, errorText(r.body, r.status), r.body);
+    return schema.parse(r.body);
+  }
+
+  async post<T>(path: string, body: unknown, schema: z.ZodType<T>): Promise<T> {
+    const r = await this.raw(path, { method: "POST", body });
+    if (r.status !== 200 && r.status !== 201) throw new ApiError(r.status, errorText(r.body, r.status), r.body);
+    return schema.parse(r.body);
+  }
+}
+
+export function encodeName(name: string): string {
+  return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
+}
+
+/** Splits "name@range" (scoped names keep their leading @). */
+export function parseSpec(spec: string): { name: string; range: string | null } {
+  const at = spec.lastIndexOf("@");
+  if (at > 0) return { name: spec.slice(0, at), range: spec.slice(at + 1) || null };
+  return { name: spec, range: null };
+}

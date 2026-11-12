@@ -1,0 +1,12 @@
+{
+  "name": "@apm/bun-scanner",
+  "version": "0.1.0",
+  "description": "Bun security scanner backed by the apm registry: blocks revoked and dangerous versions in stock bun install",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "files": ["src", "README.md"],
+  "keywords": ["bun", "security", "scanner", "apm"],
+  "private": true
+}
