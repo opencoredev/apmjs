@@ -48,18 +48,21 @@ function evidenceWithoutSource(signal: string, evidence: string): string[] {
 
 /**
  * The view with every line of the version's source taken out when the version is withheld: score evidence keeps only
- * what it cites, the AI review's findings keep their file, line and sentence but not the excerpt. Applied where the
- * view is loaded (so the MCP tool's structured answer is cut too) and again before it is written out.
+ * what it cites, and the deprecation message (the publisher's text) is dropped. The AI review's findings are the
+ * registry's own for a withheld version (WITHHELD_ISSUE for the sentence, `file N` for the path, no quote or excerpt):
+ * they are shown as sent, with any excerpt cut as a backstop. Applied where the view is loaded (so the MCP tool's
+ * structured answer is cut too) and again before it is written out.
  */
 export function withholdSource(view: PackageView): PackageView {
   if (!sourceWithheld(view)) return view;
   const score = view.score ? { ...view.score, signals: view.score.signals.map((s) => ({ ...s, evidence: s.evidence.flatMap((e) => evidenceWithoutSource(s.id, e)) })), dismissed: view.score.dismissed.map((d) => ({ ...d, evidence: [] })) } : null;
+  const status = view.status ? { ...view.status, deprecated: null } : null;
   const r = view.review;
 
   const review: PackageView["review"] =
     r.kind === "ok" ? { kind: "ok", value: { ...r.value, review: r.value.review ? { ...r.value.review, findings: r.value.review.findings.map((f) => ({ ...f, excerpt: "" })) } : null, private: null } } : r;
 
-  return { ...view, score, review };
+  return { ...view, status, score, review };
 }
 
 /** Evidence lines listed per signal; the HTML page has the rest. */
@@ -129,7 +132,7 @@ function reviewSection(review: Fetched<ReviewAnswer>): string[] {
   lines.push(`${coverageText(r.coverage)}. Model: ${inlineCode(r.model)}. Reviewed ${inlineCode(r.reviewedAt)}.`);
 
   // findings and the note are the AI's and a reviewer's words about publisher code: quoted, the excerpt as a block
-  // a withheld version's findings come without their excerpt
+  // a withheld version's findings are the registry's: a fixed sentence, a file reference and no excerpt
   for (const [i, f] of r.findings.entries()) lines.push("", `Finding ${i + 1} (${f.severity}) at ${inlineCode(`${f.file}:${f.line}`)}: ${inlineCode(f.issue)}`, ...(f.excerpt === "" ? [] : ["", codeBlock(f.excerpt)]));
 
   if (r.note) lines.push("", "Reviewer note:", "", codeBlock(r.note));
