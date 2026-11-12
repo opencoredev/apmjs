@@ -858,7 +858,8 @@ const alternativesPart = (query: string, user: string | null) =>
       const suggestions = stems.flatMap((s): Suggestion[] => {
         const name = `@you/${s}`;
 
-        return isValidPackageName(name) ? [{ name, available: false, taken: false, unknown: false, checked: false }] : [];
+        // a placeholder the look-alike guard would refuse under any scope is not worth suggesting
+        return isValidPackageName(name) && typoConflicts(name).length === 0 ? [{ name, available: false, taken: false, unknown: false, checked: false }] : [];
       });
 
       return { scope: null, suggestions };

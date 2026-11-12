@@ -121,6 +121,13 @@ describe("name check alternatives under the GitHub-scope policy", () => {
     expect(byName.get("@scope-owner/use-quokka")?.checked).toBe(true);
   });
 
+  test("a visitor is not offered a placeholder the look-alike guard would refuse", async () => {
+    const r = await getJson(`${reg.url}-/apm/v1/names?q=hono&part=alternatives`);
+
+    expect(names(r)).toContain("@you/hono");
+    expect(names(r)).not.toContain("@you/hono-js");
+  });
+
   test("a scoped name a publish would refuse as a look-alike is not offered as free", async () => {
     const r = await b.json("-/apm/v1/names?q=hono&part=alternatives");
     const byName = new Map(suggestionsOf(r).map((s) => [s.name, s]));
