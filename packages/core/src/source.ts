@@ -1,18 +1,19 @@
 // Static reading of one file's text. Every file is read with the text rules (rules.ts) over its whole text, after a
 // pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
 // codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
-import { scanJs, type Command, type Imports } from "./js.ts";
+import { scanJs, type Command, type EnvRead, type ExecutedCode, type FlowFinding, type Imports } from "./js.ts";
 import type { Dialect, Range } from "./parse.ts";
 import { parseEach } from "./parse.ts";
 import { joinStrings, scanTextRules } from "./textrules.ts";
 import { tokenText } from "./tokens.ts";
 import { lineOf, type Hidden, type TextFinding } from "./rules.ts";
+import type { Exports } from "./flow.ts";
 
 export { decodedStrings, joinStrings, type Built, type Decoded, type Joined } from "./textrules.ts";
 
 export { namedSignal, type CodeSignal, type Confidence, type Hidden, type TextFinding, type Where } from "./rules.ts";
 
-export type { Command, Imports } from "./js.ts";
+export type { Command, EnvRead, ExecutedCode, FlowFinding, Imports } from "./js.ts";
 
 /**
  * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed, and read whole with the text rules too; everything else
@@ -193,6 +194,14 @@ export type FileScan = {
   hidden?: (index: number) => Hidden | undefined;
   /** For a parsed file: the strings it passes to a process. */
   commands?: Command[];
+  /** For a parsed file: values that reach a call that sends, runs or reads them (flow.ts). */
+  flows?: FlowFinding[];
+  /** For a parsed file: what its exports carry, for a file that loads it. */
+  exports?: Exports;
+  /** For a parsed file: code it holds as text, run, recovered from its own source or held in a string. */
+  executed?: ExecutedCode[];
+  /** For a parsed file: environment variables it reads, however it reaches the environment. */
+  env?: EnvRead[];
 };
 
 /** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
@@ -207,7 +216,9 @@ export function scanFile(text: string, lang: Lang): FileScan {
   if (isDialect(lang)) {
     const js = scanJs(text, lang);
 
-    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands };
+    if (js.kind === "parsed") {
+      return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env };
+    }
 
     return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
   }

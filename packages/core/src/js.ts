@@ -5,6 +5,8 @@
 // adds to the floor (apm-score-v3's text rules over the program's code), and never removes from it. Pure; nothing
 // is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
+import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
+import { Flow, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
 import {
@@ -75,25 +77,6 @@ declare module "acorn" {
   interface NodeTypes {
     apm: TsExpression | TsImportEquals | TsExternalModuleReference | TsParameterProperty | JsxText | TsModuleDeclaration | TsEnumDeclaration | TsEmptyBody;
   }
-}
-
-/** Every object under a parsed program that has a string `type` and a numeric `start` is a node the parser built. */
-function isParsedNode(v: unknown): v is AnyNode {
-  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the one place parser output is told apart from the plain data (positions, regex flags) it carries
-  return v instanceof Object && "type" in v && typeof v.type === "string" && "start" in v && typeof v.start === "number";
-}
-
-/** A node's child nodes, in source order: every field holding a node or a list of nodes. */
-function childNodes(n: AnyNode): AnyNode[] {
-  const out: AnyNode[] = [];
-
-  for (const v of Object.values(n)) {
-    if (Array.isArray(v)) {
-      for (const x of v) if (isParsedNode(x)) out.push(x);
-    } else if (isParsedNode(v)) out.push(v);
-  }
-
-  return out;
 }
 
 /** A string literal's value. Its source starts with a quote; a number, regex, boolean or null does not. */
@@ -206,7 +189,7 @@ function isTypeOnly(n: AnyNode): boolean {
  * - `unknown`: anything else; `name` is its last property or identifier and `owner` the name before that.
  * `built` says a property name on the way was joined or decoded from pieces.
  */
-type Ref =
+export type Ref =
   | { kind: "global"; path: string; built: boolean }
   | { kind: "module"; spec: string; path: string; built: boolean }
   | { kind: "local"; fn: boolean; obj: LocalObj | null }
@@ -221,7 +204,7 @@ const GLOBAL_OBJECTS: ReadonlySet<string> = new Set(["globalThis", "global", "wi
 type Key = { kind: "name"; name: string } | { kind: "computed"; node: AnyNode };
 
 /** Where a declared name gets its value. `default` is a pattern's default (`{ run = eval } = obj`): either side. */
-type Origin =
+export type Origin =
   | { kind: "value"; init: Expression }
   | { kind: "member"; base: Expression; path: Key[] }
   | { kind: "module"; spec: string; path: string }
@@ -241,7 +224,7 @@ type Write = { kind: "set"; key: Key; value: AnyNode | null } | { kind: "define"
  * `constant` is a `const` or an import, which nothing (not even another script or a direct eval) can reassign;
  * `refs` are the identifiers that read it, filled in once the whole program is indexed.
  */
-type Binding = { name: string; count: number; assigned: boolean; constant: boolean; origin: Origin; writes: Write[]; scope: Scope; refs: Identifier[] };
+export type Binding = { name: string; count: number; assigned: boolean; constant: boolean; origin: Origin; writes: Write[]; scope: Scope; refs: Identifier[] };
 
 /**
  * A lexical scope. `function` scopes take `var` and parameters; `block` scopes take `let`, `const`, classes and
@@ -663,9 +646,6 @@ function byName(r: Ref): boolean {
 
 // ---------- strings the code builds ----------
 
-/** Stands for a piece of a string apm cannot know (`'curl ' + url`), so the rest can still be read. */
-const UNKNOWN = "__apm__";
-
 /**
  * A string value apm can work out without running anything: a literal, a template, pieces joined with `+`, a
  * constant it was assigned to, or a payload decoded with atob, Buffer.from, String.fromCharCode or URI escapes.
@@ -729,7 +709,7 @@ export const READING_LIMITS: readonly string[] = Object.values(LIMIT_NOTES);
  * - `plain`: anything else. What it names is possible at most.
  * - `none`: already read where it is used; its strings are not read again.
  */
-type Role = "code" | "shell" | "read" | "request" | "plain" | "none";
+export type Role = "code" | "shell" | "read" | "request" | "plain" | "none";
 
 /** How strong a piece of evidence is, so a file cites a call before an import and an import before a string. */
 const STRENGTH = { string: 0, load: 1, reference: 2, call: 3 } as const;
@@ -789,21 +769,6 @@ const DNS_CALL = /^(?:promises\.)?(?:resolve\w*|lookup\w*|reverse)$/;
 
 /** The helpers TypeScript, Babel, SWC and esbuild wrap a require in: each returns the module (or its namespace). */
 const INTEROP = /^_*(?:interop_?require_?(?:default|wildcard)|import(?:Default|Star)|toESM|toCommonJS)$/i;
-
-/** Unwraps what does not change a value: TypeScript casts and assertions, `a?.b` chains. */
-function unwrap(n: AnyNode): AnyNode {
-  let cur = n;
-
-  for (;;) {
-    if (cur.type === "ChainExpression") cur = cur.expression;
-    else if (cur.type === "TSAsExpression" || cur.type === "TSSatisfiesExpression" || cur.type === "TSNonNullExpression" || cur.type === "TSTypeAssertion" || cur.type === "TSInstantiationExpression") cur = cur.expression;
-    else return cur;
-  }
-}
-
-function isFunctionNode(n: AnyNode): boolean {
-  return n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression" || n.type === "ClassExpression";
-}
 
 /** An `async` function that is not a generator: calling it gives a Promise of what it returns. */
 function isAsyncFunction(n: AnyNode): boolean {
@@ -1140,6 +1105,15 @@ class Reader {
   readonly dynamic: number[] = [];
   /** Strings the program passes to exec, spawn and the like, as it builds them. */
   readonly commands: { at: number; value: string }[] = [];
+  /** Every call read, with what each argument is for, for the flow analysis (flow.ts). */
+  readonly sites: CallSite[] = [];
+  /**
+   * Code the program holds as text: `run` is a string it hands an evaluator, `held` a string that reads as a program and
+   * is used some other way (a builtin the package redefines can run it). score.ts reads each one as a program.
+   */
+  readonly executed: Executed[] = [];
+  /** Where values go (flow.ts); read for the outermost program only, since score.ts reads code held in strings itself. */
+  flow: FlowRead = NO_FLOW;
   private readonly scopes: Scopes;
   private readonly strCache = new Map<AnyNode, Str | null>();
   private readonly bindingCache = new Map<Binding, Ref[]>();
@@ -1174,6 +1148,24 @@ class Reader {
     }
 
     if (this.hexCount >= 20) this.add("obfuscated", this.hexFirst, STRENGTH.reference, "as written", "confirmed", "");
+
+    if (this.depth > 0) return;
+
+    try {
+      this.flow = new Flow({
+        program: this.program,
+        calls: this.sites,
+        refsOf: (n) => this.resolveAll(n),
+        bindingOf: (id) => this.bindingOf(id),
+        str: (n) => this.str(n),
+        returnedBy: (fn) => returnedBy(fn).nodes,
+        limit: () => this.budget.notes.add(LIMIT_NOTES.flow),
+      }).read();
+    } catch (e) {
+      // a value chain deep enough to exhaust the stack is not followed; the text rules still read the file
+      if (!(e instanceof RangeError)) throw e;
+      this.budget.notes.add(LIMIT_NOTES.flow);
+    }
   }
 
   private add(id: CodeSignal, at: number, strength: Strength, how: How, confidence: Confidence, why: string): void {
@@ -1968,6 +1960,8 @@ class Reader {
 
     const sure = role === "shell";
 
+    if (s.exact && isHeldCode(s.value)) this.hold(at, s.value, "held");
+
     // what the program hands a shell or a process, for the risk signals that read commands (apm-score-v10)
     if (role === "shell" && this.commands.length < MAX_COMMANDS) this.commands.push({ at, value: s.value.slice(0, MAX_COMMAND_CHARS) });
 
@@ -2005,6 +1999,12 @@ class Reader {
         this.add("obfuscated", at, STRENGTH.string, "as written", confidence, "a long base64 string decodes to text, but apm did not see code load or run it");
       }
     }
+  }
+
+  /** Keeps code held in a string for score.ts to read, within the file's decoded-text budget. */
+  private hold(at: number, code: string, origin: Executed["origin"]): void {
+    if (this.depth > 0 || this.executed.length >= MAX_EXECUTED || code.length > MAX_HELD_CHARS) return;
+    this.executed.push({ at, code, origin });
   }
 
   /** The `name` and `text` rules on a string, and token names, each as sure as the string's role allows. */
@@ -2046,6 +2046,8 @@ class Reader {
   /** Code held in a string that the program runs: read as code, so what it does is confirmed the same way. */
   private evaluate(s: Str, at: number): void {
     const id = s.exact && s.how !== "as written" ? namedSignal(s.value) : null;
+
+    if (s.exact) this.hold(at, s.value, "run");
 
     if (id) {
       this.add(id, at, STRENGTH.string, s.how, "possible", `builds "${s.value.slice(0, 40)}" for eval, but apm did not see it called`);
@@ -2469,6 +2471,8 @@ class Reader {
 
     for (const a of call.others) this.visit(a, "plain");
     call.slots.forEach((slot, i) => slot && this.sinkArg(slot, roleOf(i)));
+
+    if (this.depth === 0) this.sites.push({ node: n, slots: call.slots, roles: call.slots.map((_, i) => roleOf(i)), network: plans.some((p) => p.rest === "request") });
   }
 
   /** What one callee does with a call: the signals it confirms, and what each argument is for. */
@@ -2847,16 +2851,59 @@ export type Imports = { paths: string[]; loads: string[]; dynamic: Where[] };
 /** A string a parsed program passes to a process: what it holds, and the line it is cited at. */
 export type Command = { line: number; snippet: string; value: string };
 
+/** A value that reached a call that runs, sends or reads it (flow.ts), cited at the call. */
+export type FlowFinding = { kind: Sink["kind"]; line: number; snippet: string; labels: Label[] };
+
+/**
+ * Code a file holds as text, for score.ts to read as a program: `run`, a string it hands an evaluator; `recovered`, its
+ * own source (a function, a regex, the file) turned back into text and run, with comment and regex delimiters taken
+ * out so what they held reads as the code it becomes; `held`, a string that reads as a program and is used otherwise.
+ */
+export type ExecutedCode = { line: number; snippet: string; code: string; origin: "run" | "recovered" | "held" };
+
+/** An environment variable read by name (`*` when the name is built at runtime), or the whole object used (`null`). */
+export type EnvRead = { line: number; snippet: string; name: string | null };
+
 export type JsScan =
-  | { kind: "parsed"; findings: TextFinding[]; imports: Imports; notes: string[]; hidden: (index: number) => Hidden | undefined; commands: Command[] }
+  | {
+      kind: "parsed";
+      findings: TextFinding[];
+      imports: Imports;
+      notes: string[];
+      hidden: (index: number) => Hidden | undefined;
+      commands: Command[];
+      flows: FlowFinding[];
+      exports: Exports;
+      executed: ExecutedCode[];
+      env: EnvRead[];
+    }
   | { kind: "failed"; reason: "syntax" | "too-large" };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
-type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[] };
+type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; executed: Executed[] };
 
 /** At most this many commands per program, each cut to this many characters: enough to read what a command does. */
 const MAX_COMMANDS = 200;
 const MAX_COMMAND_CHARS = 4000;
+
+/** Code a program holds as text, and where (see Reader.executed). */
+type Executed = { at: number; code: string; origin: "run" | "held" };
+
+/** At most this many held programs per file, each at most this long; score.ts reads them within its own byte budget. */
+const MAX_EXECUTED = 50;
+const MAX_HELD_CHARS = 64 * 1024;
+
+/** Names a string that reads as a program must call: a builtin that reaches the network, a process, a file or code. */
+const HELD_NAMES = /\b(?:fetch|require|getBuiltinModule|import|process|Bun|Deno|eval|Function|XMLHttpRequest|WebSocket)\b/;
+
+/** A string that reads as a program that does something: long enough, naming such a builtin, with a call in it. */
+function isHeldCode(s: string): boolean {
+  const open = s.indexOf("(");
+
+  return s.length >= 12 && open > 0 && s.lastIndexOf(")") > open && HELD_NAMES.test(s);
+}
+
+const NO_FLOW: FlowRead = { sinks: [], recovered: [], exports: new Map(), env: [] };
 
 /** Reads every program `text` parses to, one at a time. Null when no parser accepted it or a tree was too large or too deep. */
 function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: "syntax" | "too-large" } {
@@ -2916,7 +2963,7 @@ function readProgram(p: Parsed, depth: number, budget: Budget): Read | null {
 
     r.read();
 
-    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands };
+    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands, flow: r.flow, executed: r.executed };
   } catch (e) {
     if (e instanceof RangeError) return null;
     throw e;
@@ -2982,5 +3029,66 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
   // a script read as a module too gives each command twice
   const commands = [...new Map(r.reads.flatMap((x) => x.commands).map((c) => [`${c.at} ${c.value}`, c])).values()].map((c) => ({ ...lineOf(text, c.at), value: c.value }));
 
-  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands };
+  // a script read as a module too gives each flow, each held program and each read twice
+  const once = <T>(list: readonly T[], key: (x: T) => string): T[] => [...new Map(list.map((x) => [key(x), x])).values()];
+  const flows = once(r.reads.flatMap((x) => x.flow.sinks), (f) => `${f.kind} ${f.at} ${f.labels.join(",")}`).map((f) => ({ kind: f.kind, ...lineOf(text, f.at), labels: f.labels }));
+  const exports = new Map<string, Label[]>();
+
+  for (const x of r.reads) for (const [name, labels] of x.flow.exports) exports.set(name, [...new Set([...(exports.get(name) ?? []), ...labels])]);
+  const env = once(r.reads.flatMap((x) => x.flow.env), (e) => `${e.at} ${e.name ?? ""}`).map((e) => ({ ...lineOf(text, e.at), name: e.name }));
+  const executed: ExecutedCode[] = once(r.reads.flatMap((x) => x.executed), (e) => `${e.at} ${e.origin}`).map((e) => ({ ...lineOf(text, e.at), code: e.code, origin: e.origin }));
+  const leftOut = r.reads[0]?.leftOut;
+
+  for (const rec of once(r.reads.flatMap((x) => x.flow.recovered), (x) => `${x.at} ${x.ranges.join(";")}`)) {
+    for (const [from, to] of rec.ranges) {
+      const code = leftOut ? recoveredText(text, leftOut, from, to) : null;
+
+      if (code !== null && executed.length < 60) executed.push({ ...lineOf(text, rec.at), code, origin: "recovered" });
+    }
+  }
+
+
+  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands, flows, exports, executed, env };
+}
+
+/** How much of a file's own source one recovery is read as code. */
+const MAX_RECOVERED_CHARS = 256 * 1024;
+
+/**
+ * The text a program gets back from its own source between `from` and `to`, as code: the comment and regex delimiters
+ * in it are blanked, so what a comment or a regex body held reads as the code it becomes once sliced out and run. Null
+ * when nothing in the range was left out of the program as written (then it is code apm already read), or when what
+ * was left out names no network, process, credential or code call (comments that are prose).
+ */
+function recoveredText(text: string, l: LeftOut, from: number, to: number): string | null {
+  const end = Math.min(to, from + MAX_RECOVERED_CHARS);
+  const chars = text.slice(from, end).split("");
+  // what the comments and regex bodies in the range hold; recovered text matters only when they name a dangerous call
+  const pieces: string[] = [];
+  let hidden = false;
+
+  const blank = (a: number, b: number): void => {
+    for (let i = Math.max(a, from); i < Math.min(b, end); i++) chars[i - from] = " ";
+  };
+
+  for (const [a, b] of l.comments) {
+    if (a < from || b > end) continue;
+    hidden = true;
+    pieces.push(text.slice(a, b));
+
+    if (text.startsWith("/*", a)) {
+      blank(a, a + 2);
+      blank(b - 2, b);
+    } else blank(a, a + (text.startsWith("<!--", a) ? 4 : text.startsWith("-->", a) ? 3 : 2));
+  }
+
+  for (const [a, b] of l.regexes) {
+    if (a < from || b > end) continue;
+    hidden = true;
+    pieces.push(text.slice(a, b));
+    blank(a, a + 1);
+    blank(text.lastIndexOf("/", b - 1), b);
+  }
+
+  return hidden && scanTextRules(pieces.join("\n")).some((f) => f.confidence === "confirmed") ? chars.join("") : null;
 }

@@ -13,7 +13,7 @@
 // above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry, findingsOf } from "../src/index.ts";
+import { analyze, finalize, MENTION_NEAR_READ_POINTS, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry, findingsOf } from "../src/index.ts";
 import fixtureData from "./fixtures/sol-lexer.json";
 import { supersetGaps } from "./superset.ts";
 import { ABOVE_FLOOR, RECORDING, recordV10 } from "./v10-record.ts";
@@ -88,7 +88,9 @@ describe("the review's fixtures", () => {
       for (const s of r.signals) {
         if (!(s.id in POSSIBLE_POINTS)) continue;
         const confirmed = s.confidence === "confirmed";
-        expect(s.points, `${s.id} points`).toBe(confirmed ? POINTS[s.id] : (possiblePoints.get(s.id) ?? Number.NaN));
+        // a credential name next to a read costs more than one on its own (apm-score-v10)
+        const table = s.id === "credential-mention" && s.evidence.some((e) => e.includes("near a file read")) ? MENTION_NEAR_READ_POINTS : POINTS[s.id];
+        expect(s.points, `${s.id} points`).toBe(confirmed ? table : (possiblePoints.get(s.id) ?? Number.NaN));
         // a confirmed signal shows only confirmed evidence; a possible one says why on every line
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }

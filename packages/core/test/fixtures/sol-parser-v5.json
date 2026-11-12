@@ -607,7 +607,7 @@
    "obfuscated": "confirmed"
   },
   "v10": 35,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-ts",
@@ -626,7 +626,7 @@
    "obfuscated": "confirmed"
   },
   "v10": 35,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-ts-padded",
@@ -1130,7 +1130,7 @@
    "obfuscated": "confirmed"
   },
   "v10": 35,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "logical-floor",

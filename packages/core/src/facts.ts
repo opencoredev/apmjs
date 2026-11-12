@@ -2,11 +2,33 @@
 // environment variables it reads, whether it dumps the whole environment, loads the filesystem, reads a credential
 // file, fingerprints the host, names a data-capture endpoint, holds a remote shell or download-and-run command, or
 // carries obfuscator output. Text rules over the file; in a parsed file a match in a comment, a regex body or a type
-// is left out, and in a file with no tree every match is kept and marked as a text match. Pure.
+// is left out, and in a file with no tree every match is kept and marked as a text match. In a parsed file the flow
+// analysis (flow.ts) adds what a character window cannot show: a value reaching the call that sends, runs or reads it
+// (`sends-*`, `runs-download`, `reads-credential`); score.ts turns those into facts. Pure.
 import type { Command } from "./js.ts";
 import { escapedTextAt, hexIdentifierRun, lineOf, longBase64Text, type Hidden } from "./rules.ts";
 
-export const FACT_KINDS = ["env", "env-dump", "filesystem", "credential-read", "host-info", "capture-endpoint", "remote-shell", "obfuscator", "fetched-code", "detached"] as const;
+export const FACT_KINDS = [
+  "env",
+  "env-dump",
+  "env-object",
+  "filesystem",
+  "credential-read",
+  "credential-near",
+  "host-info",
+  "capture-endpoint",
+  "remote-shell",
+  "obfuscator",
+  "fetched-code",
+  "detached",
+  // what the flow analysis shows a value reach (score.ts makes these from flow.ts)
+  "reads-credential",
+  "sends-env",
+  "sends-credential",
+  "sends-secrets",
+  "runs-download",
+  "runs-hidden",
+] as const;
 
 export type FactKind = (typeof FACT_KINDS)[number];
 
@@ -36,9 +58,14 @@ const ENV_COMPUTED = /\b(?:process\s*\.\s*env|Bun\s*\.\s*env)\s*(?:\?\.)?\[\s*(?
 /** `const { A, B: b } = process.env`. */
 const ENV_DESTRUCTURE = /\{([^{}]{1,600})\}\s*=\s*(?:process\s*\.\s*env|Bun\s*\.\s*env)\b/g;
 
+/** The environment object itself, ended: `process.env` or `Bun.env` with no member after it (`process.env.X` is one variable). */
+const ENV_OBJECT = String.raw`(?:\b(?:globalThis|global|window|self)\s*\.\s*)?\b(?:process\s*\.\s*env|Bun\s*\.\s*env)(?!\s*(?:\?\.|\.|\[|[\w$]))`;
+
 /** Methods that hand back the variables themselves, not one value: these read the whole environment. */
-const ENV_DUMP =
-  /\bJSON\s*\.\s*stringify\s*\(\s*process\s*\.\s*env\b|\bObject\s*\.\s*(?:keys|entries|values|getOwnPropertyNames)\s*\(\s*process\s*\.\s*env\s*\)|\bfor\s*\(\s*(?:const|let|var)?\s*[\w$]+\s+in\s+process\s*\.\s*env\b|\bDeno\s*\.\s*env\s*\.\s*toObject\s*\(|\bprintenv\b/g;
+const ENV_DUMP = new RegExp(
+  String.raw`\bJSON\s*\.\s*stringify\s*\(\s*${ENV_OBJECT}|\bObject\s*\.\s*(?:keys|entries|values|getOwnPropertyNames)\s*\(\s*${ENV_OBJECT}\s*\)|\bObject\s*\.\s*assign\s*\(\s*\{\s*\}\s*,\s*${ENV_OBJECT}\s*\)|\bfor\s*\(\s*(?:const|let|var)?\s*[\w$]+\s+in\s+${ENV_OBJECT}|\bDeno\s*\.\s*env\s*\.\s*toObject\s*\(|\bprintenv\b`,
+  "g",
+);
 
 const FS_LOAD =
   /(?:\brequire\s*\(\s*|\bimport\s*\(\s*|\bfrom\s+|\bgetBuiltinModule\s*\(\s*)['"`](?:node:)?(?:fs|fs\/promises)['"`]|(?:\brequire\s*\(\s*|\bfrom\s+)['"](?:fs-extra|graceful-fs)['"]|\bBun\s*\.\s*(?:file|write)\s*\(|\bDeno\s*\.\s*(?:readTextFile|readFile|writeTextFile|writeFile|open|remove|mkdir)\b/g;
@@ -50,8 +77,14 @@ const FS_LOAD =
 const CREDENTIAL_PATH =
   /\.npmrc\b|\.yarnrc\b|\.pypirc\b|\.ssh[/\\]|['"`/\\]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|\.aws[/\\](?:credentials|config)\b|\.git-credentials\b|\.netrc\b|\.docker[/\\]config\.json|\.kube[/\\]config\b|\.config[/\\]gcloud|\.azure[/\\]|\.gnupg\b|\.(?:bash|zsh)_history\b|\bLogin Data\b|\bLocal State\b|Local Extension Settings|User Data[/\\]|Google[/\\]Chrome|BraveSoftware|Mozilla[/\\]Firefox|\.mozilla[/\\]firefox|Library[/\\]Keychains|wallet\.dat\b|\.electrum\b|\.config[/\\]solana|\bExodus[/\\]/g;
 
-/** A read: a file API call, or a shell command that prints, copies or packs a file. */
-const READ_NEAR = /\b(?:readFileSync|readFile|createReadStream|readdirSync|readdir|copyFileSync|copyFile|existsSync|accessSync|openSync)\s*\(|\bBun\s*\.\s*file\s*\(|\bDeno\s*\.\s*read\w*\s*\(|(?:^|[\s'"`;|&(])(?:cat|type|more|cp|scp|tar|zip|base64|Get-Content)\s/;
+/** One credential path in a string, for the flow analysis (flow.ts) to tell a path that names a credential file. */
+export const CREDENTIAL_NAME = new RegExp(CREDENTIAL_PATH.source);
+
+/**
+ * A read: a file API call, a file read named on its own (`require('fs')['readFileSync']`, `const read = fs.readFileSync`),
+ * or a shell command that prints, copies or packs a file.
+ */
+const READ_NEAR = /\b(?:readFileSync|readFile|createReadStream|readdirSync|readdir|copyFileSync|copyFile|existsSync|accessSync|openSync)\s*\(|\b(?:readFileSync|readFile|createReadStream|copyFileSync|copyFile|openSync)\b|\bBun\s*\.\s*file\s*\(|\bDeno\s*\.\s*read\w*\s*\(|(?:^|[\s'"`;|&(])(?:cat|type|more|cp|scp|tar|zip|base64|Get-Content)\s/;
 
 /** How far apart (in characters) a credential path and a read may sit to count as one read. */
 const READ_WINDOW = 300;
@@ -157,10 +190,12 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   });
   each(ENV_DUMP, (m) => push("env-dump", m.index));
   each(FS_LOAD, (m) => push("filesystem", m.index));
+  // a credential path near a read: in a file with no tree that is the read; in a parsed file the flow analysis shows
+  // the reads, and the window is only a supplement (a deny list beside a generic read names the path and reads nothing)
   each(CREDENTIAL_PATH, (m) => {
     const window = text.slice(Math.max(0, m.index - READ_WINDOW), m.index + m[0].length + READ_WINDOW);
 
-    if (READ_NEAR.test(window)) push("credential-read", m.index);
+    if (READ_NEAR.test(window)) push(isText ? "credential-read" : "credential-near", m.index);
   });
   each(HOST_INFO, (m) => push("host-info", m.index));
   each(EVAL_VALUE, (m) => {

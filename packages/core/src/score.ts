@@ -7,12 +7,13 @@ import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
-import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
-import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Hidden, type Imports, type TextFinding } from "./source.ts";
+import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
+import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
 import { ambiguousPaths, type TarEntry } from "./tarball.ts";
 import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
 import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
+import type { Exports, Label } from "./flow.ts";
 
 export { CAPABILITY_IDS, declarationOf, type CapabilityId, type Declaration } from "./declare.ts";
 
@@ -239,6 +240,17 @@ export const POINTS: Record<SignalId, number> = {
   binary: -5,
   "credential-access": -25,
 };
+
+/**
+ * What a flow the parser confirmed costs on its own, whatever else the package does: code or a command it downloaded
+ * and runs (`remote-shell`), or the whole environment, a credential file's contents or three families of tokens sent in
+ * a request (`exfiltration`). Enough to refuse alone. When only a character window suggests the same thing, the signal
+ * keeps its table points (`POINTS`).
+ */
+export const CONFIRMED_FLOW_POINTS = -(100 - SCORE_FLOOR + 1);
+
+/** `credential-mention` when the name sits next to a file read that apm did not see it reach. */
+export const MENTION_NEAR_READ_POINTS = -10;
 
 const UNDECLARED_MORE = -5;
 const UNDECLARED_MAX = -20;
@@ -495,12 +507,16 @@ function signal(id: SignalId, all: string[], confidence: Confidence = "confirmed
   return out;
 }
 
-/** The files install commands run or read, as `analyze` reads them first. */
-function installRunsOf(commands: readonly { text: string }[], byPath: ReadonlyMap<string, TarEntry>): string[] {
+/**
+ * The files lifecycle commands run: for install hooks every path a command names (as apm-score-v3 read them), for git
+ * hooks (prepare, prepack, postpack) only what a command runs (`runTargets`), since a build's paths are mostly operands
+ * (`rimraf ./dist`, `tsc -p ./tsconfig.json`).
+ */
+function installRunsOf(commands: readonly { text: string; kind: HookKind }[], byPath: ReadonlyMap<string, TarEntry>): string[] {
   const out = new Set<string>();
 
   for (const c of commands) {
-    for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+    for (const w of c.kind === "install" ? [...scriptTargets(c.text), ...commandWords(c.text), ...runTargets(c.text)] : runTargets(c.text)) {
       const f = resolveIn(byPath, w);
 
       if (f && f.path !== "package.json") out.add(f.path);
@@ -508,6 +524,28 @@ function installRunsOf(commands: readonly { text: string }[], byPath: ReadonlyMa
   }
 
   return [...out];
+}
+
+/**
+ * What a command runs: a script after an interpreter (`scriptTargets`), the program a command segment starts with
+ * (`./install.sh`, `FOO=1 ./bin/setup`), and modules `node -e`, `--require` and `--import` load.
+ */
+export function runTargets(cmd: string): string[] {
+  const out = [...scriptTargets(cmd)];
+
+  for (const segment of cmd.split(/[;&|()]+/)) {
+    const first = segment.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)+/, "").split(/\s+/)[0] ?? "";
+
+    if (/^\.{0,2}\/[\w@./-]+$/.test(first)) out.push(first);
+  }
+
+  for (const m of cmd.matchAll(/\b(?:require|import)\s*\(\s*\\?['"]([^'"\\]+)\\?['"]|(?:--require|-r|--import|--loader)[\s=]+['"]?([\w@./-]+)/g)) {
+    const p = m[1] ?? m[2];
+
+    if (p && /^\.{0,2}\//.test(p)) out.push(p);
+  }
+
+  return out;
 }
 
 /** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
@@ -903,9 +941,9 @@ export function analyze(input: AnalyzeInput): Analysis {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const hooks = expandHooks(manifest);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
+  // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
-  // what runs on every install (not only a git install), for the install-time risk signals
-  const everyInstall = hooks.filter((h) => h.kind === "install").flatMap((h) => h.commands);
+  const hookCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands.map((c) => ({ text: c.text, kind: h.kind })));
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");
@@ -991,6 +1029,39 @@ export function analyze(input: AnalyzeInput): Analysis {
   // what each file shows beyond the code signals, and which files each one loads, for the v10 risk signals
   const fileFacts = new Map<string, Fact[]>();
   const edges = new Map<string, Set<string>>();
+  // where values go in each parsed file (flow.ts) and what it exports, resolved across files once every file is read
+  const fileFlows = new Map<string, { flows: FlowFinding[]; exports: Exports }>();
+  const heldBytes = new Map<string, number>();
+  // files read with no tree: nothing there can show where a value goes, so v9's reading of them stands
+  const rawFiles = new Set<string>();
+
+  /**
+   * Code a file holds as text (run from a string, recovered from its own comments or regexes, or held in a string that
+   * reads as a program), read as a program of its own: its facts and flows are the file's, cited at the line that holds
+   * it, so what runs at install still counts as install time. A string that only holds code adds its risks, not its
+   * capabilities; recovered text that does not parse, or that names a dangerous call, is code the file hid and runs.
+   */
+  const readHeld = (path: string, e: ExecutedCode, depth: number): void => {
+    const spent = heldBytes.get(path) ?? 0;
+
+    if (depth > MAX_HELD_DEPTH || spent + e.code.length > MAX_HELD_BYTES) return;
+    heldBytes.set(path, spent + e.code.length);
+    const scan = scanFile(e.code, "js");
+    const facts = fileFacts.get(path) ?? [];
+    const snippet = `${e.snippet}${HELD_NOTES[e.origin]}`;
+
+    for (const fact of readFacts(e.code, scan.hidden, scan.commands)) if (e.origin !== "held" || HELD_RISKS.has(fact.kind)) facts.push({ ...fact, line: e.line, snippet, near: true });
+
+    if (e.origin === "recovered" && (scan.read === "raw" || scan.findings.some((x) => x.confidence === "confirmed"))) facts.push({ kind: "runs-hidden", line: e.line, snippet, text: false, near: true });
+    fileFacts.set(path, facts);
+    const flows: { flows: FlowFinding[]; exports: Exports } = fileFlows.get(path) ?? { flows: [], exports: new Map() };
+
+    for (const x of scan.flows ?? []) flows.flows.push({ ...x, line: e.line, snippet });
+    fileFlows.set(path, flows);
+
+    // code that code held as text runs or holds in turn, as sure as the outer one is to run
+    for (const inner of scan.executed ?? []) readHeld(path, { ...inner, line: e.line, snippet: e.snippet, origin: e.origin === "run" ? inner.origin : e.origin }, depth + 1);
+  };
 
   const analyzeFile = (f: TarEntry, reached: boolean): void => {
     if (isBinary(f)) {
@@ -1029,7 +1100,19 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
 
-    if (lang !== "json" && lang !== "declaration") fileFacts.set(f.path, readFacts(text, scan.hidden, scan.commands));
+    if (lang !== "json" && lang !== "declaration") {
+      if (scan.read === "raw") rawFiles.add(f.path);
+      const facts = readFacts(text, scan.hidden, scan.commands);
+      // the parser's environment reads follow aliases and `globalThis.process.env`; a name read through one sits as near
+      // the network as the file is small
+      const near = text.length < 16 * 1024;
+
+      for (const e of scan.env ?? []) facts.push(e.name === null ? { kind: "env-object", line: e.line, snippet: e.snippet, text: false, near } : { kind: "env", line: e.line, snippet: e.snippet, name: e.name, text: false, near });
+      fileFacts.set(f.path, facts);
+      fileFlows.set(f.path, { flows: [...(scan.flows ?? [])], exports: scan.exports ?? new Map() });
+
+      for (const e of scan.executed ?? []) readHeld(f.path, e, 1);
+    }
 
     // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does
     for (const c of scan.commands ?? []) {
@@ -1101,10 +1184,14 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   // the floor: every file apm-score-v3 reads, in its order and within its budget, read whole by its rules
   const readRaw = (f: TarEntry, text: string): void => {
-    if (!NEVER_RUN.test(f.path) && !fileFacts.has(f.path)) fileFacts.set(f.path, readFacts(text));
+    if (NEVER_RUN.test(f.path) || fileFacts.has(f.path)) return;
+    fileFacts.set(f.path, readFacts(text));
+    rawFiles.add(f.path);
   };
 
   const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
+
+  addFlowFacts(fileFlows, fileFacts, byPath);
 
   for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
 
@@ -1135,13 +1222,16 @@ export function analyze(input: AnalyzeInput): Analysis {
     found,
     fileFacts,
     edges,
-    installRoots: [...installRunsOf(everyInstall, byPath), ...(gyp ? [gyp.path] : [])],
-    installBinaries: installRunsOf(everyInstall, byPath).filter((p) => {
+    // every lifecycle script that runs on the installing machine: install hooks, and prepare, prepack and postpack,
+    // which npm runs when it installs a package from git
+    installRoots: [...installRunsOf(hookCommands, byPath), ...(gyp ? [gyp.path] : [])],
+    installBinaries: installRunsOf(hookCommands, byPath).filter((p) => {
       const f = byPath.get(p);
 
       return f !== undefined && isBinary(f);
     }),
     reached: reachable,
+    rawFiles,
     hookEvidence,
     gyp: gyp !== undefined,
     binPaths: new Set(entryPoints(manifest).flatMap((e) => (e.field.startsWith("bin") ? [joinPath("", e.path)] : []))),
@@ -1171,6 +1261,97 @@ export function analyze(input: AnalyzeInput): Analysis {
   };
 }
 
+// ---------- apm-score-v10: code held as text, and flows across files ----------
+
+/** How deep code held as text is read (code in a string that runs code in a string), and how much of it per file. */
+const MAX_HELD_DEPTH = 3;
+const MAX_HELD_BYTES = 256 * 1024;
+
+/** What a fact found in code held as text says after its snippet. */
+const HELD_NOTES: Record<ExecutedCode["origin"], string> = {
+  run: " (in code it runs from a string)",
+  recovered: " (in its own source, which it turns back into code and runs)",
+  held: " (in a string that holds code)",
+};
+
+/** The facts a string that only holds code adds: what it would do that malware does, not what it can do. */
+const HELD_RISKS: ReadonlySet<Fact["kind"]> = new Set(["env-dump", "credential-read", "credential-near", "remote-shell", "fetched-code", "capture-endpoint"]);
+
+/** The label a `read:` label reads, rebuilt so its type is checked; only these can resolve to a credential path. */
+function readOf(l: Label): Label | null {
+  const inner = l.slice("read:".length);
+
+  if (inner === "cred-path") return "cred-path";
+
+  if (inner.startsWith("import:")) return `import:${inner.slice("import:".length)}`;
+
+  return inner.startsWith("read:") ? `read:${inner.slice("read:".length)}` : null;
+}
+
+/** At most this many flow facts of one kind per file. */
+const MAX_FLOW_FACTS = 40;
+
+/**
+ * What reached a call in each parsed file, as facts: the whole environment, a credential file's contents or three
+ * families of tokens sent in a request; a credential path opened by a read; downloaded data run as code or as a
+ * command. What a relative import carries is what that file exports (worked out the same way, through its own imports),
+ * so a read in one file and a request in another are one flow.
+ */
+function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>): void {
+  const resolve = (path: string, labels: readonly Label[], seen: ReadonlySet<string>): Set<Label> => {
+    const out = new Set<Label>();
+
+    for (const l of labels) {
+      if (l.startsWith("import:")) {
+        // `import:<spec>#<name>`, and `+` for a named member of that export (which is not a credential path)
+        const m = /^import:(.*)#([^#]*?)(\+?)$/.exec(l);
+        const target = m ? resolveIn(byPath, joinPath(dirOf(path), m[1] ?? "")) : undefined;
+
+        if (!m || !target || seen.has(target.path)) continue;
+        const exports = fileFlows.get(target.path)?.exports;
+        const name = m[2] ?? "";
+        // an export the module names gives its own labels; any other member of the module value is a named member of it
+        const own = exports?.get(name);
+        const deeper = m[3] === "+" || (own === undefined && name !== "");
+
+        for (const x of resolve(target.path, own ?? exports?.get("") ?? [], new Set([...seen, target.path]))) if (!(deeper && x === "cred-path")) out.add(x);
+      } else if (l.startsWith("read:")) {
+        // a read of a path another file gives: a credential file's contents when that path names one
+        const inner = readOf(l);
+
+        if (inner && resolve(path, [inner], seen).has("cred-path")) out.add("cred");
+      } else out.add(l);
+    }
+
+    return out;
+  };
+
+  for (const [path, { flows }] of fileFlows) {
+    const facts = fileFacts.get(path) ?? [];
+
+    const fact = (kind: Fact["kind"], f: FlowFinding, name: string): void => {
+      if (facts.filter((x) => x.kind === kind).length < MAX_FLOW_FACTS) facts.push({ kind, line: f.line, snippet: f.snippet, name, text: false, near: true });
+    };
+
+    for (const f of flows) {
+      const labels = resolve(path, f.labels, new Set([path]));
+
+      if (f.kind === "request") {
+        if (labels.has("env")) fact("sends-env", f, "sends the whole environment in a request");
+
+        if (labels.has("cred")) fact("sends-credential", f, "sends what it read from a credential file");
+        const families = new Set([...labels].flatMap((l) => (l.startsWith("secret:") ? [l.slice("secret:".length)] : [])));
+
+        if (families.size >= 3) fact("sends-secrets", f, `sends ${[...families].join(", ")} tokens in one request`);
+      } else if (f.kind === "read") {
+        if (labels.has("cred-path")) fact("reads-credential", f, "opens a path that names a credential file");
+      } else if (labels.has("net")) fact("runs-download", f, f.kind === "code" ? "runs code it downloaded" : "runs a command it downloaded");
+    }
+
+    fileFacts.set(path, facts);
+  }
+}
+
 // ---------- apm-score-v10: capabilities and risk signals ----------
 
 type AssessInput = {
@@ -1183,6 +1364,8 @@ type AssessInput = {
   installBinaries: readonly string[];
   /** Files an entry point or an install hook reaches. */
   reached: ReadonlySet<string>;
+  /** Files read with no tree, where a hidden credential name counts as a read, as in v9. */
+  rawFiles: ReadonlySet<string>;
   /** Evidence cited from install-time commands (hooks and binding.gyp). */
   hookEvidence: ReadonlySet<string>;
   gyp: boolean;
@@ -1229,6 +1412,13 @@ const DECODED_RUN = /\((?:decoded, then run|joined, then run)\)/;
 
 /** v9 evidence of a call found inside a string the program runs (`Function("fetch(u)")()`). */
 const STRING_RUN = /\(run from a string\)/;
+
+/** The `file:line` a piece of evidence cites, or the evidence itself when it cites none. */
+function lineKey(evidence: string): string {
+  const at = evidenceAt(evidence);
+
+  return at ? `${at.file}:${at.line}` : evidence;
+}
 
 function factLine(path: string, f: Fact, note = ""): string {
   return `${path}:${f.line}: ${f.snippet}${note}${f.text ? TEXT_MATCH : ""}${isTestPath(path) ? IN_TEST_FILE : ""}`;
@@ -1296,22 +1486,49 @@ function assess(input: AssessInput): Assessed {
   put("install-shell", [...atInstall("shell-exec"), ...input.installBinaries.map((p) => `${p}: an install script runs this compiled program`)]);
   put("install-eval", atInstall("eval"));
 
-  // credentials: a credential file read is heavy; a name in text is weak evidence
-  const reads = allFacts("credential-read").map(({ path, fact }) => factLine(path, fact, " (a credential path next to a file read)"));
+  // credentials: a credential file read is heavy; a name in text is weak evidence. A read is a credential path the
+  // flow analysis saw reach a read (or, in a file with no tree, a path next to a read), or one an install command names.
+  const flowReads = allFacts("reads-credential").map(({ path, fact }) => factLine(path, fact, " (a credential path reaches a file read)"));
+  const textReads = allFacts("credential-read").map(({ path, fact }) => factLine(path, fact, " (a credential path next to a file read)"));
+  const nearReads = allFacts("credential-near").map(({ path, fact }) => factLine(path, fact, " (a credential path near a file read; apm did not see the path reach it)"));
+  const readFiles = new Set([...allFacts("reads-credential"), ...allFacts("credential-read")].map(({ path }) => path));
   // a credential path or token name an install command names, or one the code hid by joining or encoding it
   const hookCredentials = found.confirmed("credential-access").flatMap((e) => (input.hookEvidence.has(e.evidence) ? [e.evidence] : []));
   const hiddenCredentials = found.confirmed("credential-access").flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) && counts(citedSource(e.evidence)) ? [e.evidence] : []));
+  // a hidden name is a read in a file that reads a credential file, where the line reads a token from the environment
+  // (`process.env['NPM' + '_TOKEN']`), in a file with no tree, or in obfuscator output; elsewhere it names one
+  const secretLines = new Set(allFacts("env").flatMap(({ path, fact }) => (fact.name !== undefined && secretFamily(fact.name) !== null ? [`${path}:${fact.line}`] : [])));
+  // obfuscator output builds its strings through tables no flow analysis follows, so there a hidden name is a read too
+  const obfuscatorFiles = new Set(allFacts("obfuscator").map(({ path }) => path));
+  const isRead = (e: string): boolean => readFiles.has(citedSource(e)) || secretLines.has(lineKey(e)) || input.rawFiles.has(citedSource(e)) || obfuscatorFiles.has(citedSource(e));
+  const hiddenReads = hiddenCredentials.filter(isRead);
   const credential = found.get("credential-access");
+  const reads = [...flowReads, ...textReads];
 
-  if (reads.length > 0 || hookCredentials.length > 0 || hiddenCredentials.length > 0) {
-    put("credential-read", [...new Set([...reads, ...hookCredentials, ...hiddenCredentials.map((e) => `${e} (a credential name hidden by joining or encoding)`), ...(credential?.evidence ?? [])])]);
+  if (reads.length > 0 || hookCredentials.length > 0 || hiddenReads.length > 0) {
+    put("credential-read", [...new Set([...reads, ...hookCredentials, ...hiddenReads.map((e) => `${e} (a credential name hidden by joining or encoding)`), ...(credential?.evidence ?? [])])]);
+  } else if (credential || nearReads.length > 0 || hiddenCredentials.length > 0) {
+    const named = [...nearReads, ...hiddenCredentials.filter((e) => !isRead(e)).map((e) => `${e} (a credential name hidden by joining or encoding; apm did not see it read)`)];
+
+    put("credential-mention", [...new Set([...named, ...(credential?.evidence ?? [])])], named.length > 0 ? "confirmed" : (credential?.confidence ?? "confirmed"), credential?.possible ?? []);
+    const mention = risks.get("credential-mention");
+
+    if (mention && nearReads.length > 0 && mention.confidence === "confirmed") {
+      mention.points = MENTION_NEAR_READ_POINTS;
+      mention.label = "Names a credential file next to a file read; apm did not see the path reach the read";
+    }
   }
-  else if (credential) put("credential-mention", credential.evidence, credential.confidence, credential.possible);
 
-  // obfuscation: obfuscator output or a hidden dangerous name is heavy; long encoded data alone is weak evidence
+  // obfuscation: obfuscator output or a hidden dangerous name is heavy; long encoded data alone is weak evidence. A
+  // credential path hidden by joining (`'.npm' + 'rc'`) in a file that reads no credential file names it, and hides
+  // no call: that is encoded data, not obfuscated code.
   const obfuscator = allFacts("obfuscator");
   const obfuscation = found.get("obfuscated");
-  const hiddenNames = found.confirmed("obfuscated").flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) ? [e.evidence] : []));
+  const hiddenLines = (id: SignalId): Set<string> => new Set(found.confirmed(id).flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) ? [lineKey(e.evidence)] : [])));
+  const hiddenCalls = new Set([...hiddenLines("shell-exec"), ...hiddenLines("network"), ...hiddenLines("eval")]);
+  const hiddenPaths = hiddenLines("credential-access");
+  const onlyNamesCredential = (e: string): boolean => hiddenPaths.has(lineKey(e)) && !hiddenCalls.has(lineKey(e)) && !isRead(e);
+  const hiddenNames = found.confirmed("obfuscated").flatMap((e) => (e.cited !== "hidden" && HIDDEN_NAME.test(e.evidence) && !onlyNamesCredential(e.evidence) ? [e.evidence] : []));
 
   if (obfuscator.length > 0 || hiddenNames.length > 0) {
     put("obfuscated", [...new Set([...obfuscator.map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "obfuscator output"})`)), ...hiddenNames, ...(obfuscation?.evidence ?? [])])]);
@@ -1322,13 +1539,20 @@ function assess(input: AssessInput): Assessed {
     found.confirmed(id).flatMap((e) => (DECODED_RUN.test(e.evidence) || (id !== "eval" && id !== "obfuscated" && STRING_RUN.test(e.evidence)) ? [e.evidence] : [])),
   );
 
-  put("runs-decoded-code", [...new Set(decodedRuns)]);
+  const hiddenRuns = allFacts("runs-hidden").map(({ path, fact }) => factLine(path, fact, " (runs text it kept in a comment or a regex)"));
+
+  put("runs-decoded-code", [...new Set([...decodedRuns, ...hiddenRuns])]);
 
   put("capture-endpoint", allFacts("capture-endpoint").map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "endpoint"})`)));
-  put("remote-shell", [
-    ...allFacts("remote-shell").flatMap(({ path, fact }) => (shellFiles.has(path) || installFiles.has(path) ? [factLine(path, fact)] : [])),
-    ...allFacts("fetched-code").map(({ path, fact }) => factLine(path, fact, " (runs a value right after a network call)")),
-  ]);
+  // remote execution: downloaded data the flow analysis saw reach an evaluator or a process, or a shell command that
+  // opens a remote shell or pipes a download into a shell, is confirmed; an evaluator near a network call is not
+  const downloads = allFacts("runs-download").map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "runs what it downloaded"})`));
+  const shells = allFacts("remote-shell").flatMap(({ path, fact }) => (shellFiles.has(path) || installFiles.has(path) ? [factLine(path, fact)] : []));
+
+  put("remote-shell", [...new Set([...downloads, ...shells, ...allFacts("fetched-code").map(({ path, fact }) => factLine(path, fact, " (runs a value right after a network call)"))])]);
+  const remote = risks.get("remote-shell");
+
+  if (remote && downloads.length + shells.length > 0) remote.points = CONFIRMED_FLOW_POINTS;
 
   // exfiltration: what a stealer collects, and the network, in one file or in the code that runs at install
   const exfil: string[] = [];
@@ -1362,7 +1586,13 @@ function assess(input: AssessInput): Assessed {
   }
 
   if (hookCredentials.length > 0 && atInstall("network").length > 0) exfil.push(...hookCredentials.map((e) => `${e} (an install command names a credential, and install-time code uses the network)`));
-  put("exfiltration", exfil);
+  // what the flow analysis saw sent: the whole environment, a credential file's contents, three families of tokens
+  const sent = (["sends-env", "sends-credential", "sends-secrets"] as const).flatMap((kind) => allFacts(kind).map(({ path, fact }) => factLine(path, fact, ` (${fact.name ?? "sends what it collected"})`)));
+
+  put("exfiltration", [...new Set([...sent, ...exfil])]);
+  const exfiltration = risks.get("exfiltration");
+
+  if (exfiltration && sent.length > 0) exfiltration.points = CONFIRMED_FLOW_POINTS;
 
   // capabilities, each with v9's evidence (and, for env and filesystem, the facts above)
   const capabilities: Capability[] = [];
@@ -1377,7 +1607,7 @@ function assess(input: AssessInput): Assessed {
 
   const used: Record<CapabilityId, { evidence: string[]; confidence: Confidence }> = {
     network: fromFound("network"),
-    env: { evidence: [...envFacts, ...allFactsAnywhere(fileFacts, "env-dump")].map(({ path, fact }) => factLine(path, fact)), confidence: "confirmed" },
+    env: { evidence: [...new Set([...envFacts, ...allFactsAnywhere(fileFacts, "env-dump"), ...allFactsAnywhere(fileFacts, "env-object")].map(({ path, fact }) => factLine(path, fact)))], confidence: "confirmed" },
     filesystem: { evidence: allFactsAnywhere(fileFacts, "filesystem").map(({ path, fact }) => factLine(path, fact)), confidence: "confirmed" },
     shell: fromFound("shell-exec"),
     eval: fromFound("eval"),

@@ -148,10 +148,12 @@ describe("what stealers and droppers do", () => {
     expect(risks(listed)).toEqual(["credential-mention"]);
   });
 
-  test("a credential name hidden by escapes counts as a read", () => {
-    const a = scored({ "index.js": "const p = '\\x4c\\x6f\\x67\\x69\\x6e' + ' Data';\nmodule.exports = p;\n" });
+  test("a credential name hidden by escapes is a read where it is read, and a mention where it is only named", () => {
+    const named = scored({ "index.js": "const p = '\\x4c\\x6f\\x67\\x69\\x6e' + ' Data';\nmodule.exports = p;\n" });
+    const read = scored({ "index.js": "const p = '\\x4c\\x6f\\x67\\x69\\x6e' + ' Data';\nmodule.exports = require('fs').readFileSync(require('path').join(process.env.LOCALAPPDATA, 'Google/Chrome/User Data/Default', p));\n" });
 
-    expect(risks(a)).toContain("credential-read");
+    expect(risks(named)).toEqual(["credential-mention"]);
+    expect(risks(read)).toContain("credential-read");
   });
 
   test("the whole environment next to a request is exfiltration; one variable is not", () => {

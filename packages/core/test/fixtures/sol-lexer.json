@@ -558,8 +558,8 @@
   "signals": {
    "credential-access": "confirmed"
   },
-  "v10": 97,
-  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
+  "v10": 70,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-read -30"
  },
  {
   "name": "alias-read",
@@ -572,8 +572,8 @@
   "signals": {
    "credential-access": "confirmed"
   },
-  "v10": 97,
-  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-mention -3"
+  "v10": 70,
+  "v10why": "apm-score-v10 lists filesystem as capabilities at no cost; risk signals: credential-read -30"
  },
  {
   "name": "data-interpolation",
@@ -825,7 +825,7 @@
    "credential-access": "confirmed"
   },
   "v10": 97,
-  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "token-env-comment",
@@ -839,7 +839,7 @@
    "credential-access": "confirmed"
   },
   "v10": 97,
-  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -3"
+  "v10why": "apm-score-v10 lists env as capabilities at no cost; risk signals: credential-mention -3"
  },
  {
   "name": "literal-fn-body",
@@ -1052,8 +1052,8 @@
    "credential-access": "confirmed"
   },
   "floor": "apm does not follow a value into a local method's parameter, and `fake` is a top-level binding another script could change, so it cannot prove `.npmrc` is never read; apm-score-v3's verdict stands",
-  "v10": 70,
-  "v10why": "apm-score-v10 finds no capability; risk signals: credential-read -30"
+  "v10": 90,
+  "v10why": "apm-score-v10 finds no capability; risk signals: credential-mention -10"
  },
  {
   "name": "type-import-nested",

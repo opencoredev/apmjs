@@ -67,8 +67,8 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v10": 95,
-  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "dynamic-other-opaque",
@@ -86,8 +86,8 @@
    "load:node:vm",
    "fetch:https://example.invalid"
   ],
-  "v10": 100,
-  "v10why": "apm-score-v10 lists network as capabilities at no cost; no risk signal"
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "dynamic-other-opaque-floor",
@@ -107,8 +107,8 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v10": 95,
-  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "regex-env-convert",
@@ -209,8 +209,8 @@
   "runs": [
    "fetch:https://example.invalid"
   ],
-  "v10": 100,
-  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; no risk signal"
+  "v10": 75,
+  "v10why": "apm-score-v10 lists network, eval as capabilities at no cost; risk signals: runs-decoded-code -25"
  },
  {
   "name": "worker-floor-comment",
@@ -228,8 +228,8 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v10": 95,
-  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
+  "v10": 70,
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-full-comment",
@@ -247,8 +247,8 @@
    "fetch:https://example.invalid",
    "env:NPM_TOKEN"
   ],
-  "v10": 95,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-mention -3, encoded-data -2"
+  "v10": 70,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-regex",
@@ -284,7 +284,7 @@
    "env:NPM_TOKEN"
   ],
   "v10": 70,
-  "v10why": "above the floor by design: apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
+  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: runs-decoded-code -25, credential-mention -3, encoded-data -2"
  },
  {
   "name": "worker-type",
