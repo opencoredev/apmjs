@@ -9,7 +9,15 @@ import type { SearchAnswer } from "@/lib/search-schema";
 // 5 a second, which typing with the 30 ms debounce stays under. In memory, one process; Cloudflare
 // rate limiting and its cache replace both after the port.
 const perClient = createTokenBucket({ capacity: 20, refillPerSecond: 5, maxKeys: 10_000 });
-const answers = createSharedCache<SearchAnswer>({ ttlMs: 30_000, maxEntries: 2_000 });
+
+// Only answers made of npm's packages are kept: a local package's text changes the moment one of its versions is
+// revoked, so an answer with one is asked of the registry every time (lib/registry.ts keeps it out of the edge cache).
+const answers = createSharedCache<SearchAnswer>({ ttlMs: 30_000, maxEntries: 2_000, keep: (a) => !hasLocal(a) });
+
+/** Whether an answer has a package published here. */
+function hasLocal(a: SearchAnswer): boolean {
+  return a.hits.some((h) => h.source === "local");
+}
 
 export async function GET(request: NextRequest): Promise<Response> {
   const q = (request.nextUrl.searchParams.get("q") ?? "").trim().toLowerCase().slice(0, 214);
@@ -26,6 +34,6 @@ export async function GET(request: NextRequest): Promise<Response> {
 
   if (!answer) return Response.json({ error: "The registry did not answer." }, { status: 502 });
 
-  // A short private cache lets back and forward reuse answers; the registry caches npm for 60s itself.
-  return Response.json(answer, { headers: { "cache-control": "private, max-age=30" } });
+  // A short private cache lets back and forward reuse npm-only answers; the registry caches npm for 60s itself.
+  return Response.json(answer, { headers: { "cache-control": hasLocal(answer) ? "no-store" : "private, max-age=30" } });
 }

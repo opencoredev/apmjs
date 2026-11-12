@@ -46,9 +46,11 @@ type Entry<T> = { value: T; expires: number };
 
 /**
  * A short cache shared by every visitor: an answer is reused for `ttlMs`, and concurrent requests for
- * the same key wait on one load. Failed loads (null) are not stored. At most `maxEntries` are kept.
+ * the same key wait on one load. Failed loads (null) are not stored, nor answers `keep` refuses (by
+ * default every answer is kept). At most `maxEntries` are kept.
  */
-export function createSharedCache<T>(opts: { ttlMs: number; maxEntries: number }): SharedCache<T> {
+export function createSharedCache<T>(opts: { ttlMs: number; maxEntries: number; keep?: (value: T) => boolean }): SharedCache<T> {
+  const keep = opts.keep ?? (() => true);
   const entries = new Map<string, Entry<T>>();
   const loading = new Map<string, Promise<T | null>>();
 
@@ -64,7 +66,7 @@ export function createSharedCache<T>(opts: { ttlMs: number; maxEntries: number }
       if (pending) return pending;
 
       const promise = load().then((value) => {
-        if (value !== null) {
+        if (value !== null && keep(value)) {
           if (entries.size >= opts.maxEntries) {
             const oldest = entries.keys().next();
 

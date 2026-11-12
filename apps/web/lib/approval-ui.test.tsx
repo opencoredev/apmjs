@@ -75,6 +75,16 @@ describe("the approval page", () => {
     expect(html).toContain("(text match in a comment)");
   });
 
+  test("an approved upload whose version is withheld says so, with no risk or file sections", () => {
+    const s = StagedDetail.parse({ ...staged, status: "approved", description: "", files: [], score: null, analysis: "incomplete", withheld: true });
+    const html = renderToStaticMarkup(<StagedReview s={s} account={account} config={config} onDecided={() => {}} />);
+
+    expect(html).toContain("This version is revoked or its revoke is pending.");
+    expect(html).not.toContain("Risk summary");
+    expect(html).not.toContain('id="files-heading"');
+    expect(html).not.toContain("The analysis did not finish");
+  });
+
   test("an expired upload shows the evidence and no approve controls", () => {
     const html = renderToStaticMarkup(<StagedReview s={{ ...staged, expiresAt: new Date(Date.now() - 1000).toISOString() }} account={account} config={config} onDecided={() => {}} />);
 

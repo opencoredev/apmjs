@@ -85,7 +85,9 @@ export type FetchJsonOptions<T> = {
 /**
  * Registry answers the site may keep: search results and a package's public log. Neither carries a version's source
  * (file text, excerpts, readmes, review quotes, score evidence), so a revoke has nothing to take back from them.
- * Everything else is read from the registry on every view, and the registry decides then whether it may be shown.
+ * Search keeps only answers made of npm's packages (lib/registry.ts): a local package's description changes when one
+ * of its versions is revoked. Everything else is read from the registry on every view, and the registry decides then
+ * whether it may be shown.
  */
 const SOURCE_FREE: readonly RegExp[] = [/\/-\/v1\/search$/, /\/-\/apm\/v1\/packages\/[^/]+\/events$/];
 
@@ -153,13 +155,19 @@ function isGone(result: Fetched<unknown>): boolean {
   return result.kind === "missing" || (result.kind === "unavailable" && result.reason.kind === "status" && result.reason.status === 410);
 }
 
-/** Reads the registry and keeps what it should: a 2xx is stored, a 404 or 410 drops what was stored, an outage keeps it. */
-async function loadAndKeep<T>(opts: FetchJsonOptions<T>, policy: CachePolicy): Promise<Fetched<T>> {
+/** Which answers of one URL the cache may keep; an answer it refuses is read from the registry every time. */
+type Keep<T> = (value: T) => boolean;
+
+/**
+ * Reads the registry and keeps what it should: a 2xx that `keep` accepts is stored; one it refuses, a 404 or a 410
+ * drops what was stored; an outage keeps it.
+ */
+async function loadAndKeep<T>(opts: FetchJsonOptions<T>, policy: CachePolicy, keep: Keep<T>): Promise<Fetched<T>> {
   const start = Date.now();
   const loaded = await load(opts);
 
-  if (loaded.body !== null) store(opts.url, loaded.body, policy, start);
-  else if (isGone(loaded.result)) evict(opts.url);
+  if (loaded.body !== null && loaded.result.kind === "ok" && keep(loaded.result.value)) store(opts.url, loaded.body, policy, start);
+  else if (loaded.body !== null || isGone(loaded.result)) evict(opts.url);
 
   return loaded.result;
 }
@@ -188,21 +196,23 @@ export async function fetchJson<T>(opts: FetchJsonOptions<T>): Promise<Fetched<T
 /**
  * fetchJson through the edge cache (lib/edge-cache.ts), for an answer that is the same for everyone and carries no
  * source (isSourceFree): a fresh copy is served as is, a stale one is served while one background read replaces it.
+ * `keep` narrows that to the answers the cache may hold; one it refuses is neither stored nor served from the cache.
  * Throws for any other URL, so a source-bearing answer can't be cached by mistake.
  */
-export async function fetchCachedJson<T>(opts: Omit<FetchJsonOptions<T>, "headers"> & { cache: CachePolicy }): Promise<Fetched<T>> {
+export async function fetchCachedJson<T>(opts: Omit<FetchJsonOptions<T>, "headers"> & { cache: CachePolicy; keep?: Keep<T> }): Promise<Fetched<T>> {
   if (!isSourceFree(opts.url)) throw new Error(`refusing to cache ${new URL(opts.url).pathname}: it can carry a version's source`);
-  const hit = await lookup(opts.url, opts.cache);
-  const cached = hit ? parseBody(hit.text, opts.schema) : null;
+  const { cache, keep = () => true, ...read } = opts;
+  const hit = await lookup(read.url, cache);
+  const cached = hit ? parseBody(hit.text, read.schema) : null;
 
-  if (hit && cached?.kind === "ok") {
+  if (hit && cached?.kind === "ok" && keep(cached.value)) {
     // the background refresh must outlive this request's abort signal
-    if (hit.stale) inBackground(loadAndKeep({ ...opts, signal: undefined }, opts.cache));
+    if (hit.stale) inBackground(loadAndKeep({ ...read, signal: undefined }, cache, keep));
 
     return cached;
   }
 
-  return loadAndKeep(opts, opts.cache);
+  return loadAndKeep(read, cache, keep);
 }
 
 /** One line for the server log. */

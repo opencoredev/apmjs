@@ -110,11 +110,15 @@ export type RecentEvent = z.infer<typeof Recent>["events"][number];
  * registry every time unless `cache` is set, which only source-free answers may set (fetchCachedJson); a read that
  * sends `headers` (a visitor's cookie) is never cached.
  */
-async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: CachePolicy } = {}): Promise<Fetched<T>> {
+async function getJson<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: { policy: CachePolicy; keep: (value: T) => boolean } } = {},
+): Promise<Fetched<T>> {
   const options: FetchJsonOptions<T> = { url: `${REGISTRY}${path}`, schema, signal: opts.signal };
 
   if (opts.headers !== undefined) options.headers = opts.headers;
-  const result = opts.cache !== undefined && opts.headers === undefined ? await fetchCachedJson({ ...options, cache: opts.cache }) : await fetchJson(options);
+  const result = opts.cache !== undefined && opts.headers === undefined ? await fetchCachedJson({ ...options, cache: opts.cache.policy, keep: opts.cache.keep }) : await fetchJson(options);
 
   if (result.kind === "unavailable" && !opts.signal?.aborted) logUnavailable(path.split("?")[0] ?? path, result.reason);
 
@@ -125,7 +129,7 @@ async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: A
 export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo);
 
 export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> {
-  const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: POLICIES.events });
+  const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: { policy: POLICIES.events, keep: () => true } });
 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }
@@ -202,9 +206,20 @@ export async function checkNamePart<P extends NamePart>(input: { q: string; part
   return r.kind === "ok" ? r.value : null;
 }
 
+/** A search object from npm. One with no source is the registry's own (WireHit's default), so it is not one of these. */
+const NpmObject = z.object({ source: z.literal("npm") });
+
+/**
+ * Whether a search answer is npm's packages only. A local package's description and keywords change the moment one of
+ * its versions is revoked (the revoked publish's text is withheld), so an answer with a local package is never cached.
+ */
+export function npmOnly(wire: { objects: readonly unknown[] }): boolean {
+  return wire.objects.every((o) => NpmObject.safeParse(o).success);
+}
+
 /** Registry search (apm packages merged with npm's), trimmed to what the search page shows. Null when the registry is down. */
 export async function search(q: string, signal?: AbortSignal): Promise<SearchAnswer | null> {
-  const r = await getJson(`-/v1/search?text=${encodeURIComponent(q)}&size=20`, WireSearch, { signal, cache: POLICIES.search });
+  const r = await getJson(`-/v1/search?text=${encodeURIComponent(q)}&size=20`, WireSearch, { signal, cache: { policy: POLICIES.search, keep: npmOnly } });
 
   if (r.kind !== "ok") return null;
   const wire = r.value;

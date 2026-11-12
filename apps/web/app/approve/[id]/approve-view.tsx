@@ -342,64 +342,72 @@ export function StagedReview({ s, account, config, onDecided }: { s: StagedDetai
         </div>
       </dl>
 
-      <section aria-labelledby="risk-heading" className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 id="risk-heading" className="text-lg font-medium tracking-tight">
-            Risk summary
-          </h2>
-          {s.score && <ScoreBadge score={s.score.score} grade={s.score.grade} />}
-        </div>
-        <p className={cn("rounded-xl px-4 py-3 text-[15px] leading-6", s.analysis === "incomplete" || belowFloor ? "bg-bad-soft text-bad" : risks.length > 0 ? "bg-warn-soft text-warn" : "bg-surface text-muted-foreground")}>
-          {s.analysis === "incomplete"
-            ? "The analysis did not finish: the tarball could not be read in full. Nothing below was checked. Look at the files yourself before you approve."
-            : belowFloor
-              ? `Score ${s.score?.score ?? 0} is under the floor of ${s.floor}. apm installs refuse versions this low unless forced. ${risks.length} risk signal${risks.length === 1 ? "" : "s"} below.`
-              : risks.length === 0
-                ? "No risk signals found. The score is a heuristic: read the files if anything about this upload is unexpected."
-                : `${risks.length} risk signal${risks.length === 1 ? "" : "s"} found. Read each one and its evidence before you approve.`}
+      {s.withheld ? (
+        <p className="rounded-xl bg-surface px-4 py-3 text-[15px] leading-6 text-muted-foreground">
+          This version is revoked or its revoke is pending. Its description, score and files are not shown anywhere on apm, this page included.
         </p>
-        {s.score && (
-          <ul className="flex flex-col divide-y rounded-xl border">
-            {risks.map((x) => (
-              <SignalRow key={x.id} x={x} />
-            ))}
-            {notes.map((x) => (
-              <SignalRow key={x.id} x={x} />
-            ))}
-            {risks.length + notes.length === 0 && <li className="px-4 py-3 text-[15px] text-muted-foreground">No signals.</li>}
-          </ul>
-        )}
-        {s.score && s.score.notChecked.length > 0 && (
-          <div className="flex flex-col gap-2">
-            <h3 className="text-[15px] font-medium">Not checked</h3>
-            <ul className="flex list-disc flex-col gap-1 pl-5 text-[15px] leading-6 text-muted-foreground marker:text-muted-foreground/60">
-              {s.score.notChecked.map((n) => (
-                <li key={n}>{n}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </section>
+      ) : (
+        <>
+          <section aria-labelledby="risk-heading" className="flex flex-col gap-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h2 id="risk-heading" className="text-lg font-medium tracking-tight">
+                Risk summary
+              </h2>
+              {s.score && <ScoreBadge score={s.score.score} grade={s.score.grade} />}
+            </div>
+            <p className={cn("rounded-xl px-4 py-3 text-[15px] leading-6", s.analysis === "incomplete" || belowFloor ? "bg-bad-soft text-bad" : risks.length > 0 ? "bg-warn-soft text-warn" : "bg-surface text-muted-foreground")}>
+              {s.analysis === "incomplete"
+                ? "The analysis did not finish: the tarball could not be read in full. Nothing below was checked. Look at the files yourself before you approve."
+                : belowFloor
+                  ? `Score ${s.score?.score ?? 0} is under the floor of ${s.floor}. apm installs refuse versions this low unless forced. ${risks.length} risk signal${risks.length === 1 ? "" : "s"} below.`
+                  : risks.length === 0
+                    ? "No risk signals found. The score is a heuristic: read the files if anything about this upload is unexpected."
+                    : `${risks.length} risk signal${risks.length === 1 ? "" : "s"} found. Read each one and its evidence before you approve.`}
+            </p>
+            {s.score && (
+              <ul className="flex flex-col divide-y rounded-xl border">
+                {risks.map((x) => (
+                  <SignalRow key={x.id} x={x} />
+                ))}
+                {notes.map((x) => (
+                  <SignalRow key={x.id} x={x} />
+                ))}
+                {risks.length + notes.length === 0 && <li className="px-4 py-3 text-[15px] text-muted-foreground">No signals.</li>}
+              </ul>
+            )}
+            {s.score && s.score.notChecked.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <h3 className="text-[15px] font-medium">Not checked</h3>
+                <ul className="flex list-disc flex-col gap-1 pl-5 text-[15px] leading-6 text-muted-foreground marker:text-muted-foreground/60">
+                  {s.score.notChecked.map((n) => (
+                    <li key={n}>{n}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </section>
 
-      <section aria-labelledby="files-heading" className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-baseline justify-between gap-3">
-          <h2 id="files-heading" className="text-lg font-medium tracking-tight">
-            Files
-          </h2>
-          <span className="text-sm text-muted-foreground">
-            {s.files.length} files · {fmtSize(s.size)} packed · select a file to read it
-          </span>
-        </div>
-        {s.files.length === 0 ? (
-          <p className="text-[15px] text-muted-foreground">The file list could not be read from this upload.</p>
-        ) : (
-          <ul className="max-h-[720px] overflow-auto rounded-xl border font-mono text-[13px]">
-            {s.files.map((f) => (
-              <FileItem key={f.path} stagedId={s.id} path={f.path} size={f.size} />
-            ))}
-          </ul>
-        )}
-      </section>
+          <section aria-labelledby="files-heading" className="flex flex-col gap-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-3">
+              <h2 id="files-heading" className="text-lg font-medium tracking-tight">
+                Files
+              </h2>
+              <span className="text-sm text-muted-foreground">
+                {s.files.length} files · {fmtSize(s.size)} packed · select a file to read it
+              </span>
+            </div>
+            {s.files.length === 0 ? (
+              <p className="text-[15px] text-muted-foreground">The file list could not be read from this upload.</p>
+            ) : (
+              <ul className="max-h-[720px] overflow-auto rounded-xl border font-mono text-[13px]">
+                {s.files.map((f) => (
+                  <FileItem key={f.path} stagedId={s.id} path={f.path} size={f.size} />
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
+      )}
 
       {pending && <Confirm s={s} account={account} config={config} onDecided={onDecided} />}
     </div>

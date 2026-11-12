@@ -80,6 +80,8 @@ export const StagedDetail = StagedSummary.extend({
   analysis: z.enum(["complete", "incomplete"]),
   /** "typed": the person types the package name to approve (incomplete analysis or a score under the floor). */
   confirmation: z.discriminatedUnion("kind", [z.object({ kind: z.literal("plain") }), z.object({ kind: z.literal("typed"), reason: z.string() })]),
+  /** The published version is revoked or revoke-pending: the registry sends no description, score or files. */
+  withheld: z.boolean().default(false),
 });
 
 export type StagedDetail = z.infer<typeof StagedDetail>;
