@@ -28,6 +28,7 @@ type RegistryModule = {
     hostname?: string;
     now?: () => number;
     upstream?: string;
+    upstreamTtlMs?: number;
     legacyAuth?: boolean;
     namePolicy?: NamePolicy;
     auth?: { secret: string; github?: { clientId: string; clientSecret: string; endpoints?: GitHubEndpoints } };
@@ -41,6 +42,8 @@ function isRegistryModule(m: unknown): m is RegistryModule {
 export type StartOptions = {
   now?: () => number;
   upstream?: string;
+  /** How long the registry trusts an upstream packument before asking again (default 60s). */
+  upstreamTtlMs?: number;
   /** npm's password adduser and password re-auth. On by default here so the older suites keep their meaning; off in production. */
   legacyAuth?: boolean;
   /** "open" lets bare names through (the older suites); "scoped" is production: new names live under your GitHub login. */
@@ -59,6 +62,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
     hostname: "127.0.0.1",
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.upstream ? { upstream: opts.upstream } : {}),
+    ...(opts.upstreamTtlMs !== undefined ? { upstreamTtlMs: opts.upstreamTtlMs } : {}),
     legacyAuth: opts.legacyAuth ?? true,
     namePolicy: opts.namePolicy ?? "open",
     auth: {
