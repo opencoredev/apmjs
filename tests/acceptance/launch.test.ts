@@ -638,4 +638,24 @@ describe("the registry marks per-user answers private, no-store", () => {
     expect(who.headers.get("cache-control")).toBe("private, no-store");
     expect(who.headers.get("vary") ?? "").toMatch(/Authorization/);
   });
+
+  test("the package page's reads say where their time went in Server-Timing; account answers do not", async () => {
+    for (const [method, path] of [
+      ["HEAD", "-/apm/v1/packages/timing-missing"],
+      ["GET", "-/apm/v1/packages/timing-missing"],
+      ["GET", "-/apm/v1/score/timing-missing/1.0.0"],
+      ["GET", "-/apm/v1/readme/timing-missing/1.0.0"],
+    ] as const) {
+      const res = await fetch(`${reg.url}${path}`, { method });
+      await res.body?.cancel();
+
+      // every one reads the package row, so the database's time is named, and the whole answer's
+      expect(res.headers.get("server-timing") ?? "", `${method} ${path}`).toMatch(/^db;dur=[\d.]+;desc="\d+"(, [a-z-]+;dur=[\d.]+;desc="\d+")*, total;dur=[\d.]+$/);
+    }
+
+    const account = await fetch(`${reg.url}-/apm/v1/account`);
+    await account.body?.cancel();
+
+    expect(account.headers.get("server-timing")).toBeNull();
+  });
 });

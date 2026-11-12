@@ -347,6 +347,21 @@ describe("AI review", () => {
     expect(dig(next.body, "review", "coverage")).toEqual({ mode: "diff", previousVersion: "1.0.0", filesInScope: 2, filesRead: 2 });
   });
 
+  test("the review answer takes a dist-tag, so the website can ask for latest while it reads the package answer", async () => {
+    await publish(reg, alice, { name: "ai-review-tag-demo", version: "1.0.0", license: "MIT", main: "index.js" });
+    await publish(reg, alice, { name: "ai-review-tag-demo", version: "1.1.0", license: "MIT", main: "index.js" }, { "index.js": "module.exports = 2;\n" });
+    const byTag = await review("ai-review-tag-demo", "latest");
+    const byVersion = await review("ai-review-tag-demo", "1.1.0");
+
+    expect(byTag.status).toBe(200);
+    expect(dig(byTag.body, "version")).toBe("1.1.0");
+    expect(byTag.body).toEqual(byVersion.body);
+    // a name that is neither a version nor a tag is still no version
+    expect((await review("ai-review-tag-demo", "nightly")).status).toBe(404);
+    // the two publishes queued a review each; finish them so the next test's reviewer sees only its own
+    expect(await runOnce(reviewer(), 4)).toBe(2);
+  });
+
   test("a flagged release reads 'under review' in public; owners and admins see the findings; only a confirmed one goes public", async () => {
     const asked = model.stats.requests;
 

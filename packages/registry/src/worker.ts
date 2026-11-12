@@ -12,11 +12,12 @@ import { Clock } from "./clock.ts";
 import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { Store, type StoreFault } from "./db.ts";
 import type { HttpFailure, InfraError } from "./errors.ts";
-import { fail, failureResponse, withPrivacyHeaders, withSlash } from "./http.ts";
+import { fail, failureResponse, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
 import { route } from "./router.ts";
 import { legacyAuthRefusal } from "./startup.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { considerUpstream, REVIEW_DEFAULTS, ReviewConfig, reviewLocalCommit, type ReviewSettings } from "./review.ts";
+import { Timing, type TimingApi } from "./timing.ts";
 import { Upstream } from "./upstream.ts";
 
 const Method = z.instanceof(Function);
@@ -202,10 +203,16 @@ export async function handle(
   ctx: ExecutionContext | null = null,
   faults: ReadonlySet<StoreFault> = new Set(),
 ): Promise<Response> {
-  return withPrivacyHeaders(req, await respond(req, rawEnv, clock, ctx, faults));
+  const start = performance.now();
+  const timing = Timing.make();
+  const res = await respond({ req, rawEnv, clock, ctx, faults, timing });
+
+  return withServerTiming(req, withPrivacyHeaders(req, res), timing.header(performance.now() - start));
 }
 
-async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, ctx: ExecutionContext | null, faults: ReadonlySet<StoreFault>): Promise<Response> {
+type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: ExecutionContext | null; faults: ReadonlySet<StoreFault>; timing: TimingApi };
+
+async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Promise<Response> {
   const parsed = WorkerEnv.safeParse(rawEnv);
 
   if (!parsed.success) {
@@ -242,6 +249,8 @@ async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, 
     ),
     Effect.provide(servicesFor(env, settings, clock, ctx === null ? null : (work) => ctx.waitUntil(work), faults)),
     Effect.scoped,
+    // outside servicesFor, so the Store and Upstream layers find it while they are built
+    Effect.provideService(Timing, timing),
   );
 
   const exit = await Effect.runPromiseExit(program);

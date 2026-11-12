@@ -23,6 +23,7 @@ import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { REGISTRY } from "@/lib/registry-url";
+import { answerFor, askedVersion } from "@/lib/early-answer";
 import { cutReadme, EXTERNAL_REL, renderReadme } from "@/lib/readme";
 import { githubRepo } from "@/lib/repository";
 import { ReadmeView } from "@/components/readme-view";
@@ -582,9 +583,18 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
   const name = route.name;
-  // proxy.ts checked that the package exists before the shell went out (a HEAD, no answer built); this is the one
-  // read of the answer
-  const [found, query] = await Promise.all([getPackage(name), searchParams]);
+  const query = await searchParams;
+  const asked = askedVersion(query.v);
+  // Started together, before the package answer says which version is shown, so no read waits for another: the
+  // package answer (proxy.ts already checked it exists with a HEAD that builds nothing), the public log, the AI review
+  // of the asked version or of latest, and an asked version's own score. An early answer is used only when it is for
+  // the version shown (lib/early-answer.ts); each is read from the registry for this view.
+  const pending = getPackage(name);
+  // an upstream package's log holds what apm's reviewers did to it (dismissed evidence); none answers 404
+  const events = getEvents(name);
+  const earlyReview = getReview(name, asked ?? "latest");
+  const earlyScore = asked === undefined ? null : getVersionScore(name, asked);
+  const found = await pending;
 
   // proxy.ts already answered 404 or 503; this covers a registry that fails between that check and this read
   if (found.kind === "missing") notFound();
@@ -595,15 +605,14 @@ async function PackageContent({ params, searchParams }: PageProps) {
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
 
-  // Started together, now. Each section below waits only for its own answer inside a Suspense boundary, so the
-  // header, the install box and the score render without waiting for the slowest call.
-  const review = version ? getReview(name, version) : Promise.resolve<Fetched<ReviewAnswer>>(none);
-  // an upstream package's log holds what apm's reviewers did to it (dismissed evidence); none answers 404
-  const events = getEvents(name);
+  // Each section below waits only for its own answer inside a Suspense boundary, so the header, the install box and
+  // the score render without waiting for the slowest call.
+  const review = version ? answerFor({ early: earlyReview, asked: asked ?? "latest", version, read: () => getReview(name, version) }) : Promise.resolve<Fetched<ReviewAnswer>>(none);
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
   const tarballReadme = version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null);
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
-  const versionScore = version && !isLatest ? await getVersionScore(name, version) : none;
+  const readScore = (v: string) => (earlyScore !== null && asked !== undefined ? answerFor({ early: earlyScore, asked, version: v, read: () => getVersionScore(name, v) }) : getVersionScore(name, v));
+  const versionScore = version && !isLatest ? await readScore(version) : none;
 
   const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
   const score = isLatest ? pkg.score : versionScore.kind === "ok" ? versionScore.value : null;

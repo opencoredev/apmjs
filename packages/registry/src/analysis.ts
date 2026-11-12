@@ -7,6 +7,7 @@ import { Clock } from "./clock.ts";
 import { Manifest, Store, type VersionRecord } from "./db.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
 import { digestLabel, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
+import { timed, timingOrNull } from "./timing.ts";
 
 export type AnalysisJob = { readonly name: string; readonly version: string };
 
@@ -95,6 +96,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         // One inline download and analysis at a time: a request may look up many packages at once (scan), and
         // each analysis holds a tarball and its inflated files in the Worker's 128 MB.
         const inline = yield* Semaphore.make(1);
+        const timeAnalysis = timed(yield* timingOrNull, "analysis");
 
         const enqueue = (name: string, version: string): Effect.Effect<void, StoreError> =>
           Effect.gen(function* () {
@@ -136,7 +138,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
 
               return yield* inline.withPermits(1)(
-                Effect.gen(function* () {
+                timeAnalysis(Effect.gen(function* () {
                   const got = yield* upstream.tarball(pkg, v.version);
 
                   if (got.kind !== "ok") return v;
@@ -148,7 +150,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                   }
 
                   return yield* analyzeAndStore(pkg, v, got);
-                }),
+                })),
               );
             }),
           enqueue,

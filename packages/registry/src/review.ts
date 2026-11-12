@@ -18,9 +18,10 @@ import { randomId } from "./hash.ts";
 import { fail, json, parseBody } from "./http.ts";
 import { requireSiteOrigin } from "./origin.ts";
 import { order } from "./semver.ts";
-import { splitPath, tarballUrl, type Caller } from "./server.ts";
+import { splitPath, tagTarget, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
+import { timed, timingOrNull } from "./timing.ts";
 import { isWithheld } from "./withheld.ts";
 
 export type ReviewSettings = {
@@ -153,7 +154,7 @@ export function previousVersionOf(versions: readonly VersionRecord[], version: s
   return best;
 }
 
-function labelOf(v: VersionRecord): string | null {
+function labelOf(v: Pick<VersionRecord, "integrity" | "shasum">): string | null {
   const d = digestOf(v);
 
   return d ? digestLabel(d) : null;
@@ -168,7 +169,7 @@ const DownloadsAnswer = z.object({ downloads: z.number() });
 
 // ---------- storage ----------
 const query = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
-  effect.pipe(
+  Effect.flatMap(timingOrNull, (timing) => timed(timing, "db")(effect)).pipe(
     Effect.mapError((cause) => new StoreError({ operation: `review.${operation}`, cause })),
     Effect.flatMap((rows) => {
       const parsed = schema.safeParse(rows);
@@ -190,6 +191,19 @@ const jobById = (id: string, lock: boolean) =>
 const reviewFor = (name: string, version: string, digest: string) =>
   Effect.flatMap(SqlClient.SqlClient, (sql) =>
     query("reviewFor", sql`SELECT * FROM reviews WHERE package = ${name} AND version = ${version} AND digest = ${digest}`, one(ReviewRow)),
+  );
+
+const StoredAndJob = z.object({ review: ReviewRow.nullable(), job: JobRow.nullable() });
+
+/** The stored review and the job of one version's bytes, in one round trip (the review answer reads both). */
+const reviewAndJob = (name: string, version: string, digest: string) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    query(
+      "reviewAndJob",
+      sql`SELECT (SELECT to_jsonb(r) FROM reviews r WHERE r.package = ${name} AND r.version = ${version} AND r.digest = ${digest}) AS review,
+                 (SELECT to_jsonb(j) FROM review_jobs j WHERE j.package = ${name} AND j.version = ${version} AND j.digest = ${digest}) AS job`,
+      one(StoredAndJob),
+    ),
   );
 
 /** Adds a job, or merges reasons into the waiting one. A finished job is reopened only for a request after no answer. */
@@ -282,31 +296,60 @@ const takeJobs = (max: number, settings: ReviewSettings) =>
   });
 
 // ---------- catalog ----------
-type Catalog = { kind: "ok"; source: Source; versions: VersionRecord[] } | { kind: "absent" } | { kind: "unavailable" };
+/** A version as a catalog lists it: the listing (catalogListing) carries no score. */
+type Listed = Omit<VersionRecord, "score">;
 
+type Catalog<V extends Listed = VersionRecord> =
+  | { kind: "ok"; source: Source; distTags: Record<string, string>; versions: readonly V[] }
+  | { kind: "absent" }
+  | { kind: "unavailable" };
+
+/** An upstream answer as a catalog. */
+function upstreamCatalog<V extends Listed>(probe: { kind: "found"; pkg: { distTags: Record<string, string>; versions: readonly V[] } } | { kind: "absent" } | { kind: "unknown" }): Catalog<V> {
+  switch (probe.kind) {
+    case "found":
+      return { kind: "ok", source: "upstream", distTags: probe.pkg.distTags, versions: probe.pkg.versions };
+    case "absent":
+      return { kind: "absent" };
+    case "unknown":
+      return { kind: "unavailable" };
+    default: {
+      const _exhaustive: never = probe;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** A package's versions with their scores (evidence checks and the reviewer's job read them). */
 const catalog = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
+    const pkg = yield* store.getPackage(name);
 
-    if (yield* store.getPackage(name)) return { kind: "ok", source: "local", versions: yield* store.listVersions(name) } satisfies Catalog;
+    if (pkg) return { kind: "ok", source: "local", distTags: pkg.distTags, versions: yield* store.listVersions(name) } satisfies Catalog;
     const upstream = yield* Effect.serviceOption(Upstream);
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog;
-    const probe = yield* upstream.value.probe(name);
 
-    switch (probe.kind) {
-      case "found":
-        return { kind: "ok", source: "upstream", versions: probe.pkg.versions } satisfies Catalog;
-      case "absent":
-        return { kind: "absent" } satisfies Catalog;
-      case "unknown":
-        return { kind: "unavailable" } satisfies Catalog;
-      default: {
-        const _exhaustive: never = probe;
+    return upstreamCatalog(yield* upstream.value.probe(name));
+  });
 
-        return _exhaustive;
-      }
-    }
+/**
+ * A package's versions, statuses and checksums, for the review answer: an upstream package's come from the listing,
+ * which reads no scores from the database. A local version's status is read from the database on every call.
+ */
+const catalogListing = (name: string) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const pkg = yield* store.getPackage(name);
+
+    if (pkg) return { kind: "ok", source: "local", distTags: pkg.distTags, versions: yield* store.listVersions(name) } satisfies Catalog<Listed>;
+    const upstream = yield* Effect.serviceOption(Upstream);
+
+    if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog<Listed>;
+
+    return upstreamCatalog(yield* upstream.value.listing(name));
   });
 
 type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string };
@@ -632,34 +675,52 @@ function privateView(r: StoredReview) {
   };
 }
 
+/** The version `version` names in `cat`, or the refusal that says why there is none. */
+const pickVersion = <V extends Listed>(cat: Catalog<V>, version: string) => {
+  if (cat.kind === "unavailable") return Effect.fail(refuse(503, "The upstream registry could not be reached."));
+
+  if (cat.kind === "absent") return Effect.fail(refuse(404, "Not found"));
+  const v = cat.versions.find((x) => x.version === version);
+
+  if (!v) return Effect.fail(refuse(404, "No such version"));
+
+  return Effect.succeed({ source: cat.source, version: v, digest: labelOf(v) });
+};
+
 export const resolveVersion = (name: string, version: string | undefined) =>
   Effect.gen(function* () {
     if (!version) return yield* Effect.fail(refuse(404, "Name a version."));
-    const cat: Catalog = yield* catalog(name);
 
-    if (cat.kind === "unavailable") return yield* Effect.fail(refuse(503, "The upstream registry could not be reached."));
+    return yield* pickVersion(yield* catalog(name), version);
+  });
 
-    if (cat.kind === "absent") return yield* Effect.fail(refuse(404, "Not found"));
-    const v = cat.versions.find((x) => x.version === version);
+/**
+ * The version a review answer is for: an exact version, else a dist-tag (the website asks for `latest` while it reads
+ * the package answer). An exact version wins over a tag of the same name.
+ */
+const resolveListed = (name: string, spec: string | undefined) =>
+  Effect.gen(function* () {
+    if (!spec) return yield* Effect.fail(refuse(404, "Name a version."));
+    const cat = yield* catalogListing(name);
+    const exact = cat.kind === "ok" && cat.versions.some((v) => v.version === spec);
 
-    if (!v) return yield* Effect.fail(refuse(404, "No such version"));
-
-    return { source: cat.source, version: v, digest: labelOf(v) };
+    return yield* pickVersion(cat, cat.kind === "ok" && !exact ? (tagTarget(cat.distTags, spec) ?? spec) : spec);
   });
 
 const reviewResponse = (req: Request, caller: Caller, name: string, version: string | undefined, settings: ReviewSettings) =>
   Effect.gen(function* () {
-    const got = yield* resolveVersion(name, version);
+    const got = yield* resolveListed(name, version);
     const v = got.version;
     const viewer = yield* viewerOf(req, caller);
     let role: "admin" | "maintainer" | "public" = "public";
 
     if (isAdmin(viewer, settings)) role = "admin";
     else if (yield* isMaintainer(viewer, name)) role = "maintainer";
-    const stored = got.digest ? yield* reviewFor(name, v.version, got.digest) : null;
+    const found = got.digest ? yield* reviewAndJob(name, v.version, got.digest) : null;
+    const stored = found?.review ?? null;
     const redacted = isWithheld(v.status);
     const review = stored && redacted ? withheldReview(stored) : stored;
-    const job = got.digest ? yield* jobByKey(name, v.version, got.digest) : null;
+    const job = found?.job ?? null;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 
     // a waiting job comes first: a retry after no answer is queued while the older result is still stored, and the

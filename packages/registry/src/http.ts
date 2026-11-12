@@ -75,6 +75,20 @@ export function withPrivacyHeaders(req: Request, res: Response): Response {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
+// The read answers the website's package page makes; each says where its time went (timing.ts).
+const TIMED_PATHS = ["/-/apm/v1/packages/", "/-/apm/v1/score/", "/-/apm/v1/review/", "/-/apm/v1/readme/", "/-/apm/v1/file/"];
+
+/** Adds `Server-Timing` to a GET or HEAD of a TIMED_PATHS answer; any other answer is returned as it is. */
+export function withServerTiming(req: Request, res: Response, value: string): Response {
+  const { path } = routePath(new URL(req.url).pathname);
+
+  if ((req.method !== "GET" && req.method !== "HEAD") || !TIMED_PATHS.some((p) => path.startsWith(p))) return res;
+  const headers = new Headers(res.headers);
+  headers.set("server-timing", value);
+
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 export function failureResponse(f: HttpFailure): Response {
   return fail(f.status, f.error, f.extra ?? {});
 }

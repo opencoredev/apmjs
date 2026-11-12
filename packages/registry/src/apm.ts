@@ -39,7 +39,7 @@ import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { digestLabel, digestOf } from "./digest.ts";
-import { Store, type VersionRecord } from "./db.ts";
+import { Store, type PackageRecord, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, parseBody } from "./http.ts";
 import { DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
@@ -147,17 +147,17 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 // ---------- catalog: local or upstream ----------
 type Source =
-  | { kind: "local"; name: string; distTags: Record<string, string>; versions: VersionRecord[] }
+  | { kind: "local"; name: string; distTags: Record<string, string>; versions: VersionRecord[]; pkg: PackageRecord }
   | { kind: "upstream"; name: string; distTags: Record<string, string>; versions: VersionRecord[]; pkg: UpstreamPackage };
 
-const localSource = (name: string, distTags: Record<string, string>, versions: VersionRecord[]): Source => ({ kind: "local", name, distTags, versions });
+const localSource = (pkg: PackageRecord, versions: VersionRecord[]): Source => ({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions, pkg });
 const upstreamSource = (pkg: UpstreamPackage): Source => ({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions, pkg });
 
 const lookup = (name: string) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
-    if (pkg) return localSource(name, pkg.distTags, yield* versionsOf(name));
+    if (pkg) return localSource(pkg, yield* versionsOf(name));
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
@@ -173,7 +173,7 @@ const lookupOrUnknown = (name: string) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
-    if (pkg) return localSource(name, pkg.distTags, yield* versionsOf(name));
+    if (pkg) return localSource(pkg, yield* versionsOf(name));
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
@@ -841,7 +841,8 @@ const packageResponse = (name: string) =>
     const src = yield* lookup(name);
 
     if (!src) return fail(404, "Not found");
-    const local = src.kind === "local" ? yield* store.getPackage(name) : null;
+    // the row lookup read, so the answer and the versions come from one read of it
+    const local = src.kind === "local" ? src.pkg : null;
     const latest0 = src.versions.find((v) => v.version === src.distTags.latest) ?? null;
     const latest = latest0 ? yield* ensureAnalyzed(src, latest0) : null;
     const latestReport = latest ? reportFor(latest, at) : null;
@@ -886,18 +887,24 @@ const packageResponse = (name: string) =>
 /**
  * HEAD /-/apm/v1/packages/<name>: whether the registry knows the package, here or upstream, with no body. The website
  * asks before a package page renders. It reads the package row or npm's packument and nothing else: no answer is
- * built and no version is analysed. 503 when npm could not be asked.
+ * built, no version is analysed and no score is read. 503 when npm could not be asked.
  */
 const packageExists = (path: string) =>
   Effect.gen(function* () {
     const sp = splitPath(`/${path}`);
 
     if (!sp || sp.rest.length > 0) return new Response(null, { status: 404 });
-    const found = yield* lookupOrUnknown(sp.name);
 
-    if (found === "unknown") return new Response(null, { status: 503 });
+    if (yield* (yield* Store).getPackage(sp.name)) return new Response(null, { status: 200 });
+    const upstream = yield* upstreamOrNull;
 
-    return new Response(null, { status: found === null ? 404 : 200 });
+    if (!upstream) return new Response(null, { status: 404 });
+    // the listing alone: whether npm has the name needs neither apm's scores nor its dismissals
+    const listed = yield* upstream.listing(sp.name);
+
+    if (listed.kind === "unknown") return new Response(null, { status: 503 });
+
+    return new Response(null, { status: listed.kind === "absent" ? 404 : 200 });
   });
 
 const eventsResponse = (name: string) =>

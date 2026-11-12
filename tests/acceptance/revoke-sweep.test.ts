@@ -359,7 +359,7 @@ function probes(): Probe[] {
     ...files,
     ...VERSIONS.map((v) => v1(`readme/${NAME}/${v}`, ['files.ts: "/-/apm/v1/readme/"'])),
     // the AI review (review.ts) and evidence (evidence.ts)
-    ...VERSIONS.map((v) => v1(`review/${NAME}/${v}`, ['review.ts: "/-/apm/v1/review/"', 'review.ts: "/-/apm/v1/review"'])),
+    ...specs.map((s) => v1(`review/${NAME}/${s}`, ['review.ts: "/-/apm/v1/review/"', 'review.ts: "/-/apm/v1/review"'])),
     v1("review-admin/queue", ['review.ts: "/-/apm/v1/review-admin/queue"']),
     v1("review-jobs?max=5", ['review.ts: "/-/apm/v1/review-jobs"']),
     v1("evidence-admin/me", ['evidence.ts: "/-/apm/v1/evidence-admin/me"']),

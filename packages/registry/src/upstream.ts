@@ -8,6 +8,7 @@ import { Store, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
 import { readCapped } from "./http.ts";
+import { timingOrNull } from "./timing.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -100,6 +101,9 @@ type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<Versio
 
 type CachedProbe = { kind: "found"; pkg: CachedPackage } | { kind: "absent" };
 
+/** The package as npm lists it, without apm's scores: what a route needs that reads only versions and checksums. */
+export type UpstreamListing = CachedProbe | { kind: "unknown" };
+
 /** How long an upstream answer is trusted before it is fetched again. */
 export const DEFAULT_TTL_MS = 60_000;
 const MAX_ENTRIES = 500;
@@ -189,6 +193,8 @@ export type UpstreamApi = {
   /** Whether `@scope` has packages upstream. */
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
   readonly probe: (name: string) => Effect.Effect<Probe, StoreError>;
+  /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
+  readonly listing: (name: string) => Effect.Effect<UpstreamListing>;
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   readonly get: (name: string) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
@@ -212,6 +218,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
       Effect.gen(function* () {
         const store = yield* Store;
         const blobs = yield* Blobs;
+        const timing = yield* timingOrNull;
         const caches = cachesFor(baseUrl, ttlMs);
         /** The only origins tarballs are fetched from, on every redirect hop. */
         const origins: ReadonlySet<string> = new Set([new URL(baseUrl).origin, NPM_ORIGIN]);
@@ -327,27 +334,32 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             try: async (): Promise<{ status: number; body: unknown; fetchedAt: number }> => {
               const key = packumentKey(url);
               const shared = sharing ? workerCache() : null;
+              const cacheStart = performance.now();
               const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
               // a copy with no time (written before copies carried one) or past its TTL is not used
               const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
               if (hit && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
                 const body: unknown = JSON.parse(await hit.text());
+                timing?.add("npm-cache", performance.now() - cacheStart);
 
                 return { status: 200, body, fetchedAt: sentAt };
               }
 
               await hit?.body?.cancel();
+              const npmStart = performance.now();
               const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
 
               if (res.status !== 200) {
                 await res.body?.cancel();
+                timing?.add("npm", performance.now() - npmStart);
 
                 return { status: res.status, body: null, fetchedAt: now };
               }
 
               const text = await res.text();
               const body: unknown = JSON.parse(text);
+              timing?.add("npm", performance.now() - npmStart);
 
               if (shared && background) {
                 const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(now) };
@@ -425,23 +437,28 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now })),
           );
 
-        const probe = (name: string): Effect.Effect<Probe, StoreError> =>
+        const listing = (name: string): Effect.Effect<UpstreamListing> =>
           Effect.gen(function* () {
             const t = yield* now;
-            let cached = caches.probes.get(name, t);
+            const cached = caches.probes.get(name, t);
 
-            if (cached === undefined) {
-              const { probe: fresh, fetchedAt } = yield* fetchPackage(name, t);
+            if (cached !== undefined) return cached;
+            const { probe: fresh, fetchedAt } = yield* fetchPackage(name, t);
 
-              if (fresh.kind === "unknown") return fresh;
-              // the TTL counts from when npm answered, which for a shared copy is before this request
-              caches.probes.set(name, fresh, fetchedAt);
-              cached = fresh;
+            if (fresh.kind === "unknown") return fresh;
+            // the TTL counts from when npm answered, which for a shared copy is before this request
+            caches.probes.set(name, fresh, fetchedAt);
 
-              if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
-            }
+            if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
 
-            if (cached.kind === "absent") return cached;
+            return fresh;
+          });
+
+        const probe = (name: string): Effect.Effect<Probe, StoreError> =>
+          Effect.gen(function* () {
+            const cached = yield* listing(name);
+
+            if (cached.kind !== "found") return cached;
             const scores = yield* store.upstreamAnalyses(name);
             const pkg = cached.pkg;
 
@@ -500,6 +517,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return answer;
             }),
           probe,
+          listing,
           get: (name) => Effect.map(probe(name), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {

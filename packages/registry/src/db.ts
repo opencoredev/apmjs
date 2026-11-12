@@ -10,6 +10,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { digestLabel, digestOf } from "./digest.ts";
 import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
 import { StoreError } from "./errors.ts";
+import { timed, timingOrNull } from "./timing.ts";
 
 export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
 
@@ -429,9 +430,11 @@ const count = z.array(z.unknown()).transform((rows) => rows.length);
 
 const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const timeQuery = timed(yield* timingOrNull, "db");
 
   const run = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
     effect.pipe(
+      timeQuery,
       Effect.mapError((cause) => new StoreError({ operation, cause })),
       Effect.flatMap((rows) => {
         const parsed = schema.safeParse(rows);
@@ -756,15 +759,20 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         all(VersionRow),
       ).pipe(Effect.flatMap(withDismissals)),
 
+    // the analyses and the package's live dismissals in one round trip: every read of an upstream package's scores
+    // (the package, score, file and readme answers) waits on it
     upstreamAnalyses: (name) =>
       Effect.gen(function* () {
         const rows = yield* run(
           "upstreamAnalyses",
-          sql`SELECT version, digest, analysis FROM upstream_analysis WHERE package = ${name} AND scorer = ${SCORER}`,
-          all(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
+          sql`WITH d AS (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb) AS list
+                         FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL)
+              SELECT u.version, u.digest, u.analysis, d.list AS dismissals FROM upstream_analysis u CROSS JOIN d
+              WHERE u.package = ${name} AND u.scorer = ${SCORER}`,
+          all(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown(), dismissals: z.array(DismissalRow) })),
         );
 
-        const dismissals = rows.length === 0 ? [] : yield* dismissalsOf([name]);
+        const dismissals = rows[0]?.dismissals ?? [];
 
         return new Map(rows.map((row) => [`${row.version} ${row.digest}`, withList(row.analysis, dismissalsFor(dismissals, row.version, row.digest))]));
       }),
