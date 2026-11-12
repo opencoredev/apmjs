@@ -100,7 +100,7 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
                 <span className="font-mono">{s.id}</span> <span className="text-inverse-muted">{s.label}</span>
               </div>
               {s.evidence.slice(0, 3).map((ev) => (
-                <div key={ev} className="mt-2 truncate border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted" title={ev}>
+                <div key={ev} className="mt-2 border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted [overflow-wrap:anywhere]">
                   {ev}
                 </div>
               ))}
