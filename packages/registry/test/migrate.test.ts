@@ -34,7 +34,7 @@ test("concurrent migration runs apply each migration once and both succeed", asy
   }
 });
 
-const RECENT_INDEX = "0008_upstream_analysis_recent";
+const RECENT_INDEX = "0009_upstream_analysis_recent";
 
 async function connect(url: string): Promise<Client> {
   const c = new Client({ connectionString: url });
@@ -43,8 +43,8 @@ async function connect(url: string): Promise<Client> {
   return c;
 }
 
-/** A database with every migration applied but 0008, as production was before it. */
-async function before0008(): Promise<{ url: string; drop: () => Promise<void> }> {
+/** A database with every migration applied but 0009, as production was before it. */
+async function before0009(): Promise<{ url: string; drop: () => Promise<void> }> {
   const db = await emptyDatabase();
   await migrate(db.url);
   const c = await connect(db.url);
@@ -64,8 +64,8 @@ const insertAnalysis = (c: Client, pkg: string) =>
 
 // Review item 8: a plain CREATE INDEX inside the migration's transaction takes a SHARE lock on upstream_analysis. While it
 // waits behind a long write, every later write queues behind it, so a deploy stalls the registry's scoring.
-test("migration 0008 builds its index without blocking writes to upstream_analysis", async () => {
-  const db = await before0008();
+test("migration 0009 builds its index without blocking writes to upstream_analysis", async () => {
+  const db = await before0009();
   const holder = await connect(db.url);
   const writer = await connect(db.url);
 
@@ -90,8 +90,8 @@ test("migration 0008 builds its index without blocking writes to upstream_analys
   }
 }, 30_000);
 
-test("migration 0008 gives up after its lock_timeout instead of waiting on a long transaction, and a retry finishes it", async () => {
-  const db = await before0008();
+test("migration 0009 gives up after its lock_timeout instead of waiting on a long transaction, and a retry finishes it", async () => {
+  const db = await before0009();
   const holder = await connect(db.url);
 
   try {

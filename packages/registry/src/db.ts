@@ -902,7 +902,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             sql`SELECT * FROM events WHERE kind = ANY(${kinds}) AND NOT (actor = ANY(${hidden.actors})) AND NOT (split_part(package, '/', 1) || '/' = ANY(${hidden.scopes})) ORDER BY at DESC, id DESC LIMIT ${limit}`,
             all(EventRow),
           ),
-    // the inner LIMIT walks the analyzed_at index (migration 0008); grouping only that window keeps it cheap
+    // the inner LIMIT walks the analyzed_at index (migration 0009); grouping only that window keeps it cheap
     recentlyScored: (limit) =>
       run(
         "recentlyScored",
