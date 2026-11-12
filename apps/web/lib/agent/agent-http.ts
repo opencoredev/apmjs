@@ -4,8 +4,8 @@
 // What an agent acts on must not outlive a change of state: a yank, a revoke or a confirmed AI review shows at once.
 // The verdict and the MCP answers are never stored. The Markdown view quotes source (evidence lines, the AI review's
 // excerpts), and the registry alone decides, on every request, whether a version's source may be shown: so the view is
-// never stored either, by the site, the edge or a shared cache. Only the OG image, which carries no source, is kept
-// for a few seconds.
+// never stored either, by the site, the edge or a shared cache. Only the OG image, which carries no source and no text
+// the publisher wrote (components/og-card.tsx), is kept for a few seconds.
 import type { Take } from "../rate-limit";
 import { packagePath } from "../package-route";
 import { explainFor, parsePackageSpec } from "./explain";
@@ -19,7 +19,7 @@ export const AGENT_CACHE = {
   decision: "no-store",
   /** The package Markdown view: it can quote a version's source, so nothing may keep it. */
   source: "private, no-store",
-  /** The OG image: the score and status, no source; a few seconds, so a status change shows almost at once. */
+  /** The OG image: the name, latest version, score and grade, no source and no publisher text; a few seconds, so a status change shows almost at once. */
   image: "public, max-age=5",
 } as const;
 
