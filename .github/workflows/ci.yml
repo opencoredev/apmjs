@@ -27,7 +27,10 @@ jobs:
       - name: Lint (Oxlint with anti-slop and @shadcn/lint, against lint-baseline.json)
         run: bun run lint
       - name: Vendored anti-slop rule tests
-        run: for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
+        # The CLI rule test spawns `pnpm exec oxlint`; pnpm is a repo devDependency, so put node_modules/.bin on PATH.
+        run: |
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Unit tests
         run: bun test packages/cli/test
       - name: Typecheck web (route types come from next typegen)
