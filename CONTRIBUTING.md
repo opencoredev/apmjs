@@ -8,6 +8,7 @@ You need Bun 1.4 or newer, plus Node with npm for the acceptance tests. pnpm is 
 bun install
 bun scripts/score.ts           # acceptance suite; the last line is the number of failing tests
 bunx tsc --noEmit -p .         # typecheck the packages
+bun run lint                   # Oxlint, anti-slop and @shadcn/lint; see docs/LINT.md
 cd apps/web && bunx tsc --noEmit
 ```
 

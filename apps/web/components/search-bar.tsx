@@ -14,14 +14,18 @@ export function SearchBar() {
 
   useEffect(() => {
     if (onHome) return;
+
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
       const el = document.activeElement;
+
       if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || (el instanceof HTMLElement && el.isContentEditable)) return;
       e.preventDefault();
       inputRef.current?.focus();
     };
+
     window.addEventListener("keydown", onKey);
+
     return () => window.removeEventListener("keydown", onKey);
   }, [onHome]);
 

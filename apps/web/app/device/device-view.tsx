@@ -22,6 +22,7 @@ const DeviceInfo = z.object({ user_code: z.string(), status: z.string() });
 function clean(code: string): string {
   return code.toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
+
 function pretty(code: string): string {
   return code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
 }
@@ -35,12 +36,16 @@ export function DeviceView() {
 
   async function open(code: string) {
     const a = await call("account", Account);
+
     if (a.kind === "signed-out") return setState({ kind: "signed-out" });
+
     if (a.kind === "error") return setState({ kind: "error", message: a.message });
     // Opening the code while signed in ties it to this browser's session.
     const res = await fetch(`/api/auth/device?user_code=${encodeURIComponent(code)}`, { credentials: "same-origin" });
     const info = DeviceInfo.safeParse(await res.json().catch(() => null));
+
     if (!res.ok || !info.success) return setState({ kind: "error", message: "That code is not valid or has expired. Run apm login again for a new one." });
+
     if (info.data.status !== "pending") return setState({ kind: "error", message: "That code was already used. Run apm login again for a new one." });
     setState({ kind: "confirm", code, account: a.value });
   }
@@ -57,12 +62,15 @@ export function DeviceView() {
     setBusy(true);
     const r = await authPost(approve ? "device/approve" : "device/deny", { userCode: state.code });
     setBusy(false);
+
     if (!r.ok) return setState({ kind: "error", message: r.message });
     setState({ kind: "done", approved: approve });
   }
 
   const back = `/device${fromUrl ? `?code=${fromUrl}` : ""}`;
+
   if (state.kind === "loading") return <div className="h-64 w-full max-w-md animate-pulse rounded-2xl bg-muted" />;
+
   if (state.kind === "signed-out") {
     return (
       <SignInPanel next={back} title="Sign in to log in the CLI">
@@ -78,6 +86,7 @@ export function DeviceView() {
       </SignInPanel>
     );
   }
+
   return (
     <section className="flex w-full max-w-md flex-col gap-5 rounded-2xl border p-6 sm:p-8">
       {state.kind === "enter" && (
@@ -85,6 +94,7 @@ export function DeviceView() {
           onSubmit={(e) => {
             e.preventDefault();
             const c = clean(typed);
+
             if (c.length >= 6) {
               setState({ kind: "loading" });
               void open(c);

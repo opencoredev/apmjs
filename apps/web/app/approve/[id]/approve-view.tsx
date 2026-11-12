@@ -45,6 +45,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     setError(null);
     const r = await call(`staged/${s.id}/approve`, Decided, { method: "POST", body });
     setBusy(null);
+
     if (r.kind === "ok") return onDecided(r.value.status);
     setError(r.kind === "error" ? r.message : "Sign in again.");
   }
@@ -53,10 +54,13 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     setBusy("passkey");
     setError(null);
     const p = await authClient().signIn.passkey();
+
     if (p.error) {
       setBusy(null);
+
       return setError(p.error.message ?? "The passkey check did not finish.");
     }
+
     await approve({}, "passkey");
   }
 
@@ -64,6 +68,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     setBusy("reject");
     const r = await call(`staged/${s.id}/reject`, Decided, { method: "POST", body: {} });
     setBusy(null);
+
     if (r.kind === "ok") return onDecided("rejected");
     setError(r.kind === "error" ? r.message : "Sign in again.");
   }
@@ -79,6 +84,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
       </p>
     );
   }
+
   return (
     <div className="flex flex-col gap-4 rounded-2xl border p-5 sm:p-6">
       <div className="flex flex-col gap-1">
@@ -90,6 +96,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
       <form
         onSubmit={(e) => {
           e.preventDefault();
+
           if (!/^\d{6}$/.test(code)) return setError("Enter the 6-digit code your app shows.");
           void approve({ code }, "code");
         }}
@@ -140,9 +147,13 @@ export function ApproveView() {
 
   const load = useCallback(async () => {
     const [s, a, c] = await Promise.all([call(`staged/${encodeURIComponent(id)}`, StagedDetail), call("account", Account), call("auth/config", AuthConfig)]);
+
     if (s.kind === "signed-out" || a.kind === "signed-out") return setState({ kind: "signed-out" });
+
     if (s.kind === "error") return setState({ kind: "error", message: s.message });
+
     if (a.kind === "error") return setState({ kind: "error", message: a.message });
+
     if (c.kind !== "ok") return setState({ kind: "error", message: "Could not load sign-in options." });
     setState({ kind: "ok", staged: s.value, account: a.value, config: c.value });
   }, [id]);
@@ -152,6 +163,7 @@ export function ApproveView() {
   }, [load]);
 
   if (state.kind === "loading") return <div className="h-96 animate-pulse rounded-2xl bg-muted" />;
+
   if (state.kind === "signed-out") {
     return (
       <SignInPanel next={`/approve/${id}`} title="Sign in to review this version">
@@ -159,6 +171,7 @@ export function ApproveView() {
       </SignInPanel>
     );
   }
+
   if (state.kind === "error") {
     return (
       <div className="flex max-w-xl flex-col gap-3">
@@ -170,6 +183,7 @@ export function ApproveView() {
       </div>
     );
   }
+
   if (state.kind === "decided") {
     return (
       <div className="flex max-w-xl flex-col gap-3">

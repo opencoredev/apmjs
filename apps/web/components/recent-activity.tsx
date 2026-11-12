@@ -17,6 +17,7 @@ const KIND = {
 function Row({ e, now }: { e: RecentEvent; now: number }) {
   const k = KIND[e.kind];
   const scope = e.package.startsWith("@") ? e.package.slice(0, e.package.indexOf("/") + 1) : "";
+
   return (
     <li className="border-b">
       <Link href={`/package/${e.package}`} prefetch={false} className="-mx-3 flex min-h-14 items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-surface sm:gap-4">
@@ -45,6 +46,7 @@ function Row({ e, now }: { e: RecentEvent; now: number }) {
 export async function RecentActivity() {
   const events = await getRecent(8);
   const now = Date.now();
+
   return (
     <section aria-labelledby="recent">
       <h2 id="recent" className="mb-2 text-[15px] font-medium">

@@ -24,6 +24,10 @@ jobs:
           node-version: 22
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit -p .
+      - name: Lint (Oxlint with anti-slop and @shadcn/lint, against lint-baseline.json)
+        run: bun run lint
+      - name: Vendored anti-slop rule tests
+        run: for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web

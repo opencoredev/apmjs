@@ -45,11 +45,14 @@ function TotpSetup({ onDone }: { onDone: () => void }) {
     setError(null);
     const r = await authPost("two-factor/enable", {});
     const uri = z.object({ totpURI: z.string() }).safeParse(r.body);
+
     if (!r.ok || !uri.success) {
       setError(r.message);
       setBusy(false);
+
       return;
     }
+
     const secret = new URL(uri.data.totpURI).searchParams.get("secret") ?? "";
     const qr = await QRCode.toDataURL(uri.data.totpURI, { margin: 1, width: 200 });
     setStep({ kind: "scan", uri: uri.data.totpURI, secret, qr });
@@ -58,11 +61,13 @@ function TotpSetup({ onDone }: { onDone: () => void }) {
 
   async function confirm(e: React.FormEvent) {
     e.preventDefault();
+
     if (!SixDigits.test(code)) return setError("Enter the 6-digit code your app shows.");
     setBusy(true);
     setError(null);
     const r = await authPost("two-factor/verify-totp", { code });
     setBusy(false);
+
     if (!r.ok) return setError("That code did not match. Check the time on your phone and try the next code.");
     onDone();
   }
@@ -77,9 +82,10 @@ function TotpSetup({ onDone }: { onDone: () => void }) {
       </div>
     );
   }
+
   return (
     <form onSubmit={(e) => void confirm(e)} className="flex flex-col gap-4 rounded-xl bg-surface p-4 sm:flex-row sm:items-start sm:gap-6">
-      {/* eslint-disable-next-line @next/next/no-img-element -- a data URL made in the browser */}
+      {/* eslint-disable-next-line @next/next/no-img-element, shadcn/no-raw-colors -- a data URL made in the browser; a QR code needs a white quiet zone to scan in dark mode */}
       <img src={step.qr} alt="QR code for your authenticator app" width={160} height={160} className="size-40 shrink-0 rounded-lg bg-white p-1" />
       <div className="flex min-w-0 flex-col gap-3">
         <p className="text-sm leading-6 text-muted-foreground">Scan this with an authenticator app (1Password, Google Authenticator, Authy). Or enter the key by hand:</p>
@@ -106,11 +112,13 @@ function StepUp({ account, config, onDone }: { account: Account; config: AuthCon
 
   async function withCode(e: React.FormEvent) {
     e.preventDefault();
+
     if (!SixDigits.test(code)) return setError("Enter the 6-digit code your app shows.");
     setBusy(true);
     setError(null);
     const r = await call("verify", z.object({ ok: z.boolean() }), { method: "POST", body: { code } });
     setBusy(false);
+
     if (r.kind !== "ok") return setError(r.kind === "error" ? r.message : "Sign in again.");
     setCode("");
     onDone();
@@ -121,13 +129,16 @@ function StepUp({ account, config, onDone }: { account: Account; config: AuthCon
     setError(null);
     const r = await authClient().signIn.passkey();
     setBusy(false);
+
     if (r.error) return setError(r.error.message ?? "The passkey check did not finish.");
     onDone();
   }
 
   const canTotp = account.security.totp;
   const canPasskey = account.security.passkeys > 0 && config.passkeys;
+
   if (!canTotp && !canPasskey) return <p className="text-sm text-muted-foreground">Set up 2FA or a passkey first.</p>;
+
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm leading-6 text-muted-foreground">
@@ -168,8 +179,11 @@ export function AccountView() {
 
   const load = useCallback(async () => {
     const [a, c] = await Promise.all([call("account", Account), call("auth/config", AuthConfig)]);
+
     if (a.kind === "signed-out") return setState({ kind: "signed-out" });
+
     if (a.kind === "error") return setState({ kind: "error", message: a.message });
+
     if (c.kind !== "ok") return setState({ kind: "error", message: c.kind === "error" ? c.message : "Could not load sign-in options." });
     setState({ kind: "ok", account: a.value, config: c.value });
   }, []);
@@ -179,7 +193,9 @@ export function AccountView() {
   }, [load]);
 
   if (state.kind === "loading") return <div className="h-96 animate-pulse rounded-2xl bg-muted" />;
+
   if (state.kind === "signed-out") return <SignInPanel next="/account" />;
+
   if (state.kind === "error") return <p className="text-bad">{state.message}</p>;
   const { account: a, config } = state;
 
@@ -192,6 +208,7 @@ export function AccountView() {
   async function addPasskey() {
     setNote(null);
     const r = await authClient().passkey.addPasskey({ name: `apm ${new Date().toLocaleDateString()}` });
+
     if (r?.error) setNote(r.error.message ?? "The passkey was not added.");
     await load();
   }
@@ -312,6 +329,7 @@ export function AccountView() {
           <ul className="flex flex-col divide-y rounded-xl border">
             {a.tokens.map((t) => {
               const revoked = t.revokedAt !== null;
+
               return (
                 <li key={t.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3">
                   <div className="flex min-w-0 flex-1 flex-col">

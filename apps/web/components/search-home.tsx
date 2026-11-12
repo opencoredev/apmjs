@@ -23,6 +23,7 @@ import {
 
 const SEARCH_DEBOUNCE_MS = 30;
 const NAME_CHECK_DEBOUNCE_MS = 250;
+
 /** Errors and answers made without npm are only reused this long, so a retype after an outage asks again. */
 const DEGRADED_TTL_MS = 5_000;
 
@@ -41,6 +42,7 @@ function packageHref(name: string): string {
 // ---------- data ----------
 
 type SearchDone = { kind: "ok"; answer: SearchAnswer } | { kind: "error" };
+
 type Stored<T> = { value: T; at: number; degraded: boolean };
 
 function fresh<T>(entry: Stored<T> | undefined): boolean {
@@ -55,19 +57,24 @@ function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: str
   useEffect(() => {
     if (have) return;
     const ctrl = new AbortController();
+
     const timer = setTimeout(async () => {
       let result: SearchDone = { kind: "error" };
+
       try {
         const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal: ctrl.signal });
         const parsed = SearchAnswer.safeParse(await res.json());
+
         if (res.ok && parsed.success) result = { kind: "ok", answer: parsed.data };
       } catch {
         if (ctrl.signal.aborted) return;
       }
+
       const degraded = result.kind === "error" || result.answer.upstreamFailed;
       setDone((prev) => new Map(prev).set(q, { value: result, at: Date.now(), degraded }));
       setShownQuery(q);
     }, SEARCH_DEBOUNCE_MS);
+
     return () => {
       clearTimeout(timer);
       ctrl.abort();
@@ -75,12 +82,15 @@ function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: str
   }, [q, have]);
 
   const current = (done.get(q) ?? done.get(shownQuery))?.value ?? null;
+
   const retry = () =>
     setDone((prev) => {
       const next = new Map(prev);
       next.delete(q);
+
       return next;
     });
+
   return { current, shownQuery: done.has(q) ? q : shownQuery, pending: !have, retry };
 }
 
@@ -93,17 +103,22 @@ function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P
   useEffect(() => {
     if (q === null || have) return;
     const ctrl = new AbortController();
+
     const timer = setTimeout(async () => {
       let result: PartState<P> = { kind: "error" };
+
       try {
         const res = await fetch(`/api/names?q=${encodeURIComponent(q)}&part=${part}`, { signal: ctrl.signal });
         const parsed = NAME_PART_SCHEMAS[part].safeParse(await res.json());
+
         if (res.ok && parsed.success) result = { kind: "ok", data: parsed.data };
       } catch {
         if (ctrl.signal.aborted) return;
       }
+
       setDone((prev) => new Map(prev).set(q, { value: result, at: Date.now(), degraded: result.kind === "error" }));
     }, NAME_CHECK_DEBOUNCE_MS);
+
     return () => {
       clearTimeout(timer);
       ctrl.abort();
@@ -117,7 +132,9 @@ function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P
 
 function Highlight({ name, q, className }: { name: string; q: string; className?: string }) {
   const i = q ? name.indexOf(q) : -1;
+
   if (i < 0) return <span className={cn("truncate font-mono", className)}>{name}</span>;
+
   return (
     <span className={cn("truncate font-mono text-muted-foreground", className)}>
       {name.slice(0, i)}
@@ -142,8 +159,10 @@ function SourceTag({ source }: { source: SearchHit["source"] }) {
 const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
 
 type StatusKind = "free" | "taken" | "warn" | "wait";
+
 function Status({ kind, children }: { kind: StatusKind; children: ReactNode }) {
   const tone = kind === "free" ? "text-ok" : kind === "warn" ? "text-warn" : "text-muted-foreground";
+
   return (
     <span className={cn("inline-flex shrink-0 items-center gap-1.5 text-sm font-medium", tone)}>
       {kind === "wait" ? (
@@ -176,7 +195,9 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
       <span className="mt-2 flex min-h-[3.25rem] min-w-0 flex-col gap-1.5">{children}</span>
     </>
   );
+
   const base = "flex min-w-0 flex-col px-4 py-3.5";
+
   return href ? (
     <Link href={href} prefetch={false} className={cn("group transition-colors hover:bg-surface focus-visible:bg-surface", base)}>
       {body}
@@ -188,8 +209,10 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
 
 function ExactStatus({ state }: { state: PartState<"exact"> }) {
   if (state.kind === "loading") return <Status kind="wait">checking</Status>;
+
   if (state.kind === "error") return <Status kind="warn">couldn&apos;t check</Status>;
   const data = state.data;
+
   if (data.taken) {
     return (
       <>
@@ -198,13 +221,17 @@ function ExactStatus({ state }: { state: PartState<"exact"> }) {
       </>
     );
   }
+
   if (data.unknown) return <Status kind="warn">couldn&apos;t check npm</Status>;
+
   if (data.available) return <Status kind="free">available</Status>;
+
   return <Status kind="warn">{data.valid ? "blocked: too close to a popular name" : "invalid"}</Status>;
 }
 
 function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
   const data = state.kind === "ok" ? state.data : null;
+
   return (
     <Slot label="Exact name" href={data?.taken ? packageHref(q) : undefined}>
       <Highlight name={q} q="" className="text-lg font-medium" />
@@ -218,6 +245,7 @@ function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
 
 function ScopeSlot({ q }: { q: string }) {
   const bare = q.startsWith("@") ? q.slice(q.indexOf("/") + 1) : q;
+
   return (
     <Slot label="Under your scope">
       <span className="truncate font-mono text-[15px] text-muted-foreground">@you/{bare}</span>
@@ -228,6 +256,7 @@ function ScopeSlot({ q }: { q: string }) {
 
 function LookalikeSlot({ state }: { state: PartState<"lookalike"> }) {
   const nearest = state.kind === "ok" ? (state.data.lookalikes[0] ?? state.data.similar[0]) : undefined;
+
   return (
     <Slot label="Look-alike" href={nearest ? packageHref(nearest.name) : undefined}>
       {state.kind === "loading" ? (
@@ -257,6 +286,7 @@ function LookalikeSlot({ state }: { state: PartState<"lookalike"> }) {
 
 function AlternativesSlot({ state }: { state: PartState<"alternatives"> }) {
   const free = state.kind === "ok" ? state.data.suggestions.filter((s) => !s.name.startsWith("@") && s.available).slice(0, 4) : [];
+
   return (
     <Slot label="Free alternatives">
       {state.kind === "loading" ? (
@@ -381,12 +411,15 @@ function Results({
       Try again
     </button>
   );
+
   if (done.kind === "error") {
     return <p className="border-t py-6 text-muted-foreground">The registry didn&apos;t answer. {again}</p>;
   }
+
   const { hits, total, upstreamFailed } = done.answer;
   // Keep the score column only when something in this answer has a stored score.
   const reserveScore = hits.some((h) => h.score !== null);
+
   return (
     <section aria-label="Search results" className="min-w-0">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-sm text-muted-foreground">
@@ -440,6 +473,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
   const setActive = (index: number) => setSelection({ query: shownQuery, index });
   const showName = q !== "" && looksLikePackageName(q);
   const nameQuery = showName ? q : null;
+
   const names: NameStates = {
     exact: useNamePart(nameQuery, "exact"),
     lookalike: useNamePart(nameQuery, "lookalike"),
@@ -450,6 +484,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
   useEffect(() => {
     const initial = new URLSearchParams(window.location.search).get("q") ?? "";
     delete document.documentElement.dataset.q;
+
     if (initial) setValue(initial);
   }, []);
 
@@ -457,14 +492,18 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     const onKey = (e: KeyboardEvent) => {
       if ((e.key !== "/" && e.key !== "Escape") || e.metaKey || e.ctrlKey || e.altKey) return;
       const el = document.activeElement;
+
       if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || (el instanceof HTMLElement && el.isContentEditable)) return;
       e.preventDefault();
+
       // Esc clears from anywhere on the page (focus can sit on the body after back navigation).
       if (e.key === "Escape") clearRef.current();
       inputRef.current?.focus();
       inputRef.current?.select();
     };
+
     window.addEventListener("keydown", onKey);
+
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
@@ -475,10 +514,13 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
   function update(next: string) {
     setValue(next);
+
     if (normalize(next) === "") setSelection({ query: "", index: -1 });
     const url = urlFor(normalize(next));
+
     if (url !== `${window.location.pathname}${window.location.search}`) window.history.replaceState(null, "", url);
   }
+
   const clearRef = useRef(() => update(""));
   useEffect(() => {
     clearRef.current = () => update("");
@@ -493,6 +535,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
       setActive(next < -1 ? hits.length - 1 : next >= hits.length ? hits.length - 1 : next);
     } else if (e.key === "Enter") {
       const hit = hits[active >= 0 ? active : 0];
+
       if (!hit) return;
       e.preventDefault();
       router.push(packageHref(hit.name));

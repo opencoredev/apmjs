@@ -54,6 +54,7 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
   const notes = score.signals.filter((s) => s.points >= 0);
   const notChecked = score.notChecked ?? [];
   const pointsLost = lost.reduce((n, s) => n - s.points, 0);
+
   return (
     <div className="overflow-hidden rounded-2xl bg-inverse text-inverse-foreground">
       <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-5 px-5 pt-5 pb-6 sm:px-6">
@@ -125,11 +126,14 @@ function ScorePanel({ score, version }: { score: NonNullable<PackageInfo["score"
 function describe(e: PackageEvent): string {
   const field = (k: string): string => {
     const val: unknown = typeof e.detail === "object" && e.detail !== null ? Reflect.get(e.detail, k) : undefined;
+
     return typeof val === "string" ? val : "";
   };
+
   const v = field("version");
   const why = field("reason") || field("message");
   const reason = why ? `: ${why}` : "";
+
   switch (e.kind) {
     case "publish":
       return `published ${v}`;
@@ -193,6 +197,7 @@ async function PackageContent({ params }: { params: Promise<{ name: string[] }> 
   const parts = (await params).name.map(decodeURIComponent);
   const name = parts.join("/");
   const pkg = await getPackage(name);
+
   if (!pkg) notFound();
   const events = pkg.source === "local" ? await getEvents(name) : [];
   const latest = pkg.versions.find((v) => v.version === pkg.latest);

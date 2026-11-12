@@ -12,6 +12,7 @@ type SectionId = (typeof SECTIONS)[number]["id"];
 
 function Block({ id, children, note }: { id: SectionId; children: React.ReactNode; note?: string }) {
   const title = SECTIONS.find((s) => s.id === id)?.title ?? id;
+
   return (
     <section aria-labelledby={id} className="border-t pt-8">
       <h2 id={id} className="scroll-mt-28 flex items-baseline gap-3 text-2xl font-medium tracking-tight">

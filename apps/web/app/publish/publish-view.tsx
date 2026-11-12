@@ -10,6 +10,7 @@ import { ExactPart, looksLikePackageName } from "@/lib/search-schema";
 import { cn } from "@/lib/utils";
 
 type State = { kind: "loading" } | { kind: "signed-out" } | { kind: "error"; message: string } | { kind: "ok"; account: Account; staged: StagedSummary[] };
+
 type Check = { kind: "idle" } | { kind: "checking" } | { kind: "invalid" } | { kind: "done"; answer: ExactPart } | { kind: "failed" };
 
 function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
@@ -35,9 +36,11 @@ function NameCheck({ scope }: { scope: string }) {
 
   useEffect(() => {
     if (bare === "") return setCheck({ kind: "idle" });
+
     if (!looksLikePackageName(full)) return setCheck({ kind: "invalid" });
     setCheck({ kind: "checking" });
     const ctrl = new AbortController();
+
     const t = setTimeout(() => {
       fetch(`/api/names?q=${encodeURIComponent(full)}&part=exact`, { signal: ctrl.signal })
         .then(async (r) => {
@@ -48,6 +51,7 @@ function NameCheck({ scope }: { scope: string }) {
           if (!ctrl.signal.aborted) setCheck({ kind: "failed" });
         });
     }, 200);
+
     return () => {
       clearTimeout(t);
       ctrl.abort();
@@ -55,11 +59,16 @@ function NameCheck({ scope }: { scope: string }) {
   }, [bare, full]);
 
   let line: { tone: "ok" | "bad" | "muted"; text: string } = { tone: "muted", text: "Lowercase letters, digits, dots, dashes and underscores." };
+
   if (check.kind === "checking") line = { tone: "muted", text: "Checking…" };
+
   if (check.kind === "invalid") line = { tone: "bad", text: "That is not a valid package name. Use lowercase letters, digits, dots, dashes and underscores." };
+
   if (check.kind === "failed") line = { tone: "bad", text: "Could not check the name right now. Try again in a moment." };
+
   if (check.kind === "done") {
     const a = check.answer;
+
     if (a.taken && a.owners.includes(scope)) line = { tone: "ok", text: `You already own ${full}${a.latest ? ` (latest ${a.latest.version})` : ""}. Publishing adds a new version.` };
     else if (a.taken) line = { tone: "bad", text: `${full} is taken${a.owners.length ? ` by ${a.owners.join(", ")}` : ""}.` };
     else line = { tone: "ok", text: `${full} is free. It is yours to publish.` };
@@ -95,12 +104,14 @@ export function PublishView() {
   useEffect(() => {
     void Promise.all([call("account", Account), call("staged", z.object({ staged: z.array(StagedSummary) }))]).then(([a, s]) => {
       if (a.kind === "signed-out") return setState({ kind: "signed-out" });
+
       if (a.kind === "error") return setState({ kind: "error", message: a.message });
       setState({ kind: "ok", account: a.value, staged: s.kind === "ok" ? s.value.staged : [] });
     });
   }, []);
 
   if (state.kind === "loading") return <div className="h-96 animate-pulse rounded-2xl bg-muted" />;
+
   if (state.kind === "signed-out") {
     return (
       <SignInPanel next="/publish" title="Sign in to publish">
@@ -108,6 +119,7 @@ export function PublishView() {
       </SignInPanel>
     );
   }
+
   if (state.kind === "error") return <p className="text-bad">{state.message}</p>;
   const { account: a, staged } = state;
   const scope = a.scope;

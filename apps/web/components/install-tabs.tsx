@@ -2,22 +2,29 @@
 
 import { useRef, useState } from "react";
 import { CopyIcon, CheckIcon } from "lucide-react";
+import { z } from "zod";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const CLIENTS = ["apm", "bun", "npm", "pnpm"] as const;
+
 type Client = (typeof CLIENTS)[number];
-const isClient = (v: unknown): v is Client => typeof v === "string" && (CLIENTS as readonly string[]).includes(v);
+
+const ClientSchema = z.enum(CLIENTS);
+
+const isClient = (v: unknown): v is Client => ClientSchema.safeParse(v).success;
 
 /** Clipboard API needs a secure context (HTTPS); fall back to a hidden textarea on plain HTTP. */
 async function copyText(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard) {
       await navigator.clipboard.writeText(text);
+
       return true;
     }
   } catch {
     // fall through to the textarea route
   }
+
   const ta = document.createElement("textarea");
   ta.value = text;
   ta.setAttribute("readonly", "");
@@ -26,12 +33,15 @@ async function copyText(text: string): Promise<boolean> {
   document.body.appendChild(ta);
   ta.select();
   let ok = false;
+
   try {
     ok = document.execCommand("copy");
   } catch {
     ok = false;
   }
+
   ta.remove();
+
   return ok;
 }
 
@@ -40,12 +50,14 @@ export function InstallTabs({ name, version }: { name: string; version: string |
   const [copied, setCopied] = useState<"yes" | "manual" | false>(false);
   const codeRef = useRef<HTMLElement>(null);
   const spec = version ? `${name}@${version}` : name;
+
   const cmd: Record<Client, string> = {
     apm: `apm add ${name}`,
     bun: `bun add ${spec}`,
     npm: `npm install ${spec}`,
     pnpm: `pnpm add ${spec}`,
   };
+
   return (
     <div className="rounded-xl bg-surface p-1.5">
       <div className="flex items-center justify-between gap-2 px-1.5 pt-0.5 pb-1.5">
@@ -77,6 +89,7 @@ export function InstallTabs({ name, version }: { name: string; version: string |
           onClick={() => {
             void copyText(cmd[client]).then((ok) => {
               setCopied(ok ? "yes" : "manual");
+
               if (!ok && codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
               setTimeout(() => setCopied(false), ok ? 1200 : 3000);
             });
