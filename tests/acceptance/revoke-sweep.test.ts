@@ -117,6 +117,13 @@ function marked(version: string): RawManifest {
 
 const CLEAN_MANIFEST: RawManifest = { name: NAME, version: CLEAN, description: "A clean version.", license: "MIT", main: "index.js", readme: "# clean" };
 
+/**
+ * A clean package whose range takes in every version of NAME, so resolving it walks into the marked versions while
+ * they are shown and must stop at them once they are withheld (tree.blocks, tree.uncheckedDeps, tree.reviews).
+ */
+const DEPENDENT = "sweep-dependent";
+const DEPENDENT_MANIFEST: RawManifest = { name: DEPENDENT, version: "1.0.0", description: "Depends on the fixture.", license: "MIT", main: "index.js", dependencies: { [NAME]: `>=${CLEAN}` } };
+
 /** Every path in the marked tarball, for the file routes. */
 const FILE_PATHS = ["package.json", ...Object.keys(FILES)];
 
@@ -190,8 +197,10 @@ const ALLOWED: readonly Allowed[] = [
       ["events", 200, /^events\.\d+\.detail\.reason$/],
       ["recent", 200, /^events\.\d+\.reason$/],
       ["package", 200, /^versions\.\d+\.statusReason$/],
+      ["versions", 200, /^statusReason$/],
       // the `revoked` signal's one evidence line is the reason (withheld.ts drops every other evidence line)
       ["score", 200, /^signals\.\d+\.evidence\.0$/],
+      ["versions", 200, /^score\.signals\.\d+\.evidence\.0$/],
       ["resolve", 422, /^newest\.report\.signals\.\d+\.evidence\.0$/],
       ["resolve", 422, /^skipped\.\d+\.revokeReason$/],
       ["resolve", 200, /^skipped\.\d+\.revokeReason$/],
@@ -402,6 +411,7 @@ beforeAll(async () => {
   if (!id) throw new Error(`no approval link: ${staged.status} ${JSON.stringify(staged.body)}`);
   stagedId = id;
   must("approve", await site.json(`-/apm/v1/staged/${stagedId}/approve`, { method: "POST", body: { code: totp(siteSecret) } }), 200);
+  must(`publish ${DEPENDENT}`, await putPublish(reg, owner, DEPENDENT_MANIFEST, { files: { "index.js": "module.exports = 3;\n" } }), 201);
 
   // the revoked version's deprecation message is the publisher's text, and lands in the package's log
   must(
@@ -517,6 +527,12 @@ function probes(): Probe[] {
     ...specs.map((s) => v1(`score/${NAME}/${s}`, "score", 200)),
     v1(`packages/${NAME}`, "package", 200),
     v1(`packages/${NAME}/events`, "events", 200),
+    ...VERSIONS.map((v) => v1(`packages/${NAME}/versions/${v}`, "versions", 200)),
+    v1(`popular-scores?names=${NAME},${DEPENDENT}`, "popular-scores", 200),
+    v1("recent-packages?limit=50", "recent-packages", 200),
+    // the dependency walk and the AI review standings of what it walked (tree.reviews); DEPENDENT is inside its cooldown
+    v1(`resolve?name=${DEPENDENT}`, "resolve", 422),
+    v1(`resolve?name=${DEPENDENT}&floor=0&cooldown=0`, "resolve", 200),
     // files and readmes (files.ts)
     ...files,
     // the clean version's tarball has no README file
@@ -598,6 +614,9 @@ describe("a revoked or revoke-pending version's text", () => {
     expect(showWrong(wrong)).toEqual([]);
     expect(show(hits.filter((h) => h.where.startsWith("header:")))).toEqual([]);
     const seen = new Set(hits.filter((h) => h.where !== "tarball").map((h) => h.marker));
+
+    // the dependent's walk reaches a marked version while it is shown, so the sweep would see it keep doing so
+    expect(hits.some((h) => h.url.includes(`resolve?name=${DEPENDENT}`) && h.where.startsWith("tree."))).toBe(true);
 
     // each kind of place a publisher writes reaches some answer while the version is active
     for (const m of [
@@ -804,6 +823,40 @@ describe("after the revoke, each answer keeps what was found", () => {
 
     expect(dig(score.body, "skipped")).toEqual(want);
     expect(dig(resolve.body, "newest", "report", "skipped")).toEqual(want);
+  });
+
+  test("the version answer: a withheld version's license and not-checked list are the score answer's, and no cache keeps it", async () => {
+    for (const version of [PENDING, REVOKED]) {
+      const res = await fetch(`${reg.url}-/apm/v1/packages/${NAME}/versions/${version}`);
+      const body: unknown = await res.json();
+      const score = await getJson(`${reg.url}-/apm/v1/score/${NAME}/${version}`);
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("private, no-store");
+      expect(dig(body, "score", "redacted")).toBe(true);
+      expect(dig(body, "facts")).toEqual(dig(score.body, "facts"));
+      expect(dig(body, "facts", "license")).toBeNull();
+      expect(dig(body, "score", "notChecked")).toEqual(dig(score.body, "notChecked"));
+      expect(dig(body, "score", "notChecked")).toContain("dependency dep-url: tarball URL: installs code from outside any registry");
+    }
+
+    const clean = await getJson(`${reg.url}-/apm/v1/packages/${NAME}/versions/${CLEAN}`);
+
+    expect(dig(clean.body, "score", "redacted")).toBe(false);
+    expect(dig(clean.body, "facts", "license")).toBe("MIT");
+  });
+
+  test("resolve walks a dependent into the clean version only, and its review standings name no withheld version", async () => {
+    const res = await getJson(`${reg.url}-/apm/v1/resolve?name=${DEPENDENT}&floor=0&cooldown=0`);
+    const walked = z.array(z.object({ name: z.string(), version: z.string() })).parse(dig(res.body, "tree", "packages"));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(walked).toEqual([{ name: NAME, version: CLEAN }]);
+    const reviews = z.record(z.string(), z.unknown()).parse(dig(res.body, "tree", "reviews"));
+
+    expect(reviews.kind).toBe("on");
+    expect(JSON.stringify(reviews)).not.toContain(PENDING);
+    expect(JSON.stringify(reviews)).not.toContain(REVOKED);
   });
 
   test("a revoke-pending version's manifest is refused like a revoked one's; its tarball stays for lockfiles", async () => {

@@ -1013,6 +1013,8 @@ const versionResponse = (name: string, version: string) =>
     if (!v0) return fail(404, `${name} has no version ${version}.`);
     const v = yield* ensureAnalyzed(src, v0);
     const report = reportFor(v, at);
+    // as on the score route: a withheld version's license and not-checked list are rebuilt without its manifest text
+    const free = report ? sourceFreeReport(v, report) : null;
 
     return json(
       {
@@ -1024,8 +1026,8 @@ const versionResponse = (name: string, version: string) =>
         deprecated: v.deprecated,
         publishedAt: new Date(v.published_at).toISOString(),
         publishedBy: v.published_by,
-        facts: report?.facts ?? null,
-        score: report ? { score: report.score, grade: report.grade, notChecked: report.notChecked, ...reviewable(v, report) } : null,
+        facts: free?.facts ?? null,
+        score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, ...reviewable(v, report) } : null,
       },
       200,
       // its score quotes the version's source, so no shared cache may keep it
