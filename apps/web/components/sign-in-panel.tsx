@@ -37,6 +37,7 @@ export function SignInPanel({ next, title = "Sign in to apm", children }: { next
     setBusy(provider);
     setError(null);
     const failed = await signIn(provider, next);
+
     if (failed) {
       setError(failed);
       setBusy(null);
@@ -44,6 +45,7 @@ export function SignInPanel({ next, title = "Sign in to apm", children }: { next
   }
 
   const providers = config ? (["github", "vercel"] as const).filter((p) => config.providers[p]) : [];
+
   return (
     <section className="flex max-w-md flex-col gap-5 rounded-2xl border p-6 sm:p-8">
       <div className="flex flex-col gap-2">

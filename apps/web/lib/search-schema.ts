@@ -14,6 +14,7 @@ export const SearchHit = z.object({
   score: Score.nullable(),
   weeklyDownloads: z.number().nullable(),
 });
+
 export type SearchHit = z.infer<typeof SearchHit>;
 
 export const SearchAnswer = z.object({
@@ -23,6 +24,7 @@ export const SearchAnswer = z.object({
   /** npm did not answer; the hits are this registry's only. */
   upstreamFailed: z.boolean(),
 });
+
 export type SearchAnswer = z.infer<typeof SearchAnswer>;
 
 const NameReason = z.object({ name: z.string(), reason: z.string() });
@@ -39,6 +41,7 @@ export const ExactPart = z.object({
   description: z.string().nullable(),
   conflicts: z.array(NameReason),
 });
+
 export type ExactPart = z.infer<typeof ExactPart>;
 
 export const LookalikePart = z.object({
@@ -47,6 +50,7 @@ export const LookalikePart = z.object({
   lookalikes: z.array(NameReason),
   similar: z.array(NameReason),
 });
+
 export type LookalikePart = z.infer<typeof LookalikePart>;
 
 export const AlternativesPart = z.object({
@@ -54,10 +58,13 @@ export const AlternativesPart = z.object({
   valid: z.boolean(),
   suggestions: z.array(z.object({ name: z.string(), available: z.boolean(), taken: z.boolean(), unknown: z.boolean().default(false) })),
 });
+
 export type AlternativesPart = z.infer<typeof AlternativesPart>;
 
 export type NamePart = "exact" | "lookalike" | "alternatives";
+
 export type NamePartAnswer = { exact: ExactPart; lookalike: LookalikePart; alternatives: AlternativesPart };
+
 /** Mapped by part, so indexing with a generic part keeps the schema tied to that part's answer. */
 export const NAME_PART_SCHEMAS: { [P in NamePart]: z.ZodType<NamePartAnswer[P]> } = { exact: ExactPart, lookalike: LookalikePart, alternatives: AlternativesPart };
 
@@ -67,6 +74,7 @@ export function isNamePart(s: string | null): s is NamePart {
 
 // Same rule as the registry's name check, so the UI only asks about strings that can be package names.
 const NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+
 export function looksLikePackageName(q: string): boolean {
   return q.length > 0 && q.length <= 214 && NAME_RE.test(q);
 }

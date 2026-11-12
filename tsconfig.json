@@ -14,5 +14,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["packages/*/src/**/*.ts", "tests/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "tests/**/*.ts", "scripts/lint.ts", "oxlint.config.ts"]
 }

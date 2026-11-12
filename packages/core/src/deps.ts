@@ -19,17 +19,23 @@ const PARTIAL_RE = new RegExp(`^${PARTIAL}$`);
 /** A node-semver range: "^1.2.0", ">=1 <2", "1.x || 2.0.0 - 2.4.0", "" and "*". */
 export function isValidRange(r: string): boolean {
   if (r.length > 1024) return false;
+
   for (const part of r.split("||")) {
     const range = part.trim();
+
     if (range === "") continue;
     const hyphen = /^(\S+)\s+-\s+(\S+)$/.exec(range);
+
     if (hyphen) {
       if (!PARTIAL_RE.test(hyphen[1] ?? "") || !PARTIAL_RE.test(hyphen[2] ?? "")) return false;
       continue;
     }
+
     const comparators = range.replace(/(<=|>=|<|>|=|~>|~|\^)\s+/g, "$1").split(/\s+/);
+
     if (!comparators.every((c) => COMPARATOR_RE.test(c))) return false;
   }
+
   return true;
 }
 
@@ -55,7 +61,9 @@ export function isRegistryDependency(d: DependencySpec): d is RegistryDependency
 /** "range or tag" for a registry name; invalid when it is neither. */
 function registryTarget(key: string, name: string, spec: string, aliased: boolean): DependencySpec {
   if (isValidRange(spec)) return { kind: "registry", key, name, range: spec.trim() === "" ? "*" : spec.trim(), aliased };
+
   if (TAG_RE.test(spec)) return { kind: "tag", key, name, tag: spec, aliased };
+
   return { kind: "invalid", key, spec, reason: `"${spec}" is neither a version range nor a dist-tag` };
 }
 
@@ -63,21 +71,32 @@ function registryTarget(key: string, name: string, spec: string, aliased: boolea
 export function parseDependencySpec(key: string, value: unknown): DependencySpec {
   if (typeof value !== "string") return { kind: "invalid", key, spec: String(value), reason: "the spec is not a string" };
   const spec = value.trim();
+
   if (spec.startsWith("npm:")) {
     const rest = spec.slice(4);
     const at = rest.startsWith("@") ? rest.indexOf("@", 1) : rest.indexOf("@");
     const name = at > 0 ? rest.slice(0, at) : rest;
     const target = at > 0 ? rest.slice(at + 1) : "";
+
     if (!isValidPackageName(name)) return { kind: "invalid", key, spec, reason: `npm: alias to an invalid name "${name}"` };
+
     return registryTarget(key, name, target, true);
   }
+
   if (spec.startsWith("workspace:")) return { kind: "workspace", key, spec };
+
   if (/^(?:file|link|portal|patch):/.test(spec) || /^(?:\.{1,2}\/|\/|~\/)/.test(spec)) return { kind: "file", key, spec };
-  if (/^(?:git\+|git:|ssh:|github:|gitlab:|bitbucket:|gist:)/.test(spec) || /^git@/.test(spec)) return { kind: "git", key, spec };
+
+  if (/^(?:git\+|git:|ssh:|github:|gitlab:|bitbucket:|gist:)/.test(spec) || spec.startsWith('git@')) return { kind: "git", key, spec };
+
   if (/^https?:\/\//.test(spec)) return /\.git(?:#.*)?$/.test(spec) ? { kind: "git", key, spec } : { kind: "url", key, spec };
+
   if (!isValidPackageName(key)) return { kind: "invalid", key, spec, reason: `"${key}" is not a valid package name` };
+
   if (isValidRange(spec)) return registryTarget(key, key, spec, false);
+
   if (/^[\w.-]+\/[\w.-]+(?:#.*)?$/.test(spec)) return { kind: "git", key, spec };
+
   return registryTarget(key, key, spec, false);
 }
 
@@ -88,10 +107,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 /** Every entry of dependencies and optionalDependencies (optional wins for a key in both, as in npm). */
 export function dependencySpecs(manifest: Record<string, unknown>): DependencySpec[] {
   const merged = new Map<string, unknown>();
+
   for (const field of ["dependencies", "optionalDependencies"] as const) {
     const d = manifest[field];
+
     if (isRecord(d)) for (const [k, v] of Object.entries(d)) merged.set(k, v);
   }
+
   return [...merged].map(([k, v]) => parseDependencySpec(k, v));
 }
 
@@ -110,6 +132,7 @@ export function describeDependency(d: DependencySpec): string {
       return `${d.key} (${d.spec})`;
     default: {
       const _exhaustive: never = d;
+
       return _exhaustive;
     }
   }
@@ -130,6 +153,7 @@ export function uncheckableReason(d: Exclude<DependencySpec, RegistryDependency>
       return d.reason;
     default: {
       const _exhaustive: never = d;
+
       return _exhaustive;
     }
   }

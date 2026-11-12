@@ -27,11 +27,13 @@ export const SIGNAL_IDS = [
   "yanked",
   "revoked",
 ] as const;
+
 export type SignalId = (typeof SIGNAL_IDS)[number];
 
 /** v2 lists the files it could not read; v1 analyses (stored before) read as having skipped nothing. */
 export const SCORER = "apm-score-v2";
 const SignalSchema = z.object({ id: z.enum(SIGNAL_IDS), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+
 const FactsSchema = z.object({
   moduleFormat: z.enum(["esm", "cjs", "dual"]),
   types: z.enum(["bundled", "none"]),
@@ -42,6 +44,7 @@ const FactsSchema = z.object({
   unpackedSize: z.number(),
   dependencyCount: z.number(),
 });
+
 const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large"]) });
 
 export const NOT_CHECKED: readonly string[] = [
@@ -59,10 +62,15 @@ const AnalysisSchema = z.object({
 });
 
 export type Signal = z.infer<typeof SignalSchema>;
+
 export type Facts = z.infer<typeof FactsSchema>;
+
 export type ModuleFormat = Facts["moduleFormat"];
+
 export type Analysis = z.infer<typeof AnalysisSchema>;
+
 export type Grade = "A" | "B" | "C" | "D" | "F";
+
 export type ScoreReport = Analysis & { score: number; grade: Grade };
 
 export const SCORE_FLOOR = 40;
@@ -138,10 +146,13 @@ function hexIdentifierRun(text: string): number {
   const re = /_0x[0-9a-f]{4,}/g;
   let first = -1;
   let n = 0;
+
   for (let m = re.exec(text); m; m = re.exec(text)) {
     if (first < 0) first = m.index;
+
     if (++n >= 20) return first;
   }
+
   return -1;
 }
 
@@ -155,42 +166,56 @@ function lineOf(text: string, index: number): { line: number; snippet: string } 
   const start = before.lastIndexOf("\n") + 1;
   const end = text.indexOf("\n", index);
   const snippet = text.slice(start, end === -1 ? undefined : end).trim().slice(0, 80);
+
   return { line, snippet };
 }
 
 function isBinary(e: TarEntry): boolean {
   if (e.path.endsWith(".node") || e.path.endsWith(".exe") || e.path.endsWith(".dll") || e.path.endsWith(".so") || e.path.endsWith(".dylib")) return true;
   const d = e.data;
+
   if (d.length < 4) return false;
   const magic = ((d[0] ?? 0) << 24) | ((d[1] ?? 0) << 16) | ((d[2] ?? 0) << 8) | (d[3] ?? 0);
+
   return magic === 0x7f454c46 || magic === 0xcffaedfe || magic === 0xfeedfacf || magic === 0xcafebabe || (d[0] === 0x4d && d[1] === 0x5a && e.path.endsWith(".exe"));
 }
 
 function hasTypesCondition(v: unknown): boolean {
   if (!isRecord(v)) return false;
+
   return Object.entries(v).some(([k, val]) => k === "types" || hasTypesCondition(val));
 }
+
 function hasCondition(v: unknown, cond: string): boolean {
   if (!isRecord(v)) return false;
+
   return Object.entries(v).some(([k, val]) => k === cond || hasCondition(val, cond));
 }
 
 export function moduleFormatOf(manifest: Record<string, unknown>): ModuleFormat {
   const exp = manifest.exports;
+
   if (hasCondition(exp, "import") && hasCondition(exp, "require")) return "dual";
+
   if (manifest.type === "module") return "esm";
+
   if (typeof manifest.module === "string" && typeof manifest.main === "string") return "dual";
+
   return "cjs";
 }
 
 export function installScriptsOf(manifest: Record<string, unknown>): Record<string, string> {
   const out: Record<string, string> = {};
   const scripts = manifest.scripts;
+
   if (!isRecord(scripts)) return out;
+
   for (const k of INSTALL_SCRIPTS) {
     const v = scripts[k];
+
     if (typeof v === "string" && v.trim()) out[k] = v;
   }
+
   return out;
 }
 
@@ -198,6 +223,7 @@ export function factsOf(manifest: Record<string, unknown>, files: readonly TarEn
   const deps = isRecord(manifest.dependencies) ? Object.keys(manifest.dependencies).length : 0;
   const typesField = typeof manifest.types === "string" || typeof manifest.typings === "string";
   const dts = files.some((f) => f.path.endsWith(".d.ts") || f.path.endsWith(".d.mts") || f.path.endsWith(".d.cts"));
+
   return {
     moduleFormat: moduleFormatOf(manifest),
     types: typesField || hasTypesCondition(manifest.exports) || dts ? "bundled" : "none",
@@ -217,8 +243,10 @@ function signal(id: SignalId, evidence: string[]): Signal {
 /** The canonical dropper shape: an install command that fetches or evaluates remote code itself. */
 export function isInlineDownload(cmd: string): boolean {
   if (/\b(?:curl|wget|iwr|Invoke-WebRequest)\b/i.test(cmd)) return true;
+
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
   const inlineEval = /\b(?:node|bun|deno)\s+(?:-e|--eval|-p|--print|eval)\b/.test(cmd);
+
   return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
 }
 
@@ -226,7 +254,9 @@ export function isInlineDownload(cmd: string): boolean {
 export function scriptTargets(cmd: string): string[] {
   const out: string[] = [];
   const re = /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|tsx|ts-node)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g;
+
   for (const m of cmd.matchAll(re)) if (m[1] && !m[1].startsWith("-")) out.push(m[1]);
+
   return out;
 }
 
@@ -238,38 +268,49 @@ function stringsIn(v: unknown, out: string[]): void {
 
 function declaredEntries(manifest: Record<string, unknown>): string[] {
   const out: string[] = [];
+
   for (const k of ["main", "module", "browser", "bin", "exports"] as const) stringsIn(manifest[k], out);
+
   return out.filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
 }
 
 function relativeImports(text: string): string[] {
   const out: string[] = [];
   const re = /(?:require\s*\(|import\s*\(|from\s+|import\s+)\s*['"`](\.{1,2}\/[^'"`]+)['"`]/g;
+
   for (const m of text.matchAll(re)) if (m[1]) out.push(m[1]);
+
   return out.slice(0, 200);
 }
 
 function dirOf(p: string): string {
   const i = p.lastIndexOf("/");
+
   return i >= 0 ? p.slice(0, i) : "";
 }
 
 function joinPath(dir: string, rel: string): string {
   const parts = dir ? dir.split("/") : [];
+
   for (const seg of rel.split("/")) {
     if (seg === "" || seg === ".") continue;
+
     if (seg === "..") parts.pop();
     else parts.push(seg);
   }
+
   return parts.join("/");
 }
 
 function resolveIn(byPath: Map<string, TarEntry>, raw: string): TarEntry | undefined {
   const p = joinPath("", raw);
+
   for (const c of [p, `${p}.js`, `${p}.cjs`, `${p}.mjs`, `${p}.ts`, `${p}/index.js`, `${p}/index.cjs`, `${p}/index.mjs`]) {
     const f = byPath.get(c);
+
     if (f) return f;
   }
+
   return undefined;
 }
 
@@ -298,20 +339,26 @@ export function dependencyNames(manifest: Record<string, unknown>): string[] {
 export function analyze(input: AnalyzeInput): Analysis {
   const { manifest, files } = input;
   const found = new Map<SignalId, string[]>();
+
   const add = (id: SignalId, ev: string): void => {
     const list = found.get(id) ?? [];
+
     if (!list.includes(ev)) list.push(ev);
     found.set(id, list);
   };
 
   const scripts = installScriptsOf(manifest);
+
   for (const [k, cmd] of Object.entries(scripts)) {
     add("install-script", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+
     if (isInlineDownload(cmd)) add("install-download", `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+
     for (const rule of RULES) {
       if (rule.re.test(cmd)) add(rule.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
     }
   }
+
   if (files.some((f) => f.path === "binding.gyp")) add("install-script", "binding.gyp: node-gyp build runs at install");
 
   // Files that run: every file with a code extension, plus whatever install scripts, main, bin and
@@ -320,71 +367,99 @@ export function analyze(input: AnalyzeInput): Analysis {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const queue: string[] = [];
   const queued = new Set<string>();
+
   const enqueue = (p: string): void => {
     if (queued.has(p)) return;
     queued.add(p);
     queue.push(p);
   };
+
   for (const f of files) if (CODE_EXT.test(f.path)) enqueue(f.path);
+
   for (const cmd of Object.values(scripts)) for (const p of scriptTargets(cmd)) enqueue(p);
+
   for (const p of declaredEntries(manifest)) enqueue(p);
   const seen = new Set<string>();
   const skipped: SkippedFile[] = [];
+
   for (let qi = 0; qi < queue.length; qi++) {
     const f = resolveIn(byPath, queue[qi] ?? "");
+
     if (!f || seen.has(f.path)) continue;
     seen.add(f.path);
+
     if (isBinary(f)) {
       add("binary", f.path);
       continue;
     }
+
     if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
       skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
       continue;
     }
+
     const text = new TextDecoder().decode(f.data);
+
     for (const rule of RULES) {
       const m = rule.re.exec(text);
+
       if (m) {
         const { line, snippet } = lineOf(text, m.index);
         add(rule.id, `${f.path}:${line}: ${snippet}`);
       }
     }
+
     const hex = hexIdentifierRun(text);
+
     if (hex >= 0) {
       const { line, snippet } = lineOf(text, hex);
       add("obfuscated", `${f.path}:${line}: ${snippet}`);
     }
+
     for (const spec of relativeImports(text)) enqueue(joinPath(dirOf(f.path), spec));
   }
+
   for (const s of skipped) add("incomplete", `not analyzed: ${describeSkip(s)}`);
+
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
 
   const facts = factsOf(manifest, files);
+
   if (!facts.license) add("no-license", "package.json has no license field");
   const typos = typoConflicts(input.name);
+
   for (const t of typos) add("typosquat", t.reason);
+
   if (input.previousPublishers.length > 0 && !input.previousPublishers.includes(input.publisher)) {
     add("new-publisher", `${input.publisher} has not published this package before (previous: ${input.previousPublishers.join(", ")})`);
   }
 
   for (const d of input.riskyDependencies ?? []) add("risky-dependency", `${d.name}@${d.version} scores ${d.score}/100`);
+
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
   const order: SignalId[] = ["incomplete", "credential-access", "install-download", "shell-exec", "install-script", "risky-dependency", "network", "eval", "obfuscated", "typosquat", "new-publisher", "new-dependency", "binary", "no-license"];
+
   const signals = order.flatMap((id) => {
     const ev = found.get(id);
+
     return ev ? [signal(id, ev)] : [];
   });
+
   const notChecked = [...NOT_CHECKED, ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`)];
+
   return { scorer: SCORER, signals, facts, notChecked, skipped };
 }
 
 export function gradeOf(score: number): Grade {
   if (score >= 90) return "A";
+
   if (score >= 75) return "B";
+
   if (score >= 60) return "C";
+
   if (score >= 40) return "D";
+
   return "F";
 }
 
@@ -393,21 +468,27 @@ export type VersionState = { publishedAt: number; now: number; deprecated: strin
 /** Applies time- and state-based signals and computes the number. */
 export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   const signals = [...analysis.signals];
+
   if (state.now - state.publishedAt < COOLDOWN_MS) {
     const hours = Math.max(0, Math.floor((state.now - state.publishedAt) / 3_600_000));
     signals.push(signal("recent", [`published ${hours}h ago`]));
   }
+
   if (state.deprecated) signals.push(signal("deprecated", [state.deprecated]));
+
   if (state.status === "yanked") signals.push(signal("yanked", [state.statusReason ?? "no reason given"]));
+
   if (state.status === "revoked" || state.status === "revoke-pending") signals.push(signal("revoked", [state.statusReason ?? "no reason given"]));
   const raw = 100 + signals.reduce((n, s) => n + s.points, 0);
   const score = Math.max(0, Math.min(100, raw));
+
   return { ...analysis, signals, score, grade: gradeOf(score) };
 }
 
 /** A stored analysis (v1 or v2), or null when the value is not one. */
 export function parseAnalysis(v: unknown): Analysis | null {
   const r = AnalysisSchema.safeParse(v);
+
   return r.success ? r.data : null;
 }
 
@@ -416,7 +497,10 @@ export function signalChanges(prev: readonly Signal[], next: readonly Signal[]):
   const p = new Set(prev.map((s) => s.id));
   const n = new Set(next.map((s) => s.id));
   const out: string[] = [];
+
   for (const s of next) if (!p.has(s.id) && s.id !== "recent") out.push(`+${s.id}: ${s.label}`);
+
   for (const s of prev) if (!n.has(s.id) && s.id !== "recent") out.push(`-${s.id}: ${s.label}`);
+
   return out;
 }

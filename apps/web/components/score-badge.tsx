@@ -4,8 +4,11 @@ export type Tone = "none" | "ok" | "warn" | "bad";
 
 export function toneOf(score: number | null | undefined): Tone {
   if (score === null || score === undefined) return "none";
+
   if (score >= 75) return "ok";
+
   if (score >= 40) return "warn";
+
   return "bad";
 }
 
@@ -23,6 +26,7 @@ export function scoreTone(score: number | null | undefined): string {
 
 export function ScoreBadge({ score, grade, className }: { score: number | null | undefined; grade?: string | null; className?: string }) {
   const unscored = score === null || score === undefined;
+
   return (
     <span
       className={cn("inline-flex h-7 min-w-[3.75rem] shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-mono text-[13px] tabular-nums", scoreTone(score), className)}
@@ -44,5 +48,6 @@ export function StatusBadge({ status }: { status: string }) {
   if (status === "active") return null;
   const tone = status === "yanked" ? SOFT.warn : SOFT.bad;
   const label = status === "revoke-pending" ? "revoke pending" : status;
+
   return <span className={cn("inline-flex h-6 items-center rounded-md px-2 text-xs font-medium", tone)}>{label}</span>;
 }

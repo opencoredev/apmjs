@@ -11,6 +11,7 @@ export function safeNext(raw: string | null): string {
 export function SignInView() {
   const params = useSearchParams();
   const failed = params.get("error") !== null;
+
   return (
     <div className="flex w-full max-w-md flex-col gap-4">
       {failed && (

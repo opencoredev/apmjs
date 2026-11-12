@@ -6,6 +6,7 @@ import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswe
 export const REGISTRY = (process.env.APM_REGISTRY ?? "http://127.0.0.1:4873/").replace(/\/?$/, "/");
 
 const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+
 export type Signal = z.infer<typeof Signal>;
 
 const Facts = z.object({
@@ -18,6 +19,7 @@ const Facts = z.object({
   unpackedSize: z.number(),
   dependencyCount: z.number(),
 });
+
 export type Facts = z.infer<typeof Facts>;
 
 const PackageInfo = z.object({
@@ -43,9 +45,11 @@ const PackageInfo = z.object({
     }),
   ),
 });
+
 export type PackageInfo = z.infer<typeof PackageInfo>;
 
 const Events = z.object({ events: z.array(z.object({ kind: z.string(), actor: z.string(), at: z.string(), detail: z.unknown() })) });
+
 export type PackageEvent = z.infer<typeof Events>["events"][number];
 
 // One object of /-/v1/search. Read per object so one odd upstream hit can't empty the list.
@@ -55,6 +59,7 @@ const WireHit = z.object({
   apmScore: z.object({ score: z.number(), grade: z.string() }).nullish(),
   downloads: z.object({ weekly: z.number() }).nullish(),
 });
+
 const WireSearch = z.object({ total: z.number(), upstreamFailed: z.boolean().default(false), objects: z.array(z.unknown()) });
 
 const Recent = z.object({
@@ -72,6 +77,7 @@ const Recent = z.object({
     }),
   ),
 });
+
 export type RecentEvent = z.infer<typeof Recent>["events"][number];
 
 function encodeName(name: string): string {
@@ -81,8 +87,10 @@ function encodeName(name: string): string {
 async function getJson<T>(path: string, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T | null> {
   try {
     const res = await fetch(`${REGISTRY}${path}`, { cache: "no-store", headers: { accept: "application/json" }, signal });
+
     if (!res.ok) return null;
     const parsed = schema.safeParse(await res.json());
+
     return parsed.success ? parsed.data : null;
   } catch {
     return null;
@@ -100,10 +108,13 @@ export async function checkNamePart<P extends NamePart>(q: string, part: P, sign
 /** Registry search (apm packages merged with npm's), trimmed to what the search page shows. Null when the registry is down. */
 export async function search(q: string, signal?: AbortSignal): Promise<SearchAnswer | null> {
   const wire = await getJson(`-/v1/search?text=${encodeURIComponent(q)}&size=20`, WireSearch, signal);
+
   if (!wire) return null;
   const hits: SearchHit[] = [];
+
   for (const raw of wire.objects) {
     const o = WireHit.safeParse(raw);
+
     if (!o.success) continue;
     const { package: p } = o.data;
     hits.push({
@@ -116,5 +127,6 @@ export async function search(q: string, signal?: AbortSignal): Promise<SearchAns
       weeklyDownloads: o.data.downloads?.weekly ?? null,
     });
   }
+
   return { query: q, hits, total: wire.total, upstreamFailed: wire.upstreamFailed };
 }

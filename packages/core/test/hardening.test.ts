@@ -31,25 +31,31 @@ function header(f: TarFile, size: number): Uint8Array {
   put("0", 156, 1);
   put("ustar\0", 257, 6);
   let sum = 0;
+
   for (const b of h) sum += b;
   put(f.checksum ?? `${sum.toString(8).padStart(6, "0")}\0 `, 148, 8);
+
   return h;
 }
 
 function tar(files: TarFile[], opts: { truncateBy?: number } = {}): Uint8Array<ArrayBuffer> {
   const parts: number[] = [];
+
   for (const f of files) {
     const data = new TextEncoder().encode(f.data);
     parts.push(...header(f, data.length), ...data, ...new Uint8Array((512 - (data.length % 512)) % 512));
   }
+
   parts.push(...new Uint8Array(1024));
   const out = new Uint8Array(parts);
+
   return opts.truncateBy ? out.subarray(0, out.length - 1024 - opts.truncateBy) : out;
 }
 
 function kindOf(fn: () => unknown): string {
   try {
     fn();
+
     return "ok";
   } catch (e) {
     return e instanceof ArchiveError ? e.kind : `other: ${String(e)}`;
@@ -85,6 +91,7 @@ describe("readTarball", () => {
   test("more than MAX_TAR_ENTRIES headers is too large", () => {
     const one = header({ path: "f", data: "" }, 0);
     const t = new Uint8Array((MAX_TAR_ENTRIES + 1) * 512 + 1024);
+
     for (let i = 0; i <= MAX_TAR_ENTRIES; i++) t.set(one, i * 512);
     expect(kindOf(() => readTar(t))).toBe("too-large");
   });
@@ -100,11 +107,13 @@ describe("readTarball", () => {
 describe("versions and ranges", () => {
   test("isValidVersion is strict semver", () => {
     for (const v of ["1.0.0", "0.1.0-beta.0", "2.0.0-rc.1+build.5", "10.20.30"]) expect(isValidVersion(v), v).toBe(true);
+
     for (const v of ["1.0.0/../../../escaped", "1.0.0.evil", "1.0.0-", "01.0.0", "v1.0.0", "1.0", " 1.0.0", "1.0.0\n"]) expect(isValidVersion(v), v).toBe(false);
   });
 
   test("isValidRange accepts node-semver ranges and rejects tags", () => {
     for (const r of ["", "*", "^1.2.3", "~1.2", ">=1.0.0 <2", ">= 1.2.3", "1.x || 2.0.0 - 2.4.0", "1.2.3-beta.1", "x"]) expect(isValidRange(r), r).toBe(true);
+
     for (const r of ["latest", "next", "github:a/b", "npm:x@1"]) expect(isValidRange(r), r).toBe(false);
   });
 });
@@ -138,6 +147,7 @@ describe("parseDependencySpec", () => {
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
+
   return { path, size: data.length, mode: 0o644, data };
 }
 
@@ -181,6 +191,7 @@ describe("incomplete analysis", () => {
       facts: { moduleFormat: "cjs", types: "none", installScripts: false, hasBin: false, license: "MIT", fileCount: 1, unpackedSize: 1, dependencyCount: 0 },
       notChecked: [],
     };
+
     expect(parseAnalysis(v1)?.skipped).toEqual([]);
     expect(parseAnalysis({ scorer: "something-else" })).toBeNull();
   });

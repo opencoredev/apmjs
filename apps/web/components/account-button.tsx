@@ -18,14 +18,17 @@ export function AccountButton() {
       if (!live) return;
       setState(r.kind === "ok" ? { kind: "signed-in", account: r.value } : { kind: "signed-out" });
     });
+
     return () => {
       live = false;
     };
   }, [pathname]);
 
   if (state.kind === "loading") return <span className="inline-block h-9 w-[76px]" aria-hidden />;
+
   if (state.kind === "signed-out") {
     const next = pathname && pathname !== "/signin" ? `?next=${encodeURIComponent(pathname)}` : "";
+
     return (
       <Link
         href={`/signin${next}`}
@@ -35,8 +38,10 @@ export function AccountButton() {
       </Link>
     );
   }
+
   const a = state.account;
   const label = a.scope ? `@${a.scope}` : a.name || "Account";
+
   return (
     <Link
       href="/account"

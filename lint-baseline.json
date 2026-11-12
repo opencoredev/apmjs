@@ -1,0 +1,209 @@
+{
+  "files": {
+    "apps/web/app/approve/[id]/approve-view.tsx": {
+      "shadcn/no-restyle": 2
+    },
+    "apps/web/app/package/[...name]/page.tsx": {
+      "anti-slop/no-reflect-get": 1,
+      "anti-slop/no-runtime-typeof": 2
+    },
+    "apps/web/app/publish/publish-view.tsx": {
+      "anti-slop/no-known-value-widening": 7,
+      "shadcn/no-restyle": 1
+    },
+    "apps/web/components/logo.tsx": {
+      "shadcn/no-inline-styles": 1
+    },
+    "apps/web/components/search-home.tsx": {
+      "anti-slop/no-known-value-widening": 1
+    },
+    "apps/web/lib/account.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 1,
+      "anti-slop/no-runtime-typeof": 7,
+      "anti-slop/no-unknown-parameters": 2
+    },
+    "apps/web/lib/search-schema.ts": {
+      "anti-slop/no-known-value-widening": 1
+    },
+    "packages/bun-scanner/src/index.ts": {
+      "anti-slop/no-runtime-typeof": 8,
+      "anti-slop/require-readable-spacing": 20
+    },
+    "packages/cli/src/api.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 3,
+      "anti-slop/no-known-value-widening": 3,
+      "anti-slop/no-runtime-typeof": 2,
+      "anti-slop/no-unknown-parameters": 3,
+      "anti-slop/require-readable-spacing": 17
+    },
+    "packages/cli/src/config.ts": {
+      "anti-slop/require-readable-spacing": 15
+    },
+    "packages/cli/src/main.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 1,
+      "anti-slop/no-known-value-widening": 2,
+      "anti-slop/no-runtime-typeof": 10,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/no-unsafe-dictionary-type": 1,
+      "anti-slop/require-readable-spacing": 200
+    },
+    "packages/cli/src/pm.ts": {
+      "anti-slop/no-runtime-typeof": 2,
+      "anti-slop/require-readable-spacing": 29,
+      "anti-slop/require-safety-comment-for-type-assertion": 1
+    },
+    "packages/core/src/deps.ts": {
+      "anti-slop/no-runtime-typeof": 2,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/no-unsafe-dictionary-type": 2
+    },
+    "packages/core/src/entries.ts": {
+      "anti-slop/no-runtime-typeof": 6,
+      "anti-slop/no-unsafe-dictionary-type": 3
+    },
+    "packages/core/src/score.ts": {
+      "anti-slop/no-known-value-widening": 3,
+      "anti-slop/no-runtime-typeof": 9,
+      "anti-slop/no-unknown-parameters": 4,
+      "anti-slop/no-unsafe-dictionary-type": 7
+    },
+    "packages/core/src/tarball.ts": {
+      "anti-slop/no-runtime-typeof": 1
+    },
+    "packages/core/test/hardening.test.ts": {
+      "anti-slop/no-unknown-returns": 1
+    },
+    "packages/registry/src/access.ts": {
+      "anti-slop/require-readable-spacing": 21
+    },
+    "packages/registry/src/account.ts": {
+      "anti-slop/no-known-value-widening": 3,
+      "anti-slop/no-runtime-typeof": 1,
+      "anti-slop/no-unsafe-dictionary-type": 2,
+      "anti-slop/require-readable-spacing": 74
+    },
+    "packages/registry/src/apm.ts": {
+      "anti-slop-effect/prefer-effect-match": 1,
+      "anti-slop/no-array-filter-map": 1,
+      "anti-slop/no-conditional-empty-object-spread": 2,
+      "anti-slop/no-known-value-widening": 8,
+      "anti-slop/no-runtime-typeof": 3,
+      "anti-slop/no-unknown-parameters": 3,
+      "anti-slop/no-unknown-returns": 4,
+      "anti-slop/no-unsafe-dictionary-type": 16,
+      "anti-slop/require-readable-spacing": 279
+    },
+    "packages/registry/src/auth.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 2,
+      "anti-slop/no-shape-in-symbol-names": 8,
+      "anti-slop/require-readable-spacing": 42
+    },
+    "packages/registry/src/db.ts": {
+      "anti-slop/no-known-value-widening": 2,
+      "anti-slop/no-runtime-typeof": 1,
+      "anti-slop/no-unknown-parameters": 3,
+      "anti-slop/no-unknown-returns": 3,
+      "anti-slop/no-unsafe-dictionary-type": 2,
+      "anti-slop/require-readable-spacing": 52
+    },
+    "packages/registry/src/index.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 2,
+      "anti-slop/require-readable-spacing": 13
+    },
+    "packages/registry/src/main.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 6,
+      "anti-slop/require-readable-spacing": 2
+    },
+    "packages/registry/src/server.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 3,
+      "anti-slop/no-known-value-widening": 9,
+      "anti-slop/no-runtime-typeof": 7,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/no-unknown-returns": 2,
+      "anti-slop/no-unsafe-dictionary-type": 12,
+      "anti-slop/require-readable-spacing": 156,
+      "eslint/no-control-regex": 1,
+      "unicorn/no-useless-fallback-in-spread": 1
+    },
+    "packages/registry/src/upstream.ts": {
+      "anti-slop/no-known-value-widening": 1,
+      "anti-slop/no-runtime-typeof": 1,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/no-unsafe-dictionary-type": 1,
+      "anti-slop/require-readable-spacing": 71
+    },
+    "scripts/score.ts": {
+      "anti-slop/require-readable-spacing": 7
+    },
+    "tests/acceptance/auth.test.ts": {
+      "anti-slop/no-unsafe-dictionary-type": 1,
+      "anti-slop/require-readable-spacing": 15
+    },
+    "tests/acceptance/bun-scanner.test.ts": {
+      "anti-slop/require-readable-spacing": 6
+    },
+    "tests/acceptance/cli.test.ts": {
+      "anti-slop/no-runtime-typeof": 2,
+      "anti-slop/require-readable-spacing": 2
+    },
+    "tests/acceptance/hardening.test.ts": {
+      "anti-slop/no-known-value-widening": 1,
+      "anti-slop/require-readable-spacing": 15
+    },
+    "tests/acceptance/harness.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 9,
+      "anti-slop/no-known-value-widening": 3,
+      "anti-slop/no-reflect-get": 1,
+      "anti-slop/no-runtime-typeof": 15,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/no-unknown-returns": 1,
+      "anti-slop/no-unsafe-dictionary-type": 2,
+      "anti-slop/require-readable-spacing": 79,
+      "unicorn/no-useless-fallback-in-spread": 1
+    },
+    "tests/acceptance/name-check.test.ts": {
+      "anti-slop/no-runtime-typeof": 1,
+      "anti-slop/no-unsafe-dictionary-type": 1,
+      "anti-slop/require-readable-spacing": 2
+    },
+    "tests/acceptance/protocol.test.ts": {
+      "anti-slop/no-runtime-typeof": 2,
+      "anti-slop/require-readable-spacing": 3
+    },
+    "tests/acceptance/publish-guard.test.ts": {
+      "anti-slop/no-unsafe-dictionary-type": 1,
+      "anti-slop/require-readable-spacing": 4
+    },
+    "tests/acceptance/review-fixes.test.ts": {
+      "anti-slop/no-runtime-typeof": 3,
+      "anti-slop/no-unsafe-dictionary-type": 3,
+      "anti-slop/require-readable-spacing": 42
+    },
+    "tests/acceptance/revoke.test.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 1,
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/require-readable-spacing": 10
+    },
+    "tests/acceptance/safe-view.test.ts": {
+      "anti-slop/require-readable-spacing": 2
+    },
+    "tests/acceptance/score.test.ts": {
+      "anti-slop/no-runtime-typeof": 7,
+      "anti-slop/no-unknown-parameters": 3,
+      "anti-slop/no-unknown-returns": 1,
+      "anti-slop/require-readable-spacing": 15
+    },
+    "tests/acceptance/search.test.ts": {
+      "anti-slop/no-runtime-typeof": 1,
+      "anti-slop/no-unknown-parameters": 4,
+      "anti-slop/require-readable-spacing": 6
+    },
+    "tests/acceptance/upstream.test.ts": {
+      "anti-slop/require-readable-spacing": 5
+    },
+    "tools/seed-demo.ts": {
+      "anti-slop/no-unknown-parameters": 1,
+      "anti-slop/require-readable-spacing": 9
+    }
+  }
+}

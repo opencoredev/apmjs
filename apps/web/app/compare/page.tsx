@@ -14,6 +14,7 @@ function Rich({ text, onSurface = false }: { text: string; onSurface?: boolean }
             </code>
           );
         }
+
         if (part.startsWith("**") && part.endsWith("**")) {
           return (
             <strong key={i} className="font-medium text-foreground">
@@ -21,6 +22,7 @@ function Rich({ text, onSurface = false }: { text: string; onSurface?: boolean }
             </strong>
           );
         }
+
         return part;
       })}
     </>
@@ -28,6 +30,7 @@ function Rich({ text, onSurface = false }: { text: string; onSurface?: boolean }
 }
 
 type Row = { label: string; npm: string; apm: string; same?: true };
+
 type Group = { title: string; rows: readonly Row[] };
 
 const POINTS = [
@@ -92,6 +95,7 @@ function Mark({ kind }: { kind: "no" | "yes" | "same" }) {
   const Icon = kind === "yes" ? CheckIcon : kind === "no" ? XIcon : EqualIcon;
   const tone = kind === "yes" ? "bg-ok-soft text-ok" : kind === "no" ? "bg-bad-soft text-bad" : "bg-secondary text-muted-foreground";
   const label = kind === "yes" ? "apm handles this" : kind === "no" ? "npm falls short" : "the same";
+
   return (
     <span className={`mt-0.5 grid size-5 shrink-0 place-items-center rounded-full ${tone}`} role="img" aria-label={label}>
       <Icon className="size-3" strokeWidth={2.5} aria-hidden />

@@ -14,6 +14,7 @@ export function describeSkip(s: SkippedFile): string {
       return `${s.path} (${(s.size / (1024 * 1024)).toFixed(1)} MB, over the ${MAX_ANALYZED_FILE_BYTES / (1024 * 1024)} MB limit)`;
     default: {
       const _exhaustive: never = s.reason;
+
       return _exhaustive;
     }
   }

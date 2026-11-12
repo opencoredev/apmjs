@@ -15,6 +15,7 @@ function Links({ current }: { current: string | null }) {
     <nav aria-label="Main" className="flex items-center gap-0.5 sm:gap-1">
       {LINKS.map((l) => {
         const active = current === l.href;
+
         return (
           <Link
             key={l.href}
