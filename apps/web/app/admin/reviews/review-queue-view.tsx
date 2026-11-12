@@ -40,7 +40,7 @@ function label(i: Item): string {
 }
 
 // Each decision needs a fresh second factor: a code typed now, or a passkey check made for it.
-type Factor = { kind: "code"; code: string } | { kind: "passkey" };
+type Factor = { kind: "code"; code: string } | { kind: "passkey" } | { kind: "error"; message: string };
 
 function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
   const [note, setNote] = useState("");
@@ -50,11 +50,11 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const files = item.public.notRead.flatMap((n) => (n.kind === "file" ? [notReadText(n)] : []));
 
-  async function factor(): Promise<Factor | string> {
-    if (!usePasskey) return /^\d{6}$/.test(code) ? { kind: "code", code } : "Enter the 6-digit code from your authenticator app.";
+  async function factor(): Promise<Factor> {
+    if (!usePasskey) return /^\d{6}$/.test(code) ? { kind: "code", code } : { kind: "error", message: "Enter the 6-digit code from your authenticator app." };
     const p = await authClient().signIn.passkey();
 
-    return p.error ? (p.error.message ?? "The passkey check did not finish.") : { kind: "passkey" };
+    return p.error ? { kind: "error", message: p.error.message ?? "The passkey check did not finish." } : { kind: "passkey" };
   }
 
   async function decide(decision: "confirm" | "dismiss") {
@@ -62,10 +62,10 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
     setError(null);
     const f = await factor();
 
-    if (typeof f === "string") {
+    if (f.kind === "error") {
       setBusy(null);
 
-      return setError(f);
+      return setError(f.message);
     }
 
     const proof = f.kind === "code" ? { code: f.code } : { passkey: true };

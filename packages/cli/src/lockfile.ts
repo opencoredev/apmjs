@@ -97,6 +97,7 @@ const NpmEntry = z
     peerDependencies: DepMap.optional(),
   })
   .loose();
+
 const NpmLock = z.object({ packages: z.record(z.string(), NpmEntry) }).loose();
 
 function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
@@ -125,6 +126,7 @@ function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
 
     return Object.keys({ ...e.dependencies, ...e.optionalDependencies, ...e.peerDependencies }).flatMap((d) => resolve(key, d) ?? []);
   };
+
   const keys = roots.kind === "all" ? Object.keys(packages).filter((k) => k !== "") : walk({ roots: roots.names.flatMap((r) => resolve(from, r) ?? []), edges });
 
   return keys.flatMap((key): LockNode[] => {
@@ -139,6 +141,7 @@ function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
 // ---------- bun: bun.lock ----------
 // "key": ["name@version", "registry tarball or empty", { dependencies, hasInstallScript, ... }, "sha512-..."]
 const BunLock = z.object({ packages: z.record(z.string(), z.array(z.unknown())) }).loose();
+
 const BunMeta = z
   .object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional(), peerDependencies: DepMap.optional(), hasInstallScript: z.boolean().optional() })
   .loose();
@@ -162,21 +165,28 @@ export function bunKeyNames(key: string): string[] {
 
 type BunEntry = { id: { name: string; spec: string }; resolved: string | null; meta: z.infer<typeof BunMeta>; integrity: string | null };
 
+const Str = z.string();
+const NonEmpty = z.string().min(1);
+
 function bunEntry(raw: unknown[]): BunEntry | null {
-  const id = typeof raw[0] === "string" ? splitId(raw[0]) : null;
+  const first = Str.safeParse(raw[0]);
+  const id = first.success ? splitId(first.data) : null;
 
   if (!id) return null;
 
   // registry packages carry [id, tarball, meta, integrity]; git, file and workspace entries are shorter
   if (isRegistryVersion(id.spec)) {
     const meta = BunMeta.safeParse(raw[2] ?? {});
+    const resolved = NonEmpty.safeParse(raw[1]);
+    const integrity = Str.safeParse(raw[3]);
 
-    return { id, resolved: typeof raw[1] === "string" && raw[1] !== "" ? raw[1] : null, meta: meta.success ? meta.data : {}, integrity: typeof raw[3] === "string" ? raw[3] : null };
+    return { id, resolved: resolved.success ? resolved.data : null, meta: meta.success ? meta.data : {}, integrity: integrity.success ? integrity.data : null };
   }
 
-  const meta = BunMeta.safeParse(raw.find((x) => typeof x === "object" && x !== null && !Array.isArray(x)) ?? {});
+  // the metadata object sits at a different index for each kind of non-registry entry
+  const meta = raw.map((x) => BunMeta.safeParse(x)).find((m) => m.success);
 
-  return { id, resolved: null, meta: meta.success ? meta.data : {}, integrity: null };
+  return { id, resolved: null, meta: meta?.success ? meta.data : {}, integrity: null };
 }
 
 function bunGraph(text: string, roots: Roots): LockNode[] {
@@ -205,6 +215,7 @@ function bunGraph(text: string, roots: Roots): LockNode[] {
 
     return m ? Object.keys({ ...m.dependencies, ...m.optionalDependencies, ...m.peerDependencies }).flatMap((d) => resolve(bunKeyNames(key), d) ?? []) : [];
   };
+
   const keys = roots.kind === "all" ? [...entries.keys()] : walk({ roots: roots.names.flatMap((r) => resolve([], r) ?? []), edges });
 
   return keys.flatMap((key): LockNode[] => {
@@ -218,11 +229,14 @@ function bunGraph(text: string, roots: Roots): LockNode[] {
 
 // ---------- pnpm: pnpm-lock.yaml v9 (and v6, where snapshots live under packages) ----------
 const PnpmDep = z.union([z.string(), z.object({ version: z.string() }).loose().transform((o) => o.version)]);
+
 const PnpmImporter = z
   .object({ dependencies: z.record(z.string(), PnpmDep).optional(), devDependencies: z.record(z.string(), PnpmDep).optional(), optionalDependencies: z.record(z.string(), PnpmDep).optional() })
   .loose();
+
 const PnpmSnapshot = z.object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional() }).loose();
 const PnpmPackage = PnpmSnapshot.extend({ resolution: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose().optional(), requiresBuild: z.boolean().optional() });
+
 const PnpmLock = z
   .object({
     importers: z.record(z.string(), PnpmImporter).optional(),
@@ -246,6 +260,7 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
   const snapOf = (key: string): z.infer<typeof PnpmSnapshot> | undefined => (snapshots ? snapshots[key] : packages[key] ?? packages[`/${key}`]);
   const top = lock.importers?.[importer] ?? lock.importers?.["."];
   const topDeps = { ...top?.dependencies, ...top?.devDependencies, ...top?.optionalDependencies };
+
   const rootKeys =
     roots.kind === "all"
       ? Object.keys(snapshots ?? packages).map((k) => k.replace(/^\//, ""))

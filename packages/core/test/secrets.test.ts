@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { findSecrets } from "../src/secrets.ts";
 
 function file(path: string, text: string | Uint8Array) {
-  return { path, data: typeof text === "string" ? new TextEncoder().encode(text) : text };
+  return { path, data: text instanceof Uint8Array ? text : new TextEncoder().encode(text) };
 }
 
 function kinds(path: string, text: string | Uint8Array): string[] {

@@ -15,6 +15,7 @@ export const MAX_SCANNED_BYTES = 200 * 1024 * 1024;
  * "compressed": an archive (gzip, zip, bzip2, xz, 7z, zstd) whose contents the secret scan cannot read.
  */
 export const SKIP_REASONS = ["too-large", "over-budget", "compressed"] as const;
+
 export type SkipReason = (typeof SKIP_REASONS)[number];
 
 /** A file an analysis did not read. Its presence makes the analysis incomplete, never clean. */

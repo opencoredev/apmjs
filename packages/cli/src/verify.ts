@@ -78,6 +78,7 @@ export async function verifyTree(input: { api: Api; cwd: string; pm: LockPm; roo
   });
 
   const registry = input.api.cfg.registry;
+
   const bad: Mismatch[] = fromRegistry.flatMap((node): Mismatch[] => {
     const expected = served.get(node.name)?.get(node.version);
 
@@ -129,6 +130,7 @@ export function removeInstalled(input: { cwd: string; nodes: readonly { name: st
       return false;
     }
   };
+
   const list = (dir: string): string[] => {
     try {
       return readdirSync(dir);

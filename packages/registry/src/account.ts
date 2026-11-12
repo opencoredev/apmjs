@@ -9,6 +9,7 @@ import type { StagedRecord, User } from "./db.ts";
 import { GRANT_MS } from "./factors.ts";
 import { commitVersion, fail, issueToken, json, publishRefusal, stagedTarballPath, type Ctx } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
+
 const ApproveBody = z.object({ ...ProofFields, confirmName: z.string().optional() });
 const VerifyBody = z.object({ ...ProofFields, command: LiveAction });
 const DeviceTokenBody = z.object({ deviceCode: z.string().min(1) });

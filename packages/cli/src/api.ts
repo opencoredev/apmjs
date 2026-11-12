@@ -15,6 +15,7 @@ export type Report = z.infer<typeof ReportSchema>;
 
 const Skipped = z.array(z.object({ version: z.string(), reason: z.string() }));
 const UncheckedDep = z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) });
+
 /** `packages`: every name@version the registry's walk checked (older registries send none). */
 export const Tree = z.object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(z.object({ name: z.string(), version: z.string() })).default([]) }).loose();
 export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional() });

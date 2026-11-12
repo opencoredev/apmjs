@@ -6,6 +6,7 @@ import { z } from "zod";
 
 const Name = z.string().min(1).max(214);
 const Version = z.string().min(1).max(256);
+
 /** One version's new deprecation message; null takes the deprecation off. */
 const DeprecateChange = z.object({ version: Version, message: z.string().max(1024).nullable() });
 

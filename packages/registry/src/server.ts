@@ -397,6 +397,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (existing && ctx.store.getVersion(name, version)) {
     return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
   }
+
   const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
 
   if (readme !== null && Buffer.byteLength(readme, "utf8") > MAX_README_BYTES) return fail(413, `The readme is over ${MAX_README_BYTES / (1024 * 1024)} MB. Shorten it or link to longer docs.`);
@@ -442,6 +443,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     const path = stagedTarballPath(ctx, id);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, tarball);
+
     // the checks above ran before the analysis awaited; these run again atomically with the insert
     const stored = ctx.store.insertStagedWithin(
       { id, package: name, version, manifest: cleanManifest, shasum, integrity, size: tarball.length, tag, readme, score, staged_by: auth.user, staged_at: at, expires_at: at + STAGE_TTL_MS },
@@ -627,12 +629,11 @@ function commitRows(ctx: Ctx, v: CommitInput, m: { at: number; size: number }): 
   ctx.store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
 }
 
-/** A publish-shaped PUT without a tarball: npm deprecate. Answers with the versions it changed; a missing version changes nothing. */
 /** The deprecation message a metadata PUT sets on a version: a non-empty string, or null to take it off. */
-function deprecationOf(manifest: Record<string, unknown>): string | null {
-  const dep = manifest.deprecated;
+function deprecationOf(manifest: { readonly deprecated?: unknown }): string | null {
+  const dep = z.string().min(1).safeParse(manifest.deprecated);
 
-  return typeof dep === "string" && dep.length > 0 ? dep : null;
+  return dep.success ? dep.data : null;
 }
 
 /** What a metadata PUT (npm deprecate) would change: each existing version whose message differs. */
@@ -645,6 +646,7 @@ function deprecationChanges(ctx: Ctx, name: string, body: PublishBody): { versio
   });
 }
 
+/** A publish-shaped PUT without a tarball: npm deprecate. Answers with the versions it changed; a missing version changes nothing. */
 function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: string): Response {
   const pkg = ctx.store.getPackage(name);
   if (!pkg) return fail(404, "Not found");

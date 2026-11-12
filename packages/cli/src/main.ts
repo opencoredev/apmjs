@@ -341,6 +341,7 @@ async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[
 
       return names.length === 0 ? 0 : (await runCmd(["npm", "rebuild", ...names], opts)).code;
     }
+
     case "pnpm":
       return (await runCmd(["pnpm", "rebuild", "--pending"], opts)).code;
     case "bun": {
@@ -352,6 +353,7 @@ async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[
 
       return (await runCmd(["bun", "install", "--frozen-lockfile", ...registryArgs("bun", input.registry, input.scopes)], opts)).code;
     }
+
     default: {
       const _exhaustive: never = pm;
 
@@ -385,6 +387,7 @@ async function verifyAndRunScripts(input: { api: Api; cwd: string; pm: LockPm; r
 
       return 1;
     }
+
     case "verified": {
       for (const n of check.notFromRegistry) say(`  ${yellow("!")} not from a registry, not checked: ${n.name}@${n.version}`);
       say(dim(`apm: ${check.nodes.length} installed package${check.nodes.length === 1 ? "" : "s"} match ${api.cfg.registry}; running install scripts`));
@@ -394,6 +397,7 @@ async function verifyAndRunScripts(input: { api: Api; cwd: string; pm: LockPm; r
 
       return code;
     }
+
     default: {
       const _exhaustive: never = check;
 
@@ -916,6 +920,7 @@ async function cmdPublish(a: Args): Promise<number> {
     fail(`Refusing to publish ${id}: the tarball contains secrets. Narrow the "files" allowlist in package.json.`);
     return 1;
   }
+
   for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} was not scanned for secrets; check it yourself.`));
   const missing = missingEntries(manifest, files);
   if (missing.length > 0) {

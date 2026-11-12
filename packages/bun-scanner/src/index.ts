@@ -137,9 +137,11 @@ export async function scanPackages(input: { packages: Bun.Security.Package[]; en
   // git, file and link dependencies are not on a registry: nothing can vouch for them, so each is reported
   const onRegistry = input.packages.filter((p) => isRegistryVersion(p.version));
   const registry = configuredRegistry({ env: input.env, cwd: input.cwd });
+
   const unchecked: Unchecked[] = input.packages
     .filter((p) => !isRegistryVersion(p.version))
     .map((p) => ({ id: `${p.name}@${p.version}`, reason: "not a registry version (git, file or link dependency), so no registry can check it" }));
+
   const out: Bun.Security.Advisory[] = [];
 
   if (!registry) {

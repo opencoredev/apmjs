@@ -4,6 +4,7 @@
 // What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
+import { entryPoints } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
@@ -262,19 +263,11 @@ export function scriptTargets(cmd: string): string[] {
   return out;
 }
 
-function stringsIn(v: unknown, out: string[]): void {
-  if (typeof v === "string") out.push(v);
-  else if (Array.isArray(v)) for (const x of v) stringsIn(x, out);
-  else if (isRecord(v)) for (const x of Object.values(v)) stringsIn(x, out);
-}
-
-/** Entry points, most direct first: bin, then main, module, browser and exports. */
+/** Entry points, most direct first, from the same collector the publish check uses. */
 function declaredEntries(manifest: Record<string, unknown>): string[] {
-  const out: string[] = [];
-
-  for (const k of ["bin", "main", "module", "browser", "exports"] as const) stringsIn(manifest[k], out);
-
-  return out.filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
+  return entryPoints(manifest)
+    .map((e) => e.path)
+    .filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
 }
 
 function dirOf(p: string): string {
