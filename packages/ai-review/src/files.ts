@@ -4,7 +4,7 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, scriptTargets, type TarEntry } from "@apm/core";
+import { analyze, scriptTargets, type TarEntry, findingsOf } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
@@ -141,7 +141,8 @@ export function ruleSignalFiles(manifest: Manifest, files: readonly TarEntry[]):
   const paths = new Set(files.map((f) => f.path));
   const out = new Set<string>();
 
-  for (const s of analysis.signals) {
+  // every finding, scored or a capability (apm-score-v10 scores network, shell and eval at 0 but still cites them)
+  for (const s of findingsOf(analysis)) {
     if (!["credential-access", "shell-exec", "network", "eval", "obfuscated"].includes(s.id)) continue;
 
     for (const ev of s.evidence) {

@@ -17,6 +17,18 @@ const FILE_SIGNALS: ReadonlySet<string> = new Set([
   "install-download",
   "git-install-script",
   "dynamic-require",
+  // apm-score-v10's risk signals that cite files
+  "install-network",
+  "install-shell",
+  "install-eval",
+  "credential-read",
+  "credential-mention",
+  "encoded-data",
+  "exfiltration",
+  "capture-endpoint",
+  "remote-shell",
+  "runs-decoded-code",
+  "suspicious-combination",
 ]);
 
 /** Whether a signal's evidence names a file in the tarball, and so can quote its source after the citation. */

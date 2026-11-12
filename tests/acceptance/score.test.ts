@@ -4,7 +4,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRegistry, addUser, makeSandbox, writePackage, run, getJson, dig, type Registry, type PkgSpec } from "./harness";
+import { startRegistry, addUser, makeSandbox, writePackage, run, getJson, dig, findingIds, ScoreFindings, type Registry, type PkgSpec } from "./harness";
 
 const DAY = 24 * 60 * 60 * 1000;
 let clock = Date.parse("2026-03-01T00:00:00Z");
@@ -91,9 +91,14 @@ describe("security score", () => {
     const body = await score("dropper", "1.0.0");
     expect(scoreOf(body)).toBeLessThan(30);
     expect(String(dig(body, "grade"))).toBe("F");
-    const ids = signalsOf(body).map((s) => s.id);
+
+    // every finding is there, scored or a capability; the risks are what it does at install and the file it reads
+    const ids = findingIds(ScoreFindings.parse(body));
     for (const id of ["install-script", "shell-exec", "network", "credential-access", "eval"]) expect(ids).toContain(id);
-    const cred = signalsOf(body).find((s) => s.id === "credential-access");
+
+    // setup.js hands `curl … | sh` to execSync: a remote shell, and it reads ~/.npmrc beside a request at install
+    for (const id of ["remote-shell", "credential-read", "exfiltration", "install-network", "install-shell", "install-eval"]) expect(signalsOf(body).map((s) => s.id)).toContain(id);
+    const cred = signalsOf(body).find((s) => s.id === "credential-read");
     expect(cred?.points ?? 0).toBeLessThan(0);
     expect((cred?.evidence ?? []).join(" ")).toContain("setup.js");
   });
@@ -176,9 +181,12 @@ describe("score robustness (council round 1)", () => {
       alice,
     );
     clock += 2 * DAY;
-    const ids = signalsOf(await score("sneaky-loader", "1.0.0")).map((s) => s.id);
+    const body = await score("sneaky-loader", "1.0.0");
+    const ids = findingIds(ScoreFindings.parse(body));
     expect(ids).toContain("eval");
     expect(ids).toContain("network");
+    // the names hidden by joining and char codes are obfuscation (the decoded string itself is a harmless console.log)
+    expect(signalsOf(body).map((s) => s.id)).toContain("obfuscated");
   });
 
   test("the report says what it could not check", async () => {

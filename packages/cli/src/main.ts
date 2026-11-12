@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -103,6 +103,28 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
     for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(e)}`);
   }
   for (const s of info) say(`  ${dim(`   · ${s.id}  ${s.label}${s.evidence[0] ? ` (${s.evidence[0]})` : ""}`)}`);
+  printCapabilities(report.capabilities);
+}
+
+/** How a capability compares with the package's declaration, and what its evidence rests on, in a few words. */
+function capabilityNote(c: Capability): string {
+  const status = c.status === "declared" ? green("declared") : c.status === "undeclared" ? yellow("not in its declaration") : c.status === "unused" ? dim("declared, not seen used") : "";
+  const basis = c.basis === "text" ? dim("text mention") : c.basis === "possible" ? dim("possible") : "";
+
+  return [status, basis].filter((x) => x !== "").join(", ");
+}
+
+/** What the package can do: one line each, with its first evidence. Never scored on its own. */
+function printCapabilities(list: readonly Capability[]): void {
+  if (list.length === 0) return;
+  say(`  ${bold("capabilities")} ${dim("(what it can do; not scored)")}`);
+
+  for (const c of list) {
+    const note = capabilityNote(c);
+    say(`    ${c.id.padEnd(11)} ${dim(c.label.replace(/^[^:]+: /, ""))}${note ? `  ${note}` : ""}`);
+
+    if (c.evidence[0]) say(`        ${dim(c.evidence[0])}`);
+  }
 }
 
 // ---------- shared ----------

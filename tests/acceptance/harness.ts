@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdi
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
+import { z } from "zod";
 import { startWorkerRegistry, type WorkerRegistryOptions } from "./worker-registry.ts";
 
 export const ROOT = join(import.meta.dir, "..", "..");
@@ -433,6 +434,32 @@ export function dig(v: unknown, ...path: (string | number)[]): unknown {
   }
 
   return cur;
+}
+
+/** The id apm-score-v9 gave what apm-score-v10 lists as a capability, or as a risk signal that grades its evidence. */
+const AS_V9 = new Map([
+  ["capability:network", "network"],
+  ["capability:shell", "shell-exec"],
+  ["capability:eval", "eval"],
+  ["capability:native", "binary"],
+  ["capability:install", "install-script"],
+  ["signal:credential-read", "credential-access"],
+  ["signal:credential-mention", "credential-access"],
+  ["signal:encoded-data", "obfuscated"],
+]);
+
+/** The parts of a score report a detection test reads: the ids of its risk signals and of its capabilities. */
+export const ScoreFindings = z.object({ signals: z.array(z.object({ id: z.string() })).default([]), capabilities: z.array(z.object({ id: z.string() })).default([]) });
+
+/**
+ * Every finding of a score report, scored or not, by apm-score-v9's ids: its risk signals and its capabilities. What
+ * a detection test checks: that the finding is there, whatever it costs.
+ */
+export function findingIds(report: z.infer<typeof ScoreFindings>): string[] {
+  const signals = report.signals.flatMap((s) => [s.id, AS_V9.get(`signal:${s.id}`) ?? s.id]);
+  const capabilities = report.capabilities.flatMap((c) => [c.id, AS_V9.get(`capability:${c.id}`) ?? c.id]);
+
+  return [...new Set([...signals, ...capabilities])];
 }
 
 // ---------- sign-in: a fake GitHub, a cookie jar, TOTP and the device login ----------

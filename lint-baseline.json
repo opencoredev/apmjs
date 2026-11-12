@@ -30,7 +30,7 @@
       "anti-slop/no-known-value-widening": 3,
       "anti-slop/no-runtime-typeof": 2,
       "anti-slop/no-unknown-parameters": 3,
-      "anti-slop/require-readable-spacing": 17
+      "anti-slop/require-readable-spacing": 16
     },
     "packages/cli/src/config.ts": {
       "anti-slop/require-readable-spacing": 11

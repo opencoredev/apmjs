@@ -72,6 +72,7 @@ import {
   StoredEventDetail,
   packageTextShown,
   readmeShown,
+  withheldCapability,
   withheldDismissals,
   withheldFacts,
   withheldLimitations,
@@ -139,6 +140,9 @@ function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
     facts: withheld ? withheldFacts(r.facts) : r.facts,
     notChecked: withheld ? withheldLimitations(r.notChecked, v.manifest) : r.notChecked,
     skipped: withheld ? withheldSkipped(r.skipped, scoreFileRefs(r)) : r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })),
+    // a capability's evidence, variable names and declared text quote the package; a withheld version keeps only kinds
+    capabilities: withheld ? r.capabilities.map(withheldCapability) : r.capabilities,
+    declaration: r.declaration ? (withheld ? { kind: r.declaration.kind, notes: [] } : r.declaration) : null,
   };
 }
 
@@ -954,7 +958,10 @@ const packageResponse = (name: string) =>
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
       facts: latestFree?.facts ?? null,
-      score: latest && latestReport && latestFree ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, ...reviewable(latest, latestReport) } : null,
+      score:
+        latest && latestReport && latestFree
+          ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, capabilities: latestFree.capabilities, declaration: latestFree.declaration, ...reviewable(latest, latestReport) }
+          : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 200)

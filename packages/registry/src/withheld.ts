@@ -11,6 +11,7 @@ import {
   isValidPackageName,
   uncheckableReason,
   type DependencySpec,
+  type Capability,
   type DismissedEvidence,
   type Facts,
   type Signal,
@@ -53,6 +54,11 @@ export function withheldDismissals(list: readonly DismissedEvidence[], ref: File
 /** The files a withheld version's score did not read: each by reference, with its size and why it was not read. */
 export function withheldSkipped(list: readonly SkippedFile[], ref: FileRef): SkippedFile[] {
   return list.map((k) => ({ path: ref(k.path), size: k.size, reason: k.reason }));
+}
+
+/** A capability of a withheld version: what kind, whether it was declared and how sure; no evidence, names or text. */
+export function withheldCapability(c: Capability): Capability {
+  return { id: c.id, label: c.label, status: c.status, basis: c.basis, evidence: [] };
 }
 
 /** The package row fields that say whose readme it is. */

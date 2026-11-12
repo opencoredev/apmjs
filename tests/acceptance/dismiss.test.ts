@@ -31,13 +31,13 @@ async function score(name: string, version: string): Promise<{ status: number; b
 async function credentialItem(name: string, version: string): Promise<Item> {
   const s = await score(name, version);
   const evidence = dig(s.body, "signals");
-  const cred = Array.isArray(evidence) ? evidence.find((x) => dig(x, "id") === "credential-access") : undefined;
+  const cred = Array.isArray(evidence) ? evidence.find((x) => dig(x, "id") === "credential-mention") : undefined;
   const first = String(dig(cred, "evidence", 0) ?? "");
   const m = /^([^:]+):(\d+):/.exec(first);
 
   if (!m?.[1] || !m[2]) throw new Error(`no credential evidence: ${JSON.stringify(s.body)}`);
 
-  return { name, version, digest: String(dig(s.body, "digest")), scorer: String(dig(s.body, "scorer")), signal: "credential-access", file: m[1], line: Number(m[2]) };
+  return { name, version, digest: String(dig(s.body, "digest")), scorer: String(dig(s.body, "scorer")), signal: "credential-mention", file: m[1], line: Number(m[2]) };
 }
 
 /** What a request adds to the item: the reviewer's reason, the code. */
@@ -113,7 +113,7 @@ describe("dismissing score evidence", () => {
     expect((await putPublish(reg, alice, { name: "deny-list-a", version: "1.0.0", license: "MIT", main: "index.js" }, { files: { "index.js": DENY } })).status).toBe(201);
     const item = await credentialItem("deny-list-a", "1.0.0");
 
-    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(97);
     expect((await getJson(`${reg.url}-/apm/v1/evidence-admin/me`)).body).toEqual({ admin: false });
     expect(dig((await admin.json("-/apm/v1/evidence-admin/me")).body, "admin")).toBe(true);
     expect(dig((await outsider.json("-/apm/v1/evidence-admin/me")).body, "admin")).toBe(false);
@@ -136,7 +136,7 @@ describe("dismissing score evidence", () => {
     expect((await dismiss(admin, item, { code: "000000" })).status).toBe(401);
     // a reason is required
     expect((await dismiss(admin, item, { reason: " ", code: totp(adminSecret) })).status).toBe(400);
-    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-a", "1.0.0")).body, "score")).toBe(97);
   });
 
   test("the score is recomputed without the item, which stays listed as dismissed", async () => {
@@ -148,8 +148,8 @@ describe("dismissing score evidence", () => {
     const s = await score("deny-list-a", "1.0.0");
 
     expect(dig(s.body, "score")).toBe(100);
-    expect(ScoreSignals.parse(s.body).signals.map((x) => x.id)).not.toContain("credential-access");
-    expect(dig(s.body, "dismissed", 0, "signal")).toBe("credential-access");
+    expect(ScoreSignals.parse(s.body).signals.map((x) => x.id)).not.toContain("credential-mention");
+    expect(dig(s.body, "dismissed", 0, "signal")).toBe("credential-mention");
     expect(dig(s.body, "dismissed", 0, "reason")).toBe("A deny list: the dev server refuses to serve .npmrc.");
     expect(String(dig(s.body, "dismissed", 0, "evidence", 0))).toContain(".npmrc");
     // the package page, the version list and the packument's score agree
@@ -164,7 +164,7 @@ describe("dismissing score evidence", () => {
 
   test("a new version, another digest or another scorer is not affected", async () => {
     expect((await putPublish(reg, alice, { name: "deny-list-a", version: "1.0.1", license: "MIT", main: "index.js" }, { files: { "index.js": DENY } })).status).toBe(201);
-    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(97);
     expect(dig((await score("deny-list-a", "1.0.1")).body, "dismissed")).toEqual([]);
     const item = await credentialItem("deny-list-a", "1.0.1");
     const otherDigest = String(dig((await score("deny-list-a", "1.0.0")).body, "digest"));
@@ -176,7 +176,7 @@ describe("dismissing score evidence", () => {
     expect((await dismiss(admin, { ...item, scorer: "apm-score-v7" }, { code: totp(adminSecret) })).status).toBe(409);
     // an item the score does not cite
     expect((await dismiss(admin, { ...item, line: 99 }, { code: totp(adminSecret) })).status).toBe(404);
-    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-a", "1.0.1")).body, "score")).toBe(97);
   });
 
   test("an undo restores the item and its points", async () => {
@@ -188,9 +188,9 @@ describe("dismissing score evidence", () => {
     expect((await restore(admin, item, { code: totp(adminSecret), reason: "Reopened to check again." })).status).toBe(200);
     const after = await score("deny-list-a", "1.0.0");
 
-    expect(dig(after.body, "score")).toBe(75);
+    expect(dig(after.body, "score")).toBe(97);
     expect(dig(after.body, "dismissed")).toEqual([]);
-    expect(ScoreSignals.parse(after.body).signals.map((x) => x.id)).toContain("credential-access");
+    expect(ScoreSignals.parse(after.body).signals.map((x) => x.id)).toContain("credential-mention");
     expect((await restore(admin, item, { code: totp(adminSecret), reason: "Again." })).status).toBe(404);
   });
 
@@ -202,7 +202,7 @@ describe("dismissing score evidence", () => {
     expect(dismissed?.actor).toBe("octo-admin");
     expect(dig(dismissed?.detail, "reason")).toBe("A deny list: the dev server refuses to serve .npmrc.");
     expect(dig(dismissed?.detail, "version")).toBe("1.0.0");
-    expect(dig(dismissed?.detail, "signal")).toBe("credential-access");
+    expect(dig(dismissed?.detail, "signal")).toBe("credential-mention");
     expect(restored?.actor).toBe("octo-admin");
     // finding 4: the undo's own reason, and the reason it undid
     expect(dig(restored?.detail, "reason")).toBe("Reopened to check again.");
@@ -210,7 +210,7 @@ describe("dismissing score evidence", () => {
   });
 
   test("an upstream package's evidence can be dismissed, and its log is public", async () => {
-    expect(dig((await score("deny-list-upstream", "2.0.0")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-upstream", "2.0.0")).body, "score")).toBe(97);
     const item = await credentialItem("deny-list-upstream", "2.0.0");
 
     expect((await dismiss(admin, item, { code: totp(adminSecret) })).status).toBe(200);
@@ -233,7 +233,7 @@ describe("finding 2: a dismissal or an undo and its log entry are one write", ()
     const r = await dismiss(admin, item, { code: totp(adminSecret) }, { "x-apm-test-fault": "event-insert" });
 
     expect(r.status).toBe(500);
-    expect(dig((await score("deny-list-tx", "1.0.0")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-tx", "1.0.0")).body, "score")).toBe(97);
     expect(dig((await score("deny-list-tx", "1.0.0")).body, "dismissed")).toEqual([]);
     expect(await liveRows("deny-list-tx")).toBe(0);
     expect((await events("deny-list-tx")).filter((e) => e.kind.startsWith("evidence-"))).toEqual([]);
@@ -252,7 +252,7 @@ describe("finding 2: a dismissal or an undo and its log entry are one write", ()
     expect((await events("deny-list-tx")).map((e) => e.kind).filter((k) => k.startsWith("evidence-"))).toEqual(["evidence-dismissed"]);
     // with the log working, the same undo goes through
     expect((await restore(admin, item, { code: totp(adminSecret), reason: "Checking the fault." })).status).toBe(200);
-    expect(dig((await score("deny-list-tx", "1.0.0")).body, "score")).toBe(75);
+    expect(dig((await score("deny-list-tx", "1.0.0")).body, "score")).toBe(97);
   });
 });
 
@@ -264,7 +264,7 @@ describe("finding 3: a dismissed fallback item", () => {
     // a confirmed signal that also carries possible evidence to fall back to, as the scorer writes one
     await reg.query(
       `UPDATE versions SET score = jsonb_set(score, '{signals}', (
-         SELECT jsonb_agg(CASE WHEN s->>'id' = 'credential-access' THEN s || jsonb_build_object('fallback', jsonb_build_array($3::text)) ELSE s END)
+         SELECT jsonb_agg(CASE WHEN s->>'id' = 'credential-mention' THEN s || jsonb_build_object('fallback', jsonb_build_array($3::text)) ELSE s END)
          FROM jsonb_array_elements(score->'signals') s))
        WHERE package = $1 AND version = $2`,
       ["deny-list-fb", "1.0.0", FALLBACK],
@@ -275,7 +275,7 @@ describe("finding 3: a dismissed fallback item", () => {
     const after = await score("deny-list-fb", "1.0.0");
 
     // the confirmed item still counts; the fallback item is in the history
-    expect(dig(after.body, "score")).toBe(75);
+    expect(dig(after.body, "score")).toBe(97);
     expect(dig(after.body, "dismissed", 0, "file")).toBe("lib/list.js");
     expect(dig(after.body, "dismissed", 0, "reason")).toBe("Only a list.");
     expect((await restore(admin, item, { code: totp(adminSecret), reason: "Undoing a test dismissal." })).status).toBe(200);

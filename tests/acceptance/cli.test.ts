@@ -152,7 +152,10 @@ describe("apm: score, name, audit", () => {
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/\b\d{1,3}\/100\b/);
     expect(r.out).toContain("install-script");
-    expect(r.out).toContain("credential-access");
+    // it reads ~/.ssh/id_rsa at install: a risk signal; what it can do is listed apart, not scored
+    expect(r.out).toContain("credential-read");
+    expect(r.out).toContain("capabilities");
+    expect(r.out).toContain("network");
   });
 
   test("apm score --json is machine readable", async () => {

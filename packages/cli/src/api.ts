@@ -4,13 +4,28 @@ import type { Config } from "./config.ts";
 
 // confidence arrived with apm-score-v4; older answers asserted every signal
 export const SignalSchema = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
+
+/** What the package can do (apm-score-v10): listed with the score, never scored on its own. Older scorers send none. */
+export const CapabilitySchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  status: z.enum(["declared", "undeclared", "not-declared", "unused"]),
+  basis: z.enum(["code", "text", "possible", "none"]),
+  declared: z.string().optional(),
+  evidence: z.array(z.string()),
+  outside: z.array(z.string()).optional(),
+});
+
 export const ReportSchema = z.object({
   score: z.number(),
   grade: z.string(),
   signals: z.array(SignalSchema),
+  capabilities: z.array(CapabilitySchema).default([]),
   notChecked: z.array(z.string()).optional(),
   facts: z.record(z.string(), z.unknown()).optional(),
 });
+
+export type Capability = z.infer<typeof CapabilitySchema>;
 export type Signal = z.infer<typeof SignalSchema>;
 export type Report = z.infer<typeof ReportSchema>;
 

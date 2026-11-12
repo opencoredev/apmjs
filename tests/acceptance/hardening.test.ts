@@ -3,7 +3,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, getJson, dig, type Registry } from "./harness";
+import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, getJson, dig, findingIds, ScoreFindings, type Registry } from "./harness";
 
 const DAY = 24 * 60 * 60 * 1000;
 const PASSWORD = "correct-horse-battery";
@@ -73,7 +73,9 @@ describe("the score sees every file that runs", () => {
     expect(r.code, r.out).toBe(0);
     clock += 2 * DAY;
     const s = await getJson(`${reg.url}-/apm/v1/score/hidden-payload/1.0.0`);
-    expect(JSON.stringify(dig(s.body, "signals"))).toContain("credential-access");
+    expect(findingIds(ScoreFindings.parse(s.body))).toContain("credential-access");
+    // it reads ~/.npmrc: since apm-score-v10 that is the heavy signal, not a mention
+    expect(findingIds(ScoreFindings.parse(s.body))).toContain("credential-read");
   });
 });
 

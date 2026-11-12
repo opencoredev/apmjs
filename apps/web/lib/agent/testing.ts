@@ -25,7 +25,7 @@ export function pkg(over: Partial<PackageInfo> = {}): PackageInfo {
     maintainers: ["stevemao"],
     latest: "1.3.0",
     facts: { moduleFormat: "cjs", types: "none", installScripts: false, hasBin: false, license: "WTFPL", fileCount: 4, unpackedSize: 2048, dependencyCount: 0 },
-    score: { score: 75, grade: "B", signals: [NETWORK], notChecked: ["what the code does at runtime", "dependency foo@1 (could not score)"], scorer: "apm-score-v9", digest: "sha512-abc", dismissed: [], redacted: false },
+    score: { score: 75, grade: "B", signals: [NETWORK], notChecked: ["what the code does at runtime", "dependency foo@1 (could not score)"], scorer: "apm-score-v9", digest: "sha512-abc", dismissed: [], redacted: false, capabilities: [] },
     versions: [
       { version: "1.3.0", publishedAt: "2026-01-01T00:00:00.000Z", publishedBy: "stevemao", status: "active", statusReason: null, deprecated: null, score: 75, grade: "B" },
       { version: "1.2.0", publishedAt: "2025-01-01T00:00:00.000Z", publishedBy: "stevemao", status: "yanked", statusReason: "broken build", deprecated: null, score: 90, grade: "A" },

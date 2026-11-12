@@ -28,6 +28,8 @@ import {
   type FakeGitHub,
   type Browser,
   type RawManifest,
+  findingIds,
+  ScoreFindings,
 } from "./harness";
 import { scanPackages } from "../../packages/bun-scanner/src/index.ts";
 
@@ -464,9 +466,9 @@ describe("blocker 6: comment handling does not hide executable code", () => {
     const r = await putPublish(reg, alice, { name: `comment-probe-${++n}`, version: "1.0.0", license: "MIT", main: "index.js" }, { files: { "index.js": code } });
 
     expect(r.status, JSON.stringify(r.body)).toBe(201);
-    const signals = dig(r.body, "score", "signals");
 
-    return Array.isArray(signals) ? signals.map((s) => String(dig(s, "id"))) : [];
+    // every finding, scored or a capability (apm-score-v10 lists network, shell and eval at no cost)
+    return findingIds(ScoreFindings.parse(dig(r.body, "score")));
   }
 
   test("a closed /* comment */ in front of code does not hide it", async () => {

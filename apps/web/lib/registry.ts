@@ -22,6 +22,28 @@ const Dismissed = z.object({ signal: z.string(), file: z.string(), line: z.numbe
 
 export type Dismissed = z.infer<typeof Dismissed>;
 
+/** What a version can do (apm-score-v10), each with its evidence: shown beside the score, never scored on its own. */
+const Capability = z.object({
+  id: z.enum(["network", "env", "filesystem", "shell", "eval", "native", "install"]),
+  label: z.string(),
+  status: z.enum(["declared", "undeclared", "not-declared", "unused"]),
+  basis: z.enum(["code", "text", "possible", "none"]),
+  declared: z.string().optional(),
+  evidence: z.array(z.string()),
+  names: z.array(z.string()).optional(),
+  outside: z.array(z.string()).optional(),
+});
+
+export type Capability = z.infer<typeof Capability>;
+
+/** Whether the package declares its capabilities, and what apm could not use in the declaration. */
+const Declaration = z.object({ kind: z.enum(["none", "declared"]), notes: z.array(z.string()) });
+
+export type Declaration = z.infer<typeof Declaration>;
+
+// added with apm-score-v10; an older registry or scorer sends neither
+const CapabilityFields = { capabilities: z.array(Capability).default([]), declaration: Declaration.nullish() };
+
 // what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out.
 // `redacted`: the version is revoked and its signals carry no evidence lines. Required: a registry too old to send it
 // may not redact either, so its answer is refused as unreadable rather than shown (packages/infra/deploy.ts).
@@ -41,7 +63,7 @@ const Facts = z.object({
 export type Facts = z.infer<typeof Facts>;
 
 /** A version's full score as the package answer (latest) and the versions route (any version) carry it. */
-const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
+const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable, ...CapabilityFields });
 
 const PackageInfo = z.object({
   name: z.string(),
@@ -154,7 +176,7 @@ const VersionInfo = z.object({ version: z.string(), status: z.string(), statusRe
 /** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
 export const getVersionInfo = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> => getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo);
 
-const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
+const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable, ...CapabilityFields });
 
 export type VersionScore = z.infer<typeof VersionScore>;
 

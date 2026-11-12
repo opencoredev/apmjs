@@ -13,13 +13,16 @@ function entry(path: string, text: string): TarEntry {
   return { path, size: data.length, mode: 0o644, data };
 }
 
-function inputOf(files: Record<string, string>, extra: Record<string, unknown> = {}) {
+/** What a test adds to the manifest: lifecycle scripts, and a capability declaration (well formed or not). */
+type Extra = { scripts?: Record<string, string>; apm?: { capabilities: Record<string, string | boolean | string[]> } };
+
+function inputOf(files: Record<string, string>, extra: Extra = {}) {
   const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", ...extra };
 
   return { name: "probe-pkg", manifest, files: [entry("package.json", JSON.stringify(manifest)), ...Object.entries(files).map(([p, t]) => entry(p, t))], publisher: "a", previousPublishers: [] };
 }
 
-function scored(files: Record<string, string>, extra: Record<string, unknown> = {}): Analysis {
+function scored(files: Record<string, string>, extra: Extra = {}): Analysis {
   return analyze(inputOf(files, extra));
 }
 

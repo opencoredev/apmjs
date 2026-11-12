@@ -8,7 +8,7 @@ import { packageCard, packageCardInput } from "@/components/og-card";
 import { pkg } from "./agent/testing";
 
 describe("the package OG card", () => {
-  const answer = pkg({ name: "og-widget", latest: "2.4.1", description: "LEAKMARK-og-description", score: { score: 82, grade: "B", signals: [], notChecked: [], scorer: "apm-score-v9", digest: "sha512-abc", dismissed: [], redacted: false } });
+  const answer = pkg({ name: "og-widget", latest: "2.4.1", description: "LEAKMARK-og-description", score: { score: 82, grade: "B", signals: [], notChecked: [], scorer: "apm-score-v9", digest: "sha512-abc", dismissed: [], redacted: false, capabilities: [] } });
 
   test("shows the name, latest version, score and grade, and not the description", () => {
     const input = packageCardInput({ name: "og-widget", pkg: answer });

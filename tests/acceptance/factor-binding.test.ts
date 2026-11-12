@@ -32,12 +32,12 @@ const Signals = z.object({ digest: z.string(), scorer: z.string(), signals: z.ar
 /** The credential items a version's score cites, by file and line. */
 async function credentialItems(name: string, version: string): Promise<Item[]> {
   const s = Signals.parse((await getJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`)).body);
-  const cred = s.signals.find((x) => x.id === "credential-access");
+  const cred = s.signals.find((x) => x.id === "credential-mention");
 
   return (cred?.evidence ?? []).flatMap((e) => {
     const m = /^([^:]+):(\d+):/.exec(e);
 
-    return m?.[1] && m[2] ? [{ name, version, digest: s.digest, scorer: s.scorer, signal: "credential-access", file: m[1], line: Number(m[2]) }] : [];
+    return m?.[1] && m[2] ? [{ name, version, digest: s.digest, scorer: s.scorer, signal: "credential-mention", file: m[1], line: Number(m[2]) }] : [];
   });
 }
 
@@ -115,7 +115,7 @@ describe("finding 1: a factor confirms one action", () => {
     // what the website used to send after a passkey check
     expect((await dismiss(admin, item, { passkey: true })).status).toBe(401);
     expect((await admin.json("api/auth/two-factor/disable", { method: "POST", body: {}, headers: { "x-apm-second-factor": "passkey" } })).status).toBe(403);
-    expect(await score("bound-a", "1.0.0")).toBe(75);
+    expect(await score("bound-a", "1.0.0")).toBe(97);
   });
 
   test("a passkey check made for one evidence item or reason cannot dismiss another, and works once", async () => {
@@ -128,7 +128,7 @@ describe("finding 1: a factor confirms one action", () => {
     expect((await dismiss(admin, b, { confirmation: id })).status).toBe(401);
     expect((await dismiss(admin, a, { confirmation: id, reason: "Another reason." })).status).toBe(401);
     expect((await admin.json("-/apm/v1/review-admin/decide", { method: "POST", body: { name: a.name, version: a.version, digest: a.digest, decision: "dismiss", confirmation: id } })).status).toBe(401);
-    expect(await score("bound-a", "1.0.0")).toBe(75);
+    expect(await score("bound-a", "1.0.0")).toBe(97);
     // the item it was made for
     expect((await dismiss(admin, a, { confirmation: id })).status).toBe(200);
     // once: the same confirmation does not undo it

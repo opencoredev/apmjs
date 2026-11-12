@@ -34,6 +34,7 @@ import type { Metadata } from "next";
 import { JsonLd } from "@/components/json-ld";
 import { packageJsonLd, packageMetadata, pageMetadata } from "@/lib/agent/seo";
 import { canonicalPackagePath } from "@/lib/agent/site";
+import { CapabilityList } from "@/components/capability-list";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -112,8 +113,27 @@ function Evidence(props: { signal: string; evidence: string; name: string; versi
   );
 }
 
-/** The signals whose evidence an apm reviewer may dismiss: what the source rules read, not facts like an install script. */
-const DISMISSABLE: ReadonlySet<string> = new Set(["shell-exec", "network", "credential-access", "eval", "obfuscated"]);
+/**
+ * The signals whose evidence an apm reviewer may dismiss: what the source rules read, not facts like an install script
+ * (DISMISSABLE in packages/core/src/score.ts). The first five are apm-score-v9's, for versions it scored.
+ */
+const DISMISSABLE: ReadonlySet<string> = new Set([
+  "shell-exec",
+  "network",
+  "credential-access",
+  "eval",
+  "obfuscated",
+  "credential-read",
+  "credential-mention",
+  "encoded-data",
+  "exfiltration",
+  "capture-endpoint",
+  "remote-shell",
+  "runs-decoded-code",
+  "install-network",
+  "install-shell",
+  "install-eval",
+]);
 
 /** What names one evidence item for a reviewer's control, or null when it cites no file line or the score has no digest. */
 type ItemKey = { name: string; version: string; digest: string; scorer: string };
@@ -543,7 +563,7 @@ async function AiReviewSlot({ review, signInHref }: { review: Promise<Fetched<Re
   if (r.kind !== "ok") return null;
 
   return (
-    <section aria-labelledby="ai-review" className="order-5 lg:order-none">
+    <section aria-labelledby="ai-review" className="order-6 lg:order-none">
       <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{r.value.version}</span>}>
         AI review
       </SectionTitle>
@@ -554,7 +574,7 @@ async function AiReviewSlot({ review, signInHref }: { review: Promise<Fetched<Re
 
 function AiReviewLoading({ version }: { version: string }) {
   return (
-    <section aria-labelledby="ai-review" aria-busy="true" className="order-5 lg:order-none">
+    <section aria-labelledby="ai-review" aria-busy="true" className="order-6 lg:order-none">
       <SectionTitle id="ai-review" aside={<span className="font-mono text-sm text-muted-foreground">{version}</span>}>
         AI review
       </SectionTitle>
@@ -580,7 +600,7 @@ async function PublicLog({ events }: { events: Promise<Fetched<PackageEvent[]>> 
 
   if (e.kind === "unavailable") {
     return (
-      <section aria-labelledby="log" className="order-8 lg:order-none">
+      <section aria-labelledby="log" className="order-9 lg:order-none">
         <SectionTitle id="log">Public log</SectionTitle>
         <p className="text-[15px] text-muted-foreground">Couldn&apos;t load the public log. The registry did not answer; reload to try again.</p>
       </section>
@@ -590,7 +610,7 @@ async function PublicLog({ events }: { events: Promise<Fetched<PackageEvent[]>> 
   if (e.kind !== "ok" || e.value.length === 0) return null;
 
   return (
-    <section aria-labelledby="log" className="order-8 lg:order-none">
+    <section aria-labelledby="log" className="order-9 lg:order-none">
       <SectionTitle id="log">Public log</SectionTitle>
       <ol className="relative flex flex-col gap-5 border-l pl-5">
         {e.value.slice(0, 15).map((ev, i) => (
@@ -693,8 +713,8 @@ async function PackageContent({ params, searchParams }: PageProps) {
         )}
       </header>
 
-      {/* Phones get one column in reading order: install, score summary, facts, the full report, readme,
-          versions. From lg the two wrappers become columns and the order classes stop applying. */}
+      {/* Phones get one column in reading order: install, score summary, facts, the full report, capabilities, the AI
+          review, readme, versions. From lg the two wrappers become columns and the order classes stop applying. */}
       <div className="flex flex-col gap-10 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-14">
         <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
           <div className="order-1 lg:order-none">
@@ -706,20 +726,29 @@ async function PackageContent({ params, searchParams }: PageProps) {
             {score ? <ScorePanel score={score} name={pkg.name} version={version} /> : <p className="rounded-xl bg-surface px-5 py-4 text-muted-foreground">Not scored yet.</p>}
           </section>
 
+          {score && (score.capabilities.length > 0 || score.scorer === "apm-score-v10") && (
+            <section aria-labelledby="capabilities" className="order-5 lg:order-none">
+              <SectionTitle id="capabilities" aside={<span className="text-sm text-muted-foreground">not scored</span>}>
+                Capabilities
+              </SectionTitle>
+              <CapabilityList capabilities={score.capabilities} declaration={score.declaration} name={pkg.name} version={version} />
+            </section>
+          )}
+
           {version && (
             <Suspense fallback={<AiReviewLoading version={version} />}>
               <AiReviewSlot review={review} signInHref={signInHref} />
             </Suspense>
           )}
 
-          <section aria-labelledby="readme" className="order-6 lg:order-none">
+          <section aria-labelledby="readme" className="order-7 lg:order-none">
             <SectionTitle id="readme">Readme</SectionTitle>
             <Suspense fallback={<Skeleton className="h-12 w-full rounded-xl" />}>
               <ReadmeSlot name={pkg.name} pkg={pkg} version={version} tarball={tarballReadme} links={links} />
             </Suspense>
           </section>
 
-          <section aria-labelledby="versions" className="order-7 lg:order-none">
+          <section aria-labelledby="versions" className="order-8 lg:order-none">
             <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>
               Versions
             </SectionTitle>
