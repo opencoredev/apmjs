@@ -30,15 +30,19 @@ Every file is read whole, as text, including comments, regular expressions and T
 
 ## Where values go
 
-In JavaScript and TypeScript, apm follows values to the calls that use them. It knows where a value came from: the whole environment, a credential file's path or contents, a network response, or the program's own source. It follows that value through variables, aliases, callbacks, function calls and returns, string building, and into other files of the package that import it. The calls it watches are the ones that run code (`eval` under any name, `Function`, `vm`, a `Worker` from a string), start a process, send a request or read a file.
+In JavaScript and TypeScript, apm follows values to the calls that use them. It knows where a value came from: the whole environment, a credential file's path or contents, a network response, or the program's own source. It follows that value through variables, aliases, callbacks, events (`emit` to a listener), generators and `for await`, string building, what a program puts into an array, object or `Map` (also through another name for it), and into other files of the package that import it. Each call of a helper function is worked out with that call's own arguments, so `id(process.env)` in one place and `id('public')` in another are told apart, and each property of an object keeps what was put there, so sending `tokens.npm` is not sending every token in `tokens`. The calls it watches are the ones that run code (`eval` under any name, `Function`, `vm`, a `Worker` from a string), start a process, send a request (including through `curl` or `wget` arguments) or read a file, and a file the program writes and then loads or runs.
 
 That is what makes the heaviest signals sure:
 
 - the environment, a credential file's contents or three kinds of tokens reaching a request is `exfiltration`, enough to refuse on its own;
-- a download reaching an evaluator, or reaching a process as the whole command (`exec(body)`), is `remote-shell`, also enough to refuse on its own;
+- a download reaching an evaluator, reaching a process as the whole command (`exec(body)`), or written to a file that is then loaded or run, is `remote-shell`, also enough to refuse on its own; a download put into a longer command (`exec('echo ' + body)`) is a possible `remote-shell`, which refuses at install;
 - a credential path reaching a file read is `credential-read`.
 
-Code a file keeps as text is read as a program too: a string it runs, a comment or regex it turns back into code with `String(fn)` or `.source` and runs, or a string that holds a program. What that code does counts where the file holds it, so code an install script runs still counts as install time.
+Code a file keeps as text is read as a program too: a string it runs, a comment or regex it turns back into code with `String(fn)` or `.source` and runs (padding is squeezed out first), or a string that holds a program. What that code does counts where the file holds it, so code an install script runs still counts as install time. A program a module only exports as text (example code a generator ships) adds its risks, but not a confirmed flow.
+
+Small decoder functions a package defines (`h => h.replace(/../g, m => String.fromCharCode(parseInt(m, 16)))`) are run on the strings they are called with, so a name hidden behind one is read.
+
+The analysis is bounded for any input: values another file gives are worked out once per export, with a work budget for the whole package, and the whole analysis has a time limit. When a budget or limit is reached, or code that runs is longer than apm reads, the result says so (`incomplete`, or `unanalyzed-files` for files nothing runs). It never reads as clean.
 
 Images, fonts, archives and WebAssembly are recognised by their bytes and skipped. Executables and native `.node` modules are listed as `binary`. A file over 32 MB, or code past the 200 MB total, is not read and marks the analysis `incomplete`, which on its own puts the version below the floor.
 
@@ -90,18 +94,22 @@ A finding made only of text matches says so: a credential name in text is `crede
 
 Every signal cites the place it came from: `file:line` and the line itself. A joined string is cited where its first piece is, a decoded payload where the decoder is called. A file in a test folder says `(in a test file)`. On apmjs.dev every citation links to the file, opened at that line.
 
-## What it cannot catch
+## What the score does not catch
 
-Every score carries this list as "not checked":
+Every score carries a shorter form of this list as "not checked". These are known, and left on purpose:
 
-- **Runtime behaviour.** Code that downloads, decrypts or assembles a second stage while running. A loader that runs what it fetched scores low, but the score cannot say what the second stage does.
+- **One named token sent the way a tool sends it.** `fetch(url, { headers: { authorization: process.env.NPM_TOKEN } })` is what every registry client does, and a stealer that sends one token looks the same. So does a CLI that reads `~/.npmrc` and sends the `_authToken` entry for a registry; the read costs points, the send does not. The whole environment, a credential file's whole contents, or three families of tokens in one request are caught.
 - **Where data goes.** A request to an API and one to an attacker look the same, so code that only uses the network costs nothing outside install time. It is listed under [capabilities](/concepts/capabilities), and the [AI review](/concepts/ai-review) reads it.
-- **Other encodings.** XOR, compression, a custom alphabet, or base64 inside base64.
-- **Names and values built some other way**: array lookups, computed indexes, values read from a file at runtime, and strings built by an obfuscator's lookup tables. apm follows values through functions in the same file and through other files' exports, but treats every call of one function alike.
+- **Payloads in dependencies.** A package that hands `process.env` to a dependency, or only declares one, has no payload of its own. That dependency has its own score, which `risky-dependency` uses.
+- **Typosquats with no visible payload.** A name like a popular package's costs points (`typosquat`), but a squat that ships a copy of the real code and nothing else passes.
+- **Destructive code that does not steal or download.** Code that deletes files, wipes a disk or corrupts a build, with nothing sent or fetched, uses only capabilities, so it costs nothing outside install time.
+- **WebAssembly and native code.** Their internals are never read; a module is listed, and a value a WebAssembly import receives is followed only on the JavaScript side.
+- **Runtime behaviour.** Code that downloads, decrypts or assembles a second stage while running. A loader that runs what it fetched scores low, but the score cannot say what the second stage does.
+- **Other encodings.** XOR, compression, a custom alphabet, base64 inside base64, unless a small decoder function in the package does it.
+- **Names and values built some other way**: values read from a file at runtime, strings built by an obfuscator's lookup tables, an object filled in by a function it is passed to, and events a class emits on itself (`this.emit`).
+- **A downloaded field in a command.** `exec('npm view pkg@' + json.version)` is a value in a command, not a command, so it costs nothing; the whole downloaded body in a command does.
 - **Files only a computed path loads.** Docs, JSON and style files are read only when code reaches them by a path apm can work out. `require(name)` pointing elsewhere shows up as `dynamic-require`.
-- **Native code and WebAssembly.** Listed, never read.
 - **A popular name under another scope**, such as `@someone/react`. Scopes exist so names can be reused.
-- **Dependencies' own code.** Each dependency has its own score, which `risky-dependency` uses.
 - **The publisher's machine or CI.** A compromised build that ships a quiet backdoor in clean-looking code scores well.
 
 ## Why it has false positives, and what fixes them
