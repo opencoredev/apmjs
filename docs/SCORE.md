@@ -1,8 +1,116 @@
 # The apm score
 
-Every version gets a number from 0 to 100, computed once from its tarball, its `package.json` and its publish history (`analyze` and `finalize` in `packages/core/src/score.ts`). It starts at 100 and every deduction is a named signal with the file and line that caused it. Below 40 (the floor), `apm add`, the `~safe` registry view and the scanners refuse the version unless you pass `--force`.
+Every version gets a number from 0 to 100, computed once from its tarball, its `package.json` and its publish history (`analyze` and `finalize` in `packages/core/src/score.ts`). It starts at 100 and every deduction is a named risk signal with the file and line that caused it. Below 40 (the floor), `apm add`, the `~safe` registry view and the scanners refuse the version unless you pass `--force`.
+
+Since **apm-score-v10** the number measures what is suspicious, not what a package can do. What it can do (the network, environment variables, the filesystem, child processes, dynamic code, native code, install scripts) is listed beside the score as **capabilities**, each with its evidence, and costs nothing. Points go to what malware does: code that runs at install and reaches the network or starts processes, credential files read, the environment collected and sent, request bins and webhooks, remote shells and code run from a download, obfuscation, look-alike names, new publishers, risky dependencies, and capabilities a package's own declaration leaves out. The next section has the model and its weights; the rest of this page describes how files are read, which has not changed since v9.
 
 The score is a static read of text. It is a strong filter for the droppers that make up most npm malware, and a weak one against an author who knows it exists and is willing to write code that only reveals itself at runtime. Read a high score as "nothing on this list was found", not as "safe".
+
+## apm-score-v10: capabilities and risk signals
+
+### Why
+
+v9 deducted points per capability. `@opencoredev/email-sdk` 3.0.1, a legitimate SDK, scored 50: 25 points for the strings `"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"` in its CLI help, 15 because bundled nodemailer loads `child_process` for its sendmail transport, 10 for calling email APIs. Popular packages lost points the same way (41 of 70 scored 80 or more), while a dependency-confusion probe whose postinstall sends the machine's identity to a request bin scored 75: an install script and a `fetch` cost the same as any SDK's. The AI release review evaluation (`research/ai-review-eval.md`) found the v9 rules caught 9 of 40 malicious samples below 60.
+
+### Capabilities (0 points)
+
+| Capability | From | Evidence |
+| --- | --- | --- |
+| `network` | v9's `network` findings | every citation v9 made |
+| `env` | `process.env.X`, `process.env['X']`, `const { X } = process.env`, `Bun.env`, `Deno.env.get`, and reads by a computed name; plus whole-environment reads | the line of each, and the variable names |
+| `filesystem` | loading `fs`, `fs/promises`, `fs-extra`, `graceful-fs`, `Bun.file`/`Bun.write`, `Deno` file calls | the load |
+| `shell` | v9's `shell-exec` findings | every citation v9 made |
+| `eval` | v9's `eval` findings (eval, Function, vm, string timers, a Worker from a string, inspector evaluation) | every citation v9 made |
+| `native` | v9's `binary` findings, and `binding.gyp` | the file |
+| `install` | v9's `install-script` findings | the hook |
+
+Each capability says what its evidence rests on: `code` (a call or load the parsed program showed, a command, a file), `text` (only text matches, such as a variable name in help output or `curl` in a comment), or `possible`. Each line of evidence keeps v9's wording, so "(text match)" and "(text match in a comment)" still say where a match sits. The version page lists capabilities in their own section, apart from the score; `apm score`, `apm add` and the publish preview print them under the score.
+
+**Detection does not shrink.** Every v9 finding is still in the analysis, as a capability or as a risk signal. `findingsOf(analysis)` names each finding by the id v9 gave it (a capability by its v9 code signal, `credential-read` and `credential-mention` as `credential-access`, `encoded-data` as `obfuscated`), and `test/superset.ts` checks the property v9 established, now in this form: on any package, v10's findings include every finding apm-score-v3 makes, confirmed where v3 confirmed it, citing every file v3 cites. The score is no longer compared with v3's; v10 scores capabilities at 0 by design.
+
+### Risk signals and their weights
+
+| Signal | Points | Fires on | Why this weight |
+| --- | ---: | --- | --- |
+| `remote-shell` | -50 | A command the code hands a process that opens a shell to another machine or downloads a program and runs it (`/dev/tcp/`, `nc -e`, `sh -i`, `curl … \| sh`, `curl -o x; chmod +x`, PowerShell `IEX … DownloadString` or `-EncodedCommand`, `certutil -urlcache`), or an evaluator handed a value right after a network call (`eval(r.data)`, `new Function.constructor("require", body)`) | It is the dropper itself. Only commands the parsed program passes to `exec`, `spawn` and the like count, so install instructions a CLI prints do not; in a file with no tree, or code that runs at install, the text counts |
+| `capture-endpoint` | -50 | A request bin or out-of-band host (`webhook.site`, Burp Collaborator and `oast.*`, `interact.sh`, `pipedream.net`, `requestbin`, `canarytokens`, `dnslog.cn`), a Discord, Slack or Telegram webhook with its secret in the URL, a raw ngrok TCP tunnel | Shipped code has no reason to send to a bin that anyone can read; every dependency-confusion probe in the sample set uses one |
+| `install-download` | -40 | As in v9: an install, git-install or `binding.gyp` command that runs `curl`/`wget`, pipes into a shell, runs `npx` for a package that is not a dependency, or `node -e` with network or process code | Unchanged |
+| `exfiltration` | -35 | What a stealer collects and the network together: the whole environment (`JSON.stringify(process.env)`, `Object.keys/entries/values(process.env)`, `for … in process.env`), a credential file read, or tokens of three credential families (npm, GitHub, AWS, Google Cloud, Azure, CI, chat, AI keys), within 1,500 characters of a network call or in a file under 16 KB; at install, also the machine's identity (`os.hostname()`, `os.userInfo()`, `networkInterfaces()`, `whoami`, an IP-lookup service) or one token, anywhere in install-time code | The exfiltration pattern. Reading one API key and calling an API is what SDKs do, so one variable is not enough outside install time |
+| `credential-read` | -30 | A credential file read: `.npmrc`, `.yarnrc`, `.pypirc`, SSH keys, cloud and container credentials, `.git-credentials`, `.netrc`, shell history, GnuPG, browser profiles (`Login Data`, `Local State`, extension storage) and wallet stores, within 300 characters of a file read or a `cat`/`cp`/`tar`; an install command naming one; or one a file hid by joining or escaping it | Reading another tool's secrets is what stealers do; few libraries read `~/.npmrc` |
+| `runs-decoded-code` | -25 | Code run from a string that was decoded or joined first, or a network, process or credential call kept inside a string the code runs (`Function("fetch(u)")()`) | Hiding behaviour in strings |
+| `install-network` | -25 | A network finding in code that runs at install: the hooks' commands (including `prepare`, which a git install runs), the files they run, and every file those load or start with a command | The second step of most install-time malware |
+| `obfuscated` | -20 | Obfuscator output (20 or more `_0x` identifiers), `\x` escapes or quoted base64 that decode to readable text, or a dangerous name found only by joining or decoding strings (including a name only the tokenizer reads, in a file with no tree) | Legitimate packages rarely ship obfuscator output; data tables and WebAssembly are `encoded-data` |
+| `typosquat` | -20 | As in v9 | Unchanged |
+| `install-shell` | -15 | A process started at install (as `install-network`), or an install command that runs a shipped compiled program | Build steps run `node-gyp` or `tar` legitimately, so lighter than network |
+| `install-eval` | -15 | Dynamic code at install | As `install-shell` |
+| `suspicious-combination` | -15, -10 each more, at most -30 | Dynamic code, the network and an install script in one package; obfuscated code that uses the network, starts processes or loads modules by computed names; a capture endpoint in a file that starts processes; install-time code that starts a detached process; processes at install in a package that ships a compiled program its `bin` does not name; a look-alike name with an install script | Each capability alone is ordinary; these pairings are what the sample set's malware has and the corpus does not |
+| `risky-dependency` | -30 | As in v9 | Unchanged |
+| `undeclared-capability` | -10, -5 each more, at most -20 | A capability the code uses (with `code` evidence) that the package's declaration leaves out | Moderate: the package said what it does and the code does more |
+| `install-script` | -10 | `preinstall`, `install`, `postinstall` or `binding.gyp`, whatever it does | Install-time code is how most malware runs, so it costs something on its own; what it does there costs more |
+| `git-install-script` | -10 | As in v9 | Unchanged |
+| `new-publisher` | -10 | As in v9 | Unchanged |
+| `yanked` | -10 | Hidden by its maintainer | A yanked version is one its own maintainer pulled |
+| `new-dependency` | -5 | As in v9 | Unchanged |
+| `deprecated` | -5 | As in v9 | Unchanged |
+| `credential-mention` | -3 (-1 possible) | Text that names a credential file or token variable, with no read: a deny list, help text, a token read from `process.env` to send to the service it belongs to | Weak evidence: names alone are what SDKs and CLIs print |
+| `encoded-data` | -2 (-1 possible) | v3's `obfuscated` rule matched only data: base64 or `\x` runs that decode to WebAssembly, fonts or tables | Weak evidence |
+| `incomplete` | -61 | As in v9 | Unchanged: unread code cannot pass |
+| `unanalyzed-files` | -20 | As in v9 | Unchanged |
+| `revoked` | -100 | As in v9 | Unchanged |
+| `dynamic-require`, `recent`, `no-license` | 0 | As in v9 (`no-license` cost 3 in v9) | Shown, not scored: a missing license is not suspicious |
+
+Every risk signal cites its evidence the way v9's signals did, and an apm reviewer can dismiss evidence of the code risks (`credential-read`, `credential-mention`, `encoded-data`, `obfuscated`, `exfiltration`, `capture-endpoint`, `remote-shell`, `runs-decoded-code`, `install-network`, `install-shell`, `install-eval`) for one tarball digest, as before.
+
+### Declared capabilities
+
+A package can say what it does in its `package.json`:
+
+```json
+{
+  "name": "@opencoredev/email-sdk",
+  "apm": {
+    "capabilities": {
+      "network": ["api.resend.com", "*.amazonaws.com"],
+      "env": ["AWS_*", "RESEND_API_KEY", "*_BASE_URL", "SMTP_*"],
+      "filesystem": "reads attachment files",
+      "shell": "sendmail transport"
+    }
+  }
+}
+```
+
+The keys are `network`, `env`, `filesystem`, `shell`, `eval`, `native` and `install`. A value is a reason (a string), `true`, or a list; `false`, `""` and `[]` declare nothing. A capability the code uses and the declaration lists is shown as declared. One the code uses (with `code` evidence; a text mention does not count) and the declaration leaves out is `undeclared-capability`. One declared and never seen is shown as "declared, not seen used", a note. For `env`, the list is variable names where `*` stands for any run of characters; variables read outside it are listed under the capability, not scored. Network hosts are shown as declared, not checked against the URLs in the code: too many URLs in code are documentation links for a host check to mean anything. A declaration never cancels a risk signal. A package without a declaration, which is most of npm, is scored on risk signals alone; an `apm` field without `capabilities`, or one apm cannot read, counts as no declaration (the second with a note), so a typo cannot cost points.
+
+### Measured
+
+Scored with v9 (`origin/main`, b0f648e) and v10 on the same inputs, without publisher history or dependency scores (so `new-publisher` and `risky-dependency` cannot fire, as in the AI review evaluation). The scripts are `tools/score-eval/`.
+
+**The 40 malicious samples** of the AI review evaluation (DataDog's dataset; read as bytes, never installed or run): **25 score below the floor under v10, against 9 under v9**, and every sample v9 refused is still refused. Mean 59.6 → 38.2.
+
+| v9 → v10 | Samples |
+| --- | --- |
+| refused by both | 9: @ctrl/tinycolor 25 → 0, react-sideflow 15 → 0, translation-note, fatfingers-hello and example-infinite-scroll 20 → 10, fmt-helpers 35 → 12, vaildator 10 → 15, dotevn 20 → 15, js-uponcaps 30 → 35 |
+| newly refused | 16: @rspack/core 40 → 0, five request-bin probes 75 → 0, @cloudplatform-single-spa/installations 60 → 0, terser-js, ethsg-util, distdiscord and @saferpay/eslint-config-base → 15, wrb3 40 → 25, eslint-config-prettier 55 → 30, is 65 → 30, @seznam-diskuze/web 75 → 30, elf-stats 75 → 35 |
+| above the floor in both | 15 |
+
+The 15 above the floor, each read: six have no payload in the tarball (jimg, @frefrefre/testhackerrr and kleiner-perkins, as the evaluation found; naniod and bingo-logger, whose code hands `process.env` and the home directory to, or is, a dependency that carries the payload, which `risky-dependency` catches once that dependency is scored; client-req-scopes, which copies its own files). Four are typosquats whose code does nothing apm sees (uudi, rimarf, yarsg; jimg above), at 80 for the name. @solana/web3.js 1.95.7 sends keys to an attacker's host with an ordinary `fetch` in an 11,000-line bundle, which only knowledge of the host can tell. debug 4.4.2 (65) and math-crypto (65) are obfuscated browser and wallet code with no install step; chai-prop (50) runs code it fetches, which `remote-shell` now catches, with nothing else suspicious; apache-iotdb (60) starts its payload detached at install from a path with a typo apm cannot resolve; chief-proxy-out (100) downloads an image into the working directory. Three rules came from reading the samples that first passed under v10: a credential name hidden by escapes counts as a read (vaildator, dotevn, js-uponcaps had dropped to 42 to 62 as mentions), an evaluator fed a response counts as running fetched code (js-uponcaps, chai-prop), and a file an install-time command starts runs at install (wrb3).
+
+**The 70 popular tarballs:** **67 score 80 or more, against 41 under v9**; mean 80.4 → 96.9, median 85 → 100; none below the floor (v9: vite at 30).
+
+| Score | v9 | v10 |
+| --- | ---: | ---: |
+| 100 | 14 | 52 |
+| 90–99 | 17 | 14 |
+| 80–89 | 10 | 1 |
+| 60–79 | 20 | 1 |
+| 40–59 | 8 | 2 |
+| below 40 | 1 | 0 |
+
+The three below 80 do at install what the signals describe: esbuild (50) and bun (50) download a binary with `https`/`fetch` and run it from their postinstall, and @swc/core (75) runs `npm install` from its postinstall. @sentry/node (80) keeps its worker scripts in base64 that decodes to code. The 90s are install scripts that build or set up and reach no network or process apm can follow (bcrypt, better-sqlite3, canvas, core-js, puppeteer); 95 to 98 are `encoded-data` (WebAssembly and tables in base64 or `\x` runs) and `credential-mention` (`.npmrc` in vite's and vitest's deny lists).
+
+**@opencoredev/email-sdk 3.0.1:** v9 50, **v10 97** with no declaration (`credential-mention` for the variable names in its help text). With the declaration above, 97, every capability declared, and the 14 variables it reads outside those patterns listed under `env`. With a shorter declaration that lists only network, env (`AWS_*`, `RESEND_API_KEY`) and shell, 87: its CLI imports `node:fs/promises`, so `filesystem` is undeclared (-10), and 31 variables are listed outside the patterns.
+
+**Fixtures and the property.** All 296 stored review fixtures keep every v3 finding (`supersetGaps` on each). 291 changed score; each records `v10` and a `v10why` naming the risk signals and capabilities behind it (`test/v10-merge.ts` writes them from a recording). A detection fixture v3 refused that v10 passes must say why in its `v10why` (it holds capabilities and no malware pattern): 57 do, mostly the parser-evasion wrappers whose payload is `require('child_process'); fetch(…); process.env.NPM_TOKEN; eval('1')` in a main file; their claim is now that the wrapper hides nothing (the wrapped file scores no higher than the bare payload, with every finding). The floor fuzz holds in its superset form on its CI seed and on 10,000 cases of a fresh seed.
 
 ## What it reads, in order
 
@@ -108,7 +216,9 @@ Some confirmed evidence is false, and no sound rule tells it apart: vite 8.3.8 i
 - A dismissal applies only to the bytes and scorer it names: another version, a different digest or a new scorer version reads the item afresh.
 - The version page keeps the item, struck through, with "Dismissed by an apm reviewer: <reason>" and the date. Anyone can ask for a dismissal with the "Appeal a score" issue form.
 
-## Signals
+## Signals (apm-score-v9, for versions it scored)
+
+apm-score-v10's signals and weights are in the section above. This table is v9's, which still applies to analyses v9 stored: a version is scored by the scorer that analyzed it.
 
 | Signal | Points (possible) | Fires on |
 | --- | --- | --- |
@@ -138,6 +248,10 @@ Some confirmed evidence is false, and no sound rule tells it apart: vite 8.3.8 i
 ## What it cannot catch
 
 Each of these is also in the `notChecked` list every score carries.
+
+- **Malicious code that only uses capabilities** (apm-score-v10). Code that runs on `require` and does only what an SDK does (reads a key, sends a request) costs nothing, wherever it sends it: the score cannot tell an API host from an attacker's. It is listed under capabilities, with its evidence, and the AI release review reads it. Install-time code, collected secrets, request bins, remote shells and obfuscation still cost points.
+- **Network hosts against a declaration.** A declared network list is shown, not compared with the URLs in the code.
+- **A call inside a string that runs, in a file with no tree.** `runs-decoded-code` needs the parse to see that a string is run; a file too large to parse keeps every v3 finding, but not that one.
 
 - **Runtime behaviour.** Code that downloads, decrypts or assembles a second stage while running looks like whatever its loader looks like. A loader still needs `fetch`, `eval`, `vm` or `child_process`, so it usually scores low, but the score cannot say what the second stage does.
 - **Other encodings.** XOR, compression, a custom alphabet, or base64 that decodes to more base64. Only base64, hex, `\x` escapes, char codes and joined string literals are undone.
