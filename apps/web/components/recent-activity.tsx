@@ -50,6 +50,9 @@ export async function RecentActivity() {
   const recent = await getRecent(8);
   const now = Date.now();
 
+  // the registry leaves its own smoke checks out of the feed; with nothing real to show, the home page shows no feed
+  if (recent.kind === "ok" && recent.value.length === 0) return null;
+
   return (
     <section aria-labelledby="recent">
       <h2 id="recent" className="mb-2 text-[15px] font-medium">
@@ -63,8 +66,6 @@ export async function RecentActivity() {
           </a>{" "}
           to try again. Search above may still work for npm packages.
         </p>
-      ) : recent.value.length === 0 ? (
-        <p className="border-t py-5 text-sm text-muted-foreground">Nothing published here yet. Search above covers npm too.</p>
       ) : (
         <ul className="border-t">
           {recent.value.map((e) => (

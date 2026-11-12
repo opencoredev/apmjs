@@ -9,7 +9,7 @@ import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
 import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
-import { splitPossible, summarizeLimitations } from "@/lib/limitations";
+import { splitPossible, splitTestFile, summarizeLimitations } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
@@ -64,17 +64,20 @@ function evidenceLink(input: { signal: string; evidence: string; name: string; v
 }
 
 /** One cited line under a signal. When it names a file, the whole row opens that file at the line. A possible
- * finding says, in plain text under the line, why apm did not count it as seen. */
+ * finding says, in plain text under the line, why apm did not count it as seen; one from a shipped test file says so. */
 function Evidence(props: { signal: string; evidence: string; name: string; version: string | null }) {
-  const { text, why } = splitPossible(props.evidence);
+  const possible = splitPossible(props.evidence);
+  const { text, testFile } = splitTestFile(possible.text);
   const link = evidenceLink({ ...props, evidence: text });
   const row = "mt-2 border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted [overflow-wrap:anywhere]";
-  const reason = why ? <span className="mt-0.5 block font-sans text-[13px] text-inverse-muted">{why}</span> : null;
+  const note = testFile ? <span className="mt-0.5 block font-sans text-[13px] text-inverse-muted">From a test file the package ships.</span> : null;
+  const reason = possible.why ? <span className="mt-0.5 block font-sans text-[13px] text-inverse-muted">{possible.why}</span> : null;
 
   if (!link) {
     return (
       <div className={row}>
         {text}
+        {note}
         {reason}
       </div>
     );
@@ -85,6 +88,7 @@ function Evidence(props: { signal: string; evidence: string; name: string; versi
     <a href={link.href} className={`group -mr-2 block rounded-r-md py-1 pr-2 transition-colors hover:border-inverse-muted hover:bg-inverse-raised ${row}`}>
       <span className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] group-hover:decoration-inverse-foreground">{link.cite}</span>
       {link.rest}
+      {note}
       {reason}
     </a>
   );
@@ -208,15 +212,21 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
   );
 }
 
-/** Phones only: the score in one line near the top, linking down to the full report. */
+/** The one line a phone shows beside the compact score: what kind of number it is and what it leaves out. */
+const SCORE_QUALIFIER = "Heuristic score; runtime behavior and dependency code not checked.";
+
+/** Phones only: the score in one line near the top, with its qualifier, linking down to the full report. */
 function ScoreSummary({ score, className }: { score: PackageInfo["score"]; className?: string }) {
   const lost = score ? score.signals.filter((s) => s.points < 0) : [];
 
   return (
     <a href="#score" className={`flex min-h-12 items-center gap-3 rounded-xl border px-4 py-2.5 transition-colors hover:bg-surface/60 ${className ?? ""}`}>
       <ScoreBadge score={score?.score} grade={score?.grade} />
-      <span className="min-w-0 flex-1 text-[15px] text-pretty">
-        {score === null ? "Not scored yet" : lost.length === 0 ? "No points lost" : `${lost.length} signal${lost.length === 1 ? "" : "s"}, ${lost.reduce((n, s) => n - s.points, 0)} points lost`}
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="text-[15px] text-pretty">
+          {score === null ? "Not scored yet" : lost.length === 0 ? "No points lost" : `${lost.length} signal${lost.length === 1 ? "" : "s"}, ${lost.reduce((n, s) => n - s.points, 0)} points lost`}
+        </span>
+        {score !== null && <span className="text-[13px] leading-5 text-pretty text-muted-foreground">{SCORE_QUALIFIER}</span>}
       </span>
       <span className="inline-flex shrink-0 items-center gap-1 text-sm text-muted-foreground">
         Report

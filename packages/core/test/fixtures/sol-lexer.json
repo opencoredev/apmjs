@@ -1,0 +1,1319 @@
+[
+ {
+  "name": "control",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid'); require('child_process');",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "decimal-division",
+  "file": "index.js",
+  "src": "const r = 1. / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "contextual-of",
+  "file": "index.js",
+  "src": "const of = 1; of / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "contextual-await",
+  "file": "index.js",
+  "src": "const await = 1; await / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-keyword",
+  "file": "index.js",
+  "src": "const \\u006ff = 1; \\u006ff / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-braced",
+  "file": "index.js",
+  "src": "const \\u{6f}f = 1; \\u{6f}f / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-callee",
+  "file": "index.js",
+  "src": "requ\\u0069re('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-braced-callee",
+  "file": "index.js",
+  "src": "requ\\u{69}re('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "ts-postfix",
+  "file": "index.ts",
+  "src": "const a = 1; const r = a! / require('child_process') / 1;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "definition-asi",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid') {}",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "definition-string",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid/) {');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "definition-default",
+  "file": "index.js",
+  "src": "function fetcher(x = fetch('https://example.invalid')) {} fetcher();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "type-import-runtime",
+  "file": "index.js",
+  "src": "import('node:http').Anything;",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "template-nested",
+  "file": "index.js",
+  "src": "const a = `${`x${require('child_process')}`}`;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "template-comment",
+  "file": "index.js",
+  "src": "const a = `/* ${require('child_process')} */`;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "template-regex",
+  "file": "index.js",
+  "src": "const a = `${/x'|'\\//.test('')} ${require('child_process')}`;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "strings-comments",
+  "file": "index.js",
+  "src": "const a='/*';require('child_process'); const b='*/';",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "regex-comments",
+  "file": "index.js",
+  "src": "const a=/[/*]/; require('child_process'); const b=/[*/]/;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "hashbang",
+  "file": "index.js",
+  "src": "#!/usr/bin/env node\nrequire('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "html-comment",
+  "file": "index.js",
+  "src": "<!-- /*\nrequire('child_process');\nconst end = '*/';",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "html-close-comment",
+  "file": "index.js",
+  "src": "--> /*\nrequire('child_process');\nconst end = '*/';",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "cr-line-comment",
+  "file": "index.js",
+  "src": "// comment\rrequire('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-line-comment",
+  "file": "index.js",
+  "src": "// comment require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-paragraph-comment",
+  "file": "index.js",
+  "src": "// comment require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "cr-hashbang",
+  "file": "index.js",
+  "src": "#!/usr/bin/env node\rrequire('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unbalanced",
+  "file": "index.js",
+  "src": "}); require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "jsx",
+  "file": "index.jsx",
+  "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "jsx-js",
+  "file": "index.js",
+  "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "jsx-fake-comment",
+  "file": "index.js",
+  "src": "const a = <p>/*</p>; require('child_process'); const b=<p>*/</p>;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-token-env",
+  "file": "index.js",
+  "src": "process.env['NPM_TOKEN'];",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-eval",
+  "file": "index.js",
+  "src": "(0, eval)(\"fetch('https://example.invalid')\");",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-alias",
+  "file": "index.js",
+  "src": "const Fn = globalThis.Function; Fn('return 1')();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "xmlhttprequest",
+  "file": "index.js",
+  "src": "const X = XMLHttpRequest; new X();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "kept-fetch-text",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid/curl -s example.invalid | sh');",
+  "kind": "precision",
+  "why": "a URL holding shell text is sent, not run: shell-exec is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "possible",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "kept-join-path",
+  "file": "index.js",
+  "src": "const x = require('path').join('.npmrc');",
+  "kind": "precision",
+  "why": "path.join builds a path but nothing reads it: credential-access is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 92,
+  "signals": {
+   "credential-access": "possible"
+  }
+ },
+ {
+  "name": "kept-readFile-shell",
+  "file": "index.js",
+  "src": "require('fs').readFileSync('child_process');",
+  "kind": "precision",
+  "why": "reading a file named child_process does not load the module: shell-exec is possible",
+  "v3": 85,
+  "v4": 85,
+  "v5": 95,
+  "signals": {
+   "shell-exec": "possible"
+  }
+ },
+ {
+  "name": "kept-import-json",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid/NPM_TOKEN');",
+  "kind": "precision",
+  "why": "a token name inside a URL is sent, not read from the environment: credential-access is possible",
+  "v3": 65,
+  "v4": 65,
+  "v5": 82,
+  "signals": {
+   "credential-access": "possible",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "computed-read",
+  "file": "index.js",
+  "src": "require('fs')['readFileSync']('.npmrc');",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "alias-read",
+  "file": "index.js",
+  "src": "const read = require('fs').readFileSync; read('.npmrc');",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 92,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "data-interpolation",
+  "file": "index.js",
+  "src": "fetch(`data:,${fetch('https://example.invalid')}`);",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ordinary-base64",
+  "file": "index.js",
+  "src": "const x = 'ZmV0Y2goJ2h0dHBzOi8vZXhhbXBsZS5pbnZhbGlkJyk=';",
+  "kind": "precision",
+  "why": "a base64 string no code decodes or runs: what it decodes to is possible",
+  "v3": 80,
+  "v4": 94,
+  "v5": 94,
+  "signals": {
+   "network": "possible",
+   "obfuscated": "possible"
+  }
+ },
+ {
+  "name": "decoded-base64",
+  "file": "index.js",
+  "src": "eval(atob('ZmV0Y2goJ2h0dHBzOi8vZXhhbXBsZS5pbnZhbGlkJyk='));",
+  "kind": "detection",
+  "v3": 70,
+  "v4": 70,
+  "v5": 70,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "jsx-comment-block",
+  "file": "index.jsx",
+  "src": "const a = <p>/*\n* {require('child_process')}\n*/</p>;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "jsx-comment-line",
+  "file": "index.jsx",
+  "src": "const a = <p>\n// {require('child_process')}\n</p>;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "tsx-comment-line",
+  "file": "index.tsx",
+  "src": "const a = <p>\n// {require('child_process')}\n</p>;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "jsx-comment-string",
+  "file": "index.jsx",
+  "src": "const a = <p>\n// {fetch('https://example.invalid')}\n</p>;",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "template-division",
+  "file": "index.js",
+  "src": "const x = `${1. / require('child_process') / 1}`;",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "template-kept-nesting",
+  "file": "index.js",
+  "src": "eval(`${'fetch(\"https://example.invalid\")'}`);",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "template-constructor",
+  "file": "index.js",
+  "src": "[].constructor.constructor(`fetch('https://example.invalid')`)();",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-eval-comma",
+  "file": "index.js",
+  "src": "(0, eval)(`fetch('https://example.invalid')`);",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-call",
+  "file": "index.js",
+  "src": "(Function)(`fetch('https://example.invalid')`)();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "optional-require",
+  "file": "index.js",
+  "src": "require?.('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "optional-exec",
+  "file": "index.js",
+  "src": "const cp = require?.('child_process'); cp.exec('echo harmless');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "optional-fetch",
+  "file": "index.js",
+  "src": "globalThis.fetch?.('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "token-env-parenthesized",
+  "file": "index.js",
+  "src": "process.env[('NPM_TOKEN')];",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "token-env-optional",
+  "file": "index.js",
+  "src": "process?.env['NPM_TOKEN'];",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "token-env-comment",
+  "file": "index.js",
+  "src": "process./*x*/env['NPM_TOKEN'];",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "literal-fn-body",
+  "file": "index.js",
+  "src": "new Function(\"fetch('https://example.invalid')\");",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 80,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "html-fetch-comment",
+  "file": "index.js",
+  "src": "<!-- /*\nfetch('https://example.invalid');\nconst x = '*/';",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "regex-unicode-terminator",
+  "file": "index.js",
+  "src": "// x fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "regex-decimal-fetch",
+  "file": "index.js",
+  "src": "1. / fetch('https://example.invalid') / 1;",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "definition-asi-newline",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid')\n{}",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "type-import-then",
+  "file": "index.js",
+  "src": "import('node:http').Then;",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "type-import-string",
+  "file": "index.js",
+  "src": "import('node:http').catch(() => 'anything');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "false-def-kept",
+  "file": "index.js",
+  "src": "eval('1) {');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "false-comment-exfil",
+  "file": "index.js",
+  "src": "Object.keys(process.env);\n// fetch('https://example.invalid')\nconfig.fetch('data:,');",
+  "kind": "precision",
+  "why": "the only fetch is in a comment, and config.fetch('data:,') reads inline data",
+  "v3": 65,
+  "v4": 72,
+  "v5": 100,
+  "signals": {}
+ },
+ {
+  "name": "hexident-comment",
+  "file": "index.js",
+  "src": "// _0x0000 _0x0001 _0x0002 _0x0003 _0x0004 _0x0005 _0x0006 _0x0007 _0x0008 _0x0009 _0x000a _0x000b _0x000c _0x000d _0x000e _0x000f _0x0010 _0x0011 _0x0012 _0x0013\nmodule.exports=1;",
+  "kind": "precision",
+  "why": "the _0x names are in a comment",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "signals": {}
+ },
+ {
+  "name": "false-b64-fetch",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid', {body:'cmVxdWlyZSgnY2hpbGRfcHJvY2Vzcycp'});",
+  "kind": "precision",
+  "why": "a base64 request body is sent, not decoded or run: what it decodes to is possible",
+  "v3": 65,
+  "v4": 65,
+  "v5": 82,
+  "signals": {
+   "shell-exec": "possible",
+   "network": "confirmed",
+   "obfuscated": "possible"
+  }
+ },
+ {
+  "name": "false-kept-new-error",
+  "file": "index.js",
+  "src": "fetch(new Error('curl example.invalid | sh'));",
+  "kind": "precision",
+  "why": "an Error message passed to fetch is not run: shell-exec is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "possible",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "false-kept-method",
+  "file": "index.js",
+  "src": "const fake = { readFileSync(x) {return x} }; fake.readFileSync('.npmrc');",
+  "kind": "precision",
+  "why": "readFileSync is a method of a local object, not fs: credential-access is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 92,
+  "signals": {
+   "credential-access": "possible"
+  }
+ },
+ {
+  "name": "type-import-nested",
+  "file": "index.ts",
+  "src": "type X = import('net').Socket;",
+  "kind": "precision",
+  "why": "a TypeScript type import is erased before anything runs",
+  "v3": 90,
+  "v4": 100,
+  "v5": 100,
+  "signals": {}
+ },
+ {
+  "name": "unicode-callee-escaped-fetch",
+  "file": "index.js",
+  "src": "f\\u0065tch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "division-jsx-unbalanced",
+  "file": "index.js",
+  "src": "const a = <p>see http://x and it's here</p>; require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "data-fetch-hex",
+  "file": "index.js",
+  "src": "fetch('d\\x61ta:,');",
+  "kind": "precision",
+  "why": "'d\\x61ta:,' is a data: URL, which fetch reads without the network",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "signals": {}
+ },
+ {
+  "name": "all-hidden-cr",
+  "file": "index.js",
+  "src": "// comment\rrequire('child_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 100,
+  "v5": 40,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "all-hidden-regex",
+  "file": "index.js",
+  "src": "const of=1; of / (require('child_process'), fetch('https://example.invalid'), process.env.NPM_TOKEN, eval('1')) / 1;",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 100,
+  "v5": 40,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "all-hidden-of",
+  "file": "index.js",
+  "src": "const of=1; of / (require('child_process'), fetch(url), process.env.NPM_TOKEN, eval('1')) / 1;",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 100,
+  "v5": 40,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "all-hidden-html",
+  "file": "index.js",
+  "src": "<!-- /*\nrequire('child_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');\nconst x='*/';",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 100,
+  "v5": 40,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "definition-all",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid/) {'); process.binding('x) {'); eval('1; // ) {');",
+  "kind": "detection",
+  "v3": 65,
+  "v4": 100,
+  "v5": 65,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "alias-function",
+  "file": "index.js",
+  "src": "const Fn = globalThis.Function; Fn('return 1')();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "joined-loc",
+  "file": "index.js",
+  "src": "const x='child_process'; require('chi'+'ld_process');",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 82,
+  "v5": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "joined-loc-comment",
+  "file": "index.js",
+  "src": "// 'fetch'\nglobalThis['fe'+'tch']('https://example.invalid');",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "built-member-ref",
+  "file": "index.js",
+  "src": "const x = obj['ex'+'ec'];",
+  "kind": "precision",
+  "why": "the built name is read but never called: obfuscated is confirmed, shell-exec possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "possible",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "ordinary-template-eval",
+  "file": "index.js",
+  "src": "eval(`${\"fetch('https://example.invalid')\"}`);",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "credential-false",
+  "file": "index.js",
+  "src": "const x = require('path').join('.npmrc');",
+  "kind": "precision",
+  "why": "path.join builds a path but nothing reads it: credential-access is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 92,
+  "signals": {
+   "credential-access": "possible"
+  }
+ },
+ {
+  "name": "credential-new-string",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid', {body: 'GITHUB_TOKEN'});",
+  "kind": "precision",
+  "why": "a token name in a request body is sent, not read from the environment: credential-access is possible",
+  "v3": 65,
+  "v4": 65,
+  "v5": 82,
+  "signals": {
+   "credential-access": "possible",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "floor-bypass-cr",
+  "file": "index.js",
+  "src": "// note\rrequire('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 100,
+  "v5": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "floor-bypass-of",
+  "file": "index.js",
+  "src": "const of=1; of / (require('chi'+'ld_process'),fetch('https://example.invalid'),process.env.NPM_TOKEN,eval('1')) / 1;",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 100,
+  "v5": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "floor-bypass-html",
+  "file": "index.js",
+  "src": "<!-- /*\nrequire('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1');\nconst end='*/';",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 100,
+  "v5": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "definition-shell",
+  "file": "index.js",
+  "src": "process.binding('spawn_sync) {');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "unicode-shell-loader",
+  "file": "index.js",
+  "src": "requ\\u0069re('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "optional-shell-loader",
+  "file": "index.js",
+  "src": "require?.('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 95,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "false-shell-fetch",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid/curl -s example.invalid | sh');",
+  "kind": "precision",
+  "why": "a URL holding shell text is sent, not run: shell-exec is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "possible",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "false-credentials",
+  "file": "index.js",
+  "src": "const x = require('path').join('.npmrc');",
+  "kind": "precision",
+  "why": "path.join builds a path but nothing reads it: credential-access is possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 92,
+  "signals": {
+   "credential-access": "possible"
+  }
+ },
+ {
+  "name": "false-decoded-body",
+  "file": "index.js",
+  "src": "fetch('https://example.invalid', {body:'cmVxdWlyZSgnY2hpbGRfcHJvY2Vzcycp'});",
+  "kind": "precision",
+  "why": "a base64 request body is sent, not decoded or run: what it decodes to is possible",
+  "v3": 65,
+  "v4": 65,
+  "v5": 82,
+  "signals": {
+   "shell-exec": "possible",
+   "network": "confirmed",
+   "obfuscated": "possible"
+  }
+ },
+ {
+  "name": "false-builtin-read",
+  "file": "index.js",
+  "src": "require('fs').readFileSync('child_process');",
+  "kind": "precision",
+  "why": "reading a file named child_process does not load the module: shell-exec is possible",
+  "v3": 85,
+  "v4": 85,
+  "v5": 95,
+  "signals": {
+   "shell-exec": "possible"
+  }
+ },
+ {
+  "name": "false-member-ref",
+  "file": "index.js",
+  "src": "const obj={exec:1}; const x=obj['ex'+'ec'];",
+  "kind": "precision",
+  "why": "the built name is read from a local object and never called: obfuscated is confirmed, shell-exec possible",
+  "v3": 75,
+  "v4": 75,
+  "v5": 85,
+  "signals": {
+   "shell-exec": "possible",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "function-parenthesized",
+  "file": "index.js",
+  "src": "(Function)(`fetch('https://example.invalid')`)();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-alias-original",
+  "file": "index.js",
+  "src": "const Fn = globalThis.Function; Fn('globalThis.x = 1')();\n",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-alias-fetch",
+  "file": "index.js",
+  "src": "const Fn = globalThis.Function; Fn(\"fetch('https://example.invalid')\")();",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 97,
+  "v5": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "isDefinition-comment",
+  "file": "index.js",
+  "src": "fetch(/* ) { */'https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "isTypeImport-url",
+  "file": "index.js",
+  "src": "import('https://example.invalid/module.js').Anything;",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "joined-floor",
+  "file": "index.js",
+  "src": "// 'fetch'\nrequire('child_process');process.env.NPM_TOKEN;eval('1');globalThis['fe'+'tch']('https://example.invalid');",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 40,
+  "v5": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "token-string",
+  "file": "index.js",
+  "src": "const help='NPM_TOKEN';",
+  "kind": "precision",
+  "why": "a token name in a string that nothing reads from the environment: credential-access is possible",
+  "v3": 75,
+  "v4": 100,
+  "v5": 92,
+  "signals": {
+   "credential-access": "possible"
+  }
+ }
+]

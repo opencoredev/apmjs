@@ -1,182 +1,75 @@
-// Static reading of one file's text: the rules, a pass that joins strings split to dodge them, decoders
-// for the cheap encodings (base64, hex, \x escapes, char codes) and the paths a file loads. Pure.
-import { lex, type Lang, type Lexed, type Region } from "./lexer.ts";
+// Static reading of one file's text. JavaScript and TypeScript are parsed (js.ts); a file no parser accepts, install
+// commands, shell scripts and other languages are read with the text rules (rules.ts), after a pass that joins strings
+// split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char codes). Pure.
+import { scanJs, type Imports } from "./js.ts";
+import { lex, type Lang as LexLang, type Lexed } from "./lexer.ts";
+import type { Dialect, Range } from "./parse.ts";
+import { parseEach } from "./parse.ts";
+import {
+  encodedLiterals,
+  envExfil,
+  hexIdentifierRun,
+  IN_STRING,
+  judged,
+  lineOf,
+  namedSignal,
+  printable,
+  RAW,
+  ruleHits,
+  type CodeSignal,
+  type Confidence,
+  type RegionOf,
+  type TextFinding,
+  type Where,
+} from "./rules.ts";
 
-export { commentRanges, langOf, type Lang } from "./lexer.ts";
+export { namedSignal, type CodeSignal, type Confidence, type TextFinding, type Where } from "./rules.ts";
 
-export type CodeSignal = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated";
-
-/**
- * `confirmed`: the code does it, or loads the module that does. `possible`: the text only names it, in an
- * ordinary string, an alias or a method apm cannot identify, so the capability is there but apm did not see it used.
- */
-export type Confidence = "confirmed" | "possible";
-
-type FindingAt = { id: CodeSignal; line: number; snippet: string; how: "as written" | "after joining strings" | "decoded" };
-
-/** One rule match: the signal, where it is, whether the text had to be joined or decoded first, and how sure it is (with why, when only possible). */
-export type TextFinding = FindingAt & ({ confidence: "confirmed" } | { confidence: "possible"; why: string });
-
-function judged(at: FindingAt, confidence: Confidence, why: string): TextFinding {
-  return confidence === "confirmed" ? { ...at, confidence } : { ...at, confidence, why };
-}
-
-const NET_MODULES = String.raw`(?:node:)?(?:https?|net|dgram|tls|http2|dns)(?:\/promises)?`;
-const HTTP_CLIENTS = "(?:axios|undici|node-fetch|got|superagent|needle|phin|ky|ws)";
-const GLOBAL = "(?:globalThis|global|window|self)";
-
-// Function('return this')() is how old code finds the global object; anything else built into a Function is eval
-const NOT_RETURN_THIS = String.raw`(?!['"\x60]return this['"\x60]\s*\))['"\x60]`;
-
-const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"), "g");
+export type { Imports } from "./js.ts";
 
 /**
- * How a pattern's match is read, by where it sits (see `Region` in lexer.ts):
- * - `code`: a call or construct. Confirmed in code or a kept string. Inside an ordinary string it is text that
- *   only runs if something evaluates it, and eval, Function, vm and string timers are rules of their own.
- * - `name`: a module name. Confirmed where it is loaded (`require('child_process')`); possible anywhere else.
- * - `text`: shell command text (`curl ... | sh`). Only strings hold it: confirmed when a call runs the string,
- *   possible otherwise. In code, `a || sh` is not a pipe.
- * - `alias`: a reference that gives the power without using it (`r = require`). Always possible.
- * Raw text (a shell script, an install command, a file the lexer could not follow) confirms every kind but `alias`.
+ * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed; `c` and `python` are lexed for comments and strings;
+ * `data` is JSON and type declarations (node parses JSON and never runs it, and a `.d.ts` file only describes code);
+ * anything else is `plain`, read raw with every match counted.
  */
-type Kind = "code" | "name" | "text" | "alias";
+export type Lang = Dialect | "c" | "python" | "data" | "plain";
 
-type Pattern = { kind: Kind; re: RegExp; why?: string };
+/** The language a file is read as: by extension, then by a node/bun/deno shebang. */
+export function langOf(path: string, text: string): Lang {
+  if (/\.(?:json|d\.[cm]?ts)$/i.test(path)) return "data";
 
-const RULES: { id: Exclude<CodeSignal, "obfuscated">; patterns: Pattern[] }[] = [
-  {
-    id: "shell-exec",
-    patterns: [
-      {
-        kind: "code",
-        re: alt([
-          String.raw`\bexec(?:File)?Sync\s*\(`,
-          String.raw`\bspawnSync\s*\(`,
-          String.raw`\bBun\.spawn(?:Sync)?\b`,
-          String.raw`\bBun\.\$`,
-          String.raw`\bDeno\.Command\b`,
-          String.raw`\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(`,
-          String.raw`\binternalBinding\s*\(`,
-        ]),
-      },
-      { kind: "name", re: /\bchild_process\b/g, why: "names child_process without loading it" },
-      { kind: "text", re: /\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b/g, why: "a string holds a shell command, but apm did not see it run" },
-    ],
-  },
-  {
-    id: "network",
-    patterns: [
-      {
-        kind: "code",
-        re: alt([
-          // fetch('data:...') reads an inline value and never leaves the machine
-          String.raw`(?<![\w$.])fetch\s*\((?!\s*['"\x60]data:)`,
-          String.raw`\b${GLOBAL}\s*\.\s*fetch\s*\((?!\s*['"\x60]data:)`,
-          String.raw`\bhttps?\.(?:get|request)\s*\(`,
-          String.raw`(?:require|import)\s*\(\s*['"\x60]${NET_MODULES}['"\x60]\s*\)`,
-          String.raw`\bfrom\s+['"]${NET_MODULES}['"]`,
-          String.raw`(?:require\s*\(\s*|from\s+|import\s*\(\s*)['"]${HTTP_CLIENTS}['"]`,
-          String.raw`\bnew\s+(?:[\w$]+\s*\.\s*)*(?:XMLHttpRequest|WebSocket|EventSource|RTCPeerConnection)\b`,
-          String.raw`\bsendBeacon\s*\(`,
-          String.raw`\bdns(?:\.promises)?\.(?:resolve\w*|lookup\w*|reverse)\s*\(`,
-          String.raw`\bimport\s*\(\s*['"\x60]https?:\/\/`,
-        ]),
-      },
-      { kind: "alias", re: /\.\s*fetch\s*\(/g, why: "calls a method named fetch on an object apm cannot identify" },
-      { kind: "alias", re: /\bXMLHttpRequest\b/g, why: "refers to XMLHttpRequest without creating one" },
-      { kind: "text", re: /\bcurl\s+|\bwget\s+/g, why: "a string holds a download command, but apm did not see it run" },
-    ],
-  },
-  {
-    id: "credential-access",
-    patterns: [
-      { kind: "code", re: /\bAWS_SECRET_ACCESS_KEY\b|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)/g },
-      {
-        kind: "text",
-        re: /\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/g,
-        why: "a string names a credential file, but apm did not see it read",
-      },
-    ],
-  },
-  {
-    id: "eval",
-    patterns: [
-      {
-        kind: "code",
-        re: alt([
-          String.raw`(?<![\w$.])eval\s*\(`,
-          String.raw`\b${GLOBAL}\s*\.\s*eval\s*\(`,
-          String.raw`\(\s*0\s*,\s*eval\s*\)`,
-          String.raw`=\s*eval\s*[;,)\n]`,
-          String.raw`\bnew\s+Function\s*\(`,
-          String.raw`(?<![\w$.])Function\s*\(\s*${NOT_RETURN_THIS}`,
-          String.raw`\.\s*Function\s*\(\s*${NOT_RETURN_THIS}`,
-          String.raw`\.constructor\s*\.\s*constructor\s*\(`,
-          String.raw`\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"\x60]`,
-          String.raw`\bvm\.(?:runIn\w*Context|Script|compileFunction|SourceTextModule)\b`,
-          String.raw`\brunIn(?:This|New)Context\s*\(`,
-          String.raw`(?:require|import)\s*\(\s*['"](?:node:)?vm['"]\s*\)|\bfrom\s+['"](?:node:)?vm['"]`,
-          String.raw`\bmodule\s*\._compile\s*\(|\bModule\.prototype\._compile\b`,
-          String.raw`\brequire\s*\(\s*String\.fromCharCode`,
-        ]),
-      },
-      { kind: "alias", re: /=\s*require\s*[;,\n]/g, why: "keeps require under another name, so apm cannot read what it loads" },
-      { kind: "alias", re: new RegExp(String.raw`\b${GLOBAL}\s*\.\s*require\b`, "g"), why: "reaches require through the global object" },
-      { kind: "alias", re: new RegExp(String.raw`=\s*${GLOBAL}\s*\.\s*Function\s*[;,\n]`, "g"), why: "keeps a reference to Function without calling it" },
-      { kind: "alias", re: /\.\s*eval\s*\(/g, why: "calls a method named eval on an object apm cannot identify" },
-    ],
-  },
-];
+  if (/\.[cm]?ts$/i.test(path)) return "ts";
 
-/** Reading the whole environment: a credential grab when a network call sits right next to it. */
-const WHOLE_ENV = /\bObject\.(?:keys|entries|values)\s*\(\s*process\.env\s*\)|\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+in\s+process\.env\b/g;
+  if (/\.tsx$/i.test(path)) return "tsx";
 
-/** How close (in characters) an environment dump and a network call must be to read as one exfiltration. */
-const NEAR = 400;
+  if (/\.jsx$/i.test(path)) return "jsx";
 
-/** A string that, once built or decoded, names something dangerous. */
-const NAMED: { id: Exclude<CodeSignal, "obfuscated">; re: RegExp }[] = [
-  { id: "shell-exec", re: /^(?:(?:node:)?child_process|execSync|execFileSync|execFile|spawnSync|spawn|exec)$/ },
-  { id: "network", re: new RegExp(`^(?:${NET_MODULES}|fetch|XMLHttpRequest|WebSocket|sendBeacon|EventSource|request)$`) },
-  { id: "eval", re: /^(?:eval|Function|require|(?:node:)?vm|runInThisContext|runInNewContext)$/ },
-  { id: "credential-access", re: /\.npmrc$|^(?:NPM_TOKEN|GITHUB_TOKEN|NODE_AUTH_TOKEN|AWS_SECRET_ACCESS_KEY)$|\.ssh\/|\bid_(?:rsa|ed25519|ecdsa)$/ },
-];
+  if (/\.[cm]?js$/i.test(path)) return "js";
 
-/** obfuscator.io output: twenty or more `_0x1a2b` identifiers. Counted in one linear pass. Returns the first one's index, or -1. */
-function hexIdentifierRun(text: string): number {
-  const re = /_0x[0-9a-f]{4,}/g;
-  let first = -1;
-  let n = 0;
+  if (/\.(?:c|cc|cpp|cxx|h|hh|hpp|hxx|cs|java|go|rs|swift|kt|m|mm)$/i.test(path)) return "c";
 
-  for (let m = re.exec(text); m; m = re.exec(text)) {
-    if (first < 0) first = m.index;
+  if (/\.py$/i.test(path)) return "python";
 
-    if (++n >= 20) return first;
-  }
+  if (!/\.[^/]+$/.test(path) && /^#!.*\b(?:node|bun|deno)\b/.test(text)) return "js";
 
-  return -1;
+  return "plain";
 }
 
-/** A line number and the text around a position, trimmed to about 80 characters. */
-export type Where = { line: number; snippet: string };
+function isDialect(lang: Lang): lang is Dialect {
+  return lang === "js" || lang === "jsx" || lang === "ts" || lang === "tsx";
+}
 
-/** Where `index` is. On a long (minified) line the snippet is the stretch around `index`, so it shows what matched. */
-export function lineOf(text: string, index: number): Where {
-  let line = 1;
+/** The [start, end) offsets of every comment in JavaScript or TypeScript source, as the parser read them. */
+export function commentRanges(text: string, dialect: Dialect = "js"): Range[] {
+  let comments: Range[] | null = null;
 
-  for (let i = text.indexOf("\n"); i !== -1 && i < index; i = text.indexOf("\n", i + 1)) line++;
-  const start = text.lastIndexOf("\n", index - 1) + 1;
-  const end = text.indexOf("\n", index);
-  const whole = text.slice(start, end === -1 ? undefined : end);
+  parseEach(text, dialect, (p) => {
+    comments ??= p.comments;
 
-  if (whole.trim().length <= 80) return { line, snippet: whole.trim() };
-  const col = index - start;
-  const from = Math.max(0, col - 30);
-  const to = from + 80;
-  const snippet = `${from > 0 ? "…" : ""}${whole.slice(from, to).trim()}${to < whole.length ? "…" : ""}`;
+    return false;
+  });
 
-  return { line, snippet };
+  return comments ?? [];
 }
 
 // ---------- joining split strings ----------
@@ -193,56 +86,111 @@ function quote(s: string): string {
   return `'${s.replace(/['\\\n]/g, " ")}'`;
 }
 
+/** One replacement made while joining: `[start, end)` of the text before it, and the length that replaced it. */
+type Edit = { start: number; end: number; length: number };
+
+/**
+ * Applies `re`'s replacements to `text` and records each one, so a position in the result can be traced back to
+ * the text the replacement came from (provenance by position, never by searching for the value).
+ */
+type Tracked = { text: string; edits: Edit[] };
+
+function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string[]) => string | null): Tracked {
+  const edits: Edit[] = [];
+  let out = "";
+  let last = 0;
+
+  for (const m of text.matchAll(re)) {
+    const replacement = fn(m[0], m.slice(1).map((g) => g ?? ""));
+
+    if (replacement === null) continue;
+    out += text.slice(last, m.index) + replacement;
+    edits.push({ start: m.index, end: m.index + m[0].length, length: replacement.length });
+    last = m.index + m[0].length;
+  }
+
+  return { text: out + text.slice(last), edits };
+}
+
+/** Maps a position in the edited text back to the original: inside a replacement, the replacement's start. */
+function traceBack(edits: readonly Edit[], index: number): number {
+  let shift = 0;
+
+  for (const e of edits) {
+    const outStart = e.start + shift;
+
+    if (index < outStart) break;
+
+    if (index < outStart + e.length) return e.start;
+    shift += e.length - (e.end - e.start);
+  }
+
+  return index - shift;
+}
+
+/** A string the joining pass had to build, and where in the original text it starts. */
+export type Built = { value: string; index: number };
+
 /**
  * Undoes the disguises that only move characters around: `'\x63hild'` becomes `'child'`, `'chi' + 'ld_'`
- * becomes `'child_'`, and `x['ex' + 'ec']` becomes `x.exec`. Nothing is run. Returns the new text and every
- * string it had to build (from escapes or from two or more pieces), which the caller checks by name.
+ * becomes `'child_'`, and `x['ex' + 'ec']` becomes `x.exec`. Nothing is run. Returns the new text, every string it
+ * had to build (from escapes or from two or more pieces) with where it starts in `text`, and `origin`, which maps a
+ * position in the new text back to `text`.
  */
-export type Joined = { text: string; built: string[] };
+export type Joined = { text: string; built: Built[]; origin: (index: number) => number };
 
 export function joinStrings(text: string): Joined {
-  const built: string[] = [];
+  const built: Built[] = [];
+  const passes: Edit[][] = [];
   let out = text;
 
-  if (out.includes("\\x") || out.includes("\\u")) {
-    out = out.replace(ESCAPED_LIT, (m, _q: string, body: string) => {
-      if (!/\\[xu]/.test(body)) return m;
-      const s = unescapeJs(body);
-      built.push(s);
+  // positions of each pass are traced back through the passes before it
+  const toOriginal = (index: number, upTo: number): number => {
+    let i = index;
 
-      return quote(s);
+    for (let p = upTo - 1; p >= 0; p--) i = traceBack(passes[p] ?? [], i);
+
+    return i;
+  };
+
+  if (out.includes("\\x") || out.includes("\\u")) {
+    const step = replaceTracked(out, ESCAPED_LIT, (_m, [, body = ""]) => {
+      if (!/\\[xu]/.test(body)) return null;
+
+      return quote(unescapeJs(body));
     });
+
+    for (const e of step.edits) built.push({ value: unescapeJs(text.slice(e.start + 1, e.end - 1)), index: e.start });
+    passes.push(step.edits);
+    out = step.text;
   }
 
   if (out.includes("+")) {
-    out = out.replace(CHAIN, (m) => {
-      const s = [...m.matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("");
-      built.push(s);
+    const before = out;
+    const step = replaceTracked(out, CHAIN, (m) => quote([...m.matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("")));
 
-      return quote(s);
-    });
+    for (const e of step.edits) {
+      const value = [...before.slice(e.start, e.end).matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("");
+      built.push({ value, index: toOriginal(e.start, passes.length) });
+    }
+
+    passes.push(step.edits);
+    out = step.text;
   }
 
-  if (out.includes("[")) out = out.replace(/(?<=[\w$)\]])\s*\[\s*(['"])([A-Za-z_$][\w$]*)\1\s*\]/g, ".$2");
+  if (out.includes("[")) {
+    const step = replaceTracked(out, /(?<=[\w$)\]])\s*\[\s*(['"])([A-Za-z_$][\w$]*)\1\s*\]/g, (_m, [, name = ""]) => `.${name}`);
+    passes.push(step.edits);
+    out = step.text;
+  }
 
-  return { text: out, built };
+  const count = passes.length;
+
+  return { text: out, built, origin: (index) => toOriginal(index, count) };
 }
 
 // ---------- decoding ----------
 const MAX_DECODED_BYTES = 256 * 1024;
-
-function printable(s: string): boolean {
-  if (s.length < 4) return false;
-  let ok = 0;
-
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-
-    if ((c >= 32 && c < 127) || c === 9 || c === 10 || c === 13) ok++;
-  }
-
-  return ok / s.length >= 0.95;
-}
 
 export type Decoded = { value: string; how: string; index: number };
 
@@ -280,184 +228,24 @@ export function decodedStrings(text: string): Decoded[] {
   return out;
 }
 
-/** The dangerous thing a built or decoded string names, if any: `'child_process'`, `'fetch'`. */
-export function namedSignal(s: string): Exclude<CodeSignal, "obfuscated"> | null {
-  const t = s.trim();
+// ---------- reading text without a parser ----------
 
-  return NAMED.find((n) => n.re.test(t))?.id ?? null;
-}
-
-// ---------- the scan ----------
-type RegionOf = (index: number) => Region;
-
-const RAW: RegionOf = () => "raw";
-
-/** What a match of each kind means in each region; a region a kind does not list is not a match. */
-const CONFIDENCE: Record<Kind, Partial<Record<Region, Confidence>>> = {
-  code: { code: "confirmed", kept: "confirmed", raw: "confirmed" },
-  name: { kept: "confirmed", raw: "confirmed", code: "possible", string: "possible" },
-  text: { kept: "confirmed", raw: "confirmed", string: "possible" },
-  alias: { code: "possible", kept: "possible", raw: "possible" },
-};
-
-const IN_STRING = "only inside an ordinary string, not in code apm saw run";
-
-/**
- * Whether the call-shaped match ending at the `(` at `open` defines a function rather than calling one:
- * `function fetch(url) {`, or a method `async fetch(url) {`. A call is never followed by `{` after its `)`.
- */
-function isDefinition(text: string, start: number, open: number): boolean {
-  if (/\bfunction\s*\*?\s*$/.test(text.slice(Math.max(0, start - 16), start))) return true;
-  let depth = 0;
-
-  for (let j = open; j < Math.min(text.length, open + 400); j++) {
-    const c = text[j];
-
-    if (c === "(") depth++;
-    else if (c === ")" && --depth === 0) {
-      let k = j + 1;
-
-      while (k < text.length && /[ \t]/.test(text[k] ?? "")) k++;
-
-      return text[k] === "{";
-    }
-  }
-
-  return false;
-}
-
-/**
- * Whether a match is TypeScript's `import('undici').RequestInit`: a type, erased before anything runs. At runtime
- * `import()` returns a promise, which has no capitalised members, so a real import never looks like this.
- */
-function isTypeImport(text: string, start: number, match: string): boolean {
-  if (!/^import\s*\(/.test(match)) return false;
-  const close = text.indexOf(")", start + match.length - 1);
-
-  return close > 0 && close - start < 300 && /^\s*\.\s*[A-Z]/.test(text.slice(close + 1, close + 40));
-}
-
-/** The first confirmed match of each rule, or its first possible one. Every match is looked at; there is no budget to run out. */
-function ruleHits(text: string, how: TextFinding["how"], skip: ReadonlySet<CodeSignal>, region: RegionOf): TextFinding[] {
-  const out: TextFinding[] = [];
-
-  for (const rule of RULES) {
-    if (skip.has(rule.id)) continue;
-    let confirmed: TextFinding | null = null;
-    let possible: TextFinding | null = null;
-
-    for (const p of rule.patterns) {
-      if (confirmed) break;
-
-      // an alias can only ever be possible
-      if (possible && p.kind === "alias") continue;
-      p.re.lastIndex = 0;
-
-      for (let m = p.re.exec(text); m; m = p.re.exec(text)) {
-        if (m[0].length === 0) {
-          p.re.lastIndex++;
-          continue;
-        }
-
-        const r = region(m.index);
-        const confidence = CONFIDENCE[p.kind][r];
-
-        if (!confidence || r === "excluded") continue;
-
-        if (m[0].endsWith("(") && isDefinition(text, m.index, m.index + m[0].length - 1)) continue;
-
-        if (isTypeImport(text, m.index, m[0])) continue;
-
-        if (confidence === "confirmed") {
-          confirmed = { id: rule.id, ...lineOf(text, m.index), how, confidence };
-          break;
-        }
-
-        if (!possible) {
-          const why = p.why ?? IN_STRING;
-          possible = { id: rule.id, ...lineOf(text, m.index), how, confidence, why };
-        }
-
-        if (p.kind === "alias") break;
-      }
-    }
-
-    const best = confirmed ?? possible;
-
-    if (best) out.push(best);
-  }
-
-  return out;
-}
-
-const NETWORK_NEAR = RULES.filter((r) => r.id === "network").flatMap((r) => r.patterns.filter((p) => p.kind !== "alias").map((p) => new RegExp(p.re.source)));
-
-/** An environment dump with a network call within NEAR characters of it. */
-function envExfil(text: string, region: RegionOf): { index: number; confidence: Confidence } | null {
-  let tries = 0;
-
-  for (const m of text.matchAll(WHOLE_ENV)) {
-    const r = region(m.index);
-
-    if (r !== "excluded") {
-      const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
-
-      if (NETWORK_NEAR.some((re) => re.test(window))) return { index: m.index, confidence: r === "string" ? "possible" : "confirmed" };
-    }
-
-    if (++tries >= 50) break;
-  }
-
-  return null;
-}
-
-/**
- * Text hidden in a literal: 40 or more `\x` escapes in a row, or a base64 string of 2000+ characters. Each counts
- * only when it decodes to readable text; data tables, images, fonts and WebAssembly (`\0asm`) are binary data,
- * which apm lists or skips like the files that hold them. Escapes spelling out text have no honest use, so they
- * are confirmed; a long base64 text is confirmed only when code loads or runs it.
- */
-function encodedLiterals(text: string, region: RegionOf): TextFinding[] {
-  const out: TextFinding[] = [];
-
-  for (const m of text.matchAll(/(?:\\x[0-9a-fA-F]{2}){40,}/g)) {
-    const r = region(m.index);
-    const value = m[0].slice(0, 4000).replace(/\\x([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(Number.parseInt(h, 16)));
-
-    if (r === "excluded" || !printable(value)) continue;
-    out.push({ id: "obfuscated", ...lineOf(text, m.index), how: "as written", confidence: "confirmed" });
-    break;
-  }
-
-  for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
-    const r = region(m.index);
-    const raw = (m[1] ?? "").slice(0, 4000);
-    const value = Buffer.from(raw.slice(0, raw.length - (raw.length % 4)), "base64").toString("latin1");
-
-    if (r === "excluded" || value.startsWith("\0asm") || !printable(value)) continue;
-    const confidence: Confidence = r === "string" ? "possible" : "confirmed";
-    out.push(judged({ id: "obfuscated", ...lineOf(text, m.index), how: "as written" }, confidence, "a long base64 string decodes to text, but apm did not see code load or run it"));
-    break;
-  }
-
-  return out;
-}
-
-function regionsOf(text: string, lang: Lang): RegionOf {
+function regionsOf(text: string, lang: LexLang): RegionOf {
   if (lang === "plain") return RAW;
   let lexed: Lexed | null = null;
 
-  // tokenized once, and only when something matched
+  // lexed once, and only when something matched
   return (index) => (lexed ??= lex(text, lang)).region(index);
 }
 
 /**
- * Every rule that matches one file's text. The rules run on the text as written, then on the text with
- * split strings joined, then on readable strings decoded from base64, hex and char codes. A dangerous
- * name that had to be built or decoded also counts as obfuscation. `lang` says how to tell code from
- * comments and strings; `plain` (install commands, shell scripts) counts every match.
+ * The text rules on a file no parser reads: install commands and shell scripts (`plain`), C and Python (comments and
+ * strings told apart), JSON and type declarations (`data`), and JavaScript that no parser accepted (read raw, as
+ * apm-score-v3 read every file). The rules run on the text as written, then with split strings joined, then on
+ * readable strings decoded from base64, hex and char codes; a dangerous name that had to be built or decoded also
+ * counts as obfuscation. Every finding cites where it is in `text`, traced back through the joining.
  */
-export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
+function scanTextRules(text: string, lang: LexLang): TextFinding[] {
   const region = regionsOf(text, lang);
   const out = ruleHits(text, "as written", new Set(), region);
   const confirmed = (): Set<CodeSignal> => new Set(out.filter((f) => f.confidence === "confirmed").map((f) => f.id));
@@ -466,30 +254,29 @@ export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
   if (hex >= 0) out.push({ id: "obfuscated", ...lineOf(text, hex), how: "as written", confidence: "confirmed" });
   out.push(...encodedLiterals(text, region));
   const joined = joinStrings(text);
-  const jregion = joined.text === text ? region : regionsOf(joined.text, lang);
+  const at = (index: number): Where => lineOf(text, joined.origin(index));
+  const jregion: RegionOf = (index) => region(joined.origin(index));
 
   if (joined.text !== text) {
     const found = new Set(out.map((f) => f.id));
 
     // joining can confirm what the text as written only suggested, but a second "possible" adds nothing
-    for (const f of ruleHits(joined.text, "after joining strings", confirmed(), jregion)) if (f.confidence === "confirmed" || !found.has(f.id)) out.push(f);
+    for (const f of ruleHits(joined.text, "after joining strings", confirmed(), jregion, at)) if (f.confidence === "confirmed" || !found.has(f.id)) out.push(f);
   }
 
-  for (const s of joined.built) {
-    const id = namedSignal(s);
+  for (const b of joined.built) {
+    const id = namedSignal(b.value);
 
     if (!id) continue;
-    const at = joined.text.indexOf(quote(s));
-    // a string that became a member access (x['ex' + 'ec'] is x.exec) is code
-    const r: Region = at < 0 ? "code" : jregion(at);
+    const r = region(b.index);
 
     if (r === "excluded") continue;
     const confidence: Confidence = r === "string" ? "possible" : "confirmed";
-    const why = `builds "${s.slice(0, 40)}" from pieces, but apm did not see it loaded or called`;
-    const where = lineOf(joined.text, Math.max(0, at));
+    const why = `builds "${b.value.slice(0, 40)}" from pieces, but apm did not see it loaded or called`;
+    const where = lineOf(text, b.index);
 
     out.push(judged({ id, ...where, how: "after joining strings" }, confidence, why));
-    out.push(judged({ id: "obfuscated", line: where.line, snippet: `builds "${s.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings" }, confidence, why));
+    out.push(judged({ id: "obfuscated", line: where.line, snippet: `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings" }, confidence, why));
   }
 
   for (const d of decodedStrings(joined.text)) {
@@ -497,7 +284,7 @@ export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
 
     if (r === "excluded") continue;
     const outer: Confidence = r === "string" ? "possible" : "confirmed";
-    const where = lineOf(joined.text, d.index);
+    const where = at(d.index);
     const named = namedSignal(d.value);
     const hits = ruleHits(d.value, "decoded", new Set(), RAW);
 
@@ -526,22 +313,22 @@ export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
 }
 
 // ---------- what a file loads ----------
-export type Imports = { paths: string[]; dynamic: { line: number; snippet: string }[] };
-
 const STATIC_IMPORT = /(?:\brequire(?:\.resolve)?\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*['"\x60](\.{1,2}\/[^'"\x60\n]+)['"\x60]/g;
 const DIRNAME_JOIN = /\b[\w$]+\.(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*['"][^'"\n]+['"]\s*)+)\)/g;
 const DIRNAME_PLUS = /\b__dirname\s*\+\s*['"](\/[^'"\n]+)['"]/g;
 const CALL = /(?<![\w$.])(?:require|import)\s*\(/g;
 
 /**
- * Relative paths a file loads (a literal require or import, require.resolve, path.join(__dirname, ...)
- * and __dirname + '/...'), and the calls whose argument is not a path apm can read.
+ * Relative paths a file no parser read loads (a literal require or import, require.resolve, path.join(__dirname,
+ * ...) and __dirname + '/...'), and the calls whose argument is not a path apm can read.
  * Run it on joined text so `require('./lib/' + 'x')` is a literal.
  */
 export function importsOf(text: string): Imports {
   const paths: string[] = [];
 
   for (const m of text.matchAll(STATIC_IMPORT)) if (m[1]) paths.push(m[1]);
+  // read raw, every literal require or import is taken for a load
+  const loads = [...paths];
 
   for (const m of text.matchAll(DIRNAME_JOIN)) {
     const segs = [...(m[1] ?? "").matchAll(/['"]([^'"\n]+)['"]/g)].map((s) => s[1] ?? "");
@@ -571,5 +358,34 @@ export function importsOf(text: string): Imports {
     else break;
   }
 
-  return { paths: paths.slice(0, 500), dynamic };
+  return { paths: paths.slice(0, 500), loads: loads.slice(0, 500), dynamic };
+}
+
+// ---------- one file ----------
+
+/** What one file's text shows: the rules it matches, and the files and modules it loads. */
+export type FileScan = { findings: TextFinding[]; imports: Imports; read: "parsed" | "raw" | "lexed" };
+
+/**
+ * Reads one file as `lang`. JavaScript and TypeScript go to the parser; when no parser accepts the file, or it is
+ * too large to hold as a tree, it is read raw (fail closed): every match counts, as in apm-score-v3.
+ */
+export function scanFile(text: string, lang: Lang): FileScan {
+  if (isDialect(lang)) {
+    const js = scanJs(text, lang);
+
+    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed" };
+
+    return { findings: scanTextRules(text, "plain"), imports: importsOf(joinStrings(text).text), read: "raw" };
+  }
+
+  // JSON and type declarations never run, so nothing in them is a load
+  const imports = lang === "data" ? { paths: [], loads: [], dynamic: [] } : importsOf(joinStrings(text).text);
+
+  return { findings: scanTextRules(text, lang), imports, read: lang === "plain" ? "raw" : "lexed" };
+}
+
+/** The rule findings for one text read as `lang`. */
+export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
+  return scanFile(text, lang).findings;
 }

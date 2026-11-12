@@ -650,7 +650,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
       </p>
 
       {q === "" ? (
-        <div data-recent className="mt-10">
+        <div data-recent className="mt-10 empty:hidden">
           {recent}
         </div>
       ) : (

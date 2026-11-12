@@ -123,6 +123,9 @@ export type StagedRecord = z.infer<typeof StagedRow>;
 
 export type NewStaged = Omit<StagedRecord, "status" | "decided_at" | "decided_by">;
 
+/** Who and what the recent-activity feed leaves out: check accounts and the scopes they publish under. */
+export type RecentHidden = { actors: readonly string[]; scopes: readonly string[] };
+
 export type EventRecord = z.infer<typeof EventRow>;
 
 export type NewVersion = Omit<VersionRecord, "status" | "status_reason" | "status_at" | "status_by" | "deprecated">;
@@ -271,7 +274,8 @@ export type StoreApi = {
 
   readonly addEvent: (e: { package: string; kind: string; actor: string; at: number; detail?: unknown }) => Effect.Effect<void, StoreError>;
   readonly eventsFor: (name: string) => Effect.Effect<EventRecord[], StoreError>;
-  readonly recentEvents: (kinds: readonly string[], limit: number) => Effect.Effect<EventRecord[], StoreError>;
+  /** The latest events of `kinds`, leaving out those by `hiddenActors` or on packages under `hiddenScopes` (`@scope/`). */
+  readonly recentEvents: (kinds: readonly string[], limit: number, hidden: RecentHidden) => Effect.Effect<EventRecord[], StoreError>;
 
   /** Better Auth's rows, read for apm's own account views. */
   readonly accountsOf: (authUserId: string) => Effect.Effect<Linked[], StoreError>;
@@ -688,10 +692,14 @@ const make = Effect.gen(function* () {
         none,
       ),
     eventsFor: (name) => run("eventsFor", sql`SELECT * FROM events WHERE package = ${name} ORDER BY at DESC, id DESC`, all(EventRow)),
-    recentEvents: (kinds, limit) =>
+    recentEvents: (kinds, limit, hidden) =>
       kinds.length === 0
         ? Effect.succeed([])
-        : run("recentEvents", sql`SELECT * FROM events WHERE kind = ANY(${kinds}) ORDER BY at DESC, id DESC LIMIT ${limit}`, all(EventRow)),
+        : run(
+            "recentEvents",
+            sql`SELECT * FROM events WHERE kind = ANY(${kinds}) AND NOT (actor = ANY(${hidden.actors})) AND NOT (split_part(package, '/', 1) || '/' = ANY(${hidden.scopes})) ORDER BY at DESC, id DESC LIMIT ${limit}`,
+            all(EventRow),
+          ),
 
     accountsOf: (authUserId) =>
       run(

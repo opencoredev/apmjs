@@ -35,3 +35,13 @@ export function splitPossible(evidence: string): PossibleEvidence {
 
   return m?.[1] !== undefined && m[2] ? { text: m[1], why: m[2] } : { text: evidence, why: null };
 }
+
+/** Evidence from a shipped test file carries ` (in a test file)` after its snippet (apm-score-v5). */
+export type TestFileEvidence = { text: string; testFile: boolean };
+
+const IN_TEST_FILE = " (in a test file)";
+
+/** Splits the test-file mark off evidence whose `[possible: why]` reason, if any, was already split off. */
+export function splitTestFile(evidence: string): TestFileEvidence {
+  return evidence.endsWith(IN_TEST_FILE) ? { text: evidence.slice(0, -IN_TEST_FILE.length), testFile: true } : { text: evidence, testFile: false };
+}

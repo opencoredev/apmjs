@@ -2,10 +2,11 @@
 // marks every hit's source, keeps npm's wire format, and still answers with local hits (and a
 // flag the UI can show) when the upstream is down. A fake upstream stands in for registry.npmjs.org.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRegistry, addUser, makeSandbox, writePackage, run, getJson, dig, type Registry } from "./harness";
+import { startRegistry, addUser, makeSandbox, writePackage, run, getJson, dig, putPublish, type Registry } from "./harness";
 
 function searchObject(name: string, version: string, description: string) {
   return {
@@ -118,5 +119,29 @@ describe("search when the upstream is down", () => {
     expect(r.status).toBe(200);
     expect(dig(r.body, "upstreamFailed")).toBe(true);
     expect(hitsOf(r.body)).toEqual([{ name: "@alice/widget-local", version: "1.0.0", source: "local" }]);
+  });
+});
+
+describe("the recent feed leaves out the staging smoke check", () => {
+  let reg: Registry;
+  beforeAll(async () => {
+    reg = await startRegistry();
+  });
+  afterAll(async () => {
+    await reg?.stop();
+  });
+
+  test("a publish by apm-staging-check (packages/infra/smoke.ts) is not recent activity; a real one is", async () => {
+    const check = await addUser(reg, "apm-staging-check");
+    const alice = await addUser(reg, "alice");
+    const smoke = await putPublish(reg, check, { name: "@apm-staging-check/smoke-x1", version: "1.0.0", license: "MIT", main: "index.js" });
+    const real = await putPublish(reg, alice, { name: "@alice/real-thing", version: "1.0.0", license: "MIT", main: "index.js" });
+    expect(smoke.status).toBeLessThan(300);
+    expect(real.status).toBeLessThan(300);
+
+    const r = await getJson(`${reg.url}-/apm/v1/recent?limit=10`);
+    expect(r.status).toBe(200);
+    const { events } = z.object({ events: z.array(z.object({ package: z.string() })) }).parse(r.body);
+    expect(events.map((e) => e.package)).toEqual(["@alice/real-thing"]);
   });
 });

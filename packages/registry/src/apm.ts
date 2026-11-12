@@ -987,6 +987,12 @@ const searchResponse = (url: URL) =>
 
 // ---------- recent activity on this registry ----------
 const RECENT_KINDS = ["publish", "yank", "unyank", "revoke", "restore"] as const;
+
+/**
+ * Left out of the recent feed: the staging smoke check (packages/infra/smoke.ts) signs in as `apm-staging-check` and
+ * publishes `@apm-staging-check/smoke-*` on every run. Those versions are checks, not packages anyone would install.
+ */
+export const RECENT_HIDDEN = { actors: ["apm-staging-check"], scopes: ["@apm-staging-check/"] } as const;
 const EventDetail = z.object({ version: z.string(), reason: z.string().nullish() }).loose();
 
 const recentResponse = (url: URL) =>
@@ -997,7 +1003,7 @@ const recentResponse = (url: URL) =>
     const seen = new Set<string>();
     const events: Record<string, unknown>[] = [];
 
-    for (const e of yield* store.recentEvents([...RECENT_KINDS], limit * 4)) {
+    for (const e of yield* store.recentEvents([...RECENT_KINDS], limit * 4, RECENT_HIDDEN)) {
       const d = EventDetail.safeParse(e.detail);
 
       if (!d.success) continue;

@@ -59,7 +59,7 @@ describe("evidence that does not support its label", () => {
 
   test("fetch of a data: URL and a TypeScript type import never reach the network", () => {
     expect(found("const R = (await fetch('data:,')).constructor;\n")).toEqual({});
-    expect(found("type R = NotAny<import('undici').RequestInit>;\n")).toEqual({});
+    expect(found("type R = NotAny<import('undici').RequestInit>;\n", "ts")).toEqual({});
   });
 
   test("WebAssembly, fonts and data tables in literals are not obfuscated code", () => {
