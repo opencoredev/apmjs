@@ -1,24 +1,36 @@
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { FactorLedger, GRANT_MS, MAX_FAILURES, PASSKEY_PROOF_MS, matchingStep, parseSixDigits, type SixDigits } from "../src/factors.ts";
+import { Effect } from "effect";
+import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
+import { GRANT_MS, MAX_FAILURES, PASSKEY_PROOF_MS, matchingStep, parseProofHeader, parseSixDigits, type SixDigits } from "../src/factors.ts";
 import { actionKey, commandLine, confirmUrl, LiveAction } from "../src/actions.ts";
-import { parseProofHeader } from "../src/auth.ts";
+import { Store, type StoreApi } from "../src/db.ts";
+import type { StoreError } from "../src/errors.ts";
 import { legacyAuthRefusal, isPublicHttps } from "../src/startup.ts";
-import { typedConfirmationReason } from "../src/account.ts";
+import { typedConfirmationReason } from "../src/approval.ts";
 
-function withDb<T>(fn: (path: string) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "apm-factors-"));
+/** The second-factor ledger lives in the registry's Postgres: each test gets a fresh, migrated database. */
+async function withLedger(fn: (ledger: StoreApi) => Promise<void>): Promise<void> {
+  const db = await freshDatabase();
 
   try {
-    return fn(join(dir, "registry.sqlite"));
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* Store;
+        yield* Effect.promise(() => fn(store));
+      }).pipe(Effect.provide(Store.postgres(db.url)), Effect.scoped),
+    );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await db.drop();
   }
 }
+
+/** A second connection to the same database, as another Worker isolate (or a restart) would open. */
+async function otherConnection<A>(url: string, fn: (ledger: StoreApi) => Effect.Effect<A, StoreError>): Promise<A> {
+  return Effect.runPromise(Effect.flatMap(Store, fn).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+}
+
+const run = <A>(effect: Effect.Effect<A, StoreError>): Promise<A> => Effect.runPromise(effect);
 
 function sixDigits(s: string): SixDigits {
   const c = parseSixDigits(s);
@@ -62,93 +74,89 @@ describe("TOTP steps", () => {
 });
 
 describe("attempt budget", () => {
-  test("reserved attempts count before they settle, so concurrent guesses share one budget", () => {
-    withDb((path) => {
-      const ledger = new FactorLedger(new Database(path, { create: true }));
+  test("reserved attempts count before they settle, so concurrent guesses share one budget", async () => {
+    await withLedger(async (ledger) => {
       const at = 1_000_000;
-      const held = Array.from({ length: MAX_FAILURES }, () => ledger.reserve({ authUserId: "u", at }));
+      const held = await Promise.all(Array.from({ length: MAX_FAILURES }, () => run(ledger.reserveAttempt({ authUserId: "u", at }))));
       expect(held.every((r) => r.kind === "reserved")).toBe(true);
-      expect(ledger.reserve({ authUserId: "u", at }).kind).toBe("locked");
-      expect(ledger.reserve({ authUserId: "other", at }).kind).toBe("reserved");
+      expect((await run(ledger.reserveAttempt({ authUserId: "u", at }))).kind).toBe("locked");
+      expect((await run(ledger.reserveAttempt({ authUserId: "other", at }))).kind).toBe("reserved");
     });
   });
 
-  test("the budget survives a restart and frees up after the window", () => {
-    withDb((path) => {
-      const first = new Database(path, { create: true });
-      const ledger = new FactorLedger(first);
+  test("the budget is shared by every connection and frees up after the window", async () => {
+    const db = await freshDatabase();
 
-      for (let i = 0; i < MAX_FAILURES; i++) {
-        const r = ledger.reserve({ authUserId: "u", at: 0 });
+    try {
+      await otherConnection(db.url, (ledger) =>
+        Effect.gen(function* () {
+          for (let i = 0; i < MAX_FAILURES; i++) {
+            const r = yield* ledger.reserveAttempt({ authUserId: "u", at: 0 });
 
-        if (r.kind === "reserved") ledger.settle({ id: r.id, authUserId: "u", ok: false });
-      }
-
-      first.close();
-      const again = new FactorLedger(new Database(path));
-      expect(again.reserve({ authUserId: "u", at: 60_000 }).kind).toBe("locked");
-      expect(again.reserve({ authUserId: "u", at: 16 * 60_000 }).kind).toBe("reserved");
-    });
+            if (r.kind === "reserved") yield* ledger.settleAttempt({ id: r.id, authUserId: "u", ok: false });
+          }
+        }),
+      );
+      expect((await otherConnection(db.url, (ledger) => ledger.reserveAttempt({ authUserId: "u", at: 60_000 }))).kind).toBe("locked");
+      expect((await otherConnection(db.url, (ledger) => ledger.reserveAttempt({ authUserId: "u", at: 16 * 60_000 }))).kind).toBe("reserved");
+    } finally {
+      await db.drop();
+    }
   });
 
-  test("a success clears earlier failures", () => {
-    withDb((path) => {
-      const ledger = new FactorLedger(new Database(path, { create: true }));
-
+  test("a success clears earlier failures", async () => {
+    await withLedger(async (ledger) => {
       for (let i = 0; i < MAX_FAILURES - 1; i++) {
-        const r = ledger.reserve({ authUserId: "u", at: 0 });
+        const r = await run(ledger.reserveAttempt({ authUserId: "u", at: 0 }));
 
-        if (r.kind === "reserved") ledger.settle({ id: r.id, authUserId: "u", ok: false });
+        if (r.kind === "reserved") await run(ledger.settleAttempt({ id: r.id, authUserId: "u", ok: false }));
       }
 
-      const ok = ledger.reserve({ authUserId: "u", at: 0 });
+      const ok = await run(ledger.reserveAttempt({ authUserId: "u", at: 0 }));
 
       if (ok.kind !== "reserved") throw new Error("expected a reservation");
-      ledger.settle({ id: ok.id, authUserId: "u", ok: true });
-      expect(ledger.reserve({ authUserId: "u", at: 0 }).kind).toBe("reserved");
+      await run(ledger.settleAttempt({ id: ok.id, authUserId: "u", ok: true }));
+      expect((await run(ledger.reserveAttempt({ authUserId: "u", at: 0 }))).kind).toBe("reserved");
     });
   });
 });
 
 describe("accepted steps", () => {
-  test("a step is accepted once, and an older step after a newer one is refused", () => {
-    withDb((path) => {
-      const ledger = new FactorLedger(new Database(path, { create: true }));
-      expect(ledger.acceptStep({ authUserId: "u", step: 100 })).toBe(true);
-      expect(ledger.acceptStep({ authUserId: "u", step: 100 })).toBe(false);
-      expect(ledger.acceptStep({ authUserId: "u", step: 99 })).toBe(false);
-      expect(ledger.acceptStep({ authUserId: "u", step: 101 })).toBe(true);
-      expect(ledger.acceptStep({ authUserId: "v", step: 100 })).toBe(true);
+  test("a step is accepted once, and an older step after a newer one is refused", async () => {
+    await withLedger(async (ledger) => {
+      expect(await run(ledger.acceptStep({ authUserId: "u", step: 100 }))).toBe(true);
+      expect(await run(ledger.acceptStep({ authUserId: "u", step: 100 }))).toBe(false);
+      expect(await run(ledger.acceptStep({ authUserId: "u", step: 99 }))).toBe(false);
+      expect(await run(ledger.acceptStep({ authUserId: "u", step: 101 }))).toBe(true);
+      expect(await run(ledger.acceptStep({ authUserId: "v", step: 100 }))).toBe(true);
     });
   });
 });
 
 describe("passkey proofs and CLI confirmations", () => {
-  test("a passkey check is bound to its session and spent on one action", () => {
-    withDb((path) => {
-      const ledger = new FactorLedger(new Database(path, { create: true }));
-      ledger.recordPasskeyProof({ sessionToken: "s1", authUserId: "u", at: 0 });
-      expect(ledger.consumePasskeyProof({ sessionToken: "s2", authUserId: "u", purpose: "approve:a", at: 1 })).toBe(false);
-      expect(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "other", purpose: "approve:a", at: 1 })).toBe(false);
-      expect(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:a", at: 1 })).toBe(true);
-      expect(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:b", at: 2 })).toBe(false);
-      ledger.recordPasskeyProof({ sessionToken: "s3", authUserId: "u", at: 0 });
-      expect(ledger.consumePasskeyProof({ sessionToken: "s3", authUserId: "u", purpose: "x", at: PASSKEY_PROOF_MS })).toBe(false);
+  test("a passkey check is bound to its session and spent on one action", async () => {
+    await withLedger(async (ledger) => {
+      await run(ledger.recordPasskeyProof({ sessionToken: "s1", authUserId: "u", at: 0 }));
+      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s2", authUserId: "u", purpose: "approve:a", at: 1 }))).toBe(false);
+      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "other", purpose: "approve:a", at: 1 }))).toBe(false);
+      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:a", at: 1 }))).toBe(true);
+      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:b", at: 2 }))).toBe(false);
+      await run(ledger.recordPasskeyProof({ sessionToken: "s3", authUserId: "u", at: 0 }));
+      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s3", authUserId: "u", purpose: "x", at: PASSKEY_PROOF_MS }))).toBe(false);
     });
   });
 
-  test("a CLI confirmation covers its named command once, within its window", () => {
-    withDb((path) => {
-      const ledger = new FactorLedger(new Database(path, { create: true }));
+  test("a CLI confirmation covers its named command once, within its window", async () => {
+    await withLedger(async (ledger) => {
       const revoke = actionKey({ kind: "revoke", name: "@a/b", version: "1.0.0" });
       const other = actionKey({ kind: "revoke", name: "@a/b", version: "1.0.1" });
-      ledger.grant({ authUserId: "u", action: revoke, at: 0 });
-      expect(ledger.consumeGrant({ authUserId: "u", action: other, at: 1 })).toBe(false);
-      expect(ledger.consumeGrant({ authUserId: "v", action: revoke, at: 1 })).toBe(false);
-      expect(ledger.consumeGrant({ authUserId: "u", action: revoke, at: 1 })).toBe(true);
-      expect(ledger.consumeGrant({ authUserId: "u", action: revoke, at: 2 })).toBe(false);
-      ledger.grant({ authUserId: "u", action: revoke, at: 0 });
-      expect(ledger.consumeGrant({ authUserId: "u", action: revoke, at: GRANT_MS })).toBe(false);
+      await run(ledger.grant({ authUserId: "u", action: revoke, at: 0 }));
+      expect(await run(ledger.consumeGrant({ authUserId: "u", action: other, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeGrant({ authUserId: "v", action: revoke, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeGrant({ authUserId: "u", action: revoke, at: 1 }))).toBe(true);
+      expect(await run(ledger.consumeGrant({ authUserId: "u", action: revoke, at: 2 }))).toBe(false);
+      await run(ledger.grant({ authUserId: "u", action: revoke, at: 0 }));
+      expect(await run(ledger.consumeGrant({ authUserId: "u", action: revoke, at: GRANT_MS }))).toBe(false);
     });
   });
 });

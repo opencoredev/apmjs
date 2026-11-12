@@ -2,32 +2,41 @@
 // results, the public and maintainer views, "Request AI review", and the owner-only queue where a
 // person confirms or dismisses a flag. The model never runs here: a separate reviewer process
 // (apps/reviewer) leases jobs over HTTP and posts results back. See docs/AI-REVIEW.md.
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { Context, Effect, Option } from "effect";
+import type { SqlError } from "effect/sql/SqlError";
+import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
-import type { ApmAuth } from "./auth.ts";
-import type { User, VersionRecord } from "./db.ts";
-import { fail, json, splitPath, tarballUrl, type Auth, type Ctx } from "./server.ts";
-import { digestLabel, digestOf, type Upstream, type UpstreamPackage } from "./upstream.ts";
+import { Auth } from "./auth.ts";
+import { Clock } from "./clock.ts";
+import { RegistryConfig } from "./config.ts";
+import { Store, type User, type VersionRecord } from "./db.ts";
+import { refuse, StoreError, type AuthError, type HttpFailure } from "./errors.ts";
+import { randomId } from "./hash.ts";
+import { fail, json, parseBody } from "./http.ts";
+import { order } from "./semver.ts";
+import { splitPath, tarballUrl, type Caller } from "./server.ts";
+import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 
-export type ReviewOptions = {
-  /** sha256 (hex) of the reviewer's service token. The token itself lives in a 0600 file. */
-  serviceTokenHash: string;
+export type ReviewSettings = {
+  /** sha256 (hex) of the reviewer's service token. The token itself stays with the reviewer. */
+  readonly serviceTokenHash: string;
   /** GitHub logins that may confirm or dismiss flagged reviews. */
-  admins: readonly string[];
+  readonly admins: readonly string[];
   /** Upstream versions are reviewed when their package has at least this many weekly downloads. */
-  popularWeekly?: number;
+  readonly popularWeekly: number;
   /** npm's download-count API, ending in "/". */
-  downloadsUrl?: string;
+  readonly downloadsUrl: string;
   /** How long a leased job stays with one reviewer before it returns to the queue. */
-  leaseMs?: number;
+  readonly leaseMs: number;
   /** "Request AI review" presses per user per hour. */
-  requestsPerHour?: number;
+  readonly requestsPerHour: number;
   /** Leases a job may take before it is marked failed. */
-  maxAttempts?: number;
+  readonly maxAttempts: number;
 };
 
-const DEFAULTS = {
+export const REVIEW_DEFAULTS = {
   popularWeekly: 10_000,
   downloadsUrl: "https://api.npmjs.org/downloads/point/last-week/",
   leaseMs: 15 * 60_000,
@@ -35,61 +44,19 @@ const DEFAULTS = {
   maxAttempts: 5,
 } as const;
 
+/** The AI review is on when this service is provided (worker.ts does when the service token hash is set). */
+export class ReviewConfig extends Context.Service<ReviewConfig, ReviewSettings>()("@apm/registry/ReviewConfig") {}
+
+/** The sha256 hex of a service token, as APM_REVIEW_TOKEN_HASH takes it. */
+export function serviceTokenHashOf(token: string): string {
+  return createHash("sha256").update(token.trim()).digest("hex");
+}
+
 const HOUR = 3_600_000;
 const DOWNLOADS_TTL_MS = 24 * HOUR;
 const DOWNLOADS_FAILURE_TTL_MS = HOUR;
 const MAX_LEASE_BATCH = 16;
-
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS review_jobs (
-  id TEXT PRIMARY KEY,
-  package TEXT NOT NULL,
-  version TEXT NOT NULL,
-  digest TEXT NOT NULL,
-  source TEXT NOT NULL,
-  reasons TEXT NOT NULL,
-  priority INTEGER NOT NULL,
-  state TEXT NOT NULL,
-  lease_id TEXT,
-  lease_expires_at INTEGER,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT,
-  enqueued_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS review_jobs_key ON review_jobs(package, version, digest);
-CREATE INDEX IF NOT EXISTS review_jobs_ready ON review_jobs(state, priority, enqueued_at);
-CREATE TABLE IF NOT EXISTS reviews (
-  package TEXT NOT NULL,
-  version TEXT NOT NULL,
-  digest TEXT NOT NULL,
-  outcome TEXT NOT NULL,
-  result TEXT NOT NULL,
-  reviewed_at INTEGER NOT NULL,
-  human_state TEXT NOT NULL,
-  human_by TEXT,
-  human_at INTEGER,
-  human_note TEXT,
-  PRIMARY KEY (package, version, digest)
-);
-CREATE INDEX IF NOT EXISTS reviews_human ON reviews(human_state, reviewed_at);
-CREATE TABLE IF NOT EXISTS review_seen (
-  package TEXT PRIMARY KEY,
-  newest_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS review_downloads (
-  package TEXT PRIMARY KEY,
-  weekly INTEGER,
-  fetched_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS review_requests (
-  actor TEXT NOT NULL,
-  package TEXT NOT NULL,
-  version TEXT NOT NULL,
-  at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS review_requests_actor ON review_requests(actor, at);
-`;
+const MAX_REVIEW_BODY_BYTES = 2 * 1024 * 1024;
 
 type Source = "local" | "upstream";
 
@@ -97,6 +64,8 @@ type JobState = "queued" | "leased" | "done" | "failed";
 
 /** none: nothing for a person to do (benign). pending: waits in the owner queue. */
 type HumanState = "none" | "pending" | "confirmed" | "dismissed";
+
+const Int = z.union([z.bigint(), z.number()]).transform((n) => Number(n));
 
 const Reasons = z.array(z.enum(["publish", "first-publish", "install-script", "popular", "requested"]));
 
@@ -106,15 +75,15 @@ const JobRow = z.object({
   version: z.string(),
   digest: z.string(),
   source: z.enum(["local", "upstream"]),
-  reasons: z.string(),
-  priority: z.number(),
+  reasons: Reasons,
+  priority: Int,
   state: z.enum(["queued", "leased", "done", "failed"]),
   lease_id: z.string().nullable(),
-  lease_expires_at: z.number().nullable(),
-  attempts: z.number(),
+  lease_expires_at: Int.nullable(),
+  attempts: Int,
   last_error: z.string().nullable(),
-  enqueued_at: z.number(),
-  updated_at: z.number(),
+  enqueued_at: Int,
+  updated_at: Int,
 });
 
 type JobRow = z.infer<typeof JobRow>;
@@ -124,29 +93,25 @@ const ReviewRow = z.object({
   version: z.string(),
   digest: z.string(),
   outcome: z.enum(["benign", "flagged", "no-answer"]),
-  result: z.string(),
-  reviewed_at: z.number(),
+  result: ReviewResult,
+  reviewed_at: Int,
   human_state: z.enum(["none", "pending", "confirmed", "dismissed"]),
   human_by: z.string().nullable(),
-  human_at: z.number().nullable(),
+  human_at: Int.nullable(),
   human_note: z.string().nullable(),
 });
 
-type StoredReview = Omit<z.infer<typeof ReviewRow>, "result"> & { result: ReviewResult };
+type StoredReview = z.infer<typeof ReviewRow>;
+
+const one = <S extends z.ZodType>(row: S) => z.array(row).transform((rows) => rows[0] ?? null);
+const all = <S extends z.ZodType>(row: S) => z.array(row);
+const none = z.array(z.unknown()).transform(() => undefined);
 
 /** Lower runs first. */
 const PRIORITY: Record<EnqueueReason, number> = { requested: 0, publish: 1, "first-publish": 2, "install-script": 2, popular: 3 };
 
 function priorityOf(reasons: readonly EnqueueReason[]): number {
   return Math.min(...reasons.map((r) => PRIORITY[r]), 9);
-}
-
-function sha256(text: string): Buffer {
-  return createHash("sha256").update(text).digest();
-}
-
-function newId(): string {
-  return randomBytes(12).toString("base64url");
 }
 
 function iso(ms: number): string {
@@ -176,9 +141,9 @@ export function previousVersionOf(versions: readonly VersionRecord[], version: s
 
     if (!isPrerelease(version) && isPrerelease(v.version)) continue;
 
-    if (Bun.semver.order(v.version, version) >= 0) continue;
+    if (order(v.version, version) >= 0) continue;
 
-    if (best === null || Bun.semver.order(v.version, best.version) > 0) best = v;
+    if (best === null || order(v.version, best.version) > 0) best = v;
   }
 
   return best;
@@ -197,214 +162,267 @@ function tarballPath(name: string, version: string): string {
 
 const DownloadsAnswer = z.object({ downloads: z.number() });
 
-type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: "token" | "session" };
+// ---------- storage ----------
+const query = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
+  effect.pipe(
+    Effect.mapError((cause) => new StoreError({ operation: `review.${operation}`, cause })),
+    Effect.flatMap((rows) => {
+      const parsed = schema.safeParse(rows);
 
-export type ReviewModule = {
-  routes: (req: Request, url: URL, auth: Auth) => Promise<Response | null>;
-  /** Called after a local version is committed. */
-  onLocalCommit: (v: { name: string; version: string; firstPublish: boolean }) => void;
-  /** Called when the upstream packument of a package is fetched (not on cache hits). */
-  onUpstreamPackage: (pkg: UpstreamPackage) => void;
-  /** Settles background work (download lookups); for tests and shutdown. */
-  idle: () => Promise<void>;
-};
+      return parsed.success ? Effect.succeed(parsed.data) : Effect.fail(new StoreError({ operation: `review.${operation}: parse`, cause: parsed.error }));
+    }),
+  );
 
-export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstream | null; options: ReviewOptions }): ReviewModule {
-  const { ctx, auth, upstream } = input;
-  const opts = { ...DEFAULTS, ...input.options };
-  const admins = new Set(opts.admins.map((a) => a.trim().toLowerCase()).filter((a) => a !== ""));
-  const tokenHash = Buffer.from(opts.serviceTokenHash, "hex");
-  const db = ctx.store.db;
-  const pending = new Set<Promise<void>>();
+const jobByKey = (name: string, version: string, digest: string) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    query("jobByKey", sql`SELECT * FROM review_jobs WHERE package = ${name} AND version = ${version} AND digest = ${digest}`, one(JobRow)),
+  );
 
-  if (tokenHash.length !== 32) throw new Error("review.serviceTokenHash must be a sha256 hex digest");
-  db.exec(SCHEMA);
+const jobById = (id: string, lock: boolean) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    query("jobById", lock ? sql`SELECT * FROM review_jobs WHERE id = ${id} FOR UPDATE` : sql`SELECT * FROM review_jobs WHERE id = ${id}`, one(JobRow)),
+  );
 
-  // ---------- storage ----------
-  function jobByKey(name: string, version: string, digest: string): JobRow | null {
-    const row = db.query("SELECT * FROM review_jobs WHERE package = ? AND version = ? AND digest = ?").get(name, version, digest);
+const reviewFor = (name: string, version: string, digest: string) =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    query("reviewFor", sql`SELECT * FROM reviews WHERE package = ${name} AND version = ${version} AND digest = ${digest}`, one(ReviewRow)),
+  );
 
-    return row ? JobRow.parse(row) : null;
-  }
+/** Adds a job, or merges reasons into the waiting one. A finished job is reopened only for a request after no answer. */
+const enqueue = (job: { name: string; version: string; digest: string; source: Source; reasons: EnqueueReason[] }) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
+    const at = yield* (yield* Clock).now;
 
-  function jobById(id: string): JobRow | null {
-    const row = db.query("SELECT * FROM review_jobs WHERE id = ?").get(id);
-
-    return row ? JobRow.parse(row) : null;
-  }
-
-  function toReview(r: z.infer<typeof ReviewRow>): StoredReview {
-    return { ...r, result: ReviewResult.parse(JSON.parse(r.result)) };
-  }
-
-  function reviewFor(name: string, version: string, digest: string): StoredReview | null {
-    const row = db.query("SELECT * FROM reviews WHERE package = ? AND version = ? AND digest = ?").get(name, version, digest);
-
-    return row ? toReview(ReviewRow.parse(row)) : null;
-  }
-
-  /** Adds a job, or merges reasons into the waiting one. A finished job is reopened only for a request after no answer. */
-  function enqueue(job: { name: string; version: string; digest: string; source: Source; reasons: EnqueueReason[] }): "queued" | "exists" {
-    const at = ctx.now();
-
-    return ctx.store.tx(() => {
-      const cur = jobByKey(job.name, job.version, job.digest);
-
-      if (!cur) {
-        db.query(
-          "INSERT INTO review_jobs (id, package, version, digest, source, reasons, priority, state, enqueued_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
-        ).run(newId(), job.name, job.version, job.digest, job.source, JSON.stringify(job.reasons), priorityOf(job.reasons), at, at);
-
-        return "queued";
-      }
-
-      const reasons = [...new Set([...Reasons.parse(JSON.parse(cur.reasons)), ...job.reasons])];
-      const reopen = job.reasons.includes("requested") && (cur.state === "failed" || reviewFor(job.name, job.version, job.digest)?.outcome === "no-answer");
-
-      if (cur.state === "queued" || cur.state === "leased" || reopen) {
-        db.query("UPDATE review_jobs SET reasons = ?, priority = ?, state = CASE WHEN ? THEN 'queued' ELSE state END, attempts = CASE WHEN ? THEN 0 ELSE attempts END, updated_at = ? WHERE id = ?").run(
-          JSON.stringify(reasons),
-          Math.min(cur.priority, priorityOf(job.reasons)),
-          reopen ? 1 : 0,
-          reopen ? 1 : 0,
-          at,
-          cur.id,
+    return yield* store.tx(
+      Effect.gen(function* () {
+        const inserted = yield* query(
+          "enqueue: insert",
+          sql`INSERT INTO review_jobs (id, package, version, digest, source, reasons, priority, state, enqueued_at, updated_at)
+              VALUES (${randomId(12)}, ${job.name}, ${job.version}, ${job.digest}, ${job.source}, ${JSON.stringify(job.reasons)}::jsonb,
+                      ${priorityOf(job.reasons)}, 'queued', ${at}, ${at})
+              ON CONFLICT (package, version, digest) DO NOTHING RETURNING id`,
+          z.array(z.unknown()),
         );
 
-        return reopen ? "queued" : "exists";
-      }
+        if (inserted.length > 0) return "queued" as const;
 
-      return "exists";
-    });
-  }
+        const cur = yield* query(
+          "enqueue: lock",
+          sql`SELECT * FROM review_jobs WHERE package = ${job.name} AND version = ${job.version} AND digest = ${job.digest} FOR UPDATE`,
+          one(JobRow),
+        );
 
-  function setJobState(id: string, state: JobState, error: string | null): void {
-    db.query("UPDATE review_jobs SET state = ?, lease_id = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE id = ?").run(state, error, ctx.now(), id);
-  }
+        if (!cur) return "exists" as const;
+        const reasons = [...new Set([...cur.reasons, ...job.reasons])];
+        const reopen = job.reasons.includes("requested") && (cur.state === "failed" || (yield* reviewFor(job.name, job.version, job.digest))?.outcome === "no-answer");
 
-  /** Takes up to `max` ready jobs; expired leases count as ready again. */
-  function takeJobs(max: number): JobRow[] {
-    const now = ctx.now();
+        if (cur.state !== "queued" && cur.state !== "leased" && !reopen) return "exists" as const;
+        const state: JobState = reopen ? "queued" : cur.state;
+        yield* query(
+          "enqueue: merge",
+          sql`UPDATE review_jobs SET reasons = ${JSON.stringify(reasons)}::jsonb, priority = ${Math.min(cur.priority, priorityOf(job.reasons))},
+                  state = ${state}, attempts = ${reopen ? 0 : cur.attempts}, updated_at = ${at} WHERE id = ${cur.id}`,
+          none,
+        );
 
-    return ctx.store.tx(() => {
-      db.query("UPDATE review_jobs SET state = 'queued', lease_id = NULL, lease_expires_at = NULL, updated_at = ? WHERE state = 'leased' AND lease_expires_at <= ?").run(now, now);
+        return reopen ? ("queued" as const) : ("exists" as const);
+      }),
+    );
+  });
 
-      db.query("UPDATE review_jobs SET state = 'failed', last_error = 'too many attempts', updated_at = ? WHERE state = 'queued' AND attempts >= ?").run(now, opts.maxAttempts);
+const setJobState = (id: string, state: JobState, error: string | null) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const at = yield* (yield* Clock).now;
+    yield* query(
+      "setJobState",
+      sql`UPDATE review_jobs SET state = ${state}, lease_id = NULL, lease_expires_at = NULL, last_error = ${error}, updated_at = ${at} WHERE id = ${id}`,
+      none,
+    );
+  });
 
-      const rows = db
-        .query("SELECT * FROM review_jobs WHERE state = 'queued' ORDER BY priority, enqueued_at LIMIT ?")
-        .all(max)
-        .map((r) => JobRow.parse(r));
+/** Takes up to `max` ready jobs; expired leases count as ready again. Concurrent reviewers never get the same job. */
+const takeJobs = (max: number, settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
+    const now = yield* (yield* Clock).now;
 
-      for (const r of rows) {
-        db.query("UPDATE review_jobs SET state = 'leased', lease_id = ?, lease_expires_at = ?, attempts = attempts + 1, updated_at = ? WHERE id = ?").run(newId(), now + opts.leaseMs, now, r.id);
-      }
+    const rows = yield* store.tx(
+      Effect.gen(function* () {
+        yield* query(
+          "takeJobs: expire",
+          sql`UPDATE review_jobs SET state = 'queued', lease_id = NULL, lease_expires_at = NULL, updated_at = ${now} WHERE state = 'leased' AND lease_expires_at <= ${now}`,
+          none,
+        );
+        yield* query(
+          "takeJobs: give up",
+          sql`UPDATE review_jobs SET state = 'failed', last_error = 'too many attempts', updated_at = ${now} WHERE state = 'queued' AND attempts >= ${settings.maxAttempts}`,
+          none,
+        );
 
-      return rows.map((r) => jobById(r.id)).filter((r): r is JobRow => r !== null);
-    });
-  }
+        return yield* query(
+          "takeJobs: lease",
+          sql`UPDATE review_jobs SET state = 'leased', lease_id = replace(gen_random_uuid()::text, '-', ''), lease_expires_at = ${now + settings.leaseMs},
+                  attempts = attempts + 1, updated_at = ${now}
+              WHERE id IN (SELECT id FROM review_jobs WHERE state = 'queued' ORDER BY priority, enqueued_at LIMIT ${max} FOR UPDATE SKIP LOCKED)
+              RETURNING *`,
+          all(JobRow),
+        );
+      }),
+    );
 
-  // ---------- catalog ----------
-  type Catalog = { kind: "ok"; source: Source; versions: VersionRecord[] } | { kind: "absent" } | { kind: "unavailable" };
+    return rows.toSorted((a, b) => a.priority - b.priority || a.enqueued_at - b.enqueued_at);
+  });
 
-  async function catalog(name: string): Promise<Catalog> {
-    if (ctx.store.getPackage(name)) return { kind: "ok", source: "local", versions: ctx.store.listVersions(name) };
+// ---------- catalog ----------
+type Catalog = { kind: "ok"; source: Source; versions: VersionRecord[] } | { kind: "absent" } | { kind: "unavailable" };
 
-    if (!upstream) return { kind: "absent" };
-    const probe = await upstream.probe(ctx, name);
+const catalog = (name: string) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+
+    if (yield* store.getPackage(name)) return { kind: "ok", source: "local", versions: yield* store.listVersions(name) } satisfies Catalog;
+    const upstream = yield* Effect.serviceOption(Upstream);
+
+    if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog;
+    const probe = yield* upstream.value.probe(name);
 
     switch (probe.kind) {
       case "found":
-        return { kind: "ok", source: "upstream", versions: probe.pkg.versions };
+        return { kind: "ok", source: "upstream", versions: probe.pkg.versions } satisfies Catalog;
       case "absent":
-        return { kind: "absent" };
+        return { kind: "absent" } satisfies Catalog;
       case "unknown":
-        return { kind: "unavailable" };
+        return { kind: "unavailable" } satisfies Catalog;
       default: {
         const _exhaustive: never = probe;
 
         return _exhaustive;
       }
     }
-  }
+  });
 
-  /** The job as the reviewer sees it, or why it cannot be built. */
-  async function jobPayload(row: JobRow): Promise<{ kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string }> {
-    const cat = await catalog(row.package);
+type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string };
 
-    if (cat.kind === "unavailable") return { kind: "later", why: "the upstream registry could not be reached" };
+/** The job as the reviewer sees it, or why it cannot be built. */
+const jobPayload = (row: JobRow) =>
+  Effect.gen(function* () {
+    const cat: Catalog = yield* catalog(row.package);
 
-    if (cat.kind === "absent") return { kind: "gone", why: "the package is no longer published" };
+    if (cat.kind === "unavailable") return { kind: "later", why: "the upstream registry could not be reached" } satisfies Payload;
+
+    if (cat.kind === "absent") return { kind: "gone", why: "the package is no longer published" } satisfies Payload;
     const v = cat.versions.find((x) => x.version === row.version);
 
-    if (!v || v.status === "revoked") return { kind: "gone", why: "the version is no longer served" };
+    if (!v || v.status === "revoked") return { kind: "gone", why: "the version is no longer served" } satisfies Payload;
 
-    if (labelOf(v) !== row.digest) return { kind: "gone", why: "the version's tarball checksum changed" };
+    if (labelOf(v) !== row.digest) return { kind: "gone", why: "the version's tarball checksum changed" } satisfies Payload;
     const prev = previousVersionOf(cat.versions, row.version);
     const prevDigest = prev ? labelOf(prev) : null;
+    const now = yield* (yield* Clock).now;
 
     return {
       kind: "ok",
       job: {
         id: row.id,
         leaseId: row.lease_id ?? "",
-        leaseExpiresAt: iso(row.lease_expires_at ?? ctx.now()),
+        leaseExpiresAt: iso(row.lease_expires_at ?? now),
         name: row.package,
         version: row.version,
         digest: row.digest,
         tarballPath: tarballPath(row.package, row.version),
         previous: prev && prevDigest ? { version: prev.version, digest: prevDigest, tarballPath: tarballPath(row.package, prev.version) } : null,
-        reasons: Reasons.parse(JSON.parse(row.reasons)),
+        reasons: row.reasons,
       },
-    };
-  }
+    } satisfies Payload;
+  });
 
-  // ---------- enqueue policy ----------
-  async function weeklyDownloads(name: string): Promise<number | null> {
-    const now = ctx.now();
-    const cached = db.query("SELECT weekly, fetched_at FROM review_downloads WHERE package = ?").get(name);
-    const hit = cached ? z.object({ weekly: z.number().nullable(), fetched_at: z.number() }).parse(cached) : null;
+// ---------- enqueue policy ----------
+const weeklyDownloads = (name: string, settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* (yield* Clock).now;
+
+    const hit = yield* query(
+      "weeklyDownloads: read",
+      sql`SELECT weekly, fetched_at FROM review_downloads WHERE package = ${name}`,
+      one(z.object({ weekly: Int.nullable(), fetched_at: Int })),
+    );
 
     if (hit && now - hit.fetched_at < (hit.weekly === null ? DOWNLOADS_FAILURE_TTL_MS : DOWNLOADS_TTL_MS)) return hit.weekly;
-    let weekly: number | null = null;
 
-    try {
-      const res = await fetch(`${opts.downloadsUrl}${name}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+    const weekly = yield* Effect.promise(async (): Promise<number | null> => {
+      try {
+        const res = await fetch(`${settings.downloadsUrl}${name}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
 
-      if (res.ok) {
+        if (!res.ok) {
+          await res.body?.cancel();
+
+          return null;
+        }
+
         const parsed = DownloadsAnswer.safeParse(await res.json());
 
-        weekly = parsed.success ? parsed.data.downloads : null;
-      } else {
-        await res.body?.cancel();
+        return parsed.success ? parsed.data.downloads : null;
+      } catch {
+        return null;
       }
-    } catch {
-      weekly = null;
-    }
-
-    db.query("INSERT OR REPLACE INTO review_downloads (package, weekly, fetched_at) VALUES (?, ?, ?)").run(name, weekly, now);
-
-    return weekly;
-  }
-
-  function background(work: Promise<void>): void {
-    const p = work.catch((cause: unknown) => {
-      process.stderr.write(`apm review: background work failed: ${cause instanceof Error ? cause.message : String(cause)}\n`);
     });
 
-    pending.add(p);
-    void p.finally(() => pending.delete(p));
-  }
+    yield* query(
+      "weeklyDownloads: write",
+      sql`INSERT INTO review_downloads (package, weekly, fetched_at) VALUES (${name}, ${weekly}, ${now})
+          ON CONFLICT (package) DO UPDATE SET weekly = EXCLUDED.weekly, fetched_at = EXCLUDED.fetched_at`,
+      none,
+    );
 
-  /** Versions apm sees for the first time: the newest on first sight of a package, then every newer one. */
-  async function considerUpstream(pkg: UpstreamPackage): Promise<void> {
+    return weekly;
+  });
+
+/** Queues a review of a version that just went live here. Does nothing while the AI review is off. */
+export const reviewLocalCommit = (v: { name: string; version: string; firstPublish: boolean }) =>
+  Effect.gen(function* () {
+    if (Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return;
+    const store = yield* Store;
+    const rec = yield* store.getVersion(v.name, v.version);
+    const digest = rec ? labelOf(rec) : null;
+
+    if (!rec || !digest) return;
+    const reasons: EnqueueReason[] = ["publish"];
+
+    if (v.firstPublish) reasons.push("first-publish");
+    const prev = previousVersionOf(yield* store.listVersions(v.name), v.version);
+
+    if (hasInstallScript(rec) && (prev === null || !hasInstallScript(prev))) reasons.push("install-script");
+    yield* enqueue({ name: v.name, version: v.version, digest, source: "local", reasons });
+  });
+
+/** Versions apm sees for the first time: the newest on first sight of a package, then every newer one. */
+export const considerUpstream = (pkg: UpstreamPackage) =>
+  Effect.gen(function* () {
+    const found = yield* Effect.serviceOption(ReviewConfig);
+
+    if (Option.isNone(found)) return;
+    const settings = found.value;
+    const sql = yield* SqlClient.SqlClient;
     const versions = pkg.versions.filter((v) => v.published_at > 0);
     const newest = Math.max(0, ...versions.map((v) => v.published_at));
-    const seenRow = db.query("SELECT newest_at FROM review_seen WHERE package = ?").get(pkg.name);
-    const seen = seenRow ? z.object({ newest_at: z.number() }).parse(seenRow).newest_at : null;
 
-    if (seen !== null && newest <= seen) return;
-    db.query("INSERT OR REPLACE INTO review_seen (package, newest_at) VALUES (?, ?)").run(pkg.name, newest);
+    // claims the newer versions atomically, so two requests that fetched the same packument queue them once
+    const claimed = yield* query(
+      "considerUpstream: seen",
+      sql`WITH old AS (SELECT newest_at FROM review_seen WHERE package = ${pkg.name} FOR UPDATE)
+          INSERT INTO review_seen (package, newest_at) VALUES (${pkg.name}, ${newest})
+          ON CONFLICT (package) DO UPDATE SET newest_at = EXCLUDED.newest_at WHERE review_seen.newest_at < EXCLUDED.newest_at
+          RETURNING (SELECT newest_at FROM old) AS previous`,
+      one(z.object({ previous: Int.nullable() })),
+    );
+
+    if (!claimed) return;
+    const seen = claimed.previous;
     const latest = pkg.distTags.latest;
     const fresh = seen === null ? versions.filter((v) => v.version === latest) : versions.filter((v) => v.published_at > seen);
 
@@ -421,150 +439,163 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
       const prev = previousVersionOf(versions, v.version);
 
       if (hasInstallScript(v) && (prev === null || !hasInstallScript(prev))) reasons.push("install-script");
-      popular ??= ((await weeklyDownloads(pkg.name)) ?? 0) >= opts.popularWeekly;
+      popular ??= ((yield* weeklyDownloads(pkg.name, settings)) ?? 0) >= settings.popularWeekly;
 
       if (popular) reasons.push("popular");
 
-      if (reasons.length > 0) enqueue({ name: pkg.name, version: v.version, digest, source: "upstream", reasons });
+      if (reasons.length > 0) yield* enqueue({ name: pkg.name, version: v.version, digest, source: "upstream", reasons });
     }
-  }
+  });
 
-  // ---------- viewers ----------
-  async function viewerOf(req: Request, a: Auth): Promise<Viewer> {
-    if (a.kind === "user") {
-      const user = ctx.store.getUser(a.user);
+// ---------- viewers ----------
+type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: "token" | "session" };
 
-      return user ? { kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: "token" } : { kind: "anon" };
+const viewerOf = (req: Request, caller: Caller) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+
+    if (caller.kind === "user") {
+      const user = yield* store.getUser(caller.user);
+
+      return user ? ({ kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: "token" } satisfies Viewer) : ({ kind: "anon" } satisfies Viewer);
     }
 
-    const s = await auth.sessionOf(req);
+    const auth = yield* Auth;
+    const s = yield* auth.sessionOf(req);
 
-    if (!s) return { kind: "anon" };
-    const user = auth.apmUserOf(s.authUserId);
+    if (!s) return { kind: "anon" } satisfies Viewer;
+    const user = yield* auth.apmUserOf(s.authUserId);
 
-    return user ? { kind: "user", user, githubLogin: auth.gitHubNameOf(s.authUserId), via: "session" } : { kind: "anon" };
-  }
+    if (!user) return { kind: "anon" } satisfies Viewer;
+    const login = yield* auth.gitHubNameOf(s.authUserId);
 
-  function isAdmin(v: Viewer): boolean {
-    return v.kind === "user" && v.githubLogin !== null && admins.has(v.githubLogin);
-  }
+    return { kind: "user", user, githubLogin: login?.toLowerCase() ?? null, via: "session" } satisfies Viewer;
+  });
 
-  function isMaintainer(v: Viewer, name: string): boolean {
-    return v.kind === "user" && ctx.store.owners(name).includes(v.user.name);
-  }
+function adminsOf(settings: ReviewSettings): ReadonlySet<string> {
+  return new Set(settings.admins.map((a) => a.trim().toLowerCase()).filter((a) => a !== ""));
+}
 
-  /** Cookie-authenticated writes must come from the website or the registry itself. */
-  function badOrigin(req: Request, v: Viewer): Response | null {
+function isAdmin(v: Viewer, settings: ReviewSettings): boolean {
+  return v.kind === "user" && v.githubLogin !== null && adminsOf(settings).has(v.githubLogin);
+}
+
+const isMaintainer = (v: Viewer, name: string) =>
+  v.kind === "user" ? Effect.map(Store.use((store) => store.owners(name)), (owners) => owners.includes(v.user.name)) : Effect.succeed(false);
+
+/** Cookie-authenticated writes must come from the website or the registry itself. */
+const checkOrigin = (req: Request, v: Viewer) =>
+  Effect.gen(function* () {
     const origin = req.headers.get("origin");
 
-    if (v.kind !== "user" || v.via !== "session" || origin === null) return null;
-    const allowed = new Set([new URL(ctx.access.webUrl()).origin, new URL(ctx.baseUrl()).origin]);
+    if (v.kind !== "user" || v.via !== "session" || origin === null) return;
+    const { webUrl, baseUrl } = yield* RegistryConfig;
+    const allowed = new Set([new URL(webUrl).origin, new URL(baseUrl).origin]);
 
-    return allowed.has(origin) ? null : fail(403, "Cross-site request refused.");
-  }
+    if (!allowed.has(origin)) return yield* Effect.fail(refuse(403, "Cross-site request refused."));
+  });
 
-  function isService(req: Request): boolean {
-    const m = /^Bearer\s+(.+)$/i.exec(req.headers.get("authorization") ?? "");
+function isService(req: Request, settings: ReviewSettings): boolean {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.get("authorization") ?? "");
+  const expected = Buffer.from(settings.serviceTokenHash, "hex");
 
-    return m?.[1] !== undefined && timingSafeEqual(sha256(m[1].trim()), tokenHash);
-  }
+  return m?.[1] !== undefined && expected.length === 32 && timingSafeEqual(createHash("sha256").update(m[1].trim()).digest(), expected);
+}
 
-  // ---------- views ----------
-  type PublicState = "found-nothing" | "under-review" | "no-answer" | "confirmed" | "cleared";
+// ---------- views ----------
+type PublicState = "found-nothing" | "under-review" | "no-answer" | "confirmed" | "cleared";
 
-  function publicState(r: StoredReview): PublicState {
-    switch (r.human_state) {
-      case "confirmed":
-        return "confirmed";
-      case "dismissed":
-        return "cleared";
-      case "none":
-      case "pending":
-        break;
-      default: {
-        const _exhaustive: never = r.human_state;
+function publicState(r: StoredReview): PublicState {
+  switch (r.human_state) {
+    case "confirmed":
+      return "confirmed";
+    case "dismissed":
+      return "cleared";
+    case "none":
+    case "pending":
+      break;
+    default: {
+      const _exhaustive: never = r.human_state;
 
-        return _exhaustive;
-      }
-    }
-
-    switch (r.result.outcome) {
-      case "benign":
-        return "found-nothing";
-      case "flagged":
-        return "under-review";
-      case "no-answer":
-        return r.result.reason === "unsettled" ? "under-review" : "no-answer";
-      default: {
-        const _exhaustive: never = r.result;
-
-        return _exhaustive;
-      }
+      return _exhaustive;
     }
   }
 
-  function findingsOf(r: ReviewResult): WireFinding[] {
-    return r.outcome === "benign" ? [] : r.findings;
+  switch (r.result.outcome) {
+    case "benign":
+      return "found-nothing";
+    case "flagged":
+      return "under-review";
+    case "no-answer":
+      return r.result.reason === "unsettled" ? "under-review" : "no-answer";
+    default: {
+      const _exhaustive: never = r.result;
+
+      return _exhaustive;
+    }
   }
+}
 
-  function publicView(r: StoredReview) {
-    const state = publicState(r);
+function findingsOf(r: ReviewResult): WireFinding[] {
+  return r.outcome === "benign" ? [] : r.findings;
+}
 
-    return {
-      state,
-      model: r.result.model,
-      reviewedAt: r.result.reviewedAt,
-      coverage: r.result.coverage,
-      read: r.result.read,
-      notRead: r.result.notRead,
-      // findings go public only after a person confirms them
-      findings: state === "confirmed" ? findingsOf(r.result) : [],
-      decidedAt: r.human_at === null ? null : iso(r.human_at),
-      note: state === "confirmed" || state === "cleared" ? r.human_note : null,
-    };
-  }
+function publicView(r: StoredReview) {
+  const state = publicState(r);
 
-  function privateView(r: StoredReview) {
-    return {
-      outcome: r.result.outcome,
-      verdict: r.result.outcome === "flagged" ? r.result.verdict : null,
-      reason: r.result.outcome === "no-answer" ? r.result.reason : null,
-      summary: r.result.summary,
-      findings: findingsOf(r.result),
-      attempts: r.result.attempts,
-      secondOpinion: r.result.secondOpinion,
-      humanState: r.human_state,
-    };
-  }
+  return {
+    state,
+    model: r.result.model,
+    reviewedAt: r.result.reviewedAt,
+    coverage: r.result.coverage,
+    read: r.result.read,
+    notRead: r.result.notRead,
+    // findings go public only after a person confirms them
+    findings: state === "confirmed" ? findingsOf(r.result) : [],
+    decidedAt: r.human_at === null ? null : iso(r.human_at),
+    note: state === "confirmed" || state === "cleared" ? r.human_note : null,
+  };
+}
 
-  type Resolved = { kind: "ok"; source: Source; version: VersionRecord; digest: string | null } | { kind: "error"; res: Response };
+function privateView(r: StoredReview) {
+  return {
+    outcome: r.result.outcome,
+    verdict: r.result.outcome === "flagged" ? r.result.verdict : null,
+    reason: r.result.outcome === "no-answer" ? r.result.reason : null,
+    summary: r.result.summary,
+    findings: findingsOf(r.result),
+    attempts: r.result.attempts,
+    secondOpinion: r.result.secondOpinion,
+    humanState: r.human_state,
+  };
+}
 
-  async function resolveVersion(name: string, version: string | undefined): Promise<Resolved> {
-    if (!version) return { kind: "error", res: fail(404, "Name a version.") };
-    const cat = await catalog(name);
+const resolveVersion = (name: string, version: string | undefined) =>
+  Effect.gen(function* () {
+    if (!version) return yield* Effect.fail(refuse(404, "Name a version."));
+    const cat: Catalog = yield* catalog(name);
 
-    if (cat.kind === "unavailable") return { kind: "error", res: fail(503, "The upstream registry could not be reached.") };
+    if (cat.kind === "unavailable") return yield* Effect.fail(refuse(503, "The upstream registry could not be reached."));
 
-    if (cat.kind === "absent") return { kind: "error", res: fail(404, "Not found") };
+    if (cat.kind === "absent") return yield* Effect.fail(refuse(404, "Not found"));
     const v = cat.versions.find((x) => x.version === version);
 
-    if (!v) return { kind: "error", res: fail(404, "No such version") };
+    if (!v) return yield* Effect.fail(refuse(404, "No such version"));
 
-    return { kind: "ok", source: cat.source, version: v, digest: labelOf(v) };
-  }
+    return { source: cat.source, version: v, digest: labelOf(v) };
+  });
 
-  async function reviewResponse(req: Request, a: Auth, name: string, version: string | undefined): Promise<Response> {
-    const got = await resolveVersion(name, version);
-
-    if (got.kind === "error") return got.res;
+const reviewResponse = (req: Request, caller: Caller, name: string, version: string | undefined, settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const got = yield* resolveVersion(name, version);
     const v = got.version;
-    const viewer = await viewerOf(req, a);
+    const viewer = yield* viewerOf(req, caller);
     let role: "admin" | "maintainer" | "public" = "public";
 
-    if (isAdmin(viewer)) role = "admin";
-    else if (isMaintainer(viewer, name)) role = "maintainer";
-    const review = got.digest ? reviewFor(name, v.version, got.digest) : null;
-    const job = got.digest ? jobByKey(name, v.version, got.digest) : null;
+    if (isAdmin(viewer, settings)) role = "admin";
+    else if (yield* isMaintainer(viewer, name)) role = "maintainer";
+    const review = got.digest ? yield* reviewFor(name, v.version, got.digest) : null;
+    const job = got.digest ? yield* jobByKey(name, v.version, got.digest) : null;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 
     if (review) status = "reviewed";
@@ -584,53 +615,73 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
       200,
       { "cache-control": "no-store" },
     );
-  }
+  });
 
-  async function requestResponse(req: Request, a: Auth, name: string, version: string | undefined): Promise<Response> {
-    const viewer = await viewerOf(req, a);
+const requestResponse = (req: Request, caller: Caller, name: string, version: string | undefined, settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const viewer = yield* viewerOf(req, caller);
 
-    if (viewer.kind !== "user") return fail(401, `Sign in at ${ctx.access.webUrl()} to request an AI review.`);
-    const bad = badOrigin(req, viewer);
-
-    if (bad) return bad;
-    const got = await resolveVersion(name, version);
-
-    if (got.kind === "error") return got.res;
+    if (viewer.kind !== "user") return fail(401, `Sign in at ${(yield* RegistryConfig).webUrl} to request an AI review.`);
+    yield* checkOrigin(req, viewer);
+    const got = yield* resolveVersion(name, version);
 
     if (!got.digest) return fail(422, "This version has no checksum, so its tarball cannot be verified for review.");
-    const existing = reviewFor(name, got.version.version, got.digest);
+    const existing = yield* reviewFor(name, got.version.version, got.digest);
 
     if (existing && existing.result.outcome !== "no-answer") return fail(409, "This version already has an AI review.");
-    const job = jobByKey(name, got.version.version, got.digest);
+    const job = yield* jobByKey(name, got.version.version, got.digest);
 
     if (job && (job.state === "queued" || job.state === "leased")) return json({ status: "queued" });
-    const since = ctx.now() - HOUR;
-    const used = z.object({ n: z.number() }).parse(db.query("SELECT COUNT(*) AS n FROM review_requests WHERE actor = ? AND at > ?").get(viewer.user.name, since)).n;
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* (yield* Clock).now;
+    const store = yield* Store;
 
-    if (used >= opts.requestsPerHour) return fail(429, `You can request ${opts.requestsPerHour} AI reviews an hour. Try again later.`, { retryAfterSeconds: 3600 });
-    db.query("INSERT INTO review_requests (actor, package, version, at) VALUES (?, ?, ?, ?)").run(viewer.user.name, name, got.version.version, ctx.now());
-    enqueue({ name, version: got.version.version, digest: got.digest, source: got.source, reasons: ["requested"] });
+    // the budget check and the press it records are one step, so parallel presses cannot overspend it
+    const allowed = yield* store.tx(
+      Effect.gen(function* () {
+        yield* query("request: lock", sql`SELECT pg_advisory_xact_lock(hashtext(${`review-request ${viewer.user.name}`}))`, none);
+
+        const used = yield* query(
+          "request: count",
+          sql`SELECT COUNT(*) AS n FROM review_requests WHERE actor = ${viewer.user.name} AND at > ${now - HOUR}`,
+          one(z.object({ n: Int })),
+        );
+
+        if ((used?.n ?? 0) >= settings.requestsPerHour) return false;
+        yield* query(
+          "request: record",
+          sql`INSERT INTO review_requests (actor, package, version, at) VALUES (${viewer.user.name}, ${name}, ${got.version.version}, ${now})`,
+          none,
+        );
+
+        return true;
+      }),
+    );
+
+    if (!allowed) return fail(429, `You can request ${settings.requestsPerHour} AI reviews an hour. Try again later.`, { retryAfterSeconds: 3600 });
+    yield* enqueue({ name, version: got.version.version, digest: got.digest, source: got.source, reasons: ["requested"] });
 
     return json({ status: "queued" }, 202);
-  }
+  });
 
-  // ---------- reviewer (service token) ----------
-  async function leaseResponse(url: URL): Promise<Response> {
+// ---------- reviewer (service token) ----------
+const leaseResponse = (url: URL, settings: ReviewSettings) =>
+  Effect.gen(function* () {
     const max = Math.max(1, Math.min(MAX_LEASE_BATCH, Number(url.searchParams.get("max") ?? "4") || 4));
     const jobs: ReviewJob[] = [];
 
-    for (const row of takeJobs(max)) {
-      const p = await jobPayload(row);
+    for (const row of yield* takeJobs(max, settings)) {
+      const p: Payload = yield* jobPayload(row);
 
       switch (p.kind) {
         case "ok":
           jobs.push(p.job);
           break;
         case "gone":
-          setJobState(row.id, "failed", p.why);
+          yield* setJobState(row.id, "failed", p.why);
           break;
         case "later":
-          setJobState(row.id, "queued", p.why);
+          yield* setJobState(row.id, "queued", p.why);
           break;
         default: {
           const _exhaustive: never = p;
@@ -641,194 +692,179 @@ export function reviewModule(input: { ctx: Ctx; auth: ApmAuth; upstream: Upstrea
     }
 
     return json({ jobs }, 200, { "cache-control": "no-store" });
-  }
-
-  async function readBody<T>(req: Request, schema: z.ZodType<T>): Promise<{ ok: true; value: T } | { ok: false; res: Response }> {
-    const text = await req.text();
-
-    if (text.length > 2 * 1024 * 1024) return { ok: false, res: fail(413, "Body too large.") };
-
-    try {
-      const parsed = schema.safeParse(JSON.parse(text));
-
-      return parsed.success ? { ok: true, value: parsed.data } : { ok: false, res: fail(400, `Invalid body: ${parsed.error.message.slice(0, 500)}`) };
-    } catch {
-      return { ok: false, res: fail(400, "Body must be JSON.") };
-    }
-  }
-
-  function leaseHolder(id: string, leaseId: string): JobRow | Response {
-    const job = jobById(id);
-
-    if (!job) return fail(404, "No such job.");
-
-    if (job.state !== "leased" || job.lease_id !== leaseId) return fail(409, "This lease is no longer yours; the job went back to the queue or was finished.");
-
-    return job;
-  }
-
-  async function resultResponse(req: Request, id: string): Promise<Response> {
-    const body = await readBody(req, ResultBody);
-
-    if (!body.ok) return body.res;
-    const at = ctx.now();
-
-    return ctx.store.tx(() => {
-      const job = leaseHolder(id, body.value.leaseId);
-
-      if (job instanceof Response) return job;
-      const r = body.value.result;
-      const human: HumanState = r.outcome === "benign" ? "none" : "pending";
-
-      db.query(
-        "INSERT OR REPLACE INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state, human_by, human_at, human_note) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
-      ).run(job.package, job.version, job.digest, r.outcome, JSON.stringify(r), at, human);
-      setJobState(job.id, "done", null);
-      const stored = reviewFor(job.package, job.version, job.digest);
-
-      return stored ? json({ ok: true, state: publicState(stored) }) : fail(500, "The review was not stored.");
-    });
-  }
-
-  async function releaseResponse(req: Request, id: string): Promise<Response> {
-    const body = await readBody(req, ReleaseBody);
-
-    if (!body.ok) return body.res;
-
-    return ctx.store.tx(() => {
-      const job = leaseHolder(id, body.value.leaseId);
-
-      if (job instanceof Response) return job;
-      setJobState(job.id, body.value.retryable ? "queued" : "failed", body.value.error);
-
-      return json({ ok: true });
-    });
-  }
-
-  // ---------- second stage: the owner queue ----------
-  const DecideBody = z.object({
-    name: z.string().min(1).max(214),
-    version: z.string().min(1).max(256),
-    digest: z.string().min(1).max(200),
-    decision: z.enum(["confirm", "dismiss"]),
-    note: z.string().max(2000).default(""),
   });
 
-  function queueResponse(): Response {
-    const rows = (sql: string): StoredReview[] =>
-      db
-        .query(sql)
-        .all()
-        .map((r) => toReview(ReviewRow.parse(r)));
+/** The job, locked, when `leaseId` still holds it. */
+const leaseHolder = (id: string, leaseId: string) =>
+  Effect.gen(function* () {
+    const job = yield* jobById(id, true);
 
-    const item = (r: StoredReview) => ({ name: r.package, version: r.version, digest: r.digest, reviewedAt: iso(r.reviewed_at), public: publicView(r), private: privateView(r), decidedBy: r.human_by });
+    if (!job) return yield* Effect.fail(refuse(404, "No such job."));
 
-    return json(
-      {
-        pending: rows("SELECT * FROM reviews WHERE human_state = 'pending' ORDER BY reviewed_at LIMIT 200").map(item),
-        decided: rows("SELECT * FROM reviews WHERE human_state IN ('confirmed', 'dismissed') ORDER BY human_at DESC LIMIT 50").map(item),
-        // the stronger-model step plugs in at the reviewer (apps/reviewer/src/second-stage.ts); none is configured
-        secondStage: null,
-      },
-      200,
-      { "cache-control": "no-store" },
+    if (job.state !== "leased" || job.lease_id !== leaseId) return yield* Effect.fail(refuse(409, "This lease is no longer yours; the job went back to the queue or was finished."));
+
+    return job;
+  });
+
+const resultResponse = (req: Request, id: string) =>
+  Effect.gen(function* () {
+    const body = yield* parseBody(req, ResultBody, MAX_REVIEW_BODY_BYTES);
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
+    const at = yield* (yield* Clock).now;
+
+    const stored = yield* store.tx(
+      Effect.gen(function* () {
+        const job = yield* leaseHolder(id, body.leaseId);
+        const r = body.result;
+        const human: HumanState = r.outcome === "benign" ? "none" : "pending";
+        yield* query(
+          "result: store",
+          sql`INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state, human_by, human_at, human_note)
+              VALUES (${job.package}, ${job.version}, ${job.digest}, ${r.outcome}, ${JSON.stringify(r)}::jsonb, ${at}, ${human}, NULL, NULL, NULL)
+              ON CONFLICT (package, version, digest) DO UPDATE SET outcome = EXCLUDED.outcome, result = EXCLUDED.result, reviewed_at = EXCLUDED.reviewed_at,
+                human_state = EXCLUDED.human_state, human_by = NULL, human_at = NULL, human_note = NULL`,
+          none,
+        );
+        yield* setJobState(job.id, "done", null);
+
+        return yield* reviewFor(job.package, job.version, job.digest);
+      }),
     );
-  }
 
-  async function decideResponse(req: Request, viewer: Viewer): Promise<Response> {
-    const body = await readBody(req, DecideBody);
+    return stored ? json({ ok: true, state: publicState(stored) }) : fail(500, "The review was not stored.");
+  });
 
-    if (!body.ok) return body.res;
-    const d = body.value;
-    const r = reviewFor(d.name, d.version, d.digest);
+const releaseResponse = (req: Request, id: string) =>
+  Effect.gen(function* () {
+    const body = yield* parseBody(req, ReleaseBody, MAX_REVIEW_BODY_BYTES);
+    const store = yield* Store;
+    yield* store.tx(
+      Effect.gen(function* () {
+        const job = yield* leaseHolder(id, body.leaseId);
+        yield* setJobState(job.id, body.retryable ? "queued" : "failed", body.error);
+      }),
+    );
+
+    return json({ ok: true });
+  });
+
+// ---------- second stage: the owner queue ----------
+const DecideBody = z.object({
+  name: z.string().min(1).max(214),
+  version: z.string().min(1).max(256),
+  digest: z.string().min(1).max(200),
+  decision: z.enum(["confirm", "dismiss"]),
+  note: z.string().max(2000).default(""),
+});
+
+const queueResponse = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+
+  const item = (r: StoredReview) => ({
+    name: r.package,
+    version: r.version,
+    digest: r.digest,
+    reviewedAt: iso(r.reviewed_at),
+    public: publicView(r),
+    private: privateView(r),
+    decidedBy: r.human_by,
+  });
+
+  const pending = yield* query("queue: pending", sql`SELECT * FROM reviews WHERE human_state = 'pending' ORDER BY reviewed_at LIMIT 200`, all(ReviewRow));
+
+  const decided = yield* query(
+    "queue: decided",
+    sql`SELECT * FROM reviews WHERE human_state IN ('confirmed', 'dismissed') ORDER BY human_at DESC LIMIT 50`,
+    all(ReviewRow),
+  );
+
+  return json(
+    {
+      pending: pending.map(item),
+      decided: decided.map(item),
+      // the stronger-model step plugs in at the reviewer (apps/reviewer/src/second-stage.ts); none is configured
+      secondStage: null,
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
+});
+
+const decideResponse = (req: Request, viewer: Extract<Viewer, { kind: "user" }>) =>
+  Effect.gen(function* () {
+    const d = yield* parseBody(req, DecideBody, MAX_REVIEW_BODY_BYTES);
+    const r = yield* reviewFor(d.name, d.version, d.digest);
 
     if (!r) return fail(404, "No such review.");
 
     if (r.human_state === "none") return fail(409, "This review found nothing; there is no flag to confirm or dismiss.");
-    const by = viewer.kind === "user" ? (viewer.githubLogin ?? viewer.user.name) : "unknown";
-
-    db.query("UPDATE reviews SET human_state = ?, human_by = ?, human_at = ?, human_note = ? WHERE package = ? AND version = ? AND digest = ?").run(
-      d.decision === "confirm" ? "confirmed" : "dismissed",
-      by,
-      ctx.now(),
-      d.note.trim() === "" ? null : d.note.trim(),
-      d.name,
-      d.version,
-      d.digest,
+    const sql = yield* SqlClient.SqlClient;
+    const at = yield* (yield* Clock).now;
+    const note = d.note.trim() === "" ? null : d.note.trim();
+    yield* query(
+      "decide",
+      sql`UPDATE reviews SET human_state = ${d.decision === "confirm" ? "confirmed" : "dismissed"}, human_by = ${viewer.githubLogin ?? viewer.user.name},
+              human_at = ${at}, human_note = ${note}
+          WHERE package = ${d.name} AND version = ${d.version} AND digest = ${d.digest}`,
+      none,
     );
 
     return json({ ok: true });
-  }
+  });
 
-  // ---------- router ----------
-  async function routes(req: Request, url: URL, a: Auth): Promise<Response | null> {
+// ---------- router ----------
+export const reviewRoute = (
+  req: Request,
+  url: URL,
+  caller: Caller,
+): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth> =>
+  Effect.gen(function* () {
     const p = url.pathname;
+    const isReviewPath = p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/") || p.startsWith("/-/apm/v1/review-admin/") || p.startsWith("/-/apm/v1/review/");
+
+    if (!isReviewPath) return null;
+    const found = yield* Effect.serviceOption(ReviewConfig);
+
+    if (Option.isNone(found)) return null;
+    const settings = found.value;
 
     if (p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/")) {
-      if (!isService(req)) return fail(401, "This route is for the AI reviewer's service token.");
+      if (!isService(req, settings)) return fail(401, "This route is for the AI reviewer's service token.");
 
-      if (p === "/-/apm/v1/review-jobs" && req.method === "GET") return leaseResponse(url);
+      if (p === "/-/apm/v1/review-jobs" && req.method === "GET") return yield* leaseResponse(url, settings);
       const m = /^\/-\/apm\/v1\/review-jobs\/([A-Za-z0-9_-]{1,64})\/(result|release)$/.exec(p);
 
       if (!m?.[1] || req.method !== "POST") return fail(404, "Not found");
 
-      return m[2] === "result" ? resultResponse(req, m[1]) : releaseResponse(req, m[1]);
+      return m[2] === "result" ? yield* resultResponse(req, m[1]) : yield* releaseResponse(req, m[1]);
     }
 
     if (p.startsWith("/-/apm/v1/review-admin/")) {
-      const viewer = await viewerOf(req, a);
+      const viewer = yield* viewerOf(req, caller);
 
       if (viewer.kind !== "user") return fail(401, "Sign in first.");
 
-      if (!isAdmin(viewer)) return fail(403, "Only apm's reviewers can see this queue.");
+      if (!isAdmin(viewer, settings)) return fail(403, "Only apm's reviewers can see this queue.");
 
-      if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return queueResponse();
+      if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return yield* queueResponse;
 
-      if (p === "/-/apm/v1/review-admin/decide" && req.method === "POST") return badOrigin(req, viewer) ?? decideResponse(req, viewer);
+      if (p === "/-/apm/v1/review-admin/decide" && req.method === "POST") {
+        yield* checkOrigin(req, viewer);
 
-      return fail(404, "Not found");
-    }
-
-    if (p.startsWith("/-/apm/v1/review/")) {
-      const sp = splitPath(p.slice("/-/apm/v1/review".length));
-
-      if (!sp) return fail(404, "Not found");
-
-      if (req.method === "GET" && sp.rest.length === 1) return reviewResponse(req, a, sp.name, sp.rest[0]);
-
-      if (req.method === "POST" && sp.rest.length === 2 && sp.rest[1] === "request") return requestResponse(req, a, sp.name, sp.rest[0]);
+        return yield* decideResponse(req, viewer);
+      }
 
       return fail(404, "Not found");
     }
 
-    return null;
-  }
+    const sp = splitPath(p.slice("/-/apm/v1/review".length));
 
-  return {
-    routes,
-    onLocalCommit(v) {
-      const rec = ctx.store.getVersion(v.name, v.version);
-      const digest = rec ? labelOf(rec) : null;
+    if (!sp) return fail(404, "Not found");
 
-      if (!rec || !digest) return;
-      const reasons: EnqueueReason[] = ["publish"];
+    if (req.method === "GET" && sp.rest.length === 1) return yield* reviewResponse(req, caller, sp.name, sp.rest[0], settings);
 
-      if (v.firstPublish) reasons.push("first-publish");
-      const prev = previousVersionOf(ctx.store.listVersions(v.name), v.version);
+    if (req.method === "POST" && sp.rest.length === 2 && sp.rest[1] === "request") return yield* requestResponse(req, caller, sp.name, sp.rest[0], settings);
 
-      if (hasInstallScript(rec) && (prev === null || !hasInstallScript(prev))) reasons.push("install-script");
-      enqueue({ name: v.name, version: v.version, digest, source: "local", reasons });
-    },
-    onUpstreamPackage(pkg) {
-      background(considerUpstream(pkg));
-    },
-    async idle() {
-      while (pending.size > 0) await Promise.all(pending);
-    },
-  };
-}
-
-/** Reads the service token from its file and returns its sha256, for StartOptions.review. */
-export function serviceTokenHashOf(token: string): string {
-  return sha256(token.trim()).toString("hex");
-}
+    return fail(404, "Not found");
+  });

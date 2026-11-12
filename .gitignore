@@ -9,3 +9,9 @@ apps/web/.next
 .env
 .env.local
 .env.*.local
+
+# registry Worker bundles
+packages/registry/dist
+.alchemy
+.open-next
+.wrangler

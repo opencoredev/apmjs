@@ -14,7 +14,6 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ROOT,
   startRegistry,
   startFakeGitHub,
   signInWithGitHub,
@@ -104,7 +103,7 @@ async function account(login: string): Promise<{ b: Browser; secret: string; sta
   const secret = await enableTotp(b);
   const { token, username } = await deviceLogin(b);
 
-  return { b, secret, stageToken: token, liveToken: reg.mintToken({ user: username, scope: "publish" }), scope: username };
+  return { b, secret, stageToken: token, liveToken: await reg.mintToken({ user: username, scope: "publish" }), scope: username };
 }
 
 beforeAll(async () => {
@@ -416,54 +415,30 @@ describe("incident", () => {
 });
 
 describe("startup", () => {
-  async function boot(env: Record<string, string>): Promise<{ exited: boolean; code: number | null; out: string }> {
-    const dataDir = mkdtempSync(join(tmpdir(), "apm-boot-"));
+  /** Starts the registry Worker with these variables and asks it something: a refusal answers every request. */
+  async function boot(env: Record<string, string>): Promise<{ refused: boolean; out: string }> {
+    const booted = await startRegistry({ legacyAuth: env.APM_LEGACY_AUTH === "1", env });
 
-    const proc = Bun.spawn(["bun", join(ROOT, "packages", "registry", "src", "main.ts")], {
-      env: { PATH: process.env.PATH ?? "", HOME: dataDir, APM_PORT: "0", APM_DATA_DIR: dataDir, APM_UPSTREAM: "off", ...env },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    try {
+      const ping = await getJson(`${booted.url}-/ping`);
 
-    let printed = "";
-    const reader = proc.stdout.getReader();
-
-    const started = (async (): Promise<boolean> => {
-      for (;;) {
-        const chunk = await reader.read();
-
-        if (chunk.done) return false;
-        printed += new TextDecoder().decode(chunk.value);
-
-        if (printed.includes("listening")) return true;
-      }
-    })();
-
-    const listening = await Promise.race([started, Bun.sleep(15_000).then(() => false)]);
-
-    if (listening) proc.kill();
-    else await Promise.race([proc.exited, Bun.sleep(5_000)]);
-    const exited = !listening && proc.exitCode !== null;
-
-    if (proc.exitCode === null) proc.kill();
-    await proc.exited;
-    const err = await new Response(proc.stderr).text();
-
-    return { exited, code: proc.exitCode, out: printed + err };
+      return { refused: ping.status === 503, out: JSON.stringify(ping.body) };
+    } finally {
+      await booted.stop();
+    }
   }
 
   test("legacy password auth on a public https URL refuses to start unless explicitly allowed", async () => {
     const refused = await boot({ APM_LEGACY_AUTH: "1", APM_PUBLIC_URL: "https://apmjs.dev/" });
-    expect(refused.exited, refused.out).toBe(true);
-    expect(refused.code).not.toBe(0);
+    expect(refused.refused, refused.out).toBe(true);
     expect(refused.out).toContain("APM_ALLOW_LEGACY_IN_PROD");
 
     const allowed = await boot({ APM_LEGACY_AUTH: "1", APM_PUBLIC_URL: "https://apmjs.dev/", APM_ALLOW_LEGACY_IN_PROD: "1" });
-    expect(allowed.out).toContain("listening");
+    expect(allowed.refused, allowed.out).toBe(false);
     const local = await boot({ APM_LEGACY_AUTH: "1", APM_PUBLIC_URL: "http://localhost:3000/" });
-    expect(local.out).toContain("listening");
-    const off = await boot({ APM_PUBLIC_URL: "https://apmjs.dev/" });
-    expect(off.out).toContain("listening");
+    expect(local.refused, local.out).toBe(false);
+    const off = await boot({ APM_LEGACY_AUTH: "0", APM_PUBLIC_URL: "https://apmjs.dev/" });
+    expect(off.refused, off.out).toBe(false);
   });
 });
 

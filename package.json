@@ -7,18 +7,22 @@
     "apps/*"
   ],
   "scripts": {
-    "registry": "bun packages/registry/src/main.ts",
     "test": "bun test tests",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "bun scripts/lint.ts",
     "lint:baseline": "bun scripts/lint.ts --update"
   },
   "devDependencies": {
+    "@alchemy.run/cloudflare-runtime": "2.0.0-beta.85",
     "@oxlint/plugins": "1.93.0",
     "@shadcn/lint": "0.2.5",
     "@types/bun": "^1.4.4",
+    "@types/pg": "8.23.1",
+    "miniflare": "4.20260730.0",
     "oxlint": "1.93.0",
+    "pg": "8.23.1",
     "pnpm": "10.18.3",
+    "rolldown": "1.2.13",
     "typescript": "^5.9.3",
     "zod": "4.6.7"
   },
@@ -26,5 +30,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/opencoredev/apmjs.git"
-  }
+  },
+  "trustedDependencies": [
+    "workerd"
+  ]
 }

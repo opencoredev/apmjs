@@ -154,9 +154,12 @@ export function readTar(tar: Uint8Array): TarEntry[] {
   return entries;
 }
 
-/** Parses a gzip'd tar within MAX_UNPACKED_BYTES. Throws ArchiveError for anything it will not read. */
-export function readTarball(tgz: Uint8Array): TarEntry[] {
-  return readTar(gunzipCapped(tgz, MAX_UNPACKED_BYTES));
+/**
+ * Parses a gzip'd tar within `maxBytes` (MAX_UNPACKED_BYTES unless a host with less memory passes a lower cap).
+ * Throws ArchiveError for anything it will not read.
+ */
+export function readTarball(tgz: Uint8Array, maxBytes: number = MAX_UNPACKED_BYTES): TarEntry[] {
+  return readTar(gunzipCapped(tgz, Math.min(maxBytes, MAX_UNPACKED_BYTES)));
 }
 
 /** Paths that appear more than once, or that try to escape the package folder. */

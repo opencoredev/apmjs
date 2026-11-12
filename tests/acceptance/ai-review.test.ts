@@ -3,7 +3,6 @@
 // returns canned JSON; no test calls a real model. Every package here is a harmless stand-in: the
 // "flagged" one only names an unresolvable host and is never installed or run.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -280,14 +279,11 @@ beforeAll(async () => {
     upstreamTtlMs: 1,
     review: { serviceTokenHash: sha256(SERVICE_TOKEN), admins: ["octo-admin"], downloadsUrl: `${npm.url}downloads/point/last-week/`, requestsPerHour: 2 },
   });
-  alice = reg.mintToken({ user: "alice", scope: "publish" });
-  bob = reg.mintToken({ user: "bob", scope: "publish" });
-  admin = reg.mintToken({ user: "octo", scope: "publish" });
+  alice = await reg.mintToken({ user: "alice", scope: "publish" });
+  bob = await reg.mintToken({ user: "bob", scope: "publish" });
+  admin = await reg.mintToken({ user: "octo", scope: "publish" });
   // admins are named by GitHub login, which sign-in records; set it directly for the test user
-  const db = new Database(join(reg.dataDir, "registry.sqlite"));
-
-  db.query("UPDATE users SET github_login = 'octo-admin' WHERE name = 'octo'").run();
-  db.close();
+  await reg.query("UPDATE users SET github_login = 'octo-admin' WHERE name = 'octo'");
 });
 
 afterAll(async () => {

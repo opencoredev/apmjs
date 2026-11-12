@@ -317,9 +317,9 @@ describe("stock npm owner and unpublish", () => {
     const octo = await signInWithGitHub(reg, gh, "octo");
     secret = await enableTotp(octo);
     await deviceLogin(octo);
-    token = reg.mintToken({ user: "octo", scope: "publish" });
-    reg.mintToken({ user: "bob", scope: "publish" });
-    reg.mintToken({ user: "carol", scope: "publish" });
+    token = await reg.mintToken({ user: "octo", scope: "publish" });
+    await reg.mintToken({ user: "bob", scope: "publish" });
+    await reg.mintToken({ user: "carol", scope: "publish" });
     await publishOk(reg, token, { name: "owned-pkg", version: "1.0.0" });
     await publishOk(reg, token, { name: "owned-pkg", version: "1.1.0" });
   });

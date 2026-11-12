@@ -150,7 +150,7 @@ describe("names", () => {
 
   test("a scope that exists on npm is refused unless the publisher's GitHub login is that scope", async () => {
     // "acme" is a name on this registry but not a verified GitHub login
-    const unverified = reg.mintToken({ user: "acme", scope: "publish" });
+    const unverified = await reg.mintToken({ user: "acme", scope: "publish" });
     const r = await publishWith("bun", "@acme/fresh", "1.0.0", unverified);
     expect(r.code).not.toBe(0);
     expect(r.out).toMatch(/@acme/);
@@ -161,7 +161,7 @@ describe("names", () => {
     const beta = await signInWithGitHub(reg, gh, "beta");
     const me = await beta.json("-/apm/v1/account");
     expect(dig(me.body, "scope")).toBe("beta");
-    const verified = reg.mintToken({ user: "beta", scope: "publish" });
+    const verified = await reg.mintToken({ user: "beta", scope: "publish" });
     const ok = await publishWith("bun", "@beta/fresh", "1.0.0", verified);
     expect(ok.code, ok.out).toBe(0);
     expect(dig((await packumentStatus("@beta/fresh")).body, "dist-tags", "latest")).toBe("1.0.0");

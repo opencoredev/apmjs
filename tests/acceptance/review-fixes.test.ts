@@ -34,27 +34,34 @@ function tarHeader(path: string, size: number, sizeField?: string): Uint8Array {
   put("ustar\0", 257, 6);
   put("00", 263, 2);
   let sum = 0;
+
   for (const b of h) sum += b;
   put(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8);
+
   return h;
 }
 
 function makeTar(files: TarFile[]): Uint8Array<ArrayBuffer> {
   const parts: Uint8Array[] = [];
+
   for (const f of files) {
     const data = typeof f.data === "string" ? new TextEncoder().encode(f.data) : f.data;
     parts.push(tarHeader(`package/${f.path}`, data.length, f.sizeField));
     parts.push(data);
     const pad = (512 - (data.length % 512)) % 512;
+
     if (pad > 0) parts.push(new Uint8Array(pad));
   }
+
   parts.push(new Uint8Array(1024));
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let off = 0;
+
   for (const p of parts) {
     out.set(p, off);
     off += p.length;
   }
+
   return out;
 }
 
@@ -76,38 +83,30 @@ async function putPublish(reg: Registry, token: string, manifest: Record<string,
     versions: { [manifest.version]: manifest },
     _attachments: { [`x-${randomBytes(4).toString("hex")}.tgz`]: { content_type: "application/octet-stream", data: Buffer.from(tgz).toString("base64"), length: tgz.length } },
   };
+
   const res = await fetch(`${reg.url}${manifest.name.startsWith("@") ? `@${encodeURIComponent(manifest.name.slice(1))}` : encodeURIComponent(manifest.name)}`, {
     method: "PUT",
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: JSON.stringify(body),
   });
+
   const text = await res.text();
   let parsed: unknown = text;
+
   try {
     parsed = JSON.parse(text);
   } catch {
     // keep text
   }
+
   return { status: res.status, body: parsed, headers: res.headers };
 }
 
 async function publishSimple(reg: Registry, token: string, name: string, version: string, extra: Record<string, unknown> = {}, files?: Record<string, string>): Promise<void> {
   const manifest = { name, version, license: "MIT", main: "index.js", ...extra };
   const r = await putPublish(reg, token, manifest, pkgTgz(manifest, files));
-  if (r.status !== 201) throw new Error(`publish ${name}@${version}: ${r.status} ${JSON.stringify(r.body)}`);
-}
 
-function filesUnder(dir: string): string[] {
-  const out: string[] = [];
-  const walk = (d: string): void => {
-    for (const e of readdirSync(d, { withFileTypes: true })) {
-      const p = join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else out.push(p);
-    }
-  };
-  walk(dir);
-  return out;
+  if (r.status !== 201) throw new Error(`publish ${name}@${version}: ${r.status} ${JSON.stringify(r.body)}`);
 }
 
 function sha1(bytes: Uint8Array): string {
@@ -131,7 +130,8 @@ describe("versions never form storage paths", () => {
     const manifest = { name: "trav-pkg", version, license: "MIT", main: "index.js" };
     const r = await putPublish(reg, alice, manifest, pkgTgz(manifest));
     expect(r.status).toBe(400);
-    expect(filesUnder(reg.dataDir).filter((p) => p.includes("escaped"))).toEqual([]);
+    // blobs are keyed by content digest, so nothing a client sends becomes a storage key
+    expect((await reg.blobs.keys()).filter((k) => k.includes("escaped") || k.includes(".."))).toEqual([]);
     expect((await getJson(`${reg.url}trav-pkg`)).status).toBe(404);
   });
 
@@ -147,56 +147,32 @@ describe("versions never form storage paths", () => {
 // ---------- 2. archive parser hangs and decompression bombs ----------
 describe("malformed archives are refused, never hang", () => {
   test("a tar header with a negative size gets a 400 from a registry that keeps answering", async () => {
-    const dataDir = mkdtempSync(join(work, "neg-"));
-    const proc = Bun.spawn(["bun", join(ROOT, "packages", "registry", "src", "main.ts")], {
-      cwd: dataDir,
-      env: {
-        PATH: process.env.PATH ?? "",
-        HOME: dataDir,
-        APM_PORT: "0",
-        APM_DATA_DIR: join(dataDir, "data"),
-        APM_UPSTREAM: "off",
-        APM_NAME_POLICY: "open",
-        APM_LEGACY_AUTH: "1",
-        APM_AUTH_SECRET: `test-${randomBytes(16).toString("hex")}`,
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const reg = await startRegistry({ now: () => clock });
+
     try {
-      const reader = proc.stdout.getReader();
-      let seen = "";
-      const deadline = Date.now() + 20_000;
-      let url: string | null = null;
-      while (!url && Date.now() < deadline) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        seen += new TextDecoder().decode(value);
-        url = /listening on (\S+)/.exec(seen)?.[1] ?? null;
-      }
-      expect(url, seen).not.toBeNull();
-      const base = url ?? "";
-      const reg: Registry = { url: base, dataDir, stop: async () => {}, mintToken: () => "" };
       const token = await addUser(reg, "alice", PASSWORD);
       const manifest = { name: "neg-size", version: "1.0.0", license: "MIT", main: "index.js" };
+
       const tgz = makeTgz([
         { path: "package.json", data: JSON.stringify(manifest) },
         { path: "index.js", data: "module.exports = 1;\n", sizeField: "-0000001000\0" },
       ]);
+
       let status = 0;
+
       try {
         const body = { name: "neg-size", "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": manifest }, _attachments: { "neg-size-1.0.0.tgz": { data: Buffer.from(tgz).toString("base64"), length: tgz.length } } };
-        const res = await fetch(`${base}neg-size`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+        const res = await fetch(`${reg.url}neg-size`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
         status = res.status;
       } catch {
         status = -1; // timed out: the registry froze
       }
+
       expect(status).toBe(400);
-      const ping = await fetch(`${base}-/ping`, { signal: AbortSignal.timeout(5_000) }).then((r) => r.status).catch(() => -1);
+      const ping = await fetch(`${reg.url}-/ping`, { signal: AbortSignal.timeout(5_000) }).then((r) => r.status).catch(() => -1);
       expect(ping).toBe(200);
     } finally {
-      proc.kill(9);
-      await proc.exited;
+      await reg.stop();
     }
   });
 
@@ -351,10 +327,12 @@ describe("upstream tarballs are checked on every read", () => {
     const first = await fetch(`${reg.url}cache-pkg/-/cache-pkg-1.0.0.tgz`);
     expect(first.status).toBe(200);
     expect(sha1(new Uint8Array(await first.arrayBuffer()))).toBe(shasum);
-    const cached = filesUnder(join(reg.dataDir, "tarballs")).filter((p) => p.endsWith(".tgz"));
+    const cached = await reg.blobs.keys();
     expect(cached.length).toBeGreaterThan(0);
-    for (const p of cached) writeFileSync(p, "tampered bytes");
+
+    for (const key of cached) await reg.blobs.put(key, "tampered bytes");
     const second = await fetch(`${reg.url}cache-pkg/-/cache-pkg-1.0.0.tgz`);
+
     if (second.status === 200) expect(sha1(new Uint8Array(await second.arrayBuffer()))).toBe(shasum);
     else expect(second.status).toBeGreaterThanOrEqual(500);
   });
@@ -365,6 +343,7 @@ describe("upstream tarballs are checked on every read", () => {
       headers: { "content-type": "application/json", authorization: `Bearer ${upTok}` },
       body: JSON.stringify({ name: "cache-pkg", version: "1.0.0", reason: "malware", password: PASSWORD }),
     });
+
     expect(rv.status, JSON.stringify(rv.body)).toBe(200);
     const after = await fetch(`${reg.url}cache-pkg/-/cache-pkg-1.0.0.tgz`);
     expect(after.status).toBe(404);
@@ -385,6 +364,7 @@ describe("upstream tarball URLs cannot reach other hosts", () => {
       hostname: "127.0.0.1",
       fetch: () => {
         internalHits++;
+
         return new Response(tgz);
       },
     });
@@ -394,9 +374,12 @@ describe("upstream tarball URLs cannot reach other hosts", () => {
       hostname: "127.0.0.1",
       fetch(req) {
         const p = new URL(req.url).pathname;
+
         if (p === "/redirect.tgz") return Response.redirect(internalUrl, 302);
+
         if (p !== "/ssrf-pkg") return Response.json({ error: "Not found" }, { status: 404 });
         const doc = (version: string, tarball: string) => ({ ...manifest, version, dist: { tarball, integrity, shasum: sha1(tgz) } });
+
         return Response.json({
           name: "ssrf-pkg",
           "dist-tags": { latest: "1.1.0" },
@@ -445,10 +428,12 @@ describe("two publishes of one version", () => {
 
   test("racing publishes give one 201 and one 409, and the served tarball matches the stored shasum", async () => {
     const manifest = { name: "race-pkg", version: "1.0.0", license: "MIT", main: "index.js" };
+
     const [a, b] = await Promise.all([
       putPublish(reg, alice, manifest, pkgTgz(manifest, { "index.js": "module.exports = 'first';\n" })),
       putPublish(reg, alice, manifest, pkgTgz(manifest, { "index.js": "module.exports = 'second';\n" })),
     ]);
+
     expect([a.status, b.status].sort()).toEqual([201, 409]);
     const pack = await getJson(`${reg.url}race-pkg`);
     const shasum = String(dig(pack.body, "versions", "1.0.0", "dist", "shasum"));
@@ -480,10 +465,12 @@ describe("checks that could not run are reported", () => {
     const mod: unknown = await import(join(ROOT, "packages", "bun-scanner", "src", "index.ts"));
     const scanner = dig(mod, "scanner");
     const scan = dig(scanner, "scan");
+
     if (typeof scan !== "function") throw new Error("scanner.scan missing");
     const before = process.env.APM_SCANNER_STRICT;
     process.env.APM_SCANNER_STRICT = "1";
     let threw = false;
+
     try {
       await scan.call(scanner, { packages: [{ name: "never-published-xyz", version: "1.0.0", tarball: `${reg.url}never-published-xyz/-/never-published-xyz-1.0.0.tgz`, requestedRange: "^1.0.0" }] });
     } catch {
@@ -492,6 +479,7 @@ describe("checks that could not run are reported", () => {
       if (before === undefined) delete process.env.APM_SCANNER_STRICT;
       else process.env.APM_SCANNER_STRICT = before;
     }
+
     expect(threw).toBe(true);
   });
 
@@ -512,6 +500,7 @@ describe("the token file", () => {
   test("saving a token makes an existing world-readable .npmrc private, atomically", async () => {
     const mod: unknown = await import(join(ROOT, "packages", "cli", "src", "config.ts"));
     const save = dig(mod, "saveToken");
+
     if (typeof save !== "function") throw new Error("saveToken missing");
     const dir = mkdtempSync(join(work, "npmrc-"));
     const rc = join(dir, ".npmrc");
@@ -544,6 +533,7 @@ describe("owners", () => {
       headers: { "content-type": "application/json", authorization: `Bearer ${alice}` },
       body: JSON.stringify({ name: "solo-owned", user: "alice", password: PASSWORD }),
     });
+
     expect(r.status).toBe(409);
     const p = await getJson(`${reg.url}-/apm/v1/packages/solo-owned`);
     expect(dig(p.body, "maintainers")).toEqual(["alice"]);
@@ -561,10 +551,13 @@ describe("short searches", () => {
       hostname: "127.0.0.1",
       fetch(req) {
         const url = new URL(req.url);
+
         if (url.pathname !== "/-/v1/search") return Response.json({ error: "Not found" }, { status: 404 });
         upstreamSearches++;
+
         // npm refuses text shorter than two characters
         if ((url.searchParams.get("text") ?? "").length < 2) return Response.json({ error: "text must be at least 2 characters" }, { status: 400 });
+
         return Response.json({ objects: [], total: 0, time: new Date().toUTCString() });
       },
     });
