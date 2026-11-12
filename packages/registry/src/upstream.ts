@@ -42,13 +42,69 @@ function encodeName(name: string): string {
 /** "unknown" means the upstream could not be asked; it is never treated as "absent". */
 export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" } | { kind: "unknown" };
 
+// One object of the upstream's /-/v1/search answer. Read loosely: extra fields (downloads, flags, links)
+// pass through untouched so the merged answer keeps npm's wire format.
+const UpSearchObject = z
+  .object({
+    package: z.object({ name: z.string(), version: z.string(), description: z.string().nullish(), date: z.string().nullish() }).loose(),
+  })
+  .loose();
+export type UpSearchObject = z.infer<typeof UpSearchObject>;
+const UpSearch = z.object({ objects: z.array(z.unknown()), total: z.number().optional() }).loose();
+
+export type UpstreamSearch = { kind: "ok"; objects: UpSearchObject[]; total: number } | { kind: "unavailable" };
+
+const SEARCH_CACHE_MAX = 500;
+
 export class Upstream {
   private cache = new Map<string, { at: number; probe: Probe }>();
   private inflight = new Map<string, Promise<Probe>>();
+  private searchCache = new Map<string, { at: number; result: Extract<UpstreamSearch, { kind: "ok" }> }>();
+  private searchInflight = new Map<string, Promise<UpstreamSearch>>();
   constructor(
     readonly baseUrl: string,
     private readonly ttlMs = 60_000,
   ) {}
+
+  /** The upstream's own search, cached for the TTL. Failures are not cached so the next keystroke retries. */
+  async search(text: string, size: number): Promise<UpstreamSearch> {
+    const key = `${size}\u0000${text}`;
+    const hit = this.searchCache.get(key);
+    if (hit && Date.now() - hit.at < this.ttlMs) return hit.result;
+    const running = this.searchInflight.get(key);
+    if (running) return running;
+    const p = this.fetchSearch(text, size).finally(() => this.searchInflight.delete(key));
+    this.searchInflight.set(key, p);
+    const result = await p;
+    if (result.kind === "ok") {
+      this.searchCache.delete(key);
+      this.searchCache.set(key, { at: Date.now(), result });
+      // Map keeps insertion order, so the first key is the oldest entry.
+      if (this.searchCache.size > SEARCH_CACHE_MAX) {
+        const oldest = this.searchCache.keys().next();
+        if (!oldest.done) this.searchCache.delete(oldest.value);
+      }
+    }
+    return result;
+  }
+
+  private async fetchSearch(text: string, size: number): Promise<UpstreamSearch> {
+    const url = `${this.baseUrl}-/v1/search?text=${encodeURIComponent(text)}&size=${size}`;
+    try {
+      const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(4_000) });
+      if (res.status !== 200) return { kind: "unavailable" };
+      const parsed = UpSearch.safeParse(await res.json());
+      if (!parsed.success) return { kind: "unavailable" };
+      const objects: UpSearchObject[] = [];
+      for (const raw of parsed.data.objects) {
+        const one = UpSearchObject.safeParse(raw);
+        if (one.success) objects.push(one.data);
+      }
+      return { kind: "ok", objects, total: parsed.data.total ?? objects.length };
+    } catch {
+      return { kind: "unavailable" };
+    }
+  }
 
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   async get(ctx: Ctx, name: string): Promise<UpstreamPackage | null> {

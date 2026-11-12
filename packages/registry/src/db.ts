@@ -330,6 +330,18 @@ export class Store {
       });
   }
 
+  /** Newest events of the given kinds across all packages. */
+  recentEvents(kinds: string[], limit: number): EventRecord[] {
+    if (kinds.length === 0) return [];
+    return this.db
+      .query(`SELECT * FROM events WHERE kind IN (${kinds.map(() => "?").join(", ")}) ORDER BY at DESC, id DESC LIMIT ?`)
+      .all(...kinds, limit)
+      .map((r) => {
+        const e = EventRow.parse(r);
+        return { ...e, detail: parseJson(e.detail) };
+      });
+  }
+
   tx<T>(fn: () => T): T {
     return this.db.transaction(fn)();
   }

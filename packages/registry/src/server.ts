@@ -426,12 +426,19 @@ export function searchPackages(ctx: Ctx, text: string): SearchHit[] {
   return hits;
 }
 
-function handleSearch(url: URL, ctx: Ctx, ext: Extensions): Response {
-  const text = url.searchParams.get("text") ?? "";
-  const size = Math.min(250, Math.max(1, Number(url.searchParams.get("size") ?? 20) || 20));
-  const from = Math.max(0, Number(url.searchParams.get("from") ?? 0) || 0);
-  const hits = searchPackages(ctx, text);
-  const objects = hits.slice(from, from + size).map((h) => ({
+/** Paging of a /-/v1/search request, clamped the way npm's registry clamps it. */
+export function searchPaging(url: URL): { text: string; size: number; from: number } {
+  return {
+    text: url.searchParams.get("text") ?? "",
+    size: Math.min(250, Math.max(1, Number(url.searchParams.get("size") ?? 20) || 20)),
+    from: Math.max(0, Number(url.searchParams.get("from") ?? 0) || 0),
+  };
+}
+
+/** Search objects in npm's wire shape for packages published here, best match first. */
+export function localSearchObjects(ctx: Ctx, ext: Extensions, text: string) {
+  return searchPackages(ctx, text).map((h) => ({
+    source: "local" as const,
     package: {
       name: h.pkg.name,
       scope: h.pkg.name.startsWith("@") ? h.pkg.name.slice(1, h.pkg.name.indexOf("/")) : "unscoped",
@@ -447,7 +454,13 @@ function handleSearch(url: URL, ctx: Ctx, ext: Extensions): Response {
     searchScore: h.rank,
     apmScore: h.latest && ext.searchScore ? ext.searchScore(h.latest) : null,
   }));
-  return json({ objects, total: hits.length, time: new Date(ctx.now()).toUTCString() });
+}
+export type LocalSearchObject = ReturnType<typeof localSearchObjects>[number];
+
+function handleSearch(url: URL, ctx: Ctx, ext: Extensions): Response {
+  const { text, size, from } = searchPaging(url);
+  const all = localSearchObjects(ctx, ext, text);
+  return json({ objects: all.slice(from, from + size), total: all.length, time: new Date(ctx.now()).toUTCString(), upstreamFailed: false });
 }
 
 // ---------- router ----------

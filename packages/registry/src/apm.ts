@@ -24,7 +24,7 @@ import {
   type TarEntry,
 } from "@apm/core";
 import type { VersionRecord } from "./db.ts";
-import { fail, json, splitPath, highest, servedVersions, tarballUrl, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
+import { fail, json, splitPath, highest, servedVersions, tarballUrl, searchPaging, localSearchObjects, type Auth, type Ctx, type Extensions, type PublishHook, type PackumentView } from "./server.ts";
 import type { Upstream, UpstreamPackage } from "./upstream.ts";
 
 const HOUR = 3_600_000;
@@ -533,16 +533,44 @@ function eventsResponse(ctx: Ctx, name: string): Response {
   });
 }
 
-export async function nameReport(env: Env, q: string, user: string | null): Promise<Record<string, unknown>> {
+/** The name check answers in parts so a UI can fill each slot as soon as its part is ready. */
+export const NAME_PARTS = ["exact", "lookalike", "alternatives"] as const;
+export type NamePart = (typeof NAME_PARTS)[number];
+export function isNamePart(s: string | null): s is NamePart {
+  return NAME_PARTS.some((p) => p === s);
+}
+
+async function exactPart(env: Env, query: string, valid: boolean): Promise<Record<string, unknown>> {
   const ctx = env.ctx;
-  const query = q.trim().toLowerCase();
-  const valid = isValidPackageName(query);
   const found = valid ? await lookupOrUnknown(env, query) : null;
   // When npm can't be asked, the name is neither taken nor available: say so instead of "available".
   const unknown = found === "unknown";
   const src = found === "unknown" ? null : found;
   const conflicts = valid && !src ? typoConflicts(query) : [];
-  const similar = valid ? registryNeighbours(ctx, query) : [];
+  const latestRaw = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
+  const latest0 = src && latestRaw ? await ensureAnalyzed(env, src, latestRaw) : null;
+  const latestReport = latest0 ? reportFor(ctx, latest0) : null;
+  return {
+    taken: src !== null,
+    source: src?.kind ?? null,
+    unknown,
+    available: valid && !unknown && src === null && conflicts.length === 0,
+    owners: src ? (src.kind === "local" ? ctx.store.owners(query) : src.pkg.maintainers) : [],
+    latest: latest0 ? { version: latest0.version, score: latestReport?.score ?? null, grade: latestReport?.grade ?? null } : null,
+    description: src ? (src.kind === "local" ? (ctx.store.getPackage(query)?.description ?? "") : src.pkg.description) : null,
+    conflicts,
+  };
+}
+
+function lookalikePart(ctx: Ctx, query: string, valid: boolean): Record<string, unknown> {
+  return {
+    // popular names this one could be mistaken for, whether or not it is taken (install-side typo warning)
+    lookalikes: valid ? typoConflicts(query) : [],
+    similar: valid ? registryNeighbours(ctx, query) : [],
+  };
+}
+
+async function alternativesPart(env: Env, query: string, user: string | null): Promise<Record<string, unknown>> {
   const bare = query.startsWith("@") ? query.slice(query.indexOf("/") + 1) : query;
   const candidates = [...(user ? [`@${user}/${bare}`] : []), `${bare}-js`, `${bare}js`, `use-${bare}`, `${bare}-kit`, `${bare}-core`].filter((c) => c !== query);
   const suggestions = await Promise.all(
@@ -555,25 +583,97 @@ export async function nameReport(env: Env, q: string, user: string | null): Prom
         return { name: c, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown" };
       }),
   );
-  const latestRaw = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
-  const latest0 = src && latestRaw ? await ensureAnalyzed(env, src, latestRaw) : null;
-  const latestReport = latest0 ? reportFor(ctx, latest0) : null;
-  return {
-    query,
-    // popular names this one could be mistaken for, whether or not it is taken (install-side typo warning)
-    lookalikes: valid ? typoConflicts(query) : [],
-    valid,
-    taken: src !== null,
-    source: src?.kind ?? null,
-    unknown,
-    available: valid && !unknown && src === null && conflicts.length === 0,
-    owners: src ? (src.kind === "local" ? ctx.store.owners(query) : src.pkg.maintainers) : [],
-    latest: latest0 ? { version: latest0.version, score: latestReport?.score ?? null, grade: latestReport?.grade ?? null } : null,
-    description: src ? (src.kind === "local" ? (ctx.store.getPackage(query)?.description ?? "") : src.pkg.description) : null,
-    conflicts,
-    similar,
-    suggestions,
-  };
+  return { suggestions };
+}
+
+export async function nameReport(env: Env, q: string, user: string | null, part: NamePart | null = null): Promise<Record<string, unknown>> {
+  const query = q.trim().toLowerCase();
+  const valid = isValidPackageName(query);
+  const head = { query, valid };
+  if (part !== null) {
+    switch (part) {
+      case "exact":
+        return { ...head, ...(await exactPart(env, query, valid)) };
+      case "lookalike":
+        return { ...head, ...lookalikePart(env.ctx, query, valid) };
+      case "alternatives":
+        return { ...head, ...(await alternativesPart(env, query, user)) };
+      default: {
+        const _exhaustive: never = part;
+        return _exhaustive;
+      }
+    }
+  }
+  const [exact, alternatives] = await Promise.all([exactPart(env, query, valid), alternativesPart(env, query, user)]);
+  return { ...head, ...lookalikePart(env.ctx, query, valid), ...exact, ...alternatives };
+}
+
+// ---------- search: local packages merged with the upstream's search ----------
+/** A score for an upstream search hit, only when that version was analyzed before. Never fetches a tarball. */
+function storedUpstreamScore(ctx: Ctx, name: string, version: string, date: string | null | undefined): ReturnType<typeof compact> | null {
+  const analysis = ctx.store.getUpstreamAnalysis(name, version);
+  if (!isAnalysis(analysis)) return null;
+  return compact(finalize(analysis, { publishedAt: Date.parse(date ?? "") || 0, now: ctx.now(), deprecated: null, status: "active", statusReason: null }));
+}
+
+/**
+ * Local hits first (they are what this registry serves under that name), then the upstream's in its own order.
+ * An exact name match from either side goes to the top; a name published here hides the upstream hit.
+ */
+export function mergeSearch<L extends { package: { name: string } }, U extends { package: { name: string } }>(input: { text: string; local: L[]; upstream: U[] }): (L | U)[] {
+  const q = input.text.trim().toLowerCase();
+  const localNames = new Set(input.local.map((o) => o.package.name));
+  const upstream = input.upstream.filter((o) => !localNames.has(o.package.name));
+  const merged: (L | U)[] = [...input.local, ...upstream];
+  const exact = merged.findIndex((o) => o.package.name === q);
+  if (exact > 0) merged.unshift(...merged.splice(exact, 1));
+  return merged;
+}
+
+async function searchResponse(env: Env, url: URL, scoreOf: (v: VersionRecord) => unknown): Promise<Response> {
+  const ctx = env.ctx;
+  const { text, size, from } = searchPaging(url);
+  const local = localSearchObjects(ctx, { searchScore: scoreOf }, text);
+  const up = env.upstream && text.trim() !== "" ? await env.upstream.search(text.trim(), Math.min(250, from + size)) : null;
+  const upstream =
+    up?.kind === "ok"
+      ? up.objects.map((o) => ({ ...o, source: "npm" as const, apmScore: storedUpstreamScore(ctx, o.package.name, o.package.version, o.package.date) }))
+      : [];
+  const merged = mergeSearch({ text, local, upstream });
+  const total = local.length + (up?.kind === "ok" ? Math.max(up.total, upstream.length) : 0);
+  return json({ objects: merged.slice(from, from + size), total, time: new Date(ctx.now()).toUTCString(), upstreamFailed: up?.kind === "unavailable" });
+}
+
+// ---------- recent activity on this registry ----------
+const RECENT_KINDS = ["publish", "yank", "unyank", "revoke", "restore"] as const;
+const EventDetail = z.object({ version: z.string(), reason: z.string().nullish() }).loose();
+
+function recentResponse(ctx: Ctx, url: URL): Response {
+  const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 12) || 12));
+  const seen = new Set<string>();
+  const events: Record<string, unknown>[] = [];
+  for (const e of ctx.store.recentEvents([...RECENT_KINDS], limit * 4)) {
+    const d = EventDetail.safeParse(e.detail);
+    if (!d.success) continue;
+    const key = `${e.package}@${d.data.version}:${e.kind}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const v = ctx.store.getVersion(e.package, d.data.version);
+    const r = v ? reportFor(ctx, v) : null;
+    events.push({
+      package: e.package,
+      version: d.data.version,
+      kind: e.kind,
+      actor: e.actor,
+      at: new Date(e.at).toISOString(),
+      reason: d.data.reason ?? null,
+      status: v?.status ?? null,
+      score: r?.score ?? null,
+      grade: r?.grade ?? null,
+    });
+    if (events.length >= limit) break;
+  }
+  return json({ events });
 }
 
 // ---------- policy: ~safe view, resolve, scan ----------
@@ -834,13 +934,14 @@ async function upstreamRoute(req: Request, url: URL, env: Env, viaSafe: boolean)
 }
 
 // ---------- router ----------
-function makeRoutes(env: Env): NonNullable<Extensions["routes"]> {
+function makeRoutes(env: Env, scoreOf: (v: VersionRecord) => unknown): NonNullable<Extensions["routes"]> {
   return async (req, url, ctx, auth) => {
     for (const v of ctx.store.matureRevocations(ctx.now() - PENDING_MS)) {
       ctx.store.addEvent({ package: v.package, kind: "revoke", actor: "registry", at: ctx.now(), detail: { version: v.version, reason: "pending revoke became final after 24h" } });
     }
     const p = url.pathname;
     if (p === "/-/npm/v1/security/advisories/bulk" && req.method === "POST") return bulkAdvisories(req, env);
+    if (p === "/-/v1/search" && env.upstream && (req.method === "GET" || req.method === "HEAD")) return searchResponse(env, url, scoreOf);
     if (!p.startsWith("/-/apm/v1/")) {
       const viaSafe = new URL(req.url).pathname.startsWith("/~safe");
       return upstreamRoute(req, url, env, viaSafe);
@@ -856,8 +957,11 @@ function makeRoutes(env: Env): NonNullable<Extensions["routes"]> {
     if (req.method !== "GET") return fail(405, "Method not allowed");
     if (rest === "names") {
       const user = url.searchParams.get("user") ?? (auth.kind === "user" ? auth.user : null);
-      return json(await nameReport(env, url.searchParams.get("q") ?? "", user));
+      const part = url.searchParams.get("part");
+      if (part !== null && !isNamePart(part)) return fail(400, `part must be one of ${NAME_PARTS.join(", ")}`);
+      return json(await nameReport(env, url.searchParams.get("q") ?? "", user, part));
     }
+    if (rest === "recent") return recentResponse(ctx, url);
     if (rest === "resolve") return resolveResponse(env, url);
     if (rest === "me") return auth.kind === "user" ? json({ username: auth.user }) : fail(401, "Not logged in");
     if (rest.startsWith("score/")) {
@@ -887,5 +991,5 @@ export function apmExtensions(ctx: Ctx, upstream: Upstream | null = null): Exten
     const r = reportFor(ctx, v);
     return r ? compact(r) : null;
   };
-  return { onPublish: makeOnPublish(env), routes: makeRoutes(env), safeView, compactScore: scoreOf, searchScore: scoreOf };
+  return { onPublish: makeOnPublish(env), routes: makeRoutes(env, scoreOf), safeView, compactScore: scoreOf, searchScore: scoreOf };
 }
