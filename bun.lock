@@ -16,6 +16,7 @@
         "apm": "./src/main.ts",
       },
       "dependencies": {
+        "@apm/core": "workspace:*",
         "zod": "^4.6.7",
       },
     },
@@ -30,6 +31,7 @@
       "name": "@apm/registry",
       "version": "0.1.0",
       "dependencies": {
+        "@apm/core": "workspace:*",
         "zod": "^4.6.7",
       },
     },

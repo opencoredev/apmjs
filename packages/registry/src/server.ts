@@ -6,7 +6,7 @@ import { z } from "zod";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 
 export type Ctx = { store: Store; now: () => number; baseUrl: () => string };
-type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: string };
+export type Auth = { kind: "anon" } | { kind: "user"; user: string; tokenHash: string };
 
 // ---------- responses ----------
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -106,7 +106,26 @@ export function servedVersions(versions: VersionRecord[]): VersionRecord[] {
   return versions.filter((v) => v.status === "active");
 }
 
-export function versionDoc(ctx: Ctx, pkg: PackageRecord, v: VersionRecord): Record<string, unknown> {
+export type PackumentView = { keep: (v: VersionRecord) => boolean };
+
+/** Highest stable version, or highest prerelease when there is no stable one. */
+export function highest(versions: string[]): string | undefined {
+  const sorted = [...versions].sort((a, b) => Bun.semver.order(b, a));
+  return sorted.find((v) => !v.includes("-")) ?? sorted[0];
+}
+
+/** Keeps tags that point at kept versions; moves latest to the highest kept version. */
+export function retag(tags: Record<string, string>, kept: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [t, v] of Object.entries(tags)) if (kept.includes(v)) out[t] = v;
+  if (!out.latest) {
+    const h = highest(kept);
+    if (h) out.latest = h;
+  }
+  return out;
+}
+
+export function versionDoc(ctx: Ctx, pkg: PackageRecord, v: VersionRecord, ext: Extensions = {}): Record<string, unknown> {
   const doc: Record<string, unknown> = {
     ...v.manifest,
     name: pkg.name,
@@ -120,19 +139,25 @@ export function versionDoc(ctx: Ctx, pkg: PackageRecord, v: VersionRecord): Reco
     },
     _npmUser: { name: v.published_by },
   };
+  const scripts = v.manifest.scripts;
+  if (typeof scripts === "object" && scripts !== null && ["preinstall", "install", "postinstall"].some((k) => k in scripts)) doc.hasInstallScript = true;
   if (v.deprecated) doc.deprecated = v.deprecated;
   else delete doc.deprecated;
-  if (v.score !== null) doc._apmScore = v.score;
+  if (ext.compactScore) {
+    const c = ext.compactScore(v);
+    if (c !== null) doc._apmScore = c;
+  }
   return doc;
 }
 
-export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean): Record<string, unknown> {
+export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean, ext: Extensions = {}, view?: PackumentView): Record<string, unknown> {
   const all = ctx.store.listVersions(pkg.name);
-  const live = servedVersions(all);
+  const served = servedVersions(all);
+  const live = view ? served.filter(view.keep) : served;
   const versions: Record<string, unknown> = {};
   const time: Record<string, string> = { created: iso(pkg.created_at), modified: iso(pkg.modified_at) };
   for (const v of live) {
-    const full = versionDoc(ctx, pkg, v);
+    const full = versionDoc(ctx, pkg, v, ext);
     if (abbreviated) {
       const slim: Record<string, unknown> = {};
       for (const k of ABBREV_FIELDS) if (k in full) slim[k] = full[k];
@@ -143,7 +168,7 @@ export function packument(ctx: Ctx, pkg: PackageRecord, abbreviated: boolean): R
     }
     time[v.version] = iso(v.published_at);
   }
-  const distTags = { ...pkg.distTags };
+  const distTags = view ? retag(pkg.distTags, live.map((v) => v.version)) : { ...pkg.distTags };
   if (abbreviated) {
     return { name: pkg.name, modified: iso(pkg.modified_at), "dist-tags": distTags, versions };
   }
@@ -185,10 +210,14 @@ export type PublishHook = (input: {
   tarball: Uint8Array;
   user: string;
   existing: PackageRecord | null;
-}) => { ok: true; score: unknown } | { ok: false; status: number; error: string; detail?: unknown };
+}) => { ok: true; manifest: Record<string, unknown>; score: unknown } | { ok: false; status: number; error: string; detail?: unknown };
 
 export type Extensions = {
   onPublish?: PublishHook;
+  compactScore?: (v: VersionRecord) => unknown;
+  /** Filter for the `~safe` registry view. */
+  safeView?: (ctx: Ctx) => PackumentView;
+  searchScore?: (v: VersionRecord) => unknown;
   routes?: (req: Request, url: URL, ctx: Ctx, auth: Auth) => Promise<Response | null> | Response | null;
 };
 
@@ -238,19 +267,21 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
 
   let score: unknown = null;
+  let storedManifest: Record<string, unknown> = manifest;
   if (ext.onPublish) {
     const verdict = ext.onPublish({ ctx, name, version, manifest, tarball, user: auth.user, existing });
     if (!verdict.ok) return fail(verdict.status, verdict.error, verdict.detail === undefined ? {} : { detail: verdict.detail });
     score = verdict.score;
+    storedManifest = verdict.manifest;
   }
 
   const at = ctx.now();
   const path = tarballPath(ctx, name, version);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, tarball);
-  const cleanManifest: Record<string, unknown> = { ...manifest };
+  const cleanManifest: Record<string, unknown> = { ...storedManifest };
   for (const k of ["_id", "dist", "_npmUser", "_attachments", "readme", "_resolved", "_integrity", "_from"]) delete cleanManifest[k];
-  const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
+  const requestedTag = Object.keys(body["dist-tags"])[0] ?? "latest";
 
   ctx.store.tx(() => {
     if (!existing) ctx.store.createPackage(name, at, auth.user);
@@ -269,12 +300,12 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     const tags = { ...(pkg?.distTags ?? {}) };
     const isPrerelease = version.includes("-");
     const currentLatest = tags.latest;
-    if (tag !== "latest" || !isPrerelease || !currentLatest) {
-      if (tag === "latest" && currentLatest && Bun.semver.order(version, currentLatest) < 0) {
-        // publishing an older line (e.g. a 1.x backport) never moves latest backwards
-      } else {
-        tags[tag] = version;
-      }
+    // a prerelease never takes `latest` once a stable release exists; it goes to `next`
+    const tag = requestedTag === "latest" && isPrerelease && currentLatest ? "next" : requestedTag;
+    if (tag === "latest" && currentLatest && Bun.semver.order(version, currentLatest) < 0) {
+      // publishing an older line (a 1.x backport) never moves latest backwards
+    } else {
+      tags[tag] = version;
     }
     ctx.store.setDistTags(name, tags, at);
     const description = typeof manifest.description === "string" ? manifest.description : undefined;
@@ -286,7 +317,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
       ...(keywords !== undefined ? { keywords } : {}),
       ...(readme !== undefined ? { readme } : {}),
     });
-    ctx.store.addEvent({ package: name, kind: "publish", actor: auth.user, at, detail: { version, tag } });
+    ctx.store.addEvent({ package: name, kind: "publish", actor: auth.user, at, detail: { version, tag: requestedTag } });
   });
   return json({ ok: true, id: name, rev: `${at}`, success: true, score }, 201);
 }
@@ -324,7 +355,7 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
     const raw: unknown = await req.json();
     const version = z.string().parse(raw);
     const v = ctx.store.getVersion(name, version);
-    if (!v || v.status !== "active") return fail(404, `Version ${version} not found`);
+    if (!v || v.status !== "active") return fail(404, `Version ${version} not found or not active`);
     tags[tag] = version;
   } else if (req.method === "DELETE") {
     if (tag === "latest") return fail(400, "Cannot delete latest");
@@ -394,7 +425,7 @@ export function searchPackages(ctx: Ctx, text: string): SearchHit[] {
   return hits;
 }
 
-function handleSearch(url: URL, ctx: Ctx): Response {
+function handleSearch(url: URL, ctx: Ctx, ext: Extensions): Response {
   const text = url.searchParams.get("text") ?? "";
   const size = Math.min(250, Math.max(1, Number(url.searchParams.get("size") ?? 20) || 20));
   const from = Math.max(0, Number(url.searchParams.get("from") ?? 0) || 0);
@@ -413,7 +444,7 @@ function handleSearch(url: URL, ctx: Ctx): Response {
     },
     score: { final: h.rank / 100, detail: { quality: 1, popularity: 1, maintenance: 1 } },
     searchScore: h.rank,
-    apmScore: h.latest?.score ?? null,
+    apmScore: h.latest && ext.searchScore ? ext.searchScore(h.latest) : null,
   }));
   return json({ objects, total: hits.length, time: new Date(ctx.now()).toUTCString() });
 }
@@ -433,8 +464,14 @@ export function createHandler(ctx: Ctx, ext: Extensions = {}): (req: Request) =>
 
 async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response> {
   const url = new URL(req.url);
-  const path = url.pathname;
+  let path = url.pathname;
   const auth = authOf(req, ctx);
+  let view: PackumentView | undefined;
+  if (path === "/~safe" || path.startsWith("/~safe/")) {
+    path = path.slice("/~safe".length) || "/";
+    url.pathname = path;
+    if (ext.safeView) view = ext.safeView(ctx);
+  }
 
   if (ext.routes) {
     const r = await ext.routes(req, url, ctx, auth);
@@ -450,7 +487,7 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
     if (auth.kind === "user") ctx.store.db.query("UPDATE tokens SET revoked_at = ? WHERE token_hash = ?").run(ctx.now(), auth.tokenHash);
     return json({ ok: true });
   }
-  if (path === "/-/v1/search") return handleSearch(url, ctx);
+  if (path === "/-/v1/search") return handleSearch(url, ctx, ext);
   if (path.startsWith("/-/package/")) {
     const sp = splitPath(path.slice("/-/package".length));
     if (!sp) return fail(404, "Not found");
@@ -476,7 +513,7 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
     if (!pkg || !m?.[2]) return fail(404, "Not found");
     const v = ctx.store.getVersion(name, m[2]);
     if (!v) return fail(404, "Not found");
-    if (v.status !== "active") {
+    if (v.status === "revoked") {
       return fail(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`, { revoked: true });
     }
     const p = tarballPath(ctx, name, v.version);
@@ -487,13 +524,23 @@ async function route(req: Request, ctx: Ctx, ext: Extensions): Promise<Response>
   if (rest.length === 0) {
     const accept = req.headers.get("accept") ?? "";
     const abbreviated = accept.includes("application/vnd.npm.install-v1+json");
-    const body = packument(ctx, pkg, abbreviated);
-    return json(body, 200, { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json" });
+    const body = packument(ctx, pkg, abbreviated, ext, view);
+    const text = JSON.stringify(body);
+    const etag = `"${createHash("sha1").update(text).digest("base64url")}"`;
+    // Version state can change at any time (yank, revoke), so clients must revalidate every time.
+    const headers = {
+      "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json",
+      "cache-control": "no-cache",
+      etag,
+      "last-modified": new Date(pkg.modified_at).toUTCString(),
+    };
+    if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
+    return new Response(text, { status: 200, headers });
   }
   // GET /:name/:versionOrTag
   const spec = rest[0] ?? "";
   const resolved = pkg.distTags[spec] ?? spec;
   const v = ctx.store.getVersion(name, resolved);
-  if (!v || v.status !== "active") return fail(404, "Version not found");
-  return json(versionDoc(ctx, pkg, v));
+  if (!v || v.status === "revoked") return fail(404, "Version not found");
+  return json(versionDoc(ctx, pkg, v, ext));
 }

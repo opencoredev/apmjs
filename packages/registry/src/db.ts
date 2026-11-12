@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_pkg ON events(package, at);
 `;
 
-export type VersionStatus = "active" | "revoked";
+export type VersionStatus = "active" | "yanked" | "revoked";
 
 const UserRow = z.object({ name: z.string(), password_hash: z.string(), email: z.string(), created_at: z.number() });
 const TokenRow = z.object({
@@ -103,7 +103,7 @@ const VersionRow = z.object({
   published_at: z.number(),
   published_by: z.string(),
   deprecated: z.string().nullable(),
-  status: z.enum(["active", "revoked"]),
+  status: z.enum(["active", "yanked", "revoked"]),
   status_reason: z.string().nullable(),
   status_at: z.number().nullable(),
   status_by: z.string().nullable(),
