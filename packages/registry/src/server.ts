@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
-import { editDistance, isValidTagName, isValidVersion } from "@apm/core";
+import { isValidTagName, isValidVersion } from "@apm/core";
 import { hashPassword } from "better-auth/crypto";
 import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CAPABILITIES, type AccessServices, type Refusal as AccessRefusal, type TokenScope } from "./access.ts";
 import type { Analysis } from "./analysis.ts";
@@ -18,6 +18,7 @@ import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 import { fail, json, MAX_PUBLISH_BODY_BYTES, parseBody } from "./http.ts";
 import { atTime } from "./lifecycle.ts";
 import { order } from "./semver.ts";
+import { searchPackages } from "./search.ts";
 import { isWithheld, packageTextShown, readmeShown } from "./withheld.ts";
 
 export type { NamePolicy };
@@ -952,73 +953,6 @@ const handleRevPut = (req: Request, name: string, caller: Caller) =>
   });
 
 // ---------- search ----------
-export type SearchHit = { pkg: PackageRecord; latest: VersionRecord; rank: number; owners: string[] };
-
-function bareName(name: string): string {
-  return name.startsWith("@") ? name.slice(name.indexOf("/") + 1) : name;
-}
-
-function rankOf(pkg: PackageRecord, terms: string[]): number {
-  const name = pkg.name;
-  const hay = `${name} ${pkg.description} ${pkg.keywords.join(" ")}`.toLowerCase();
-  let rank = 0;
-
-  if (terms.length === 0) rank = 1;
-
-  for (const t of terms) {
-    if (name === t) rank += 100;
-    else if (name.startsWith(t)) rank += 40;
-    else if (name.includes(t)) rank += 25;
-    else if (pkg.keywords.some((k) => k.toLowerCase() === t)) rank += 15;
-    else if (hay.includes(t)) rank += 5;
-    // A misspelled name still finds the package: one edit away for short names, two for long ones.
-    else if (t.length >= 4 && editDistance(bareName(name), bareName(t)) <= (t.length >= 8 ? 2 : 1)) rank += 10;
-  }
-
-  return rank;
-}
-
-export const searchPackages = (text: string): Effect.Effect<SearchHit[], StoreError, Store | Clock> =>
-  Effect.gen(function* () {
-    const store = yield* Store;
-    const now = yield* (yield* Clock).now;
-    const q = text.trim().toLowerCase();
-    const terms = q.split(/\s+/).filter(Boolean);
-    // a package with a withheld version is ranked, and shown, by the text its shown versions wrote (withheld.ts)
-    const withheld = new Set(yield* store.withheldPackageNames());
-    const packages: PackageRecord[] = [];
-
-    for (const pkg of yield* store.listPackages()) {
-      packages.push(withheld.has(pkg.name) ? { ...pkg, ...packageTextShown(pkg, (yield* store.listVersions(pkg.name)).map((v) => atTime(v, now))) } : pkg);
-    }
-
-    const ranked = packages.flatMap((pkg) => {
-      const rank = rankOf(pkg, terms);
-
-      return rank > 0 ? [{ pkg, rank }] : [];
-    });
-
-    const names = ranked.map((h) => h.pkg.name);
-    const active = (yield* store.activeVersionsOf(names)).map((v) => atTime(v, now)).filter((v) => v.status === "active");
-    const owners = yield* store.ownersOf(names);
-    const byPackage = new Map<string, VersionRecord[]>();
-
-    for (const v of active) byPackage.set(v.package, [...(byPackage.get(v.package) ?? []), v]);
-    const hits: SearchHit[] = [];
-
-    for (const { pkg, rank } of ranked) {
-      const live = byPackage.get(pkg.name) ?? [];
-      const latest = live.find((v) => v.version === pkg.distTags.latest) ?? live[live.length - 1];
-
-      if (!latest) continue;
-      hits.push({ pkg, latest, rank, owners: owners.get(pkg.name) ?? [] });
-    }
-
-    hits.sort((a, b) => b.rank - a.rank || a.pkg.name.localeCompare(b.pkg.name));
-
-    return hits;
-  });
-
 /** Paging of a /-/v1/search request, clamped the way npm's registry clamps it. */
 export function searchPaging(url: URL): { text: string; size: number; from: number } {
   return {
@@ -1125,7 +1059,7 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
       if (!v) return fail(404, "Not found");
 
       if (v.status === "revoked") {
-        return fail(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`, { revoked: true });
+        return fail(410, `${name}@${v.version} was revoked by its owner.`, { revoked: true, revokeReason: v.status_reason ?? "no reason given" });
       }
 
       if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);

@@ -15,6 +15,7 @@ import { silentLogger } from "../../apps/reviewer/src/log.ts";
 import { modelClient } from "../../apps/reviewer/src/model.ts";
 import { registryClient } from "../../apps/reviewer/src/registry.ts";
 import { runOnce, type WorkerDeps } from "../../apps/reviewer/src/worker.ts";
+import { WITHHELD_ISSUE } from "../../packages/registry/src/withheld.ts";
 import { addUser, deviceLogin, dig, enableTotp, getJson, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
 
 // ---------- a tar writer ----------
@@ -665,10 +666,11 @@ describe("a revoked version", () => {
         expect(JSON.stringify(after.body)).not.toContain(SOURCE);
         expect(dig(after.body, "redacted")).toBe(true);
         expect(dig(after.body, "review", "state")).toBe("confirmed");
-        // the finding still says where and what
-        expect(dig(after.body, "review", "findings", 0, "file")).toBe("index.js");
+        // the finding still says which file (by reference), which line and how bad; its sentence is fixed words
+        expect(dig(after.body, "review", "findings", 0, "file")).toMatch(/^file \d+$/);
         expect(dig(after.body, "review", "findings", 0, "line")).toBe(2);
-        expect(dig(after.body, "review", "findings", 0, "issue")).toBe("Posts process.env to a remote host on import.");
+        expect(dig(after.body, "review", "findings", 0, "issue")).toBe(WITHHELD_ISSUE);
+        expect(dig(after.body, "review", "findings", 0, "severity")).toBe("high");
         expect(dig(after.body, "review", "findings", 0, "excerpt")).toBe("");
       }
 

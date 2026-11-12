@@ -69,6 +69,8 @@ const VersionRow = z.object({
   size: Int,
   tarball_key: z.string(),
   published_at: Int,
+  /** Insert order: two publishes in the same millisecond are ordered by it, as every version query orders them. */
+  seq: Int,
   published_by: z.string(),
   deprecated: z.string().nullable(),
   status: z.enum(["active", "yanked", "revoke-pending", "revoked"]),
@@ -77,6 +79,14 @@ const VersionRow = z.object({
   status_by: z.string().nullable(),
   score: z.unknown(),
 });
+
+/** A version as far as the package text it wrote goes (withheld.ts): its description and keywords, unparsed. */
+const TextSourceRow = VersionRow.pick({ package: true, status: true, status_at: true, published_at: true, seq: true })
+  .extend({ description: z.unknown(), keywords: z.unknown() })
+  .transform(({ description, keywords, ...v }) => ({ ...v, manifest: { description, keywords } }));
+
+/** One version of a package with a withheld version, as withheldPackageText reads it. */
+export type VersionText = Omit<z.output<typeof TextSourceRow>, "package">;
 
 const AdvisoryRow = z.object({
   id: Int,
@@ -174,7 +184,7 @@ export type RecentHidden = { actors: readonly string[]; scopes: readonly string[
 
 export type EventRecord = z.infer<typeof EventRow>;
 
-export type NewVersion = Omit<VersionRecord, "status" | "status_reason" | "status_at" | "status_by" | "deprecated">;
+export type NewVersion = Omit<VersionRecord, "seq" | "status" | "status_reason" | "status_at" | "status_by" | "deprecated">;
 
 export type Linked = { provider: string; accountId: string };
 
@@ -305,8 +315,11 @@ export type StoreApi = {
 
   readonly listVersions: (name: string) => Effect.Effect<VersionRecord[], StoreError>;
   readonly activeVersionsOf: (names: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
-  /** Packages with a revoked or revoke-pending version: their row's text may be a withheld publish's (withheld.ts). */
-  readonly withheldPackageNames: () => Effect.Effect<string[], StoreError>;
+  /**
+   * Every version of each package that has a revoked or revoke-pending version, with only what packageTextShown reads
+   * (withheld.ts), in publish order, in one query. Those packages' row text may be a withheld publish's.
+   */
+  readonly withheldPackageText: () => Effect.Effect<Map<string, VersionText[]>, StoreError>;
   readonly getVersion: (name: string, version: string) => Effect.Effect<VersionRecord | null, StoreError>;
   /** Inserts the version; false when that version already exists. */
   readonly insertVersion: (v: NewVersion) => Effect.Effect<boolean, StoreError>;
@@ -697,11 +710,22 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             sql`SELECT * FROM versions WHERE package = ANY(${names}) AND status = 'active' ORDER BY package, published_at, seq`,
             all(VersionRow),
           ).pipe(Effect.flatMap(withDismissals)),
-    withheldPackageNames: () =>
+    withheldPackageText: () =>
       run(
-        "withheldPackageNames",
-        sql`SELECT DISTINCT package FROM versions WHERE status IN ('revoke-pending', 'revoked') ORDER BY package`,
-        all(z.object({ package: z.string() }).transform((r) => r.package)),
+        "withheldPackageText",
+        sql`SELECT package, status, status_at, published_at, seq, manifest->'description' AS description, manifest->'keywords' AS keywords
+            FROM versions
+            WHERE package IN (SELECT package FROM versions WHERE status IN ('revoke-pending', 'revoked'))
+            ORDER BY package, published_at, seq`,
+        all(TextSourceRow),
+      ).pipe(
+        Effect.map((rows) => {
+          const out = new Map<string, VersionText[]>();
+
+          for (const { package: name, ...v } of rows) out.set(name, [...(out.get(name) ?? []), v]);
+
+          return out;
+        }),
       ),
     getVersion: (name, version) =>
       run("getVersion", sql`SELECT * FROM versions WHERE package = ${name} AND version = ${version}`, one(VersionRow)).pipe(

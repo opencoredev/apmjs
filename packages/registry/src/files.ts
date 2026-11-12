@@ -163,7 +163,7 @@ const open = (input: { found: Found; name: string }) =>
     const { found, name } = input;
     const v = found.v;
 
-    if (isWithheld(v.status)) return yield* Effect.fail(refuse(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`));
+    if (isWithheld(v.status)) return yield* Effect.fail(refuse(410, `${name}@${v.version} was revoked: its files are not shown.`, { revoked: true, revokeReason: v.status_reason ?? "no reason given" }));
     const digest = digestOf(v);
 
     if (!digest) return yield* Effect.fail(refuse(422, "This version has no checksum, so its tarball cannot be verified."));

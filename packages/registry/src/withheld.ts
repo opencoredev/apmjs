@@ -8,6 +8,7 @@ import {
   dependencySpecs,
   describeDependency,
   isRegistryDependency,
+  isValidPackageName,
   uncheckableReason,
   type DependencySpec,
   type DismissedEvidence,
@@ -33,9 +34,14 @@ export function withheldSignal(s: Signal): WithheldSignal {
   return { id: s.id, label: s.label, points: s.points, confidence: s.confidence, evidence: s.id === "revoked" ? [...s.evidence] : [] };
 }
 
-/** A dismissed item of a withheld version: the signal, file, line and the reviewer's reason; the quoted evidence goes. */
-export function withheldDismissal(d: DismissedEvidence): DismissedEvidence {
-  return { signal: d.signal, file: d.file, line: d.line, reason: d.reason, at: d.at, evidence: [] };
+/**
+ * A withheld version's dismissed items: the signal, line and the reviewer's reason; the quoted evidence goes, and each
+ * file is a numbered reference ("file 2"), the same for one path throughout the list, since a path is the publisher's.
+ */
+export function withheldDismissals(list: readonly DismissedEvidence[]): DismissedEvidence[] {
+  const refs = new Map([...new Set(list.map((d) => d.file))].toSorted().map((p, i) => [p, `file ${i + 1}`]));
+
+  return list.map((d) => ({ signal: d.signal, file: refs.get(d.file) ?? "file", line: d.line, reason: d.reason, at: d.at, evidence: [] }));
 }
 
 /** The package row fields that say whose readme it is. */
@@ -73,6 +79,24 @@ export function withheldFacts(f: Facts): Facts {
 const UNREAD = /^(\d+) file\(s\) not analyzed: the package is larger than the (\d+(?:\.\d+)?) MB one analysis reads$/;
 const MORE_DEPENDENCIES = /^dependency (\d+) more dependencies: apm checks the first (\d+) at publish$/;
 
+/**
+ * What a withheld version's review finding says in place of the model's sentence, which can quote the package
+ * (review.ts). A finding names no category apm could word it from, so it is this one sentence; its severity stays in
+ * its own field.
+ */
+export const WITHHELD_ISSUE = "Finding withheld with this version";
+
+/** How a withheld version's answers refer to a dependency whose manifest key is not a valid npm name. */
+export const INVALID_DEPENDENCY = "a dependency with an invalid name";
+
+/**
+ * A dependency's manifest key, when it is a name npm would accept. A URL, git or file dependency's key is not checked
+ * at publish, so it can be any text the publisher wrote; one that is not a valid name is not repeated.
+ */
+function dependencyLabel(key: string): string {
+  return isValidPackageName(key) ? key : INVALID_DEPENDENCY;
+}
+
 /** Why a dependency was not checked, in fixed words by its kind: never its spec, which is the publisher's text. */
 function dependencyLimit(d: DependencySpec): string {
   if (isRegistryDependency(d)) return "apm could not check it at publish";
@@ -104,7 +128,7 @@ export function withheldLimitations(notChecked: readonly string[], manifest: Ver
 
     if (!deps.some((n) => said.some((p) => n.startsWith(p)))) continue;
     named++;
-    out.push(`dependency ${d.key}: ${dependencyLimit(d)}`);
+    out.push(`dependency ${dependencyLabel(d.key)}: ${dependencyLimit(d)}`);
   }
 
   for (const n of deps) {
@@ -124,8 +148,8 @@ export function withheldLimitations(notChecked: readonly string[], manifest: Ver
 /** What a package's row says from its publishes' manifests. */
 export type PackageText = { description: string; keywords: string[] };
 
-/** A version, as far as the package text it wrote goes. */
-type TextSource = Pick<VersionRecord, "status" | "published_at" | "manifest">;
+/** A version, as far as the package text it wrote goes: `published_at` then `seq` is publish order, as in the database. */
+type TextSource = Pick<VersionRecord, "status" | "published_at" | "seq" | "manifest">;
 
 /** What a publish writes to the row, read the way publish reads it: a string description, the string keywords. */
 const ManifestText = z.object({
@@ -147,11 +171,52 @@ export function packageTextShown(pkg: PackageText, versions: readonly TextSource
 
   const shown = versions
     .filter((v) => !isWithheld(v.status))
-    .toSorted((a, b) => b.published_at - a.published_at)
+    .toSorted((a, b) => b.published_at - a.published_at || b.seq - a.seq)
     .map((v) => ManifestText.parse(v.manifest));
 
   const description = shown.find((t) => t.description !== undefined)?.description ?? "";
   const keywords = shown.find((t) => t.keywords !== undefined)?.keywords ?? [];
 
   return { description, keywords };
+}
+
+/**
+ * What an event about a withheld version keeps in its detail, by kind: which version, the people and times that make
+ * it an audit record, and the words a person wrote about the action itself (a revoke's, yank's or restore's reason, a
+ * reviewer's dismissal reason). Text that came with the package goes: a deprecation message, a dist-tag name, a file
+ * path. A kind not named here keeps only its version.
+ */
+const EVENT_KEEPS = new Map([
+  ["publish", ["version", "approvedBy", "stagedAt"]],
+  ["yank", ["version", "reason"]],
+  ["unyank", ["version"]],
+  ["revoke", ["version", "reason", "confirms"]],
+  ["revoke-pending", ["version", "reason", "finalAt", "dependents"]],
+  ["restore", ["version", "reason", "from"]],
+  ["deprecate", ["version"]],
+  ["undeprecate", ["version"]],
+  ["dist-tag", ["version"]],
+  ["evidence-dismissed", ["version", "digest", "scorer", "signal", "line", "reason"]],
+  ["evidence-restored", ["version", "digest", "scorer", "signal", "line", "reason", "dismissal"]],
+]);
+
+/** An event's detail: a JSON object, read for the version it names; every other field is the event kind's own. */
+export const StoredEventDetail = z.looseObject({ version: z.string().nullish().catch(null) });
+
+export type StoredEventDetail = z.infer<typeof StoredEventDetail>;
+
+/**
+ * An event's detail as an answer may show it: as stored, unless it names a version in `withheld`; then only the fields
+ * EVENT_KEEPS names for its kind, with `withheld: true`.
+ */
+export function eventDetailShown(input: { kind: string; detail: StoredEventDetail; withheld: ReadonlySet<string> }): StoredEventDetail {
+  const { kind, detail, withheld } = input;
+  const version = detail.version ?? null;
+
+  if (version === null || !withheld.has(version)) return detail;
+  const shown: StoredEventDetail = { version, withheld: true };
+
+  for (const k of EVENT_KEEPS.get(kind) ?? ["version"]) if (k in detail) shown[k] = detail[k];
+
+  return shown;
 }

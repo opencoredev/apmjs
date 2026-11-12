@@ -217,7 +217,7 @@ type Resolved = {
   name: string;
   version: string | null;
   report: Report | null;
-  skipped: { version: string; reason: string }[];
+  skipped: { version: string; reason: string; revokeReason?: string | null | undefined }[];
   blocked: string | null;
   forceable: boolean;
   source: string;
@@ -269,7 +269,7 @@ async function scoreOf(api: Api, name: string, version: string): Promise<Report 
 
 function printResolved(r: Resolved): void {
   printCard(`${r.blocked ? red("✗") : green("✓")} ${r.name}@${r.version ?? "?"}`, r.report);
-  for (const s of r.skipped.slice(0, 5)) say(`  ${dim(`skipped ${s.version}: ${s.reason}`)}`);
+  for (const s of r.skipped.slice(0, 5)) say(`  ${dim(`skipped ${s.version}: ${s.reason}${s.revokeReason ? ` (${s.revokeReason})` : ""}`)}`);
   // dependencies apm could not score install unchecked: say which, so nobody reads silence as clean
   for (const u of r.unchecked.slice(0, 10)) say(`  ${yellow("!")} not checked: ${u.dependency} (${u.reason})`);
   if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);

@@ -20,6 +20,7 @@ import { requireSiteOrigin } from "./origin.ts";
 import { typedConfirmationReason } from "./approval.ts";
 import { commitVersion, dropBlobIfUnused, issueToken } from "./server.ts";
 import { ProofFields, refusedProof, secondFactor } from "./step-up.ts";
+import { isWithheld } from "./withheld.ts";
 
 export { typedConfirmationReason } from "./approval.ts";
 
@@ -136,6 +137,32 @@ const reviewOf = (row: StagedRecord) =>
     return { entries, report, typed: typedConfirmationReason({ report, filesListed: entries !== null }) };
   });
 
+/**
+ * The detail of an upload whose published version is revoked or revoke-pending: the upload's facts and hashes only.
+ * Its description, file list and score are the package's text, so they are not shown, as on every other route.
+ */
+const withheldStagedDetail = (row: StagedRecord) =>
+  Effect.gen(function* () {
+    const { webUrl } = yield* RegistryConfig;
+    const pkg = yield* (yield* Store).getPackage(row.package);
+
+    return {
+      ...stagedSummary(row, webUrl),
+      newPackage: false,
+      currentLatest: pkg?.distTags.latest ?? null,
+      description: "",
+      size: row.size,
+      integrity: row.integrity,
+      shasum: row.shasum,
+      files: [],
+      score: null,
+      floor: SCORE_FLOOR,
+      analysis: "incomplete",
+      confirmation: { kind: "plain" },
+      withheld: true,
+    };
+  });
+
 const stagedDetail = (row: StagedRecord) =>
   Effect.gen(function* () {
     const { webUrl } = yield* RegistryConfig;
@@ -157,6 +184,7 @@ const stagedDetail = (row: StagedRecord) =>
       floor: SCORE_FLOOR,
       analysis: report === null || entries === null ? "incomplete" : "complete",
       confirmation: typed === null ? { kind: "plain" } : { kind: "typed", reason: typed },
+      withheld: false,
     };
   });
 
@@ -344,7 +372,15 @@ export const accountRoute = (req: Request, url: URL) =>
 
       if (!who.user || !(yield* mayApprove(row, who.user.name))) return fail(403, `Only ${row.staged_by} or an owner of ${row.package} can approve this.`);
 
-      if (action === null) return json(yield* stagedDetail(row));
+      // An approved upload is the published version: once that is revoked or revoke-pending, the upload's files and
+      // text are withheld here too. A version is immutable, so any upload of the same name and version is it or a
+      // copy that can never be approved.
+      const published = yield* store.getVersion(row.package, row.version);
+      const withheld = published !== null && isWithheld(published.status);
+
+      if (action === null) return json(withheld ? yield* withheldStagedDetail(row) : yield* stagedDetail(row));
+
+      if (action === "file" && withheld) return fail(410, `${row.package}@${row.version} was revoked: its files are not shown.`);
 
       if (action === "file") {
         // Read-only: one file's contents, looked up by its exact path in the staged tarball.

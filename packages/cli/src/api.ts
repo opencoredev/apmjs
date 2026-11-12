@@ -14,7 +14,8 @@ export const ReportSchema = z.object({
 export type Signal = z.infer<typeof SignalSchema>;
 export type Report = z.infer<typeof ReportSchema>;
 
-const Skipped = z.array(z.object({ version: z.string(), reason: z.string() }));
+/** `revokeReason`: the owner's words, for a revoked or revoke-pending version (older registries put them in `reason`). */
+const Skipped = z.array(z.object({ version: z.string(), reason: z.string(), revokeReason: z.string().nullish() }));
 const UncheckedDep = z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) });
 
 /** `packages`: every name@version the registry's walk checked (older registries send none). */

@@ -8,6 +8,7 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
+import { isValidPackageName } from "@apm/core";
 import { ReviewDecision } from "./actions.ts";
 import { Auth, type SignedIn } from "./auth.ts";
 import { Clock } from "./clock.ts";
@@ -22,7 +23,7 @@ import { splitPath, tagTarget, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
-import { isWithheld } from "./withheld.ts";
+import { INVALID_DEPENDENCY, isWithheld, WITHHELD_ISSUE } from "./withheld.ts";
 
 export type ReviewSettings = {
   /** sha256 (hex) of the reviewer's service token. The token itself stays with the reviewer. */
@@ -596,15 +597,32 @@ function publicState(r: StoredReview): PublicState {
   }
 }
 
-// A withheld version's review (withheld.ts) is rebuilt from allowed fields: paths, lines, the reviewer's sentence,
-// severities, verdict enums and counts. The model's summaries and every quote and excerpt are left out, and a field
-// added to the wire format later is not sent until it is named here.
+// A withheld version's review (withheld.ts) is rebuilt from allowed fields: line numbers, severities, verdict enums and
+// counts. The model's summaries, its finding sentences, and every quote and excerpt are left out, and a field added to
+// the wire format later is not sent until it is named here. File paths are publisher text too, so each is replaced by
+// a numbered reference ("file 3") that is the same for one path throughout the review.
 
-/** A finding of a withheld version: where, what the reviewer said, and how bad; no quote or excerpt. */
-const withheldFinding = (f: WireFinding): WireFinding => ({ file: f.file, line: f.line, issue: f.issue, severity: f.severity, quote: "", excerpt: "" });
+/** Every path a review result names, sorted, each mapped to "file <n>". */
+function fileRefs(res: ReviewResult): (path: string) => string {
+  const so = res.secondOpinion;
+
+  const paths = [
+    ...res.read,
+    ...res.notRead.flatMap((n) => (n.kind === "file" ? [n.path] : [])),
+    ...findingsOf(res).map((f) => f.file),
+    ...(so ? so.findings.map((f) => f.file) : []),
+  ];
+
+  const refs = new Map([...new Set(paths)].toSorted().map((p, i) => [p, `file ${i + 1}`]));
+
+  return (path) => refs.get(path) ?? "file";
+}
+
+/** A finding of a withheld version: which file by reference, the line, and how bad; no sentence, quote or excerpt. */
+const withheldFinding = (f: WireFinding, ref: (path: string) => string): WireFinding => ({ file: ref(f.file), line: f.line, issue: WITHHELD_ISSUE, severity: f.severity, quote: "", excerpt: "" });
 
 /** The result fields every outcome shares, from allowed fields only. */
-function withheldFields(res: ReviewResult) {
+function withheldFields(res: ReviewResult, ref: (path: string) => string) {
   const so = res.secondOpinion;
 
   return {
@@ -612,24 +630,28 @@ function withheldFields(res: ReviewResult) {
     reviewedAt: res.reviewedAt,
     summary: "",
     coverage: { mode: res.coverage.mode, previousVersion: res.coverage.previousVersion, filesInScope: res.coverage.filesInScope, filesRead: res.coverage.filesRead },
-    read: [...res.read],
-    notRead: res.notRead.map((n) => (n.kind === "file" ? { kind: "file" as const, path: n.path, reason: n.reason } : { kind: "dependency" as const, name: n.name })),
+    read: res.read.map(ref),
+    // a dependency's manifest key is any text the publisher wrote: one that is not a valid npm name is not repeated
+    notRead: res.notRead.map((n) =>
+      n.kind === "file" ? { kind: "file" as const, path: ref(n.path), reason: n.reason } : { kind: "dependency" as const, name: isValidPackageName(n.name) ? n.name : INVALID_DEPENDENCY },
+    ),
     attempts: res.attempts.map((a) => ({ result: a.result, kept: a.kept, dropped: a.dropped, promptTokens: a.promptTokens, completionTokens: a.completionTokens, latencyMs: a.latencyMs })),
-    secondOpinion: so ? { reviewer: so.reviewer, verdict: so.verdict, summary: "", findings: so.findings.map(withheldFinding) } : null,
+    secondOpinion: so ? { reviewer: so.reviewer, verdict: so.verdict, summary: "", findings: so.findings.map((f) => withheldFinding(f, ref)) } : null,
   };
 }
 
 /** A withheld version's review result, built from allowed fields only. */
 function withheldResult(res: ReviewResult): ReviewResult {
-  const fields = withheldFields(res);
+  const ref = fileRefs(res);
+  const fields = withheldFields(res, ref);
 
   switch (res.outcome) {
     case "benign":
       return { outcome: "benign", ...fields };
     case "flagged":
-      return { outcome: "flagged", verdict: res.verdict, findings: res.findings.map(withheldFinding), ...fields };
+      return { outcome: "flagged", verdict: res.verdict, findings: res.findings.map((f) => withheldFinding(f, ref)), ...fields };
     case "no-answer":
-      return { outcome: "no-answer", reason: res.reason, findings: res.findings.map(withheldFinding), ...fields };
+      return { outcome: "no-answer", reason: res.reason, findings: res.findings.map((f) => withheldFinding(f, ref)), ...fields };
     default: {
       const _exhaustive: never = res;
 

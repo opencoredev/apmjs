@@ -1,4 +1,5 @@
-// One request in, one Response out. Picks the route; everything else lives in the route modules.
+// One request in, one Response out. Picks the route; everything else lives in the route modules. A GET or HEAD is
+// answered only on a path the GET table (routes.ts) lists.
 import { Effect } from "effect";
 import { accountRoute } from "./account.ts";
 import { apmExtensions, apmRoute, safeView, upstreamRoute } from "./apm.ts";
@@ -6,18 +7,23 @@ import { Auth } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { evidenceRoute } from "./evidence.ts";
 import { fileRoute } from "./files.ts";
-import { routePath } from "./http.ts";
+import { fail, routePath } from "./http.ts";
 import { reviewRoute } from "./review.ts";
+import { getRouteOf, NO_GET_ROUTE } from "./routes.ts";
 import { callerOf, protocolRoute, type PackumentView } from "./server.ts";
 
 export const route = (req: Request) =>
   Effect.gen(function* () {
     const url = new URL(req.url);
+    const isAuth = url.pathname.startsWith("/api/auth/");
+    const { path, viaSafe } = routePath(url.pathname);
 
-    if (url.pathname.startsWith("/api/auth/")) return yield* (yield* Auth).handler(req);
+    // a read the GET table (routes.ts) does not list is answered here, before any module could answer it
+    if ((req.method === "GET" || req.method === "HEAD") && getRouteOf(isAuth ? url.pathname : path) === null) return fail(404, NO_GET_ROUTE);
+
+    if (isAuth) return yield* (yield* Auth).handler(req);
 
     const caller = yield* callerOf(req);
-    const { path, viaSafe } = routePath(url.pathname);
     let view: PackumentView | undefined;
 
     if (viaSafe) {

@@ -1,16 +1,18 @@
 // Spec: a revoked or revoke-pending version's text is shown nowhere. One package carries a unique marker in every
-// free-text place a publisher controls (readme, manifest fields, every kind of script, dependency specs, bin and
-// exports, file contents, file names). It is scored, reviewed by a stub model whose findings quote marker lines,
-// and has evidence dismissed. Then one version is revoked and another goes revoke-pending, and every GET route the
-// registry serves is asked, as an anonymous visitor, the maintainer and an admin, plain and under /~safe/. No marker
-// may come back except where ALLOWED says why.
+// free-text place a publisher controls (readme, manifest fields, every kind of script, dependency specs and keys, bin
+// and exports, file contents, file names, a deprecation message). It is scored, reviewed by a stub model whose
+// findings quote marker lines and name a marked file, has evidence dismissed, and one version arrives through a staged
+// upload a signed-in owner approves. Then one version is revoked and another goes revoke-pending, and every GET route
+// the registry serves is asked, as an anonymous visitor, the maintainer's token, the signed-in owner and an admin,
+// plain and under /~safe/. Every answer must have the status its probe expects and a body, and no marker may come back,
+// in a body or a header, except where ALLOWED names the exact route, status, field and marker.
 //
-// The router is a chain of hand-written matchers (router.ts), so the route list cannot be read off it. Instead the
-// last test scans the route modules for every path literal a matcher compares against and fails when one is neither
-// swept here nor named as a non-GET route, so a new route cannot be forgotten.
+// The routes come from the registry's own GET table (packages/registry/src/routes.ts), which the router enforces: a
+// GET the table does not list is refused before any module sees it. The sweep probes every entry, so a new GET route
+// is either swept here or never answered.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -19,13 +21,16 @@ import { silentLogger } from "../../apps/reviewer/src/log.ts";
 import { modelClient } from "../../apps/reviewer/src/model.ts";
 import { registryClient } from "../../apps/reviewer/src/registry.ts";
 import { runOnce, type WorkerDeps } from "../../apps/reviewer/src/worker.ts";
+import { WITHHELD_ISSUE } from "../../packages/registry/src/withheld.ts";
+import { GET_ROUTES, getRouteOf, NO_GET_ROUTE, type GetRouteName } from "../../packages/registry/src/routes.ts";
 import {
   addUser,
+  approvalId,
+  deviceLogin,
   dig,
   enableTotp,
   getJson,
   putPublish,
-  ROOT,
   signInWithGitHub,
   startFakeGitHub,
   startRegistry,
@@ -41,6 +46,7 @@ const HOUR = 60 * 60 * 1000;
 const PASSWORD = "correct-horse-battery";
 const NAME = "sweep-fixture";
 const MAINTAINER = "sweep-owner";
+const SITE_OWNER = "sweep-site";
 const ADMIN = "sweep-admin";
 const SERVICE_TOKEN = `svc_${randomBytes(24).toString("base64url")}`;
 const MARK = /LEAKMARK-[A-Za-z0-9-]+/g;
@@ -66,6 +72,7 @@ const BLOB = new Uint8Array([0, 1, 2, 0, ...new TextEncoder().encode("LEAKMARK-b
 
 const FILES = {
   "index.js": INDEX_JS,
+  "README.md": "# LEAKMARK-readme-file\n",
   "index.d.ts": 'export declare const marker: "LEAKMARK-dts";\n',
   "data.json": '{ "note": "LEAKMARK-json" }\n',
   "cli.js": '#!/usr/bin/env node\nconsole.log("LEAKMARK-bin-file");\n',
@@ -100,6 +107,8 @@ function marked(version: string): RawManifest {
       "dep-url": "https://collector.example.invalid/LEAKMARK-dep-url.tgz",
       "dep-git": "github:someone/LEAKMARK-dep-git",
       "dep-tag": "LEAKMARK-dep-tag",
+      // a URL dependency's key is not checked at publish: any text the publisher wrote
+      "LEAKMARK-dep-key": "https://collector.example.invalid/x.tgz",
     },
     optionalDependencies: { "opt-url": "https://collector.example.invalid/LEAKMARK-optional.tgz" },
     peerDependencies: { "peer-dep": "LEAKMARK-peer" },
@@ -111,12 +120,15 @@ const CLEAN_MANIFEST: RawManifest = { name: NAME, version: CLEAN, description: "
 /** Every path in the marked tarball, for the file routes. */
 const FILE_PATHS = ["package.json", ...Object.keys(FILES)];
 
-// ---------- the stub model: flags anything marked and quotes the marked line ----------
+// ---------- the stub model: flags anything marked, quotes the marked line, and words its finding with a marker ----------
 const FLAG = {
   verdict: "malicious",
   confidence: 0.9,
   summary: 'Line 2 exports "LEAKMARK-js-string" on import.',
-  findings: [{ file: "index.js", line: 2, quote: 'module.exports = "LEAKMARK-js-string";', issue: "Exports a fixed string on import.", severity: "high" }],
+  findings: [
+    { file: "index.js", line: 2, quote: 'module.exports = "LEAKMARK-js-string";', issue: 'Exports "LEAKMARK-review-issue" on import.', severity: "high" },
+    { file: "lib/LEAKMARK-filename.js", line: 1, quote: "module.exports = 2;", issue: "Exports a number.", severity: "low" },
+  ],
 };
 
 const BENIGN = { verdict: "benign", confidence: 0.8, summary: "Nothing harmful.", findings: [] };
@@ -134,41 +146,88 @@ function startStubModel() {
   });
 }
 
-// ---------- who asks ----------
-type CallerName = "anonymous" | "maintainer" | "admin";
+// ---------- who asks, and when ----------
+/** The maintainer's CLI token, the signed-in owner who staged and approved REVOKED, an admin, and nobody. */
+const CALLERS = ["anonymous", "maintainer", "site-owner", "admin"] as const;
 
-/** One GET the sweep sends. `keys` are the route literals (see SOURCE_KEYS) it exercises. */
-type Probe = { path: string; keys: readonly string[]; headers?: Record<string, string> };
+type CallerName = (typeof CALLERS)[number];
 
-/** A marker found in an answer, and where: a JSON path, "text" or "tarball". */
-type Hit = { caller: CallerName; url: string; status: number; marker: string; where: string };
+type Phase = "before" | "after";
+
+/** One request of the sweep: who, how, and whether the revokes have happened. */
+type Ask = { caller: CallerName; safe: boolean; phase: Phase };
 
 /**
- * Where a marker may appear, and why. Each must be used at least once, so a stale exception fails the test too.
- * Names and versions carry no marker here: they are the package's identity and appear everywhere by design.
+ * One GET the sweep sends: the route it exercises (from routes.ts), and the status it must get. Every answer must have
+ * a body, or a Location when it is a redirect; `emptyBody` names the one probe whose answer has neither, and why.
  */
-const ALLOWED: readonly { name: string; reason: string; allows: (h: Hit) => boolean }[] = [
-  {
-    name: "revoke reason",
-    reason: "the owner's own words when revoking, not the package's text; the audit log, version list and 410 answers quote it",
-    allows: (h) => h.marker === "LEAKMARK-revoke-reason",
-  },
-  {
-    name: "file paths",
-    reason: "withheld.ts keeps paths so a finding or a skipped file can still say where it is; a path is never file content",
-    allows: (h) => h.marker === "LEAKMARK-filename" && /(^|\.)(file|path)$|(^|\.)read\.\d+$/.test(h.where),
-  },
+type Probe = { route: GetRouteName; path: string; status: number | ((a: Ask) => number); headers?: Record<string, string>; emptyBody?: string };
+
+/** A marker found in an answer: where (a JSON path, "text", "tarball" or "header:<name>"), and the answer's route. */
+type Hit = { caller: CallerName; url: string; route: GetRouteName; status: number; marker: string; where: string };
+
+/**
+ * Where a marker may appear, and why: one route, one status, one field and one marker each. Each must be used at least
+ * once, so a stale exception fails the test too. Names and versions carry no marker here: they are the package's
+ * identity and appear everywhere by design.
+ */
+type Allowed = { name: string; reason: string; route: GetRouteName; status: number; where: RegExp; marker: string };
+
+const REASON = "LEAKMARK-revoke-reason";
+
+const ALLOWED: readonly Allowed[] = [
+  // the owner's own words when revoking, not the package's text, each in the one field that holds them
+  ...(
+    [
+      ["events", 200, /^events\.\d+\.detail\.reason$/],
+      ["recent", 200, /^events\.\d+\.reason$/],
+      ["package", 200, /^versions\.\d+\.statusReason$/],
+      // the `revoked` signal's one evidence line is the reason (withheld.ts drops every other evidence line)
+      ["score", 200, /^signals\.\d+\.evidence\.0$/],
+      ["resolve", 422, /^newest\.report\.signals\.\d+\.evidence\.0$/],
+      ["resolve", 422, /^skipped\.\d+\.revokeReason$/],
+      ["resolve", 200, /^skipped\.\d+\.revokeReason$/],
+      ["tarball", 410, /^revokeReason$/],
+      ["file", 410, /^revokeReason$/],
+      ["readme", 410, /^revokeReason$/],
+    ] as const
+  ).map(
+    ([route, status, where]): Allowed => ({
+      name: `revoke reason (${route} ${status} ${where.source})`,
+      reason: "the owner's words about the revoke, in the field that holds them",
+      route,
+      status,
+      where,
+      marker: REASON,
+    }),
+  ),
   {
     name: "request echo",
-    reason: "an error that names the file the request asked for repeats the asker's own input, not the package's",
-    allows: (h) => h.where === "error" && decodeURIComponent(h.url).includes(h.marker),
+    reason: "a 404 that names the file the request asked for repeats the asker's own input, not the package's",
+    route: "file",
+    status: 404,
+    where: /^error$/,
+    marker: "LEAKMARK-filename",
   },
   {
     name: "pending tarball",
     reason: "while a revoke is pending, the tarball stays downloadable for existing lockfiles; no other route shows its contents",
-    allows: (h) => h.where === "tarball" && new URL(h.url).pathname.endsWith(`/${NAME}/-/${NAME}-${PENDING}.tgz`) && !new URL(h.url).pathname.includes("/~safe/"),
+    route: "tarball",
+    status: 200,
+    where: /^tarball$/,
+    marker: "*",
   },
 ];
+
+/** Whether an exception covers a hit; the pending tarball's covers every marker in that one tarball, outside /~safe/. */
+function allows(a: Allowed, h: Hit): boolean {
+  if (a.route !== h.route || a.status !== h.status || !a.where.test(h.where)) return false;
+
+  if (a.marker !== "*") return h.marker === a.marker;
+  const path = new URL(h.url).pathname;
+
+  return path.endsWith(`/${NAME}/-/${NAME}-${PENDING}.tgz`) && !path.includes("/~safe/");
+}
 
 // ---------- reading an answer for markers ----------
 const looksBase64 = (s: string): boolean => s.length >= 16 && s.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(s);
@@ -223,6 +282,11 @@ function markersInBody(bytes: Uint8Array<ArrayBuffer>): { marker: string; where:
   return out;
 }
 
+/** Every marker in a response's headers, each where "header:<name>". */
+function markersInHeaders(headers: Headers): { marker: string; where: string }[] {
+  return [...headers].flatMap(([k, v]) => [...markersOf(k), ...markersOf(v)].map((marker) => ({ marker, where: `header:${k}` })));
+}
+
 // ---------- setup ----------
 let reg: Registry;
 let model: ReturnType<typeof startStubModel>;
@@ -230,8 +294,12 @@ let gh: FakeGitHub;
 let stateDir: string;
 let clock = Date.parse("2026-06-01T10:00:00Z");
 let owner: string;
+let site: Browser;
 let admin: Browser;
 let adminSecret: string;
+
+/** The staged upload of REVOKED that the signed-in owner approved: the version it became is revoked below. */
+let stagedId: string;
 
 const sha256 = (s: string): string => createHash("sha256").update(s).digest("hex");
 
@@ -252,6 +320,8 @@ function headersFor(caller: CallerName): Headers {
       return new Headers();
     case "maintainer":
       return new Headers({ authorization: `Bearer ${owner}` });
+    case "site-owner":
+      return new Headers({ cookie: site.cookie(), origin: new URL(reg.url).origin });
     case "admin":
       return new Headers({ cookie: admin.cookie(), origin: new URL(reg.url).origin });
     default: {
@@ -278,6 +348,11 @@ async function dismissEval(version: string): Promise<void> {
   if (r.status !== 200) throw new Error(`dismiss ${version}: ${r.status} ${JSON.stringify(r.body)}`);
 }
 
+/** Fails setup with the answer when a step does not get the status it needs. */
+function must(step: string, r: { status: number; body: unknown }, status: number): void {
+  if (r.status !== status) throw new Error(`${step}: ${r.status} ${JSON.stringify(r.body)}`);
+}
+
 beforeAll(async () => {
   model = startStubModel();
   gh = startFakeGitHub();
@@ -286,21 +361,47 @@ beforeAll(async () => {
   owner = await addUser(reg, MAINTAINER, PASSWORD);
   admin = await signInWithGitHub(reg, gh, ADMIN);
   adminSecret = await enableTotp(admin);
+  site = await signInWithGitHub(reg, gh, SITE_OWNER);
+  const siteSecret = await enableTotp(site);
+  const siteToken = (await deviceLogin(site)).token;
 
   for (const [manifest, files] of [
     [CLEAN_MANIFEST, { "index.js": "module.exports = 0;\n" }],
     [marked(PENDING), FILES],
   ] as const) {
-    const r = await putPublish(reg, owner, manifest, { files });
-
-    if (r.status !== 201) throw new Error(`publish ${manifest.version}: ${r.status} ${JSON.stringify(r.body)}`);
+    must(`publish ${manifest.version}`, await putPublish(reg, owner, manifest, { files }), 201);
   }
+
+  // the signed-in owner: added by the maintainer, then stages REVOKED from `apm login`'s token and approves it
+  must(
+    "owner add",
+    await getJson(`${reg.url}-/apm/v1/owners`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
+      body: JSON.stringify({ name: NAME, user: SITE_OWNER, password: PASSWORD }),
+    }),
+    200,
+  );
 
   // four days later, so the first marked version is past 72 hours when both are revoked
   clock += 4 * DAY;
-  const r = await putPublish(reg, owner, marked(REVOKED), { files: FILES });
+  const staged = await putPublish(reg, siteToken, marked(REVOKED), { files: FILES });
+  const id = approvalId(JSON.stringify(staged.body));
 
-  if (r.status !== 201) throw new Error(`publish ${REVOKED}: ${r.status} ${JSON.stringify(r.body)}`);
+  if (!id) throw new Error(`no approval link: ${staged.status} ${JSON.stringify(staged.body)}`);
+  stagedId = id;
+  must("approve", await site.json(`-/apm/v1/staged/${stagedId}/approve`, { method: "POST", body: { code: totp(siteSecret) } }), 200);
+
+  // the revoked version's deprecation message is the publisher's text, and lands in the package's log
+  must(
+    "deprecate",
+    await getJson(`${reg.url}${NAME}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
+      body: JSON.stringify({ name: NAME, versions: { [REVOKED]: { deprecated: "LEAKMARK-deprecation" } } }),
+    }),
+    200,
+  );
 
   for (let n = await runOnce(reviewer(), 4); n > 0; n = await runOnce(reviewer(), 4)) await Bun.sleep(0);
   // the revoked version's flag is confirmed (decided); the pending one's stays in the queue (pending)
@@ -309,12 +410,14 @@ beforeAll(async () => {
 
   if (!flagged) throw new Error(`no pending review for ${REVOKED}: ${JSON.stringify(queue)}`);
 
-  const decide = await admin.json("-/apm/v1/review-admin/decide", {
-    method: "POST",
-    body: { name: NAME, version: REVOKED, digest: flagged.digest, decision: "confirm", note: "Checked by hand.", code: totp(adminSecret) },
-  });
-
-  if (decide.status !== 200) throw new Error(`decide: ${decide.status} ${JSON.stringify(decide.body)}`);
+  must(
+    "decide",
+    await admin.json("-/apm/v1/review-admin/decide", {
+      method: "POST",
+      body: { name: NAME, version: REVOKED, digest: flagged.digest, decision: "confirm", note: "Checked by hand.", code: totp(adminSecret) },
+    }),
+    200,
+  );
 
   for (const v of [PENDING, REVOKED]) await dismissEval(v);
 }, 120_000);
@@ -327,170 +430,163 @@ afterAll(async () => {
 });
 
 // ---------- the route list ----------
-/** Every GET the sweep sends, each naming the route literals it exercises. */
+const signedIn = (a: Ask): boolean => a.caller === "site-owner" || a.caller === "admin";
+
+/** 401 to a request without a session cookie, else `status`. */
+const sessionOnly = (status: number) => (a: Ask) => (signedIn(a) ? status : 401);
+
+/** Every GET the sweep sends, each naming the route (routes.ts) it exercises and the status it must get. */
 function probes(): Probe[] {
-  const specs = [...VERSIONS, "latest", ...Object.keys(STALE_TAGS)];
-  const v1 = (rest: string, keys: readonly string[]): Probe => ({ path: `-/apm/v1/${rest}`, keys });
+  const specs = [...VERSIONS, "latest"];
+  const v1 = (rest: string, route: GetRouteName, status: Probe["status"]): Probe => ({ path: `-/apm/v1/${rest}`, route, status });
+  // after the revokes; `latest` then points at the clean version, as the revoke moves tags off a withheld one
+  const withheld = (v: string): boolean => v === PENDING || v === REVOKED;
+  // REVOKED was published an hour ago: inside the 24-hour cooldown, so /~safe/ and a plain resolve leave it out
+  const cooling = (v: string): boolean => v === REVOKED;
+
+  /** What resolve answers: 422 when the newest version the range allows is refused (withheld, or cooling without an override). */
+  const resolveStatus = (range: string, override: boolean) => (a: Ask) => {
+    if (a.phase === "after") return [PENDING, REVOKED, "^1.0.0"].includes(range) ? 422 : 200;
+
+    return range === REVOKED && !override ? 422 : 200;
+  };
+
+  // a withheld version's files answer 410; a shown one's 200, and a path it does not have 404
+  const fileStatus = (v: string, p: string) => (a: Ask) => (a.phase === "after" && withheld(v) ? 410 : v === CLEAN && p !== "package.json" && p !== "index.js" ? 404 : 200);
+  // tags the sweep writes after the revoke (STALE_TAGS), still on the withheld versions: none exists before it
+  const staleStatus = (a: Ask) => (a.phase === "after" ? 200 : 404);
 
   const files = VERSIONS.flatMap((v) =>
-    FILE_PATHS.flatMap((p) => [v1(`file/${NAME}/${v}?path=${encodeURIComponent(p)}`, ["files.ts: \"/-/apm/v1/file/\""]), v1(`file/${NAME}/${v}?path=${encodeURIComponent(p)}&line=1`, ["files.ts: \"/-/apm/v1/file/\""])]),
+    FILE_PATHS.flatMap((p) => [v1(`file/${NAME}/${v}?path=${encodeURIComponent(p)}`, "file", fileStatus(v, p)), v1(`file/${NAME}/${v}?path=${encodeURIComponent(p)}&line=1`, "file", fileStatus(v, p))]),
   );
+
+  // the staged upload: only its uploader or an owner may read it, and only from the website
+  const stagedRead = (status: (a: Ask) => number) => (a: Ask) => (a.caller === "site-owner" ? status(a) : a.caller === "admin" ? 403 : 401);
+
+  const staged = [
+    v1(`staged/${stagedId}`, "staged detail", stagedRead(() => 200)),
+    ...FILE_PATHS.map((p) => v1(`staged/${stagedId}/file?path=${encodeURIComponent(p)}`, "staged file", stagedRead((a) => (a.phase === "after" ? 410 : 200)))),
+  ];
 
   return [
     // the npm protocol (server.ts)
-    { path: "", keys: [] },
-    { path: "-/ping", keys: ['server.ts: "/-/ping"'] },
-    { path: "-/whoami", keys: ['server.ts: "/-/whoami"'] },
-    { path: `-/user/org.couchdb.user:${MAINTAINER}`, keys: ['server.ts: "/-/user/org.couchdb.user:"', 'server.ts: "/-/user/"'] },
-    { path: `-/v1/search?text=${NAME}`, keys: ['server.ts: "/-/v1/search"', 'apm.ts: "/-/v1/search"'] },
-    { path: "-/v1/search?text=LEAKMARK", keys: ['server.ts: "/-/v1/search"'] },
-    { path: `-/package/${NAME}/dist-tags`, keys: ['server.ts: "/-/package/"', 'server.ts: "/-/package"'] },
-    { path: NAME, keys: [] },
-    { path: NAME, keys: [], headers: { accept: "application/vnd.npm.install-v1+json" } },
-    ...specs.map((s): Probe => ({ path: `${NAME}/${s}`, keys: [] })),
-    ...VERSIONS.map((v): Probe => ({ path: `${NAME}/-/${NAME}-${v}.tgz`, keys: ['server.ts: rest[0] === "-"', 'apm.ts: sp.rest[0] === "-"'] })),
+    { path: "", route: "root", status: 200 },
+    { path: "-/ping", route: "ping", status: 200 },
+    { path: "-/whoami", route: "whoami", status: (a) => (a.caller === "maintainer" ? 200 : 401) },
+    { path: `-/user/org.couchdb.user:${MAINTAINER}`, route: "user", status: 200 },
+    { path: `-/v1/search?text=${NAME}`, route: "search", status: 200 },
+    { path: "-/v1/search?text=LEAKMARK", route: "search", status: 200 },
+    { path: `-/package/${NAME}/dist-tags`, route: "dist-tags", status: 200 },
+    { path: NAME, route: "packument", status: 200 },
+    { path: NAME, route: "packument", status: 200, headers: { accept: "application/vnd.npm.install-v1+json" } },
+    ...specs.map((s): Probe => ({ path: `${NAME}/${s}`, route: "version", status: (a) => ((a.phase === "after" && withheld(s)) || (a.safe && cooling(s)) ? 404 : 200) })),
+    // a revoked tarball is 410; a pending one stays for lockfiles, outside /~safe/, which serves only what passes
+    ...VERSIONS.map(
+      (v): Probe => ({
+        path: `${NAME}/-/${NAME}-${v}.tgz`,
+        route: "tarball",
+        status: (a) => (a.phase === "after" && v === REVOKED ? 410 : a.safe && (cooling(v) || (a.phase === "after" && withheld(v))) ? 404 : 200),
+      }),
+    ),
     // apm's API (apm.ts)
-    v1(`names?q=${NAME}`, ['apm.ts: rest === "names"']),
-    ...["exact", "lookalike", "alternatives"].map((part) => v1(`names?q=${NAME}&part=${part}`, ['apm.ts: rest === "names"'])),
-    v1("recent?limit=50", ['apm.ts: rest === "recent"']),
+    v1(`names?q=${NAME}`, "names", 200),
+    ...["exact", "lookalike", "alternatives"].map((part) => v1(`names?q=${NAME}&part=${part}`, "names", 200)),
+    v1("recent?limit=50", "recent", 200),
     ...[...specs, "^1.0.0", "*"].flatMap((range) => [
-      v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}`, ['apm.ts: rest === "resolve"']),
-      v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}&floor=0&cooldown=0`, ['apm.ts: rest === "resolve"']),
+      v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}`, "resolve", resolveStatus(range, false)),
+      v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}&floor=0&cooldown=0`, "resolve", resolveStatus(range, true)),
     ]),
-    v1("me", ['apm.ts: rest === "me"']),
-    v1(`score/${NAME}`, ['apm.ts: rest.startsWith("score/")']),
-    ...specs.map((s) => v1(`score/${NAME}/${s}`, ['apm.ts: rest.startsWith("score/")'])),
-    v1(`packages/${NAME}`, ['apm.ts: rest.startsWith("packages/")']),
-    v1(`packages/${NAME}/events`, ['apm.ts: rest.startsWith("packages/")', 'apm.ts: sp.rest[0] === "events"']),
+    v1("me", "me", (a) => (a.caller === "maintainer" ? 200 : 401)),
+    v1(`score/${NAME}`, "score", 200),
+    ...specs.map((s) => v1(`score/${NAME}/${s}`, "score", 200)),
+    v1(`packages/${NAME}`, "package", 200),
+    v1(`packages/${NAME}/events`, "events", 200),
     // files and readmes (files.ts)
     ...files,
-    ...VERSIONS.map((v) => v1(`readme/${NAME}/${v}`, ['files.ts: "/-/apm/v1/readme/"'])),
+    // the clean version's tarball has no README file
+    ...VERSIONS.map((v) => v1(`readme/${NAME}/${v}`, "readme", (a) => (v === CLEAN ? 404 : a.phase === "after" ? 410 : 200))),
     // the AI review (review.ts) and evidence (evidence.ts)
-    ...specs.map((s) => v1(`review/${NAME}/${s}`, ['review.ts: "/-/apm/v1/review/"', 'review.ts: "/-/apm/v1/review"'])),
-    v1("review-admin/queue", ['review.ts: "/-/apm/v1/review-admin/queue"']),
-    v1("review-jobs?max=5", ['review.ts: "/-/apm/v1/review-jobs"']),
-    v1("evidence-admin/me", ['evidence.ts: "/-/apm/v1/evidence-admin/me"']),
+    ...specs.map((v) => v1(`review/${NAME}/${v}`, "review", 200)),
+    ...Object.keys(STALE_TAGS).flatMap((t) => [v1(`review/${NAME}/${t}`, "review", staleStatus), v1(`score/${NAME}/${t}`, "score", staleStatus)]),
+    v1("review-admin/queue", "review queue", (a) => (a.caller === "admin" ? 200 : a.caller === "anonymous" ? 401 : 403)),
+    v1("review-jobs?max=5", "review lease", 401),
+    v1("evidence-admin/me", "reviewer", 200),
     // the account (account.ts)
-    v1("auth/config", ['account.ts: rest === "auth/config"']),
-    v1("account", ['account.ts: rest === "account"']),
-    v1("staged", ['account.ts: rest === "staged"']),
-    v1("staged/no-such-id", ["account.ts: /^staged\\/([A-Za-z0-9_-]+)(?:\\/(approve|reject|file))?$/"]),
-    v1("staged/no-such-id/file?path=index.js", ["account.ts: /^staged\\/([A-Za-z0-9_-]+)(?:\\/(approve|reject|file))?$/"]),
+    v1("auth/config", "auth config", 200),
+    v1("account", "account", sessionOnly(200)),
+    v1("staged", "staged list", sessionOnly(200)),
+    v1("staged/no-such-id", "staged detail", sessionOnly(404)),
+    v1("staged/no-such-id/file?path=index.js", "staged file", sessionOnly(404)),
+    ...staged,
     // Better Auth's GET routes (auth.ts)
-    ...["get-session", "error", "ok", "passkey/generate-register-options", "passkey/generate-authenticate-options", "device"].map(
-      (r): Probe => ({ path: `api/auth/${r}`, keys: [`auth.ts: ${r} [GET]`] }),
-    ),
-    { path: "api/auth/callback/github", keys: ["auth.ts: callback/"] },
-    { path: "api/auth/oauth2/callback/github", keys: ["auth.ts: oauth2/callback/"] },
+    { path: "api/auth/get-session", route: "auth get-session", status: 200 },
+    { path: "api/auth/error", route: "auth error", status: 200 },
+    { path: "api/auth/ok", route: "auth ok", status: 200 },
+    { path: "api/auth/passkey/generate-register-options", route: "auth passkey register options", status: sessionOnly(200) },
+    { path: "api/auth/passkey/generate-authenticate-options", route: "auth passkey sign-in options", status: 200 },
+    { path: "api/auth/device", route: "auth device", status: 400 },
+    { path: "api/auth/callback/github", route: "auth callback", status: 302 },
+    {
+      path: "api/auth/oauth2/callback/github",
+      route: "auth oauth2 callback",
+      status: 404,
+      emptyBody: "no generic OAuth provider is configured in this registry, and Better Auth answers an unknown one's callback 404 with no body",
+    },
   ];
 }
 
-/** The route literals that are not GET routes, or only dispatch to others, and why the sweep does not send them. */
-const NOT_SWEPT = {
-  'apm.ts: "/-/"': "prefix: everything under it is one of the routes here",
-  'apm.ts: "/-/apm/v1/"': "prefix",
-  'account.ts: "/-/apm/v1/"': "prefix",
-  'router.ts: "/-/apm/v1/"': "prefix",
-  'server.ts: "/-/"': "prefix: unknown /-/ paths answer 404",
-  'evidence.ts: "/-/apm/v1/evidence-admin/"': "prefix",
-  'review.ts: "/-/apm/v1/review-admin/"': "prefix",
-  'review.ts: "/-/apm/v1/review-jobs/"': "prefix of the POST result and release routes",
-  'apm.ts: "/-/npm/v1/security/advisories/bulk"': "POST only",
-  'apm.ts: rest === "yank"': "POST only",
-  'apm.ts: rest === "unyank"': "POST only",
-  'apm.ts: rest === "revoke"': "POST only",
-  'apm.ts: rest === "restore"': "POST only",
-  'apm.ts: rest === "incident"': "POST only",
-  'apm.ts: rest === "owners"': "POST and DELETE only",
-  'apm.ts: rest === "scan"': "POST only",
-  'apm.ts: rest === "audit"': "POST only",
-  'account.ts: rest === "account/tokens/revoke"': "POST only",
-  'account.ts: rest === "factor/confirm"': "POST only",
-  'account.ts: rest === "factor/passkey-challenge"': "POST only",
-  'account.ts: rest === "login/device"': "POST only",
-  'account.ts: rest === "login/device/token"': "POST only",
-  'account.ts: rest === "verify"': "POST only",
-  'server.ts: "/-/user/token/"': "DELETE only",
-  'server.ts: rest[0] === "-rev"': "PUT only",
-  'evidence.ts: "/-/apm/v1/evidence-admin/dismiss"': "POST only",
-  'evidence.ts: "/-/apm/v1/evidence-admin/restore"': "POST only",
-  'review.ts: "/-/apm/v1/review-admin/decide"': "POST only",
-  "review.ts: /^\\/-\\/apm\\/v1\\/review-jobs\\/([A-Za-z0-9_-]{1,64})\\/(result|release)$/": "POST only",
-  'review.ts: sp.rest[1] === "request"': "POST only",
-  "auth.ts: sign-in/social [POST]": "POST only",
-  "auth.ts: sign-out [POST]": "POST only",
-  "auth.ts: link-social [POST]": "POST only",
-  "auth.ts: two-factor/enable [POST]": "POST only",
-  "auth.ts: two-factor/disable [POST]": "POST only",
-  "auth.ts: passkey/verify-registration [POST]": "POST only",
-  "auth.ts: passkey/verify-authentication [POST]": "POST only",
-  "auth.ts: device/approve [POST]": "POST only",
-  "auth.ts: device/deny [POST]": "POST only",
-} satisfies Readonly<Record<string, string>>;
-
-/** The modules router.ts dispatches to, which the scan reads; anything else it imports must be a helper named here. */
-const ROUTE_MODULES = ["account.ts", "apm.ts", "auth.ts", "evidence.ts", "files.ts", "review.ts", "server.ts", "router.ts"];
-const ROUTER_HELPERS = ["clock.ts", "http.ts"];
-
-/** Every literal a route matcher compares a path against, as "<file>: <literal>". */
-function sourceKeys(): Set<string> {
-  const keys = new Set<string>();
-  const src = (f: string): string => readFileSync(join(ROOT, "packages", "registry", "src", f), "utf8");
-
-  for (const f of ROUTE_MODULES) {
-    const text = src(f);
-
-    for (const m of text.matchAll(/"\/-\/[^"]*"/g)) keys.add(`${f}: ${m[0]}`);
-
-    for (const m of text.matchAll(/\b(?:sp\.)?rest(?:\[\d\])? === "[^"]+"/g)) keys.add(`${f}: ${m[0]}`);
-
-    for (const m of text.matchAll(/\brest\.startsWith\("[^"]+"\)/g)) keys.add(`${f}: ${m[0]}`);
-
-    for (const m of text.matchAll(/(\/\^[^\n]*?\$\/)\.exec\((?:rest|p)\)/g)) keys.add(`${f}: ${m[1]}`);
-  }
-
-  const auth = src("auth.ts");
-
-  for (const m of auth.matchAll(/\["([^"]+)",\s*\{\s*methods:\s*\[([^\]]*)\]/g)) keys.add(`auth.ts: ${m[1]} [${(m[2] ?? "").replace(/"/g, "").replace(/\s/g, "")}]`);
-  const callbacks = /const CALLBACK_PREFIXES = \[([^\]]*)\]/.exec(auth)?.[1] ?? "";
-
-  for (const m of callbacks.matchAll(/"([^"]+)"/g)) keys.add(`auth.ts: ${m[1]}`);
-
-  return keys;
-}
-
 // ---------- the sweep ----------
-async function sweep(): Promise<Hit[]> {
+/** A probe that did not get its status, or got an empty body. */
+type Wrong = { caller: CallerName; url: string; want: number; got: number; bytes: number };
+
+async function sweep(phase: Phase): Promise<{ hits: Hit[]; wrong: Wrong[] }> {
   const hits: Hit[] = [];
+  const wrong: Wrong[] = [];
   const list = probes();
 
-  for (const caller of ["anonymous", "maintainer", "admin"] as const) {
+  for (const caller of CALLERS) {
     for (const safe of [false, true]) {
       for (const p of list) {
+        // Better Auth's routes take no /~safe/ prefix: the router answers that as a package named "api"
+        if (safe && p.route.startsWith("auth ")) continue;
         const url = `${reg.url}${safe ? "~safe/" : ""}${p.path}`;
         const headers = headersFor(caller);
 
         for (const [k, v] of Object.entries(p.headers ?? {})) headers.set(k, v);
         const res = await fetch(url, { headers, redirect: "manual" });
         const bytes = new Uint8Array(await res.arrayBuffer());
+        // oxlint-disable-next-line anti-slop/no-runtime-typeof -- a probe's status is a number or a rule of who asks
+        const want = typeof p.status === "number" ? p.status : p.status({ caller, safe, phase });
 
-        for (const { marker, where } of markersInBody(bytes)) hits.push({ caller, url, status: res.status, marker, where });
+        // an error page must not pass as a clean answer: the status is the probe's, and there is a body to read
+        const redirect = res.status >= 300 && res.status < 400 && res.headers.has("location");
+
+        if (res.status !== want || (bytes.length === 0 && !redirect && p.emptyBody === undefined)) wrong.push({ caller, url, want, got: res.status, bytes: bytes.length });
+
+        for (const { marker, where } of [...markersInBody(bytes), ...markersInHeaders(res.headers)]) hits.push({ caller, url, route: p.route, status: res.status, marker, where });
       }
     }
   }
 
-  return hits;
+  return { hits, wrong };
 }
 
-const show = (hits: readonly Hit[]): string[] => [...new Set(hits.map((h) => `${h.caller} ${h.status} ${h.url.slice(reg.url.length - 1)} ${h.where}: ${h.marker}`))];
+const short = (url: string): string => url.slice(reg.url.length - 1);
+const show = (hits: readonly Hit[]): string[] => [...new Set(hits.map((h) => `${h.caller} ${h.status} ${short(h.url)} ${h.where}: ${h.marker}`))];
+const showWrong = (w: readonly Wrong[]): string[] => w.map((x) => `${x.caller} ${short(x.url)}: wanted ${x.want}, got ${x.got} with ${x.bytes} bytes`);
 
 describe("a revoked or revoke-pending version's text", () => {
   test("is shown on the routes the sweep asks before the revoke, so the sweep would see a leak", async () => {
-    const seen = new Set((await sweep()).filter((h) => h.where !== "tarball").map((h) => h.marker));
+    const { hits, wrong } = await sweep("before");
+
+    expect(showWrong(wrong)).toEqual([]);
+    expect(show(hits.filter((h) => h.where.startsWith("header:")))).toEqual([]);
+    const seen = new Set(hits.filter((h) => h.where !== "tarball").map((h) => h.marker));
 
     // each kind of place a publisher writes reaches some answer while the version is active
     for (const m of [
       "LEAKMARK-readme",
+      "LEAKMARK-readme-file",
       "LEAKMARK-description",
       "LEAKMARK-keyword",
       "LEAKMARK-license",
@@ -502,6 +598,7 @@ describe("a revoked or revoke-pending version's text", () => {
       "LEAKMARK-script-leaf",
       "LEAKMARK-dep-url",
       "LEAKMARK-dep-git",
+      "LEAKMARK-dep-key",
       "LEAKMARK-optional",
       "LEAKMARK-peer",
       "LEAKMARK-bin-name",
@@ -512,9 +609,15 @@ describe("a revoked or revoke-pending version's text", () => {
       "LEAKMARK-json",
       "LEAKMARK-bin-file",
       "LEAKMARK-filename",
+      "LEAKMARK-review-issue",
+      "LEAKMARK-deprecation",
     ]) {
       expect(seen.has(m), m).toBe(true);
     }
+
+    // the approved upload's own routes show its files to the owner before the revoke
+    expect(hits.some((h) => h.route === "staged file" && h.caller === "site-owner" && h.marker === "LEAKMARK-js-string")).toBe(true);
+    expect(hits.some((h) => h.route === "staged detail" && h.caller === "site-owner" && h.marker === "LEAKMARK-description")).toBe(true);
   }, 120_000);
 
   test("is shown on no GET route after the revoke, to anyone, except where ALLOWED says why", async () => {
@@ -522,7 +625,7 @@ describe("a revoked or revoke-pending version's text", () => {
       const r = await getJson(`${reg.url}-/apm/v1/revoke`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
-        body: JSON.stringify({ name: NAME, version, reason: "posts the environment (LEAKMARK-revoke-reason)", password: PASSWORD }),
+        body: JSON.stringify({ name: NAME, version, reason: `posts the environment (${REASON})`, password: PASSWORD }),
       });
 
       expect(dig(r.body, "status"), JSON.stringify(r.body)).toBe(version === PENDING ? "revoke-pending" : "revoked");
@@ -530,29 +633,57 @@ describe("a revoked or revoke-pending version's text", () => {
 
     await reg.query("UPDATE packages SET dist_tags = dist_tags || $1::jsonb WHERE name = $2", [JSON.stringify(STALE_TAGS), NAME]);
     clock += HOUR;
-    const hits = await sweep();
-    const leaks = hits.filter((h) => !ALLOWED.some((a) => a.allows(h)));
+    const { hits, wrong } = await sweep("after");
+    const leaks = hits.filter((h) => !ALLOWED.some((a) => allows(a, h)));
+    const unused = ALLOWED.flatMap((a) => (hits.some((h) => allows(a, h)) ? [] : [a.name]));
 
-    expect(show(leaks)).toEqual([]);
-
-    for (const a of ALLOWED) expect(hits.some((h) => a.allows(h)), `exception "${a.name}" is never used`).toBe(true);
+    expect({ wrong: showWrong(wrong), leaks: show(leaks), unused }).toEqual({ wrong: [], leaks: [], unused: [] });
   }, 120_000);
+});
 
-  test("every route literal in the router's modules is swept here or named as not a GET route", () => {
-    const found = sourceKeys();
-    const swept = new Set(probes().flatMap((p) => p.keys));
-    const named = new Set([...swept, ...Object.keys(NOT_SWEPT)]);
+describe("the GET table (routes.ts)", () => {
+  test("every GET route is swept, and every probe's path is the route it names", () => {
+    const list = probes();
+    const swept = new Set(list.map((p) => p.route));
 
-    // a matcher literal nobody listed: a new route, or a new GET on an old one
-    expect([...found].filter((k) => !named.has(k))).toEqual([]);
-    // a listed literal that is gone: the list is stale
-    expect([...named].filter((k) => !found.has(k))).toEqual([]);
+    expect(GET_ROUTES.map((r) => r.name).filter((n) => !swept.has(n))).toEqual([]);
+    // a probe named for one route but answered by another would leave its route unswept
+    expect(list.filter((p) => getRouteOf(new URL(`/${p.path}`, "http://x").pathname) !== p.route).map((p) => `${p.route}: ${p.path}`)).toEqual([]);
+  });
 
-    // a route module router.ts gains is read by the scan only once it is named
-    const router = readFileSync(join(ROOT, "packages", "registry", "src", "router.ts"), "utf8");
-    const imports = [...router.matchAll(/from "\.\/([^"]+)"/g)].map((m) => m[1] ?? "");
+  test("a GET or HEAD of a path no entry lists is refused by the router, before any route module answers it", async () => {
+    // POST-only routes a module matches by path: a GET added to one of them answers nothing until it is in the table
+    const notGet = [
+      "-/apm/v1/scan",
+      "-/apm/v1/revoke",
+      "-/apm/v1/owners",
+      "-/apm/v1/login/device",
+      "-/apm/v1/verify",
+      "-/apm/v1/evidence-admin/dismiss",
+      "-/apm/v1/review-admin/decide",
+      "-/apm/v1/review-jobs/abc/result",
+      `-/apm/v1/staged/${stagedId}/approve`,
+      `-/apm/v1/review/${NAME}/${REVOKED}/request`,
+      "-/npm/v1/security/advisories/bulk",
+      "-/user/token/abc",
+      `${NAME}/-rev/1-abc`,
+      "api/auth/sign-in/social",
+      "api/auth/two-factor/verify-totp",
+      "-/apm/v1/no-such-route",
+    ];
 
-    expect(imports.filter((f) => !ROUTE_MODULES.includes(f) && !ROUTER_HELPERS.includes(f))).toEqual([]);
+    for (const caller of CALLERS) {
+      for (const method of ["GET", "HEAD"] as const) {
+        for (const p of notGet) {
+          const res = await fetch(`${reg.url}${p}`, { method, headers: headersFor(caller), redirect: "manual" });
+          const body = method === "GET" ? await res.text() : "";
+
+          expect(`${method} ${p} ${res.status}`).toBe(`${method} ${p} 404`);
+
+          if (method === "GET") expect(body, `${caller} GET ${p}`).toContain(NO_GET_ROUTE);
+        }
+      }
+    }
   });
 });
 
@@ -606,7 +737,7 @@ describe("after the revoke, each answer keeps what was found", () => {
     }
   });
 
-  test("the admin queue: decided and pending items of withheld versions keep path, line and sentence, not the source", async () => {
+  test("the admin queue: decided and pending items of withheld versions keep a file reference, line and severity, not the source", async () => {
     const queue = AdminQueue.parse((await admin.json("-/apm/v1/review-admin/queue")).body);
     const items = [...queue.pending, ...queue.decided].filter((i) => i.name === NAME);
 
@@ -615,7 +746,13 @@ describe("after the revoke, each answer keeps what was found", () => {
     for (const i of items) {
       expect(i.redacted).toBe(true);
       expect(i.private.summary).toBe("");
-      expect(i.private.findings).toEqual([{ file: "index.js", line: 2, issue: "Exports a fixed string on import.", severity: "high", quote: "", excerpt: "" }]);
+      // the model's sentence can quote the package, so it is fixed wording; each path is a numbered reference
+      expect(i.private.findings.map((f) => ({ ...f, file: /^file \d+$/.test(f.file) ? "file <n>" : f.file }))).toEqual([
+        { file: "file <n>", line: 2, issue: WITHHELD_ISSUE, severity: "high", quote: "", excerpt: "" },
+        { file: "file <n>", line: 1, issue: WITHHELD_ISSUE, severity: "low", quote: "", excerpt: "" },
+      ]);
+      // two paths, two references
+      expect(new Set(i.private.findings.map((f) => f.file)).size).toBe(2);
     }
   });
 

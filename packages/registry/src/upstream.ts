@@ -383,7 +383,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           if (!parsed.success) return { kind: "unknown" };
           const raw = parsed.data;
           const tarballs = new Map<string, string>();
-          const versions: Omit<VersionRecord, "score">[] = [];
+          const versions: Omit<VersionRecord, "score" | "seq">[] = [];
 
           for (const [v, rawDoc] of Object.entries(raw.versions)) {
             const one = UpVersion.safeParse(rawDoc);
@@ -414,7 +414,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             });
           }
 
-          versions.sort((a, b) => a.published_at - b.published_at);
+          // npm has no insert order: an upstream version's seq is its place in publish order
+          const ordered = versions.toSorted((a, b) => a.published_at - b.published_at).map((v, seq) => ({ ...v, seq }));
 
           return {
             kind: "found",
@@ -424,7 +425,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               description: raw.description ?? "",
               readme: raw.readme ?? "",
               maintainers: (raw.maintainers ?? []).map((m) => m.name),
-              versions,
+              versions: ordered,
               tarballs,
             },
           };

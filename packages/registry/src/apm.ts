@@ -64,7 +64,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
-import { isWithheld, packageTextShown, readmeShown, withheldDismissal, withheldFacts, withheldLimitations, withheldSignal } from "./withheld.ts";
+import { eventDetailShown, isWithheld, StoredEventDetail, packageTextShown, readmeShown, withheldDismissals, withheldFacts, withheldLimitations, withheldSignal } from "./withheld.ts";
 
 const HOUR = 3_600_000;
 
@@ -98,7 +98,7 @@ function reviewable(v: VersionRecord, r: ScoreReport) {
   const d = digestOf(v);
   const head = { scorer: r.scorer, digest: d ? digestLabel(d) : null };
 
-  if (isWithheld(v.status)) return { ...head, redacted: true, signals: r.signals.map(withheldSignal), dismissed: (r.dismissed ?? []).map(withheldDismissal) };
+  if (isWithheld(v.status)) return { ...head, redacted: true, signals: r.signals.map(withheldSignal), dismissed: withheldDismissals(r.dismissed ?? []) };
   const signals = r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s);
 
   return { ...head, redacted: false, signals, dismissed: r.dismissed ?? [] };
@@ -876,7 +876,8 @@ const packageResponse = (name: string) =>
             publishedBy: v.published_by,
             status: v.status,
             statusReason: v.status_reason,
-            deprecated: v.deprecated,
+            // a deprecation message is the publisher's text: a withheld version's is not shown (withheld.ts)
+            deprecated: isWithheld(v.status) ? null : v.deprecated,
             score: r?.score ?? null,
             grade: r?.grade ?? null,
           };
@@ -912,11 +913,23 @@ const eventsResponse = (name: string) =>
     const store = yield* Store;
 
     const events = yield* store.eventsFor(name);
+    const pkg = yield* store.getPackage(name);
 
     // a package proxied from upstream has a log only for what apm's reviewers did to it (dismissed evidence)
-    if (events.length === 0 && !(yield* store.getPackage(name))) return fail(404, "Not found");
+    if (events.length === 0 && !pkg) return fail(404, "Not found");
+    // an upstream version is never withheld; a local one's events keep who, when and which version (withheld.ts).
+    // A pending revoke only ever becomes final, so the stored status says whether a version is withheld.
+    const withheld = new Set(pkg ? (yield* store.listVersions(name)).filter((v) => isWithheld(v.status)).map((v) => v.version) : []);
 
-    return json({ name, events: events.map((e) => ({ kind: e.kind, actor: e.actor, at: new Date(e.at).toISOString(), detail: e.detail })) });
+    return json({
+      name,
+      events: events.map((e) => {
+        // a detail that is not an object names no version, so nothing in it can be a withheld version's
+        const d = StoredEventDetail.safeParse(e.detail);
+
+        return { kind: e.kind, actor: e.actor, at: new Date(e.at).toISOString(), detail: d.success ? eventDetailShown({ kind: e.kind, detail: d.data, withheld }) : e.detail };
+      }),
+    });
   });
 
 /** The name check answers in parts so a UI can fill each slot as soon as its part is ready. */
@@ -1153,11 +1166,14 @@ export type Policy = { cooldownMs: number; floor: number };
 
 export const DEFAULT_POLICY: Policy = { cooldownMs: COOLDOWN_MS, floor: SCORE_FLOOR };
 
-/** Why a version fails the policy, or null when it passes. A version that was never scored fails. */
+/**
+ * Why a version fails the policy, or null when it passes. A version that was never scored fails. A withheld version's
+ * reason is fixed words: the owner's own reason travels in its own field (revokeReason) where an answer gives it.
+ */
 export function policyBlock(v: VersionRecord, policy: Policy, at: number): string | null {
-  if (v.status === "revoked") return `revoked: ${v.status_reason ?? "no reason given"}`;
+  if (v.status === "revoked") return "revoked by its owner";
 
-  if (v.status === "revoke-pending") return `revocation pending: ${v.status_reason ?? "no reason given"}`;
+  if (v.status === "revoke-pending") return "revocation pending";
 
   if (v.status === "yanked") return `yanked${v.status_reason ? `: ${v.status_reason}` : ""}`;
   const age = at - v.published_at;
@@ -1341,7 +1357,7 @@ const resolveResponse = (url: URL) =>
       .filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range)))
       .sort((a, b) => newestFirst(a.version, b.version));
 
-    const skipped: { version: string; reason: string }[] = [];
+    const skipped: { version: string; reason: string; revokeReason: string | null }[] = [];
     let analyzedCount = 0;
 
     for (const v0 of matches) {
@@ -1363,7 +1379,7 @@ const resolveResponse = (url: URL) =>
         return json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } });
       }
 
-      skipped.push({ version: v.version, reason: block });
+      skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
 
       if (skipped.length >= 20) break;
     }
