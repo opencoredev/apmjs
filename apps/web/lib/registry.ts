@@ -138,8 +138,10 @@ export const getReview = (name: string, version: string): Promise<Fetched<Review
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
 
+export type VersionScore = z.infer<typeof VersionScore>;
+
 /** One version's full score, for a version other than latest, read from the registry on every view (its evidence quotes the package). */
-export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>
+export const getVersionScore = (name: string, version: string): Promise<Fetched<VersionScore>> =>
   getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore);
 
 const FileHead = { name: z.string(), version: z.string(), path: z.string(), size: z.number() };

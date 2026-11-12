@@ -13,6 +13,8 @@ void mock.module("server-only", () => ({}));
 
 const { getFile, getPackage, getReview, getVersionScore } = await import("./registry");
 const { GET: readmeRoute } = await import("../app/api/readme/route");
+const { startPackageReads } = await import("./package-reads");
+const { shownOf } = await import("./early-answer");
 
 const T0 = Date.parse("2026-11-12T12:00:00Z");
 const SOURCE = "collector.example.invalid";
@@ -229,6 +231,78 @@ describe("a view and a revoke", () => {
 
     expect(down.map((d) => d.kind)).toEqual(["unavailable", "unavailable", "unavailable"]);
     expect(JSON.stringify(down)).not.toContain(SOURCE);
+  });
+});
+
+// The package page reads a version's review and score before its package answer (package-reads.ts). A revoke that
+// commits between the two leaves early answers read while the version was active; the package answer then reports it
+// withheld, and the page must not show them.
+describe("a revoke between the page's early reads and its package answer", () => {
+  /** A package answer listing 1.0.0 with `status` and an active latest 2.0.0. */
+  function withVersion(name: string, status: string) {
+    const base = packageBody({ name, readme: "", score: null, readmeVersion: null });
+    const row = (version: string, s: string) => ({ version, publishedAt: "2026-11-12T00:00:00Z", publishedBy: "alice", status: s, statusReason: s === "active" ? null : "malware", deprecated: null, score: null, grade: null });
+
+    return { ...base, latest: "2.0.0", distTags: { latest: "2.0.0" }, versions: [row("1.0.0", status), row("2.0.0", "active")] };
+  }
+
+  /** Waits until the code under test has sent a request for each of `paths` (unheld ones are answered as sent). */
+  async function sent(paths: readonly string[]): Promise<void> {
+    for (let i = 0; i < 200 && !paths.every((p) => seen.some((s) => s.path === p)); i++) await Bun.sleep(1);
+
+    expect(paths.filter((p) => !seen.some((s) => s.path === p))).toEqual([]);
+  }
+
+  for (const status of ["revoked", "revoke-pending"] as const) {
+    test(`?v= of a version that went ${status}: the early review and score are read again, and the answers shown are redacted`, async () => {
+      const name = `early-${status}`;
+      answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
+      answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+      toHold.add(packagePath(name));
+
+      const reads = startPackageReads({ name, asked: "1.0.0" });
+      const pkg = await heldRequest(packagePath(name));
+      // the early reads were answered while 1.0.0 was active
+      await sent([reviewPath(name), scorePath(name)]);
+      await Bun.sleep(5);
+
+      // the revoke commits, then the package answer reads the versions
+      answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
+      answers.set(scorePath(name), { status: 200, body: scoreBody(name, true) });
+      pkg.release({ status: 200, body: withVersion(name, status) });
+      const found = await reads.package;
+
+      if (found.kind !== "ok") throw new Error(`package answer: ${found.kind}`);
+      const shown = shownOf(found.value.versions, "1.0.0");
+
+      expect(shown).toEqual({ version: "1.0.0", withheld: true });
+      const [review, score] = await Promise.all([reads.review(shown), reads.score(shown)]);
+
+      expect(review.kind === "ok" && review.value.redacted).toBe(true);
+      expect(score.kind === "ok" && score.value.redacted).toBe(true);
+      expect(JSON.stringify([review, score])).not.toContain(SOURCE);
+      // each was asked twice: the early read and the read for the withheld version
+      expect(seen.filter((s) => s.path === reviewPath(name)).length).toBe(2);
+      expect(seen.filter((s) => s.path === scorePath(name)).length).toBe(2);
+    });
+  }
+
+  test("a version still active when the package answer reads it: the early answers are used, with no second read", async () => {
+    const name = "early-active";
+    answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
+    answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+    answers.set(packagePath(name), { status: 200, body: withVersion(name, "active") });
+
+    const reads = startPackageReads({ name, asked: "1.0.0" });
+    const found = await reads.package;
+
+    if (found.kind !== "ok") throw new Error(`package answer: ${found.kind}`);
+    const shown = shownOf(found.value.versions, "1.0.0");
+    const [review, score] = await Promise.all([reads.review(shown), reads.score(shown)]);
+
+    expect(review.kind === "ok" && !review.value.redacted).toBe(true);
+    expect(score.kind === "ok" && !score.value.redacted).toBe(true);
+    expect(seen.filter((s) => s.path === reviewPath(name) || s.path === scorePath(name)).length).toBe(2);
   });
 });
 

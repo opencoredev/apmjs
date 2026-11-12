@@ -51,6 +51,13 @@ const PENDING = "1.0.0";
 const CLEAN = "0.9.0";
 const VERSIONS = [CLEAN, PENDING, REVOKED] as const;
 
+/**
+ * Tags left on the withheld versions after the revoke. The revoke moves every tag off a version, so the sweep would
+ * otherwise never ask a tag route about a withheld target; these are written to the row afterwards, the way a tag
+ * the move missed would stay, and each tag route must answer for that version as it answers for its number.
+ */
+const STALE_TAGS = { "stale-revoked": REVOKED, "stale-pending": PENDING } as const;
+
 // ---------- the marked package ----------
 const INDEX_JS = ['// LEAKMARK-js-comment', 'module.exports = "LEAKMARK-js-string";', 'eval("LEAKMARK-js-eval");', ""].join("\n");
 
@@ -322,7 +329,7 @@ afterAll(async () => {
 // ---------- the route list ----------
 /** Every GET the sweep sends, each naming the route literals it exercises. */
 function probes(): Probe[] {
-  const specs = [...VERSIONS, "latest"];
+  const specs = [...VERSIONS, "latest", ...Object.keys(STALE_TAGS)];
   const v1 = (rest: string, keys: readonly string[]): Probe => ({ path: `-/apm/v1/${rest}`, keys });
 
   const files = VERSIONS.flatMap((v) =>
@@ -521,6 +528,7 @@ describe("a revoked or revoke-pending version's text", () => {
       expect(dig(r.body, "status"), JSON.stringify(r.body)).toBe(version === PENDING ? "revoke-pending" : "revoked");
     }
 
+    await reg.query("UPDATE packages SET dist_tags = dist_tags || $1::jsonb WHERE name = $2", [JSON.stringify(STALE_TAGS), NAME]);
     clock += HOUR;
     const hits = await sweep();
     const leaks = hits.filter((h) => !ALLOWED.some((a) => a.allows(h)));
@@ -576,6 +584,24 @@ describe("after the revoke, each answer keeps what was found", () => {
         expect(list.some((s) => s.id === "install-script")).toBe(true);
         // only the revoke's own reason is left as evidence
         expect(list.filter((s) => s.id !== "revoked").flatMap((s) => s.evidence)).toEqual([]);
+      }
+    }
+  });
+
+  test("a dist-tag still on a withheld version: the review and score asked by the tag answer for it, redacted", async () => {
+    // the row still points the stale tags at the withheld versions, so the tag routes below resolve to them
+    expect(await reg.query("SELECT dist_tags->>'stale-revoked' AS r, dist_tags->>'stale-pending' AS p FROM packages WHERE name = $1", [NAME])).toEqual([{ r: REVOKED, p: PENDING }]);
+
+    for (const caller of ["anonymous", "maintainer", "admin"] as const) {
+      for (const [tag, version] of Object.entries(STALE_TAGS)) {
+        for (const route of ["review", "score"]) {
+          const res = await fetch(`${reg.url}-/apm/v1/${route}/${NAME}/${tag}`, { headers: headersFor(caller) });
+          const body: unknown = await res.json();
+
+          expect(res.status, `${caller} ${route} ${tag}`).toBe(200);
+          expect(dig(body, "version"), `${caller} ${route} ${tag}`).toBe(version);
+          expect(dig(body, "redacted"), `${caller} ${route} ${tag}`).toBe(true);
+        }
       }
     }
   });
