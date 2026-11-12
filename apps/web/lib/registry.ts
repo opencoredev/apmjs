@@ -1,6 +1,7 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
 import { z } from "zod";
+import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 
 export const REGISTRY = (process.env.APM_REGISTRY ?? "http://127.0.0.1:4873/").replace(/\/?$/, "/");
 
@@ -47,41 +48,39 @@ export type PackageInfo = z.infer<typeof PackageInfo>;
 const Events = z.object({ events: z.array(z.object({ kind: z.string(), actor: z.string(), at: z.string(), detail: z.unknown() })) });
 export type PackageEvent = z.infer<typeof Events>["events"][number];
 
-const NameCheck = z.object({
-  query: z.string(),
-  valid: z.boolean(),
-  taken: z.boolean(),
-  source: z.string().nullable(),
-  available: z.boolean(),
-  unknown: z.boolean().default(false),
-  owners: z.array(z.string()),
-  latest: z.object({ version: z.string(), score: z.number().nullable(), grade: z.string().nullable() }).nullable(),
-  description: z.string().nullable(),
-  conflicts: z.array(z.object({ name: z.string(), reason: z.string() })),
-  similar: z.array(z.object({ name: z.string(), reason: z.string() })),
-  lookalikes: z.array(z.object({ name: z.string(), reason: z.string() })),
-  suggestions: z.array(z.object({ name: z.string(), available: z.boolean(), taken: z.boolean() })),
+// One object of /-/v1/search. Read per object so one odd upstream hit can't empty the list.
+const WireHit = z.object({
+  source: z.enum(["local", "npm"]).default("local"),
+  package: z.object({ name: z.string(), version: z.string(), description: z.string().nullish(), date: z.string().nullish() }),
+  apmScore: z.object({ score: z.number(), grade: z.string() }).nullish(),
+  downloads: z.object({ weekly: z.number() }).nullish(),
 });
-export type NameCheck = z.infer<typeof NameCheck>;
+const WireSearch = z.object({ total: z.number(), upstreamFailed: z.boolean().default(false), objects: z.array(z.unknown()) });
 
-const Search = z.object({
-  total: z.number(),
-  objects: z.array(
+const Recent = z.object({
+  events: z.array(
     z.object({
-      package: z.object({ name: z.string(), version: z.string(), description: z.string(), date: z.string(), publisher: z.object({ username: z.string() }) }),
-      apmScore: z.object({ score: z.number(), grade: z.string(), signals: z.array(z.string()) }).nullable(),
+      package: z.string(),
+      version: z.string(),
+      kind: z.enum(["publish", "yank", "unyank", "revoke", "restore"]),
+      actor: z.string(),
+      at: z.string(),
+      reason: z.string().nullable(),
+      status: z.string().nullable(),
+      score: z.number().nullable(),
+      grade: z.string().nullable(),
     }),
   ),
 });
-export type SearchResult = z.infer<typeof Search>["objects"][number];
+export type RecentEvent = z.infer<typeof Recent>["events"][number];
 
 function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
 }
 
-async function getJson<T>(path: string, schema: z.ZodType<T>): Promise<T | null> {
+async function getJson<T>(path: string, schema: z.ZodType<T>, signal?: AbortSignal): Promise<T | null> {
   try {
-    const res = await fetch(`${REGISTRY}${path}`, { cache: "no-store", headers: { accept: "application/json" } });
+    const res = await fetch(`${REGISTRY}${path}`, { cache: "no-store", headers: { accept: "application/json" }, signal });
     if (!res.ok) return null;
     const parsed = schema.safeParse(await res.json());
     return parsed.success ? parsed.data : null;
@@ -92,5 +91,30 @@ async function getJson<T>(path: string, schema: z.ZodType<T>): Promise<T | null>
 
 export const getPackage = (name: string) => getJson(`-/apm/v1/packages/${encodeName(name)}`, PackageInfo);
 export const getEvents = async (name: string) => (await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events))?.events ?? [];
-export const checkName = (q: string) => getJson(`-/apm/v1/names?q=${encodeURIComponent(q)}`, NameCheck);
-export const search = async (q: string) => (await getJson(`-/v1/search?text=${encodeURIComponent(q)}&size=25`, Search))?.objects ?? [];
+export const getRecent = async (limit: number) => (await getJson(`-/apm/v1/recent?limit=${limit}`, Recent))?.events ?? [];
+
+export async function checkNamePart<P extends NamePart>(q: string, part: P, signal?: AbortSignal): Promise<NamePartAnswer[P] | null> {
+  return getJson(`-/apm/v1/names?q=${encodeURIComponent(q)}&part=${part}`, NAME_PART_SCHEMAS[part], signal);
+}
+
+/** Registry search (apm packages merged with npm's), trimmed to what the search page shows. Null when the registry is down. */
+export async function search(q: string, signal?: AbortSignal): Promise<SearchAnswer | null> {
+  const wire = await getJson(`-/v1/search?text=${encodeURIComponent(q)}&size=20`, WireSearch, signal);
+  if (!wire) return null;
+  const hits: SearchHit[] = [];
+  for (const raw of wire.objects) {
+    const o = WireHit.safeParse(raw);
+    if (!o.success) continue;
+    const { package: p } = o.data;
+    hits.push({
+      name: p.name,
+      version: p.version,
+      description: p.description ?? "",
+      date: p.date ?? null,
+      source: o.data.source,
+      score: o.data.apmScore ?? null,
+      weeklyDownloads: o.data.downloads?.weekly ?? null,
+    });
+  }
+  return { query: q, hits, total: wire.total, upstreamFailed: wire.upstreamFailed };
+}

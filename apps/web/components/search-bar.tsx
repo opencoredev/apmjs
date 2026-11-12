@@ -1,75 +1,61 @@
 "use client";
 
-import { useEffect, useRef, useState, useTransition } from "react";
-import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { SearchIcon, LoaderCircleIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { SearchIcon } from "lucide-react";
 
-/** One stationary input; the query lives in ?q= so every search is a shareable URL. */
-export function SearchBar({ autoFocus = false }: { autoFocus?: boolean }) {
+/** Header search for pages other than home. Enter opens the home page with the query; "/" focuses it. */
+export function SearchBar() {
   const router = useRouter();
   const pathname = usePathname();
-  const params = useSearchParams();
-  const [value, setValue] = useState(params.get("q") ?? "");
-  const [pending, startTransition] = useTransition();
+  const [value, setValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onHome = pathname === "/";
 
   useEffect(() => {
+    if (onHome) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "/" && document.activeElement !== inputRef.current) {
-        e.preventDefault();
-        inputRef.current?.focus();
-      }
+      if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = document.activeElement;
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || (el instanceof HTMLElement && el.isContentEditable)) return;
+      e.preventDefault();
+      inputRef.current?.focus();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [onHome]);
 
-  function go(next: string) {
-    const q = next.trim();
-    const url = q ? `/?q=${encodeURIComponent(q)}` : "/";
-    startTransition(() => (pathname === "/" ? router.replace(url, { scroll: false }) : router.push(url)));
-  }
+  if (onHome) return null;
 
   return (
     <form
       role="search"
-      className="relative w-full"
+      className="relative order-last w-full sm:order-none sm:w-auto sm:max-w-xl sm:flex-1"
       onSubmit={(e) => {
         e.preventDefault();
-        if (timer.current) clearTimeout(timer.current);
-        go(value);
+        const q = value.trim().toLowerCase();
+        router.push(q ? `/?q=${encodeURIComponent(q)}` : "/");
       }}
     >
-      <SearchIcon className="pointer-events-none absolute top-1/2 left-4 size-[18px] -translate-y-1/2 text-muted-foreground" aria-hidden />
+      <SearchIcon className="pointer-events-none absolute top-1/2 left-3.5 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
       <input
         ref={inputRef}
         type="search"
         name="q"
         value={value}
-        autoFocus={autoFocus}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setValue("");
+        }}
         autoComplete="off"
         autoCapitalize="none"
         spellCheck={false}
-        placeholder="Search or check a name"
+        enterKeyHint="search"
+        placeholder="Search packages"
         aria-label="Search packages"
-        className="h-12 w-full rounded-xl border border-transparent bg-surface pr-14 pl-11 text-base outline-none transition-[background-color,border-color,box-shadow] duration-150 placeholder:text-muted-foreground hover:border-border focus-visible:border-ring/60 focus-visible:bg-background focus-visible:shadow-[0_0_0_4px_color-mix(in_oklab,var(--ring)_18%,transparent)] focus-visible:outline-none [&:not(:placeholder-shown)]:font-mono [&::-webkit-search-cancel-button]:appearance-none"
-        onChange={(e) => {
-          const next = e.target.value;
-          setValue(next);
-          if (timer.current) clearTimeout(timer.current);
-          if (pathname === "/") timer.current = setTimeout(() => go(next), 180);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            setValue("");
-            go("");
-          }
-        }}
+        className="h-10 w-full rounded-xl border border-transparent bg-surface pr-11 pl-10 text-[15px] outline-none transition-[background-color,border-color] duration-150 placeholder:text-muted-foreground hover:border-border focus-visible:border-ring/60 focus-visible:bg-background focus-visible:outline-none [&:not(:placeholder-shown)]:font-mono [&::-webkit-search-cancel-button]:appearance-none"
       />
-      <span className="pointer-events-none absolute top-1/2 right-3.5 flex -translate-y-1/2 items-center gap-2 text-muted-foreground">
-        {pending ? <LoaderCircleIcon className="size-4 animate-spin" aria-label="Searching" /> : <kbd className="grid h-6 min-w-6 place-items-center rounded-md border bg-background px-1.5 font-mono text-xs">/</kbd>}
-      </span>
+      <kbd className="pointer-events-none absolute top-1/2 right-3 grid h-5 min-w-5 -translate-y-1/2 place-items-center rounded-md border bg-background px-1 font-mono text-[11px] text-muted-foreground">/</kbd>
     </form>
   );
 }

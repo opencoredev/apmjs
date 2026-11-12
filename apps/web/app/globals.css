@@ -119,6 +119,10 @@
   --inverse-bad: #ff7a72;
   --prompt: #40bed1;
 
+  --logo-left: #171717;
+  --logo-right: #4a4a47;
+  --logo-top: #9a9a95;
+
   --chart-1: #171717;
   --chart-2: #696965;
   --chart-3: #a3a39e;
@@ -169,6 +173,10 @@
     --inverse-raised: #242424;
     --inverse-border: #313131;
 
+    --logo-left: #eeeeee;
+    --logo-right: #a9a9a4;
+    --logo-top: #5e5e5a;
+
     --chart-1: #eeeeee;
     --chart-2: #a3a39e;
     --chart-3: #6e6e6a;
@@ -205,4 +213,19 @@
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
+}
+
+@keyframes apm-progress {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  @keyframes apm-progress {
+    0%, 100% { transform: translateX(100%); }
+  }
+}
+
+/* Set by an inline script before hydration when the URL carries ?q=, so the empty-state list never flashes. */
+html[data-q] [data-recent] {
+  visibility: hidden;
 }

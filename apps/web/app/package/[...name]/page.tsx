@@ -5,17 +5,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { getEvents, getPackage, type Facts, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { ScoreBadge, StatusBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
+import { ago } from "@/lib/format";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-
-function ago(iso: string): string {
-  const ms = Date.now() - Date.parse(iso);
-  const d = Math.floor(ms / 86_400_000);
-  if (d >= 365) return `${Math.floor(d / 365)}y ago`;
-  if (d >= 30) return `${Math.floor(d / 30)}mo ago`;
-  if (d >= 1) return `${d}d ago`;
-  const h = Math.floor(ms / 3_600_000);
-  return h >= 1 ? `${h}h ago` : "just now";
-}
 
 function size(n: number): string {
   return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1048576).toFixed(1)} MB`;
