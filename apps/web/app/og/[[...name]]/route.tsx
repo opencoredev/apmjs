@@ -94,7 +94,7 @@ export async function GET(_request: NextRequest, ctx: RouteContext<"/og/[[...nam
 
   if (route?.kind !== "package") return new Response("Not found", { status: 404 });
   // a package card shows a score that a yank, a revoke or a dismissal changes: stored for seconds, not an hour
-  const headers = { "cache-control": AGENT_CACHE.view };
+  const headers = { "cache-control": AGENT_CACHE.image };
   const found = await getPackageUncached(route.name);
 
   if (found.kind === "missing") return new Response("Not found", { status: 404, headers });

@@ -114,8 +114,9 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
 }
 
 /**
- * Everything the agent views read. Each call says "missing" or "unavailable" instead of throwing. Version state and
- * the AI review are read without a cache: a verdict or a view must never repeat a status that has since changed.
+ * Everything the agent views read. Each call says "missing" or "unavailable" instead of throwing. Version state, the
+ * AI review and file excerpts are read without a cache: a verdict or a view must never repeat a status that has since
+ * changed, and only the registry, asked on every read, decides whether a version's source may be shown.
  */
 export type AgentSource = {
   package: (name: string) => Promise<Fetched<PackageInfo>>;
@@ -126,5 +127,6 @@ export type AgentSource = {
   search: (input: { query: string }) => Promise<SearchAnswer | null>;
   /** The name check; `scope` is the npm scope (without @) the alternatives are checked under. */
   names: (input: { name: string; scope: string | null }) => Promise<NameReport | null>;
+  /** Lines of a file; a revoked version's answer is unavailable with status 410, a line past the end 416. */
   excerpt: (input: { name: string; version: string; path: string; line: number; context: number }) => Promise<Fetched<ExcerptAnswer>>;
 };

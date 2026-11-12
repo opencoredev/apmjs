@@ -47,6 +47,23 @@ export type ReviewInput =
   | { kind: "off" }
   | { kind: "unreadable" };
 
+/**
+ * How far the AI review of the picked version got. reviewed: it has a result. in-progress: queued or running.
+ * no-answer: it ended without a usable result. not-selected: apm never picked this version for one. disabled: this
+ * registry runs none. unreadable: apm could not read it. not-read: the verdict was decided before the review was read.
+ */
+export const AI_REVIEW_COVERAGE = ["reviewed", "in-progress", "no-answer", "not-selected", "disabled", "unreadable", "not-read"] as const;
+
+export type AiReviewCoverage = (typeof AI_REVIEW_COVERAGE)[number];
+
+/** Whether apm scored every dependency the install would bring in; not-read when the verdict never got that far. */
+export const DEPENDENCY_COVERAGE = ["complete", "incomplete", "not-read"] as const;
+
+export type DependencyCoverage = (typeof DEPENDENCY_COVERAGE)[number];
+
+/** What the verdict rests on, as data: a client can tell "install, with no AI review" from "install, reviewed". */
+export type Coverage = { aiReview: AiReviewCoverage; dependencies: DependencyCoverage };
+
 export type Verdict = {
   verdict: VerdictKind;
   name: string;
@@ -56,6 +73,7 @@ export type Verdict = {
   summary: string;
   reasons: string[];
   commands: { apm: string; bun: string; npm: string; pnpm: string } | null;
+  coverage: Coverage;
 };
 
 const SHOWN = 3;
@@ -69,6 +87,46 @@ export function oneLine(text: string): string {
   return text.replace(LINE_BREAKERS, " ").replace(/\s+/g, " ").trim();
 }
 
+/** The longest run of backticks in `text`, in one pass: a spread into Math.max overflows the stack on big input. */
+function longestBacktickRun(text: string): number {
+  let longest = 0;
+  let run = 0;
+
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 96) {
+      run++;
+
+      if (run > longest) longest = run;
+    } else run = 0;
+  }
+
+  return longest;
+}
+
+/** Most characters of one registry or publisher string the verdict quotes; the rest is cut, and a note says so. */
+const MAX_QUOTED = 300;
+
+/**
+ * Registry text that can come from a publisher (a yank reason, a dependency spec, a version) as a Markdown code span
+ * on one line, fenced by more backticks than any run inside: an agent reading the verdict as Markdown sees data, never
+ * a link, an image or HTML. The website quotes the same way (apps/web/lib/agent/text.ts inlineCode).
+ */
+export function quoted(text: string): string {
+  const flat0 = oneLine(text);
+  const end = flat0.length > MAX_QUOTED && /[\uD800-\uDBFF]/.test(flat0.charAt(MAX_QUOTED - 1)) ? MAX_QUOTED - 1 : MAX_QUOTED;
+  const cut = Math.max(0, flat0.length - end);
+  const flat = (cut > 0 ? flat0.slice(0, end) : flat0).trim();
+
+  if (flat === "") return "(empty)";
+  const fence = "`".repeat(longestBacktickRun(flat) + 1);
+  const pad = flat.startsWith("`") || flat.endsWith("`") ? " " : "";
+
+  return `${fence}${pad}${flat}${pad}${fence}${cut > 0 ? ` (cut: ${cut} more character${cut === 1 ? "" : "s"} not shown)` : ""}`;
+}
+
+/** A version or range as written when it is a plain one, else quoted. */
+const plain = (text: string): string => (/^[0-9A-Za-z.+~^-]{1,64}$/.test(text) ? text : quoted(text));
+
 function commands(name: string, version: string): NonNullable<Verdict["commands"]> {
   const spec = `${name}@${version}`;
 
@@ -77,7 +135,56 @@ function commands(name: string, version: string): NonNullable<Verdict["commands"
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 
-const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => oneLine(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
+const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => quoted(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
+
+const skippedText = (skipped: readonly { version: string; reason: string }[]): string => skipped.slice(0, SHOWN).map((s) => `${quoted(s.version)} (${quoted(s.reason)})`).join("; ");
+
+/** How far the picked version's AI review got, for the coverage field. */
+export function aiReviewCoverage(review: ReviewInput): AiReviewCoverage {
+  switch (review.kind) {
+    case "reviewed":
+      return review.state === "no-answer" ? "no-answer" : "reviewed";
+    case "queued":
+    case "leased":
+      return "in-progress";
+    case "failed":
+      return "no-answer";
+    case "not-reviewed":
+      return "not-selected";
+    case "off":
+      return "disabled";
+    case "unreadable":
+      return "unreadable";
+    default: {
+      const _exhaustive: never = review;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** The words the summary ends with when no AI review stands behind the verdict; "" when one does or is under way. */
+function noReviewNote(coverage: AiReviewCoverage): string {
+  switch (coverage) {
+    case "not-selected":
+      return " No AI review: apm never picked this version for one.";
+    case "disabled":
+      return " No AI review: this registry runs none.";
+    case "reviewed":
+    case "in-progress":
+    case "no-answer":
+    case "unreadable":
+    case "not-read":
+      return "";
+    default: {
+      const _exhaustive: never = coverage;
+
+      return _exhaustive;
+    }
+  }
+}
+
+const NOT_READ: Coverage = { aiReview: "not-read", dependencies: "not-read" };
 
 function reviewReason(review: ReviewInput): string {
   switch (review.kind) {
@@ -145,18 +252,19 @@ function reviewHold(review: ReviewInput): string | null {
 export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
   const { name, resolved, review } = input;
   const range = input.range ?? "latest";
-  const asked = range === "latest" ? name : `${name}@${range}`;
+  const asked = range === "latest" ? name : `${name}@${plain(range)}`;
   const base = { name, range };
 
+  // registry text can carry publisher text (a yank reason, an error): the summary is apm's words only, the reasons quote it
   switch (resolved.kind) {
     case "unavailable":
-      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: ${oneLine(resolved.reason)}. Nothing was checked; try again.`, reasons: [], commands: null };
+      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: the registry did not answer. Nothing was checked; try again.`, reasons: [`What happened: ${quoted(resolved.reason)}`], commands: null, coverage: NOT_READ };
     case "missing":
-      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [oneLine(resolved.reason)], commands: null };
+      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [`The registry said: ${quoted(resolved.reason)}`], commands: null, coverage: NOT_READ };
     case "refused": {
-      const skips = resolved.skipped.slice(0, SHOWN).map((s) => `Skipped ${oneLine(s.version)}: ${oneLine(s.reason)}.`);
+      const skips = resolved.skipped.slice(0, SHOWN).map((s) => `Skipped ${quoted(s.version)}: ${quoted(s.reason)}.`);
 
-      return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: ${oneLine(resolved.reason)}`, reasons: [oneLine(resolved.reason), ...skips], commands: null };
+      return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons: [`The registry said: ${quoted(resolved.reason)}`, ...skips], commands: null, coverage: NOT_READ };
     }
 
     case "ok":
@@ -169,9 +277,10 @@ export function explain(input: { name: string; range: string | null; resolved: R
   }
 
   const { version, report, deps } = resolved;
-  const id = `${name}@${version}`;
+  const id = `${name}@${plain(version)}`;
   const score = report ? { score: report.score, grade: report.grade } : null;
-  const known = { ...base, version, score };
+  const aiReview = aiReviewCoverage(review);
+  const known = { ...base, version, score, coverage: { aiReview, dependencies: deps.unchecked > 0 ? "incomplete" : "complete" } satisfies Coverage };
 
   // 1. confirmed malicious, the version or anything it installs
   if (review.kind === "reviewed" && review.state === "confirmed") {
@@ -222,7 +331,7 @@ export function explain(input: { name: string; range: string | null; resolved: R
   if (deps.unchecked > 0) {
     holds.push({
       why: `apm could not score ${deps.unchecked} of its dependencies`,
-      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => oneLine(d.dependency)).join(", ")}.`,
+      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => quoted(d.dependency)).join(", ")}.`,
     });
   }
 
@@ -236,19 +345,22 @@ export function explain(input: { name: string; range: string | null; resolved: R
 
   if (!own) reasons.push(reviewReason(review));
 
-  if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${resolved.skipped.slice(0, SHOWN).map((s) => `${oneLine(s.version)} (${oneLine(s.reason)})`).join("; ")}.`);
+  if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${skippedText(resolved.skipped)}.`);
   const run = commands(name, version);
+  const note = noReviewNote(aiReview);
 
-  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.`, reasons, commands: run };
-  const scoreText = `scores ${report.score}/100 (${report.grade})`;
+  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.${note}`, reasons, commands: run };
+  const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
   const first = holds[0];
 
-  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.`, reasons, commands: run };
+  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.${note}`, reasons, commands: run };
 
+  // a version apm never picked for AI review, or a registry that runs none, still installs on the static checks and a
+  // fully scored tree; the summary says so in its own words, and coverage says it as data
   return {
     ...known,
     verdict: "install",
-    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.`,
+    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
     reasons,
     commands: run,
   };

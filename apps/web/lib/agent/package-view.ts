@@ -3,7 +3,7 @@
 //
 // The package answer lists only the newest 200 versions and carries latest's facts, so the shown version (latest
 // included) is read from the registry's versions route, which knows every version. Nothing here is cached.
-import type { PackageView } from "./package-md";
+import { withholdSource, type PackageView } from "./package-md";
 import type { AgentSource } from "./source";
 
 export type LoadedView = { kind: "ok"; view: PackageView } | { kind: "missing"; reason: string } | { kind: "unavailable" };
@@ -28,8 +28,9 @@ export async function loadPackageView(input: { name: string; version: string | n
   if (info.kind === "unavailable") return { kind: "unavailable" };
   const v = info.value;
 
+  // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
     kind: "ok",
-    view: { pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, review, registry: input.registry },
+    view: withholdSource({ pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, review, registry: input.registry }),
   };
 }

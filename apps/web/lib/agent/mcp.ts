@@ -155,7 +155,7 @@ const checkName: Tool<typeof CheckNameInput> = {
     const lines: string[] = [];
 
     if (!r.valid) lines.push(`${name} is not a valid package name.`);
-    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map(inlineCode).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
+    else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
     else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
     else if (r.available) lines.push(`${name} is available.`);
     else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
@@ -184,24 +184,47 @@ const explain: Tool<typeof ExplainInput> = {
   },
 };
 
+/** The most characters of one excerpt the tool returns. */
+const MAX_EXCERPT_CHARS = 256 * 1024;
+
+/**
+ * The answer for a version the registry withholds (a 410: revoked, or a revoke pending): no line of it, and the
+ * revoke's reason in its place, read from the registry now.
+ */
+async function withheldExcerpt(args: z.output<typeof ExcerptInput>, source: AgentSource): Promise<ToolResult> {
+  const info = await source.version({ name: args.name, version: args.version });
+  const status = info.kind === "ok" ? info.value.status : null;
+  const reason = info.kind === "ok" ? info.value.statusReason : null;
+  const word = status !== null && /^[a-z][a-z-]{0,40}$/.test(status) ? status : "revoked";
+  const why = reason ? ` Reason: ${inlineCode(reason)}.` : "";
+
+  return text(`${args.name}@${inlineCode(args.version)} is ${word}: apm shows none of its files.${why}`, { name: args.name, version: args.version, withheld: true, status, reason }, true);
+}
+
 const fileExcerpt: Tool<typeof ExcerptInput> = {
   name: "get_file_excerpt",
   title: "Read lines of a package file",
   description: "Lines around one line of a file inside a published version, for checking a cited signal. Works on files of any size.",
   input: ExcerptInput,
   async run(args, source) {
+    // read from the registry every time: it alone says whether this version's source may be shown
     const r = await source.excerpt(args);
 
     if (r.kind === "missing") return text(`${args.name}@${inlineCode(args.version)} has no file ${inlineCode(args.path)}.`, undefined, true);
 
-    if (r.kind === "unavailable") return text(`Could not read ${inlineCode(args.path)}: the registry did not answer, or line ${args.line} is past the end of the file.`, undefined, true);
+    if (r.kind === "unavailable" && r.reason.kind === "status" && r.reason.status === 410) return withheldExcerpt(args, source);
+
+    if (r.kind === "unavailable" && r.reason.kind === "status" && r.reason.status === 416) return text(`Line ${args.line} is past the end of ${inlineCode(args.path)}.`, undefined, true);
+
+    if (r.kind === "unavailable") return text(`Could not read ${inlineCode(args.path)}: the registry did not answer. Nothing was shown; try again.`, undefined, true);
     const e = r.value;
 
     if (e.kind === "binary") return text(`${inlineCode(e.path)} in ${oneLine(e.name)}@${inlineCode(e.version)} is a binary file (${e.size} bytes).`, { ...e });
     const width = String(e.to).length;
     const body = e.lines.map((l) => `${String(l.n).padStart(width)}  ${l.text}${l.truncated ? ` [line cut, ${l.truncated.bytes} bytes]` : ""}`).join("\n");
 
-    return text([`${inlineCode(e.path)} in ${oneLine(e.name)}@${inlineCode(e.version)}, lines ${e.from}-${e.to} of ${e.totalLines}:`, UNTRUSTED_NOTE, "", codeBlock(body)].join("\n"), { ...e });
+    // the registry already bounds an excerpt (201 lines, each cut at its own limit); the block's cap is only a backstop
+    return text([`${inlineCode(e.path)} in ${oneLine(e.name)}@${inlineCode(e.version)}, lines ${e.from}-${e.to} of ${e.totalLines}:`, UNTRUSTED_NOTE, "", codeBlock(body, "", { max: MAX_EXCERPT_CHARS })].join("\n"), { ...e });
   },
 };
 

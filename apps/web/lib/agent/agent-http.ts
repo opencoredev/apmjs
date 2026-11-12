@@ -2,8 +2,10 @@
 // Pure over its inputs (the registry port, the rate limit), so the unit tests drive it with real Request objects.
 //
 // What an agent acts on must not outlive a change of state: a yank, a revoke or a confirmed AI review shows at once.
-// The verdict and the MCP answers are never stored; the Markdown view and the OG image, which show the same mutable
-// status to readers and crawlers, are stored for a few seconds at most.
+// The verdict and the MCP answers are never stored. The Markdown view quotes source (evidence lines, the AI review's
+// excerpts), and the registry alone decides, on every request, whether a version's source may be shown: so the view is
+// never stored either, by the site, the edge or a shared cache. Only the OG image, which carries no source, is kept
+// for a few seconds.
 import type { Take } from "../rate-limit";
 import { packagePath } from "../package-route";
 import { explainFor, parsePackageSpec } from "./explain";
@@ -15,8 +17,10 @@ import type { AgentSource } from "./source";
 export const AGENT_CACHE = {
   /** An install verdict, an MCP answer: never stored anywhere. */
   decision: "no-store",
-  /** The package Markdown view and its OG image: a few seconds, so a status change shows almost at once. */
-  view: "public, max-age=5",
+  /** The package Markdown view: it can quote a version's source, so nothing may keep it. */
+  source: "private, no-store",
+  /** The OG image: the score and status, no source; a few seconds, so a status change shows almost at once. */
+  image: "public, max-age=5",
 } as const;
 
 export async function explainResponse(url: URL, deps: { source: AgentSource; take: () => Take | Promise<Take> }): Promise<Response> {
@@ -38,11 +42,11 @@ export async function markdownResponse(input: { name: string; version: string | 
 
   switch (loaded.kind) {
     case "missing":
-      return new Response(`${loaded.reason}\n`, { status: 404, headers: { ...TEXT, "cache-control": AGENT_CACHE.view } });
+      return new Response(`${loaded.reason}\n`, { status: 404, headers: { ...TEXT, "cache-control": AGENT_CACHE.source } });
     case "unavailable":
-      return new Response("The registry did not answer. Nothing was checked; try again.\n", { status: 503, headers: { ...TEXT, "cache-control": "no-store", "retry-after": "30" } });
+      return new Response("The registry did not answer. Nothing was checked; try again.\n", { status: 503, headers: { ...TEXT, "cache-control": AGENT_CACHE.source, "retry-after": "30" } });
     case "ok":
-      return new Response(packageMarkdown(loaded.view), { headers: { ...TEXT, "cache-control": AGENT_CACHE.view, link: `<${siteUrl(packagePath(input.name))}>; rel="canonical"` } });
+      return new Response(packageMarkdown(loaded.view), { headers: { ...TEXT, "cache-control": AGENT_CACHE.source, link: `<${siteUrl(packagePath(input.name))}>; rel="canonical"` } });
     default: {
       const _exhaustive: never = loaded;
 

@@ -19,6 +19,11 @@ const FILE_SIGNALS: ReadonlySet<string> = new Set([
   "dynamic-require",
 ]);
 
+/** Whether a signal's evidence names a file in the tarball, and so can quote its source after the citation. */
+export function namesFile(signal: string): boolean {
+  return FILE_SIGNALS.has(signal);
+}
+
 /** Where a citation points: a file, and a line or a package.json script in it. */
 export type Citation = { path: string; line: number | null; anchor: string | null };
 

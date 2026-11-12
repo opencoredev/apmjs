@@ -1,5 +1,6 @@
 // The package page as Markdown, for agents: every section an agent needs, publisher text kept inert.
 import { describe, expect, test } from "bun:test";
+import { handleMessage } from "./mcp";
 import { packageMarkdown } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { fakeSource, INSTALL, pkg, REVIEW_CLEAN } from "./testing";
@@ -168,5 +169,63 @@ describe("loadPackageView", () => {
     });
     expect((await loadPackageView({ name: "nope", version: null, registry: REGISTRY, source: fakeSource() })).kind).toBe("missing");
     expect((await loadPackageView({ name: "x", version: null, registry: REGISTRY, source: fakeSource({ down: true }) })).kind).toBe("unavailable");
+  });
+});
+
+// Re-review finding 3: a revoked version's Markdown view and check_package answer still quoted its evidence lines and
+// the AI review's excerpts. Now they show what was found and where, the revoke's reason, and no line of its source.
+describe("a revoked version shows no source", () => {
+  const SOURCE_LINE = "REVOKED-SOURCE-LINE";
+  const base = pkg();
+  const score = base.score;
+  const clean = REVIEW_CLEAN.review;
+
+  if (!score || !clean) throw new Error("pkg() has a score and REVIEW_CLEAN a review");
+
+  const revokedScore = {
+    ...score,
+    signals: [
+      { ...score.signals[0], id: "network", label: "Uses the network: fetch, http, sockets", points: -10, confidence: "confirmed" as const, evidence: [`lib/index.js:12: fetch("https://x.example/${SOURCE_LINE}")`] },
+      { ...INSTALL, evidence: [`package.json scripts.postinstall: node ${SOURCE_LINE}.js`] },
+    ],
+    dismissed: [{ signal: "eval", file: "lib/b.js", line: 3, evidence: [`lib/b.js:3: eval("${SOURCE_LINE}")`], reason: "a test helper", at: 0 }],
+  };
+
+  const review = { ...REVIEW_CLEAN, review: { ...clean, state: "confirmed" as const, findings: [{ file: "lib/index.js", line: 12, excerpt: `fetch("${SOURCE_LINE}")`, issue: "Sends the npm token out", severity: "high" as const }] } };
+
+  for (const status of ["revoked", "revoke-pending"]) {
+    test(`${status}: the Markdown view names files and lines, gives the reason, and quotes no source`, () => {
+      const md = packageMarkdown({ pkg: base, version: "1.3.0", status: { status, statusReason: "credential stealer", deprecated: null }, facts: base.facts, score: revokedScore, review: { kind: "ok", value: review }, registry: REGISTRY });
+
+      expect(md).not.toContain(SOURCE_LINE);
+      expect(md).toContain(`- Status: ${status}, reason \`credential stealer\`. New installs skip it.`);
+      expect(md).toContain("- Source: withheld.");
+      expect(md).toContain("  - `lib/index.js:12`");
+      expect(md).toContain("  - `package.json scripts.postinstall`");
+      // no links to files the registry answers 410 for
+      expect(md).not.toContain("/file/lib/index.js");
+      expect(md).toContain("Finding 1 (high) at `lib/index.js:12`: `Sends the npm token out`");
+    });
+  }
+
+  test("check_package's structured answer leaves the source out too, and an active version keeps it", async () => {
+    const source = (status: string) =>
+      fakeSource({
+        packages: { "left-pad": base },
+        versions: { "left-pad@1.3.0": { version: "1.3.0", status, statusReason: status === "revoked" ? "credential stealer" : null, deprecated: null, facts: base.facts, score: revokedScore } },
+        reviews: { "left-pad@1.3.0": review },
+      });
+
+    const call = async (status: string): Promise<string> => {
+      const answer = await handleMessage({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad" } } }, source(status));
+
+      return JSON.stringify(answer);
+    };
+
+    expect(await call("revoked")).not.toContain(SOURCE_LINE);
+    expect(await call("active")).toContain(SOURCE_LINE);
+    const loaded = await loadPackageView({ name: "left-pad", version: null, registry: REGISTRY, source: source("revoked") });
+
+    expect(JSON.stringify(loaded)).not.toContain(SOURCE_LINE);
   });
 });

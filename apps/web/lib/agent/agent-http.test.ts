@@ -60,19 +60,22 @@ describe("the MCP endpoint is never stored", () => {
   });
 });
 
-describe("the Markdown view is stored for seconds at most", () => {
-  test("found, missing and unavailable answers", async () => {
+// Re-review finding 3: the Markdown view quotes evidence lines and the AI review's excerpts, and was public for 5
+// seconds, so a version revoked a moment ago could still be shown from a cache. It is now never stored.
+describe("the Markdown view is never stored", () => {
+  test("found, missing and unavailable answers are private, no-store", async () => {
     const source = fakeSource({ packages: { "left-pad": pkg() }, reviews: { "left-pad@1.3.0": REVIEW_CLEAN } });
     const ok = await markdownResponse({ name: "left-pad", version: null, registry: "https://registry.apmjs.dev/", source });
 
     expect(ok.status).toBe(200);
-    expect(maxAge(ok)).toBeLessThanOrEqual(5);
-    expect(maxAge(await markdownResponse({ name: "left-pad", version: "9.9.9", registry: "https://registry.apmjs.dev/", source }))).toBeLessThanOrEqual(5);
-    expect(maxAge(await markdownResponse({ name: "left-pad", version: null, registry: "https://registry.apmjs.dev/", source: fakeSource({ down: true }) }))).toBe(0);
+    expect(ok.headers.get("cache-control")).toBe("private, no-store");
+    expect((await markdownResponse({ name: "left-pad", version: "9.9.9", registry: "https://registry.apmjs.dev/", source })).headers.get("cache-control")).toBe("private, no-store");
+    expect((await markdownResponse({ name: "left-pad", version: null, registry: "https://registry.apmjs.dev/", source: fakeSource({ down: true }) })).headers.get("cache-control")).toBe("private, no-store");
   });
 
-  test("the view policy is a few seconds, the decision policy never stored", () => {
+  test("the decision and source policies are never stored; only the OG image keeps a few seconds", () => {
     expect(AGENT_CACHE.decision).toBe("no-store");
-    expect(Number(/max-age=(\d+)/.exec(AGENT_CACHE.view)?.[1])).toBeLessThanOrEqual(5);
+    expect(AGENT_CACHE.source).toBe("private, no-store");
+    expect(maxAge(new Response(null, { headers: { "cache-control": AGENT_CACHE.image } }))).toBeLessThanOrEqual(5);
   });
 });

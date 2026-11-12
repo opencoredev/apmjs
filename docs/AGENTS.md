@@ -13,7 +13,7 @@ None of them calls a version "safe". A score says what apm read in the tarball. 
 | `do-not-install` | The install policy refused the range (cooldown, score floor, yank, revoke, a refused dependency), or apm reviewers confirmed the version or any dependency in its tree malicious. |
 | `unknown` | apm could not read what it needs: the registry, the version's AI review, or the AI review state of its dependencies. Nothing was decided; try again. |
 | `review-first` | The version passes the policy, but something is not settled: its AI review or a dependency's is queued, running, flagged or ended without an answer; it scores under 75; it is not scored; or apm could not score some of its dependencies. |
-| `install` | It passes the policy, scores 75 or more, nothing in its tree was refused, flagged or left unscored, and no AI review in the tree is open. A version apm never picked for AI review can still be `install`; the reasons say so. |
+| `install` | It passes the policy, scores 75 or more, nothing in its tree was refused, flagged or left unscored, and no AI review in the tree is open. A version apm never picked for AI review, or one on a registry that runs none, can still be `install` on these checks; the summary then says "No AI review", and `coverage.aiReview` is `not-selected` or `disabled`. |
 
 ## MCP server
 
@@ -62,7 +62,8 @@ Before adding a dependency, call the apm MCP tool explain_install for it and fol
 
 ## HTTP, without MCP
 
-- `GET https://apmjs.dev/api/explain?package=<name>[@range]`: the install verdict as JSON (`verdict`, `summary`, `reasons`, `commands`).
+- `GET https://apmjs.dev/api/explain?package=<name>[@range]`: the install verdict as JSON (`verdict`, `summary`, `reasons`, `commands`, and `coverage`: `aiReview` is `reviewed`, `in-progress`, `no-answer`, `not-selected`, `disabled`, `unreadable` or `not-read`; `dependencies` is `complete`, `incomplete` or `not-read`). Text the registry passes on from a publisher (a yank reason, a dependency spec) is quoted in code spans in `reasons`; `summary` is apm's own words.
+- The package Markdown view and the MCP answers are never cached (`no-store`). A revoked version's view names the files and lines apm found and the revoke's reason, never a line of its source.
 - `GET https://apmjs.dev/package/<name>.md` (or `/package/<name>?format=md`, and `?v=<version>` for an older version): the package page as Markdown. A scoped name is two segments: `/package/@scope/name.md`.
 - `GET https://apmjs.dev/openapi.json`: OpenAPI 3.1 for the registry's JSON API (score, name check, search, AI review, file excerpts, install policy) and these agent routes.
 - `GET https://apmjs.dev/llms.txt` and `/llms-full.txt`: what apm is, and these docs as one text file.

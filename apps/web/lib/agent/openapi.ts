@@ -6,7 +6,7 @@ import { ExcerptAnswer } from "../file-excerpt";
 import { ReviewAnswer } from "../review-schema";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
 import { PUBLIC_REGISTRY_URL, SITE_URL } from "./site";
-import { VERDICTS } from "./verdict";
+import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, VERDICTS } from "./verdict";
 
 const Signal = z.object({
   id: z.string().describe("Stable signal id, such as install-script, network, shell-exec, eval, credential-access, obfuscated"),
@@ -70,6 +70,12 @@ const Verdict = z.object({
   summary: z.string(),
   reasons: z.array(z.string()),
   commands: z.object({ apm: z.string(), bun: z.string(), npm: z.string(), pnpm: z.string() }).nullable(),
+  coverage: z
+    .object({
+      aiReview: z.enum(AI_REVIEW_COVERAGE).describe("How far the AI review of the version got; not-selected and disabled mean there was none"),
+      dependencies: z.enum(DEPENDENCY_COVERAGE).describe("Whether apm scored every dependency the install brings in"),
+    })
+    .describe("What the verdict rests on"),
 });
 
 const RecentAnswer = z.object({

@@ -205,6 +205,20 @@ export async function getExcerpt(input: { name: string; version: string; path: s
   return result;
 }
 
+/**
+ * Lines of one file, straight from the registry, for an agent (the get_file_excerpt MCP tool): never from the edge
+ * cache, so the registry decides on every read whether the version's source may be shown. A revoked version answers
+ * 410; a line past the end, 416. Neither is logged as an outage.
+ */
+export async function getExcerptUncached(input: { name: string; version: string; path: string; line: number; context: number }): Promise<Fetched<ExcerptAnswer>> {
+  const path = excerptApiPath(input);
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS });
+
+  if (result.kind === "unavailable" && !(result.reason.kind === "status" && (result.reason.status === 410 || result.reason.status === 416))) logUnavailable(path.split("?")[0] ?? path, result.reason);
+
+  return result;
+}
+
 /** The README npm would pick from a version's tarball, for packages whose packument has no readme. "missing" when there is none. */
 export async function getTarballReadme(input: { name: string; version: string }): Promise<Fetched<FileAnswer>> {
   const path = readmeApiPath(input);

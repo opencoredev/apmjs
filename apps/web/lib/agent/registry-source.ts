@@ -2,7 +2,7 @@
 import "server-only";
 import { z } from "zod";
 import { ExcerptAnswer } from "../file-excerpt";
-import { getExcerpt, getPackageUncached, getRecent, getReviewUncached, getVersionInfo, search, type Fetched } from "../registry";
+import { getExcerptUncached, getPackageUncached, getRecent, getReviewUncached, getVersionInfo, search, type Fetched } from "../registry";
 import { fetchJson, logUnavailable, readCappedText, REGISTRY_TIMEOUT_MS, withTimeout } from "../registry-fetch";
 import { registryFetch } from "../registry-transport";
 import { REGISTRY } from "../registry-url";
@@ -47,7 +47,7 @@ async function names(input: { name: string; scope: string | null }): Promise<Nam
   return r.kind === "ok" ? r.value : null;
 }
 
-/** The agent views read version state and the AI review without the edge cache: see AgentSource. */
+/** The agent views read version state, the AI review and file excerpts without the edge cache: see AgentSource. */
 export const registrySource: AgentSource = {
   package: getPackageUncached,
   version: ({ name, version }) => getVersionInfo(name, version),
@@ -55,7 +55,8 @@ export const registrySource: AgentSource = {
   resolve,
   search: ({ query }) => search(query),
   names,
-  excerpt: (input): Promise<Fetched<ExcerptAnswer>> => getExcerpt(input),
+  // lines of source: read from the registry every time, which alone decides whether a version's source may be shown
+  excerpt: (input): Promise<Fetched<ExcerptAnswer>> => getExcerptUncached(input),
 };
 
 const RecentPackages = z.object({ packages: z.array(z.object({ name: z.string(), at: z.string() })) });

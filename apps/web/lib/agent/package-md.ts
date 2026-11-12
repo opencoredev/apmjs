@@ -1,6 +1,6 @@
 // The package page as Markdown, for agents: GET /package/<name>.md (or ?format=md) and the check_package MCP
 // tool. The same facts as the HTML page, in the order an agent deciding on an install needs them. Pure.
-import { citeEvidence } from "../evidence";
+import { citeEvidence, namesFile } from "../evidence";
 import { installCommand, installNote, INSTALL_CLIENTS } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
@@ -26,6 +26,35 @@ export type PackageView = {
   registry: string;
 };
 
+/** A revoked version, or one whose revoke is pending: the registry shows none of its source, and neither do these views. */
+export function isWithheld(status: string): boolean {
+  return status === "revoked" || status === "revoke-pending";
+}
+
+/** One piece of evidence without the package's text: the file and line (or script) it cites, or nothing at all. */
+function evidenceWithoutSource(signal: string, evidence: string): string[] {
+  if (!namesFile(signal)) return [evidence];
+  const cited = citeEvidence(signal, splitTestFile(splitPossible(evidence).text).text);
+
+  return cited ? [cited.cite] : [];
+}
+
+/**
+ * The view with every line of the version's source taken out when the version is withheld: score evidence keeps only
+ * what it cites, the AI review's findings keep their file, line and sentence but not the excerpt. Applied where the
+ * view is loaded (so the MCP tool's structured answer is cut too) and again before it is written out.
+ */
+export function withholdSource(view: PackageView): PackageView {
+  if (view.status === null || !isWithheld(view.status.status)) return view;
+  const score = view.score ? { ...view.score, signals: view.score.signals.map((s) => ({ ...s, evidence: s.evidence.flatMap((e) => evidenceWithoutSource(s.id, e)) })), dismissed: view.score.dismissed.map((d) => ({ ...d, evidence: [] })) } : null;
+  const r = view.review;
+
+  const review: PackageView["review"] =
+    r.kind === "ok" ? { kind: "ok", value: { ...r.value, review: r.value.review ? { ...r.value.review, findings: r.value.review.findings.map((f) => ({ ...f, excerpt: "" })) } : null, private: null } } : r;
+
+  return { ...view, score, review };
+}
+
 /** Evidence lines listed per signal; the HTML page has the rest. */
 const MAX_EVIDENCE = 5;
 
@@ -39,22 +68,23 @@ function wordText(s: string): string {
   return /^[a-z][a-z-]{0,40}$/.test(s) ? s : inlineCode(s);
 }
 
-function evidenceLine(input: { signal: string; evidence: string; name: string; version: string | null }): string {
+function evidenceLine(input: { signal: string; evidence: string; name: string; version: string | null; withheld: boolean }): string {
   const possible = splitPossible(input.evidence);
   const { text, testFile } = splitTestFile(possible.text);
   const cited = citeEvidence(input.signal, text);
-  const href = cited && input.version ? fileHref({ name: input.name, version: input.version, ...cited.citation }) : null;
+  // a withheld version's files answer 410: its citations are not links
+  const href = cited && input.version && !input.withheld ? fileHref({ name: input.name, version: input.version, ...cited.citation }) : null;
   const tail = [testFile ? "in a test file the package ships" : null, possible.why ? `possible: ${inlineCode(possible.why)}` : null].filter(Boolean).join("; ");
   // the cited path is publisher text too, so it sits in a code span inside the link text
   const rest = cited ? cited.rest.replace(/^:\s*/, "") : "";
-  const body = cited && href ? `[${inlineCode(cited.cite)}](${linkUrl(siteUrl(href))})${rest ? ` ${inlineCode(rest)}` : ""}` : inlineCode(text);
+  const body = cited && href ? `[${inlineCode(cited.cite)}](${linkUrl(siteUrl(href))})${rest ? ` ${inlineCode(rest)}` : ""}` : cited && input.withheld ? inlineCode(cited.cite) : inlineCode(text);
 
   return `  - ${body}${tail ? ` (${tail})` : ""}`;
 }
 
-function signalBlock(s: Signal, name: string, version: string | null): string[] {
+function signalBlock(s: Signal, input: { name: string; version: string | null; withheld: boolean }): string[] {
   const head = `- **${s.points < 0 ? `−${points(-s.points)}` : "note"}** ${oneLine(s.label)}${s.confidence === "possible" ? " (possible: named but not seen in use)" : ""} ${inlineCode(s.id)}`;
-  const lines = [head, ...s.evidence.slice(0, MAX_EVIDENCE).map((evidence) => evidenceLine({ signal: s.id, evidence, name, version }))];
+  const lines = [head, ...s.evidence.slice(0, MAX_EVIDENCE).map((evidence) => evidenceLine({ signal: s.id, evidence, ...input }))];
 
   if (s.evidence.length > MAX_EVIDENCE) lines.push(`  - and ${s.evidence.length - MAX_EVIDENCE} more on the page`);
 
@@ -92,7 +122,8 @@ function reviewSection(review: Fetched<ReviewAnswer>): string[] {
   lines.push(`${coverageText(r.coverage)}. Model: ${inlineCode(r.model)}. Reviewed ${inlineCode(r.reviewedAt)}.`);
 
   // findings and the note are the AI's and a reviewer's words about publisher code: quoted, the excerpt as a block
-  for (const [i, f] of r.findings.entries()) lines.push("", `Finding ${i + 1} (${f.severity}) at ${inlineCode(`${f.file}:${f.line}`)}: ${inlineCode(f.issue)}`, "", codeBlock(f.excerpt));
+  // a withheld version's findings come without their excerpt
+  for (const [i, f] of r.findings.entries()) lines.push("", `Finding ${i + 1} (${f.severity}) at ${inlineCode(`${f.file}:${f.line}`)}: ${inlineCode(f.issue)}`, ...(f.excerpt === "" ? [] : ["", codeBlock(f.excerpt)]));
 
   if (r.note) lines.push("", "Reviewer note:", "", codeBlock(r.note));
 
@@ -106,8 +137,10 @@ function statusLine(status: NonNullable<PackageView["status"]>): string {
 }
 
 /** The whole Markdown document for one package version. */
-export function packageMarkdown(view: PackageView): string {
+export function packageMarkdown(input: PackageView): string {
+  const view = withholdSource(input);
   const { pkg, version, score } = view;
+  const withheld = view.status !== null && isWithheld(view.status.status);
   const url = siteUrl(canonicalPackagePath(pkg.name));
   const older = version !== null && version !== pkg.latest;
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
@@ -115,12 +148,13 @@ export function packageMarkdown(view: PackageView): string {
   out.push(
     `- Version shown: ${version ? versionText(version) : "none published"}${older ? ` (latest is ${pkg.latest ? versionText(pkg.latest) : "unknown"})` : version ? " (latest)" : ""}`,
     ...(view.status ? [statusLine(view.status)] : []),
+    ...(withheld ? ["- Source: withheld. This version's revoke takes its files out of view: apm shows no line of its code, only what was found and where."] : []),
     ...(view.status?.deprecated ? [`- Deprecated: ${inlineCode(view.status.deprecated)}`] : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
     `- Score: ${score ? `${score.score}/100, grade ${oneLine(score.grade)}` : "not scored yet"}`,
     `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : ""}`,
-    `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map(inlineCode).join(", ") : "unknown"}`,
+    `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
     "",
     UNTRUSTED_NOTE,
     "",
@@ -138,11 +172,12 @@ export function packageMarkdown(view: PackageView): string {
     const notes = score.signals.filter((s) => s.points >= 0);
 
     if (lost.length === 0) out.push("No signal lost points.");
-    else out.push(`${lost.length} signal${lost.length === 1 ? "" : "s"} lost ${points(lost.reduce((n, s) => n - s.points, 0))}. Each cited line links to that line of the file.`, "");
+    else out.push(`${lost.length} signal${lost.length === 1 ? "" : "s"} lost ${points(lost.reduce((n, s) => n - s.points, 0))}. ${withheld ? "Each names the file and line it found; the lines themselves are withheld." : "Each cited line links to that line of the file."}`, "");
+    const where = { name: pkg.name, version, withheld };
 
-    for (const s of lost) out.push(...signalBlock(s, pkg.name, version));
+    for (const s of lost) out.push(...signalBlock(s, where));
 
-    if (notes.length > 0) out.push("", "Notes (no points lost):", ...notes.flatMap((s) => signalBlock(s, pkg.name, version)));
+    if (notes.length > 0) out.push("", "Notes (no points lost):", ...notes.flatMap((s) => signalBlock(s, where)));
 
     if (score.dismissed.length > 0) {
       out.push("", "Evidence an apm reviewer dismissed for this version:", ...score.dismissed.map((d) => `- ${inlineCode(d.signal)} at ${inlineCode(`${d.file}:${d.line}`)}, reason ${inlineCode(d.reason)}`));

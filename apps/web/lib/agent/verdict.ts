@@ -10,7 +10,7 @@ import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-
 import type { Fetched } from "../registry";
 import type { PublicReview, ReviewAnswer } from "../review-schema";
 import type { DepRef, DepReviews, ResolveOutcome } from "./source";
-import { oneLine } from "./text";
+import { inlineCode, oneLine, UNTRUSTED_NOTE } from "./text";
 
 export const VERDICTS = ["install", "review-first", "do-not-install", "not-found", "unknown"] as const;
 
@@ -33,6 +33,23 @@ export type ReviewInput =
   | { kind: "off" }
   | { kind: "unreadable" };
 
+/**
+ * How far the AI review of the picked version got. reviewed: it has a result. in-progress: queued or running.
+ * no-answer: it ended without a usable result. not-selected: apm never picked this version for one. disabled: this
+ * registry runs none. unreadable: apm could not read it. not-read: the verdict was decided before the review was read.
+ */
+export const AI_REVIEW_COVERAGE = ["reviewed", "in-progress", "no-answer", "not-selected", "disabled", "unreadable", "not-read"] as const;
+
+export type AiReviewCoverage = (typeof AI_REVIEW_COVERAGE)[number];
+
+/** Whether apm scored every dependency the install would bring in; not-read when the verdict never got that far. */
+export const DEPENDENCY_COVERAGE = ["complete", "incomplete", "not-read"] as const;
+
+export type DependencyCoverage = (typeof DEPENDENCY_COVERAGE)[number];
+
+/** What the verdict rests on, as data: a client can tell "install, with no AI review" from "install, reviewed". */
+export type Coverage = { aiReview: AiReviewCoverage; dependencies: DependencyCoverage };
+
 export type Verdict = {
   verdict: VerdictKind;
   name: string;
@@ -47,6 +64,7 @@ export type Verdict = {
   reasons: string[];
   /** What to run, by client; null when nothing should be installed yet. */
   commands: Record<InstallClient, string> | null;
+  coverage: Coverage;
 };
 
 const SHOWN = 3;
@@ -62,7 +80,63 @@ function commandsFor(name: string, version: string): Record<InstallClient, strin
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 
-const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => oneLine(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
+// Text the registry passes on (a yank reason, a dependency spec, a version) can come from a publisher: it is quoted as
+// a code span, so a Markdown reader sees data, never a link, an image, HTML or a line of apm's
+const quoted = (text: string): string => inlineCode(text, { max: 300 });
+
+/** A version or range as written when it is a plain one, else quoted. */
+const plain = (text: string): string => (/^[0-9A-Za-z.+~^-]{1,64}$/.test(text) ? text : quoted(text));
+
+const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => quoted(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
+
+const skippedText = (skipped: readonly { version: string; reason: string }[]): string => skipped.slice(0, SHOWN).map((s) => `${quoted(s.version)} (${quoted(s.reason)})`).join("; ");
+
+/** How far the picked version's AI review got, for the coverage field. */
+export function aiReviewCoverage(review: ReviewInput): AiReviewCoverage {
+  switch (review.kind) {
+    case "reviewed":
+      return review.state === "no-answer" ? "no-answer" : "reviewed";
+    case "queued":
+    case "leased":
+      return "in-progress";
+    case "failed":
+      return "no-answer";
+    case "not-reviewed":
+      return "not-selected";
+    case "off":
+      return "disabled";
+    case "unreadable":
+      return "unreadable";
+    default: {
+      const _exhaustive: never = review;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** The words the summary ends with when no AI review stands behind the verdict; "" when one does or is under way. */
+function noReviewNote(coverage: AiReviewCoverage): string {
+  switch (coverage) {
+    case "not-selected":
+      return " No AI review: apm never picked this version for one.";
+    case "disabled":
+      return " No AI review: this registry runs none.";
+    case "reviewed":
+    case "in-progress":
+    case "no-answer":
+    case "unreadable":
+    case "not-read":
+      return "";
+    default: {
+      const _exhaustive: never = coverage;
+
+      return _exhaustive;
+    }
+  }
+}
+
+const NOT_READ: Coverage = { aiReview: "not-read", dependencies: "not-read" };
 
 function reviewReason(review: ReviewInput): string {
   switch (review.kind) {
@@ -131,19 +205,19 @@ function reviewHold(review: ReviewInput): string | null {
 export function explainInstall(input: { name: string; range: string | null; resolve: ResolveOutcome; review: ReviewInput }): Verdict {
   const { name, resolve, review } = input;
   const range = input.range ?? "latest";
-  const asked = range === "latest" ? name : `${name}@${range}`;
+  const asked = range === "latest" ? name : `${name}@${plain(range)}`;
   const base = { name, range };
 
   switch (resolve.kind) {
     case "unavailable":
-      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: the registry did not answer. Nothing was checked; try again.`, reasons: [], commands: null };
-    // the registry's reasons carry publisher text (a yank reason): one line each, so none can pose as a line of apm's
+      return { ...base, verdict: "unknown", version: null, score: null, summary: `apm could not check ${asked}: the registry did not answer. Nothing was checked; try again.`, reasons: [], commands: null, coverage: NOT_READ };
+    // the registry's reasons carry publisher text (a yank reason): the summary is apm's words only, the reasons quote it
     case "missing":
-      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [oneLine(resolve.reason)], commands: null };
+      return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [`The registry said: ${quoted(resolve.reason)}`], commands: null, coverage: NOT_READ };
     case "refused": {
-      const skips = resolve.skipped.slice(0, SHOWN).map((s) => `Skipped ${oneLine(s.version)}: ${oneLine(s.reason)}.`);
+      const skips = resolve.skipped.slice(0, SHOWN).map((s) => `Skipped ${quoted(s.version)}: ${quoted(s.reason)}.`);
 
-      return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: ${oneLine(resolve.reason)}`, reasons: [oneLine(resolve.reason), ...skips], commands: null };
+      return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons: [`The registry said: ${quoted(resolve.reason)}`, ...skips], commands: null, coverage: NOT_READ };
     }
 
     case "ok":
@@ -156,9 +230,10 @@ export function explainInstall(input: { name: string; range: string | null; reso
   }
 
   const { version, report, deps } = resolve;
-  const id = `${name}@${version}`;
+  const id = `${name}@${plain(version)}`;
   const score = report ? { score: report.score, grade: report.grade } : null;
-  const known = { ...base, version, score };
+  const aiReview = aiReviewCoverage(review);
+  const known = { ...base, version, score, coverage: { aiReview, dependencies: deps.unchecked > 0 ? "incomplete" : "complete" } satisfies Coverage };
 
   // 1. confirmed malicious, the version or anything it installs
   if (review.kind === "reviewed" && review.state === "confirmed") {
@@ -209,7 +284,7 @@ export function explainInstall(input: { name: string; range: string | null; reso
   if (deps.unchecked > 0) {
     holds.push({
       why: `apm could not score ${deps.unchecked} of its dependencies`,
-      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => oneLine(d.dependency)).join(", ")}.`,
+      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => quoted(d.dependency)).join(", ")}.`,
     });
   }
 
@@ -223,19 +298,22 @@ export function explainInstall(input: { name: string; range: string | null; reso
 
   if (!own) reasons.push(reviewReason(review));
 
-  if (resolve.skipped.length > 0) reasons.push(`Newer versions were skipped: ${resolve.skipped.slice(0, SHOWN).map((s) => `${oneLine(s.version)} (${oneLine(s.reason)})`).join("; ")}.`);
+  if (resolve.skipped.length > 0) reasons.push(`Newer versions were skipped: ${skippedText(resolve.skipped)}.`);
   const commands = commandsFor(name, version);
+  const note = noReviewNote(aiReview);
 
-  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.`, reasons, commands };
-  const scoreText = `scores ${report.score}/100 (${report.grade})`;
+  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.${note}`, reasons, commands };
+  const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
   const first = holds[0];
 
-  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.`, reasons, commands };
+  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.${note}`, reasons, commands };
 
+  // a version apm never picked for AI review, or a registry that runs none, still installs on the static checks and a
+  // fully scored tree; the summary says so in its own words, and coverage says it as data
   return {
     ...known,
     verdict: "install",
-    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.`,
+    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
     reasons,
     commands,
   };
@@ -284,11 +362,14 @@ export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "revie
   }
 }
 
-/** The verdict as a few plain lines: the summary, the reasons, and the apm command. */
+/**
+ * The verdict as a few plain lines: apm's verdict and summary first, on lines of their own, then the reasons (where
+ * anything the registry passed on from a publisher sits in code spans), the coverage and the apm command.
+ */
 export function verdictText(v: Verdict): string {
-  const lines = [`Verdict: ${v.verdict}`, v.summary];
+  const lines = [`Verdict: ${v.verdict}`, v.summary, `AI review: ${v.coverage.aiReview}. Dependencies scored: ${v.coverage.dependencies}.`];
 
-  if (v.reasons.length > 0) lines.push("", ...v.reasons.map((r) => `- ${r}`));
+  if (v.reasons.length > 0) lines.push("", "Reasons:", ...v.reasons.map((r) => `- ${r}`), "", UNTRUSTED_NOTE);
 
   if (v.commands) {
     lines.push("", `Run: ${v.commands.apm}`, `(or ${v.commands.bun}, ${v.commands.npm}, ${v.commands.pnpm}; plain bun, npm and pnpm only get apm's checks when their registry is set to apm)`);

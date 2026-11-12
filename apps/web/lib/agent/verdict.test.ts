@@ -6,7 +6,7 @@ import cases from "../../../../tests/fixtures/explain-verdicts.json";
 import { explainFor, parsePackageSpec } from "./explain";
 import { parseResolve, type ResolveOutcome } from "./source";
 import { fakeSource, NETWORK, REVIEW_CLEAN, signal } from "./testing";
-import { explainInstall, reviewInput, VERDICTS, verdictText, type ReviewInput } from "./verdict";
+import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, explainInstall, reviewInput, VERDICTS, verdictText, type ReviewInput } from "./verdict";
 
 // ---------- the shared cases ----------
 
@@ -37,7 +37,13 @@ const Case = z.object({
     z.object({ kind: z.literal("reviewed"), state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.number() }),
     z.object({ kind: z.enum(["queued", "leased", "failed", "not-reviewed", "off", "unreadable"]) }),
   ]),
-  expect: z.object({ verdict: z.enum(VERDICTS), commands: z.boolean(), summary: z.string(), reasons: z.array(z.string()).optional() }),
+  expect: z.object({
+    verdict: z.enum(VERDICTS),
+    commands: z.boolean(),
+    summary: z.string(),
+    reasons: z.array(z.string()).optional(),
+    coverage: z.object({ aiReview: z.enum(AI_REVIEW_COVERAGE), dependencies: z.enum(DEPENDENCY_COVERAGE) }),
+  }),
 });
 
 export const CASES = z.object({ cases: z.array(Case).min(20) }).parse(cases).cases;
@@ -76,6 +82,8 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       expect(v.verdict).toBe(c.expect.verdict);
       expect(v.summary).toBe(c.expect.summary);
       expect(v.commands !== null).toBe(c.expect.commands);
+
+      expect(v.coverage).toEqual(c.expect.coverage);
 
       for (const r of c.expect.reasons ?? []) expect(v.reasons).toContain(r);
       expect(v.summary).not.toMatch(/\bsafe\b/);
