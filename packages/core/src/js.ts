@@ -6,7 +6,7 @@
 // is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
-import { runDecoder, type Known } from "./decode.ts";
+import { MAX_DECODER_STEPS, runDecoder, type Known } from "./decode.ts";
 import { Flow, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
@@ -677,6 +677,9 @@ const MAX_DECODED_BYTES = 256 * 1024;
 /** How long a function apm runs as a decoder may be, in characters of source. */
 const MAX_DECODER_CHARS = 2000;
 
+/** Steps every decoder run in one file may take together (decode.ts counts them): ten calls at their own limit. */
+const MAX_FILE_DECODER_STEPS = 10 * MAX_DECODER_STEPS;
+
 /** How deep code held in a string is followed: code that evaluates code that evaluates code. */
 const MAX_EVAL_DEPTH = 3;
 
@@ -685,7 +688,7 @@ const MAX_EVAL_DEPTH = 3;
  * limits it ran into. A limit never hides anything: what was past it is read as unknown, so only the text rules (the
  * floor every finding starts from) judge it, and the limit is named in the score's not-checked list.
  */
-type Budget = { decoded: number; notes: Set<string> };
+type Budget = { decoded: number; notes: Set<string>; decoder: { steps: number } };
 
 /**
  * Why a reading stopped short, as the not-checked list names it, followed by the files. Past each limit the text rules
@@ -1989,18 +1992,44 @@ class Reader {
       pieces += s.pieces;
     }
 
-    const value = runDecoder(fn, args, {
-      constant: (id) => {
-        const s = this.str(id);
+    const run = runDecoder(
+      fn,
+      args,
+      {
+        constant: (id) => {
+          const s = this.str(id);
 
-        if (!s?.exact) return null;
+          if (!s?.exact) return null;
 
-        return s.numeric ? { kind: "number", value: Number(s.value) } : { kind: "text", value: s.value };
+          return s.numeric ? { kind: "number", value: Number(s.value) } : { kind: "text", value: s.value };
+        },
+        localFunction: (callee) => this.localFunctionOf(callee),
       },
-      localFunction: (callee) => this.localFunctionOf(callee),
-    });
+      this.budget.decoder,
+    );
 
-    return value === null ? null : this.decoded(value, { value: "", exact: true, how: "as written", pieces, via: null, numeric: false }, "a decoder function it defines");
+    // what a decoder returns is unknown when apm stopped, not because the program hides nothing: the analysis says so,
+    // as it does for code it does not read
+    const stopped = (limit: string): null => {
+      if (this.unread.length < MAX_EXECUTED) this.unread.push({ at: n.start, why: `calls a decoder function it defines, which apm stopped running at its limit (${limit}), so what it returns was not read` });
+
+      return null;
+    };
+
+    switch (run.kind) {
+      case "decoded":
+        // the file's decoded-text budget refusing the result is a limit too
+        return this.decoded(run.value, { value: "", exact: true, how: "as written", pieces, via: null, numeric: false }, "a decoder function it defines") ?? stopped(LIMIT_NOTES.decoded);
+      case "unsupported":
+        return null;
+      case "exhausted":
+        return stopped(run.limit);
+      default: {
+        const _exhaustive: never = run;
+
+        return _exhaustive;
+      }
+    }
   }
 
   private localFunctionOf(callee: AnyNode): AnyNode | null {
@@ -3168,7 +3197,7 @@ function bestPerSignal(hits: readonly Hit[]): Hit[] {
  * the caller then reads it raw, the way apm-score-v3 read every file.
  */
 export function scanJs(text: string, dialect: Dialect): JsScan {
-  const budget: Budget = { decoded: MAX_DECODED_BYTES, notes: new Set() };
+  const budget: Budget = { decoded: MAX_DECODED_BYTES, notes: new Set(), decoder: { steps: MAX_FILE_DECODER_STEPS } };
   const r = readText(text, dialect, 0, budget);
 
   if (r.outcome !== "parsed") return { kind: "failed", reason: r.outcome };

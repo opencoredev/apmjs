@@ -209,19 +209,19 @@ describe("the decoder apm runs on a program's own helper functions", () => {
   const text = (value: string): Known => ({ kind: "text", value });
 
   test("hex, char-code and reversed-string decoders", () => {
-    expect(runDecoder(fnOf("function g(h){return h.replace(/../g,m=>String.fromCharCode(parseInt(m,16)))}"), [text("6178696f73")], host)).toBe("axios");
-    expect(runDecoder(fnOf("function g(a){return a.split('').reverse().join('')}"), [text("ssecorp_dlihc")], host)).toBe("child_process");
-    expect(runDecoder(fnOf("function g(s,k){return s.split(',').map(c=>String.fromCharCode(Number(c)^k)).join('')}"), [text("43,42,47"), { kind: "number", value: 66 }], host)).toBe("ihm");
-    expect(runDecoder(fnOf("function g(s){return Buffer.from(s,'base64').toString()}"), [text("ZmV0Y2g=")], host)).toBe("fetch");
+    expect(runDecoder(fnOf("function g(h){return h.replace(/../g,m=>String.fromCharCode(parseInt(m,16)))}"), [text("6178696f73")], host)).toEqual({ kind: "decoded", value: "axios" });
+    expect(runDecoder(fnOf("function g(a){return a.split('').reverse().join('')}"), [text("ssecorp_dlihc")], host)).toEqual({ kind: "decoded", value: "child_process" });
+    expect(runDecoder(fnOf("function g(s,k){return s.split(',').map(c=>String.fromCharCode(Number(c)^k)).join('')}"), [text("43,42,47"), { kind: "number", value: 66 }], host)).toEqual({ kind: "decoded", value: "ihm" });
+    expect(runDecoder(fnOf("function g(s){return Buffer.from(s,'base64').toString()}"), [text("ZmV0Y2g=")], host)).toEqual({ kind: "decoded", value: "fetch" });
   });
 
   test("it gives up on anything it cannot run purely and quickly", () => {
     // a regex with a group or an open-ended repeat, a loop, a write, a call it does not know
-    expect(runDecoder(fnOf("function g(h){return h.replace(/(a+)+$/g,'')}"), [text("aaaa")], host)).toBeNull();
-    expect(runDecoder(fnOf("function g(h){for(;;){}return h}"), [text("x")], host)).toBeNull();
-    expect(runDecoder(fnOf("function g(h){globalThis.x=h;return h}"), [text("x")], host)).toBeNull();
-    expect(runDecoder(fnOf("function g(h){return fetch(h)}"), [text("x")], host)).toBeNull();
-    // a decoder that would build more than it may
-    expect(runDecoder(fnOf("function g(h){return h.split('').map(c=>h+h+h+h).join('')}"), [text("y".repeat(4000))], host)).toBeNull();
+    expect(runDecoder(fnOf("function g(h){return h.replace(/(a+)+$/g,'')}"), [text("aaaa")], host)).toEqual({ kind: "unsupported" });
+    expect(runDecoder(fnOf("function g(h){for(;;){}return h}"), [text("x")], host)).toEqual({ kind: "unsupported" });
+    expect(runDecoder(fnOf("function g(h){globalThis.x=h;return h}"), [text("x")], host)).toEqual({ kind: "unsupported" });
+    expect(runDecoder(fnOf("function g(h){return fetch(h)}"), [text("x")], host)).toEqual({ kind: "unsupported" });
+    // a decoder that would build more than it may stops at its limit, and says so
+    expect(runDecoder(fnOf("function g(h){return h.split('').map(c=>h+h+h+h).join('')}"), [text("y".repeat(4000))], host)).toMatchObject({ kind: "exhausted" });
   });
 });

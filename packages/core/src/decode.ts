@@ -2,8 +2,10 @@
 // String.fromCharCode(parseInt(m, 16)))}`) on the strings it is called with, so apm reads the names malware hides
 // behind it (`require(g('6178696f73'))` is `require('axios')`). Only expressions over strings, numbers and arrays:
 // string and array methods, String.fromCharCode, parseInt, atob and Buffer decoding, arithmetic, and callbacks of
-// those. No property writes, no loops, no other calls: anything else gives up. A step budget and length caps bound
-// it, and only regexes without groups or open-ended repeats run, so no input can make it slow. Pure.
+// those. No property writes, no loops, no other calls: anything else is unsupported. A step budget, length caps and a
+// call depth bound it, and it says when one of them stopped it (exhausted), which the analysis reports as code it did
+// not finish reading. Regexes run only from a subset apm can prove linear (safeRegexCost), and their work is charged to
+// the step budget, so no input can make it slow. Pure.
 import type { AnyNode, CallExpression, Identifier } from "acorn";
 
 type Env = ReadonlyMap<string, Value>;
@@ -20,7 +22,8 @@ type Value =
   | { k: "list"; v: Value[] }
   | { k: "fn"; node: AnyNode; env: Env }
   | { k: "bytes"; latin1: string }
-  | { k: "re"; re: RegExp };
+  /** `cost`: characters one attempt at matching compares at most (safeRegexCost). */
+  | { k: "re"; re: RegExp; cost: number };
 
 /** What the decoder needs from the reader: a constant's string or number, and the local function a callee names. */
 export type DecodeHost = {
@@ -28,37 +31,143 @@ export type DecodeHost = {
   localFunction: (callee: AnyNode) => AnyNode | null;
 };
 
-const MAX_STEPS = 200_000;
+/** What running a decoder came to: its string, a program apm does not run (unsupported), or a limit it hit (exhausted). */
+export type DecodeResult = { kind: "decoded"; value: string } | { kind: "unsupported" } | { kind: "exhausted"; limit: string };
+
+/** Steps one decoder call may take, shared with the regex work it does. */
+export const MAX_DECODER_STEPS = 200_000;
 const MAX_CHARS = 64 * 1024;
 const MAX_CALL_DEPTH = 4;
 
-/**
- * Regexes the decoder runs: characters, escapes and classes, each repeated at most a fixed one- or two-digit count or
- * made optional. No groups, alternation or open-ended repeats, so matching stays linear in the input.
- */
-const SAFE_REGEX = /^(?:(?:[^()|+*\\{}?[\]]|\\.|\[(?:[^\]\\]|\\.)*\])(?:\{\d{1,2}\}|\?)?)*$/;
+/** The longest fixed match a decoder regex may describe, in characters. */
+const MAX_REGEX_WIDTH = 64;
 
 const NOTHING: Value = { k: "nothing" };
 
-class GiveUp extends Error {}
+/** The program does something the decoder does not run. */
+class Unsupported extends Error {}
 
-type State = { steps: number; depth: number; host: DecodeHost };
+/** The decoder stopped at one of its limits; `limit` says which. */
+class Exhausted extends Error {
+  constructor(readonly limit: string) {
+    super(limit);
+  }
+}
+
+const LIMITS = {
+  steps: `more than ${MAX_DECODER_STEPS} steps`,
+  chars: `more than ${MAX_CHARS / 1024} KB of text`,
+  depth: `calls nested more than ${MAX_CALL_DEPTH} deep`,
+  builtin: "an argument list or nesting larger than the runtime takes",
+} as const;
+
+/** Steps the decoder may still take: this call's, and what the caller's allowance has left, whichever is smaller. */
+type State = { steps: number; max: number; depth: number; host: DecodeHost };
+
+function spend(state: State, n: number): void {
+  state.steps += n;
+
+  if (state.steps > state.max) throw new Exhausted(LIMITS.steps);
+}
+
+/**
+ * What one attempt at matching costs, in characters compared, when `pattern` is in the subset apm runs; null when it
+ * is not. The subset: single characters, escapes (no back-references), `.` and classes, each once, an exact `{n}`
+ * times (n at most 99) or, for one atom in the whole pattern, optional; `^`, `$`, `\b` and `\B` anywhere. No groups,
+ * alternation, lookarounds, open-ended or ranged repeats, lazy quantifiers or second optional atom. Such a pattern is a
+ * fixed sequence of one-character tests with at most one choice, so a backtracking engine tries at most two paths of
+ * at most MAX_REGEX_WIDTH characters from each start: linear in the input. Anything else is refused, not risked.
+ */
+export function safeRegexCost(pattern: string, flags: string): number | null {
+  if (/[^gimsuy]/.test(flags) || new Set(flags).size !== flags.length) return null;
+  let width = 0;
+  let optional = 0;
+  let i = 0;
+
+  while (i < pattern.length) {
+    const c = pattern[i] ?? "";
+    let atom = true;
+
+    if (c === "^" || c === "$") {
+      atom = false;
+      i++;
+    } else if (c === "\\") {
+      const e = pattern[i + 1];
+
+      // a back-reference, a named one, a property escape (it takes braces) or a trailing backslash
+      if (e === undefined || /[1-9kpP]/.test(e)) return null;
+
+      if (e === "b" || e === "B") atom = false;
+      i += 2;
+    } else if (c === "[") {
+      let j = i + 1;
+
+      if (pattern[j] === "]") return null;
+
+      for (; j < pattern.length && pattern[j] !== "]"; j++) {
+        if (pattern[j] === "\\") j++;
+        // a nested class or a set operation (only under the v flag, which is refused) never reaches here
+        else if (pattern[j] === "[") return null;
+      }
+
+      if (j >= pattern.length) return null;
+      i = j + 1;
+    } else if ("()|*+?{}]".includes(c)) return null;
+    else i++;
+
+    let times = 1;
+    const q = pattern[i];
+
+    if (q === "{") {
+      const m = /^\{(\d{1,2})\}/.exec(pattern.slice(i));
+
+      if (!m || !atom) return null;
+      times = Number(m[1]);
+      i += m[0].length;
+    } else if (q === "?") {
+      if (!atom || ++optional > 1) return null;
+      i++;
+    }
+
+    // a quantifier on a quantifier ("{2}?", "??", "{2}{3}") or a stray one after an assertion
+    if (pattern[i] === "?" || pattern[i] === "{" || pattern[i] === "*" || pattern[i] === "+") return null;
+
+    if (atom) width += times;
+
+    if (width > MAX_REGEX_WIDTH) return null;
+  }
+
+  return Math.max(1, width) * (optional + 1);
+}
 
 const str = (v: string): Value => ({ k: "str", v });
 const num = (v: number): Value => ({ k: "num", v });
 const known = (v: Known): Value => (v.kind === "text" ? str(v.value) : num(v.value));
 
-/** The string `fn` returns for `args`, or null when apm cannot run it as a pure decoder. */
-export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost): string | null {
-  const state: State = { steps: 0, depth: 0, host };
+/**
+ * The string `fn` returns for `args`, run as a pure decoder. `allowance` is the steps the caller still lets decoders
+ * take (a file's budget across every call); what this call takes is subtracted from it.
+ */
+export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost, allowance: { steps: number } = { steps: MAX_DECODER_STEPS }): DecodeResult {
+  if (allowance.steps <= 0) return { kind: "exhausted", limit: LIMITS.steps };
+  const state: State = { steps: 0, max: Math.min(MAX_DECODER_STEPS, allowance.steps), depth: 0, host };
 
   try {
     const out = call(fn, args.map(known), new Map(), state);
 
-    return out.k === "str" && out.v.length <= MAX_CHARS ? out.v : null;
-  } catch {
-    // GiveUp, or a builtin refusing its input (a too-long argument list, a bad encoding): not a decoder apm runs
-    return null;
+    if (out.k !== "str") return { kind: "unsupported" };
+
+    return out.v.length <= MAX_CHARS ? { kind: "decoded", value: out.v } : { kind: "exhausted", limit: LIMITS.chars };
+  } catch (e) {
+    if (e instanceof Exhausted) return { kind: "exhausted", limit: e.limit };
+
+    // a builtin refusing an argument list too long, or a stack too deep: a size limit, not a program apm does not run
+    if (e instanceof RangeError) return { kind: "exhausted", limit: LIMITS.builtin };
+
+    // Unsupported, or a builtin refusing its input (a bad encoding, a malformed URI escape): not a decoder apm runs
+    return { kind: "unsupported" };
+  } finally {
+    allowance.steps -= state.steps;
   }
 }
 
@@ -80,7 +189,9 @@ function parts(fn: AnyNode): { params: Identifier[]; body: AnyNode } | null {
 function call(fn: AnyNode, args: readonly Value[], outer: Env, state: State): Value {
   const f = parts(fn);
 
-  if (!f || state.depth >= MAX_CALL_DEPTH) throw new GiveUp();
+  if (!f) throw new Unsupported();
+
+  if (state.depth >= MAX_CALL_DEPTH) throw new Exhausted(LIMITS.depth);
   const env = new Map(outer);
 
   f.params.forEach((p, i) => env.set(p.name, args[i] ?? NOTHING));
@@ -95,15 +206,15 @@ function call(fn: AnyNode, args: readonly Value[], outer: Env, state: State): Va
     for (const st of body.body) {
       if (st.type === "ReturnStatement") return st.argument ? evaluate(st.argument, env, state) : NOTHING;
 
-      if (st.type !== "VariableDeclaration" || st.kind === "var") throw new GiveUp();
+      if (st.type !== "VariableDeclaration" || st.kind === "var") throw new Unsupported();
 
       for (const d of st.declarations) {
-        if (d.id.type !== "Identifier" || !d.init) throw new GiveUp();
+        if (d.id.type !== "Identifier" || !d.init) throw new Unsupported();
         env.set(d.id.name, evaluate(d.init, env, state));
       }
     }
 
-    throw new GiveUp();
+    throw new Unsupported();
   } finally {
     state.depth--;
   }
@@ -119,12 +230,15 @@ function text(v: Value): string {
     case "nothing":
       return "undefined";
     case "list":
-      return v.v.map((x) => (x.k === "nothing" ? "" : text(x))).join(",");
+      return joined(
+        v.v.map((x) => (x.k === "nothing" ? "" : text(x))),
+        ",",
+      );
     case "bytes":
       return Buffer.from(v.latin1, "latin1").toString("utf8");
     case "fn":
     case "re":
-      throw new GiveUp();
+      throw new Unsupported();
     default: {
       const _exhaustive: never = v;
 
@@ -137,7 +251,7 @@ function number(v: Value): number {
   if (v.k === "num") return v.v;
 
   if (v.k === "str" || v.k === "bool") return Number(v.v);
-  throw new GiveUp();
+  throw new Unsupported();
 }
 
 function truthy(v: Value): boolean {
@@ -156,22 +270,37 @@ function truthy(v: Value): boolean {
 }
 
 function capped(s: string): Value {
-  if (s.length > MAX_CHARS) throw new GiveUp();
+  if (s.length > MAX_CHARS) throw new Exhausted(LIMITS.chars);
 
   return str(s);
 }
 
 function list(v: Value[]): Value {
-  if (v.length > MAX_CHARS) throw new GiveUp();
+  if (v.length > MAX_CHARS) throw new Exhausted(LIMITS.chars);
 
   return { k: "list", v };
 }
 
+/** Joins pieces, refusing before it builds a string longer than the decoder may hold. */
+function joined(pieces: readonly string[], sep: string): string {
+  let total = Math.max(0, pieces.length - 1) * sep.length;
+
+  for (const p of pieces) {
+    total += p.length;
+
+    if (total > MAX_CHARS) throw new Exhausted(LIMITS.chars);
+  }
+
+  return pieces.join(sep);
+}
+
 function literal(n: Extract<AnyNode, { type: "Literal" }>): Value {
   if ("regex" in n && n.regex) {
-    if (!SAFE_REGEX.test(n.regex.pattern) || /[^gimsuy]/.test(n.regex.flags)) throw new GiveUp();
+    const cost = safeRegexCost(n.regex.pattern, n.regex.flags);
 
-    return { k: "re", re: new RegExp(n.regex.pattern, n.regex.flags) };
+    if (cost === null) throw new Unsupported();
+
+    return { k: "re", re: new RegExp(n.regex.pattern, n.regex.flags), cost };
   }
 
   const raw = n.raw ?? "";
@@ -186,7 +315,7 @@ function literal(n: Extract<AnyNode, { type: "Literal" }>): Value {
 }
 
 function evaluate(n: AnyNode, env: Env, state: State): Value {
-  if (++state.steps > MAX_STEPS) throw new GiveUp();
+  spend(state, 1);
 
   switch (n.type) {
     case "Literal":
@@ -199,7 +328,7 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
       if (n.name === "undefined") return NOTHING;
       const c = state.host.constant(n);
 
-      if (c === null) throw new GiveUp();
+      if (c === null) throw new Unsupported();
 
       return known(c);
     }
@@ -232,11 +361,11 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
       if (n.operator === "~") return num(~number(v));
 
       if (n.operator === "!") return { k: "bool", v: !truthy(v) };
-      throw new GiveUp();
+      throw new Unsupported();
     }
 
     case "BinaryExpression": {
-      if (n.left.type === "PrivateIdentifier") throw new GiveUp();
+      if (n.left.type === "PrivateIdentifier") throw new Unsupported();
 
       return binary(n.operator, evaluate(n.left, env, state), evaluate(n.right, env, state));
     }
@@ -244,7 +373,7 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
     case "ConditionalExpression":
       return truthy(evaluate(n.test, env, state)) ? evaluate(n.consequent, env, state) : evaluate(n.alternate, env, state);
     case "MemberExpression": {
-      if (n.object.type === "Super") throw new GiveUp();
+      if (n.object.type === "Super") throw new Unsupported();
       const obj = evaluate(n.object, env, state);
       const key = n.computed ? evaluate(n.property, env, state) : n.property.type === "Identifier" ? str(n.property.name) : NOTHING;
       const items = obj.k === "str" ? obj.v.split("").map(str) : obj.k === "list" ? obj.v : null;
@@ -252,7 +381,7 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
       if (items && key.k === "str" && key.v === "length") return num(items.length);
 
       if (items && key.k === "num") return items[key.v] ?? NOTHING;
-      throw new GiveUp();
+      throw new Unsupported();
     }
 
     case "CallExpression":
@@ -260,7 +389,7 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
     case "ChainExpression":
       return evaluate(n.expression, env, state);
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
 
@@ -289,12 +418,12 @@ function binary(op: string, a: Value, b: Value): Value {
     case ">>>":
       return num(number(a) >>> number(b));
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
 
 function invoke(f: Value, args: readonly Value[], state: State): Value {
-  if (f.k !== "fn") throw new GiveUp();
+  if (f.k !== "fn") throw new Unsupported();
 
   return call(f.node, args, f.env, state);
 }
@@ -315,16 +444,16 @@ function encoding(v: Value | undefined): BufferEncoding {
     case "utf-8":
       return "utf8";
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
 
 function callExpr(n: CallExpression, env: Env, state: State): Value {
-  if (n.callee.type === "Super") throw new GiveUp();
+  if (n.callee.type === "Super") throw new Unsupported();
   const args: Value[] = [];
 
   for (const a of n.arguments) {
-    if (a.type === "SpreadElement") throw new GiveUp();
+    if (a.type === "SpreadElement") throw new Unsupported();
     args.push(evaluate(a, env, state));
   }
 
@@ -366,24 +495,24 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
       default: {
         const fn = state.host.localFunction(callee);
 
-        if (!fn) throw new GiveUp();
+        if (!fn) throw new Unsupported();
 
         return call(fn, args, new Map(), state);
       }
     }
   }
 
-  if (callee.type !== "MemberExpression" || callee.computed || callee.property.type !== "Identifier" || callee.object.type === "Super") throw new GiveUp();
+  if (callee.type !== "MemberExpression" || callee.computed || callee.property.type !== "Identifier" || callee.object.type === "Super") throw new Unsupported();
   const recv = evaluate(callee.object, env, state);
   const method = callee.property.name;
 
   switch (recv.k) {
     case "bytes":
-      if (method !== "toString") throw new GiveUp();
+      if (method !== "toString") throw new Unsupported();
 
       return capped(Buffer.from(recv.latin1, "latin1").toString(encoding(args[0])));
     case "num":
-      if (method !== "toString") throw new GiveUp();
+      if (method !== "toString") throw new Unsupported();
 
       return str(recv.v.toString(args[0] === undefined ? 10 : number(a0)));
     case "str":
@@ -391,7 +520,7 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
     case "list":
       return arrayMethod(recv.v, method, args, state);
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
 
@@ -409,25 +538,34 @@ function stringMethod(s: string, method: string, a: readonly Value[], state: Sta
       const [pat, rep] = a;
       const target = pat?.k === "re" ? pat.re : pat?.k === "str" ? pat.v : null;
 
-      if (target === null || rep === undefined) throw new GiveUp();
+      if (target === null || rep === undefined) throw new Unsupported();
 
-      if (rep.k === "fn") {
-        const replacer = (m: string): string => {
-          state.steps += 4;
+      // matching tries every start, each at most `cost` characters: charged before the engine runs
+      if (pat?.k === "re") spend(state, Math.ceil(((s.length + 1) * pat.cost) / 16));
+      const fixed = rep.k === "fn" ? null : text(rep);
 
-          return text(invoke(rep, [str(m)], state));
-        };
+      // `$&`, `$'` and the like copy parts of the input per match, which the output count below cannot see coming
+      if (fixed?.includes("$")) throw new Unsupported();
+      // the output is counted as it is built, so a replacement that grows it stops before the string is made
+      let out = s.length;
 
-        return capped(method === "replace" ? s.replace(target, replacer) : s.replaceAll(target, replacer));
-      }
+      const replacer = (m: string): string => {
+        spend(state, 4);
+        const piece = rep.k === "fn" ? text(invoke(rep, [str(m)], state)) : (fixed ?? "");
+        out += piece.length - m.length;
 
-      return capped(method === "replace" ? s.replace(target, text(rep)) : s.replaceAll(target, text(rep)));
+        if (out > MAX_CHARS) throw new Exhausted(LIMITS.chars);
+
+        return piece;
+      };
+
+      return capped(method === "replace" ? s.replace(target, replacer) : s.replaceAll(target, replacer));
     }
 
     case "split": {
       const sep = a[0];
 
-      if (sep?.k !== "str") throw new GiveUp();
+      if (sep?.k !== "str") throw new Unsupported();
 
       return list(s.split(sep.v).map(str));
     }
@@ -455,7 +593,7 @@ function stringMethod(s: string, method: string, a: readonly Value[], state: Sta
     case "concat":
       return capped(s + a.map(text).join(""));
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
 
@@ -464,7 +602,12 @@ function arrayMethod(arr: Value[], method: string, a: readonly Value[], state: S
     case "join": {
       const sep = a[0];
 
-      return capped(arr.map((x) => (x.k === "nothing" ? "" : text(x))).join(sep === undefined || sep.k === "nothing" ? "," : text(sep)));
+      return str(
+        joined(
+          arr.map((x) => (x.k === "nothing" ? "" : text(x))),
+          sep === undefined || sep.k === "nothing" ? "," : text(sep),
+        ),
+      );
     }
 
     case "reverse":
@@ -476,12 +619,12 @@ function arrayMethod(arr: Value[], method: string, a: readonly Value[], state: S
     case "map": {
       const f = a[0];
 
-      if (f === undefined) throw new GiveUp();
+      if (f === undefined) throw new Unsupported();
 
       return list(arr.map((x, i) => invoke(f, [x, num(i)], state)));
     }
 
     default:
-      throw new GiveUp();
+      throw new Unsupported();
   }
 }
