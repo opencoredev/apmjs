@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Store } from "./db.ts";
-import { createHandler, issueToken, type Ctx, type Extensions, type NamePolicy, type TokenScope } from "./server.ts";
+import { createHandler, issueToken, withPrivacyHeaders, type Ctx, type Extensions, type NamePolicy, type TokenScope } from "./server.ts";
 import { apmExtensions } from "./apm.ts";
 import { Upstream } from "./upstream.ts";
 import { createAuth, type AuthOptions } from "./auth.ts";
@@ -108,7 +108,8 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
     },
   };
   const handler = createHandler(ctx, ext);
-  handle = async (req) => {
+
+  const route = async (req: Request): Promise<Response> => {
     if (new URL(req.url).pathname.startsWith("/api/auth/")) {
       try {
         return await auth.handler(req);
@@ -119,6 +120,9 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
     }
     return handler(req);
   };
+
+  // per-user answers say so to every cache, whichever route made them
+  handle = async (req) => withPrivacyHeaders(req, await route(req));
 
   return {
     url: base,

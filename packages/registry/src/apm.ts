@@ -38,9 +38,9 @@ import { digestLabel, type Upstream, type UpstreamPackage } from "./upstream.ts"
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-/** A revoke of an old or depended-on version waits this long before it becomes final. */
+/** A revoke of a version older than FRESH_MS waits this long before it becomes final. */
 export const PENDING_MS = DAY;
-/** Revokes of versions younger than this with no dependents take effect at once. */
+/** Revokes of versions younger than this take effect at once, dependents or not. */
 const FRESH_MS = 72 * HOUR;
 /** Incident response can reach back at most this far. */
 const INCIDENT_WINDOW_MS = 30 * DAY;
@@ -327,7 +327,7 @@ function moveTagsOff(ctx: Ctx, name: string, version: string): void {
   ctx.store.setDistTags(name, tags, ctx.now());
 }
 
-/** Revokes now when the version is fresh and nothing depends on it; otherwise starts a pending revoke. */
+/** Revokes now when the version is fresh (dependents or not); otherwise starts a pending revoke. */
 function revokeVersion(ctx: Ctx, v: VersionRecord, actor: string, reason: string, opts: { forceFinal?: boolean } = {}): "revoked" | "revoke-pending" {
   const at = ctx.now();
   // A fresh version revoked with the owner's password is the malware case: final at once, even if
