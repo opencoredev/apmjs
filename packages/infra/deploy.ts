@@ -7,8 +7,8 @@
 //   bun packages/infra/deploy.ts deploy  --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage production
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
@@ -125,7 +125,9 @@ const secret = authSecret({ action: args.action, dir: SECRETS, stage: args.stage
 // a plan of a stage that has never been deployed has no secret yet; Alchemy plans with a stand-in
 if (secret.kind === "missing") process.stdout.write(`auth secret: missing; deploy creates ${join(SECRETS, `auth-secret-${args.stage}`)}\n`);
 
-const bundle = await buildWorker("worker");
+// plan must not change the working tree: it bundles into a throwaway folder that is removed afterwards
+const planDir = args.action === "plan" ? mkdtempSync(join(tmpdir(), "apm-plan-bundle-")) : null;
+const bundle = planDir === null ? await buildWorker("worker") : await buildWorker("worker", planDir);
 
 process.stdout.write(`registry bundle: ${bundle}\n`);
 
@@ -152,6 +154,7 @@ const child = Bun.spawn(
       WORKERS_SUBDOMAIN: subdomain,
       NEON_URL: neonUrl,
       APM_DATABASE: database,
+      APM_REGISTRY_BUNDLE: bundle,
       AUTH_SECRET: secret.kind === "missing" ? "plan-only-stand-in-for-the-auth-secret-deploy-creates" : secret.value,
       GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
@@ -165,4 +168,8 @@ const child = Bun.spawn(
   },
 );
 
-process.exit(await child.exited);
+const exitCode = await child.exited;
+
+if (planDir !== null) rmSync(planDir, { recursive: true, force: true });
+
+process.exit(exitCode);

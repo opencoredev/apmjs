@@ -50,7 +50,7 @@ export default Alchemy.Stack(
 
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
-      main: resolve(import.meta.dirname, "../registry/dist/worker.js"),
+      main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
       bundle: false,
       compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
       env: {
