@@ -35,7 +35,7 @@ function Row({ e, now }: { e: RecentEvent; now: number }) {
             {e.reason ? `: ${e.reason}` : ` by ${e.actor}`}
           </span>
         </span>
-        <span className="hidden shrink-0 text-sm text-faint tabular-nums sm:block">{ago(e.at, now)}</span>
+        <span className="hidden shrink-0 text-sm text-muted-foreground tabular-nums sm:block">{ago(e.at, now)}</span>
         <ScoreBadge score={e.score} grade={e.grade} />
       </Link>
     </li>

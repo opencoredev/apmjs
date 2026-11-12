@@ -23,6 +23,8 @@ import {
 
 const SEARCH_DEBOUNCE_MS = 30;
 const NAME_CHECK_DEBOUNCE_MS = 250;
+/** Errors and answers made without npm are only reused this long, so a retype after an outage asks again. */
+const DEGRADED_TTL_MS = 5_000;
 
 function normalize(q: string): string {
   return q.trim().toLowerCase();
@@ -39,11 +41,16 @@ function packageHref(name: string): string {
 // ---------- data ----------
 
 type SearchDone = { kind: "ok"; answer: SearchAnswer } | { kind: "error" };
+type Stored<T> = { value: T; at: number; degraded: boolean };
 
-function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: string; pending: boolean } {
-  const [done, setDone] = useState<ReadonlyMap<string, SearchDone>>(() => new Map());
+function fresh<T>(entry: Stored<T> | undefined): boolean {
+  return entry !== undefined && (!entry.degraded || Date.now() - entry.at < DEGRADED_TTL_MS);
+}
+
+function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: string; pending: boolean; retry: () => void } {
+  const [done, setDone] = useState<ReadonlyMap<string, Stored<SearchDone>>>(() => new Map());
   const [shownQuery, setShownQuery] = useState("");
-  const have = q === "" || done.has(q);
+  const have = q === "" || fresh(done.get(q));
 
   useEffect(() => {
     if (have) return;
@@ -57,7 +64,8 @@ function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: str
       } catch {
         if (ctrl.signal.aborted) return;
       }
-      setDone((prev) => new Map(prev).set(q, result));
+      const degraded = result.kind === "error" || result.answer.upstreamFailed;
+      setDone((prev) => new Map(prev).set(q, { value: result, at: Date.now(), degraded }));
       setShownQuery(q);
     }, SEARCH_DEBOUNCE_MS);
     return () => {
@@ -66,15 +74,21 @@ function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: str
     };
   }, [q, have]);
 
-  const current = done.get(q) ?? done.get(shownQuery) ?? null;
-  return { current, shownQuery: done.has(q) ? q : shownQuery, pending: !have };
+  const current = (done.get(q) ?? done.get(shownQuery))?.value ?? null;
+  const retry = () =>
+    setDone((prev) => {
+      const next = new Map(prev);
+      next.delete(q);
+      return next;
+    });
+  return { current, shownQuery: done.has(q) ? q : shownQuery, pending: !have, retry };
 }
 
 type PartState<P extends NamePart> = { kind: "loading" } | { kind: "ok"; data: NamePartAnswer[P] } | { kind: "error" };
 
 function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P> {
-  const [done, setDone] = useState<ReadonlyMap<string, PartState<P>>>(() => new Map());
-  const have = q === null || done.has(q);
+  const [done, setDone] = useState<ReadonlyMap<string, Stored<PartState<P>>>>(() => new Map());
+  const have = q === null || fresh(done.get(q));
 
   useEffect(() => {
     if (q === null || have) return;
@@ -88,7 +102,7 @@ function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P
       } catch {
         if (ctrl.signal.aborted) return;
       }
-      setDone((prev) => new Map(prev).set(q, result));
+      setDone((prev) => new Map(prev).set(q, { value: result, at: Date.now(), degraded: result.kind === "error" }));
     }, NAME_CHECK_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
@@ -96,7 +110,7 @@ function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P
     };
   }, [q, part, have]);
 
-  return (q !== null && done.get(q)) || { kind: "loading" };
+  return (q !== null && done.get(q)?.value) || { kind: "loading" };
 }
 
 // ---------- small pieces ----------
@@ -316,8 +330,11 @@ function NameDisclosure({ q, states }: { q: string; states: NameStates }) {
 
 function ResultRow({ hit, q, id, active, reserveScore, onHover }: { hit: SearchHit; q: string; id: string; active: boolean; reserveScore: boolean; onHover: () => void }) {
   return (
-    <li id={id} role="option" aria-selected={active} className="border-b" onMouseMove={onHover}>
+    <li role="presentation" className="border-b" onMouseMove={onHover}>
       <Link
+        id={id}
+        role="option"
+        aria-selected={active}
         href={packageHref(hit.name)}
         prefetch={false}
         tabIndex={-1}
@@ -335,7 +352,7 @@ function ResultRow({ hit, q, id, active, reserveScore, onHover }: { hit: SearchH
         </span>
         <span className="hidden shrink-0 flex-col items-end gap-0.5 text-right font-mono text-[13px] text-muted-foreground tabular-nums sm:flex">
           <span>{hit.version}</span>
-          {hit.weeklyDownloads !== null && <span className="text-faint">{compact.format(hit.weeklyDownloads)}/wk</span>}
+          {hit.weeklyDownloads !== null && <span>{compact.format(hit.weeklyDownloads)}/wk</span>}
         </span>
         {hit.score ? <ScoreBadge score={hit.score.score} grade={hit.score.grade} /> : reserveScore ? <span className="hidden w-[3.75rem] shrink-0 sm:block" aria-hidden /> : null}
         <CornerDownLeftIcon className={cn("hidden size-4 shrink-0 text-muted-foreground sm:block", active ? "opacity-100" : "opacity-0")} aria-hidden />
@@ -350,15 +367,22 @@ function Results({
   listId,
   active,
   setActive,
+  retry,
 }: {
   done: SearchDone;
   q: string;
   listId: string;
   active: number;
   setActive: (i: number) => void;
+  retry: () => void;
 }) {
+  const again = (
+    <button type="button" onClick={retry} className="font-medium text-foreground underline underline-offset-4 hover:no-underline">
+      Try again
+    </button>
+  );
   if (done.kind === "error") {
-    return <p className="border-t py-6 text-muted-foreground">The registry did not answer. Keep typing or try again in a moment.</p>;
+    return <p className="border-t py-6 text-muted-foreground">The registry didn&apos;t answer. {again}</p>;
   }
   const { hits, total, upstreamFailed } = done.answer;
   // Keep the score column only when something in this answer has a stored score.
@@ -378,7 +402,15 @@ function Results({
       </div>
       {hits.length === 0 ? (
         <p className="border-t py-6 text-pretty text-muted-foreground">
-          Nothing on apm or npm matches <span className="font-mono text-foreground">{q}</span>.
+          {upstreamFailed ? (
+            <>
+              Nothing on this registry matches <span className="font-mono text-foreground">{q}</span>, and npm results are missing because npm didn&apos;t answer. {again}
+            </>
+          ) : (
+            <>
+              Nothing on apm or npm matches <span className="font-mono text-foreground">{q}</span>.
+            </>
+          )}
         </p>
       ) : (
         <ul id={listId} role="listbox" aria-label="Packages" className="border-t">
@@ -399,10 +431,11 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
   const listId = useId();
   const [value, setValue] = useState("");
   const q = normalize(value);
-  const { current, shownQuery, pending } = useLiveSearch(q);
+  const { current, shownQuery, pending, retry } = useLiveSearch(q);
   // Selection belongs to the answer it was made in, so a new answer starts unselected.
   const [selection, setSelection] = useState<{ query: string; index: number }>({ query: "", index: -1 });
-  const hits = current?.kind === "ok" ? current.answer.hits : [];
+  // Only a non-empty query has navigable results; after Esc the old answer must not open.
+  const hits = q !== "" && current?.kind === "ok" ? current.answer.hits : [];
   const active = selection.query === shownQuery ? Math.min(selection.index, hits.length - 1) : -1;
   const setActive = (index: number) => setSelection({ query: shownQuery, index });
   const showName = q !== "" && looksLikePackageName(q);
@@ -442,6 +475,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
   function update(next: string) {
     setValue(next);
+    if (normalize(next) === "") setSelection({ query: "", index: -1 });
     const url = urlFor(normalize(next));
     if (url !== `${window.location.pathname}${window.location.search}`) window.history.replaceState(null, "", url);
   }
@@ -540,7 +574,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
           )}
           <div className={cn("min-w-0 transition-opacity duration-200", pending && current ? "opacity-70" : "")}>
             {current ? (
-              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} />
+              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} retry={retry} />
             ) : (
               <div aria-hidden className="flex flex-col">
                 <Line className="mb-4 w-24" />
