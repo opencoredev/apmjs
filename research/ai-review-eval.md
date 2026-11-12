@@ -150,7 +150,7 @@ Do not use the rules as a cheap pre-filter that decides what Flash reads: they p
 - Labels are DataDog's. Three of the 40 have no payload in the tarball, and I judged that by reading them after the run.
 - I changed the file ordering once after looking at a sample: the @solana/web3.js payload was in the Node bundles, while the budget had gone to the browser bundles. Node entry points now rank above browser ones. The diff algorithm was also replaced, from LCS to Myers, after the LCS fallback turned that bundle into one 11,000-line rewrite. Both changes were made before any model run, but they were informed by one malicious sample.
 - Benign "first publish" reviews reuse the same 41 releases as the diff reviews, so the two columns are not independent.
-- The rule score ran without publisher history or dependency scores, which understates it somewhat.
+- The rule score ran without publisher history or dependency scores, which understates it somewhat. The runs used `score.ts` as of 7a5e0d8. The hardening commit db8e430 landed while I was writing up, so I recomputed every case with it: 10 scores dropped by 10 points (the new obfuscation check fires more often, for example debug 4.4.2 goes from 90 to 80), and no case crossed 60, so the rules rows above still hold. `results/summary.json` keeps the scores from the run.
 - The volume figures assume the packument `time` field is accurate and that a package's latest change in the feed is its last modification. Unpublished versions are not counted.
 - Some compromised samples (debug, solana) are well-known incidents that may be in the model's training data. The 2026 samples were caught at the same rate.
 
