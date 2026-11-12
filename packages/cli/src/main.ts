@@ -7,8 +7,11 @@ import { join, relative } from "node:path";
 import { z } from "zod";
 import { analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
-import { loadConfig, saveToken } from "./config.ts";
-import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection } from "./pm.ts";
+import { installedPackages, isValidRange } from "./audit.ts";
+import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
+import { isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
+import { lockedEntry } from "./lockfile.ts";
+import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
 
 const VERSION = "0.1.0";
 const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
@@ -56,11 +59,26 @@ const dim = paint("2");
 const bold = paint("1");
 
 let jsonMode = false;
+let jsonDone = false;
+let lastError: string | null = null;
 function say(line = ""): void {
   (jsonMode ? process.stderr : process.stdout).write(`${line}\n`);
 }
 function warn(line: string): void {
   process.stderr.write(`${line}\n`);
+}
+
+/** A failure: printed to stderr, and kept for the --json result. */
+function fail(line: string): void {
+  lastError = line;
+  warn(red(line));
+}
+
+/** With --json every apm command prints exactly one JSON document on stdout; the first one wins. */
+function emit<Doc extends { ok: boolean }>(doc: Doc): void {
+  if (!jsonMode || jsonDone) return;
+  jsonDone = true;
+  process.stdout.write(`${JSON.stringify(doc)}\n`);
 }
 
 function gradeColor(score: number): (s: string) => string {
@@ -89,9 +107,31 @@ function env(): Record<string, string | undefined> {
   return { ...process.env };
 }
 
-/** Child env for the package manager: it installs from the same registry apm just checked. */
-function pmEnv(registry: string): Record<string, string | undefined> {
-  return { ...process.env, npm_config_registry: registry, NPM_CONFIG_REGISTRY: registry };
+/** Reads the config and says so when APM_TOKEN is held back from a registry it was not issued for. */
+function config(cwd: string): Config {
+  const cfg = loadConfig(cwd, env());
+
+  if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${cfg.withheld}, so it is not sent to ${cfg.registry} (set by a project .npmrc or npm_config_registry)`));
+
+  return cfg;
+}
+
+/**
+ * Child env for the package manager: no credentials (install scripts and package binaries run with it), and
+ * the registry and the given scopes pinned to the registry apm just checked.
+ */
+function pmEnv(registry: string, scopes: string[] = []): Record<string, string | undefined> {
+  return childEnv({ parent: process.env, registry, scopes, keepAuth: false });
+}
+
+/** Refuses when a config file would fetch (or publish) a scope from a registry other than the one apm checked. */
+function refuseOverrides(overrides: Override[], registry: string, action: string): boolean {
+  if (overrides.length === 0) return false;
+
+  for (const o of overrides) fail(`refused: ${o.source} sends ${o.scope} to ${o.registry}, but apm checked ${registry}`);
+  say(`apm will not ${action} a package from a registry it did not check. Remove those lines, or point APM_REGISTRY at that registry.`);
+
+  return true;
 }
 
 async function readPassword(a: Args): Promise<string> {
@@ -102,9 +142,10 @@ async function readPassword(a: Args): Promise<string> {
     return text.split(/\r?\n/)[0] ?? "";
   }
   if (!process.stdin.isTTY) throw new Error("This needs your account password. Pass it with --password-stdin.");
-  process.stdout.write("Password: ");
+  const tty = jsonMode ? process.stderr : process.stdout;
+  tty.write("Password: ");
   const answer = await readHidden();
-  process.stdout.write("\n");
+  tty.write("\n");
   return answer;
 }
 
@@ -162,13 +203,21 @@ function pmFor(a: Args, cwd: string): Detection {
 
 // ---------- add / x ----------
 type UncheckedDeps = z.infer<typeof Tree>["uncheckedDeps"];
-type Resolved = { name: string; version: string | null; report: Report | null; skipped: { version: string; reason: string }[]; blocked: string | null; source: string; unchecked: UncheckedDeps };
+
+/**
+ * `forceable`: --force would get past this refusal, because some version is held back only by the score floor
+ * or the cooldown. Revoked and yanked versions, unknown names and dangerous dependencies never are.
+ */
+type Resolved = { name: string; version: string | null; report: Report | null; skipped: { version: string; reason: string }[]; blocked: string | null; forceable: boolean; source: string; unchecked: UncheckedDeps };
+
+const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
 
 async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
   const params = new URLSearchParams({ name, range: range ?? "latest" });
-  // --force overrides the score floor and the cooldown; revoked and yanked versions stay blocked
+  // --force overrides this package's score floor and cooldown; revoked and yanked versions stay blocked,
+  // and the registry still checks its dependency tree at the default floor
   if (has(a, "no-cooldown") || force) params.set("cooldown", "0");
   else if (flag(a, "cooldown")) params.set("cooldown", flag(a, "cooldown") ?? "24h");
   if (force) params.set("floor", "0");
@@ -176,16 +225,21 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const r = await api.raw(`-/apm/v1/resolve?${params}`);
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [] };
+
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [] };
   }
   if (r.status === 422) {
-    const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional() }).parse(r.body);
+    const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
     const newestReport = f.newest ? (await scoreOf(api, name, f.newest.version)) : null;
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, source: "apm", unchecked: [] };
+    const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
+    const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
+
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [] };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, source: "none", unchecked: [] };
+
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [] };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -206,15 +260,67 @@ function printResolved(r: Resolved): void {
   if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);
 }
 
+/** What to tell someone whose install was refused: --force only when it would help, and what it does. */
+function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
+  const forceable = blocked.filter((b) => b.forceable);
+  const stuck = blocked.filter((b) => !b.forceable);
+
+  if (forceable.length > 0) {
+    say(`Review the signals above. To ${verb === "add" ? "install" : "run"} anyway: apm ${verb} ${forceable.map((b) => b.name).join(" ")} --force`);
+    say(dim("  --force lifts the score floor and the cooldown for the named package only; its dependencies are still checked."));
+  }
+
+  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, unknown names and dangerous dependencies stay blocked.`);
+}
+
+const DistSchema = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose() }).loose()) }).loose();
+
+/**
+ * The lockfile must record, for each added package, the integrity the checked registry serves. bun and pnpm
+ * keep a locked name@version even when told another registry, so this runs before the install (an entry
+ * pinned to another artifact is refused before its scripts run) and after it (`afterInstall`: the entry
+ * the package manager just wrote).
+ */
+async function lockMismatches(input: { api: Api; cwd: string; pm: Pm; results: Resolved[]; afterInstall: boolean }): Promise<string[]> {
+  const { api, cwd, pm } = input;
+  const problems: string[] = [];
+
+  for (const r of input.results) {
+    if (r.version === null) continue;
+    const locked = lockedEntry({ cwd, pm, name: r.name, version: r.version });
+
+    if (!locked?.integrity) {
+      if (input.afterInstall && pm !== "yarn") warn(yellow(`apm: could not find ${r.name}@${r.version} in the ${pm} lockfile to confirm it came from ${api.cfg.registry}`));
+      continue;
+    }
+
+    let expected: string | undefined;
+
+    try {
+      expected = (await api.get(encodeName(r.name), DistSchema)).versions[r.version]?.dist.integrity;
+    } catch {
+      expected = undefined;
+    }
+
+    if (!expected) warn(yellow(`apm: ${api.cfg.registry} gave no integrity for ${r.name}@${r.version}; the lockfile entry was not compared`));
+    else if (expected !== locked.integrity) problems.push(`${r.name}@${r.version}: the lockfile has ${locked.integrity}${locked.resolved ? ` from ${locked.resolved}` : ""}, but ${api.cfg.registry} serves ${expected}`);
+  }
+
+  return problems;
+}
+
 async function cmdAdd(a: Args): Promise<number> {
   const cwd = process.cwd();
-  const cfg = loadConfig(cwd, env());
+  const cfg = config(cwd);
   const api = new Api(cfg);
   const det = pmFor(a, cwd);
   const specs = a.positional;
   if (specs.length === 0) {
     say(dim(`apm: no packages given, running ${det.pm} install`));
-    return (await runCmd([det.pm, "install"], { cwd, env: env() })).code;
+    const code = (await runCmd([det.pm, "install"], { cwd, env: withoutSecrets(process.env), stdoutToStderr: jsonMode })).code;
+    emit({ ok: code === 0, pm: det.pm, packages: [] });
+
+    return code;
   }
   const results: Resolved[] = [];
   for (const spec of specs) results.push(await resolveSpec(api, spec, a));
@@ -223,36 +329,74 @@ async function cmdAdd(a: Args): Promise<number> {
   if (blocked.length > 0) {
     say();
     for (const b of blocked) say(red(`refused: ${b.blocked ?? `${b.name}: nothing to install`}`));
-    say(`Review the signals above. To install anyway: apm add ${blocked.map((b) => b.name).join(" ")} --force`);
-    if (jsonMode) emitJson(false, det, results);
+    refusalAdvice(blocked, "add");
+    emitJson(false, det, results);
+
+    return 1;
+  }
+
+  const scopes = scopesOf(results.map((r) => r.name));
+
+  if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "install")) {
+    emitJson(false, det, results, lastError);
+
+    return 1;
+  }
+
+  const pinnedElsewhere = await lockMismatches({ api, cwd, pm: det.pm, results, afterInstall: false });
+
+  for (const m of pinnedElsewhere) fail(`refused: the lockfile pins another artifact: ${m}`);
+
+  if (pinnedElsewhere.length > 0) {
+    say(`Delete ${pinnedElsewhere.length === 1 ? "that entry" : "those entries"} from the lockfile, then run apm add again.`);
+    emitJson(false, det, results, lastError);
     return 1;
   }
   const pinned = results.map((r) => `${r.name}@${r.version}`);
-  const cmd = addArgs(det.pm, pinned, has(a, "dev"));
+  const cmd = [...addArgs(det.pm, pinned, has(a, "dev")), ...registryArgs(det.pm, cfg.registry, scopes)];
   say(dim(`→ ${cmd.join(" ")}  (${det.pm}: ${det.why})`));
-  const run = await runCmd(cmd, { cwd, env: pmEnv(cfg.registry), stdoutToStderr: jsonMode });
-  if (jsonMode) emitJson(run.code === 0, det, results);
-  return run.code;
+  const run = await runCmd(cmd, { cwd, env: pmEnv(cfg.registry, scopes), stdoutToStderr: jsonMode });
+
+  if (run.code !== 0) {
+    emitJson(false, det, results);
+
+    return run.code;
+  }
+
+  const mismatched = await lockMismatches({ api, cwd, pm: det.pm, results, afterInstall: true });
+
+  for (const m of mismatched) fail(`not the checked artifact: ${m}`);
+
+  if (mismatched.length > 0) {
+    say(`Remove ${mismatched.length === 1 ? "it" : "them"} (${det.pm} remove …) and check the lockfile and .npmrc for another registry.`);
+    emitJson(false, det, results, lastError);
+
+    return 1;
+  }
+
+  emitJson(true, det, results);
+
+  return 0;
 }
 
-function emitJson(ok: boolean, det: Detection, results: Resolved[]): void {
-  process.stdout.write(
-    `${JSON.stringify({
-      ok,
-      pm: det.pm,
-      packages: results.map((r) => ({
-        name: r.name,
-        version: r.version,
-        score: r.report?.score ?? null,
-        grade: r.report?.grade ?? null,
-        signals: r.report?.signals.map((s) => ({ id: s.id, points: s.points })) ?? [],
-        skipped: r.skipped,
-        unchecked: r.unchecked,
-        blocked: r.blocked !== null,
-        reason: r.blocked,
-      })),
-    })}\n`,
-  );
+function emitJson(ok: boolean, det: Detection, results: Resolved[], error: string | null = null): void {
+  emit({
+    ok,
+    pm: det.pm,
+    error,
+    packages: results.map((r) => ({
+      name: r.name,
+      version: r.version,
+      score: r.report?.score ?? null,
+      grade: r.report?.grade ?? null,
+      signals: r.report?.signals.map((s) => ({ id: s.id, points: s.points })) ?? [],
+      skipped: r.skipped,
+      unchecked: r.unchecked,
+      blocked: r.blocked !== null,
+      reason: r.blocked,
+      forceable: r.forceable,
+    })),
+  });
 }
 
 async function cmdX(a: Args): Promise<number> {
@@ -262,20 +406,26 @@ async function cmdX(a: Args): Promise<number> {
     warn("usage: apm x <package>[@version] [args...]");
     return 2;
   }
-  const cfg = loadConfig(cwd, env());
+
+  const cfg = config(cwd);
   const api = new Api(cfg);
   const det = pmFor(a, cwd);
   const r = await resolveSpec(api, spec, a);
   printResolved(r);
   if (r.blocked !== null || r.version === null) {
     say(red(`refused to run ${r.name}: ${r.blocked ?? "no version"}`));
-    say(`To run it anyway: apm x ${spec} --force`);
+    refusalAdvice([r], "x");
     return 1;
   }
+
+  const scopes = scopesOf([r.name]);
+
+  if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "run")) return 1;
   const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown"].includes(x));
   const cmd = execArgs(det.pm, `${r.name}@${r.version}`, rest.length > 0 ? passArgs : []);
   say(dim(`→ ${cmd.join(" ")}`));
-  return (await runCmd(cmd, { cwd, env: pmEnv(cfg.registry) })).code;
+
+  return (await runCmd(cmd, { cwd, env: pmEnv(cfg.registry, scopes) })).code;
 }
 
 // ---------- score / name ----------
@@ -285,11 +435,13 @@ async function cmdScore(a: Args): Promise<number> {
     warn("usage: apm score <package>[@version] [--json]");
     return 2;
   }
-  const api = new Api(loadConfig(process.cwd(), env()));
+
+  const api = new Api(config(process.cwd()));
   const { name, range } = parseSpec(spec);
   const s = await api.get(`-/apm/v1/score/${encodeName(name)}${range ? `/${encodeURIComponent(range)}` : ""}`, ScoreResponse);
-  if (has(a, "json")) {
-    process.stdout.write(`${JSON.stringify(s)}\n`);
+
+  if (jsonMode) {
+    emit({ ok: true, ...s });
     return 0;
   }
   printCard(`${s.name}@${s.version}`, s, { maxEvidence: 3 });
@@ -305,7 +457,8 @@ async function cmdName(a: Args): Promise<number> {
     warn("usage: apm name <name>");
     return 2;
   }
-  const cfg = loadConfig(process.cwd(), env());
+
+  const cfg = config(process.cwd());
   const api = new Api(cfg);
   let user = "";
   if (cfg.token) {
@@ -313,8 +466,9 @@ async function cmdName(a: Args): Promise<number> {
     if (me.status === 200 && typeof me.body === "object" && me.body !== null && "username" in me.body) user = String(me.body.username);
   }
   const r = await api.get(`-/apm/v1/names?q=${encodeURIComponent(q)}${user ? `&user=${encodeURIComponent(user)}` : ""}`, NameResponse);
-  if (has(a, "json")) {
-    process.stdout.write(`${JSON.stringify(r)}\n`);
+
+  if (jsonMode) {
+    emit({ ok: true, ...r });
     return 0;
   }
   if (!r.valid) say(red(`✗ ${r.query} is not a valid package name`));
@@ -328,54 +482,34 @@ async function cmdName(a: Args): Promise<number> {
 }
 
 // ---------- audit ----------
-function installedPackages(root: string): Map<string, Set<string>> {
-  const out = new Map<string, Set<string>>();
-  const visit = (nm: string, depth: number): void => {
-    if (depth > 8 || !existsSync(nm)) return;
-    for (const entry of readdirSync(nm)) {
-      if (entry.startsWith(".")) continue;
-      const dirs = entry.startsWith("@") ? readdirSync(join(nm, entry)).map((s) => join(entry, s)) : [entry];
-      for (const d of dirs) {
-        const pj = join(nm, d, "package.json");
-        if (!existsSync(pj)) continue;
-        try {
-          const parsed = z.object({ name: z.string(), version: z.string() }).safeParse(JSON.parse(readFileSync(pj, "utf8")));
-          if (parsed.success) {
-            const set = out.get(parsed.data.name) ?? new Set<string>();
-            set.add(parsed.data.version);
-            out.set(parsed.data.name, set);
-          }
-        } catch {
-          // skip unreadable package.json
-        }
-        visit(join(nm, d, "node_modules"), depth + 1);
-      }
-    }
-  };
-  visit(join(root, "node_modules"), 0);
-  return out;
-}
-
-async function cmdAudit(a: Args): Promise<number> {
+async function cmdAudit(): Promise<number> {
   const cwd = process.cwd();
-  const api = new Api(loadConfig(cwd, env()));
-  const installed = installedPackages(cwd);
-  if (installed.size === 0) {
+  const api = new Api(config(cwd));
+  const { packages: installed, unchecked: unreadable } = installedPackages(cwd);
+
+  if (installed.size === 0 && unreadable.length === 0) {
     say(dim("apm audit: nothing installed (run apm install first)"));
+    emit({ ok: true, checked: 0, findings: [], unchecked: [] });
     return 0;
   }
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
-  const audit = await api.post("-/apm/v1/audit", query, AuditResponse);
-  const scan = await api.post("-/apm/v1/scan", { packages: [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version }))) }, ScanResponse);
+  const audit = installed.size > 0 ? await api.post("-/apm/v1/audit", query, AuditResponse) : { advisories: {}, unavailable: [] };
+  const scan = installed.size > 0 ? await api.post("-/apm/v1/scan", { packages: [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version }))) }, ScanResponse) : { advisories: [], unchecked: [] };
   const findings: { id: string; severity: string; text: string }[] = [];
   // checks that could not run: an audit with any of these is not a pass
   const unchecked: { id: string; reason: string }[] = [
+    ...unreadable,
     ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: "advisories could not be fetched from the upstream registry" }))),
     ...scan.unchecked.map((u) => ({ id: `${u.package}@${u.version}`, reason: u.reason })),
   ];
   for (const [name, advisories] of Object.entries(audit.advisories)) {
     for (const adv of advisories) {
+      // Bun.semver.satisfies matches every version against a malformed range; such an advisory is unchecked, not a hit
+      if (!isValidRange(adv.vulnerable_versions)) {
+        unchecked.push({ id: name, reason: `advisory "${adv.title}" has an unparseable range ${JSON.stringify(adv.vulnerable_versions)}` });
+        continue;
+      }
       for (const v of installed.get(name) ?? []) {
         if (Bun.semver.satisfies(v, adv.vulnerable_versions)) findings.push({ id: `${name}@${v}`, severity: adv.severity, text: adv.title });
       }
@@ -385,8 +519,9 @@ async function cmdAudit(a: Args): Promise<number> {
     if (!findings.some((f) => f.id === `${s.package}@${s.version}`)) findings.push({ id: `${s.package}@${s.version}`, severity: "critical", text: s.description });
   }
   const ok = findings.length === 0 && unchecked.length === 0;
-  if (has(a, "json")) {
-    process.stdout.write(`${JSON.stringify({ ok, checked: installed.size, findings, unchecked })}\n`);
+
+  if (jsonMode) {
+    emit({ ok, checked: installed.size, findings, unchecked });
     return ok ? 0 : 1;
   }
   if (ok) {
@@ -394,10 +529,14 @@ async function cmdAudit(a: Args): Promise<number> {
     return 0;
   }
   for (const f of findings) say(`${red(f.severity.padEnd(8))} ${bold(f.id)}  ${f.text}`);
-  for (const u of unchecked) say(`${yellow("unchecked".padEnd(8))} ${bold(u.id)}  ${u.reason}`);
+
+  for (const u of unchecked.slice(0, 20)) say(`${yellow("unchecked".padEnd(8))} ${bold(u.id)}  ${u.reason}`);
+
+  if (unchecked.length > 20) say(dim(`  … and ${unchecked.length - 20} more not checked`));
   say();
   if (findings.length > 0) say(`${findings.length} problem${findings.length === 1 ? "" : "s"} in ${installed.size} packages. Upgrade or remove them; revoked versions stop installing soon.`);
-  if (unchecked.length > 0) say(`${unchecked.length} package version${unchecked.length === 1 ? "" : "s"} could not be checked, so this audit is not a pass.`);
+
+  if (unchecked.length > 0) say(`${unchecked.length} item${unchecked.length === 1 ? "" : "s"} could not be checked, so this audit is not a pass.`);
   return 1;
 }
 
@@ -409,7 +548,8 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
     warn(`usage: apm ${action} <package>@<version>${action === "revoke" || action === "yank" ? " --reason \"...\"" : ""}`);
     return 2;
   }
-  const api = new Api(loadConfig(process.cwd(), env()));
+
+  const api = new Api(config(process.cwd()));
   const reason = flag(a, "reason");
   if (action === "revoke" && !reason) {
     warn("apm revoke needs --reason; everyone with this version installed will see it.");
@@ -421,12 +561,13 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
   const proof = needsFactor ? await readProof(a) : otp ? { otp } : {};
   const r = await api.raw(`-/apm/v1/${action}`, { method: "POST", body: { name: parsed.name, version: parsed.range, ...(reason ? { reason } : {}), ...proof } });
   if (r.status !== 200) {
-    warn(red(`apm ${action} failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));
+    fail(`apm ${action} failed: ${errorOf(r.body, r.status)}`);
     return 1;
   }
   const body = z.object({ status: z.string(), finalAt: z.string().optional(), note: z.string().optional() }).loose().parse(r.body);
   say(`${green("✓")} ${parsed.name}@${parsed.range} is now ${bold(body.status)}`);
   if (body.finalAt) say(dim(`  becomes a full revoke at ${body.finalAt}. ${body.note ?? ""}`));
+  emit({ ok: true, name: parsed.name, version: parsed.range, status: body.status, finalAt: body.finalAt ?? null, note: body.note ?? null });
   return 0;
 }
 
@@ -436,24 +577,39 @@ async function cmdIncident(a: Args): Promise<number> {
     warn("usage: apm incident --since <ISO time of your last trusted publish> [--reason ...] [--dry-run]");
     return 2;
   }
-  const api = new Api(loadConfig(process.cwd(), env()));
+
+  const api = new Api(config(process.cwd()));
   const proof = await readProof(a);
   const body = { since, reason: flag(a, "reason") ?? "account compromised", ...proof, dryRun: has(a, "dry-run") };
   const r = await api.raw("-/apm/v1/incident", { method: "POST", body });
   if (r.status !== 200) {
-    warn(red(`apm incident failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));
+    fail(`apm incident failed: ${errorOf(r.body, r.status)}`);
     return 1;
   }
   const res = z.object({ revoked: z.array(z.string()), tokensRevoked: z.number(), dryRun: z.boolean().optional() }).loose().parse(r.body);
   say(res.dryRun ? bold("Preview (nothing changed):") : bold("Incident response done:"));
   for (const id of res.revoked) say(`  revoke ${id}`);
   say(`  ${res.dryRun ? "would revoke" : "revoked"} ${res.tokensRevoked} token(s)`);
+  emit({ ok: true, dryRun: res.dryRun ?? false, revoked: res.revoked, tokensRevoked: res.tokensRevoked });
   return 0;
 }
 
 // ---------- login ----------
 const DeviceStart = z.object({ deviceCode: z.string(), userCode: z.string(), verificationUrl: z.string(), verificationUrlComplete: z.string(), interval: z.number(), expiresIn: z.number() });
 const DeviceDone = z.object({ token: z.string(), username: z.string() });
+
+/** Saves a token the registry handed out, after checking it is one: a newline in it would write extra .npmrc lines. */
+function storeToken(cfg: Config, token: string): boolean {
+  if (!isApmToken(token)) {
+    fail(`login failed: ${cfg.registry} returned a token that is not an apm token; nothing was saved`);
+
+    return false;
+  }
+
+  saveToken(cfg.userconfig, cfg.registry, token);
+
+  return true;
+}
 
 function openBrowser(url: string): void {
   const cmd = process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
@@ -467,16 +623,16 @@ function openBrowser(url: string): void {
 /** Device login: the browser signs in (GitHub or Vercel) and approves the code; the CLI gets a token that stages publishes. */
 async function cmdLogin(a: Args): Promise<number> {
   if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
-  const cfg = loadConfig(process.cwd(), env());
+  const cfg = config(process.cwd());
   const api = new Api({ ...cfg, token: null });
   const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
   const d = DeviceStart.safeParse(start.body);
   if (start.status !== 200 || !d.success) {
-    warn(red(`login failed: ${errorOf(start.body, start.status)}`));
+    fail(`login failed: ${errorOf(start.body, start.status)}`);
     return 1;
   }
   const code = d.data.userCode.length === 8 ? `${d.data.userCode.slice(0, 4)}-${d.data.userCode.slice(4)}` : d.data.userCode;
-  process.stdout.write(`Open ${d.data.verificationUrlComplete}\nand check that it shows the code ${bold(code)}, then approve.\n`);
+  say(`Open ${d.data.verificationUrlComplete}\nand check that it shows the code ${bold(code)}, then approve.`);
   const canOpen = !has(a, "no-browser") && process.stdout.isTTY === true && (process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY));
   if (canOpen) openBrowser(d.data.verificationUrlComplete);
   say(dim("Waiting for the browser…"));
@@ -487,10 +643,12 @@ async function cmdLogin(a: Args): Promise<number> {
     const r = await api.raw("-/apm/v1/login/device/token", { method: "POST", body: { deviceCode: d.data.deviceCode } });
     if (r.status === 200) {
       const done = DeviceDone.parse(r.body);
-      saveToken(cfg.userconfig, cfg.registry, done.token);
+
+      if (!storeToken(cfg, done.token)) return 1;
       say(`${green("✓")} logged in to ${cfg.registry} as ${bold(done.username)}`);
       say(dim(`  token saved to ${cfg.userconfig}; npm, pnpm and bun read it from there`));
       say(dim(`  publishes with it wait for you to approve them in the browser`));
+      emit({ ok: true, registry: cfg.registry, username: done.username, userconfig: cfg.userconfig });
       return 0;
     }
     const err = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "";
@@ -499,16 +657,18 @@ async function cmdLogin(a: Args): Promise<number> {
       interval += 1000;
       continue;
     }
-    warn(red(`login failed: ${errorOf(r.body, r.status)}`));
+
+    fail(`login failed: ${errorOf(r.body, r.status)}`);
     return 1;
   }
-  warn(red("login failed: the code expired before it was approved. Run apm login again."));
+
+  fail("login failed: the code expired before it was approved. Run apm login again.");
   return 1;
 }
 
 /** npm's password login, for registries that run with legacy auth on. */
 async function cmdPasswordLogin(a: Args): Promise<number> {
-  const cfg = loadConfig(process.cwd(), env());
+  const cfg = config(process.cwd());
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
     warn("usage: apm login --username <name> --password-stdin");
@@ -522,25 +682,28 @@ async function cmdPasswordLogin(a: Args): Promise<number> {
   });
   const tok = z.object({ token: z.string() }).safeParse(r.body);
   if ((r.status !== 201 && r.status !== 200) || !tok.success) {
-    warn(red(`login failed: ${errorOf(r.body, r.status)}`));
+    fail(`login failed: ${errorOf(r.body, r.status)}`);
     return 1;
   }
-  saveToken(cfg.userconfig, cfg.registry, tok.data.token);
+
+  if (!storeToken(cfg, tok.data.token)) return 1;
   say(`${green("✓")} logged in to ${cfg.registry} as ${bold(username)}`);
   say(dim(`  token saved to ${cfg.userconfig}; npm, pnpm and bun read it from there`));
+  emit({ ok: true, registry: cfg.registry, username, userconfig: cfg.userconfig });
   return 0;
 }
 
 async function cmdWhoami(): Promise<number> {
-  const cfg = loadConfig(process.cwd(), env());
+  const cfg = config(process.cwd());
   const api = new Api(cfg);
   const r = await api.raw("-/whoami");
   if (r.status !== 200) {
-    warn(`not logged in to ${cfg.registry} (run apm login)`);
+    fail(`not logged in to ${cfg.registry} (run apm login)`);
     return 1;
   }
   const me = z.object({ username: z.string() }).parse(r.body);
   say(`${me.username} ${dim(`on ${cfg.registry}`)}`);
+  emit({ ok: true, username: me.username, registry: cfg.registry });
   return 0;
 }
 
@@ -577,7 +740,8 @@ function fmtSize(n: number): string {
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-const Manifest = z.object({ name: z.string(), version: z.string(), files: z.array(z.string()).optional() }).loose();
+const Manifest = z.object({ name: z.string(), version: z.string(), files: z.array(z.string()).optional(), publishConfig: z.object({ registry: z.string().optional() }).loose().optional() }).loose();
+const Published = z.object({ versions: z.record(z.string(), z.object({ version: z.string() }).loose()) }).loose();
 
 async function cmdPublish(a: Args): Promise<number> {
   const cwd = process.cwd();
@@ -586,8 +750,23 @@ async function cmdPublish(a: Args): Promise<number> {
     warn("apm publish: no package.json here");
     return 2;
   }
+
+  const cfg = config(cwd);
   const det = pmFor(a, cwd);
   const pj = Manifest.parse(JSON.parse(readFileSync(pjPath, "utf8")));
+  // The upload goes to the registry apm checks and previews for, or nowhere: publishConfig and scoped
+  // registry lines in .npmrc or bunfig would otherwise send it elsewhere (npm's public registry, say).
+  const scopes = scopesOf([pj.name]);
+  const target = pj.publishConfig?.registry;
+
+  if (target && !sameRegistry(target, cfg.registry)) {
+    fail(`refused: package.json publishConfig.registry is ${target}, but apm publishes to ${cfg.registry}`);
+    say("Remove publishConfig.registry, or set APM_REGISTRY to that registry if it is the one you mean.");
+
+    return 1;
+  }
+
+  if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "publish")) return 1;
   const bumpKind = flag(a, "bump");
   const dry = has(a, "dry-run");
   let version = pj.version;
@@ -607,7 +786,7 @@ async function cmdPublish(a: Args): Promise<number> {
     const local = findSecrets(walkFiles(cwd)).findings;
     if (local.length > 0) {
       for (const s of local) say(red(`✗ ${s.path}: ${s.kind}`));
-      say(`Refusing to publish ${id}: secret-shaped files sit in the package folder and package.json has no "files" allowlist,`);
+      fail(`Refusing to publish ${id}: secret-shaped files sit in the package folder and package.json has no "files" allowlist,`);
       say(`so whether they ship depends on the package manager. Add "files": ["dist", ...] to package.json, or delete them.`);
       return 1;
     }
@@ -616,11 +795,12 @@ async function cmdPublish(a: Args): Promise<number> {
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
   process.once("exit", () => rmSync(dest, { recursive: true, force: true }));
-  const packed = await runCmd(packArgs(det.pm, dest), { cwd, env: env(), quiet: true });
+  // packing runs the project's prepack and prepare scripts: no credentials in their env
+  const packed = await runCmd(packArgs(det.pm, dest), { cwd, env: pmEnv(cfg.registry, scopes), quiet: true });
   const tgzName = readdirSync(dest).find((f) => f.endsWith(".tgz"));
   if (packed.code !== 0 || !tgzName) {
     warn(packed.out);
-    warn(red(`apm publish: ${det.pm} pack failed`));
+    fail(`apm publish: ${det.pm} pack failed`);
     return 1;
   }
   const tgzPath = join(dest, tgzName);
@@ -633,14 +813,14 @@ async function cmdPublish(a: Args): Promise<number> {
   const secrets = findSecrets(files);
   if (secrets.findings.length > 0) {
     for (const s of secrets.findings) say(red(`✗ ${s.path}: ${s.kind}`));
-    say(`Refusing to publish ${id}: the tarball contains secrets. Narrow the "files" allowlist in package.json.`);
+    fail(`Refusing to publish ${id}: the tarball contains secrets. Narrow the "files" allowlist in package.json.`);
     return 1;
   }
   for (const s of secrets.skipped) say(yellow(`! ${describeSkip(s)} is too large to scan for secrets; check it yourself.`));
   const missing = missingEntries(manifest, files);
   if (missing.length > 0) {
     for (const m of missing) say(red(`✗ "${m.field}" points to ${m.path}, which is not in the tarball`));
-    say(`Refusing to publish ${id}. Run your build first, or fix "files" in package.json.`);
+    fail(`Refusing to publish ${id}. Run your build first, or fix "files" in package.json.`);
     return 1;
   }
 
@@ -651,15 +831,19 @@ async function cmdPublish(a: Args): Promise<number> {
   const report = finalize(analysis, { publishedAt: Number.NEGATIVE_INFINITY, now: Date.now(), deprecated: null, status: "active", statusReason: null });
   printCard("preview", report);
 
+  const summary = { name: pj.name, version, registry: cfg.registry, files: files.length, score: report.score, grade: report.grade };
   if (dry) {
-    say(dim("dry run: nothing uploaded"));
+    say(dim(`dry run: nothing uploaded (it would go to ${cfg.registry})`));
+    emit({ ok: true, status: "dry-run", ...summary });
     return 0;
   }
   const tag = flag(a, "tag") ?? (version.includes("-") ? "next" : null);
-  const pub = await runCmd(publishArgs(det.pm, tgzPath, tag), { cwd, env: env(), quiet: true });
+  // `publish <tarball>` runs no package scripts, so the credential variables an .npmrc may name stay; APM_TOKEN does not
+  const pubEnv = childEnv({ parent: process.env, registry: cfg.registry, scopes, keepAuth: true });
+  const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
-    warn(red(`apm publish: ${det.pm} publish failed for ${id}`));
+    fail(`apm publish: ${det.pm} publish failed for ${id}`);
     return pub.code;
   }
   // A login token stages the version: the registry answers with an approval link in its notice.
@@ -668,9 +852,22 @@ async function cmdPublish(a: Args): Promise<number> {
     say(`${yellow("●")} ${bold(id)} is uploaded but not live yet: it is waiting for approval.`);
     say(`  Approve it within 24h with your passkey or authenticator code: ${bold(approval)}`);
     say(dim("  If an agent ran this publish, it should hand this link to you."));
+    emit({ ok: true, status: "staged", approval, ...summary });
     return 0;
   }
-  say(`${green("✓")} published ${bold(id)}${tag ? ` with tag ${tag}` : ""} via ${det.pm}`);
+
+  // The package manager said it published; confirm the version is on the registry apm checked.
+  const landed = await new Api(cfg).raw(encodeName(pj.name));
+  const doc = Published.safeParse(landed.body);
+
+  if (landed.status !== 200 || !doc.success || !(version in doc.data.versions)) {
+    fail(`apm publish: ${det.pm} reported success, but ${cfg.registry} does not have ${id}. Check where it was uploaded (npm config get registry).`);
+
+    return 1;
+  }
+
+  say(`${green("✓")} published ${bold(id)}${tag ? ` with tag ${tag}` : ""} to ${cfg.registry} via ${det.pm}`);
+  emit({ ok: true, status: "published", tag, ...summary });
   return 0;
 }
 
@@ -692,16 +889,21 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
 Flags: --pm bun|npm|pnpm|yarn, --force, --no-cooldown, --json, --otp <code>, --no-browser
 Registry: APM_REGISTRY or registry= in .npmrc (default ${"https://apmjs.dev/"})`;
 
+// Commands that run package install scripts: their env gets no credentials. `apm run` keeps the env, as `bun run` would.
+const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebuild", "add", "remove", "rm", "uninstall", "link"]);
+
+// Commands that print one JSON document with --json (everything else is the package manager's).
+const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
+
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
   const args = a.raw.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm");
-  return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: env() })).code;
+
+  return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
-async function main(argv: string[]): Promise<number> {
-  const a = parseArgs(argv);
-  jsonMode = has(a, "json");
+async function main(a: Args): Promise<number> {
   switch (a.cmd) {
     case "help":
     case "--help":
@@ -726,7 +928,7 @@ async function main(argv: string[]): Promise<number> {
     case "name":
       return cmdName(a);
     case "audit":
-      return cmdAudit(a);
+      return cmdAudit();
     case "yank":
     case "unyank":
     case "revoke":
@@ -745,10 +947,19 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
+const args = parseArgs(process.argv.slice(2));
+
+// `apm install` with no packages is the package manager's own install, and so is its --json
+const ownsJson = JSON_COMMANDS.has(args.cmd) && !((args.cmd === "install" || args.cmd === "i") && args.positional.length === 0);
+
+jsonMode = has(args, "json");
 try {
-  process.exitCode = await main(process.argv.slice(2));
+  process.exitCode = await main(args);
+
+  if (ownsJson) emit({ ok: process.exitCode === 0, error: lastError });
 } catch (e) {
-  if (e instanceof ApiError) warn(red(`apm: ${e.message}`));
-  else warn(red(`apm: ${e instanceof Error ? e.message : String(e)}`));
+  fail(`apm: ${e instanceof Error ? e.message : String(e)}`);
+
+  if (ownsJson) emit({ ok: false, error: lastError });
   process.exitCode = 1;
 }

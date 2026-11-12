@@ -4,10 +4,21 @@ Makes stock `bun install` and `bun add` ask the apm registry about every package
 
 ```toml
 # bunfig.toml
+[install]
+registry = "https://apmjs.dev/"
+
 [install.security]
 scanner = "@apm/bun-scanner"
 ```
 
 Install it once with `bun add -d @apm/bun-scanner`. Bun cancels the install when a package version is revoked (or has a pending revocation) or scores below 40.
 
-The scanner asks the registry each package came from. Packages from other registries go to `APM_REGISTRY` when it is set. When the registry is unreachable, the scanner prints a warning and allows the install. Set `APM_SCANNER_STRICT=1` to block the install instead.
+The scanner asks one registry: `APM_REGISTRY` when it is set, otherwise `[install] registry` from `bunfig.toml` (the project's, then the global one). It never takes a registry from package data, so a tarball URL in a lockfile cannot choose who checks it or who sees your package list.
+
+It prints a warning for each package it could not check: no registry configured, the registry is unreachable or is not an apm registry, or bun downloads the package from another host than the configured registry. By default those installs go ahead, so a registry outage does not stop your work.
+
+In CI, set `APM_SCANNER_STRICT=1` so that any unchecked package cancels the install:
+
+```sh
+APM_SCANNER_STRICT=1 bun install --frozen-lockfile
+```

@@ -28,6 +28,8 @@ jobs:
         run: bun run lint
       - name: Vendored anti-slop rule tests
         run: for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
+      - name: Unit tests
+        run: bun test packages/cli/test
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web

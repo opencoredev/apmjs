@@ -67,6 +67,10 @@ registry = "https://apmjs.dev/"
 
 [install.security]
 scanner = "@apm/bun-scanner"`}</Code>
+          <Text>
+            The scanner warns about each package it could not check, for example when the registry is down, and lets the install go ahead. In CI, make it cancel the install instead:
+          </Text>
+          <Code label="CI">{`APM_SCANNER_STRICT=1 bun install --frozen-lockfile`}</Code>
         </Block>
 
         <Block id="npm">

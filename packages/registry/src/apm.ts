@@ -859,10 +859,15 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
   const ctx = env.ctx;
   const name = url.searchParams.get("name") ?? "";
   const range = url.searchParams.get("range") || "latest";
+  const floor = Number(url.searchParams.get("floor") ?? DEFAULT_POLICY.floor);
   const policy: Policy = {
     cooldownMs: parseDuration(url.searchParams.get("cooldown"), DEFAULT_POLICY.cooldownMs),
-    floor: Number(url.searchParams.get("floor") ?? DEFAULT_POLICY.floor),
+    // a floor that is not a number would let every score through
+    floor: Number.isFinite(floor) ? floor : DEFAULT_POLICY.floor,
   };
+  // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
+  // always checked at the default floor or the stricter one asked for.
+  const treeFloor = Math.max(policy.floor, DEFAULT_POLICY.floor);
   const src = await lookup(env, name);
   if (!src) return fail(404, `No package named ${name}.`);
   const tagged = src.distTags[range];
@@ -882,7 +887,7 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
     const block = policyBlock(ctx, v, policy);
     if (block === null) {
       const report = reportFor(ctx, v);
-      const tree: Tree = policy.floor > 0 ? await treeBlocks(env, v, policy.floor) : { blocks: [], unchecked: 0, uncheckedDeps: [] };
+      const tree: Tree = await treeBlocks(env, v, treeFloor);
       if (tree.blocks.length > 0) {
         const list = tree.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
         return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report }, tree }, 422);

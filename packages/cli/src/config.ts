@@ -6,7 +6,8 @@ import { dirname, join } from "node:path";
 
 export const DEFAULT_REGISTRY = "https://apmjs.dev/";
 
-export type Config = { registry: string; token: string | null; userconfig: string };
+/** `withheld` names the registry APM_TOKEN belongs to when apm talks to a different one and so sends no token. */
+export type Config = { registry: string; token: string | null; userconfig: string; withheld: string | null };
 
 function withSlash(u: string): string {
   return u.endsWith("/") ? u : `${u}/`;
@@ -56,23 +57,58 @@ export function authKey(registry: string): string {
   return `//${u.host}${u.pathname}`;
 }
 
+/** Same host, path and protocol: a token or a check for one applies to the other. */
+export function sameRegistry(a: string, b: string): boolean {
+  try {
+    return authKey(a) === authKey(b) && new URL(a).protocol === new URL(b).protocol;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The registry APM_TOKEN is issued for: APM_REGISTRY, else `registry=` in the user .npmrc, else the default.
+ * A project .npmrc and npm_config_registry never count: both can come from a cloned repo
+ * (`npm run` exports project config as npm_config_* variables).
+ */
+export function tokenRegistry(env: Record<string, string | undefined>): string {
+  return withSlash(env.APM_REGISTRY ?? readNpmrc(userconfigPath(env)).get("registry") ?? DEFAULT_REGISTRY);
+}
+
 export function loadConfig(cwd: string, env: Record<string, string | undefined>): Config {
   const userconfig = userconfigPath(env);
   const files = [...projectNpmrcs(cwd), userconfig].map(readNpmrc);
   const registry = withSlash(env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? files.find((f) => f.has("registry"))?.get("registry") ?? DEFAULT_REGISTRY);
-  let token: string | null = env.APM_TOKEN ?? null;
-  if (!token) {
-    const key = `${authKey(registry)}:_authToken`;
-    const host = `//${new URL(registry).host}/:_authToken`;
-    for (const f of files) {
-      const t = f.get(key) ?? f.get(host);
-      if (t) {
-        token = t.replace(/^\$\{(\w+)\}$/, (_, name: string) => env[name] ?? "");
-        break;
-      }
-    }
+  const envToken = env.APM_TOKEN || null;
+
+  if (envToken) {
+    const bound = tokenRegistry(env);
+
+    if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null };
+
+    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound };
   }
-  return { registry, token: token || null, userconfig };
+
+  return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
+}
+
+/** The token .npmrc files hold for exactly this registry host (never one keyed to another host). */
+function fileToken(files: Map<string, string>[], registry: string, env: Record<string, string | undefined>): string | null {
+  const key = `${authKey(registry)}:_authToken`;
+  const host = `//${new URL(registry).host}/:_authToken`;
+
+  for (const f of files) {
+    const t = f.get(key) ?? f.get(host);
+
+    if (t) return t.replace(/^\$\{(\w+)\}$/, (_, name: string) => env[name] ?? "") || null;
+  }
+
+  return null;
+}
+
+/** apm tokens are `apm_` plus base64url. Anything else (a newline above all) must never reach an .npmrc line. */
+export function isApmToken(token: string): boolean {
+  return /^apm_[A-Za-z0-9_-]{16,256}$/.test(token);
 }
 
 /**

@@ -26,8 +26,8 @@
       "anti-slop/no-known-value-widening": 1
     },
     "packages/bun-scanner/src/index.ts": {
-      "anti-slop/no-runtime-typeof": 8,
-      "anti-slop/require-readable-spacing": 20
+      "anti-slop/no-runtime-typeof": 7,
+      "anti-slop/require-readable-spacing": 6
     },
     "packages/cli/src/api.ts": {
       "anti-slop/no-conditional-empty-object-spread": 3,
@@ -37,15 +37,15 @@
       "anti-slop/require-readable-spacing": 17
     },
     "packages/cli/src/config.ts": {
-      "anti-slop/require-readable-spacing": 15
+      "anti-slop/require-readable-spacing": 11
     },
     "packages/cli/src/main.ts": {
       "anti-slop/no-conditional-empty-object-spread": 1,
-      "anti-slop/no-known-value-widening": 2,
-      "anti-slop/no-runtime-typeof": 10,
+      "anti-slop/no-known-value-widening": 1,
+      "anti-slop/no-runtime-typeof": 8,
       "anti-slop/no-unknown-parameters": 1,
       "anti-slop/no-unsafe-dictionary-type": 1,
-      "anti-slop/require-readable-spacing": 200
+      "anti-slop/require-readable-spacing": 166
     },
     "packages/cli/src/pm.ts": {
       "anti-slop/no-runtime-typeof": 2,
