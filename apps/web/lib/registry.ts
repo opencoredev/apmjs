@@ -4,7 +4,8 @@ import { z } from "zod";
 import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY, servableKey } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
-import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
+import { fetchJson, logUnavailable, MAX_REGISTRY_TIMEOUT_MS, type Fetched, type FetchJsonOptions, type SourceGate } from "./registry-fetch";
+import { packageGate, reviewGate, scoreGate } from "./source-gates";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
 import { RepositoryField } from "./repository";
@@ -21,8 +22,9 @@ const Dismissed = z.object({ signal: z.string(), file: z.string(), line: z.numbe
 
 export type Dismissed = z.infer<typeof Dismissed>;
 
-// what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out
-const Reviewable = { scorer: z.string().optional(), digest: z.string().nullish(), dismissed: z.array(Dismissed).default([]) };
+// what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out.
+// `redacted`: the version is revoked and its evidence names files and lines only; added with that redaction.
+const Reviewable = { scorer: z.string().optional(), digest: z.string().nullish(), dismissed: z.array(Dismissed).default([]), redacted: z.boolean().default(false) };
 
 const Facts = z.object({
   moduleFormat: z.enum(["esm", "cjs", "dual"]),
@@ -104,11 +106,13 @@ export type RecentEvent = z.infer<typeof Recent>["events"][number];
  * Reads a registry path. Failures other than a 404 are logged here, once, with the path and the reason. With `cache`,
  * the answer comes from the edge cache when it has one; a read that sends `headers` (a visitor's cookie) never does.
  */
-async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: CachePolicy } = {}): Promise<Fetched<T>> {
+async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: AbortSignal; headers?: HeadersInit; cache?: CachePolicy; gate?: SourceGate<T> } = {}): Promise<Fetched<T>> {
   const options: FetchJsonOptions<T> = { url: `${REGISTRY}${path}`, schema, signal: opts.signal };
 
   if (opts.headers !== undefined) options.headers = opts.headers;
   else if (opts.cache !== undefined) options.cache = opts.cache;
+
+  if (opts.gate !== undefined) options.gate = opts.gate;
   const signal = opts.signal;
   const result = await fetchJson(options);
 
@@ -117,7 +121,7 @@ async function getJson<T>(path: string, schema: z.ZodType<T>, opts: { signal?: A
   return result;
 }
 
-export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo, { cache: POLICIES.package });
+export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo, { cache: POLICIES.package, gate: packageGate() });
 
 export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> {
   const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: POLICIES.events });
@@ -126,13 +130,13 @@ export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> 
 }
 
 /** The public AI review of one version. "missing" when the registry has AI review off or does not know the version. */
-export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer, { cache: POLICIES.review });
+export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(`-/apm/v1/review/${encodeName(name)}/${encodeURIComponent(version)}`, ReviewAnswer, { cache: POLICIES.review, gate: reviewGate() });
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable });
 
 /** One version's full score, for a version other than latest. */
 export const getVersionScore = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionScore>>> =>
-  getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore, { cache: POLICIES.versionScore });
+  getJson(`-/apm/v1/score/${encodeName(name)}/${encodeURIComponent(version)}`, VersionScore, { cache: POLICIES.versionScore, gate: scoreGate() });
 
 const FileHead = { name: z.string(), version: z.string(), path: z.string(), size: z.number() };
 
@@ -146,7 +150,7 @@ export type FileAnswer = z.infer<typeof FileAnswer>;
 
 /** A 1 MB file is at most a few MB as JSON (escapes), and the first read of a big upstream tarball takes a while. */
 const FILE_MAX_BYTES = 8 * 1024 * 1024;
-const FILE_TIMEOUT_MS = 20_000;
+const FILE_TIMEOUT_MS = MAX_REGISTRY_TIMEOUT_MS;
 
 /** One file of one version, as text, or why it isn't shown. */
 export async function getFile(input: { name: string; version: string; path: string }): Promise<Fetched<FileAnswer>> {

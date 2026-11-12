@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AiReviewSection } from "@/components/ai-review";
+import { FindingList } from "@/components/finding-list";
 import { offersRequest, pollStep } from "./review-poll";
 import { ReviewAnswer } from "./review-schema";
 
@@ -39,5 +40,18 @@ describe("a retry queued after a review with no answer", () => {
     expect(pollStep({ status: noAnswer.status, startedAt: 0, now: 1_000 }).kind).toBe("wait");
     expect(offersRequest(noAnswer)).toBe(false);
     expect(pollStep({ status: "reviewed", startedAt: 0, now: 1_000 }).kind).toBe("stop");
+  });
+});
+
+describe("the findings of a revoked version", () => {
+  test("a finding without its line shows the file, line and sentence, and no empty code block", () => {
+    const finding = { file: "index.js", line: 2, issue: "Posts process.env to a remote host.", severity: "high" } as const;
+    const revoked = renderToStaticMarkup(<FindingList findings={[{ ...finding, excerpt: "" }]} name="x" version="1.0.0" />);
+    const shown = renderToStaticMarkup(<FindingList findings={[{ ...finding, excerpt: "https.request(x)" }]} name="x" version="1.0.0" />);
+
+    expect(revoked).toContain("index.js:2");
+    expect(revoked).toContain("Posts process.env to a remote host.");
+    expect(revoked).not.toContain("<pre");
+    expect(shown).toContain("<pre");
   });
 });

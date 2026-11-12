@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { offersRequest, POLL_EVERY_MS, POLL_FOR_MS, pollStep } from "./review-poll";
 import type { ReviewAnswer } from "./review-schema";
 
-const answer = (over: Partial<ReviewAnswer>): ReviewAnswer => ({ name: "x", version: "1.0.0", status: "not-reviewed", review: null, viewer: "public", private: null, canRequest: false, ...over });
+const answer = (over: Partial<ReviewAnswer>): ReviewAnswer => ({ name: "x", version: "1.0.0", status: "not-reviewed", review: null, redacted: false, viewer: "public", private: null, canRequest: false, ...over });
 
 describe("pollStep", () => {
   test("a queued review is asked again every 5 seconds", () => {

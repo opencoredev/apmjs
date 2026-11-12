@@ -1,5 +1,5 @@
-// Cited findings of an AI review: file:line (a link to that line of the file), the line itself, and one
-// sentence on what it does.
+// Cited findings of an AI review: file:line (a link to that line of the file), the line itself (none for a revoked
+// version), and one sentence on what it does.
 import { fileHref } from "@/lib/package-route";
 import type { Finding } from "@/lib/review-schema";
 
@@ -22,7 +22,8 @@ export function FindingList({ findings, name, version }: { findings: readonly Fi
                 cite
               )}
             </div>
-            <pre className="overflow-x-auto rounded-lg bg-surface px-3 py-2 font-mono text-[12.5px] leading-5 whitespace-pre-wrap [overflow-wrap:anywhere]">{f.excerpt}</pre>
+            {/* a revoked version's findings come without the line (packages/registry/src/withheld.ts) */}
+            {f.excerpt !== "" && <pre className="overflow-x-auto rounded-lg bg-surface px-3 py-2 font-mono text-[12.5px] leading-5 whitespace-pre-wrap [overflow-wrap:anywhere]">{f.excerpt}</pre>}
             <p className="text-[15px] leading-6 text-pretty">{f.issue}</p>
           </li>
         );

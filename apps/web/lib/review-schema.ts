@@ -52,6 +52,8 @@ export const ReviewAnswer = z.object({
   version: z.string(),
   status: z.enum(["reviewed", "queued", "failed", "not-reviewed"]),
   review: PublicReview.nullable(),
+  /** The version is revoked: findings keep their file, line and sentence, with no excerpt. Added with that redaction. */
+  redacted: z.boolean().default(false),
   viewer: z.enum(["public", "maintainer", "admin"]),
   private: PrivateReview.nullable(),
   canRequest: z.boolean(),

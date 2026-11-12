@@ -99,25 +99,32 @@ function hitOf(entry: Entry, policy: CachePolicy, now: number): CacheHit | null 
   return { text: entry.text, stale: age >= policy.freshMs };
 }
 
-/** The cached body for `key`, fresh or stale; null when there is none worth serving. */
-export async function lookup(key: string, policy: CachePolicy, now = Date.now()): Promise<CacheHit | null> {
+/** Layer 1 alone, synchronously: what this isolate holds for `key`, fresh or stale; null when nothing worth serving. */
+export function peek(key: string, policy: CachePolicy, now = Date.now()): CacheHit | null {
   const m = memory();
   const local = m.entries.get(key);
 
-  if (local) {
-    const hit = hitOf(local, policy, now);
+  if (!local) return null;
+  const hit = hitOf(local, policy, now);
 
-    if (hit) {
-      // keep it at the young end of the LRU order
-      m.entries.delete(key);
-      m.entries.set(key, local);
-
-      return hit;
-    }
-
+  if (!hit) {
     forget(m, key);
+
+    return null;
   }
 
+  // keep it at the young end of the LRU order
+  m.entries.delete(key);
+  m.entries.set(key, local);
+
+  return hit;
+}
+
+/**
+ * Layer 2 alone: what the data center's Cache API holds for `key`. A hit is copied into layer 1 unless layer 1 holds
+ * something written later, so an older copy never replaces a newer one.
+ */
+export async function lookupShared(key: string, policy: CachePolicy, now = Date.now()): Promise<CacheHit | null> {
   const shared = sharedCache();
 
   if (!shared) return null;
@@ -132,13 +139,19 @@ export async function lookup(key: string, policy: CachePolicy, now = Date.now())
     if (!Number.isFinite(at)) return null;
     const entry: Entry = { text, at, until: at + policy.freshMs + policy.staleMs };
     const hit = hitOf(entry, policy, now);
+    const local = memory().entries.get(key);
 
-    if (hit) remember(key, entry);
+    if (hit && (local === undefined || local.at < at)) remember(key, entry);
 
     return hit;
   } catch {
     return null;
   }
+}
+
+/** The cached body for `key`, fresh or stale, from this isolate first; null when there is none worth serving. */
+export async function lookup(key: string, policy: CachePolicy, now = Date.now()): Promise<CacheHit | null> {
+  return peek(key, policy, now) ?? lookupShared(key, policy, now);
 }
 
 /** Keeps `text` under `key` in both layers. The Cache API write finishes after the response. */
@@ -178,7 +191,15 @@ export const POLICIES = {
    * shown can (a revoke), so a cached copy is served only while `servable` says yes (lib/registry-fetch.ts).
    */
   versionFile: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
-  /** That a version's files may be shown: a revoke hides them within these few seconds, and nothing is served stale. */
+  /**
+   * That a version's source may be shown: a revoke hides it within these few seconds, and nothing is served stale. The
+   * seconds count from when the request that asked the registry started (lib/registry-fetch.ts).
+   */
   servable: { freshMs: 5_000, staleMs: 0 },
+  /**
+   * How long the registry's last word on a version is kept: a yes for `servable` above, and a no (a 410 or 404) for
+   * longer than any registry request may run, so an older yes still in flight can't replace it (MAX_REGISTRY_TIMEOUT_MS).
+   */
+  servableRecord: { freshMs: 60_000, staleMs: 0 },
   search: { freshMs: 60_000, staleMs: 5 * 60_000 },
 } as const satisfies Record<string, CachePolicy>;

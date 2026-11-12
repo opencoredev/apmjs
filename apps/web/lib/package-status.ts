@@ -7,6 +7,7 @@ import { z } from "zod";
 import { lookup, POLICIES, store } from "./edge-cache";
 import { askServable, confirmServable, fetchJson, logUnavailable, REGISTRY_TIMEOUT_MS, type Fetched } from "./registry-fetch";
 import { fileApiPath, packageApiPath, REGISTRY, servableKey } from "./registry-url";
+import { packageQuotes } from "./source-gates";
 
 /** "refused": the registry deliberately won't show it (a revoked version's 410, an unreadable tarball's 422); the page explains why. */
 export type Status = "ok" | "missing" | "refused" | "unavailable";
@@ -22,7 +23,8 @@ export async function packageStatus(name: string, signal?: AbortSignal): Promise
 
   if (await lookup(known, POLICIES.exists)) return "ok";
   // the same URL and cache entry as the page's getPackage: the page renders from this answer
-  const result = await fetchJson({ url, schema: Exists, signal, cache: POLICIES.package });
+  // the answer holds no source, but the page's copy does: this read records the version's permission like the page's would
+  const result = await fetchJson({ url, schema: Exists, signal, cache: POLICIES.package, gate: { quotes: packageQuotes, withoutSource: (v) => v } });
 
   if (result.kind === "ok") store(known, YES, POLICIES.exists);
   else if (result.kind === "unavailable" && !signal?.aborted) logUnavailable(packageApiPath(name), result.reason);
