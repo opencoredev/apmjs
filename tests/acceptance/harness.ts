@@ -71,7 +71,8 @@ export function makeSandbox(reg: Registry, token?: string): { home: string; env:
   const bunfig = [`[install]`, token ? `registry = { url = "${reg.url}", token = "${token}" }` : `registry = "${reg.url}"`, `[install.cache]`, `dir = "${join(home, ".bun-cache")}"`, ``].join("\n");
   writeFileSync(join(home, ".bunfig.toml"), bunfig);
   const env: Record<string, string> = {
-    PATH: process.env.PATH ?? "",
+    // repo-pinned tools (pnpm) first: the machine's pnpm may be an npx shim that fetches from the configured registry
+    PATH: `${join(ROOT, "node_modules", ".bin")}:${process.env.PATH ?? ""}`,
     HOME: home,
     XDG_CONFIG_HOME: join(home, ".config"),
     npm_config_userconfig: join(home, ".npmrc"),
