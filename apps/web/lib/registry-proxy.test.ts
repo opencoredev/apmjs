@@ -2,7 +2,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { forwardToRegistry } from "./registry-proxy";
 
-type Seen = { method: string; path: string; headers: Record<string, string>; body: string; bytes: Uint8Array };
+type Seen = { method: string; path: string; headers: Record<string, string>; body: string; bytes: Uint8Array<ArrayBuffer> };
 
 let seen: Seen[] = [];
 let server: ReturnType<typeof Bun.serve>;
