@@ -582,8 +582,8 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
   const name = route.name;
-  // proxy.ts looked the package up (or knew it exists) before the shell went out, and left its answer in the edge
-  // cache, so this read is usually from memory
+  // proxy.ts checked that the package exists before the shell went out (a HEAD, no answer built); this is the one
+  // read of the answer
   const [found, query] = await Promise.all([getPackage(name), searchParams]);
 
   // proxy.ts already answered 404 or 503; this covers a registry that fails between that check and this read

@@ -7,8 +7,8 @@
 //     the package up, so the response status is decided here: a rewrite to an unmatched path for a registry
 //     404 (Next.js renders its not-found page with a 404), and a standalone 503 page when it can't be read. A file
 //     the registry refuses on purpose (a revoked version's 410, a 422) goes on to the page, which says why.
-//     A package or file known to exist is answered from the edge cache (lib/package-status.ts), and a package
-//     looked up here stays cached for the page, so a view reads the package from the registry at most once.
+//     Both checks are HEAD requests the registry answers without building the package answer or reading the
+//     file, and a package or file known to exist is answered from the edge cache (lib/package-status.ts).
 import { NextResponse, type NextRequest } from "next/server";
 import { CLIENT_FORWARDING_HEADERS, edgeClientIp } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
