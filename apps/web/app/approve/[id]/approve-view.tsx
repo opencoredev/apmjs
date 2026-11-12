@@ -171,14 +171,16 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
 }
 
 function SignalRow({ x }: { x: Signal }) {
-  const risk = x.points < 0;
+  const risk = x.points < 0 && x.confidence === "confirmed";
 
   return (
     <li className="flex gap-4 px-4 py-3">
       <span className={cn("w-9 shrink-0 text-right font-mono text-[15px] tabular-nums", !risk ? "text-muted-foreground" : x.points <= -20 ? "text-bad" : "text-warn")}>{x.points}</span>
       <div className="min-w-0 flex-1">
         <div className="text-[15px] leading-6">
-          <span className="font-mono">{x.id}</span> <span className="text-muted-foreground">{x.label}</span>
+          <span className="font-mono">{x.id}</span>{" "}
+          {x.confidence === "possible" && <span className="mr-1 inline-flex h-5 items-center rounded-full border px-2 align-[1px] text-xs">possible</span>}
+          <span className="text-muted-foreground">{x.label}</span>
         </div>
         {x.evidence.map((ev, i) => (
           <div key={`${i}:${ev}`} className="mt-1.5 border-l-2 pl-3 font-mono text-[12.5px] leading-5 text-muted-foreground [overflow-wrap:anywhere]">

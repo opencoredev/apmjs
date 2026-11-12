@@ -3,12 +3,19 @@
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { SearchIcon } from "lucide-react";
+import { afterNavigation } from "@/lib/header-search";
 
 /** Header search for pages other than home. Enter opens the home page with the query; "/" focuses it. */
 export function SearchBar() {
   const router = useRouter();
   const pathname = usePathname();
-  const [value, setValue] = useState("");
+  const [field, setField] = useState({ path: pathname, value: "" });
+  const next = afterNavigation(field, pathname);
+
+  // a new page starts with an empty field; set during render so the old query never paints on it
+  if (next !== field) setField(next);
+  const value = next.value;
+  const setValue = (v: string) => setField({ path: pathname, value: v });
   const inputRef = useRef<HTMLInputElement>(null);
   const onHome = pathname === "/";
 

@@ -8,7 +8,7 @@ import { entryPoints } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
-import { importsOf, joinStrings, scanText, type TextFinding } from "./source.ts";
+import { importsOf, joinStrings, langOf, scanText, type Confidence, type TextFinding } from "./source.ts";
 import type { TarEntry } from "./tarball.ts";
 
 export { isInlineDownload } from "./scripts.ts";
@@ -39,9 +39,21 @@ export const SIGNAL_IDS = [
 
 export type SignalId = (typeof SIGNAL_IDS)[number];
 
-/** v2 lists the files it could not read. v3 reads every file, follows install-script indirection and decodes cheap encodings. */
-export const SCORER = "apm-score-v3";
-const SignalSchema = z.object({ id: z.enum(SIGNAL_IDS), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+/**
+ * v2 lists the files it could not read. v3 reads every file, follows install-script indirection and decodes cheap
+ * encodings. v4 matches code rules against code only (not comments, regex literals or ordinary strings) and marks
+ * what it could not see used as `possible`, for fewer points.
+ */
+export const SCORER = "apm-score-v4";
+
+const SignalSchema = z.object({
+  id: z.enum(SIGNAL_IDS),
+  label: z.string(),
+  points: z.number(),
+  evidence: z.array(z.string()),
+  // analyses before v4 asserted every signal
+  confidence: z.enum(["confirmed", "possible"]).default("confirmed"),
+});
 
 const FactsSchema = z.object({
   moduleFormat: z.enum(["esm", "cjs", "dual"]),
@@ -69,7 +81,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -118,10 +130,33 @@ export const POINTS: Record<SignalId, number> = {
   "unanalyzed-files": -20,
 };
 
+/** Signals the source rules can only suspect, and what each costs then: a third or so of the confirmed points. */
+type CodeSignalId = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated";
+
+export const POSSIBLE_POINTS: Record<CodeSignalId, number> = {
+  "shell-exec": -5,
+  network: -3,
+  "credential-access": -8,
+  eval: -3,
+  obfuscated: -3,
+};
+
+const POSSIBLE_LABELS: Record<CodeSignalId, string> = {
+  "shell-exec": "Possible shell use: names a shell command or child_process, but apm did not see one started",
+  network: "Possible network use: names a request or download, but apm did not see one made",
+  "credential-access": "Possible credential access: names a credential file or token, but apm did not see it read",
+  eval: "Possible eval: keeps a way to run code built at runtime, but apm did not see it used",
+  obfuscated: "Possibly obfuscated: holds encoded or assembled text that apm did not see run",
+};
+
+function isCodeSignal(id: SignalId): id is CodeSignalId {
+  return id in POSSIBLE_POINTS;
+}
+
 const LABELS: Record<SignalId, string> = {
   "install-script": "Runs a script at install time (preinstall, install or postinstall)",
-  "shell-exec": "Starts shell commands or child processes",
-  network: "Makes network requests",
+  "shell-exec": "Starts shell commands or child processes, or loads child_process",
+  network: "Uses the network: fetch, http, sockets, or a module that makes requests",
   "credential-access": "Reads credential files or secret environment variables",
   eval: "Evaluates code built at runtime (eval, Function, vm)",
   obfuscated: "Contains obfuscated code",
@@ -249,8 +284,10 @@ export function factsOf(manifest: Record<string, unknown>, files: readonly TarEn
   };
 }
 
-function signal(id: SignalId, evidence: string[]): Signal {
-  return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5) };
+function signal(id: SignalId, evidence: string[], confidence: Confidence = "confirmed"): Signal {
+  if (confidence === "possible" && isCodeSignal(id)) return { id, label: POSSIBLE_LABELS[id], points: POSSIBLE_POINTS[id], evidence: evidence.slice(0, 5), confidence };
+
+  return { id, label: LABELS[id], points: POINTS[id], evidence: evidence.slice(0, 5), confidence: "confirmed" };
 }
 
 /** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
@@ -331,25 +368,40 @@ export function dependencyNames(manifest: Record<string, unknown>): string[] {
   return [...new Set(dependencySpecs(manifest).map((d) => (isRegistryDependency(d) ? d.name : d.key)))];
 }
 
-type Found = { add: (id: SignalId, ev: string) => void; has: (id: SignalId) => boolean; get: (id: SignalId) => string[] | undefined };
+type Found = {
+  /** Records evidence; a signal is confirmed once any of its evidence is, and then shows only confirmed evidence. */
+  add: (id: SignalId, ev: string, confidence?: Confidence) => void;
+  has: (id: SignalId) => boolean;
+  get: (id: SignalId) => { evidence: string[]; confidence: Confidence } | undefined;
+};
 
 function collector(): Found {
-  const found = new Map<SignalId, string[]>();
+  const found = new Map<SignalId, { confirmed: string[]; possible: string[] }>();
 
   return {
-    add(id, ev) {
-      const list = found.get(id) ?? [];
+    add(id, ev, confidence = "confirmed") {
+      const entry = found.get(id) ?? { confirmed: [], possible: [] };
+      const list = entry[confidence];
 
       if (!list.includes(ev)) list.push(ev);
-      found.set(id, list);
+      found.set(id, entry);
     },
     has: (id) => found.has(id),
-    get: (id) => found.get(id),
+    get: (id) => {
+      const entry = found.get(id);
+
+      if (!entry) return undefined;
+
+      return entry.confirmed.length > 0 ? { evidence: entry.confirmed, confidence: "confirmed" } : { evidence: entry.possible, confidence: "possible" };
+    },
   };
 }
 
 function describeFinding(where: string, f: TextFinding): string {
-  return `${where}:${f.line}: ${f.snippet}${f.how === "as written" ? "" : ` (${f.how})`}`;
+  const how = f.how === "as written" ? "" : ` (${f.how})`;
+  const why = f.confidence === "possible" ? ` [possible: ${f.why}]` : "";
+
+  return `${where}:${f.line}: ${f.snippet}${how}${why}`;
 }
 
 function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[]): Set<string> {
@@ -376,8 +428,8 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
         risky = true;
       }
 
-      for (const f of scanText(c.text)) {
-        found.add(f.id, `${label}${f.how === "as written" ? "" : ` (${f.how})`}`);
+      for (const f of scanText(c.text, "plain")) {
+        found.add(f.id, `${label}${f.how === "as written" ? "" : ` (${f.how})`}`, f.confidence);
         risky = true;
       }
     }
@@ -387,7 +439,7 @@ function analyzeHooks(found: Found, manifest: AnalyzeInput["manifest"], hooks: r
 
   // scripts no hook reaches never run on an installer's machine; only what they would do to one is reported
   for (const [k, cmd] of Object.entries(otherScripts(manifest, hooks))) {
-    for (const f of scanText(cmd)) if (f.id === "credential-access" || f.id === "obfuscated") found.add(f.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`);
+    for (const f of scanText(cmd, "plain")) if (f.id === "credential-access" || f.id === "obfuscated") found.add(f.id, `package.json scripts.${k}: ${cmd.slice(0, 80)}`, f.confidence);
   }
 }
 
@@ -410,7 +462,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     for (const cmd of gypCommands(new TextDecoder().decode(gyp.data))) {
       if (isInlineDownload(cmd)) add("install-download", `binding.gyp: ${cmd.slice(0, 80)}`);
 
-      for (const f of scanText(cmd)) add(f.id, `binding.gyp: ${cmd.slice(0, 80)}`);
+      for (const f of scanText(cmd, "plain")) add(f.id, `binding.gyp: ${cmd.slice(0, 80)}`, f.confidence);
     }
   }
 
@@ -483,7 +535,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     // read whatever the bytes are: skipping "non-text" would let a NUL byte hide code
     const text = new TextDecoder().decode(f.data);
 
-    for (const finding of scanText(text)) add(finding.id, describeFinding(f.path, finding));
+    for (const finding of scanText(text, langOf(f.path, text))) add(finding.id, describeFinding(f.path, finding), finding.confidence);
 
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
     const imports = importsOf(joinStrings(text).text);
@@ -571,9 +623,9 @@ export function analyze(input: AnalyzeInput): Analysis {
   ];
 
   const signals = order.flatMap((id) => {
-    const ev = found.get(id);
+    const got = found.get(id);
 
-    return ev ? [signal(id, ev)] : [];
+    return got ? [signal(id, got.evidence, got.confidence)] : [];
   });
 
   const notChecked = [

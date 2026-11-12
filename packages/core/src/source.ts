@@ -1,63 +1,132 @@
 // Static reading of one file's text: the rules, a pass that joins strings split to dodge them, decoders
 // for the cheap encodings (base64, hex, \x escapes, char codes) and the paths a file loads. Pure.
+import { lex, type Lang, type Lexed, type Region } from "./lexer.ts";
+
+export { commentRanges, langOf, type Lang } from "./lexer.ts";
 
 export type CodeSignal = "shell-exec" | "network" | "credential-access" | "eval" | "obfuscated";
 
-/** One rule match: the signal, where it is, and whether the text had to be joined or decoded first. */
-export type TextFinding = { id: CodeSignal; line: number; snippet: string; how: "as written" | "after joining strings" | "decoded" };
+/**
+ * `confirmed`: the code does it, or loads the module that does. `possible`: the text only names it, in an
+ * ordinary string, an alias or a method apm cannot identify, so the capability is there but apm did not see it used.
+ */
+export type Confidence = "confirmed" | "possible";
+
+type FindingAt = { id: CodeSignal; line: number; snippet: string; how: "as written" | "after joining strings" | "decoded" };
+
+/** One rule match: the signal, where it is, whether the text had to be joined or decoded first, and how sure it is (with why, when only possible). */
+export type TextFinding = FindingAt & ({ confidence: "confirmed" } | { confidence: "possible"; why: string });
+
+function judged(at: FindingAt, confidence: Confidence, why: string): TextFinding {
+  return confidence === "confirmed" ? { ...at, confidence } : { ...at, confidence, why };
+}
 
 const NET_MODULES = String.raw`(?:node:)?(?:https?|net|dgram|tls|http2|dns)(?:\/promises)?`;
 const HTTP_CLIENTS = "(?:axios|undici|node-fetch|got|superagent|needle|phin|ky|ws)";
+const GLOBAL = "(?:globalThis|global|window|self)";
 
-const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"));
+// Function('return this')() is how old code finds the global object; anything else built into a Function is eval
+const NOT_RETURN_THIS = String.raw`(?!['"\x60]return this['"\x60]\s*\))['"\x60]`;
+
+const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"), "g");
 
 /**
- * The rules. `re` matches anywhere. `docSafe` holds the patterns docs show as examples (`new EventSource(...)`
- * in a JSDoc block), so its matches inside a real comment, on a line that starts like one, are passed over.
+ * How a pattern's match is read, by where it sits (see `Region` in lexer.ts):
+ * - `code`: a call or construct. Confirmed in code or a kept string. Inside an ordinary string it is text that
+ *   only runs if something evaluates it, and eval, Function, vm and string timers are rules of their own.
+ * - `name`: a module name. Confirmed where it is loaded (`require('child_process')`); possible anywhere else.
+ * - `text`: shell command text (`curl ... | sh`). Only strings hold it: confirmed when a call runs the string,
+ *   possible otherwise. In code, `a || sh` is not a pipe.
+ * - `alias`: a reference that gives the power without using it (`r = require`). Always possible.
+ * Raw text (a shell script, an install command, a file the lexer could not follow) confirms every kind but `alias`.
  */
-const RULES: { id: CodeSignal; re: RegExp; docSafe?: RegExp }[] = [
+type Kind = "code" | "name" | "text" | "alias";
+
+type Pattern = { kind: Kind; re: RegExp; why?: string };
+
+const RULES: { id: Exclude<CodeSignal, "obfuscated">; patterns: Pattern[] }[] = [
   {
     id: "shell-exec",
-    re: /\bchild_process\b|\bexec(?:File)?Sync\s*\(|\bspawnSync\s*\(|\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b|\bBun\.spawn\b|\bBun\.\$|\bDeno\.Command\b/,
-    docSafe: /\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(|\binternalBinding\s*\(/,
+    patterns: [
+      {
+        kind: "code",
+        re: alt([
+          String.raw`\bexec(?:File)?Sync\s*\(`,
+          String.raw`\bspawnSync\s*\(`,
+          String.raw`\bBun\.spawn(?:Sync)?\b`,
+          String.raw`\bBun\.\$`,
+          String.raw`\bDeno\.Command\b`,
+          String.raw`\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(`,
+          String.raw`\binternalBinding\s*\(`,
+        ]),
+      },
+      { kind: "name", re: /\bchild_process\b/g, why: "names child_process without loading it" },
+      { kind: "text", re: /\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b/g, why: "a string holds a shell command, but apm did not see it run" },
+    ],
   },
   {
     id: "network",
-    re: /\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\(\s*['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]\s*\)|from\s+['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]|\bXMLHttpRequest\b|\bnew\s+WebSocket\b|\bcurl\s+|\bwget\s+|\bdns\.(?:resolve|lookup)\b|\bimport\s*\(\s*['"`]https?:\/\//,
-    docSafe: alt([
-      String.raw`(?:require|import)\s*\(\s*['"\x60]${NET_MODULES}['"\x60]\s*\)`,
-      String.raw`from\s+['"]${NET_MODULES}['"]`,
-      String.raw`(?:require\s*\(\s*|from\s+|import\s*\(\s*)['"]${HTTP_CLIENTS}['"]`,
-      String.raw`\bnew\s+(?:EventSource|RTCPeerConnection)\b`,
-      String.raw`\bsendBeacon\s*\(`,
-      String.raw`\bdns(?:\.promises)?\.(?:resolve\w*|lookup\w*|reverse)\s*\(`,
-    ]),
+    patterns: [
+      {
+        kind: "code",
+        re: alt([
+          // fetch('data:...') reads an inline value and never leaves the machine
+          String.raw`(?<![\w$.])fetch\s*\((?!\s*['"\x60]data:)`,
+          String.raw`\b${GLOBAL}\s*\.\s*fetch\s*\((?!\s*['"\x60]data:)`,
+          String.raw`\bhttps?\.(?:get|request)\s*\(`,
+          String.raw`(?:require|import)\s*\(\s*['"\x60]${NET_MODULES}['"\x60]\s*\)`,
+          String.raw`\bfrom\s+['"]${NET_MODULES}['"]`,
+          String.raw`(?:require\s*\(\s*|from\s+|import\s*\(\s*)['"]${HTTP_CLIENTS}['"]`,
+          String.raw`\bnew\s+(?:[\w$]+\s*\.\s*)*(?:XMLHttpRequest|WebSocket|EventSource|RTCPeerConnection)\b`,
+          String.raw`\bsendBeacon\s*\(`,
+          String.raw`\bdns(?:\.promises)?\.(?:resolve\w*|lookup\w*|reverse)\s*\(`,
+          String.raw`\bimport\s*\(\s*['"\x60]https?:\/\/`,
+        ]),
+      },
+      { kind: "alias", re: /\.\s*fetch\s*\(/g, why: "calls a method named fetch on an object apm cannot identify" },
+      { kind: "alias", re: /\bXMLHttpRequest\b/g, why: "refers to XMLHttpRequest without creating one" },
+      { kind: "text", re: /\bcurl\s+|\bwget\s+/g, why: "a string holds a download command, but apm did not see it run" },
+    ],
   },
   {
     id: "credential-access",
-    re: /\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|AWS_SECRET_ACCESS_KEY|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/,
+    patterns: [
+      { kind: "code", re: /\bAWS_SECRET_ACCESS_KEY\b|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)/g },
+      {
+        kind: "text",
+        re: /\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/g,
+        why: "a string names a credential file, but apm did not see it read",
+      },
+    ],
   },
   {
     id: "eval",
-    re: /(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b|=\s*require\s*[;,\n]|\brequire\s*\(\s*String\.fromCharCode/,
-    docSafe: alt([
-      String.raw`\.\s*eval\s*\(`,
-      String.raw`\(\s*0\s*,\s*eval\s*\)`,
-      String.raw`=\s*eval\s*[;,)\n]`,
-      // Function('return this')() is how old code finds the global object; anything else built into a Function is eval
-      String.raw`(?<![\w$.])Function\s*\(\s*(?!['"\x60]return this['"\x60]\s*\))['"\x60]`,
-      String.raw`\.\s*Function\s*\(\s*(?!['"\x60]return this['"\x60]\s*\))['"\x60]`,
-      String.raw`=\s*(?:globalThis|global|window|self)\s*\.\s*Function\s*[;,\n]`,
-      String.raw`\.constructor\s*\.\s*constructor\s*\(`,
-      String.raw`\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"\x60]`,
-      String.raw`\bvm\.(?:compileFunction|SourceTextModule)\b`,
-      String.raw`\brunIn(?:This|New)Context\s*\(`,
-      String.raw`(?:require|import)\s*\(\s*['"](?:node:)?vm['"]\s*\)|from\s+['"](?:node:)?vm['"]`,
-      String.raw`\bmodule\s*\._compile\s*\(|\bModule\.prototype\._compile\b`,
-      String.raw`(?:globalThis|global|window|self)\s*\.\s*require\b`,
-    ]),
+    patterns: [
+      {
+        kind: "code",
+        re: alt([
+          String.raw`(?<![\w$.])eval\s*\(`,
+          String.raw`\b${GLOBAL}\s*\.\s*eval\s*\(`,
+          String.raw`\(\s*0\s*,\s*eval\s*\)`,
+          String.raw`=\s*eval\s*[;,)\n]`,
+          String.raw`\bnew\s+Function\s*\(`,
+          String.raw`(?<![\w$.])Function\s*\(\s*${NOT_RETURN_THIS}`,
+          String.raw`\.\s*Function\s*\(\s*${NOT_RETURN_THIS}`,
+          String.raw`\.constructor\s*\.\s*constructor\s*\(`,
+          String.raw`\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"\x60]`,
+          String.raw`\bvm\.(?:runIn\w*Context|Script|compileFunction|SourceTextModule)\b`,
+          String.raw`\brunIn(?:This|New)Context\s*\(`,
+          String.raw`(?:require|import)\s*\(\s*['"](?:node:)?vm['"]\s*\)|\bfrom\s+['"](?:node:)?vm['"]`,
+          String.raw`\bmodule\s*\._compile\s*\(|\bModule\.prototype\._compile\b`,
+          String.raw`\brequire\s*\(\s*String\.fromCharCode`,
+        ]),
+      },
+      { kind: "alias", re: /=\s*require\s*[;,\n]/g, why: "keeps require under another name, so apm cannot read what it loads" },
+      { kind: "alias", re: new RegExp(String.raw`\b${GLOBAL}\s*\.\s*require\b`, "g"), why: "reaches require through the global object" },
+      { kind: "alias", re: new RegExp(String.raw`=\s*${GLOBAL}\s*\.\s*Function\s*[;,\n]`, "g"), why: "keeps a reference to Function without calling it" },
+      { kind: "alias", re: /\.\s*eval\s*\(/g, why: "calls a method named eval on an object apm cannot identify" },
+    ],
   },
-  { id: "obfuscated", re: /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/ },
 ];
 
 /** Reading the whole environment: a credential grab when a network call sits right next to it. */
@@ -89,16 +158,23 @@ function hexIdentifierRun(text: string): number {
   return -1;
 }
 
-/** A line number and that line, trimmed to 80 characters. */
+/** A line number and the text around a position, trimmed to about 80 characters. */
 export type Where = { line: number; snippet: string };
 
+/** Where `index` is. On a long (minified) line the snippet is the stretch around `index`, so it shows what matched. */
 export function lineOf(text: string, index: number): Where {
   let line = 1;
 
   for (let i = text.indexOf("\n"); i !== -1 && i < index; i = text.indexOf("\n", i + 1)) line++;
   const start = text.lastIndexOf("\n", index - 1) + 1;
   const end = text.indexOf("\n", index);
-  const snippet = text.slice(start, end === -1 ? undefined : end).trim().slice(0, 80);
+  const whole = text.slice(start, end === -1 ? undefined : end);
+
+  if (whole.trim().length <= 80) return { line, snippet: whole.trim() };
+  const col = index - start;
+  const from = Math.max(0, col - 30);
+  const to = from + 80;
+  const snippet = `${from > 0 ? "…" : ""}${whole.slice(from, to).trim()}${to < whole.length ? "…" : ""}`;
 
   return { line, snippet };
 }
@@ -211,255 +287,239 @@ export function namedSignal(s: string): Exclude<CodeSignal, "obfuscated"> | null
   return NAMED.find((n) => n.re.test(t))?.id ?? null;
 }
 
-// ---------- comments ----------
-/** Words after which a `/` starts a regular expression, not a division. */
-const REGEX_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
+// ---------- the scan ----------
+type RegionOf = (index: number) => Region;
 
-/** Where a `/` may start a regex: yes after an operator, no after a value, and "try" after `)`, `]` or `}`. */
-type SlashMeaning = "regex" | "division" | "try-regex";
+const RAW: RegionOf = () => "raw";
 
-/** The end of the regex literal starting at `i` (just past its closing `/` and flags), or -1 when there is none on this line. */
-function regexEnd(text: string, i: number): number {
-  let inClass = false;
+/** What a match of each kind means in each region; a region a kind does not list is not a match. */
+const CONFIDENCE: Record<Kind, Partial<Record<Region, Confidence>>> = {
+  code: { code: "confirmed", kept: "confirmed", raw: "confirmed" },
+  name: { kept: "confirmed", raw: "confirmed", code: "possible", string: "possible" },
+  text: { kept: "confirmed", raw: "confirmed", string: "possible" },
+  alias: { code: "possible", kept: "possible", raw: "possible" },
+};
 
-  for (let j = i + 1; j < text.length; j++) {
-    const c = text[j];
-
-    if (c === "\n" || c === "\r") return -1;
-
-    if (c === "\\") j++;
-    else if (c === "[") inClass = true;
-    else if (c === "]") inClass = false;
-    else if (c === "/" && !inClass) {
-      let k = j + 1;
-
-      while (k < text.length && /[a-z]/i.test(text[k] ?? "")) k++;
-
-      return k;
-    }
-  }
-
-  return -1;
-}
-
-/** The end of the quoted string starting at `i` (past its closing quote, or at the end of the line when it has none). */
-function stringEnd(text: string, i: number, quote: string): number {
-  for (let j = i + 1; j < text.length; j++) {
-    const c = text[j];
-
-    if (c === "\\") j++;
-    else if (c === quote) return j + 1;
-    else if (c === "\n") return j;
-  }
-
-  return text.length;
-}
+const IN_STRING = "only inside an ordinary string, not in code apm saw run";
 
 /**
- * The [start, end) offsets of every comment in JavaScript or TypeScript source. A small tokenizer: it skips
- * strings, template literals (with nested `${}`) and regex literals, so `'/*'` in a string or `/\/*$/` in a
- * regex is not a comment, and a `/* closed *\/` comment ends where it closes. Where `/` could be either a
- * regex or a division (after `)`, `]` or `}`), it reads a regex when one fits on the line: that can only
- * miss a comment, never invent one, so code is never hidden by a wrong guess. An unclosed block comment is
- * a syntax error and counts as code. Linear in the length of the text.
+ * Whether the call-shaped match ending at the `(` at `open` defines a function rather than calling one:
+ * `function fetch(url) {`, or a method `async fetch(url) {`. A call is never followed by `{` after its `)`.
  */
-export function commentRanges(text: string): [number, number][] {
-  const out: [number, number][] = [];
-  // each frame is code (counting its open braces) or the text part of a template literal
-  const stack: ({ kind: "code"; depth: number } | { kind: "template" })[] = [{ kind: "code", depth: 0 }];
-  let slash: SlashMeaning = "regex";
-  let i = 0;
+function isDefinition(text: string, start: number, open: number): boolean {
+  if (/\bfunction\s*\*?\s*$/.test(text.slice(Math.max(0, start - 16), start))) return true;
+  let depth = 0;
 
-  while (i < text.length) {
-    const top = stack[stack.length - 1] ?? { kind: "code", depth: 0 };
-    const c = text[i] ?? "";
+  for (let j = open; j < Math.min(text.length, open + 400); j++) {
+    const c = text[j];
 
-    if (top.kind === "template") {
-      if (c === "\\") i += 2;
-      else if (c === "`") {
-        stack.pop();
-        i++;
-        slash = "division";
-      } else if (c === "$" && text[i + 1] === "{") {
-        stack.push({ kind: "code", depth: 0 });
-        i += 2;
-        slash = "regex";
-      } else i++;
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) {
+      let k = j + 1;
 
-      continue;
+      while (k < text.length && /[ \t]/.test(text[k] ?? "")) k++;
+
+      return text[k] === "{";
     }
-
-    if (c === "/" && text[i + 1] === "/") {
-      const nl = text.indexOf("\n", i);
-      const end = nl < 0 ? text.length : nl;
-
-      out.push([i, end]);
-      i = end;
-    } else if (c === "/" && text[i + 1] === "*") {
-      const close = text.indexOf("*/", i + 2);
-
-      if (close < 0) i += 2;
-      else {
-        out.push([i, close + 2]);
-        i = close + 2;
-      }
-    } else if (c === "/") {
-      const end: number = slash === "division" ? -1 : regexEnd(text, i);
-
-      i = end > 0 ? end : i + 1;
-      slash = end > 0 ? "division" : "regex";
-    } else if (c === "'" || c === '"') {
-      i = stringEnd(text, i, c);
-      slash = "division";
-    } else if (c === "`") {
-      stack.push({ kind: "template" });
-      i++;
-    } else if (c === "{") {
-      top.depth++;
-      i++;
-      slash = "regex";
-    } else if (c === "}") {
-      if (top.depth === 0 && stack.length > 1) stack.pop();
-      else top.depth--;
-      i++;
-      slash = "try-regex";
-    } else if (c === ")" || c === "]") {
-      i++;
-      slash = "try-regex";
-    } else if (/[\w$]/.test(c)) {
-      let j = i + 1;
-
-      while (j < text.length && /[\w$]/.test(text[j] ?? "")) j++;
-      slash = REGEX_AFTER_WORD.has(text.slice(i, j)) ? "regex" : "division";
-      i = j;
-    } else {
-      if (!/\s/.test(c)) slash = "regex";
-      i++;
-    }
-  }
-
-  return out;
-}
-
-/** Whether `index` falls inside one of the sorted `ranges`. */
-function inRanges(ranges: readonly [number, number][], index: number): boolean {
-  let lo = 0;
-  let hi = ranges.length - 1;
-
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    const r = ranges[mid];
-
-    if (!r) return false;
-
-    if (index < r[0]) hi = mid - 1;
-    else if (index >= r[1]) lo = mid + 1;
-    else return true;
   }
 
   return false;
 }
 
-/** Whether the line holding `index` starts like a comment: `* ...` inside a JSDoc block, `// ...` or `/* ...`. */
-function onCommentLine(text: string, index: number): boolean {
-  const start = text.lastIndexOf("\n", index - 1) + 1;
-
-  return /^\s*(?:\*|\/\/|\/\*)/.test(text.slice(start, Math.min(index, start + 200)));
-}
-
 /**
- * First match of `re` in `text` that is not documentation: a match is passed over only when it sits inside a
- * real comment and on a line that starts like one. Every match is looked at; there is no budget to run out.
+ * Whether a match is TypeScript's `import('undici').RequestInit`: a type, erased before anything runs. At runtime
+ * `import()` returns a promise, which has no capitalised members, so a real import never looks like this.
  */
-function firstOutsideComments(re: RegExp, text: string, ranges: () => [number, number][]): number {
-  const g = new RegExp(re.source, "g");
+function isTypeImport(text: string, start: number, match: string): boolean {
+  if (!/^import\s*\(/.test(match)) return false;
+  const close = text.indexOf(")", start + match.length - 1);
 
-  for (let m = g.exec(text); m; m = g.exec(text)) {
-    if (!(inRanges(ranges(), m.index) && onCommentLine(text, m.index))) return m.index;
-
-    if (m[0].length === 0) g.lastIndex++;
-  }
-
-  return -1;
+  return close > 0 && close - start < 300 && /^\s*\.\s*[A-Z]/.test(text.slice(close + 1, close + 40));
 }
 
-// ---------- the scan ----------
-function ruleHits(text: string, how: TextFinding["how"], skip: ReadonlySet<CodeSignal>): TextFinding[] {
+/** The first confirmed match of each rule, or its first possible one. Every match is looked at; there is no budget to run out. */
+function ruleHits(text: string, how: TextFinding["how"], skip: ReadonlySet<CodeSignal>, region: RegionOf): TextFinding[] {
   const out: TextFinding[] = [];
-  let ranges: [number, number][] | null = null;
-  // tokenized once per text, and only when a docs-shaped pattern matched somewhere
-  const comments = (): [number, number][] => (ranges ??= commentRanges(text));
 
   for (const rule of RULES) {
     if (skip.has(rule.id)) continue;
-    const m = rule.re.exec(text);
-    const at = m ? m.index : rule.docSafe ? firstOutsideComments(rule.docSafe, text, comments) : -1;
+    let confirmed: TextFinding | null = null;
+    let possible: TextFinding | null = null;
 
-    if (at >= 0) out.push({ id: rule.id, ...lineOf(text, at), how });
+    for (const p of rule.patterns) {
+      if (confirmed) break;
+
+      // an alias can only ever be possible
+      if (possible && p.kind === "alias") continue;
+      p.re.lastIndex = 0;
+
+      for (let m = p.re.exec(text); m; m = p.re.exec(text)) {
+        if (m[0].length === 0) {
+          p.re.lastIndex++;
+          continue;
+        }
+
+        const r = region(m.index);
+        const confidence = CONFIDENCE[p.kind][r];
+
+        if (!confidence || r === "excluded") continue;
+
+        if (m[0].endsWith("(") && isDefinition(text, m.index, m.index + m[0].length - 1)) continue;
+
+        if (isTypeImport(text, m.index, m[0])) continue;
+
+        if (confidence === "confirmed") {
+          confirmed = { id: rule.id, ...lineOf(text, m.index), how, confidence };
+          break;
+        }
+
+        if (!possible) {
+          const why = p.why ?? IN_STRING;
+          possible = { id: rule.id, ...lineOf(text, m.index), how, confidence, why };
+        }
+
+        if (p.kind === "alias") break;
+      }
+    }
+
+    const best = confirmed ?? possible;
+
+    if (best) out.push(best);
   }
 
   return out;
 }
 
-const NETWORK = RULES.filter((r) => r.id === "network").flatMap((r) => (r.docSafe ? [r.re, r.docSafe] : [r.re]));
+const NETWORK_NEAR = RULES.filter((r) => r.id === "network").flatMap((r) => r.patterns.filter((p) => p.kind !== "alias").map((p) => new RegExp(p.re.source)));
 
-/** An environment dump with a network call within NEAR characters of it: the index of the dump, or -1. */
-function envExfil(text: string): number {
+/** An environment dump with a network call within NEAR characters of it. */
+function envExfil(text: string, region: RegionOf): { index: number; confidence: Confidence } | null {
   let tries = 0;
 
   for (const m of text.matchAll(WHOLE_ENV)) {
-    const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
+    const r = region(m.index);
 
-    if (NETWORK.some((re) => re.test(window))) return m.index;
+    if (r !== "excluded") {
+      const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
+
+      if (NETWORK_NEAR.some((re) => re.test(window))) return { index: m.index, confidence: r === "string" ? "possible" : "confirmed" };
+    }
 
     if (++tries >= 50) break;
   }
 
-  return -1;
+  return null;
+}
+
+/**
+ * Text hidden in a literal: 40 or more `\x` escapes in a row, or a base64 string of 2000+ characters. Each counts
+ * only when it decodes to readable text; data tables, images, fonts and WebAssembly (`\0asm`) are binary data,
+ * which apm lists or skips like the files that hold them. Escapes spelling out text have no honest use, so they
+ * are confirmed; a long base64 text is confirmed only when code loads or runs it.
+ */
+function encodedLiterals(text: string, region: RegionOf): TextFinding[] {
+  const out: TextFinding[] = [];
+
+  for (const m of text.matchAll(/(?:\\x[0-9a-fA-F]{2}){40,}/g)) {
+    const r = region(m.index);
+    const value = m[0].slice(0, 4000).replace(/\\x([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(Number.parseInt(h, 16)));
+
+    if (r === "excluded" || !printable(value)) continue;
+    out.push({ id: "obfuscated", ...lineOf(text, m.index), how: "as written", confidence: "confirmed" });
+    break;
+  }
+
+  for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
+    const r = region(m.index);
+    const raw = (m[1] ?? "").slice(0, 4000);
+    const value = Buffer.from(raw.slice(0, raw.length - (raw.length % 4)), "base64").toString("latin1");
+
+    if (r === "excluded" || value.startsWith("\0asm") || !printable(value)) continue;
+    const confidence: Confidence = r === "string" ? "possible" : "confirmed";
+    out.push(judged({ id: "obfuscated", ...lineOf(text, m.index), how: "as written" }, confidence, "a long base64 string decodes to text, but apm did not see code load or run it"));
+    break;
+  }
+
+  return out;
+}
+
+function regionsOf(text: string, lang: Lang): RegionOf {
+  if (lang === "plain") return RAW;
+  let lexed: Lexed | null = null;
+
+  // tokenized once, and only when something matched
+  return (index) => (lexed ??= lex(text, lang)).region(index);
 }
 
 /**
  * Every rule that matches one file's text. The rules run on the text as written, then on the text with
  * split strings joined, then on readable strings decoded from base64, hex and char codes. A dangerous
- * name that had to be built or decoded also counts as obfuscation.
+ * name that had to be built or decoded also counts as obfuscation. `lang` says how to tell code from
+ * comments and strings; `plain` (install commands, shell scripts) counts every match.
  */
-export function scanText(text: string): TextFinding[] {
-  const out = ruleHits(text, "as written", new Set());
-  const have = (): Set<CodeSignal> => new Set(out.map((f) => f.id));
+export function scanText(text: string, lang: Lang = "js"): TextFinding[] {
+  const region = regionsOf(text, lang);
+  const out = ruleHits(text, "as written", new Set(), region);
+  const confirmed = (): Set<CodeSignal> => new Set(out.filter((f) => f.confidence === "confirmed").map((f) => f.id));
   const hex = hexIdentifierRun(text);
 
-  if (hex >= 0 && !have().has("obfuscated")) out.push({ id: "obfuscated", ...lineOf(text, hex), how: "as written" });
+  if (hex >= 0) out.push({ id: "obfuscated", ...lineOf(text, hex), how: "as written", confidence: "confirmed" });
+  out.push(...encodedLiterals(text, region));
   const joined = joinStrings(text);
+  const jregion = joined.text === text ? region : regionsOf(joined.text, lang);
 
-  if (joined.text !== text) out.push(...ruleHits(joined.text, "after joining strings", have()));
+  if (joined.text !== text) {
+    const found = new Set(out.map((f) => f.id));
+
+    // joining can confirm what the text as written only suggested, but a second "possible" adds nothing
+    for (const f of ruleHits(joined.text, "after joining strings", confirmed(), jregion)) if (f.confidence === "confirmed" || !found.has(f.id)) out.push(f);
+  }
 
   for (const s of joined.built) {
     const id = namedSignal(s);
 
     if (!id) continue;
-    const at = Math.max(0, joined.text.indexOf(quote(s)));
-    const where = lineOf(joined.text, at);
-    out.push({ id, ...where, how: "after joining strings" });
-    out.push({ id: "obfuscated", line: where.line, snippet: `builds "${s.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings" });
+    const at = joined.text.indexOf(quote(s));
+    // a string that became a member access (x['ex' + 'ec'] is x.exec) is code
+    const r: Region = at < 0 ? "code" : jregion(at);
+
+    if (r === "excluded") continue;
+    const confidence: Confidence = r === "string" ? "possible" : "confirmed";
+    const why = `builds "${s.slice(0, 40)}" from pieces, but apm did not see it loaded or called`;
+    const where = lineOf(joined.text, Math.max(0, at));
+
+    out.push(judged({ id, ...where, how: "after joining strings" }, confidence, why));
+    out.push(judged({ id: "obfuscated", line: where.line, snippet: `builds "${s.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings" }, confidence, why));
   }
 
   for (const d of decodedStrings(joined.text)) {
+    const r = jregion(d.index);
+
+    if (r === "excluded") continue;
+    const outer: Confidence = r === "string" ? "possible" : "confirmed";
     const where = lineOf(joined.text, d.index);
     const named = namedSignal(d.value);
-    const hits = ruleHits(d.value, "decoded", new Set());
+    const hits = ruleHits(d.value, "decoded", new Set(), RAW);
 
-    if (named) hits.push({ id: named, line: where.line, snippet: d.value.slice(0, 80), how: "decoded" });
+    if (named) hits.push({ id: named, line: where.line, snippet: d.value.slice(0, 80), how: "decoded", confidence: "confirmed" });
 
     if (hits.length === 0) continue;
+    const hidden = `decoded from ${d.how} in an ordinary string that apm did not see code load or run`;
 
-    for (const h of hits) out.push({ ...h, line: where.line, snippet: `${d.how} "${d.value.slice(0, 60)}" at ${where.snippet}`.slice(0, 120) });
-    out.push({ id: "obfuscated", line: where.line, snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded" });
+    for (const h of hits) {
+      const confidence: Confidence = outer === "possible" || h.confidence === "possible" ? "possible" : "confirmed";
+      const snippet = `${d.how} "${d.value.slice(0, 60)}" at ${where.snippet}`.slice(0, 120);
+
+      out.push(judged({ id: h.id, line: where.line, snippet, how: "decoded" }, confidence, h.confidence === "possible" ? h.why : hidden));
+    }
+
+    out.push(judged({ id: "obfuscated", line: where.line, snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded" }, outer, hidden));
   }
 
-  if (!have().has("credential-access") && have().has("network")) {
-    const at = envExfil(text);
+  if (!confirmed().has("credential-access") && out.some((f) => f.id === "network")) {
+    const hit = envExfil(text, region);
 
-    if (at >= 0) out.push({ id: "credential-access", ...lineOf(text, at), how: "as written" });
+    if (hit) out.push(judged({ id: "credential-access", ...lineOf(text, hit.index), how: "as written" }, hit.confidence, IN_STRING));
   }
 
   return out;

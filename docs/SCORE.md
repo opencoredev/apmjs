@@ -17,23 +17,42 @@ A file's bytes are read whatever they look like: a NUL byte does not make a file
 
 The rules run three times: on the text as written; on the text with split strings joined (`'chi' + 'ld_' + 'process'` becomes `'child_process'`, `x['ex' + 'ec']` becomes `x.exec`, and `\x63hild` escapes are decoded); and on strings decoded from base64, hex (`Buffer.from('…', 'hex')`) and char codes (`String.fromCharCode(102, 101, …)`, or a numeric array in a file that calls it). A dangerous name or rule match that only appears after joining or decoding also counts as `obfuscated`.
 
-Rules added in this version that docs often show as examples (`process.binding`, `new EventSource`, `sendBeacon`, `dns.promises`, HTTP client imports, the indirect eval forms) skip lines that start like a comment (`*` or `//`), so a JSDoc example does not count as code.
+### Code, strings and comments
+
+The code rules (`shell-exec`, `network`, `credential-access`, `eval`, `obfuscated`) match code, not prose. A small lexer (`packages/core/src/lexer.ts`) reads JavaScript and TypeScript, the C family and Python and puts every character in one of four places:
+
+- **Code.**
+- **A kept string**: a module specifier (`require('x')`, `import`, `from 'x'`) or an argument of a call that loads, runs or reads what it is given: `require`, `import`, `spawn`, `exec`, `execSync`, `execFile`, `fork`, `fetch`, `eval`, `Function`, string timers, `vm`, `readFileSync`, `path.join`, `Buffer.from`, `atob`, `system`, `popen` and similar. `` $`…` `` templates count too.
+- **An ordinary string** or template text.
+- **Excluded**: comments (JSDoc and line comments alike) and the bodies of regex literals.
+
+Each rule then says what a match means where it sits. A call (`execSync(`, `fetch(`, `new Function(`) counts in code or a kept string; inside an ordinary string it is text that only runs if something evaluates it, which the eval rules catch. A module name (`child_process`) is confirmed where it is loaded and **possible** anywhere else. Shell text (`curl …`, `| sh`, `wget`, `powershell`) and credential paths (`.npmrc`, `.ssh`) are confirmed in a kept string and possible in an ordinary one; in code they are not text at all (`a || sh` is not a pipe). Aliases that give the power without using it (`r = require`, `x = globalThis.Function`, a method named `fetch` or `eval` on an object apm cannot identify) are always possible. A function or method *definition* named `fetch` or `exec` is not a call, `fetch('data:…')` never leaves the machine, and TypeScript's `import('undici').RequestInit` is a type.
+
+Strings joined from pieces and payloads decoded from base64, hex or char codes keep the evasion checks: they are confirmed when the result is loaded or run (`require('chi' + 'ld_process')`, `eval(atob('…'))`) and possible when the built string is only held. Long base64 literals and runs of `\x` escapes count as `obfuscated` only when they decode to readable text: WebAssembly, fonts and data tables are binary data, read or skipped like the files that hold them.
+
+JSON files and type declarations (`.d.ts`) are data: what they name is possible at most. Install commands, shell scripts, files with other extensions and JSX are read raw, with every match counted, because the lexer cannot follow them.
+
+The lexer refuses to guess. When it loses its place (a bracket closed that was never opened, a template or bracket left open at the end, or a `/` after a `}` that could be a regex or a division) the whole file is read raw, and a comment then hides a match only on a line that starts like a comment. In the 28,172 JavaScript, C and Python files of the 70 popular tarballs below, that happened to 3 C files.
+
+### Confirmed and possible
+
+Every code signal carries `confidence`. **Confirmed**: apm saw the code do it or load the module that does. **Possible**: the text names it (a string, an alias, an unidentified method) but apm did not see it used. A possible signal is labelled as one ("Possible shell use: …"), costs about a third of the points, and lists only possible evidence, each line saying why it is not confirmed. One confirmed finding makes the whole signal confirmed, and then only confirmed evidence is shown.
 
 ## Signals
 
-| Signal | Points | Fires on |
+| Signal | Points (possible) | Fires on |
 | --- | --- | --- |
 | `install-download` | -40 | An install, git-install or binding.gyp command that runs `curl`/`wget`, pipes into a shell, runs `npx`/`bunx`/`dlx` for a package that is not a dependency, or `node -e` with network or process code (also once its base64 is decoded); a shell script an install hook runs that does the same |
 | `incomplete` | -61 | Code that runs could not be read (too large, or past the budget). Keeps the score below the floor on its own |
-| `credential-access` | -25 | `.npmrc`, `.ssh`, cloud credential paths, token variable names, `JSON.stringify(process.env)`, and `Object.keys(process.env)` or `for…in process.env` within 400 characters of a network call |
+| `credential-access` | -25 (-8) | `.npmrc`, `.ssh`, cloud credential paths, token variable names, `JSON.stringify(process.env)`, and `Object.keys(process.env)` or `for…in process.env` within 400 characters of a network call |
 | `risky-dependency` | -30 | A dependency whose resolved version scores below the floor |
 | `typosquat` | -20 | A name one edit from a popular name (two dropped or added letters for names of 8+ characters), the same name with different separators, a popular name plus `.js`/`js`/`-js`/`.mjs`, a near miss of a popular scoped name (`@type/node`), or a scoped name whose bare part swaps two letters of, or adds a suffix to, a popular name (`@evil/raect`) |
 | `unanalyzed-files` | -20 | Files no code was seen loading were left out because the byte budget ran out |
 | `install-script` | -15 | `preinstall`, `install`, `postinstall` or a `binding.gyp` |
-| `shell-exec` | -15 | `child_process`, `execSync`, `spawnSync`, `Bun.spawn`, `Bun.$`, `Deno.Command`, `\| sh`, `curl`, `wget`, `powershell`, `process.binding`, `internalBinding`, `process.dlopen` |
-| `network` | -10 | `fetch(`, `http(s).get/request`, `net`/`tls`/`dgram`/`http2`/`dns` imports, `axios`/`undici`/`got`/`node-fetch`/`ws` and similar clients, `XMLHttpRequest`, `WebSocket`, `EventSource`, `RTCPeerConnection`, `sendBeacon`, `dns.resolve*`/`lookup`, `import('https://…')` |
-| `eval` | -10 | `eval(`, `(0, eval)`, `x.eval(`, `new Function`, `Function('code')` (but not `Function('return this')`), `x.constructor.constructor(`, string `setTimeout`/`setInterval`, `vm` imports and `runInThisContext`/`runInNewContext`/`compileFunction`, `module._compile`, aliases of `require` |
-| `obfuscated` | -10 | 20+ `_0x…` identifiers, 40+ `\x` escapes in a row, a 2000+ character base64 literal, or anything the joining and decoding passes had to undo to find a dangerous name |
+| `shell-exec` | -15 (-5) | `child_process`, `execSync`, `spawnSync`, `Bun.spawn`, `Bun.$`, `Deno.Command`, `\| sh`, `curl`, `wget`, `powershell`, `process.binding`, `internalBinding`, `process.dlopen` |
+| `network` | -10 (-3) | `fetch(`, `http(s).get/request`, `net`/`tls`/`dgram`/`http2`/`dns` imports, `axios`/`undici`/`got`/`node-fetch`/`ws` and similar clients, `XMLHttpRequest`, `WebSocket`, `EventSource`, `RTCPeerConnection`, `sendBeacon`, `dns.resolve*`/`lookup`, `import('https://…')` |
+| `eval` | -10 (-3) | `eval(`, `(0, eval)`, `x.eval(`, `new Function`, `Function('code')` (but not `Function('return this')`), `x.constructor.constructor(`, string `setTimeout`/`setInterval`, `vm` imports and `runInThisContext`/`runInNewContext`/`compileFunction`, `module._compile`, aliases of `require` |
+| `obfuscated` | -10 (-3) | 20+ `_0x…` identifiers, 40+ `\x` escapes in a row or a 2000+ character base64 literal that decode to text, or anything the joining and decoding passes had to undo to find a dangerous name |
 | `git-install-script` | -10 | `prepare`, `prepack` or `postpack` (or a script they run) with shell, network, credential or eval content: npm runs these when someone installs the package from git |
 | `new-publisher` | -10 | An account that never published this package before |
 | `binary` | -5 | Executables and native modules |
@@ -54,7 +73,8 @@ Each of these is also in the `notChecked` list every score carries.
 - **Other encodings.** XOR, compression, a custom alphabet, or base64 that decodes to more base64. Only base64, hex, `\x` escapes, char codes and joined string literals are undone.
 - **Names built any other way**: array lookups, reversed strings, `[...].join('')`, computed indexes, values read from a file at runtime.
 - **Files only a computed path loads.** Docs, type, JSON, style and markup files are read only when code reaches them by a path apm can resolve. Node runs any required file as JavaScript, so `require(name)` pointing at `docs/notes.md` would run code apm did not read; that call shows up as `dynamic-require` with no points.
-- **Comment-shaped lines** for the rules listed above as skipping them: a line of code that starts with `*` (a multiplication continued onto a new line) hides those rules' matches on it.
+- **Code the lexer reads wrong without noticing.** It tracks statement headers, blocks and object literals to tell a regex from a division, and falls back to reading the file raw when it cannot tell. TypeScript's postfix `!` before a `/` and JSX inside a `.js` file are the known ways to mislead it; `.jsx` and `.tsx` files are always read raw.
+- **What a possible signal hides.** A command or credential path held in an ordinary string and run later through a variable (`const c = 'curl …'; spawn(sh, ['-c', c])`) is possible, not confirmed: apm cannot follow the value. Loading `child_process` is still confirmed, so the shell use itself shows.
 - **Native code and WebAssembly.** Listed as `binary` (native) or skipped (WebAssembly), never read.
 - **A popular name under another scope.** `@someone/react` is not a typosquat: scopes exist so names can be reused, and `@sentry/react` and `@types/node` are real.
 - **Dependencies' code.** Each dependency has its own score; `risky-dependency` and the resolve tree walk use them. Git, URL and file dependencies cannot be scored and are listed by name.
@@ -62,4 +82,8 @@ Each of these is also in the `notChecked` list every score carries.
 
 ## Checking the false positives
 
-Changes to the rules are checked against real packages. For this version, 70 popular tarballs (zod, react, hono, next, lodash, express, typescript, vite, webpack, esbuild, sharp and others) were scored with the previous and the new scorer. zod, react, hono, next and lodash kept their scores. The ones that dropped do what the new eval rules describe: `better-sqlite3`, `core-js` and `regenerator-runtime` build functions from code strings, and `ts-node` and `tsx` load `vm` for their REPLs. `@types/node`, `execa` and `@angular/core` went up, because type declarations and docs are no longer read as code. The typosquat rules were run over 2,594 real package names from a large dependency tree; they flag 15, the same 15 the earlier one-edit and separator rules flagged.
+Changes to the rules are checked against real packages: 70 popular tarballs (zod, react, hono, next, lodash, express, typescript, vite, webpack, esbuild, sharp and others), scored with the previous and the new scorer, and every code-signal citation read by hand.
+
+**apm-score-v4** (code, not comments, regex literals or strings). Under v3 the 70 packages carried 97 code signals. 21 had no basis: regex literals read as shell pipes (`/…|sh|…/` in hono, date-fns and mongoose), `|| sh` read as a pipe (three, canvas), prose comments about `curl` or `fetch()` (undici, ws, svelte, sharp, electron, eslint), function definitions named `fetch` (core-js, glob's error message) and WebAssembly or font data counted as obfuscation (@prisma/client, next, sass, three, tsx, undici, vite, webpack). 7 more asserted what only a name supports: a list of builtin module names (eslint, prettier), `.npmrc` in a list of root markers (vite, vitest), `aliasedRequire = require` (moment), a base64 worker script (@sentry/node) and a configurable `config.fetch` (@anthropic-ai/sdk). So **21 of 97 were false (22%)**, and with the 7 overstated, 28 of 97 (29%) claimed more than their evidence showed. Under v4, those 21 are gone and the 7 are labelled possible; the 69 confirmed signals cite 193 lines, all read by hand, and **none is false**. Three are real but weak: `require('node:net').isIP` in express, node-fetch and undici loads a network module only to parse addresses, and zod's `vm` import sits in its shipped test files. 23 scores changed, all upward (mean 81.2 to 85.7); hono went from 75 to 90 and keeps `network` for `fetch(options.jwks_uri)` in its JWT helper. zod (90), react (100), lodash (100) and express (90) did not change.
+
+**apm-score-v3**. zod, react, hono, next and lodash kept their scores. The ones that dropped do what the new eval rules describe: `better-sqlite3`, `core-js` and `regenerator-runtime` build functions from code strings, and `ts-node` and `tsx` load `vm` for their REPLs. `@types/node`, `execa` and `@angular/core` went up, because type declarations and docs are no longer read as code. The typosquat rules were run over 2,594 real package names from a large dependency tree; they flag 15, the same 15 the earlier one-edit and separator rules flagged.

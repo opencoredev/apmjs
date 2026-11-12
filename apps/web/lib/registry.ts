@@ -8,7 +8,8 @@ import { ReviewAnswer } from "./review-schema";
 
 export type { Fetched } from "./registry-fetch";
 
-const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+// confidence arrived with apm-score-v4; older answers asserted every signal
+const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
 
 export type Signal = z.infer<typeof Signal>;
 

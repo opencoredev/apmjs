@@ -8,6 +8,7 @@ import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
 import { citeEvidence } from "@/lib/evidence";
+import { splitLimitation, splitPossible, summarizeLimitations } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
 import { InstallTabs } from "@/components/install-tabs";
@@ -61,19 +62,70 @@ function evidenceLink(input: { signal: string; evidence: string; name: string; v
   return cited && href ? { ...cited, href } : null;
 }
 
-/** One cited line under a signal. When it names a file, the whole row opens that file at the line. */
+/** One cited line under a signal. When it names a file, the whole row opens that file at the line. A possible
+ * finding says, in plain text under the line, why apm did not count it as seen. */
 function Evidence(props: { signal: string; evidence: string; name: string; version: string | null }) {
-  const link = evidenceLink(props);
+  const { text, why } = splitPossible(props.evidence);
+  const link = evidenceLink({ ...props, evidence: text });
   const row = "mt-2 border-l-2 border-inverse-border pl-3 font-mono text-[12.5px] leading-5 text-inverse-muted [overflow-wrap:anywhere]";
+  const reason = why ? <span className="mt-0.5 block font-sans text-[13px] text-inverse-muted">{why}</span> : null;
 
-  if (!link) return <div className={row}>{props.evidence}</div>;
+  if (!link) {
+    return (
+      <div className={row}>
+        {text}
+        {reason}
+      </div>
+    );
+  }
 
   return (
     // a full page load: the file view reads the #L anchor when it starts
     <a href={link.href} className={`group -mr-2 block rounded-r-md py-1 pr-2 transition-colors hover:border-inverse-muted hover:bg-inverse-raised ${row}`}>
       <span className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] group-hover:decoration-inverse-foreground">{link.cite}</span>
       {link.rest}
+      {reason}
     </a>
+  );
+}
+
+/** What the score did not check: a short line under the number, and the whole list behind a disclosure. */
+function LimitationsLine({ notChecked }: { notChecked: readonly string[] }) {
+  const s = summarizeLimitations(notChecked);
+
+  return (
+    <p className="w-full text-sm leading-6 text-pretty text-inverse-muted">
+      {s.headline}
+      {s.extra && <span className="text-inverse-foreground"> {s.extra}</span>}{" "}
+      <a href="#not-checked" className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground">
+        All {s.total}
+      </a>
+    </p>
+  );
+}
+
+function LimitationsList({ notChecked }: { notChecked: readonly string[] }) {
+  return (
+    <details id="not-checked" className="group scroll-mt-24 border-t border-inverse-border bg-inverse-raised">
+      <summary className="flex min-h-12 cursor-pointer list-none items-center justify-between gap-3 px-5 py-3 text-sm text-inverse-foreground select-none hover:bg-inverse-border/40 sm:px-6 [&::-webkit-details-marker]:hidden">
+        <span>
+          What this score does not check <span className="text-inverse-muted tabular-nums">({notChecked.length})</span>
+        </span>
+        <ChevronDownIcon className="size-4 text-inverse-muted transition-transform group-open:rotate-180" aria-hidden />
+      </summary>
+      <ul className="flex flex-col gap-2 px-5 pb-4 text-sm leading-6 text-pretty text-inverse-muted sm:px-6">
+        {notChecked.map((n) => {
+          const { topic, detail } = splitLimitation(n);
+
+          return (
+            <li key={n}>
+              <span className="text-inverse-foreground">{topic}</span>
+              {detail && `: ${detail}`}
+            </li>
+          );
+        })}
+      </ul>
+    </details>
   );
 }
 
@@ -128,15 +180,18 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
         >
           <div className={`h-full rounded-full ${tone.bar}`} style={{ width: `${Math.max(2, score.score)}%` }} />
         </div>
+        {notChecked.length > 0 && <LimitationsLine notChecked={notChecked} />}
       </div>
       <ul className="border-t border-inverse-border">
         {lost.length === 0 && <li className="px-5 py-4 text-[15px] text-inverse-muted sm:px-6">No risk signals in {version ?? "this version"}.</li>}
         {lost.map((s) => (
           <li key={s.id} className="flex gap-4 border-b border-inverse-border px-5 py-4 last:border-b-0 sm:px-6">
-            <span className={`w-9 shrink-0 text-right font-mono text-[15px] leading-6 tabular-nums ${INVERSE_TONE[s.points <= -20 ? "bad" : "warn"].text}`}>{s.points}</span>
+            <span className={`w-9 shrink-0 text-right font-mono text-[15px] leading-6 tabular-nums ${s.confidence === "possible" ? "text-inverse-muted" : INVERSE_TONE[s.points <= -20 ? "bad" : "warn"].text}`}>{s.points}</span>
             <div className="min-w-0 flex-1">
               <div className="text-[15px] leading-6">
-                <span className="font-mono">{s.id}</span> <span className="text-inverse-muted">{s.label}</span>
+                <span className="font-mono">{s.id}</span>{" "}
+                {s.confidence === "possible" && <span className="mr-1 inline-flex h-5 items-center rounded-full border border-inverse-border px-2 align-[1px] text-xs text-inverse-foreground">possible</span>}
+                <span className="text-inverse-muted">{s.label}</span>
               </div>
               {s.evidence.slice(0, 3).map((ev) => (
                 <Evidence key={ev} signal={s.id} evidence={ev} name={name} version={version} />
@@ -154,16 +209,7 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
           </li>
         ))}
       </ul>
-      {notChecked.length > 0 && (
-        <div className="border-t border-inverse-border bg-inverse-raised px-5 py-4 sm:px-6">
-          <div className="text-sm text-inverse-foreground">Not checked</div>
-          <ul className="mt-1.5 flex flex-col gap-1 text-sm text-pretty text-inverse-muted">
-            {notChecked.map((n) => (
-              <li key={n}>{n}</li>
-            ))}
-          </ul>
-        </div>
-      )}
+      {notChecked.length > 0 && <LimitationsList notChecked={notChecked} />}
     </div>
   );
 }

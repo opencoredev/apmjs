@@ -2,7 +2,8 @@
 import { z } from "zod";
 import type { Config } from "./config.ts";
 
-export const SignalSchema = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+// confidence arrived with apm-score-v4; older answers asserted every signal
+export const SignalSchema = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
 export const ReportSchema = z.object({
   score: z.number(),
   grade: z.string(),

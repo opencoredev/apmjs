@@ -97,7 +97,8 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
   const info = report.signals.filter((s) => s.points >= 0);
   if (bad.length === 0) say(`  ${green("✓")} no risk signals found`);
   for (const s of bad) {
-    say(`  ${red(String(s.points).padStart(4))} ${s.id}  ${dim(s.label)}`);
+    const pts = String(s.points).padStart(4);
+    say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${s.id}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(s.label)}`);
     for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(e)}`);
   }
   for (const s of info) say(`  ${dim(`   · ${s.id}  ${s.label}${s.evidence[0] ? ` (${s.evidence[0]})` : ""}`)}`);

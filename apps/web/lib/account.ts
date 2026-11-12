@@ -61,7 +61,8 @@ export const StagedSummary = z.object({
 
 export type StagedSummary = z.infer<typeof StagedSummary>;
 
-const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()) });
+// confidence arrived with apm-score-v4; older answers asserted every signal
+const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
 
 export type Signal = z.infer<typeof Signal>;
 
