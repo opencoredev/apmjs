@@ -125,7 +125,7 @@ describe("upstream proxy", () => {
     const body: unknown = await res.json();
 
     expect(res.status, JSON.stringify(body)).toBe(200);
-    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
     expect(dig(body, "version")).toBe("1.0.0");
     expect(dig(body, "status")).toBe("active");
     expect(dig(body, "statusReason")).toBeNull();

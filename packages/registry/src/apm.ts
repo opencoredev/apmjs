@@ -960,7 +960,8 @@ const versionResponse = (name: string, version: string) =>
         score: report ? { score: report.score, grade: report.grade, notChecked: report.notChecked, ...reviewable(v, report) } : null,
       },
       200,
-      { "cache-control": "no-store" },
+      // its score quotes the version's source, so no shared cache may keep it
+      { "cache-control": "private, no-store" },
     );
   });
 
