@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { z } from "zod";
+import { editDistance } from "@apm/core";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 
 export type Ctx = { store: Store; now: () => number; baseUrl: () => string };
@@ -398,6 +399,10 @@ async function handleAddUser(req: Request, ctx: Ctx, rawName: string): Promise<R
 // ---------- search ----------
 export type SearchHit = { pkg: PackageRecord; latest: VersionRecord | null; rank: number };
 
+function bareName(name: string): string {
+  return name.startsWith("@") ? name.slice(name.indexOf("/") + 1) : name;
+}
+
 export function searchPackages(ctx: Ctx, text: string): SearchHit[] {
   const q = text.trim().toLowerCase();
   const terms = q.split(/\s+/).filter(Boolean);
@@ -414,6 +419,8 @@ export function searchPackages(ctx: Ctx, text: string): SearchHit[] {
       else if (name.includes(t)) rank += 25;
       else if (pkg.keywords.some((k) => k.toLowerCase() === t)) rank += 15;
       else if (hay.includes(t)) rank += 5;
+      // A misspelled name still finds the package: one edit away for short names, two for long ones.
+      else if (t.length >= 4 && editDistance(bareName(name), bareName(t)) <= (t.length >= 8 ? 2 : 1)) rank += 10;
     }
     if (rank === 0) continue;
     const live = servedVersions(ctx.store.listVersions(name));
