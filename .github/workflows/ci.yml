@@ -24,7 +24,8 @@ jobs:
           node-version: 22
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit -p .
-      - run: bunx tsc --noEmit
+      - name: Typecheck web (route types come from next typegen)
+        run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web
       - name: Acceptance suite (real bun, npm and pnpm against an in-process registry)
         run: |
