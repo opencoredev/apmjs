@@ -13,8 +13,9 @@ export type Lang = "c" | "python" | "data" | "plain";
  * - `string`: any other string.
  * - `excluded`: a comment.
  * - `raw`: the lexer could not follow this file, so nothing is known and every match counts.
+ * - `unparsed`: JavaScript with no tree (too large, or no parser accepts it), read as apm-score-v3 read every file.
  */
-export type Region = "code" | "kept" | "string" | "excluded" | "raw";
+export type Region = "code" | "kept" | "string" | "excluded" | "raw" | "unparsed";
 
 type Range = [number, number];
 

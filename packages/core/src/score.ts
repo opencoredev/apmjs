@@ -4,7 +4,7 @@
 // What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
-import { entryPoints } from "./entries.ts";
+import { entryPoints, targetFiles } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
@@ -43,9 +43,12 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * v2 lists the files it could not read. v3 reads every file, follows install-script indirection and decodes cheap
  * encodings. v4 matches code rules against code only (not comments, regex literals or ordinary strings) and marks
  * what it could not see used as `possible`, for fewer points. v5 parses JavaScript and TypeScript with real parsers,
- * reads calls, aliases and evaluated strings from the tree, and confirms what a string holds only by its role.
+ * reads calls, aliases and evaluated strings from the tree, and confirms what a string holds only by its role. v6
+ * resolves names by lexical scope, reads members of local objects (getters, Proxy traps, writes), follows every
+ * operand that can be a callee and arguments through apply, bind and spreads, reads a file with no tree token by
+ * token, and reads every file an exports or imports pattern exposes.
  */
-export const SCORER = "apm-score-v5";
+export const SCORER = "apm-score-v6";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -73,7 +76,7 @@ const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.e
 export const NOT_CHECKED: readonly string[] = [
   "runtime behavior: code that downloads, decrypts or builds a second stage while running",
   "code hidden by anything but base64, hex, \\x escapes, char codes or joined string literals (XOR, compression, a custom encoding)",
-  "names built at runtime from values apm cannot work out in the file (array lookups, computed indexes, values read at runtime)",
+  "names built at runtime from values apm cannot work out in the file (array lookups, computed indexes, values read at runtime, values passed through a function's parameters)",
   "documentation, type, JSON, style and markup files that no code reaches by a path apm can read; a computed require is reported as dynamic-require",
   "native binaries and WebAssembly: listed, not read",
   "a popular name reused under another scope (@someone/react): scopes exist so names can be reused",
@@ -82,7 +85,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -312,12 +315,28 @@ export function scriptTargets(cmd: string): string[] {
   return out;
 }
 
-/** Entry points, most direct first, from the same collector the publish check uses. */
-function declaredEntries(manifest: Record<string, unknown>): string[] {
-  return entryPoints(manifest)
-    .map((e) => e.path)
-    .filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
+/**
+ * Entry points, most direct first, from the same collector the publish check uses: `paths` named one at a time, and
+ * `files` that a subpath pattern (`"./*": "./docs/*.txt"`) or folder mapping exposes, matched against the tarball.
+ */
+type DeclaredEntries = { paths: string[]; files: string[] };
+
+function declaredEntries(manifest: Record<string, unknown>, all: readonly string[]): DeclaredEntries {
+  const paths: string[] = [];
+  const files: string[] = [];
+
+  for (const e of entryPoints(manifest)) {
+    const t = targetFiles(e.path, all);
+
+    if (t.kind === "files") files.push(...t.files);
+    else if (t.path.startsWith(".") || /^[\w@]/.test(t.path)) paths.push(t.path);
+  }
+
+  return { paths, files: [...new Set(files)] };
 }
+
+/** Files node reads as data, not code, whatever exposes them: JSON, type declarations and native modules. */
+const NEVER_RUN = /(?:^|\/)package\.json$|\.(?:json|d\.[cm]?ts|node)$/i;
 
 function dirOf(p: string): string {
   const i = p.lastIndexOf("/");
@@ -509,8 +528,9 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   // node runs an entry point or a required file as JavaScript whatever its extension, so it is read as JavaScript
   const runsAsCode = new Set<string>();
+  const entries = declaredEntries(manifest, files.map((f) => f.path));
 
-  for (const p of declaredEntries(manifest)) {
+  for (const p of entries.paths) {
     const f = resolveIn(byPath, p);
 
     // type declarations listed under exports never run
@@ -518,6 +538,17 @@ export function analyze(input: AnalyzeInput): Analysis {
       first.push(f.path);
       runsAsCode.add(f.path);
     }
+  }
+
+  // every file a pattern exposes can be loaded, and runs as JavaScript whatever its extension (`docs/*.txt` too)
+  const exposedOnly = new Set<string>();
+
+  for (const p of entries.files) {
+    if (NEVER_RUN.test(p)) continue;
+    first.push(p);
+
+    if (!runsAsCode.has(p)) exposedOnly.add(p);
+    runsAsCode.add(p);
   }
 
   const reachable = new Set<string>(first);
@@ -557,6 +588,9 @@ export function analyze(input: AnalyzeInput): Analysis {
     const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : named;
     const scan = scanFile(text, lang);
 
+    // a README or LICENSE a pattern exposes is not JavaScript: node would throw a SyntaxError, so nothing in it runs
+    if (scan.rejected && exposedOnly.has(f.path) && NOT_CODE.test(f.path)) return;
+
     for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence);
 
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
@@ -569,7 +603,10 @@ export function analyze(input: AnalyzeInput): Analysis {
 
       if (!target || seen.has(target.path)) continue;
 
-      if (imports.loads.includes(spec)) runsAsCode.add(target.path);
+      if (imports.loads.includes(spec)) {
+        runsAsCode.add(target.path);
+        exposedOnly.delete(target.path);
+      }
 
       if (reached && !reachable.has(target.path)) {
         reachable.add(target.path);

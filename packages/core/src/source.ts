@@ -5,6 +5,7 @@ import { scanJs, type Imports } from "./js.ts";
 import { lex, type Lang as LexLang, type Lexed } from "./lexer.ts";
 import type { Dialect, Range } from "./parse.ts";
 import { parseEach } from "./parse.ts";
+import { tokenText } from "./tokens.ts";
 import {
   encodedLiterals,
   envExfil,
@@ -20,6 +21,7 @@ import {
   type Confidence,
   type RegionOf,
   type TextFinding,
+  UNPARSED,
   type Where,
 } from "./rules.ts";
 
@@ -230,7 +232,12 @@ export function decodedStrings(text: string): Decoded[] {
 
 // ---------- reading text without a parser ----------
 
-function regionsOf(text: string, lang: LexLang): RegionOf {
+/** How a file read with the text rules is read: lexed (C, Python), raw, or JavaScript that has no tree. */
+type TextLang = LexLang | "unparsed";
+
+function regionsOf(text: string, lang: TextLang): RegionOf {
+  if (lang === "unparsed") return UNPARSED;
+
   if (lang === "plain") return RAW;
   let lexed: Lexed | null = null;
 
@@ -243,18 +250,26 @@ function regionsOf(text: string, lang: LexLang): RegionOf {
  * strings told apart), JSON and type declarations (`data`), and JavaScript that no parser accepted (read raw, as
  * apm-score-v3 read every file). The rules run on the text as written, then with split strings joined, then on
  * readable strings decoded from base64, hex and char codes; a dangerous name that had to be built or decoded also
- * counts as obfuscation. Every finding cites where it is in `text`, traced back through the joining.
+ * counts as obfuscation. Every finding cites where it is in the file as written, traced back through the joining.
+ * `text` is the file itself, or (with `from`) a window of its tokens in plain form (tokens.ts), which keep every
+ * offset: `from.offset` is where the window starts in `from.shown`, the file as written.
  */
-function scanTextRules(text: string, lang: LexLang): TextFinding[] {
+function scanTextRules(text: string, lang: TextLang, from: { shown: string; offset: number } | null = null): TextFinding[] {
   const region = regionsOf(text, lang);
-  const out = ruleHits(text, "as written", new Set(), region);
+  const place = (index: number): Where => (from ? lineOf(from.shown, index + from.offset) : lineOf(text, index));
+  const out = ruleHits(text, "as written", new Set(), region, place);
   const confirmed = (): Set<CodeSignal> => new Set(out.filter((f) => f.confidence === "confirmed").map((f) => f.id));
-  const hex = hexIdentifierRun(text);
 
-  if (hex >= 0) out.push({ id: "obfuscated", ...lineOf(text, hex), how: "as written", confidence: "confirmed" });
-  out.push(...encodedLiterals(text, region));
+  // escapes and identifier runs are read on the file as written; its tokens in plain form have them decoded
+  if (!from) {
+    const hex = hexIdentifierRun(text);
+
+    if (hex >= 0) out.push({ id: "obfuscated", ...place(hex), how: "as written", confidence: "confirmed" });
+    out.push(...encodedLiterals(text, region));
+  }
+
   const joined = joinStrings(text);
-  const at = (index: number): Where => lineOf(text, joined.origin(index));
+  const at = (index: number): Where => place(joined.origin(index));
   const jregion: RegionOf = (index) => region(joined.origin(index));
 
   if (joined.text !== text) {
@@ -273,7 +288,7 @@ function scanTextRules(text: string, lang: LexLang): TextFinding[] {
     if (r === "excluded") continue;
     const confidence: Confidence = r === "string" ? "possible" : "confirmed";
     const why = `builds "${b.value.slice(0, 40)}" from pieces, but apm did not see it loaded or called`;
-    const where = lineOf(text, b.index);
+    const where = place(b.index);
 
     out.push(judged({ id, ...where, how: "after joining strings" }, confidence, why));
     out.push(judged({ id: "obfuscated", line: where.line, snippet: `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings" }, confidence, why));
@@ -306,11 +321,48 @@ function scanTextRules(text: string, lang: LexLang): TextFinding[] {
   if (!confirmed().has("credential-access") && out.some((f) => f.id === "network")) {
     const hit = envExfil(text, region);
 
-    if (hit) out.push(judged({ id: "credential-access", ...lineOf(text, hit.index), how: "as written" }, hit.confidence, IN_STRING));
+    if (hit) out.push(judged({ id: "credential-access", ...place(hit.index), how: "as written" }, hit.confidence, IN_STRING));
   }
 
   return out;
 }
+
+/**
+ * JavaScript with no tree: the text rules on the file as written (everything apm-score-v3 caught), and on its tokens
+ * in plain form, which undo what only the tokenizer sees through: escaped names, escaped strings and comments between
+ * joined pieces. The token pass adds only what the pass as written did not confirm, so no confirmed citation moves.
+ */
+function scanUnparsed(text: string): FileScan {
+  const raw = scanTextRules(text, "unparsed");
+  const rawImports = importsOf(joinStrings(text).text);
+  const plain = tokenText(text);
+
+  if (plain === null || plain === text) return { findings: raw, imports: rawImports, read: "raw", rejected: false };
+  const sure = new Set(raw.filter((f) => f.confidence === "confirmed").map((f) => f.id));
+  const more: TextFinding[] = [];
+  const paths = new Set(rawImports.paths);
+  const loads = new Set(rawImports.loads);
+
+  // read in overlapping windows, so a file of tens of megabytes never needs a second joined copy of itself
+  for (let start = 0; start < plain.length; start += TOKEN_WINDOW) {
+    const piece = plain.slice(start, start + TOKEN_WINDOW + TOKEN_OVERLAP);
+
+    for (const f of scanTextRules(piece, "unparsed", { shown: text, offset: start })) if (!sure.has(f.id)) more.push(f);
+    const found = importsOf(joinStrings(piece).text);
+
+    for (const p of found.paths) paths.add(p);
+
+    for (const p of found.loads) loads.add(p);
+  }
+
+  const imports: Imports = { paths: [...paths].slice(0, 500), loads: [...loads].slice(0, 500), dynamic: rawImports.dynamic };
+
+  return { findings: [...raw, ...more], imports, read: "raw", rejected: false };
+}
+
+/** How much of a file's tokens one pass of the text rules reads, and how far each window reaches into the next. */
+const TOKEN_WINDOW = 4 * 1024 * 1024;
+const TOKEN_OVERLAP = 64 * 1024;
 
 // ---------- what a file loads ----------
 const STATIC_IMPORT = /(?:\brequire(?:\.resolve)?\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*['"\x60](\.{1,2}\/[^'"\x60\n]+)['"\x60]/g;
@@ -363,26 +415,30 @@ export function importsOf(text: string): Imports {
 
 // ---------- one file ----------
 
-/** What one file's text shows: the rules it matches, and the files and modules it loads. */
-export type FileScan = { findings: TextFinding[]; imports: Imports; read: "parsed" | "raw" | "lexed" };
+/**
+ * What one file's text shows: the rules it matches, and the files and modules it loads. `rejected` says no parser
+ * accepted it as JavaScript or TypeScript (a syntax error, not a size limit), so node could not run it either.
+ */
+export type FileScan = { findings: TextFinding[]; imports: Imports; read: "parsed" | "raw" | "lexed"; rejected: boolean };
 
 /**
  * Reads one file as `lang`. JavaScript and TypeScript go to the parser; when no parser accepts the file, or it is
- * too large to hold as a tree, it is read raw (fail closed): every match counts, as in apm-score-v3.
+ * too large to hold as a tree, it is read raw (fail closed): every match counts, as in apm-score-v3, and its tokens
+ * are read too, so escapes and comments cannot hide a name from the raw rules.
  */
 export function scanFile(text: string, lang: Lang): FileScan {
   if (isDialect(lang)) {
     const js = scanJs(text, lang);
 
-    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed" };
+    if (js.kind === "parsed") return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false };
 
-    return { findings: scanTextRules(text, "plain"), imports: importsOf(joinStrings(text).text), read: "raw" };
+    return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
   }
 
   // JSON and type declarations never run, so nothing in them is a load
   const imports = lang === "data" ? { paths: [], loads: [], dynamic: [] } : importsOf(joinStrings(text).text);
 
-  return { findings: scanTextRules(text, lang), imports, read: lang === "plain" ? "raw" : "lexed" };
+  return { findings: scanTextRules(text, lang), imports, read: lang === "plain" ? "raw" : "lexed", rejected: false };
 }
 
 /** The rule findings for one text read as `lang`. */

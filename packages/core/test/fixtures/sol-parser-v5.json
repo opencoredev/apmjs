@@ -1,0 +1,1628 @@
+[
+ {
+  "name": "scope-fetch",
+  "file": "index.js",
+  "src": "function unused(){const fetch=()=>{};} fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "scope-require",
+  "file": "index.js",
+  "src": "function unused(){const require=()=>{};} require('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 95,
+  "v6": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "scope-eval",
+  "file": "index.js",
+  "src": "function unused(){const eval=()=>{};} eval(\"fetch('https://example.invalid')\");",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 80,
+  "v5": 100,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "scope-process",
+  "file": "index.js",
+  "src": "function unused(){const process={};} process.env.NPM_TOKEN;",
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 100,
+  "v6": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "scope-floor",
+  "file": "index.js",
+  "src": "function unused(){const fetch=()=>{}; const require=()=>{}; const process={}; const eval=()=>{};} require('chi'+'ld_process'); fetch('https://example.invalid'); process.env.NPM_TOKEN; eval('1');",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "with-fetch",
+  "file": "index.js",
+  "src": "const fetch=()=>{}; with(globalThis){fetch('https://example.invalid');}",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "getter-fetch",
+  "file": "index.js",
+  "src": "const obj={ get fetch(){return globalThis.fetch;} }; obj.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "getter-eval",
+  "file": "index.js",
+  "src": "const obj={ get run(){return eval;} }; obj.run(\"fetch('https://example.invalid')\");",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "proxy-fetch",
+  "file": "index.js",
+  "src": "const obj=new Proxy({}, {get(){return globalThis.fetch;}});obj.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 97,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "reflect-get",
+  "file": "index.js",
+  "src": "Reflect.get(globalThis,'fetch')('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "reflect-apply-control",
+  "file": "index.js",
+  "src": "Reflect.apply(fetch,null,['https://example.invalid']);",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "reflect-apply-constant",
+  "file": "index.js",
+  "src": "const args=['https://example.invalid']; Reflect.apply(fetch,null,args);",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "destructuring-computed",
+  "file": "index.js",
+  "src": "const {['fe'+'tch']: send}=globalThis; send('https://example.invalid');",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 94,
+  "v5": 94,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "destructuring-default",
+  "file": "index.js",
+  "src": "const {send=fetch}={}; send('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "destructuring-array",
+  "file": "index.js",
+  "src": "const [send]=[fetch]; send('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "object-property-fetch",
+  "file": "index.js",
+  "src": "const obj={fetch:globalThis.fetch};obj.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "global-function-return",
+  "file": "index.js",
+  "src": "Function('return this')().fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 97,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-enum",
+  "file": "index.ts",
+  "src": "enum E { X=fetch('https://example.invalid') as any }",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-namespace",
+  "file": "index.ts",
+  "src": "namespace X { export const r=fetch('https://example.invalid'); }",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-param",
+  "file": "index.ts",
+  "src": "class X { constructor(public x=fetch('https://example.invalid')){} }new X();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-shadow-ambient",
+  "file": "index.ts",
+  "src": "declare namespace X { function fetch(x:string):void; } fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-shadow-type",
+  "file": "index.ts",
+  "src": "type X = (fetch: any) => void; fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-decorator",
+  "file": "index.ts",
+  "src": "@((target:any)=>{ fetch('https://example.invalid');return target;}) class X {}",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-decorator-escaped",
+  "file": "index.ts",
+  "src": "@((target:any)=>{ f\\u0065tch('https://example.invalid');return target;}) class X {}",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-abstract-runtime",
+  "file": "index.ts",
+  "src": "abstract class X { static y=fetch('https://example.invalid'); }",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "cjs-await",
+  "file": "index.cjs",
+  "src": "await (fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "mjs-await",
+  "file": "index.mjs",
+  "src": "await (fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "noext-await",
+  "file": "index",
+  "src": "await (fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "mjs-html",
+  "file": "index.mjs",
+  "src": "let x=1,y=1; x <!-- y; fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "global-computed-control",
+  "file": "index.js",
+  "src": "globalThis['fe'+'tch']('https://example.invalid');",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 80,
+  "v5": 80,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "eval-args-spread",
+  "file": "index.js",
+  "src": "eval(...[\"fetch('https://example.invalid')\"]);",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 80,
+  "v5": 80,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-bound",
+  "file": "index.js",
+  "src": "Function.bind(null,\"fetch('https://example.invalid')\")()();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "eval-array-apply",
+  "file": "index.js",
+  "src": "const args=[\"fetch('https://example.invalid')\"];eval.apply(null,args);",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "eval-apply-holes",
+  "file": "index.js",
+  "src": "eval.apply(null,[,\"fetch('https://example.invalid')\"]);",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "function-data-params",
+  "file": "index.js",
+  "src": "Function('fetch', 'return 1');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "data-nonliteral-tail",
+  "file": "index.js",
+  "src": "fetch('data:' + url);",
+  "kind": "precision",
+  "why": "'data:' + url is a data: URL whatever follows, which fetch reads without the network",
+  "v3": 90,
+  "v4": 100,
+  "v5": 100,
+  "v6": 100,
+  "signals": {}
+ },
+ {
+  "name": "data-upper",
+  "file": "index.js",
+  "src": "fetch('DATA:,hello');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "local-mutation",
+  "file": "index.js",
+  "src": "const obj={fetch:()=>{}};obj.fetch=globalThis.fetch;obj.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "fallback-plain",
+  "file": "index.js",
+  "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 30,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "fallback-ts",
+  "file": "index.ts",
+  "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 30,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "fallback-ts-padded",
+  "file": "index.ts",
+  "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
+  "pad": "ts",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "fallback-js-padded",
+  "file": "index.js",
+  "src": "requ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
+  "pad": "js",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "scope-type-declaration",
+  "file": "index.ts",
+  "src": "declare namespace X { const fetch: (x:string)=>void; const process: any; } fetch('https://example.invalid'); process.env.NPM_TOKEN;",
+  "kind": "detection",
+  "v3": 65,
+  "v4": 65,
+  "v5": 90,
+  "v6": 65,
+  "signals": {
+   "credential-access": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "scope-in-namespace",
+  "file": "index.ts",
+  "src": "namespace X { export const fetch=()=>{}; } fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "scope-block",
+  "file": "index.js",
+  "src": "{const fetch=()=>{};}fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "with-require",
+  "file": "index.js",
+  "src": "const require=()=>{};with(globalThis){require('child_process');}",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 95,
+  "v6": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "local-proto",
+  "file": "index.js",
+  "src": "const g={__proto__:globalThis};g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "local-getter-eval",
+  "file": "index.js",
+  "src": "const obj={get run(){return eval;}};obj.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 40,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "local-spread",
+  "file": "index.js",
+  "src": "const g={...globalThis};g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "local-reflect",
+  "file": "index.js",
+  "src": "const g={};Reflect.set(g,'fetch',globalThis.fetch);g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "local-objectassign",
+  "file": "index.js",
+  "src": "const g={};Object.assign(g,globalThis);g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "computed-constant",
+  "file": "index.js",
+  "src": "const key='fe'+'tch'; const {[key]:send}=globalThis;send('https://example.invalid');",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 94,
+  "v5": 94,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "destructure-literal",
+  "file": "index.js",
+  "src": "const {fetch:send}=globalThis;send('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "reflect-get-eval",
+  "file": "index.js",
+  "src": "Reflect.get(globalThis,'eval')(\"fetch('https://example.invalid')\");",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 100,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "reflect-get-floor",
+  "file": "index.js",
+  "src": "Reflect.get(globalThis,'eval')(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "bind-eval",
+  "file": "index.js",
+  "src": "eval.bind(null,\"fetch('https://example.invalid')\")();",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 100,
+  "v5": 90,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "bind-eval-floor",
+  "file": "index.js",
+  "src": "eval.bind(null,\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\")();",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 82,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "const-apply-eval-floor",
+  "file": "index.js",
+  "src": "const args=[\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\"];Reflect.apply(eval,null,args);",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 82,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "spread-eval-default",
+  "file": "index.js",
+  "src": "const args=[\"fetch('https://example.invalid')\"];eval(...args);",
+  "kind": "detection",
+  "v3": 80,
+  "v4": 90,
+  "v5": 90,
+  "v6": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "apply-hole-precision",
+  "file": "index.js",
+  "src": "eval.apply(null,[,\"require('child_process');fetch('https://example.invalid');process.env.NPM_TOKEN\"]);",
+  "kind": "precision",
+  "why": "the hole passes undefined as eval's first argument; the payload is its second, which eval ignores",
+  "v3": 50,
+  "v4": 95,
+  "v5": 77,
+  "v6": 77,
+  "signals": {
+   "credential-access": "possible",
+   "shell-exec": "possible",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "local-call-precision",
+  "file": "index.js",
+  "src": "const obj={call(...args){return args;}};obj.call(null, 'https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 100,
+  "signals": {}
+ },
+ {
+  "name": "logical-or",
+  "file": "index.js",
+  "src": "(null || fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "logical-and",
+  "file": "index.js",
+  "src": "(true && fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "logical-conditional",
+  "file": "index.js",
+  "src": "(true ? fetch : ()=>{})('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "logical-eval-floor",
+  "file": "index.js",
+  "src": "(null || eval)(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "logical-global",
+  "file": "index.js",
+  "src": "const g = null || globalThis;g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "conditional-eval-floor",
+  "file": "index.js",
+  "src": "(true ? eval : ()=>{})(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "default-destructure-eval",
+  "file": "index.js",
+  "src": "const {run=eval}={};run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN\");",
+  "kind": "detection",
+  "v3": 40,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "data-uri-path",
+  "file": "index.js",
+  "src": "fetch('da\\nta:,');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "decorator-full",
+  "file": "index.ts",
+  "src": "@((target:any)=>target)\nclass X {}\nrequ\\u0069re('ch\\u{69}ld_process');f\\u0065tch('https://example.invalid');process.env['NPM'+/*gap*/'_TOKEN'];globalThis['ev'+/*gap*/'al']('1');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "logical-floor",
+  "file": "index.js",
+  "src": "(null || eval)(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "getter-floor",
+  "file": "index.js",
+  "src": "const obj={get run(){return eval;}};obj.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "bound-floor",
+  "file": "index.js",
+  "src": "eval.bind(null,\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")();",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 82,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "apply-floor",
+  "file": "index.js",
+  "src": "const args=[\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\"];Reflect.apply(eval,null,args);",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 82,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "scope-esm",
+  "file": "index.mjs",
+  "src": "function unused(){const fetch=()=>{};}fetch('https://example.invalid');export {};",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "with-no-call",
+  "file": "index.js",
+  "src": "const fetch=()=>{};with(globalThis){fetch('https://example.invalid');}",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "wildcard-export",
+  "file": "index.js",
+  "src": "module.exports=1;",
+  "extra": {
+   "docs/payload.txt": "require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')"
+  },
+  "manifest": {
+   "exports": {
+    "./*": {
+     "node": {
+      "require": "./docs/*.txt"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "mode-cjs-cr",
+  "file": "index.cjs",
+  "src": "// note\rrequire('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 100,
+  "v5": 85,
+  "v6": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "mode-mjs-await",
+  "file": "index.mjs",
+  "src": "await (fetch)('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "mode-type-module-await-2",
+  "file": "index.js",
+  "src": "await (fetch)('https://example.invalid');",
+  "manifest": {
+   "type": "module"
+  },
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "mode-type-module-await",
+  "file": "index.js",
+  "src": "await (fetch)('https://example.invalid');",
+  "manifest": {
+   "type": "module"
+  },
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "mode-noextension-cr",
+  "file": "index",
+  "src": "// note\rrequire('child_process');",
+  "kind": "detection",
+  "v3": 85,
+  "v4": 85,
+  "v5": 85,
+  "v6": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "mode-nested-type-module",
+  "file": "index.js",
+  "src": "import './sub/entry.js';",
+  "extra": {
+   "sub/entry.js": "await (fetch)('https://example.invalid');",
+   "sub/package.json": "{\"type\":\"module\"}"
+  },
+  "manifest": {
+   "type": "module"
+  },
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 90,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "exports-condition-payload-mjs",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "payload.mjs": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./payload.mjs",
+      "require": "./payload.mjs"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "exports-condition-payload-cjs",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "payload.cjs": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./payload.cjs",
+      "require": "./payload.cjs"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "exports-condition-payload",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "payload": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./payload",
+      "require": "./payload"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "exports-condition-docs-payload-txt",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "docs/payload.txt": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./docs/payload.txt",
+      "require": "./docs/payload.txt"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "exports-condition-docs-payload-d-ts",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "docs/payload.d.ts": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./docs/payload.d.ts",
+      "require": "./docs/payload.d.ts"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 100,
+  "signals": {}
+ },
+ {
+  "name": "exports-condition-docs-payload-json",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "docs/payload.json": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./docs/payload.json",
+      "require": "./docs/payload.json"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "precision",
+  "why": "node reads a .json target as JSON and never runs it, so what it names is possible",
+  "v3": 75,
+  "v4": 95,
+  "v5": 95,
+  "v6": 95,
+  "signals": {
+   "shell-exec": "possible"
+  }
+ },
+ {
+  "name": "exports-condition-docs-payload-html",
+  "file": "index.js",
+  "src": "export {};",
+  "extra": {
+   "docs/payload.html": "fetch('https://example.invalid');require('child_process');"
+  },
+  "manifest": {
+   "exports": {
+    ".": {
+     "node": {
+      "import": "./docs/payload.html",
+      "require": "./docs/payload.html"
+     },
+     "default": "./index.js"
+    }
+   }
+  },
+  "kind": "detection",
+  "v3": 75,
+  "v4": 75,
+  "v5": 75,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "instance-getter",
+  "file": "index.js",
+  "src": "class A { get run(){ return eval; } } new A().run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "instance-constructor",
+  "file": "index.js",
+  "src": "class A { constructor(){ this.run = eval; } } const a = new A(); a.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "instance-field",
+  "file": "index.js",
+  "src": "class A { run = eval } new A().run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "static-getter",
+  "file": "index.js",
+  "src": "class A { static get run(){ return eval; } } A.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "define-property-getter",
+  "file": "index.js",
+  "src": "const o = {}; Object.defineProperty(o, 'run', { get: () => eval }); o.run(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 30,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "object-create-global",
+  "file": "index.js",
+  "src": "const g = Object.create(globalThis); g.fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 97,
+  "v5": 97,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "function-returns-eval",
+  "file": "index.js",
+  "src": "const get = () => eval; get()(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "eval-passed-on",
+  "file": "index.js",
+  "src": "function run(f, c){ return f(c); } run(eval, \"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "param-default-eval",
+  "file": "index.js",
+  "src": "function f(go = eval){ go(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\"); } f();",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 82,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "proxy-trap-eval",
+  "file": "index.js",
+  "src": "const p = new Proxy({}, { get: () => eval }); p.anything(\"require('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "kind": "detection",
+  "v3": 30,
+  "v4": 92,
+  "v5": 92,
+  "v6": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "block-function-call",
+  "file": "index.js",
+  "src": "{ function fetch(){} } fetch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "ts-decorator-legacy-param",
+  "file": "index.ts",
+  "src": "class A { constructor(@((t: any) => t) private x: number) {} }\nrequ\\u0069re('ch\\u{69}ld_process');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 75,
+  "signals": {
+   "shell-exec": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "ts-decorator-standard",
+  "file": "index.ts",
+  "src": "export @((t: any) => t) class A {}\nf\\u0065tch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "js-decorator",
+  "file": "index.js",
+  "src": "@((t) => t) class A {}\nf\\u0065tch('https://example.invalid');",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "typeof-eval-control",
+  "file": "index.js",
+  "src": "if (typeof eval === 'function') {}",
+  "kind": "detection",
+  "v3": 100,
+  "v4": 100,
+  "v5": 100,
+  "v6": 100,
+  "signals": {}
+ },
+ {
+  "name": "hoisted-local-control",
+  "file": "index.js",
+  "src": "function f(){ var fetch = () => 1; return fetch('https://example.invalid'); }",
+  "kind": "precision",
+  "why": "the fetch called is the function's own `var fetch`, which covers the call; the global is never reached",
+  "v3": 90,
+  "v4": 90,
+  "v5": 100,
+  "v6": 100,
+  "signals": {}
+ }
+]

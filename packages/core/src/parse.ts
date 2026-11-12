@@ -60,22 +60,29 @@ function acornParse(text: string, goal: Goal, withJsx: boolean): Parsed | "synta
   }
 }
 
-function babelParse(text: string, goal: Goal, withJsx: boolean): Parsed | "syntax" {
-  const plugins: ParserPlugin[] = ["estree", "typescript"];
+/**
+ * Decorators come in two dialects that one Babel parse cannot take at once: TypeScript's `experimentalDecorators`
+ * (`@dec export class`, parameter decorators) and the standard proposal (`export @dec class`). The legacy one is tried
+ * first, as most TypeScript that ships decorators was written for it.
+ */
+const DECORATORS: readonly ParserPlugin[] = ["decorators-legacy", "decorators"];
 
-  if (withJsx) plugins.push("jsx");
+function babelParse(text: string, goal: Goal, base: readonly ParserPlugin[], dialect: Dialect): Parsed | "syntax" {
+  for (const decorators of DECORATORS) {
+    try {
+      const file = parseBabel(text, { sourceType: goal, plugins: [...base, decorators], allowReturnOutsideFunction: goal === "script", attachComment: false, errorRecovery: false });
+      const comments: Range[] = (file.comments ?? []).map((c) => [c.start ?? 0, c.end ?? 0]);
+      const program: unknown = file.program;
 
-  try {
-    const file = parseBabel(text, { sourceType: goal, plugins, allowReturnOutsideFunction: goal === "script", attachComment: false, errorRecovery: false });
-    const comments: Range[] = (file.comments ?? []).map((c) => [c.start ?? 0, c.end ?? 0]);
-    const program: unknown = file.program;
+      if (!isProgram(program)) return "syntax";
 
-    if (!isProgram(program)) return "syntax";
-
-    return { program, comments, goal, dialect: withJsx ? "tsx" : "ts" };
-  } catch {
-    return "syntax";
+      return { program, comments, goal, dialect };
+    } catch {
+      // the other decorator dialect, if any, is tried next
+    }
   }
+
+  return "syntax";
 }
 
 /**
@@ -99,14 +106,34 @@ export type ReadEach = (p: Parsed) => boolean;
 
 function parseTs(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
   if (text.length > MAX_PARSED_TS_BYTES) return "too-large";
+  const base: ParserPlugin[] = withJsx ? ["estree", "typescript", "jsx"] : ["estree", "typescript"];
 
   for (const goal of ["module", "script"] as const) {
-    const p = babelParse(text, goal, withJsx);
+    const p = babelParse(text, goal, base, withJsx ? "tsx" : "ts");
 
     if (p === "syntax") continue;
 
     // TypeScript has no HTML-like comments, so a parse that needed one is a parse of something else
     if (hasHtmlComment(text, p.comments)) return "syntax";
+    each(p);
+
+    return "parsed";
+  }
+
+  return "syntax";
+}
+
+/**
+ * JavaScript acorn rejects but Babel reads: decorators, which acorn does not parse. Babel's tree costs three times
+ * acorn's, so this is held to the TypeScript size cap. Flow is not enabled: its type annotations would read as code.
+ */
+function parseJsWithBabel(text: string, each: ReadEach): ParseOutcome {
+  if (text.length > MAX_PARSED_TS_BYTES) return "syntax";
+
+  for (const goal of ["module", "script"] as const) {
+    const p = babelParse(text, goal, ["estree", "jsx"], "jsx");
+
+    if (p === "syntax") continue;
     each(p);
 
     return "parsed";
@@ -122,7 +149,8 @@ function parseTs(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
  * comment (`x <!-- y` hides the rest of the line in a script, and is `x < !--y` in a module) and `await` (a name in
  * a script, so `await (f)(x)` calls `await`; an operator in a module, which calls `f`). A script with either is
  * parsed as a module too and both programs are read: node runs `.mjs` and `"type": "module"` files as modules.
- * Nothing is guessed: when no goal accepts the file the outcome is `syntax`, and the caller reads it raw.
+ * JavaScript acorn rejects is offered to Babel (decorators). Nothing is guessed: when no goal accepts the file the
+ * outcome is `syntax`, and the caller reads it token by token and raw.
  */
 export function parseEach(text: string, dialect: Dialect, each: ReadEach): ParseOutcome {
   if (dialect === "ts" || dialect === "tsx") return parseTs(text, dialect === "tsx", each);
@@ -157,5 +185,5 @@ export function parseEach(text: string, dialect: Dialect, each: ReadEach): Parse
     throw e;
   }
 
-  return "syntax";
+  return parseJsWithBabel(text, each);
 }

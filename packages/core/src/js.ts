@@ -53,9 +53,19 @@ interface JsxText extends Node {
   value: string;
 }
 
+interface TsModuleDeclaration extends Node {
+  type: "TSModuleDeclaration";
+  id: AnyNode;
+}
+
+interface TsEnumDeclaration extends Node {
+  type: "TSEnumDeclaration";
+  id: Identifier;
+}
+
 declare module "acorn" {
   interface NodeTypes {
-    apm: TsExpression | TsImportEquals | TsExternalModuleReference | TsParameterProperty | JsxText;
+    apm: TsExpression | TsImportEquals | TsExternalModuleReference | TsParameterProperty | JsxText | TsModuleDeclaration | TsEnumDeclaration;
   }
 }
 
@@ -124,43 +134,72 @@ function isTypeOnly(n: AnyNode): boolean {
 /**
  * - `global`: a global and a path in it (`fetch`, `process.env`, `Bun.spawn`); `""` is the global object itself.
  * - `module`: a module and a member path in it (`child_process` and `exec`).
- * - `local`: a value this file makes (a function, class, object, array or literal), so not a platform API.
+ * - `local`: a value this file makes (a function, class, object, array or literal), so not a platform API. `obj` is
+ *   the node that made it, when its members can be read (an object literal, an array, a class, a function, a Proxy,
+ *   `Object.create(…)`), and the binding that holds it, whose later writes (`obj.x = …`) are members too.
  * - `unknown`: anything else; `name` is its last property or identifier and `owner` the name before that.
  * `built` says a property name on the way was joined or decoded from pieces.
  */
 type Ref =
   | { kind: "global"; path: string; built: boolean }
   | { kind: "module"; spec: string; path: string; built: boolean }
-  | { kind: "local"; fn: boolean }
+  | { kind: "local"; fn: boolean; obj: LocalObj | null }
   | { kind: "unknown"; name: string | null; owner: string | null; built: boolean };
+
+/** A value this file makes, read through the node that made it; `instance` is an object a local class constructs. */
+type LocalObj = { node: AnyNode; binding: Binding | null; instance: boolean };
 
 const GLOBAL_OBJECTS: ReadonlySet<string> = new Set(["globalThis", "global", "window", "self"]);
 
-/** Where a declared name gets its value. */
+/** A property name in a pattern or a write: known as written, or a computed key apm works out when it is read. */
+type Key = { kind: "name"; name: string } | { kind: "computed"; node: AnyNode };
+
+/** Where a declared name gets its value. `default` is a pattern's default (`{ run = eval } = obj`): either side. */
 type Origin =
   | { kind: "value"; init: Expression }
-  | { kind: "member"; base: Expression; path: string[] }
+  | { kind: "member"; base: Expression; path: Key[] }
   | { kind: "module"; spec: string; path: string }
-  | { kind: "local" }
+  | { kind: "local"; node: AnyNode }
+  | { kind: "default"; inner: Origin; fallback: AnyNode }
   | { kind: "opaque" };
 
-/** Every declaration of one name in the file. Only a name declared once and never assigned is resolved. */
-type Binding = { count: number; assigned: boolean; origin: Origin };
+/**
+ * A write to a member of a declared value, found anywhere in the file: `obj.x = v` and `Reflect.set(obj, 'x', v)`
+ * (`set`), `Object.defineProperty(obj, 'x', descriptor)` (`define`), `Object.assign(obj, source)` (`spread`),
+ * `Object.setPrototypeOf(obj, proto)` (`proto`).
+ */
+type Write = { kind: "set"; key: Key; value: AnyNode | null } | { kind: "define"; key: Key; descriptor: AnyNode | null } | { kind: "spread"; source: AnyNode } | { kind: "proto"; value: AnyNode };
 
-type Bindings = Map<string, Binding>;
+/** One declaration of a name in one scope. Only a name declared once there and never assigned is resolved. */
+type Binding = { name: string; count: number; assigned: boolean; origin: Origin; writes: Write[] };
 
-function declare(b: Bindings, name: string, origin: Origin): void {
-  const had = b.get(name);
+/**
+ * A lexical scope. `function` scopes take `var` and parameters; `block` scopes take `let`, `const`, classes and
+ * functions declared in a block; `with` stands for a `with` statement's body, where any name may be a property of
+ * the object instead of the binding outside it.
+ */
+type Scope = { parent: Scope | null; kind: "function" | "block" | "with"; names: Map<string, Binding> };
 
-  if (had) had.count++;
-  else b.set(name, { count: 1, assigned: false, origin });
+/** The program's scopes: the scope every identifier sits in, and the names assigned that no scope declares. */
+type Scopes = { scopeOf: Map<AnyNode, Scope>; assignedFree: Set<string> };
+
+function newScope(parent: Scope | null, kind: Scope["kind"]): Scope {
+  return { parent, kind, names: new Map() };
 }
 
-function assign(b: Bindings, name: string): void {
-  const had = b.get(name);
+function varScope(s: Scope): Scope {
+  let cur = s;
 
-  if (had) had.assigned = true;
-  else b.set(name, { count: 0, assigned: true, origin: { kind: "opaque" } });
+  while (cur.kind !== "function" && cur.parent) cur = cur.parent;
+
+  return cur;
+}
+
+function declare(scope: Scope, name: string, origin: Origin): void {
+  const had = scope.names.get(name);
+
+  if (had) had.count++;
+  else scope.names.set(name, { name, count: 1, assigned: false, origin, writes: [] });
 }
 
 function propertyName(key: AnyNode, computed: boolean): string | null {
@@ -175,134 +214,317 @@ function propertyName(key: AnyNode, computed: boolean): string | null {
   return null;
 }
 
-function bindPattern(b: Bindings, p: AnyNode, origin: Origin): void {
+function keyOf(key: AnyNode, computed: boolean): Key | null {
+  const name = propertyName(key, computed);
+
+  if (name !== null) return { kind: "name", name };
+
+  return computed && key.type !== "PrivateIdentifier" ? { kind: "computed", node: key } : null;
+}
+
+/** The origin of one property of a value: `{ a } = init` gives `init.a`. */
+function memberOrigin(origin: Origin, key: Key | null): Origin {
+  if (key === null) return { kind: "opaque" };
+
+  switch (origin.kind) {
+    case "value":
+      return { kind: "member", base: origin.init, path: [key] };
+    case "member":
+      return { kind: "member", base: origin.base, path: [...origin.path, key] };
+    case "module":
+      return key.kind === "name" ? { kind: "module", spec: origin.spec, path: origin.path ? `${origin.path}.${key.name}` : key.name } : { kind: "opaque" };
+    case "default":
+      return memberOrigin(origin.inner, key);
+    case "local":
+    case "opaque":
+      return { kind: "opaque" };
+    default: {
+      const _exhaustive: never = origin;
+
+      return _exhaustive;
+    }
+  }
+}
+
+function bindPattern(scope: Scope, p: AnyNode, origin: Origin): void {
   switch (p.type) {
     case "Identifier":
-      declare(b, p.name, origin);
+      declare(scope, p.name, origin);
       break;
     case "ObjectPattern":
       for (const prop of p.properties) {
-        if (prop.type === "RestElement") {
-          bindPattern(b, prop.argument, { kind: "opaque" });
-          continue;
-        }
-
-        const key = propertyName(prop.key, prop.computed);
-        let inner: Origin = { kind: "opaque" };
-
-        if (key !== null) {
-          if (origin.kind === "value") inner = { kind: "member", base: origin.init, path: [key] };
-          else if (origin.kind === "member") inner = { kind: "member", base: origin.base, path: [...origin.path, key] };
-          else if (origin.kind === "module") inner = { kind: "module", spec: origin.spec, path: origin.path ? `${origin.path}.${key}` : key };
-        }
-
-        bindPattern(b, prop.value, inner);
+        if (prop.type === "RestElement") bindPattern(scope, prop.argument, { kind: "opaque" });
+        else bindPattern(scope, prop.value, memberOrigin(origin, keyOf(prop.key, prop.computed)));
       }
 
       break;
     case "AssignmentPattern":
-      bindPattern(b, p.left, origin);
+      bindPattern(scope, p.left, { kind: "default", inner: origin, fallback: p.right });
       break;
     case "ArrayPattern":
-      for (const el of p.elements) if (el) bindPattern(b, el, { kind: "opaque" });
+      p.elements.forEach((el, i) => {
+        if (el?.type === "RestElement") bindPattern(scope, el.argument, { kind: "opaque" });
+        else if (el) bindPattern(scope, el, memberOrigin(origin, { kind: "name", name: String(i) }));
+      });
+
       break;
     case "RestElement":
-      bindPattern(b, p.argument, { kind: "opaque" });
+      bindPattern(scope, p.argument, { kind: "opaque" });
       break;
     case "TSParameterProperty":
-      bindPattern(b, p.parameter, { kind: "opaque" });
+      bindPattern(scope, p.parameter, { kind: "opaque" });
       break;
     default:
       break;
   }
 }
 
-function assignPattern(b: Bindings, p: AnyNode): void {
+/** The identifiers a pattern assigns to (`[a, b] = …`, `({ a } = …)`). */
+function assignedNames(p: AnyNode, out: Identifier[]): void {
   switch (p.type) {
     case "Identifier":
-      assign(b, p.name);
+      out.push(p);
       break;
     case "ObjectPattern":
-      for (const prop of p.properties) assignPattern(b, prop.type === "RestElement" ? prop.argument : prop.value);
+      for (const prop of p.properties) assignedNames(prop.type === "RestElement" ? prop.argument : prop.value, out);
       break;
     case "ArrayPattern":
-      for (const el of p.elements) if (el) assignPattern(b, el);
+      for (const el of p.elements) if (el) assignedNames(el, out);
       break;
     case "AssignmentPattern":
-      assignPattern(b, p.left);
+      assignedNames(p.left, out);
       break;
     case "RestElement":
-      assignPattern(b, p.argument);
+      assignedNames(p.argument, out);
       break;
     default:
       break;
   }
 }
 
-/** Every name the program declares or assigns, with where its value comes from. */
-function collectBindings(program: Program): Bindings {
-  const b: Bindings = new Map();
-  const stack: AnyNode[] = [program];
+/** `Object.assign`, `Object.defineProperty`, `Reflect.set` and their kin: a call that writes members of its first argument. */
+function writeOf(n: CallExpression): { target: Identifier; write: Write } | null {
+  const callee = unwrap(n.callee);
 
-  for (let n = stack.pop(); n; n = stack.pop()) {
+  if (callee.type !== "MemberExpression" || callee.computed || callee.object.type !== "Identifier" || callee.property.type !== "Identifier") return null;
+  const api = `${callee.object.name}.${callee.property.name}`;
+  const [target, a1, a2] = n.arguments;
+
+  if (target?.type !== "Identifier") return null;
+  const key = a1 && a1.type !== "SpreadElement" ? keyOf(a1, true) : null;
+  const third = a2 && a2.type !== "SpreadElement" ? a2 : null;
+
+  switch (api) {
+    case "Object.assign":
+      return a1 && a1.type !== "SpreadElement" ? { target, write: { kind: "spread", source: a1 } } : null;
+    case "Object.defineProperty":
+    case "Reflect.defineProperty":
+      return key ? { target, write: { kind: "define", key, descriptor: third } } : null;
+    case "Reflect.set":
+      return key ? { target, write: { kind: "set", key, value: third } } : null;
+    case "Object.setPrototypeOf":
+    case "Reflect.setPrototypeOf":
+      return a1 && a1.type !== "SpreadElement" ? { target, write: { kind: "proto", value: a1 } } : null;
+    case "Object.defineProperties":
+      return { target, write: { kind: "set", key: { kind: "computed", node: target }, value: null } };
+    default:
+      return null;
+  }
+}
+
+function functionBody(fn: AnyNode): AnyNode[] {
+  if (fn.type !== "FunctionDeclaration" && fn.type !== "FunctionExpression" && fn.type !== "ArrowFunctionExpression") return [];
+
+  return fn.body.type === "BlockStatement" ? fn.body.body : [fn.body];
+}
+
+/**
+ * Builds the program's scopes: each declaration goes to the scope it belongs to (`var` and parameters to the
+ * function, `let`, `const`, classes and block functions to the block), and every identifier is mapped to the scope
+ * it sits in, so a reference finds the binding that covers it and no other. Type-only syntax is skipped: an ambient
+ * `declare` or a type's parameter declares nothing that runs.
+ */
+function buildScopes(program: Program): Scopes {
+  const root = newScope(null, "function");
+  const scopeOf = new Map<AnyNode, Scope>();
+  const assigned: Identifier[] = [];
+  const writes: { target: Identifier; write: Write }[] = [];
+  const stack: [AnyNode, Scope][] = [[program, root]];
+
+  const push = (scope: Scope, nodes: readonly (AnyNode | null | undefined)[]): void => {
+    for (const c of nodes) if (c) stack.push([c, scope]);
+  };
+
+  const fnScope = (n: AnyNode & { params: AnyNode[] }, scope: Scope): Scope => {
+    const inner = newScope(scope, "function");
+
+    for (const p of n.params) bindPattern(inner, p, { kind: "opaque" });
+
+    return inner;
+  };
+
+  for (let item = stack.pop(); item; item = stack.pop()) {
+    const [n, scope] = item;
+
+    if (isTypeOnly(n)) continue;
+
     switch (n.type) {
-      case "VariableDeclarator":
-        bindPattern(b, n.id, n.init ? { kind: "value", init: n.init } : { kind: "opaque" });
-        break;
-      case "FunctionDeclaration":
-      case "FunctionExpression":
-      case "ArrowFunctionExpression":
-        if ("id" in n && n.id) declare(b, n.id.name, { kind: "local" });
+      case "Identifier":
+        scopeOf.set(n, scope);
+        continue;
+      case "VariableDeclaration": {
+        const target = n.kind === "var" ? varScope(scope) : scope;
 
-        for (const p of n.params) bindPattern(b, p, { kind: "opaque" });
+        for (const d of n.declarations) bindPattern(target, d.id, d.init ? { kind: "value", init: d.init } : { kind: "opaque" });
         break;
+      }
+
+      case "FunctionDeclaration": {
+        if (n.id) declare(scope, n.id.name, { kind: "local", node: n });
+        const inner = fnScope(n, scope);
+        push(scope, [n.id]);
+        push(inner, [...n.params, ...n.body.body]);
+        continue;
+      }
+
+      case "FunctionExpression": {
+        const inner = fnScope(n, scope);
+
+        if (n.id) declare(inner, n.id.name, { kind: "local", node: n });
+        push(inner, [n.id, ...n.params, ...n.body.body]);
+        continue;
+      }
+
+      case "ArrowFunctionExpression":
+        push(fnScope(n, scope), [...n.params, ...functionBody(n)]);
+        continue;
       case "ClassDeclaration":
-      case "ClassExpression":
-        if (n.id) declare(b, n.id.name, { kind: "local" });
-        break;
-      case "CatchClause":
-        if (n.param) bindPattern(b, n.param, { kind: "opaque" });
-        break;
-      case "ImportDeclaration":
+      case "ClassExpression": {
+        const inner = newScope(scope, "block");
+
+        if (n.id) declare(n.type === "ClassDeclaration" ? scope : inner, n.id.name, { kind: "local", node: n });
+        push(inner, childNodes(n));
+        continue;
+      }
+
+      case "BlockStatement":
+      case "ForStatement":
+      case "SwitchStatement":
+        push(newScope(scope, "block"), childNodes(n));
+        continue;
+      case "ForInStatement":
+      case "ForOfStatement":
+        if (n.left.type !== "VariableDeclaration") assignedNames(n.left, assigned);
+        push(newScope(scope, "block"), childNodes(n));
+        continue;
+      case "StaticBlock":
+        push(newScope(scope, "function"), n.body);
+        continue;
+      case "CatchClause": {
+        const inner = newScope(scope, "block");
+
+        if (n.param) bindPattern(inner, n.param, { kind: "opaque" });
+        push(inner, [n.param, ...n.body.body]);
+        continue;
+      }
+
+      case "WithStatement":
+        push(scope, [n.object]);
+        push(newScope(scope, "with"), [n.body]);
+        continue;
+      case "TSModuleDeclaration":
+        if (n.id.type === "Identifier") declare(scope, n.id.name, { kind: "local", node: n });
+        push(newScope(scope, "function"), childNodes(n));
+        continue;
+      case "TSEnumDeclaration":
+        declare(scope, n.id.name, { kind: "local", node: n });
+        push(newScope(scope, "block"), childNodes(n));
+        continue;
+      case "ImportDeclaration": {
         const spec = stringValue(n.source);
 
-        if (isTypeOnly(n) || spec === null) break;
+        if (spec === null) break;
 
         for (const s of n.specifiers) {
           if (isTypeOnly(s)) continue;
           const path = s.type === "ImportSpecifier" ? (propertyName(s.imported, false) ?? "") : "";
-          declare(b, s.local.name, { kind: "module", ...moduleOf(spec, path) });
+          declare(scope, s.local.name, { kind: "module", ...moduleOf(spec, path) });
         }
 
         break;
+      }
+
       case "TSImportEqualsDeclaration": {
         const ref = n.moduleReference;
-
         const spec = ref.type === "TSExternalModuleReference" && ref.expression.type === "Literal" ? stringValue(ref.expression) : null;
 
-        if (spec !== null) declare(b, n.id.name, { kind: "module", ...moduleOf(spec, "") });
-        else declare(b, n.id.name, { kind: "opaque" });
+        declare(scope, n.id.name, spec !== null ? { kind: "module", ...moduleOf(spec, "") } : { kind: "opaque" });
         break;
       }
 
-      case "AssignmentExpression":
-        assignPattern(b, n.left);
+      case "AssignmentExpression": {
+        const left = n.left;
+
+        if (left.type === "MemberExpression" && left.object.type === "Identifier") {
+          const key = keyOf(left.property, left.computed);
+
+          if (key) writes.push({ target: left.object, write: { kind: "set", key, value: n.operator === "=" ? n.right : null } });
+        } else assignedNames(left, assigned);
+
         break;
+      }
+
       case "UpdateExpression":
-        if (n.argument.type === "Identifier") assign(b, n.argument.name);
+        if (n.argument.type === "Identifier") assigned.push(n.argument);
         break;
-      case "ForInStatement":
-      case "ForOfStatement":
-        if (n.left.type !== "VariableDeclaration") assignPattern(b, n.left);
+      case "CallExpression": {
+        const w = writeOf(n);
+
+        if (w) writes.push(w);
         break;
+      }
+
       default:
         break;
     }
 
-    stack.push(...childNodes(n));
+    push(scope, childNodes(n));
   }
 
-  return b;
+  const assignedFree = new Set<string>();
+
+  for (const id of assigned) {
+    const b = lookup(scopeOf, id);
+
+    if (b === null) assignedFree.add(id.name);
+    else if (b !== "dynamic") b.assigned = true;
+  }
+
+  for (const { target, write } of writes) {
+    const b = lookup(scopeOf, target);
+
+    if (b !== null && b !== "dynamic") b.writes.push(write);
+  }
+
+  return { scopeOf, assignedFree };
+}
+
+/**
+ * The binding an identifier refers to: the nearest scope around it that declares the name. `dynamic` when a `with`
+ * body sits between the two (the name may be a property of the `with` object), null when no scope declares it.
+ */
+function lookup(scopeOf: ReadonlyMap<AnyNode, Scope>, id: Identifier): Binding | "dynamic" | null {
+  let crossedWith = false;
+
+  for (let s = scopeOf.get(id) ?? null; s; s = s.parent) {
+    const b = s.names.get(id.name);
+
+    if (b) return crossedWith ? "dynamic" : b;
+
+    if (s.kind === "with") crossedWith = true;
+  }
+
+  return null;
 }
 
 /** A module specifier as apm names it: without `node:`, with `fs/promises` read as `fs` and its `promises` member. */
@@ -484,8 +706,206 @@ function decodeBase64(s: string): string | null {
   return Buffer.from(body.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("latin1");
 }
 
-/** What a call invokes, with which arguments; `list` is the array literal holding them for `apply` forms. */
-type Invoked = { r: Ref; args: (Expression | SpreadElement)[]; isNew: boolean; list: AnyNode | null };
+/** An argument in the position it is passed at; null for a hole (`[, x]`). */
+type Slot = AnyNode | null;
+
+/** Arguments placed in their positions, and the argument nodes apm could not place (read as plain values). */
+type Placed = { slots: Slot[]; others: AnyNode[] };
+
+function isGlobal(r: Ref, path: string): boolean {
+  return r.kind === "global" && r.path === path;
+}
+
+/**
+ * What a call invokes and with which arguments. `refs` are every callee the expression can be (`(a || b)(x)` is
+ * either); `slots` are the arguments in their positions, through `f.call`, `f.apply`, `Reflect.apply`,
+ * `Reflect.construct`, `f.bind(that, a)` and spreads of arrays apm can read; `others` are the remaining argument
+ * nodes (a `this` value, an array apm could not read), read as plain values.
+ */
+type Invoked = { refs: Ref[]; isNew: boolean; slots: Slot[]; others: AnyNode[] };
+
+/** The most callees one expression is read as; more than this and the rest are dropped. */
+const MAX_CANDIDATES = 6;
+
+const UNKNOWN_REF: Ref = { kind: "unknown", name: null, owner: null, built: false };
+
+function unknownNamed(name: string | null, owner: string | null = null, built = false): Ref {
+  return { kind: "unknown", name, owner, built };
+}
+
+/** How much a reference says, for when one has to stand for several: a platform API, then a module, then a name. */
+function rankOf(r: Ref): number {
+  switch (r.kind) {
+    case "global":
+      return r.path ? 5 : 4;
+    case "module":
+      return 4;
+    case "unknown":
+      return r.name ? 2 : 1;
+    case "local":
+      return 0;
+    default: {
+      const _exhaustive: never = r;
+
+      return _exhaustive;
+    }
+  }
+}
+
+function refKey(r: Ref): string {
+  return r.kind === "local" ? "" : `${r.kind}:${nameOf(r)}:${r.kind === "unknown" ? (r.owner ?? "") : ""}:${String(r.built)}`;
+}
+
+/** The distinct references in `refs`, at most MAX_CANDIDATES; local values are kept apart by the node that made them. */
+function distinct(refs: readonly Ref[]): Ref[] {
+  const out: Ref[] = [];
+  const seen = new Set<string>();
+  const nodes = new Set<AnyNode | null>();
+
+  for (const r of refs) {
+    if (r.kind === "local") {
+      const node = r.obj?.node ?? null;
+
+      if (nodes.has(node)) continue;
+      nodes.add(node);
+    } else {
+      const k = refKey(r);
+
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
+
+    out.push(r);
+
+    if (out.length >= MAX_CANDIDATES) break;
+  }
+
+  return out.length > 0 ? out : [UNKNOWN_REF];
+}
+
+/** The one reference that stands for several: the one that says the most, the first of equals. */
+function pick(refs: readonly Ref[]): Ref {
+  let best: Ref = refs[0] ?? UNKNOWN_REF;
+
+  for (const r of refs) if (rankOf(r) > rankOf(best)) best = r;
+
+  return best;
+}
+
+/** Whether an expression is truthy (true), falsy (false), or apm cannot tell (null). */
+function truthiness(n: AnyNode): boolean | null {
+  const t = unwrap(n);
+
+  switch (t.type) {
+    case "Literal":
+      return "regex" in t && t.regex ? true : Boolean(t.value);
+    case "Identifier":
+      return t.name === "undefined" ? false : null;
+    case "UnaryExpression": {
+      if (t.operator === "void") return false;
+
+      if (t.operator !== "!") return null;
+      const inner = truthiness(t.argument);
+
+      return inner === null ? null : !inner;
+    }
+
+    case "TemplateLiteral":
+      return t.expressions.length === 0 ? Boolean(t.quasis[0]?.value.cooked) : null;
+    case "ObjectExpression":
+    case "ArrayExpression":
+    case "FunctionExpression":
+    case "ArrowFunctionExpression":
+    case "ClassExpression":
+      return true;
+    default:
+      return null;
+  }
+}
+
+/** Whether an expression is null or undefined (true), is neither (false), or apm cannot tell (null). */
+function nullishness(n: AnyNode): boolean | null {
+  const t = unwrap(n);
+
+  switch (t.type) {
+    case "Literal":
+      return t.value === null && !("regex" in t && t.regex);
+    case "Identifier":
+      return t.name === "undefined" ? true : null;
+    case "UnaryExpression":
+      return t.operator === "void" ? true : null;
+    case "TemplateLiteral":
+    case "ObjectExpression":
+    case "ArrayExpression":
+    case "FunctionExpression":
+    case "ArrowFunctionExpression":
+    case "ClassExpression":
+      return false;
+    default:
+      return null;
+  }
+}
+
+/** The operands a logical or conditional expression can evaluate to, by what apm can tell of its test. */
+function operands(n: AnyNode): AnyNode[] | null {
+  if (n.type === "LogicalExpression") {
+    const test = n.operator === "??" ? nullishness(n.left) : truthiness(n.left);
+
+    if (test === null) return [n.left, n.right];
+
+    // `a || b` is a when a is truthy; `a && b` is b when a is truthy; `a ?? b` is b when a is nullish
+    const takesRight = n.operator === "||" ? !test : test;
+
+    return [takesRight ? n.right : n.left];
+  }
+
+  if (n.type === "ConditionalExpression") {
+    const test = truthiness(n.test);
+
+    return test === null ? [n.consequent, n.alternate] : [test ? n.consequent : n.alternate];
+  }
+
+  return null;
+}
+
+/** The expressions a function's own `return` statements give (not those of functions inside it), at most four. */
+function returnedBy(fn: AnyNode): AnyNode[] {
+  if (fn.type === "ArrowFunctionExpression" && fn.body.type !== "BlockStatement") return [fn.body];
+  const out: AnyNode[] = [];
+  const stack: AnyNode[] = [...functionBody(fn)];
+
+  for (let n = stack.pop(); n && out.length < 4; n = stack.pop()) {
+    if (n.type === "ReturnStatement") {
+      if (n.argument) out.push(n.argument);
+      continue;
+    }
+
+    if (isFunctionNode(n) || n.type === "FunctionDeclaration" || n.type === "ClassDeclaration" || isTypeOnly(n)) continue;
+    stack.push(...childNodes(n));
+  }
+
+  return out;
+}
+
+/** The values a constructor assigns to `this.prop` in its own body (not in functions inside it). */
+function thisWrites(fn: AnyNode, prop: string): AnyNode[] {
+  const out: AnyNode[] = [];
+  const stack: AnyNode[] = [...functionBody(fn)];
+
+  for (let n = stack.pop(); n && out.length < 4; n = stack.pop()) {
+    if (n.type === "AssignmentExpression" && n.operator === "=" && n.left.type === "MemberExpression" && n.left.object.type === "ThisExpression" && propertyName(n.left.property, n.left.computed) === prop) out.push(n.right);
+
+    if (n.type === "FunctionExpression" || n.type === "FunctionDeclaration" || n.type === "ClassDeclaration" || n.type === "ClassExpression" || isTypeOnly(n)) continue;
+    stack.push(...childNodes(n));
+  }
+
+  return out;
+}
+
+const ROLE_RANK: Record<Role, number> = { none: 0, plain: 1, request: 2, read: 3, shell: 4, code: 5 };
+
+/** One callee's reading of a call: what each argument is for, by position, and for the rest. */
+type Plan = { roles: Role[]; rest: Role | "inherit" };
 
 /** One program, read once. Findings go to `hits`; module paths and loads apm cannot follow go to `paths` and `dynamic`. */
 class Reader {
@@ -493,9 +913,12 @@ class Reader {
   readonly paths = new Set<string>();
   readonly loads = new Set<string>();
   readonly dynamic: number[] = [];
-  private readonly bindings: Bindings;
+  private readonly scopes: Scopes;
   private readonly strCache = new Map<AnyNode, Str | null>();
-  private readonly identCache = new Map<string, Ref>();
+  private readonly bindingCache = new Map<Binding, Ref[]>();
+  private readonly returnCache = new Map<AnyNode, Ref[]>();
+  private readonly resolveCache = new Map<AnyNode, Ref[]>();
+  private readonly memberCache = new Map<AnyNode, Map<string, Ref[]>>();
   private readonly envDumps: number[] = [];
   private readonly netCalls: { at: number; confidence: Confidence }[] = [];
   /** Set when the program uses `await` as a name: a module reads the same text as the operator. */
@@ -509,7 +932,7 @@ class Reader {
     private readonly depth: number,
     private readonly budget: Budget,
   ) {
-    this.bindings = collectBindings(program);
+    this.scopes = buildScopes(program);
   }
 
   read(): void {
@@ -535,56 +958,99 @@ class Reader {
 
   // ----- resolving names -----
 
-  private resolve(n: AnyNode): Ref {
-    if (this.resolving > 24) return { kind: "unknown", name: null, owner: null, built: false };
+  /** The binding an identifier refers to, in the scope it sits in. */
+  private bindingOf(id: Identifier): Binding | "dynamic" | null {
+    return lookup(this.scopes.scopeOf, id);
+  }
+
+  /** The value a constant holds: a name declared once in its scope, with a value, and never assigned. */
+  private constInit(id: Identifier): Expression | null {
+    const b = this.bindingOf(id);
+
+    return b !== null && b !== "dynamic" && b.count === 1 && !b.assigned && b.origin.kind === "value" && b.origin.init !== id ? b.origin.init : null;
+  }
+
+  /** Every value `n` can be, as far as apm can tell: several for `a || b`, `c ? a : b`, a getter, or a written member. */
+  private resolveAll(n: AnyNode): Ref[] {
+    const node = unwrap(n);
+    const cached = this.resolveCache.get(node);
+
+    if (cached) return cached;
+
+    if (this.resolving > 24) return [UNKNOWN_REF];
+    // a value that refers back to itself reads as unknown
+    this.resolveCache.set(node, [UNKNOWN_REF]);
     this.resolving++;
 
     try {
-      return this.resolveNode(unwrap(n));
+      const refs = distinct(this.resolveNode(node));
+      this.resolveCache.set(node, refs);
+
+      return refs;
     } finally {
       this.resolving--;
     }
   }
 
-  private resolveIdentifier(name: string): Ref {
-    const cached = this.identCache.get(name);
-
-    if (cached) return cached;
-    const r = this.resolveBinding(name);
-    this.identCache.set(name, r);
-
-    return r;
+  /** The one value that stands for what `n` can be (see `pick`). */
+  private resolve(n: AnyNode): Ref {
+    return pick(this.resolveAll(n));
   }
 
-  private resolveBinding(name: string): Ref {
-    const b = this.bindings.get(name);
+  private resolveIdentifier(id: Identifier): Ref[] {
+    const b = this.bindingOf(id);
 
-    if (!b) return GLOBAL_OBJECTS.has(name) ? { kind: "global", path: "", built: false } : { kind: "global", path: name, built: false };
+    // a name no scope declares is the global; so is one a `with` body may read from its object
+    if (b === null || b === "dynamic") {
+      if (b === null && this.scopes.assignedFree.has(id.name)) return [unknownNamed(id.name)];
 
-    if (b.count !== 1 || b.assigned) return { kind: "unknown", name, owner: null, built: false };
-    const o = b.origin;
+      return [{ kind: "global", path: GLOBAL_OBJECTS.has(id.name) ? "" : id.name, built: false }];
+    }
 
+    const cached = this.bindingCache.get(b);
+
+    if (cached) return cached;
+    // a value that refers to itself reads as its name
+    this.bindingCache.set(b, [unknownNamed(b.name)]);
+    const refs = b.count !== 1 || b.assigned ? [unknownNamed(b.name)] : this.originRefs(b.origin, b);
+    this.bindingCache.set(b, refs);
+
+    return refs;
+  }
+
+  private originRefs(o: Origin, b: Binding): Ref[] {
     switch (o.kind) {
       case "local":
-        return { kind: "local", fn: true };
+        return [{ kind: "local", fn: o.node.type === "FunctionDeclaration" || o.node.type === "ClassDeclaration" || isFunctionNode(o.node), obj: { node: o.node, binding: b, instance: false } }];
       case "module":
-        return { kind: "module", spec: o.spec, path: o.path, built: false };
+        return [{ kind: "module", spec: o.spec, path: o.path, built: false }];
       case "opaque":
-        return { kind: "unknown", name, owner: null, built: false };
+        return [unknownNamed(b.name)];
       case "value": {
-        const r = this.resolve(o.init);
+        const init = unwrap(o.init);
 
-        return r.kind === "unknown" && r.name === null ? { kind: "unknown", name, owner: null, built: r.built } : r;
+        return this.resolveAll(o.init).map((r) => {
+          // the binding that holds a value this file makes also holds the writes made to it later
+          if (r.kind === "local" && r.obj && r.obj.binding === null && (r.obj.node === init || r.obj.instance)) return { ...r, obj: { ...r.obj, binding: b } };
+
+          return r.kind === "unknown" && r.name === null ? unknownNamed(b.name, null, r.built) : r;
+        });
       }
 
       case "member": {
-        let r = this.resolve(o.base);
+        let refs = this.resolveAll(o.base);
 
-        for (const p of o.path) r = member(r, p, false);
+        for (const k of o.path) {
+          const key = this.keyName(k);
 
-        return r;
+          refs = key === null ? [unknownNamed(b.name)] : distinct(refs.flatMap((r) => this.memberAll(r, key.name, key.built)));
+        }
+
+        return refs;
       }
 
+      case "default":
+        return [...this.originRefs(o.inner, b), ...this.resolveAll(o.fallback)];
       default: {
         const _exhaustive: never = o;
 
@@ -593,113 +1059,346 @@ class Reader {
     }
   }
 
+  private keyName(k: Key): { name: string; built: boolean } | null {
+    if (k.kind === "name") return { name: k.name, built: false };
+    const s = this.str(k.node);
+
+    return s?.exact && !s.numeric ? { name: s.value, built: s.how !== "as written" } : s?.exact ? { name: s.value, built: false } : null;
+  }
+
+  /** Every value `base[prop]` can be. A local value's members are read from the node that made it and the writes to it. */
+  private memberAll(base: Ref, prop: string, built: boolean): Ref[] {
+    if (base.kind !== "local") return [member(base, prop, built)];
+
+    if (prop === "constructor") return [member(base, prop, built)];
+    const obj = base.obj;
+
+    if (!obj) return [{ kind: "local", fn: false, obj: null }];
+    const key = `${obj.instance ? "i" : "v"}:${obj.binding?.name ?? ""}:${prop}`;
+    const byKey = this.memberCache.get(obj.node) ?? new Map<string, Ref[]>();
+    const cached = byKey.get(key);
+
+    if (cached) return cached;
+
+    if (this.resolving > 24) return [unknownNamed(prop)];
+    this.memberCache.set(obj.node, byKey);
+    byKey.set(key, [unknownNamed(prop)]);
+    this.resolving++;
+
+    try {
+      const out = [...(this.ownMember(obj.node, prop, obj.instance) ?? [])];
+
+      for (const w of obj.binding?.writes ?? []) out.push(...this.writtenMember(w, prop, obj.binding?.name ?? null));
+      const refs = out.length > 0 ? distinct(out) : [{ kind: "local", fn: false, obj: null } satisfies Ref];
+      byKey.set(key, refs);
+
+      return refs;
+    } finally {
+      this.resolving--;
+    }
+  }
+
+  /** What a write to a local value makes `prop` (nothing when it writes another member). */
+  private writtenMember(w: Write, prop: string, owner: string | null): Ref[] {
+    switch (w.kind) {
+      case "set": {
+        const key = this.keyName(w.key);
+
+        if (key !== null && key.name !== prop) return [];
+
+        // a key apm cannot work out may be this one: what it holds is told by name
+        if (key === null || w.value === null) return [unknownNamed(prop, owner)];
+
+        return this.resolveAll(w.value);
+      }
+
+      case "define": {
+        const key = this.keyName(w.key);
+
+        if (key !== null && key.name !== prop) return [];
+
+        if (key === null || w.descriptor === null) return [unknownNamed(prop, owner)];
+
+        return this.described(w.descriptor, prop, owner);
+      }
+
+      case "spread":
+        return this.resolveAll(w.source).flatMap((r) => (r.kind === "local" ? (r.obj ? (this.ownMember(r.obj.node, prop) ?? []) : []) : this.memberAll(r, prop, false)));
+      case "proto":
+        return this.resolveAll(w.value).flatMap((r) => this.memberAll(r, prop, false));
+      default: {
+        const _exhaustive: never = w;
+
+        return _exhaustive;
+      }
+    }
+  }
+
+  /** What a property descriptor (`{ value }` or `{ get }`) makes a property read give. */
+  private described(descriptor: AnyNode, prop: string, owner: string | null): Ref[] {
+    const d = unwrap(descriptor);
+
+    if (d.type !== "ObjectExpression") return [unknownNamed(prop, owner)];
+    const value = this.ownMember(d, "value") ?? [];
+    const getters = this.ownMember(d, "get") ?? [];
+
+    return [...value, ...getters.flatMap((g) => this.calledRefs(g, prop, owner))];
+  }
+
+  /** What calling a function value gives: what its own returns give, or, when apm cannot read it, a value told by `prop`. */
+  private calledRefs(fn: Ref, prop: string, owner: string | null): Ref[] {
+    if (fn.kind !== "local" || !fn.obj) return [unknownNamed(prop, owner)];
+
+    return this.returnsOf(fn.obj.node).map((r) => (r.kind === "unknown" ? unknownNamed(prop, owner, r.built) : r));
+  }
+
+  /** What a function's returns give, cached per function. */
+  private returnsOf(fn: AnyNode): Ref[] {
+    const cached = this.returnCache.get(fn);
+
+    if (cached) return cached;
+    this.returnCache.set(fn, [UNKNOWN_REF]);
+    const returned = returnedBy(fn);
+    const refs = returned.length === 0 ? [{ kind: "local", fn: false, obj: null } satisfies Ref] : distinct(returned.flatMap((r) => this.resolveAll(r)));
+    this.returnCache.set(fn, refs);
+
+    return refs;
+  }
+
+  /**
+   * A member of the value a node makes: an object literal's property, getter or spread (later ones win, so they are
+   * read first), its `__proto__`; an array's element; a class's static member; any member of a Proxy whose `get`
+   * trap apm can read; a member of `Object.create(proto)`. Null when the node does not have the member.
+   */
+  private ownMember(node: AnyNode, prop: string, instance = false): Ref[] | null {
+    // spreads, prototypes and superclasses can refer back to themselves
+    if (this.resolving > 24) return [unknownNamed(prop)];
+    this.resolving++;
+
+    try {
+      return this.ownMemberOf(node, prop, instance);
+    } finally {
+      this.resolving--;
+    }
+  }
+
+  private ownMemberOf(node: AnyNode, prop: string, instance: boolean): Ref[] | null {
+    switch (node.type) {
+      case "ObjectExpression": {
+        const out: Ref[] = [];
+        let proto: AnyNode | null = null;
+
+        for (const p of node.properties.toReversed()) {
+          if (p.type === "SpreadElement") {
+            for (const r of this.resolveAll(p.argument)) {
+              const own = r.kind === "local" ? (r.obj ? this.ownMember(r.obj.node, prop) : null) : this.memberAll(r, prop, false);
+
+              if (own) out.push(...own);
+            }
+
+            continue;
+          }
+
+          const key = p.computed ? this.keyName({ kind: "computed", node: p.key }) : { name: propertyName(p.key, false) ?? "", built: false };
+
+          if (!p.computed && !p.shorthand && p.kind === "init" && key?.name === "__proto__") {
+            proto ??= p.value;
+            continue;
+          }
+
+          if (key === null) {
+            out.push(unknownNamed(prop));
+            continue;
+          }
+
+          if (key.name !== prop) continue;
+
+          if (p.kind === "get") return [...out, ...this.calledRefs({ kind: "local", fn: true, obj: { node: p.value, binding: null, instance: false } }, prop, null)];
+
+          if (p.kind === "init") return [...out, ...this.resolveAll(p.value)];
+        }
+
+        if (proto) out.push(...this.resolveAll(proto).flatMap((r) => this.memberAll(r, prop, false)));
+
+        return out.length > 0 ? out : null;
+      }
+
+      case "ArrayExpression": {
+        const el = /^\d+$/.test(prop) ? node.elements[Number(prop)] : undefined;
+
+        return el && el.type !== "SpreadElement" ? this.resolveAll(el) : null;
+      }
+
+      case "ClassDeclaration":
+      case "ClassExpression": {
+        // static members on the class; methods, getters, fields and `this.x = …` in the constructor on an instance
+        for (const m of node.body.body.toReversed()) {
+          if (m.type !== "MethodDefinition" && m.type !== "PropertyDefinition") continue;
+
+          if (m.static === instance || m.key.type === "PrivateIdentifier" || propertyName(m.key, m.computed) !== prop) continue;
+
+          if (m.type === "MethodDefinition") return m.kind === "get" ? this.calledRefs({ kind: "local", fn: true, obj: { node: m.value, binding: null, instance: false } }, prop, null) : [{ kind: "local", fn: true, obj: { node: m.value, binding: null, instance: false } }];
+
+          return m.value ? this.resolveAll(m.value) : null;
+        }
+
+        if (instance) {
+          const ctor = node.body.body.find((m) => m.type === "MethodDefinition" && m.kind === "constructor");
+          const set = ctor?.type === "MethodDefinition" ? thisWrites(ctor.value, prop) : [];
+
+          if (set.length > 0) return set.flatMap((v) => this.resolveAll(v));
+        }
+
+        // inherited: from a class this file defines, or told by name from one it does not
+        if (!node.superClass) return null;
+
+        return this.resolveAll(node.superClass).flatMap((r) => (r.kind === "local" && r.obj ? (this.ownMember(r.obj.node, prop, instance) ?? []) : instance ? [unknownNamed(prop)] : this.memberAll(r, prop, false)));
+      }
+
+      case "NewExpression": {
+        // new Proxy(target, { get() { return … } }): every member is what the trap returns
+        const handler = node.arguments[1];
+
+        if (!handler || handler.type === "SpreadElement") return [unknownNamed(prop)];
+        const traps = this.resolveAll(handler).flatMap((h) => (h.kind === "local" && h.obj ? (this.ownMember(h.obj.node, "get") ?? []) : []));
+
+        return traps.length > 0 ? traps.flatMap((t) => this.calledRefs(t, prop, null)) : [unknownNamed(prop)];
+      }
+
+      case "CallExpression": {
+        // Object.create(proto): members come from the prototype
+        const proto = node.arguments[0];
+
+        return proto && proto.type !== "SpreadElement" ? this.resolveAll(proto).flatMap((r) => this.memberAll(r, prop, false)) : null;
+      }
+
+      default:
+        return null;
+    }
+  }
+
   private memberKey(n: MemberExpression): { name: string; built: boolean } | null {
     if (!n.computed) return n.property.type === "Identifier" ? { name: n.property.name, built: false } : null;
     const s = n.property.type === "PrivateIdentifier" ? null : this.str(n.property);
 
-    return s?.exact && !s.numeric ? { name: s.value, built: s.how !== "as written" } : null;
+    return s?.exact && !s.numeric ? { name: s.value, built: s.how !== "as written" } : s?.exact ? { name: s.value, built: false } : null;
   }
 
-  private resolveNode(n: AnyNode): Ref {
+  private resolveNode(n: AnyNode): Ref[] {
+    const branches = operands(n);
+
+    if (branches) return branches.flatMap((b) => this.resolveAll(b));
+
     switch (n.type) {
       case "Identifier":
-        return this.resolveIdentifier(n.name);
+        return this.resolveIdentifier(n);
       case "MemberExpression": {
-        if (n.object.type === "Super") return { kind: "unknown", name: null, owner: null, built: false };
+        if (n.object.type === "Super") return [UNKNOWN_REF];
         const key = this.memberKey(n);
         const object = unwrap(n.object);
 
         // (function () {}).constructor and (async () => {}).constructor are Function
-        if (key?.name === "constructor" && isFunctionNode(object)) return { kind: "global", path: "Function", built: key.built };
-        const base = this.resolve(object);
+        if (key?.name === "constructor" && isFunctionNode(object)) return [{ kind: "global", path: "Function", built: key.built }];
+        const bases = this.resolveAll(object);
 
-        if (!key) return { kind: "unknown", name: null, owner: base.kind === "unknown" ? base.name : lastName(base) || null, built: false };
+        if (!key) return bases.map((base) => unknownNamed(null, base.kind === "unknown" ? base.name : lastName(base) || null));
 
-        return member(base, key.name, key.built);
+        return bases.flatMap((base) => this.memberAll(base, key.name, key.built));
       }
 
       case "SequenceExpression": {
         const last = n.expressions.at(-1);
 
-        return last ? this.resolve(last) : { kind: "unknown", name: null, owner: null, built: false };
+        return last ? this.resolveAll(last) : [UNKNOWN_REF];
       }
 
       case "AwaitExpression":
-        return this.resolve(n.argument);
+        return this.resolveAll(n.argument);
       case "AssignmentExpression":
-        return n.operator === "=" ? this.resolve(n.right) : { kind: "unknown", name: null, owner: null, built: false };
-      case "LogicalExpression": {
-        // `custom || fetch`: a fallback is what the code reaches for when the first value is missing, so a side apm
-        // knows (a module, a local value) wins, then the side that names a platform API
-        const left = this.resolve(n.left);
-        const right = this.resolve(n.right);
-
-        if (left.kind === "module" || left.kind === "local") return left;
-
-        return right.kind === "unknown" ? left : right;
-      }
-
+        return n.operator === "=" ? this.resolveAll(n.right) : [UNKNOWN_REF];
       case "CallExpression":
         return this.resolveCall(n);
       case "NewExpression": {
-        // a Module instance has the same _compile that runs code as `module` does
-        const made = this.resolve(n.callee);
+        const made = this.resolveAll(n.callee);
 
-        return made.kind === "module" && made.spec === "module" && (made.path === "" || made.path === "Module") ? { kind: "global", path: "module", built: false } : { kind: "unknown", name: null, owner: null, built: false };
+        // a Module instance has the same _compile that runs code as `module` does
+        if (made.some((m) => m.kind === "module" && m.spec === "module" && (m.path === "" || m.path === "Module"))) return [{ kind: "global", path: "module", built: false }];
+
+        if (made.some((m) => m.kind === "global" && m.path === "Proxy")) return [{ kind: "local", fn: false, obj: { node: n, binding: null, instance: false } }];
+        // an instance of a class this file defines has the class's methods, getters and fields
+        const classes = made.flatMap((m) => (m.kind === "local" && m.obj && (m.obj.node.type === "ClassDeclaration" || m.obj.node.type === "ClassExpression") ? [m.obj.node] : []));
+
+        return classes.length > 0 ? classes.map((node): Ref => ({ kind: "local", fn: false, obj: { node, binding: null, instance: true } })) : [UNKNOWN_REF];
       }
 
       case "ImportExpression": {
         const s = this.str(n.source);
 
-        return s?.exact ? { kind: "module", ...moduleOf(s.value, ""), built: s.how !== "as written" } : { kind: "unknown", name: null, owner: null, built: false };
+        return [s?.exact ? { kind: "module", ...moduleOf(s.value, ""), built: s.how !== "as written" } : UNKNOWN_REF];
       }
 
       case "FunctionExpression":
       case "ArrowFunctionExpression":
       case "ClassExpression":
-        return { kind: "local", fn: true };
+        return [{ kind: "local", fn: true, obj: { node: n, binding: null, instance: false } }];
       case "ObjectExpression":
       case "ArrayExpression":
+        return [{ kind: "local", fn: false, obj: { node: n, binding: null, instance: false } }];
       case "Literal":
       case "TemplateLiteral":
-        return { kind: "local", fn: false };
+        return [{ kind: "local", fn: false, obj: null }];
       default:
-        return { kind: "unknown", name: null, owner: null, built: false };
+        return [UNKNOWN_REF];
     }
   }
 
-  private resolveCall(n: CallExpression): Ref {
-    if (n.callee.type === "Super") return { kind: "unknown", name: null, owner: null, built: false };
-    const callee = this.resolve(n.callee);
-    const name = nameOf(callee);
-    const arg = n.arguments[0];
-
-    if (isRequire(callee) && arg && arg.type !== "SpreadElement") {
-      const s = this.str(arg);
-
-      if (s?.exact) return { kind: "module", ...moduleOf(s.value, ""), built: s.how !== "as written" };
-    }
-
-    if (callee.kind === "global" && name === "Object.getPrototypeOf" && arg && arg.type !== "SpreadElement" && isFunctionNode(unwrap(arg))) return { kind: "local", fn: true };
-
-    // compilers wrap a require in an interop helper that returns the same module
-    const written = unwrap(n.callee);
-    const helper = written.type === "Identifier" ? written.name : written.type === "MemberExpression" && !written.computed && written.property.type === "Identifier" ? written.property.name : "";
-
-    // (often defined in the same file, so it is matched by the name it is called by)
-    if (INTEROP.test(helper) && arg && arg.type !== "SpreadElement") {
-      const inner = this.resolve(arg);
-
-      if (inner.kind === "module") return inner;
-    }
-
-    if ((callee.kind === "global" && name === "createRequire") || (callee.kind === "module" && name === "module.createRequire")) return { kind: "global", path: "require", built: false };
+  private resolveCall(n: CallExpression): Ref[] {
+    if (n.callee.type === "Super") return [UNKNOWN_REF];
     const target = unwrap(n.callee);
 
-    // eval.bind(null) is eval
-    if (target.type === "MemberExpression" && !target.computed && target.property.type === "Identifier" && target.property.name === "bind" && target.object.type !== "Super") return this.resolve(target.object);
+    // Function('return this')() is the global object
+    if ((target.type === "CallExpression" || target.type === "NewExpression") && target.callee.type !== "Super" && target.arguments.length === 1) {
+      const body = target.arguments[0] && target.arguments[0].type !== "SpreadElement" ? this.str(target.arguments[0]) : null;
 
-    return { kind: "unknown", name: null, owner: null, built: false };
+      if (body?.exact && body.value.trim() === "return this" && this.resolveAll(target.callee).some((r) => r.kind === "global" && r.path === "Function")) return [{ kind: "global", path: "", built: false }];
+    }
+
+    // eval.bind(null) is eval
+    if (target.type === "MemberExpression" && !target.computed && target.property.type === "Identifier" && target.property.name === "bind" && target.object.type !== "Super") return this.resolveAll(target.object);
+    const arg = n.arguments[0];
+    const argNode = arg && arg.type !== "SpreadElement" ? arg : null;
+    // compilers wrap a require in an interop helper that returns the same module (often defined in the same file,
+    // so it is matched by the name it is called by)
+    const helper = target.type === "Identifier" ? target.name : target.type === "MemberExpression" && !target.computed && target.property.type === "Identifier" ? target.property.name : "";
+
+    if (INTEROP.test(helper) && argNode) {
+      const inner = this.resolveAll(argNode).filter((r) => r.kind === "module");
+
+      if (inner.length > 0) return inner;
+    }
+
+    const out: Ref[] = [];
+
+    for (const callee of this.resolveAll(n.callee)) {
+      const name = nameOf(callee);
+
+      if (isRequire(callee) && argNode) {
+        const s = this.str(argNode);
+
+        out.push(s?.exact ? { kind: "module", ...moduleOf(s.value, ""), built: s.how !== "as written" } : UNKNOWN_REF);
+      } else if (callee.kind === "global" && name === "Object.getPrototypeOf" && argNode && isFunctionNode(unwrap(argNode))) out.push({ kind: "local", fn: true, obj: null });
+      else if ((callee.kind === "global" && name === "createRequire") || (callee.kind === "module" && name === "module.createRequire")) out.push({ kind: "global", path: "require", built: false });
+      else if (callee.kind === "global" && name === "Reflect.get" && argNode) {
+        // Reflect.get(globalThis, 'fetch') is globalThis.fetch
+        const key = n.arguments[1] && n.arguments[1].type !== "SpreadElement" ? this.keyName({ kind: "computed", node: n.arguments[1] }) : null;
+
+        out.push(...(key ? this.resolveAll(argNode).flatMap((r) => this.memberAll(r, key.name, key.built)) : [UNKNOWN_REF]));
+      } else if (callee.kind === "global" && name === "Object.create") out.push({ kind: "local", fn: false, obj: { node: n, binding: null, instance: false } });
+      else if (callee.kind === "local" && callee.obj && (isFunctionNode(callee.obj.node) || callee.obj.node.type === "FunctionDeclaration")) out.push(...this.returnsOf(callee.obj.node));
+      else out.push(UNKNOWN_REF);
+    }
+
+    return out;
   }
 
   // ----- working out strings -----
@@ -740,13 +1439,13 @@ class Reader {
       }
 
       case "Identifier": {
-        const b = this.bindings.get(n.name);
+        const init = this.constInit(n);
 
-        if (!b || b.count !== 1 || b.assigned || b.origin.kind !== "value") return null;
+        if (!init) return null;
         this.resolving++;
 
         try {
-          return this.str(b.origin.init);
+          return this.str(init);
         } finally {
           this.resolving--;
         }
@@ -898,9 +1597,9 @@ class Reader {
     const target = unwrap(n);
 
     if (target.type === "Identifier") {
-      const b = this.bindings.get(target.name);
+      const init = this.constInit(target);
 
-      return b && b.count === 1 && !b.assigned && b.origin.kind === "value" && b.origin.init !== target ? this.arrayStrings(b.origin.init) : null;
+      return init ? this.arrayStrings(init) : null;
     }
 
     if (target.type === "ArrayExpression") {
@@ -942,9 +1641,9 @@ class Reader {
     const target = unwrap(n);
 
     if (target.type === "Identifier") {
-      const b = this.bindings.get(target.name);
+      const init = this.constInit(target);
 
-      return b && b.count === 1 && !b.assigned && b.origin.kind === "value" ? this.numbers(b.origin.init) : null;
+      return init ? this.numbers(init) : null;
     }
 
     if (target.type !== "ArrayExpression") return null;
@@ -1186,7 +1885,7 @@ class Reader {
 
         return;
       case "Identifier":
-        this.identifier(n);
+        this.identifier(n, true);
 
         return;
       case "VariableDeclarator":
@@ -1212,13 +1911,19 @@ class Reader {
         return;
       case "Property":
         if (n.computed) this.visit(n.key, "plain");
-        else if (n.key.type === "Identifier") this.identifier(n.key);
+        else if (n.key.type === "Identifier") this.identifier(n.key, false);
         else this.visit(n.key, "plain");
         this.visit(n.value, "plain");
 
         return;
       case "ArrayExpression":
         for (const el of n.elements) if (el) this.visit(el, role);
+
+        return;
+      case "UnaryExpression":
+        // `typeof eval` asks whether it exists; it hands nothing on
+        if (n.operator === "typeof" && n.argument.type === "Identifier") this.identifier(n.argument, false);
+        else this.visit(n.argument, "plain");
 
         return;
       case "ConditionalExpression":
@@ -1263,8 +1968,12 @@ class Reader {
     for (const c of childNodes(n)) this.visit(c, role);
   }
 
-  private identifier(n: Identifier): void {
+  /** A name where it is read: `value` is false for a property key or a callee, which are not values passed on. */
+  private identifier(n: Identifier, value: boolean): void {
     if (n.name === "await") this.sawAwaitName = true;
+
+    // eval handed on as a value (`run(eval, code)`, `{ go: eval }`) runs code wherever it is called, which apm may not see
+    if (value && n.name === "eval" && this.bindingOf(n) === null) this.add("eval", n.start, STRENGTH.reference, "as written", "possible", "passes eval on as a value, and apm did not follow where it is called");
 
     if (/^_0x[0-9a-f]{4,}$/.test(n.name)) {
       if (this.hexFirst < 0) this.hexFirst = n.start;
@@ -1273,7 +1982,7 @@ class Reader {
 
     if (TOKEN_NAMES.has(n.name)) this.add("credential-access", n.start, STRENGTH.string, "as written", "possible", "names a token variable, but apm did not see it read from the environment");
 
-    if (n.name === "XMLHttpRequest" && !this.bindings.has(n.name)) this.add("network", n.start, STRENGTH.reference, "as written", "possible", "refers to XMLHttpRequest without creating one");
+    if (n.name === "XMLHttpRequest" && this.bindingOf(n) === null) this.add("network", n.start, STRENGTH.reference, "as written", "possible", "refers to XMLHttpRequest without creating one");
   }
 
   /** `x = require`, `x = globalThis.Function`, `x = eval`: a way to run code kept under another name. */
@@ -1452,20 +2161,54 @@ class Reader {
     }
 
     const call = this.invoked(n);
-    const { r, args, isNew } = call;
+    const at = unwrap(n.callee).start;
+    const isMethod = unwrap(n.callee).type === "MemberExpression";
+    const first = call.slots[0] ?? null;
+    const firstStr = first ? this.str(first) : null;
+    // every callee the expression can be reads the call its own way; each argument takes the strongest role any gives it
+    const plans = call.refs.map((r) => this.plan({ r, n, call, role, at, isMethod, first, firstStr }));
+
+    // a call that is handed eval itself (`run(eval, code)`) most likely runs what else it is handed
+    const handsEval = call.slots.some((slot) => slot !== null && unwrap(slot).type === "Identifier" && isGlobal(this.resolve(slot), "eval"));
+
+    const roleOf = (i: number): Role => {
+      let best: Role = handsEval ? "code" : "none";
+
+      for (const p of plans) {
+        const r = p.roles[i] ?? (p.rest === "inherit" ? role : p.rest);
+
+        if (ROLE_RANK[r] > ROLE_RANK[best]) best = r;
+      }
+
+      return best;
+    };
+
+    const dir = this.dirnamePath(n);
+
+    if (dir) this.paths.add(dir);
+    const callee = unwrap(n.callee);
+
+    if (callee.type === "MemberExpression") this.visitMember(callee, plans.some((p) => p.rest === "inherit") ? role : "plain");
+    else if (callee.type === "Identifier") this.identifier(callee, false);
+    else this.visit(callee, "plain");
+
+    for (const a of call.others) this.visit(a, "plain");
+    call.slots.forEach((slot, i) => slot && this.sinkArg(slot, roleOf(i)));
+  }
+
+  /** What one callee does with a call: the signals it confirms, and what each argument is for. */
+  private plan(c: { r: Ref; n: CallExpression | NewExpression; call: Invoked; role: Role; at: number; isMethod: boolean; first: Slot; firstStr: Str | null }): Plan {
+    const { r, n, call, role, at, isMethod, first, firstStr } = c;
+    const isNew = call.isNew;
     const name = nameOf(r);
     const last = lastName(r);
-    const at = unwrap(n.callee).start;
-    const first = args[0];
-    const firstStr = first && first.type !== "SpreadElement" ? this.str(first) : null;
     const isLocal = r.kind === "local";
-    const isMethod = unwrap(n.callee).type === "MemberExpression";
     let roles: Role[] = [];
     let rest: Role | "inherit" = "plain";
     let effect = true;
 
     if (!isNew && isRequire(r)) {
-      this.load(first, n.start);
+      this.load(first ?? undefined, n.start);
       roles = ["none"];
     } else if (r.kind === "global" && name === "require.resolve") {
       if (firstStr?.exact && /^\.\.?\//.test(firstStr.value)) this.paths.add(firstStr.value);
@@ -1473,13 +2216,13 @@ class Reader {
       this.add("eval", at, STRENGTH.call, "as written", "confirmed", "");
       roles = ["code"];
     } else if (r.kind === "global" && name === "Function") {
-      const returnsThis = args.length === 1 && firstStr?.exact && firstStr.value.trim() === "return this";
+      const returnsThis = call.slots.length === 1 && firstStr?.exact && firstStr.value.trim() === "return this";
 
       if (!returnsThis) {
         this.add("eval", at, STRENGTH.call, "as written", "confirmed", "");
         rest = "code";
       }
-    } else if (r.kind === "global" && TIMERS.has(name) && first && first.type !== "SpreadElement" && (firstStr || first.type === "TemplateLiteral")) {
+    } else if (r.kind === "global" && TIMERS.has(name) && first && (firstStr || first.type === "TemplateLiteral")) {
       this.add("eval", at, STRENGTH.call, "as written", "confirmed", "");
       roles = ["code"];
     } else if ((r.kind === "module" && r.spec === "vm" && VM_EVAL.has(r.path)) || (byName(r) && (last === "runInThisContext" || last === "runInNewContext" || (ownerOf(r) === "vm" && VM_EVAL.has(last))))) {
@@ -1515,9 +2258,9 @@ class Reader {
       effect = false;
     } else if (r.kind === "unknown" && last === "eval" && isMethod) {
       this.add("eval", at, STRENGTH.call, "as written", "possible", "calls a method named eval on an object apm cannot identify");
-    } else if (r.kind === "global" && name === "JSON.stringify" && first && first.type !== "SpreadElement" && nameOf(this.resolve(first)) === "process.env") {
+    } else if (r.kind === "global" && name === "JSON.stringify" && first && nameOf(this.resolve(first)) === "process.env") {
       this.add("credential-access", at, STRENGTH.call, "as written", "confirmed", "");
-    } else if (r.kind === "global" && /^Object\.(?:keys|entries|values)$/.test(name) && first && first.type !== "SpreadElement" && nameOf(this.resolve(first)) === "process.env") {
+    } else if (r.kind === "global" && /^Object\.(?:keys|entries|values)$/.test(name) && first && nameOf(this.resolve(first)) === "process.env") {
       this.envDumps.push(n.start);
     } else if ((r.kind === "global" && DECODERS.has(name)) || (isMethod && STRING_METHODS.has(last))) {
       rest = role === "code" ? "none" : "inherit";
@@ -1528,7 +2271,7 @@ class Reader {
     } else effect = false;
 
     // a callee named by joining pieces (`cp['ex' + 'ec'](...)`, `g['fe' + 'tch'](...)`) and then called
-    if (r.kind !== "local" && "built" in r && r.built) {
+    if (r.kind !== "local" && r.built) {
       const id = namedSignal(last);
 
       if (id || effect) this.add("obfuscated", at, STRENGTH.call, "after joining strings", "confirmed", "");
@@ -1537,62 +2280,155 @@ class Reader {
       if (id) this.add(id, at, STRENGTH.call, "after joining strings", "confirmed", "");
     }
 
-    const dir = this.dirnamePath(n);
+    return { roles, rest };
+  }
 
-    if (dir) this.paths.add(dir);
-    const callee = unwrap(n.callee);
+  /**
+   * The arguments `list` passes, in position: a spread of an array apm can read (`...args` where `const args = […]`)
+   * puts its elements in place. Past a spread apm cannot read, positions are unknown: the rest are `others`.
+   */
+  private placed(list: readonly (AnyNode | null)[]): Placed {
+    const slots: Slot[] = [];
+    const others: AnyNode[] = [];
+    let open = true;
 
-    if (callee.type === "MemberExpression") this.visitMember(callee, rest === "inherit" ? role : "plain");
-    else this.visit(callee, "plain");
-
-    const roleOf = (i: number): Role => roles[i] ?? (rest === "inherit" ? role : rest);
-
-    if (call.list) {
-      // f.apply(that, [a, b]) and Reflect.apply(f, that, [a, b]): the array holds the arguments
-      for (const a of n.arguments) {
-        if (a === call.list && a.type === "ArrayExpression") a.elements.forEach((el, i) => el && this.sinkArg(el, roleOf(i)));
-        else this.visit(a, "plain");
+    for (const a of list) {
+      if (a === null) {
+        // a hole keeps its place
+        if (open) slots.push(null);
+        continue;
       }
 
-      return;
+      if (!open) {
+        others.push(a);
+        continue;
+      }
+
+      if (a.type !== "SpreadElement") {
+        slots.push(a);
+        continue;
+      }
+
+      const elements = this.arrayElements(a.argument);
+
+      if (elements) {
+        slots.push(...elements);
+
+        // an array written in place is read through its elements; a name holding one is read as well
+        if (unwrap(a.argument).type !== "ArrayExpression") others.push(a);
+      } else {
+        others.push(a);
+        open = false;
+      }
     }
 
-    const shift = n.arguments.length - args.length;
+    return { slots, others };
+  }
 
-    n.arguments.forEach((a, i) => (i < shift ? this.visit(a, "plain") : this.sinkArg(a, roleOf(i - shift))));
+  /** The elements of an array literal, or of a constant holding one, with holes kept in place. Null when apm cannot read it. */
+  private arrayElements(n: AnyNode): Slot[] | null {
+    const t = unwrap(n);
+
+    if (t.type === "Identifier") {
+      const init = this.constInit(t);
+
+      if (!init || this.resolving > 24) return null;
+      this.resolving++;
+
+      try {
+        return this.arrayElements(init);
+      } finally {
+        this.resolving--;
+      }
+    }
+
+    if (t.type !== "ArrayExpression") return null;
+
+    return this.placed(t.elements).slots;
+  }
+
+  /** An argument list passed as one array (`f.apply(that, list)`, `Reflect.apply(f, that, list)`). */
+  private listed(list: AnyNode | undefined): Placed {
+    if (!list || list.type === "SpreadElement") return { slots: [], others: list ? [list] : [] };
+    const slots = this.arrayElements(list);
+
+    if (!slots) return { slots: [], others: [list] };
+
+    return { slots, others: unwrap(list).type === "ArrayExpression" ? [] : [list] };
+  }
+
+  /** `f.bind(that, a)`, also through a constant (`const g = f.bind(that, a)`): what is bound, and the arguments bound with it. */
+  private bound(n: AnyNode, depth = 0): { target: AnyNode; args: AnyNode[] } | null {
+    const t = unwrap(n);
+
+    if (depth > 8) return null;
+
+    if (t.type === "Identifier") {
+      const init = this.constInit(t);
+
+      return init ? this.bound(init, depth + 1) : null;
+    }
+
+    if (t.type !== "CallExpression" || t.callee.type === "Super") return null;
+    const callee = unwrap(t.callee);
+
+    if (callee.type !== "MemberExpression" || callee.computed || callee.property.type !== "Identifier" || callee.property.name !== "bind" || callee.object.type === "Super") return null;
+    const inner = this.bound(callee.object, depth + 1) ?? { target: callee.object, args: [] };
+
+    return { target: inner.target, args: [...inner.args, ...t.arguments.slice(1)] };
   }
 
   /**
    * What a call invokes and with which arguments. `f.call(that, a)`, `f.apply(that, [a])`, `Reflect.apply(f, that,
-   * [a])` and `Reflect.construct(F, [a])` invoke `f` (or construct `F`) with `a`; `list` is the array literal that
-   * holds the arguments, when they come as one.
+   * [a])`, `Reflect.construct(F, [a])` and `f.bind(that, a)()` invoke `f` (or construct `F`) with `a`.
    */
   private invoked(n: CallExpression | NewExpression): Invoked {
-    const direct = this.resolve(n.callee);
-    const plain = { r: direct, args: n.arguments, isNew: n.type === "NewExpression", list: null };
-    const elements = (a: AnyNode | undefined): (Expression | SpreadElement)[] => (a?.type === "ArrayExpression" ? a.elements.filter((e): e is Expression | SpreadElement => e !== null) : []);
-    const target = unwrap(n.callee);
+    const isNew = n.type === "NewExpression";
+    const direct = this.resolveAll(n.callee);
+    const plain = (): Invoked => ({ refs: direct, isNew, ...this.placed(n.arguments) });
+    const b = isNew ? null : this.bound(n.callee);
 
-    if (n.type === "CallExpression" && direct.kind === "global" && (direct.path === "Reflect.apply" || direct.path === "Reflect.construct")) {
-      const [fn, second, third] = n.arguments;
+    if (b) {
+      const bound = this.placed(b.args);
+      const given = this.placed(n.arguments);
 
-      if (!fn || fn.type === "SpreadElement") return plain;
-      const list = direct.path === "Reflect.apply" ? third : second;
-
-      return { r: this.resolve(fn), args: elements(list), isNew: direct.path === "Reflect.construct", list: list ?? null };
+      // the bound arguments come first; the callee expression (which holds them) is read on its own
+      return { refs: this.resolveAll(b.target), isNew, slots: [...bound.slots, ...given.slots], others: given.others };
     }
 
-    if (n.type !== "CallExpression" || target.type !== "MemberExpression" || target.object.type === "Super") return plain;
+    if (!isNew && direct.some((r) => r.kind === "global" && (r.path === "Reflect.apply" || r.path === "Reflect.construct"))) {
+      const construct = direct.some((r) => r.kind === "global" && r.path === "Reflect.construct");
+      const [fn, second, third, ...more] = n.arguments;
+
+      if (!fn || fn.type === "SpreadElement") return plain();
+      const list = this.listed(construct ? second : third);
+      const rest = construct ? [third, ...more] : [second, ...more];
+
+      return { refs: this.resolveAll(fn), isNew: construct, slots: list.slots, others: [fn, ...rest.filter((x): x is Expression | SpreadElement => x !== undefined), ...list.others] };
+    }
+
+    const target = unwrap(n.callee);
+
+    if (isNew || target.type !== "MemberExpression" || target.object.type === "Super") return plain();
     const key = this.memberKey(target);
 
-    if (key?.name !== "call" && key?.name !== "apply") return plain;
-    const inner = this.resolve(target.object);
+    if (key?.name !== "call" && key?.name !== "apply") return plain();
+    const inner = this.resolveAll(target.object);
 
-    if (inner.kind === "local" || (inner.kind === "unknown" && inner.name === null)) return plain;
+    // an object of this file with its own `call` method, or a value apm cannot name, is called as itself
+    if (inner.every((r) => r.kind === "local" || (r.kind === "unknown" && r.name === null))) return plain();
+    const [that, ...rest] = n.arguments;
+    const others = that ? [that] : [];
 
-    if (key.name === "call") return { r: inner, args: n.arguments.slice(1), isNew: false, list: null };
+    if (key.name === "call") {
+      const args = this.placed(rest);
 
-    return { r: inner, args: elements(n.arguments[1]), isNew: false, list: n.arguments[1] ?? null };
+      return { refs: inner, isNew, slots: args.slots, others: [...others, ...args.others] };
+    }
+
+    const list = this.listed(rest[0]);
+
+    return { refs: inner, isNew, slots: list.slots, others: [...others, ...list.others, ...rest.slice(1)] };
   }
 }
 
@@ -1617,9 +2453,9 @@ function member(base: Ref, prop: string, built: boolean): Ref {
       return { kind: "module", spec: base.spec, path: base.path ? `${base.path}.${prop}` : prop, built: base.built || built };
     case "local":
       // a function's constructor is Function; any other value's constructor (Array, Object, String) is a function
-      if (prop === "constructor") return base.fn ? { kind: "global", path: "Function", built } : { kind: "local", fn: true };
+      if (prop === "constructor") return base.fn ? { kind: "global", path: "Function", built } : { kind: "local", fn: true, obj: null };
 
-      return { kind: "local", fn: false };
+      return { kind: "local", fn: false, obj: null };
     case "unknown":
       // x.constructor.constructor is Function, whatever x is
       if (prop === "constructor" && base.name === "constructor") return { kind: "global", path: "Function", built: base.built || built };

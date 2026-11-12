@@ -36,6 +36,7 @@ const Fields = z.object({
   module: OptionalPath,
   browser: PathOrMap,
   exports: ExportsTree.optional(),
+  imports: ExportsTree.optional(),
   types: OptionalPath,
   typings: OptionalPath,
 });
@@ -77,8 +78,10 @@ function pathsIn(field: string, v: z.infer<typeof PathOrMap>, keyed: (k: string)
 }
 
 /**
- * Every entry point, most direct first: bin, main, module, browser, exports (every subpath and condition),
- * then types and typings. `browser` may map paths to other paths or to false; its string values are listed.
+ * Every entry point, most direct first: bin, main, module, browser, exports and imports (every subpath and
+ * condition), then types and typings. `browser` may map paths to other paths or to false; its string values are
+ * listed. A subpath pattern (`./docs/*.txt`) or folder mapping (`./lib/`) is listed as written; `targetFiles` says
+ * which files it names.
  */
 export function entryPoints(manifest: Record<string, unknown>): EntryPoint[] {
   const m = Fields.parse(manifest);
@@ -90,6 +93,8 @@ export function entryPoints(manifest: Record<string, unknown>): EntryPoint[] {
 
   if (m.exports) exportTargets(m.exports, "exports", out);
 
+  if (m.imports) exportTargets(m.imports, "imports", out);
+
   for (const [field, path] of [["types", m.types], ["typings", m.typings]] as const) if (path !== undefined) out.push({ field, path });
 
   return out;
@@ -97,11 +102,11 @@ export function entryPoints(manifest: Record<string, unknown>): EntryPoint[] {
 
 /**
  * Entries that must name a file in the tarball. Not checked: `browser` (a bundler's remapping, which may
- * name other packages), subpath patterns with `*`, folder mappings ending in "/", and exports targets that
- * do not start with "./" (node rejects those itself).
+ * name other packages), `imports` (private aliases, which may name packages too), subpath patterns with `*`,
+ * folder mappings ending in "/", and exports targets that do not start with "./" (node rejects those itself).
  */
 function mustExist(e: EntryPoint): boolean {
-  if (e.field.startsWith("browser") || e.path.includes("*") || e.path.endsWith("/")) return false;
+  if (e.field.startsWith("browser") || e.field.startsWith("imports") || e.path.includes("*") || e.path.endsWith("/")) return false;
 
   return !e.field.startsWith("exports") || e.path.startsWith("./");
 }
@@ -119,4 +124,36 @@ export function missingEntries(manifest: Record<string, unknown>, files: readonl
 
       return ![".js", ".json", ".node", "/index.js", "/index.json"].some((ext) => have.has(p + ext));
     });
+}
+
+/** What an entry's target names: one path, or every file of `paths` a pattern or folder mapping matches. */
+export type Target = { kind: "path"; path: string } | { kind: "files"; files: string[] };
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The files a target names. A pattern (`./docs/*.txt`) names every file it matches, with each `*` standing for the
+ * same text, as node substitutes it; a folder mapping (`./lib/`) names every file under the folder. Anything else is
+ * one path.
+ */
+export function targetFiles(target: string, paths: readonly string[]): Target {
+  const t = stripDot(target);
+
+  if (target.includes("*")) {
+    // the first `*` captures the substitution; every later one must be the same text
+    const body = t
+      .split("*")
+      .map((part, i) => (i === 0 ? "" : i === 1 ? "(.+)" : "\\1") + escapeRegExp(part))
+      .join("");
+
+    const re = new RegExp(`^${body}$`);
+
+    return { kind: "files", files: paths.filter((p) => re.test(p)) };
+  }
+
+  if (target.endsWith("/") && target.startsWith("./")) return { kind: "files", files: paths.filter((p) => p.startsWith(t)) };
+
+  return { kind: "path", path: target };
 }

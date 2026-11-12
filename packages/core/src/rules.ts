@@ -45,7 +45,8 @@ const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"), "g");
  * - `text`: shell command text (`curl ... | sh`). Only strings hold it: confirmed when a call runs the string,
  *   possible otherwise. In code, `a || sh` is not a pipe.
  * - `alias`: a reference that gives the power without using it (`r = require`). Always possible.
- * Raw text (a shell script, an install command, a file no parser could read) confirms every kind but `alias`.
+ * Raw text (a shell script, an install command) confirms every kind but `alias`. JavaScript no parser could hold
+ * as a tree is `unparsed`: every kind confirms there, aliases too, as apm-score-v3 read every file.
  * JavaScript and TypeScript are not matched with these patterns as code: js.ts reads them from the parsed program,
  * and uses the `name` and `text` patterns on the strings it finds.
  */
@@ -240,12 +241,15 @@ export type RegionOf = (index: number) => Region;
 /** A file read raw: no parser could follow it, so nothing is known and every match counts. */
 export const RAW: RegionOf = () => "raw";
 
+/** JavaScript with no tree: read raw, and every pattern counts as apm-score-v3 counted it, aliases included. */
+export const UNPARSED: RegionOf = () => "unparsed";
+
 /** What a match of each kind means in each region; a region a kind does not list is not a match. */
 const CONFIDENCE: Record<Kind, Partial<Record<Region, Confidence>>> = {
-  code: { code: "confirmed", kept: "confirmed", raw: "confirmed" },
-  name: { kept: "confirmed", raw: "confirmed", code: "possible", string: "possible" },
-  text: { kept: "confirmed", raw: "confirmed", string: "possible" },
-  alias: { code: "possible", kept: "possible", raw: "possible" },
+  code: { code: "confirmed", kept: "confirmed", raw: "confirmed", unparsed: "confirmed" },
+  name: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", code: "possible", string: "possible" },
+  text: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", string: "possible" },
+  alias: { code: "possible", kept: "possible", raw: "possible", unparsed: "confirmed" },
 };
 
 export const IN_STRING = "only inside an ordinary string, not in code apm saw run";
