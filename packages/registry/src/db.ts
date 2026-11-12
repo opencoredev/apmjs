@@ -760,21 +760,24 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       ).pipe(Effect.flatMap(withDismissals)),
 
     // the analyses and the package's live dismissals in one round trip: every read of an upstream package's scores
-    // (the package, score, file and readme answers) waits on it
+    // (the package, score, file and readme answers) waits on it. One row holding two arrays, so each analysis and
+    // each dismissal is sent once: a join would repeat every dismissal on every analysis row.
     upstreamAnalyses: (name) =>
       Effect.gen(function* () {
-        const rows = yield* run(
+        const row = yield* run(
           "upstreamAnalyses",
-          sql`WITH d AS (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb) AS list
-                         FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL)
-              SELECT u.version, u.digest, u.analysis, d.list AS dismissals FROM upstream_analysis u CROSS JOIN d
-              WHERE u.package = ${name} AND u.scorer = ${SCORER}`,
-          all(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown(), dismissals: z.array(DismissalRow) })),
+          sql`SELECT
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE u.package = ${name} AND u.scorer = ${SCORER}) AS analyses,
+                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
+                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals`,
+          one(z.object({ analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })), dismissals: z.array(DismissalRow) })),
         );
 
-        const dismissals = rows[0]?.dismissals ?? [];
+        const analyses = row?.analyses ?? [];
+        const dismissals = row?.dismissals ?? [];
 
-        return new Map(rows.map((row) => [`${row.version} ${row.digest}`, withList(row.analysis, dismissalsFor(dismissals, row.version, row.digest))]));
+        return new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))]));
       }),
     latestUpstreamAnalyses: (versions) =>
       Effect.gen(function* () {
