@@ -13,7 +13,7 @@ const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"));
 
 /**
  * The rules. `re` matches anywhere. `docSafe` holds the patterns docs show as examples (`new EventSource(...)`
- * in a JSDoc block), so its matches on lines that start like a comment (`*`, `//`) are passed over.
+ * in a JSDoc block), so its matches inside a real comment, on a line that starts like one, are passed over.
  */
 const RULES: { id: CodeSignal; re: RegExp; docSafe?: RegExp }[] = [
   {
@@ -211,21 +211,171 @@ export function namedSignal(s: string): Exclude<CodeSignal, "obfuscated"> | null
   return NAMED.find((n) => n.re.test(t))?.id ?? null;
 }
 
-// ---------- the scan ----------
-/** Whether the line holding `index` starts like a comment: `* ...` inside a JSDoc block, or `// ...`. */
+// ---------- comments ----------
+/** Words after which a `/` starts a regular expression, not a division. */
+const REGEX_AFTER_WORD = new Set(["return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do", "else", "yield", "await"]);
+
+/** Where a `/` may start a regex: yes after an operator, no after a value, and "try" after `)`, `]` or `}`. */
+type SlashMeaning = "regex" | "division" | "try-regex";
+
+/** The end of the regex literal starting at `i` (just past its closing `/` and flags), or -1 when there is none on this line. */
+function regexEnd(text: string, i: number): number {
+  let inClass = false;
+
+  for (let j = i + 1; j < text.length; j++) {
+    const c = text[j];
+
+    if (c === "\n" || c === "\r") return -1;
+
+    if (c === "\\") j++;
+    else if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) {
+      let k = j + 1;
+
+      while (k < text.length && /[a-z]/i.test(text[k] ?? "")) k++;
+
+      return k;
+    }
+  }
+
+  return -1;
+}
+
+/** The end of the quoted string starting at `i` (past its closing quote, or at the end of the line when it has none). */
+function stringEnd(text: string, i: number, quote: string): number {
+  for (let j = i + 1; j < text.length; j++) {
+    const c = text[j];
+
+    if (c === "\\") j++;
+    else if (c === quote) return j + 1;
+    else if (c === "\n") return j;
+  }
+
+  return text.length;
+}
+
+/**
+ * The [start, end) offsets of every comment in JavaScript or TypeScript source. A small tokenizer: it skips
+ * strings, template literals (with nested `${}`) and regex literals, so `'/*'` in a string or `/\/*$/` in a
+ * regex is not a comment, and a `/* closed *\/` comment ends where it closes. Where `/` could be either a
+ * regex or a division (after `)`, `]` or `}`), it reads a regex when one fits on the line: that can only
+ * miss a comment, never invent one, so code is never hidden by a wrong guess. An unclosed block comment is
+ * a syntax error and counts as code. Linear in the length of the text.
+ */
+export function commentRanges(text: string): [number, number][] {
+  const out: [number, number][] = [];
+  // each frame is code (counting its open braces) or the text part of a template literal
+  const stack: ({ kind: "code"; depth: number } | { kind: "template" })[] = [{ kind: "code", depth: 0 }];
+  let slash: SlashMeaning = "regex";
+  let i = 0;
+
+  while (i < text.length) {
+    const top = stack[stack.length - 1] ?? { kind: "code", depth: 0 };
+    const c = text[i] ?? "";
+
+    if (top.kind === "template") {
+      if (c === "\\") i += 2;
+      else if (c === "`") {
+        stack.pop();
+        i++;
+        slash = "division";
+      } else if (c === "$" && text[i + 1] === "{") {
+        stack.push({ kind: "code", depth: 0 });
+        i += 2;
+        slash = "regex";
+      } else i++;
+
+      continue;
+    }
+
+    if (c === "/" && text[i + 1] === "/") {
+      const nl = text.indexOf("\n", i);
+      const end = nl < 0 ? text.length : nl;
+
+      out.push([i, end]);
+      i = end;
+    } else if (c === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+
+      if (close < 0) i += 2;
+      else {
+        out.push([i, close + 2]);
+        i = close + 2;
+      }
+    } else if (c === "/") {
+      const end: number = slash === "division" ? -1 : regexEnd(text, i);
+
+      i = end > 0 ? end : i + 1;
+      slash = end > 0 ? "division" : "regex";
+    } else if (c === "'" || c === '"') {
+      i = stringEnd(text, i, c);
+      slash = "division";
+    } else if (c === "`") {
+      stack.push({ kind: "template" });
+      i++;
+    } else if (c === "{") {
+      top.depth++;
+      i++;
+      slash = "regex";
+    } else if (c === "}") {
+      if (top.depth === 0 && stack.length > 1) stack.pop();
+      else top.depth--;
+      i++;
+      slash = "try-regex";
+    } else if (c === ")" || c === "]") {
+      i++;
+      slash = "try-regex";
+    } else if (/[\w$]/.test(c)) {
+      let j = i + 1;
+
+      while (j < text.length && /[\w$]/.test(text[j] ?? "")) j++;
+      slash = REGEX_AFTER_WORD.has(text.slice(i, j)) ? "regex" : "division";
+      i = j;
+    } else {
+      if (!/\s/.test(c)) slash = "regex";
+      i++;
+    }
+  }
+
+  return out;
+}
+
+/** Whether `index` falls inside one of the sorted `ranges`. */
+function inRanges(ranges: readonly [number, number][], index: number): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid];
+
+    if (!r) return false;
+
+    if (index < r[0]) hi = mid - 1;
+    else if (index >= r[1]) lo = mid + 1;
+    else return true;
+  }
+
+  return false;
+}
+
+/** Whether the line holding `index` starts like a comment: `* ...` inside a JSDoc block, `// ...` or `/* ...`. */
 function onCommentLine(text: string, index: number): boolean {
   const start = text.lastIndexOf("\n", index - 1) + 1;
 
   return /^\s*(?:\*|\/\/|\/\*)/.test(text.slice(start, Math.min(index, start + 200)));
 }
 
-/** First match of `re` in `text` that is not on a comment-shaped line. Bounded: gives up after 200 tries. */
-function firstOutsideComments(re: RegExp, text: string): number {
+/**
+ * First match of `re` in `text` that is not documentation: a match is passed over only when it sits inside a
+ * real comment and on a line that starts like one. Every match is looked at; there is no budget to run out.
+ */
+function firstOutsideComments(re: RegExp, text: string, ranges: () => [number, number][]): number {
   const g = new RegExp(re.source, "g");
-  let tries = 0;
 
-  for (let m = g.exec(text); m && tries < 200; m = g.exec(text), tries++) {
-    if (!onCommentLine(text, m.index)) return m.index;
+  for (let m = g.exec(text); m; m = g.exec(text)) {
+    if (!(inRanges(ranges(), m.index) && onCommentLine(text, m.index))) return m.index;
 
     if (m[0].length === 0) g.lastIndex++;
   }
@@ -233,13 +383,17 @@ function firstOutsideComments(re: RegExp, text: string): number {
   return -1;
 }
 
+// ---------- the scan ----------
 function ruleHits(text: string, how: TextFinding["how"], skip: ReadonlySet<CodeSignal>): TextFinding[] {
   const out: TextFinding[] = [];
+  let ranges: [number, number][] | null = null;
+  // tokenized once per text, and only when a docs-shaped pattern matched somewhere
+  const comments = (): [number, number][] => (ranges ??= commentRanges(text));
 
   for (const rule of RULES) {
     if (skip.has(rule.id)) continue;
     const m = rule.re.exec(text);
-    const at = m ? m.index : rule.docSafe ? firstOutsideComments(rule.docSafe, text) : -1;
+    const at = m ? m.index : rule.docSafe ? firstOutsideComments(rule.docSafe, text, comments) : -1;
 
     if (at >= 0) out.push({ id: rule.id, ...lineOf(text, at), how });
   }
