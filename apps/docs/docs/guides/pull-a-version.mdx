@@ -43,7 +43,7 @@ What happens next depends on the version's age:
 - **Under 72 hours old**: revoked at once, even when other packages depend on it. Those dependents are what a malicious version would attack.
 - **Older**: yanked at once (`revoke-pending`), so new installs skip it, and fully revoked 24 hours later. Existing lockfiles keep working until then. If a second owner runs `apm revoke` on the same version, it becomes final at once.
 
-While a revoke is pending, the tarball stays downloadable for existing lockfiles; no other route shows its contents. Its manifest answers 404, and its files, readme, review quotes, score evidence and manifest text are withheld exactly as for a revoked version.
+While a revoke is pending, the tarball stays downloadable for existing lockfiles; no other route shows its contents. Its manifest answers 404, and everything else is withheld exactly as for a revoked version (see [What a revoke hides](#what-a-revoke-hides)).
 
 ```text
 ✓ @you/my-lib@1.2.3 is now revoke-pending
@@ -52,9 +52,27 @@ While a revoke is pending, the tarball stays downloadable for existing lockfiles
 
 Once a version is revoked:
 
-- its tarball answers `410 Gone` with your reason, on the plain registry and on `~safe`;
+- its tarball answers `410 Gone`, on the plain registry and on `~safe`, with your reason in the body's `revokeReason` field (npm prints only the error line, "revoked by its owner");
 - `bun audit`, `npm audit` and `apm audit` report it as a critical advisory;
 - the [Bun scanner](/guides/bun-scanner) cancels any install that includes it.
+
+### What a revoke hides
+
+People revoke to pull malware, and also to pull a secret they published by accident. Both get the same guarantee, for revoked and revoke-pending versions alike.
+
+**Guaranteed.** No route on the registry or apmjs.dev serves the version's:
+
+- file contents, or code quoted from them (score evidence, review quotes and excerpts);
+- readme text;
+- AI review text that could quote the package (the model's summary and its finding sentences; a finding keeps only a numbered file reference, its line and its severity);
+- install script bodies;
+- staged upload's files, if it was approved from the website.
+
+The one exception is a revoke-pending version's tarball, which stays downloadable for lockfiles that already pin it until the revoke is final.
+
+**Best effort, not guaranteed.** Publisher metadata is hidden where that is practical: the description, keywords, deprecation message, file names and dependency names. Today apm leaves out the description, keywords and deprecation message, shows file names as numbered references ("file 3"), and names a dependency only when its name is a valid npm name. None of this is part of the guarantee, and copies may already exist elsewhere (npm mirrors, search engines, someone's terminal). If you leaked a secret in any of these, or anywhere in the package, rotate the secret: a revoke stops apm from showing it, not anyone from having seen it.
+
+Your revoke reason is shown: it is your own words about the revoke, not the package's text. Don't put the secret in it.
 
 ### Undo a revoke
 
