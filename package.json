@@ -8,9 +8,12 @@
   ],
   "scripts": {
     "test": "bun test tests",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p packages/registry/tsconfig.json && tsc -p packages/infra/tsconfig.json",
     "lint": "bun scripts/lint.ts",
-    "lint:baseline": "bun scripts/lint.ts --update"
+    "lint:baseline": "bun scripts/lint.ts --update",
+    "build:registry": "bun packages/registry/scripts/build.ts",
+    "deploy:staging": "bun packages/infra/deploy.ts deploy --stage staging",
+    "smoke:staging": "bun packages/infra/smoke.ts --stage staging"
   },
   "devDependencies": {
     "@alchemy.run/cloudflare-runtime": "2.0.0-beta.85",

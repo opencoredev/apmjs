@@ -1,0 +1,79 @@
+// apm on Cloudflare, as one Alchemy stack: the registry Worker with its R2 bucket, analysis queue and Hyperdrive
+// in front of Neon, and the website Worker. Stages: "staging" serves on workers.dev; "production" on apmjs.dev.
+// Secrets arrive as environment variables from deploy.ts, which reads them from ~/.config/apmjs.
+import { resolve } from "node:path";
+import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Alchemy from "alchemy";
+import * as Config from "effect/Config";
+import * as Effect from "effect/Effect";
+import * as Redacted from "effect/Redacted";
+import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../registry/scripts/compat.ts";
+
+const PRODUCTION = { registry: "registry.apmjs.dev", web: "apmjs.dev" } as const;
+
+export default Alchemy.Stack(
+  "apmjs",
+  { providers: Cloudflare.providers(), state: Alchemy.localState() },
+  Effect.gen(function* () {
+    const stage = yield* Alchemy.Stage;
+    const production = stage === "production";
+    const subdomain = yield* Config.String("WORKERS_SUBDOMAIN");
+    const registryName = `apmjs-registry-${stage}`;
+    const webName = `apmjs-web-${stage}`;
+    const registryUrl = production ? `https://${PRODUCTION.registry}/` : `https://${registryName}.${subdomain}.workers.dev/`;
+    const webUrl = production ? `https://${PRODUCTION.web}/` : `https://${webName}.${subdomain}.workers.dev/`;
+
+    const neon = new URL(Redacted.value(yield* Config.Redacted("NEON_URL")));
+    const database = yield* Config.String("APM_DATABASE");
+
+    const blobs = yield* Cloudflare.R2.Bucket("Blobs", { name: `apmjs-blobs-${stage}` });
+    const analysis = yield* Cloudflare.Queues.Queue("Analysis", { name: `apmjs-analysis-${stage}` });
+
+    const postgres = yield* Cloudflare.Hyperdrive.Connection("Postgres", {
+      name: `apmjs-${stage}`,
+      origin: {
+        scheme: "postgres",
+        host: neon.hostname,
+        port: 5432,
+        database,
+        user: decodeURIComponent(neon.username),
+        password: Redacted.make(decodeURIComponent(neon.password)),
+      },
+      // Version state changes at any time (yank, revoke), so nothing the registry reads may come from a cache.
+      caching: { disabled: true },
+    });
+
+    const registry = yield* Cloudflare.Worker("Registry", {
+      name: registryName,
+      main: resolve(import.meta.dirname, "../registry/dist/worker.js"),
+      bundle: false,
+      compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
+      env: {
+        HYPERDRIVE: postgres,
+        BLOBS: blobs,
+        ANALYSIS_QUEUE: analysis,
+        APM_REGISTRY_URL: registryUrl,
+        APM_PUBLIC_URL: webUrl,
+        APM_UPSTREAM: "https://registry.npmjs.org/",
+        APM_NAME_POLICY: "scoped",
+        APM_LEGACY_AUTH: "0",
+        APM_AUTH_SECRET: yield* Config.Redacted("AUTH_SECRET"),
+        APM_GITHUB_CLIENT_ID: yield* Config.String("GITHUB_CLIENT_ID"),
+        APM_GITHUB_CLIENT_SECRET: yield* Config.Redacted("GITHUB_CLIENT_SECRET"),
+      },
+      // Writes down pending revokes past 24h and expired staged versions; reads already treat them as final.
+      crons: ["*/10 * * * *"],
+      observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
+      // staging has no custom domain: undefined leaves workers.dev as the only address
+      domain: production ? PRODUCTION.registry : undefined,
+    });
+
+    yield* Cloudflare.Queues.Consumer("AnalysisConsumer", {
+      queueId: analysis.queueId,
+      scriptName: registry.workerName,
+      settings: { batchSize: 5, maxRetries: 3, maxWaitTimeMs: 1000, retryDelay: 30 },
+    });
+
+    return { registry: registryUrl, web: webUrl, registryWorker: registry.url };
+  }),
+);

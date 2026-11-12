@@ -8,7 +8,8 @@ import { randomBytes } from "node:crypto";
 import { Miniflare } from "miniflare";
 import { Client } from "pg";
 import { z } from "zod";
-import { buildWorker, COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/build.ts";
+import { buildWorker } from "../../packages/registry/scripts/build.ts";
+import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/compat.ts";
 import { freshDatabase } from "./postgres.ts";
 
 export type WorkerRegistryOptions = {
@@ -101,7 +102,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     modules: [{ type: "ESModule", path: script }],
     modulesRoot: dirname(script),
     compatibilityDate: COMPATIBILITY_DATE,
-    compatibilityFlags: COMPATIBILITY_FLAGS,
+    compatibilityFlags: [...COMPATIBILITY_FLAGS],
     bindings: Object.fromEntries(vars),
     r2Buckets: ["BLOBS"],
     queueProducers: { ANALYSIS_QUEUE: { queueName: queue } },

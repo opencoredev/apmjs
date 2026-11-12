@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { rolldown } from "rolldown";
 import cloudflareRolldown from "@alchemy.run/cloudflare-runtime/rolldown";
 
-export const COMPATIBILITY_DATE = "2026-07-30";
-export const COMPATIBILITY_FLAGS = ["nodejs_compat"];
+import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "./compat.ts";
+
+export { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS };
 
 const ROOT = join(import.meta.dir, "..");
 
@@ -15,7 +16,7 @@ export async function buildWorker(entry: "worker" | "worker-test", outDir = join
   const bundle = await rolldown({
     input: join(ROOT, "src", `${entry}.ts`),
     external: ["lightningcss", "fsevents"],
-    plugins: [cloudflareRolldown({ compatibilityDate: COMPATIBILITY_DATE, compatibilityFlags: COMPATIBILITY_FLAGS })],
+    plugins: [cloudflareRolldown({ compatibilityDate: COMPATIBILITY_DATE, compatibilityFlags: [...COMPATIBILITY_FLAGS] })],
   });
 
   await bundle.write({ dir: outDir, format: "esm", entryFileNames: "[name].js", codeSplitting: false, minify: false, sourcemap: false });
