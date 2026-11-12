@@ -73,9 +73,11 @@ describe("upstreamAnalyses", () => {
       const linear = analyses + dismissals;
 
       proxy.reset();
-      const scores = await Effect.runPromise(Effect.flatMap(Store, (s) => s.upstreamAnalyses(NAME)).pipe(Effect.provide(Store.postgres(proxy.url)), Effect.scoped));
+      const { scores, unscorable } = await Effect.runPromise(Effect.flatMap(Store, (s) => s.upstreamAnalyses(NAME)).pipe(Effect.provide(Store.postgres(proxy.url)), Effect.scoped));
 
       expect(scores.size).toBe(ANALYSES);
+      // the same round trip carries the versions decided unscorable (migration 0010); this package has none
+      expect(unscorable.size).toBe(0);
       expect(scores.get("1.0.1 sha512-1")).toEqual(analysis);
       // what was sent is the analyses and the dismissals once each, plus the connection's own messages; a join that
       // repeated the dismissals on every analysis row would send about ANALYSES times the dismissals' size
