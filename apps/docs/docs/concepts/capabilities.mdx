@@ -1,16 +1,61 @@
 ---
 title: Capabilities
-description: Declaring what your package needs (network, shell, file system) in package.json. This page is a placeholder until the feature ships.
-sidebar:
-  badge: Soon
+description: What a version can do (network, environment, files, processes, dynamic code, native code, install scripts), listed beside the score, and how a package declares them in package.json.
 ---
 
-:::note
-Capabilities are not part of apm yet. Work on an `apm.capabilities` field in `package.json` is in progress, and this page will describe it once it lands. Nothing on this page works today.
-:::
+Since `apm-score-v10`, the [score](/concepts/score) counts what looks like malware, and what a package can do is listed beside it as **capabilities**. A capability costs no points on its own. An email SDK that calls its API, reads its key from the environment and has a sendmail transport is scored on its risks, not on those abilities.
 
-{/* TODO(capabilities): the apm.capabilities field is being built on the feat/capabilities branch, which was not
-    pushed when this site was written. Replace this page with the field's schema, an example, how the score
-    and the approval page use a declaration, and what happens when code does more than it declares. */}
+## The capabilities
 
-Until the field exists, the [score's](/concepts/score) code signals (`network`, `shell-exec`, `credential-access`, `eval`, `obfuscated`) are apm's record of what a version's code does, each with the file and line it came from.
+| Capability | What apm looks for |
+| --- | --- |
+| `network` | `fetch`, `http`/`https` requests, sockets, DNS, HTTP client libraries, `WebSocket` |
+| `env` | `process.env.X`, `process.env['X']`, `const { X } = process.env`, `Bun.env`, `Deno.env.get`, reads by a computed name, and reads of the whole environment |
+| `filesystem` | loading `fs`, `fs/promises`, `fs-extra` or `graceful-fs`, `Bun.file`, `Deno` file calls |
+| `shell` | `child_process` and its calls, `Bun.spawn`, `Bun.$`, `Deno.Command`, shell text in commands |
+| `eval` | `eval`, `Function`, `vm`, string timers, a `Worker` run from a string |
+| `native` | executables, native `.node` modules, `binding.gyp` |
+| `install` | `preinstall`, `install` and `postinstall` scripts |
+
+Each one lists the lines that show it, linked to the file. When every line is only text, such as a variable name in help output or `curl` in a comment, the capability says "Text mention only". For `env`, the variable names it reads are listed too.
+
+The version page shows capabilities in their own section, under the score. `apm score`, `apm add` and `apm publish` print them under the score.
+
+## Declaring capabilities
+
+A package can say what it does in its `package.json`:
+
+```json
+{
+  "name": "@opencoredev/email-sdk",
+  "apm": {
+    "capabilities": {
+      "network": ["api.resend.com", "*.amazonaws.com"],
+      "env": ["AWS_*", "RESEND_API_KEY", "*_BASE_URL", "SMTP_*"],
+      "filesystem": "reads attachment files",
+      "shell": "sendmail transport"
+    }
+  }
+}
+```
+
+The keys are `network`, `env`, `filesystem`, `shell`, `eval`, `native` and `install`. Each value is a reason (a string), `true`, or a list. `false`, `""` and `[]` declare nothing.
+
+apm compares the declaration with the code:
+
+| The code | The declaration | Result |
+| --- | --- | --- |
+| uses it | lists it | shown as **Declared** |
+| uses it | leaves it out | **Not in its declaration**: the `undeclared-capability` risk signal, 10 points for the first, 5 for each further one, at most 20 |
+| uses it only as text | leaves it out | shown, costs nothing |
+| never uses it | lists it | a note: "Declared, not seen used" |
+
+For `env`, the list is variable names, where `*` stands for any run of characters. Variables the code reads outside the list are shown under the capability; they are not scored. Network hosts are shown as declared and not checked against the URLs in the code, because most URLs in code are documentation links.
+
+A declaration never cancels a risk signal. An install-time download, a credential file read or a request bin costs the same whether or not the package declares the network.
+
+A package without a declaration, which is most of npm, is scored on risk signals alone. An `apm` field without `capabilities`, or one apm cannot read, counts as no declaration, so a typo cannot cost points; the version page says when apm could not read it.
+
+## Example
+
+`@opencoredev/email-sdk` 3.0.1 scores 97 without a declaration: 3 points for the variable names in its CLI help, a weak `credential-mention`. With the declaration above it still scores 97, with every capability marked declared. With a declaration that lists only `network`, `env` (`AWS_*`, `RESEND_API_KEY`) and `shell`, it scores 87: its CLI imports `node:fs/promises`, so `filesystem` is undeclared.

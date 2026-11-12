@@ -8,6 +8,7 @@ export const GENERAL_LIMITS: readonly string[] = [
   "runtime behavior: what the code does when it runs, such as downloading or unpacking more code",
   "code hidden by a custom encoding, compression or encryption",
   "the code of its dependencies, beyond their own scores",
+  "where the code sends what it sends: a request to an API and one to an attacker look the same, so network use alone costs nothing",
   "native binaries and WebAssembly: listed, not read",
   "whether the publisher's machine or CI was compromised",
 ];
