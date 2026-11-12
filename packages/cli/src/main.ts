@@ -113,14 +113,14 @@ type Proof = { password?: string; otp?: string };
 /**
  * The second factor for revoke, restore, incident and owner changes: --otp <code>, or a password on
  * legacy password registries. Without either, a terminal is asked for the code; Enter skips it, which
- * works when you confirmed with your passkey on the website in the last 10 minutes.
+ * works when you approved this exact command on the website in the last 10 minutes (the error links there).
  */
 async function readProof(a: Args): Promise<Proof> {
   if (flag(a, "password") || has(a, "password-stdin")) return { password: await readPassword(a) };
   const otp = flag(a, "otp");
   if (otp) return { otp };
   if (!process.stdin.isTTY) return {};
-  const answer = prompt("Code from your authenticator app (Enter to skip if you just confirmed on the website):");
+  const answer = prompt("Code from your authenticator app (Enter to skip if you approved this command on the website):");
   return answer && answer.trim() ? { otp: answer.trim() } : {};
 }
 
@@ -415,8 +415,10 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
     warn("apm revoke needs --reason; everyone with this version installed will see it.");
     return 2;
   }
+  // yank and unyank take --otp too: a login token needs a fresh code to change what installs
   const needsFactor = action === "revoke" || action === "restore";
-  const proof = needsFactor ? await readProof(a) : {};
+  const otp = flag(a, "otp");
+  const proof = needsFactor ? await readProof(a) : otp ? { otp } : {};
   const r = await api.raw(`-/apm/v1/${action}`, { method: "POST", body: { name: parsed.name, version: parsed.range, ...(reason ? { reason } : {}), ...proof } });
   if (r.status !== 200) {
     warn(red(`apm ${action} failed: ${typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : `HTTP ${r.status}`}`));

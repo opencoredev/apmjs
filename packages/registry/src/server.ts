@@ -4,6 +4,7 @@ import { existsSync, linkSync, readFileSync, rmSync, writeFileSync, mkdirSync } 
 import { join, dirname, resolve, sep } from "node:path";
 import { z } from "zod";
 import { editDistance, isValidVersion } from "@apm/core";
+import type { LiveAction } from "./actions.ts";
 import type { Store, VersionRecord, PackageRecord } from "./db.ts";
 
 export type NamePolicy = "scoped" | "open";
@@ -19,12 +20,26 @@ export type Access = {
   newNameRefusal: (input: { name: string; user: string }) => Promise<Refusal | null>;
   /** Why `user` may not stage a publish (no passkey or 2FA), or null. */
   stageRefusal: (user: string) => Refusal | null;
-  /** Why `user` may not do a destructive action with this proof (password only in legacy mode, or a TOTP code), or null. */
-  secondFactor: (input: { user: string; password?: string | undefined; otp?: string | undefined }) => Promise<Refusal | null>;
+  /**
+   * Why `user` may not do `action` with this proof, or null. A password counts only in legacy mode; a TOTP code
+   * counts once; with neither, a website confirmation of exactly this command counts once.
+   */
+  secondFactor: (input: { user: string; password?: string | undefined; otp?: string | undefined; action: LiveAction }) => Promise<Refusal | null>;
+  /** Why this token may not change live state (`action`), or null. Staging tokens need a fresh second factor for it. */
+  liveChangeRefusal: (input: { user: string; scope: TokenScope; action: LiveAction; otp?: string | undefined }) => Promise<Refusal | null>;
 };
 export type Ctx = { store: Store; now: () => number; baseUrl: () => string; access: Access };
 /** "publish" tokens go live at once (legacy logins, test tokens, later CI trusted publishing); "stage" tokens need approval. */
 export type TokenScope = "publish" | "stage";
+
+/**
+ * What each kind of token may do. A staging token (apm login, the website's device flow) uploads versions that wait
+ * for a person, and changes live state (dist-tags, deprecate, yank, unyank) only with a fresh second factor.
+ */
+export const TOKEN_CAPABILITIES: Record<TokenScope, { publish: "live" | "staged"; liveChanges: "token" | "second-factor" }> = {
+  publish: { publish: "live", liveChanges: "token" },
+  stage: { publish: "staged", liveChanges: "second-factor" },
+};
 /** What a token row's scope means today. "legacy" tokens came from password logins: direct publish only while legacy auth is on. */
 export function effectiveScope(stored: string, legacyAuth: boolean): TokenScope {
   if (stored === "stage") return "stage";
@@ -325,6 +340,9 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (perm) return fail(perm.status, perm.error);
 
   if (!body._attachments || Object.keys(body._attachments).length === 0) {
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "deprecate", name }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     return handleMetadataUpdate(ctx, name, body, auth.user);
   }
 
@@ -341,7 +359,10 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (existing && ctx.store.getVersion(name, version)) {
     return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
   }
-  if (auth.scope === "stage") {
+
+  const staged = TOKEN_CAPABILITIES[auth.scope].publish === "staged";
+
+  if (staged) {
     const pending = ctx.store.pendingStaged(name, version);
     if (pending && pending.expires_at > ctx.now()) {
       return fail(409, `${name}@${version} is already waiting for approval: ${approvalUrl(ctx, pending.id)}`);
@@ -370,7 +391,7 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   // header-safe: a tar path may hold control characters
   const warningText = warnings.length > 0 ? `Warning: ${warnings.join(" ")}`.replace(/[\x00-\x1f\x7f]/g, " ") : null;
 
-  if (auth.scope === "stage") {
+  if (staged) {
     const at = ctx.now();
     const id = randomBytes(12).toString("base64url");
     const path = stagedTarballPath(ctx, id);
@@ -550,6 +571,16 @@ function handleMetadataUpdate(ctx: Ctx, name: string, body: PublishBody, user: s
   return json({ ok: true });
 }
 
+/** The one-time code npm sends with `--otp` (and after asking, when a 401 says `www-authenticate: OTP`). */
+function npmOtp(req: Request): string | undefined {
+  return req.headers.get("npm-otp") ?? undefined;
+}
+
+/** A refusal npm answers by asking for a one-time code. */
+function otpFail(r: Refusal): Response {
+  return json({ error: r.error }, r.status, r.status === 401 ? { "www-authenticate": "OTP" } : {});
+}
+
 // ---------- dist-tags ----------
 async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string | undefined, auth: Auth): Promise<Response> {
   const pkg = ctx.store.getPackage(name);
@@ -565,9 +596,15 @@ async function handleDistTags(req: Request, ctx: Ctx, name: string, tag: string 
     if (!isValidVersion(version)) return fail(400, `Invalid version "${version}"`);
     const v = ctx.store.getVersion(name, version);
     if (!v || v.status !== "active") return fail(404, `Version ${version} not found or not active`);
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "dist-tag", name, tag, version }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     tags[tag] = version;
   } else if (req.method === "DELETE") {
     if (tag === "latest") return fail(400, "Cannot delete latest");
+    const denied = await ctx.access.liveChangeRefusal({ user: auth.user, scope: auth.scope, action: { kind: "dist-tag", name, tag, version: null }, otp: npmOtp(req) });
+
+    if (denied) return otpFail(denied);
     delete tags[tag];
   } else {
     return fail(405, "Method not allowed");

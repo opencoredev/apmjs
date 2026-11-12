@@ -96,8 +96,10 @@ apm incident --since 2026-11-10T00:00:00Z --dry-run`}</Code>
               ["Yank", "Hidden from new installs. Lockfiles keep working. Reversible."],
               [
                 "Revoke",
-                "For malicious versions. Needs a fresh second factor: pass --otp with your authenticator code, or confirm on your account page within the last 10 minutes. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
+                "For malicious versions. Needs a fresh second factor: pass --otp with your authenticator code, or open the link the command prints and approve that one command on your account page, then run it again within 10 minutes. A version under 72 hours old with no dependents is revoked at once; otherwise it is yanked now and fully revoked after 24 hours, or sooner if a second owner confirms.",
               ],
+              ["Login tokens", "The token from apm login uploads versions that wait for your approval. It moves dist-tags, deprecates, yanks or unyanks only with --otp (npm asks for the code itself)."],
+              ["Scopes", "Your scope is your GitHub login when you first sign in, tied to your GitHub account's numeric id. It is permanent: renaming on GitHub does not move or free it. To move packages to a new name, open a name dispute."],
               ["Audits", "Revoked versions show up as critical advisories in bun audit and npm audit, and their tarballs return 410."],
               ["Log", "Every action lands in the package’s public log."],
             ].map(([term, def]) => (

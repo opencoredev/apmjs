@@ -7,10 +7,25 @@ import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SignInPanel } from "@/components/sign-in-panel";
-import { Account, AuthConfig, authClient, authPost, call, linkProvider, PROVIDER_LABEL } from "@/lib/account";
+import {
+  Account,
+  AuthConfig,
+  authClient,
+  authPost,
+  call,
+  commandFromLink,
+  commandText,
+  linkProvider,
+  PROVIDER_LABEL,
+  proofHeaders,
+  type FactorProof,
+  type LiveAction,
+} from "@/lib/account";
 import { cn } from "@/lib/utils";
 
 type State = { kind: "loading" } | { kind: "signed-out" } | { kind: "error"; message: string } | { kind: "ok"; account: Account; config: AuthConfig };
+
+const NAME_DISPUTE_URL = "https://github.com/opencoredev/apmjs/issues/new?template=name-dispute.yml";
 
 function Section({ title, children, aside }: { title: string; children: React.ReactNode; aside?: React.ReactNode }) {
   return (
@@ -34,33 +49,208 @@ function fmt(iso: string): string {
 
 const SixDigits = /^\d{6}$/;
 
-function TotpSetup({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<{ kind: "idle" } | { kind: "scan"; uri: string; secret: string; qr: string }>({ kind: "idle" });
+function hasFactor(a: Account): boolean {
+  return a.security.totp || a.security.passkeys > 0;
+}
+
+/**
+ * Asks for the factor the account already has: a code from the app (or a recovery code), or a passkey check.
+ * `run` gets the proof and returns an error message, or null when it worked.
+ */
+function FactorPrompt({
+  account,
+  config,
+  action,
+  busyLabel,
+  allowRecovery = false,
+  run,
+}: {
+  account: Account;
+  config: AuthConfig;
+  action: string;
+  busyLabel: string;
+  allowRecovery?: boolean;
+  run: (proof: FactorProof) => Promise<string | null>;
+}) {
+  const [mode, setMode] = useState<"totp" | "recovery">("totp");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState<"code" | "passkey" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const canTotp = account.security.totp;
+  const canPasskey = account.security.passkeys > 0 && config.passkeys;
+
+  async function withCode(e: React.FormEvent) {
+    e.preventDefault();
+    const value = code.trim();
+
+    if (mode === "totp" && !SixDigits.test(value)) return setError("Enter the 6-digit code your app shows.");
+
+    if (mode === "recovery" && !/^[A-Za-z0-9-]{6,64}$/.test(value)) return setError("Enter one of your recovery codes, like abcde-12345.");
+    setBusy("code");
+    setError(null);
+    const message = await run({ kind: mode, code: value });
+    setBusy(null);
+
+    if (message) return setError(message);
+    setCode("");
+  }
+
+  async function withPasskey() {
+    setBusy("passkey");
+    setError(null);
+    const p = await authClient().signIn.passkey();
+
+    if (p.error) {
+      setBusy(null);
+
+      return setError(p.error.message ?? "The passkey check did not finish.");
+    }
+
+    const message = await run({ kind: "passkey" });
+    setBusy(null);
+
+    if (message) setError(message);
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <form onSubmit={(e) => void withCode(e)} className="flex flex-wrap items-end gap-2">
+        {canTotp && (
+          <>
+            <label className="flex flex-col gap-1.5 text-sm text-muted-foreground">
+              {mode === "totp" ? "Code from your authenticator app" : "Recovery code"}
+              <Input
+                value={code}
+                onChange={(e) => setCode(mode === "totp" ? e.target.value.replace(/\D/g, "").slice(0, 6) : e.target.value.slice(0, 64))}
+                inputMode={mode === "totp" ? "numeric" : "text"}
+                autoComplete={mode === "totp" ? "one-time-code" : "off"}
+                spellCheck={false}
+                placeholder={mode === "totp" ? "123456" : "abcde-12345"}
+                aria-invalid={error !== null}
+                className={cn("h-9 font-mono", mode === "totp" ? "w-36 tracking-widest" : "w-48")}
+              />
+            </label>
+            <Button type="submit" variant="outline" size="lg" disabled={busy !== null}>
+              {busy === "code" ? busyLabel : action}
+            </Button>
+          </>
+        )}
+        {canPasskey && (
+          <Button type="button" variant="outline" size="lg" disabled={busy !== null} onClick={() => void withPasskey()}>
+            {busy === "passkey" ? "Waiting for passkey…" : canTotp ? "Use passkey instead" : `${action} with passkey`}
+          </Button>
+        )}
+      </form>
+      {canTotp && allowRecovery && (
+        <button
+          type="button"
+          className="self-start text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
+          onClick={() => {
+            setMode(mode === "totp" ? "recovery" : "totp");
+            setCode("");
+            setError(null);
+          }}
+        >
+          {mode === "totp" ? "Lost your phone? Use a recovery code" : "Use a code from your app instead"}
+        </button>
+      )}
+      {error && (
+        <p role="alert" className="text-sm text-bad">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone: () => void }) {
+  const [saved, setSaved] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const text = `apm recovery codes\nEach code works once. Keep them somewhere safe, away from your phone.\n\n${codes.join("\n")}\n`;
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(codes.join("\n"));
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  function download() {
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "apm-recovery-codes.txt";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div className="flex flex-col gap-4 rounded-xl border border-warn/40 bg-warn-soft/40 p-4 sm:p-5">
+      <div className="flex flex-col gap-1">
+        <h3 className="text-[15px] font-medium">Save your recovery codes</h3>
+        <p className="text-sm leading-6 text-muted-foreground">
+          2FA is on. If you lose your phone, each of these codes turns 2FA off once. This is the only time apm shows them.
+        </p>
+      </div>
+      <ol className="grid grid-cols-1 gap-x-6 gap-y-1.5 rounded-lg bg-background px-4 py-3 font-mono text-[15px] tabular-nums min-[420px]:grid-cols-2">
+        {codes.map((c) => (
+          <li key={c}>{c}</li>
+        ))}
+      </ol>
+      <div className="flex flex-wrap gap-2">
+        <Button variant="outline" onClick={() => void copy()}>
+          {copied ? "Copied" : "Copy codes"}
+        </Button>
+        <Button variant="outline" onClick={download}>
+          Download .txt
+        </Button>
+      </div>
+      <label className="flex items-start gap-2.5 text-[15px] leading-6">
+        <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} className="mt-1 size-4 accent-foreground" />
+        I saved these codes somewhere safe
+      </label>
+      <Button className="self-start" disabled={!saved} onClick={onDone}>
+        Done
+      </Button>
+    </div>
+  );
+}
+
+/** Sets up an authenticator app; `onEnabled` gets the recovery codes to show once. */
+function TotpSetup({ account, config, onEnabled }: { account: Account; config: AuthConfig; onEnabled: (recoveryCodes: string[]) => void }) {
+  const [step, setStep] = useState<{ kind: "idle" } | { kind: "scan"; secret: string; qr: string; codes: string[] }>({ kind: "idle" });
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // An account with a passkey proves it before adding an authenticator app.
+  const needsProof = hasFactor(account);
 
-  async function start() {
+  async function start(proof: FactorProof | null): Promise<string | null> {
     setBusy(true);
     setError(null);
-    const r = await authPost("two-factor/enable", {});
-    const uri = z.object({ totpURI: z.string() }).safeParse(r.body);
+    const r = await authPost("two-factor/enable", {}, proof);
+    const parsed = z.object({ totpURI: z.string(), backupCodes: z.array(z.string()) }).safeParse(r.body);
 
-    if (!r.ok || !uri.success) {
-      setError(r.message);
+    if (!r.ok || !parsed.success) {
       setBusy(false);
 
-      return;
+      return r.message;
     }
 
-    const secret = new URL(uri.data.totpURI).searchParams.get("secret") ?? "";
-    const qr = await QRCode.toDataURL(uri.data.totpURI, { margin: 1, width: 200 });
-    setStep({ kind: "scan", uri: uri.data.totpURI, secret, qr });
+    const secret = new URL(parsed.data.totpURI).searchParams.get("secret") ?? "";
+    const qr = await QRCode.toDataURL(parsed.data.totpURI, { margin: 1, width: 200 });
+    setStep({ kind: "scan", secret, qr, codes: parsed.data.backupCodes });
     setBusy(false);
+
+    return null;
   }
 
   async function confirm(e: React.FormEvent) {
     e.preventDefault();
+
+    if (step.kind !== "scan") return;
 
     if (!SixDigits.test(code)) return setError("Enter the 6-digit code your app shows.");
     setBusy(true);
@@ -68,14 +258,29 @@ function TotpSetup({ onDone }: { onDone: () => void }) {
     const r = await authPost("two-factor/verify-totp", { code });
     setBusy(false);
 
-    if (!r.ok) return setError("That code did not match. Check the time on your phone and try the next code.");
-    onDone();
+    if (!r.ok) return setError(r.status === 429 ? r.message : "That code did not match. Check the time on your phone and try the next code.");
+    onEnabled(step.codes);
   }
 
   if (step.kind === "idle") {
+    if (needsProof) {
+      return (
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-muted-foreground">Confirm with your passkey to add an authenticator app.</p>
+          <FactorPrompt account={account} config={config} action="Set up" busyLabel="Starting…" run={(p) => start(p)} />
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-col gap-2">
-        <Button className="self-start" onClick={() => void start()} disabled={busy}>
+        <Button
+          className="self-start"
+          onClick={() => {
+            void start(null).then((m) => m && setError(m));
+          }}
+          disabled={busy}
+        >
           {busy ? "Starting…" : "Set up an authenticator app"}
         </Button>
         {error && <p className="text-sm text-bad">{error}</p>}
@@ -103,72 +308,117 @@ function TotpSetup({ onDone }: { onDone: () => void }) {
   );
 }
 
-function StepUp({ account, config, onDone }: { account: Account; config: AuthConfig; onDone: () => void }) {
-  const [code, setCode] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const until = account.security.verifiedAt ? Date.parse(account.security.verifiedAt) + 10 * 60_000 : 0;
-  const active = until > Date.now();
-
-  async function withCode(e: React.FormEvent) {
-    e.preventDefault();
-
-    if (!SixDigits.test(code)) return setError("Enter the 6-digit code your app shows.");
-    setBusy(true);
-    setError(null);
-    const r = await call("verify", z.object({ ok: z.boolean() }), { method: "POST", body: { code } });
-    setBusy(false);
-
-    if (r.kind !== "ok") return setError(r.kind === "error" ? r.message : "Sign in again.");
-    setCode("");
-    onDone();
-  }
-
-  async function withPasskey() {
-    setBusy(true);
-    setError(null);
-    const r = await authClient().signIn.passkey();
-    setBusy(false);
-
-    if (r.error) return setError(r.error.message ?? "The passkey check did not finish.");
-    onDone();
-  }
-
-  const canTotp = account.security.totp;
-  const canPasskey = account.security.passkeys > 0 && config.passkeys;
-
-  if (!canTotp && !canPasskey) return <p className="text-sm text-muted-foreground">Set up 2FA or a passkey first.</p>;
+/** Approves one CLI command that printed a link here. The CLI can then run that command once, within 10 minutes. */
+function ConfirmCommand({ command, account, config, onDone }: { command: LiveAction; account: Account; config: AuthConfig; onDone: (message: string) => void }) {
+  const text = commandText(command);
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4 rounded-2xl border p-5 sm:p-6">
+      <div className="flex flex-col gap-1.5">
+        <h2 className="text-lg font-medium tracking-tight">Approve a command from your terminal</h2>
+        <p className="text-[15px] leading-6 text-muted-foreground">This lets your CLI run this one command, once, in the next 10 minutes. Approve only if you just ran it.</p>
+      </div>
+      <code className="rounded-lg bg-surface px-4 py-3 font-mono text-[15px] [overflow-wrap:anywhere]">{text}</code>
+      {hasFactor(account) ? (
+        <FactorPrompt
+          account={account}
+          config={config}
+          action="Approve command"
+          busyLabel="Approving…"
+          run={async (proof) => {
+            if (proof.kind === "recovery") return "Use a code from your app or your passkey for this.";
+
+            const r = await call("verify", z.object({ ok: z.boolean(), command: z.string(), until: z.string() }), {
+              method: "POST",
+              body: { command, ...(proof.kind === "totp" ? { code: proof.code } : { passkey: true }) },
+            });
+
+            if (r.kind === "ok") {
+              onDone(`Approved. Run ${r.value.command} again before ${new Date(r.value.until).toLocaleTimeString(undefined, { timeStyle: "short" })}.`);
+
+              return null;
+            }
+
+            return r.kind === "error" ? r.message : "Sign in again.";
+          }}
+        />
+      ) : (
+        <p className="text-sm text-muted-foreground">Set up 2FA or a passkey below first.</p>
+      )}
+    </div>
+  );
+}
+
+function AddPasskey({ account, config, onDone }: { account: Account; config: AuthConfig; onDone: (note: string | null) => void }) {
+  const [asking, setAsking] = useState(false);
+
+  async function add(proof: FactorProof | null): Promise<string | null> {
+    const r = await authClient().passkey.addPasskey({ name: `apm ${new Date().toLocaleDateString()}`, fetchOptions: { headers: proofHeaders(proof) } });
+
+    if (r?.error) return r.error.message ?? "The passkey was not added.";
+    setAsking(false);
+    onDone(null);
+
+    return null;
+  }
+
+  if (!config.passkeys) return <p className="text-sm text-muted-foreground">Passkeys need HTTPS. This registry is served over plain HTTP, so use an authenticator app here.</p>;
+
+  if (!hasFactor(account)) {
+    return (
+      <Button variant="outline" className="self-start" onClick={() => void add(null).then((m) => m && onDone(m))}>
+        Add a passkey
+      </Button>
+    );
+  }
+
+  if (!asking) {
+    return (
+      <Button variant="outline" className="self-start" onClick={() => setAsking(true)}>
+        Add a passkey
+      </Button>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-sm text-muted-foreground">Confirm it&apos;s you before adding another passkey.</p>
+      <FactorPrompt account={account} config={config} action="Add passkey" busyLabel="Adding…" run={(p) => add(p)} />
+    </div>
+  );
+}
+
+function TurnOffTotp({ account, config, onDone }: { account: Account; config: AuthConfig; onDone: (note: string) => void }) {
+  const [open, setOpen] = useState(false);
+
+  if (!open) {
+    return (
+      <Button variant="ghost" className="-ml-2.5 self-start text-muted-foreground" onClick={() => setOpen(true)}>
+        Turn off 2FA
+      </Button>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl bg-surface p-4">
       <p className="text-sm leading-6 text-muted-foreground">
-        Revoke, restore, incident response and owner changes need a fresh check. Confirm here, then run the command within 10 minutes, or pass <code className="font-mono">--otp</code> to it.
-        {active && <span className="text-foreground"> Confirmed until {new Date(until).toLocaleTimeString(undefined, { timeStyle: "short" })}.</span>}
+        Turning off 2FA needs your current code, a recovery code or your passkey. {account.security.passkeys === 0 && "Without 2FA or a passkey you cannot approve publishes."}
       </p>
-      <form onSubmit={(e) => void withCode(e)} className="flex flex-wrap items-center gap-2">
-        {canTotp && (
-          <>
-            <Input
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-              inputMode="numeric"
-              autoComplete="one-time-code"
-              placeholder="123456"
-              aria-label="Code from your authenticator app"
-              className="h-9 w-36 font-mono tracking-widest"
-            />
-            <Button type="submit" variant="outline" size="lg" disabled={busy}>
-              Confirm with code
-            </Button>
-          </>
-        )}
-        {canPasskey && (
-          <Button type="button" variant="outline" size="lg" disabled={busy} onClick={() => void withPasskey()}>
-            Confirm with passkey
-          </Button>
-        )}
-      </form>
-      {error && <p className="text-sm text-bad">{error}</p>}
+      <FactorPrompt
+        account={account}
+        config={config}
+        action="Turn off 2FA"
+        busyLabel="Turning off…"
+        allowRecovery
+        run={async (proof) => {
+          const r = await authPost("two-factor/disable", {}, proof);
+
+          if (!r.ok) return r.message;
+          onDone("2FA is off. Set it up again to get new recovery codes.");
+
+          return null;
+        }}
+      />
     </div>
   );
 }
@@ -176,6 +426,10 @@ function StepUp({ account, config, onDone }: { account: Account; config: AuthCon
 export function AccountView() {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [note, setNote] = useState<string | null>(null);
+  const [command, setCommand] = useState<LiveAction | null>(null);
+  const [linking, setLinking] = useState<"github" | "vercel" | null>(null);
+  // Recovery codes from a setup that just finished: shown until the person says they saved them.
+  const [recovery, setRecovery] = useState<string[] | null>(null);
 
   const load = useCallback(async () => {
     const [a, c] = await Promise.all([call("account", Account), call("auth/config", AuthConfig)]);
@@ -189,14 +443,27 @@ export function AccountView() {
   }, []);
 
   useEffect(() => {
+    setCommand(commandFromLink(window.location.search));
     void load();
   }, [load]);
 
   if (state.kind === "loading") return <div className="h-96 animate-pulse rounded-2xl bg-muted" />;
 
-  if (state.kind === "signed-out") return <SignInPanel next="/account" />;
+  if (state.kind === "signed-out") return <SignInPanel next={`/account${typeof window === "undefined" ? "" : window.location.search}`} />;
 
-  if (state.kind === "error") return <p className="text-bad">{state.message}</p>;
+  if (state.kind === "error") {
+    return (
+      <div className="flex max-w-xl flex-col items-start gap-3">
+        <p role="alert" className="text-bad">
+          {state.message}
+        </p>
+        <Button variant="outline" onClick={() => void load()}>
+          Try again
+        </Button>
+      </div>
+    );
+  }
+
   const { account: a, config } = state;
 
   async function revoke(id: string) {
@@ -205,12 +472,8 @@ export function AccountView() {
     await load();
   }
 
-  async function addPasskey() {
-    setNote(null);
-    const r = await authClient().passkey.addPasskey({ name: `apm ${new Date().toLocaleDateString()}` });
-
-    if (r?.error) setNote(r.error.message ?? "The passkey was not added.");
-    await load();
+  async function link(p: "github" | "vercel", proof: FactorProof | null): Promise<string | null> {
+    return linkProvider(p, "/account", proof);
   }
 
   async function signOut() {
@@ -246,24 +509,54 @@ export function AccountView() {
         </p>
       )}
 
+      {command && (
+        <ConfirmCommand
+          command={command}
+          account={a}
+          config={config}
+          onDone={(message) => {
+            setNote(message);
+            setCommand(null);
+            window.history.replaceState(null, "", "/account");
+          }}
+        />
+      )}
+
       <Section title="Your scope">
         {a.scope ? (
-          <p className="text-[15px] leading-7 text-muted-foreground">
-            New packages you publish are named <code className="font-mono text-foreground">@{a.scope}/&lt;name&gt;</code>. Your scope is your GitHub login
-            {a.github && a.github !== a.scope ? ` (${a.github})` : ""}.{" "}
-            <Link href="/publish" className="text-foreground underline underline-offset-4">
-              Publish a package
-            </Link>
-          </p>
+          <div className="flex flex-col gap-3">
+            <p className="text-[15px] leading-7 text-muted-foreground">
+              New packages you publish are named <code className="font-mono text-foreground">@{a.scope}/&lt;name&gt;</code>.{" "}
+              {a.githubRenamed ? null : "Your scope is your GitHub login. "}
+              <Link href="/publish" className="text-foreground underline underline-offset-4">
+                Publish a package
+              </Link>
+            </p>
+            {a.githubRenamed && a.github && (
+              <p className="rounded-xl bg-surface px-4 py-3 text-[15px] leading-7 text-muted-foreground">
+                Your GitHub login is now <code className="font-mono text-foreground">{a.github}</code>. Your scope stays <code className="font-mono text-foreground">@{a.scope}</code>: a scope is
+                permanent once claimed, and a GitHub rename does not move or free it. To move your packages to <code className="font-mono text-foreground">@{a.github.toLowerCase()}</code>,{" "}
+                <a href={NAME_DISPUTE_URL} className="text-foreground underline underline-offset-4">
+                  open a name dispute
+                </a>
+                .
+              </p>
+            )}
+          </div>
         ) : a.scopeTaken ? (
           <p className="text-[15px] leading-7 text-muted-foreground">
-            Your GitHub login, <code className="font-mono text-foreground">{a.scopeTaken}</code>, is already the name of an older apm account, so it is not yours to publish under yet. Open a name dispute on GitHub (opencoredev/apmjs) and we will sort it out.
+            Your GitHub login, <code className="font-mono text-foreground">{a.scopeTaken}</code>, is already someone&apos;s apm scope. Scopes are permanent once claimed, even after a GitHub rename, so
+            it is not yours to publish under.{" "}
+            <a href={NAME_DISPUTE_URL} className="text-foreground underline underline-offset-4">
+              Open a name dispute
+            </a>{" "}
+            if it should be.
           </p>
         ) : (
           <div className="flex flex-col gap-3">
             <p className="text-[15px] leading-7 text-muted-foreground">You have no scope yet. Your scope is your GitHub login, so link GitHub before you publish.</p>
             {config.providers.github && (
-              <Button className="self-start" onClick={() => void linkProvider("github", "/account").then((m) => m && setNote(m))}>
+              <Button className="self-start" onClick={() => (hasFactor(a) ? setLinking("github") : void link("github", null).then((m) => m && setNote(m)))}>
                 Link GitHub
               </Button>
             )}
@@ -278,24 +571,48 @@ export function AccountView() {
               <span className="text-[15px] font-medium">Authenticator app (2FA)</span>
               <Status on={a.security.totp}>{a.security.totp ? "On" : "Off"}</Status>
             </div>
-            {!a.security.totp && <TotpSetup onDone={() => void load()} />}
+            {recovery !== null ? (
+              <RecoveryCodes codes={recovery} onDone={() => setRecovery(null)} />
+            ) : a.security.totp ? (
+              <TurnOffTotp
+                account={a}
+                config={config}
+                onDone={(m) => {
+                  setNote(m);
+                  void load();
+                }}
+              />
+            ) : (
+              <TotpSetup
+                account={a}
+                config={config}
+                onEnabled={(codes) => {
+                  setRecovery(codes);
+                  void load();
+                }}
+              />
+            )}
           </div>
           <div className="flex flex-col gap-3">
             <div className="flex items-center gap-3">
               <span className="text-[15px] font-medium">Passkeys</span>
               <Status on={a.security.passkeys > 0}>{a.security.passkeys === 0 ? "None" : `${a.security.passkeys} set up`}</Status>
             </div>
-            {config.passkeys ? (
-              <Button variant="outline" className="self-start" onClick={() => void addPasskey()}>
-                Add a passkey
-              </Button>
-            ) : (
-              <p className="text-sm text-muted-foreground">Passkeys need HTTPS. This registry is served over plain HTTP, so use an authenticator app here.</p>
-            )}
+            <AddPasskey
+              account={a}
+              config={config}
+              onDone={(m) => {
+                setNote(m);
+                void load();
+              }}
+            />
           </div>
-          <div className="flex flex-col gap-3">
-            <span className="text-[15px] font-medium">Confirm it&apos;s you</span>
-            <StepUp account={a} config={config} onDone={() => void load()} />
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[15px] font-medium">Commands from your terminal</span>
+            <p className="text-sm leading-6 text-muted-foreground">
+              Revoke, restore, incident response and owner changes ask for <code className="font-mono">--otp</code>. Without it, the command prints a link to this page that approves that one command,
+              once.
+            </p>
           </div>
         </div>
       </Section>
@@ -309,13 +626,19 @@ export function AccountView() {
             </li>
           ))}
         </ul>
-        {linkable.length > 0 && (
+        {linkable.length > 0 && linking === null && (
           <div className="flex flex-wrap gap-2">
             {linkable.map((p) => (
-              <Button key={p} variant="outline" onClick={() => void linkProvider(p, "/account").then((m) => m && setNote(m))}>
+              <Button key={p} variant="outline" onClick={() => (hasFactor(a) ? setLinking(p) : void link(p, null).then((m) => m && setNote(m)))}>
                 Link {PROVIDER_LABEL[p]}
               </Button>
             ))}
+          </div>
+        )}
+        {linking !== null && (
+          <div className="flex flex-col gap-2">
+            <p className="text-sm text-muted-foreground">Confirm it&apos;s you before linking {PROVIDER_LABEL[linking]}: it becomes another way to sign in.</p>
+            <FactorPrompt account={a} config={config} action={`Link ${PROVIDER_LABEL[linking]}`} busyLabel="Opening…" run={(p) => link(linking, p)} />
           </div>
         )}
       </Section>

@@ -29,6 +29,8 @@ export type StartOptions = {
   namePolicy?: NamePolicy;
   /** OAuth apps and the signing secret. Without a secret, one is generated once and kept in the data dir. */
   auth?: Partial<AuthOptions>;
+  /** The clock authenticator codes are checked against. Wall-clock time unless a test passes its own. */
+  totpNow?: () => number;
 };
 
 export type StartedRegistry = {
@@ -67,6 +69,7 @@ export async function startRegistry(opts: StartOptions): Promise<StartedRegistry
   const auth = await createAuth({
     store,
     now,
+    totpNow: opts.totpNow ?? Date.now,
     baseURL: web,
     options: {
       secret: opts.auth?.secret ?? persistentSecret(opts.dataDir),

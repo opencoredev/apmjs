@@ -90,11 +90,6 @@ CREATE TABLE IF NOT EXISTS staged (
   decided_by TEXT
 );
 CREATE INDEX IF NOT EXISTS staged_pkg ON staged(package, version);
-CREATE TABLE IF NOT EXISTS stepups (
-  auth_user_id TEXT PRIMARY KEY,
-  at INTEGER NOT NULL,
-  method TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS github_profiles (
   github_id TEXT PRIMARY KEY,
   login TEXT NOT NULL,
@@ -266,6 +261,10 @@ export class Store {
     this.db.query("UPDATE users SET auth_user_id = ?, github_id = ?, github_login = ? WHERE name = ?").run(link.authUserId, link.githubId, link.githubLogin, name);
   }
 
+  /** The GitHub login shown for a name, refreshed after a GitHub rename. The name itself never changes. */
+  setGitHubLogin(name: string, login: string): void {
+    this.db.query("UPDATE users SET github_login = ? WHERE name = ?").run(login, name);
+  }
   // GitHub logins seen at sign-in, by GitHub's numeric id
   setGitHubProfile(githubId: string, login: string, at: number): void {
     this.db.query("INSERT OR REPLACE INTO github_profiles (github_id, login, updated_at) VALUES (?, ?, ?)").run(githubId, login, at);
@@ -273,15 +272,6 @@ export class Store {
   gitHubLogin(githubId: string): string | null {
     const row = this.db.query("SELECT login FROM github_profiles WHERE github_id = ?").get(githubId);
     return row ? z.object({ login: z.string() }).parse(row).login : null;
-  }
-
-  // step-up: the last time an account proved a second factor
-  setStepup(authUserId: string, at: number, method: string): void {
-    this.db.query("INSERT OR REPLACE INTO stepups (auth_user_id, at, method) VALUES (?, ?, ?)").run(authUserId, at, method);
-  }
-  stepupAt(authUserId: string): number | null {
-    const row = this.db.query("SELECT at FROM stepups WHERE auth_user_id = ?").get(authUserId);
-    return row ? z.object({ at: z.number() }).parse(row).at : null;
   }
 
   // staged versions: uploaded with a login token, waiting for a person to approve

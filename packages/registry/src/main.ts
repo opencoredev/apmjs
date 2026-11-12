@@ -1,6 +1,14 @@
 import { startRegistry } from "./index.ts";
+import { legacyAuthRefusal } from "./startup.ts";
 
 const env = process.env;
+const refusal = legacyAuthRefusal(env);
+
+if (refusal !== null) {
+  process.stderr.write(`apm registry refused to start: ${refusal}\n`);
+  process.exit(1);
+}
+
 const port = Number(env.APM_PORT ?? 4873);
 const dataDir = env.APM_DATA_DIR ?? ".data";
 const upstream = env.APM_UPSTREAM ?? "https://registry.npmjs.org/";
