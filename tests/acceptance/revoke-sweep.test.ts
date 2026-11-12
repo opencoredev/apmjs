@@ -615,6 +615,9 @@ describe("a revoked or revoke-pending version's text", () => {
     expect(show(hits.filter((h) => h.where.startsWith("header:")))).toEqual([]);
     const seen = new Set(hits.filter((h) => h.where !== "tarball").map((h) => h.marker));
 
+    // the version answer shows the deprecation message while the version is active, so the sweep would see it kept
+    expect(hits.some((h) => h.route === "versions" && h.where === "deprecated" && h.marker === "LEAKMARK-deprecation")).toBe(true);
+
     // the dependent's walk reaches a marked version while it is shown, so the sweep would see it keep doing so
     expect(hits.some((h) => h.url.includes(`resolve?name=${DEPENDENT}`) && h.where.startsWith("tree."))).toBe(true);
 
@@ -825,7 +828,7 @@ describe("after the revoke, each answer keeps what was found", () => {
     expect(dig(resolve.body, "newest", "report", "skipped")).toEqual(want);
   });
 
-  test("the version answer: a withheld version's license and not-checked list are the score answer's, and no cache keeps it", async () => {
+  test("the version answer: a withheld version's license and not-checked list are the score answer's, its deprecation is null, and no cache keeps it", async () => {
     for (const version of [PENDING, REVOKED]) {
       const res = await fetch(`${reg.url}-/apm/v1/packages/${NAME}/versions/${version}`);
       const body: unknown = await res.json();
@@ -836,6 +839,8 @@ describe("after the revoke, each answer keeps what was found", () => {
       expect(dig(body, "score", "redacted")).toBe(true);
       expect(dig(body, "facts")).toEqual(dig(score.body, "facts"));
       expect(dig(body, "facts", "license")).toBeNull();
+      // the publisher's deprecation message is withheld with the version, as in the package answer's version list
+      expect(dig(body, "deprecated")).toBeNull();
       expect(dig(body, "score", "notChecked")).toEqual(dig(score.body, "notChecked"));
       expect(dig(body, "score", "notChecked")).toContain("dependency dep-url: tarball URL: installs code from outside any registry");
     }

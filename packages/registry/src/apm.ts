@@ -1025,7 +1025,8 @@ const versionResponse = (name: string, version: string) =>
         source: src.kind,
         status: v.status,
         statusReason: v.status_reason,
-        deprecated: v.deprecated,
+        // the publisher's text: a withheld version's is not shown, as in the package answer's version list (withheld.ts)
+        deprecated: isWithheld(v.status) ? null : v.deprecated,
         publishedAt: new Date(v.published_at).toISOString(),
         publishedBy: v.published_by,
         facts: free?.facts ?? null,
