@@ -5,7 +5,7 @@ import { join, dirname, resolve, sep } from "node:path";
 import { z } from "zod";
 import { editDistance, isValidTagName, isValidVersion } from "@apm/core";
 import type { LiveAction } from "./actions.ts";
-import type { Store, VersionRecord, PackageRecord } from "./db.ts";
+import type { StagedLoad, Store, VersionRecord, PackageRecord } from "./db.ts";
 import { checkPassword, LOCKED_MESSAGE } from "./passwords.ts";
 
 export type NamePolicy = "scoped" | "open";
@@ -65,6 +65,10 @@ export const MAX_STAGED_BYTES_PER_USER = 256 * 1024 * 1024;
 
 /** Versions of one package that may wait for approval at once. */
 export const MAX_STAGED_PER_PACKAGE = 5;
+
+/** The most readme and manifest text one version may store (npm's own readme cap is far lower in practice). */
+export const MAX_README_BYTES = 1024 * 1024;
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 // ---------- responses ----------
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
@@ -387,6 +391,11 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   if (existing && ctx.store.getVersion(name, version)) {
     return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
   }
+  const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
+
+  if (readme !== null && Buffer.byteLength(readme, "utf8") > MAX_README_BYTES) return fail(413, `The readme is over ${MAX_README_BYTES / (1024 * 1024)} MB. Shorten it or link to longer docs.`);
+
+  if (Buffer.byteLength(JSON.stringify(manifest), "utf8") > MAX_MANIFEST_BYTES) return fail(413, `package.json is over ${MAX_MANIFEST_BYTES / (1024 * 1024)} MB.`);
 
   const staged = TOKEN_CAPABILITIES[auth.scope].publish === "staged";
 
@@ -416,7 +425,6 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   const cleanManifest: Record<string, unknown> = { ...storedManifest };
   for (const k of ["_id", "dist", "_npmUser", "_attachments", "readme", "_resolved", "_integrity", "_from"]) delete cleanManifest[k];
   const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
-  const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
   const shasum = createHash("sha1").update(tarball).digest("hex");
   const integrity = integrityOf(tarball);
   // header-safe: a tar path may hold control characters
@@ -428,21 +436,17 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
     const path = stagedTarballPath(ctx, id);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, tarball);
-    ctx.store.insertStaged({
-      id,
-      package: name,
-      version,
-      manifest: cleanManifest,
-      shasum,
-      integrity,
-      size: tarball.length,
-      tag,
-      readme,
-      score,
-      staged_by: auth.user,
-      staged_at: at,
-      expires_at: at + STAGE_TTL_MS,
-    });
+    // the checks above ran before the analysis awaited; these run again atomically with the insert
+    const stored = ctx.store.insertStagedWithin(
+      { id, package: name, version, manifest: cleanManifest, shasum, integrity, size: tarball.length, tag, readme, score, staged_by: auth.user, staged_at: at, expires_at: at + STAGE_TTL_MS },
+      { perUser: MAX_STAGED_PER_USER, perPackage: MAX_STAGED_PER_PACKAGE, bytesPerUser: MAX_STAGED_BYTES_PER_USER },
+    );
+
+    if (stored.kind !== "staged") {
+      rmSync(path, { force: true });
+
+      return stored.kind === "duplicate" ? fail(409, `${name}@${version} is already waiting for approval: ${approvalUrl(ctx, stored.id)}`) : fail(429, quotaMessage(ctx, { name, quota: stored.quota, load: stored.load }));
+    }
     const link = approvalUrl(ctx, id);
     const expiresAt = new Date(at + STAGE_TTL_MS).toISOString();
     // bun prints this header as "note: ...", npm as "npm notice ...": that is how the link reaches a person.
@@ -455,18 +459,35 @@ async function handlePublish(req: Request, ctx: Ctx, name: string, auth: Auth, e
   return json({ ok: true, id: name, rev: `${ctx.now()}`, success: true, score, warnings }, 201, warningText ? { "npm-notice": warningText } : {});
 }
 
-/** Why one more staged upload of `size` bytes would go over a quota, or null. */
+/** Why one more staged upload of `size` tarball bytes would go over a quota, or null. A fast check before the analysis. */
 function stageQuotaRefusal(ctx: Ctx, input: { user: string; name: string; size: number }): string | null {
   const load = ctx.store.pendingStagedLoad({ user: input.user, name: input.name, now: ctx.now() });
-  const where = `Approve or reject them at ${ctx.access.webUrl()}publish, or wait for them to expire (24h).`;
 
-  if (load.byPackage >= MAX_STAGED_PER_PACKAGE) return `${input.name} already has ${load.byPackage} versions waiting for approval, the most one package may have. ${where}`;
+  if (load.byPackage >= MAX_STAGED_PER_PACKAGE) return quotaMessage(ctx, { name: input.name, quota: "package", load });
 
-  if (load.byUser >= MAX_STAGED_PER_USER) return `You already have ${load.byUser} versions waiting for approval, the most one account may have. ${where}`;
+  if (load.byUser >= MAX_STAGED_PER_USER) return quotaMessage(ctx, { name: input.name, quota: "user", load });
 
-  if (load.bytesByUser + input.size > MAX_STAGED_BYTES_PER_USER) return `Your versions waiting for approval would take more than ${MAX_STAGED_BYTES_PER_USER / (1024 * 1024)} MB. ${where}`;
+  if (load.bytesByUser + input.size > MAX_STAGED_BYTES_PER_USER) return quotaMessage(ctx, { name: input.name, quota: "bytes", load });
 
   return null;
+}
+
+function quotaMessage(ctx: Ctx, input: { name: string; quota: "package" | "user" | "bytes"; load: StagedLoad }): string {
+  const where = `Approve or reject them at ${ctx.access.webUrl()}publish, or wait for them to expire (24h).`;
+
+  switch (input.quota) {
+    case "package":
+      return `${input.name} already has ${input.load.byPackage} versions waiting for approval, the most one package may have. ${where}`;
+    case "user":
+      return `You already have ${input.load.byUser} versions waiting for approval, the most one account may have. ${where}`;
+    case "bytes":
+      return `Your versions waiting for approval would take more than ${MAX_STAGED_BYTES_PER_USER / (1024 * 1024)} MB. ${where}`;
+    default: {
+      const _exhaustive: never = input.quota;
+
+      return _exhaustive;
+    }
+  }
 }
 
 export function approvalUrl(ctx: Ctx, id: string): string {

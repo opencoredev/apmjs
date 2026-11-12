@@ -183,6 +183,22 @@ export type StagedStatus = "pending" | "approved" | "rejected" | "expired";
 
 /** What is waiting for approval: versions and bytes one user staged, and versions waiting for one package. */
 export type StagedLoad = { byUser: number; bytesByUser: number; byPackage: number };
+
+/** Most versions waiting per account and per package, and most bytes (tarballs plus metadata) per account. */
+export type StageLimits = { perUser: number; perPackage: number; bytesPerUser: number };
+
+/** How an atomic staged insert went: stored, already waiting for this name@version, or over a quota. */
+export type StageInsert = { kind: "staged" } | { kind: "duplicate"; id: string } | { kind: "over"; quota: "package" | "user" | "bytes"; load: StagedLoad };
+
+// Bytes a staged row holds: the tarball plus the metadata kept in the database (manifest, readme, score).
+const STAGED_BYTES = "size + length(CAST(manifest AS BLOB)) + COALESCE(length(CAST(readme AS BLOB)), 0) + COALESCE(length(CAST(score AS BLOB)), 0)";
+
+/** What a staged upload charges against the byte quota, computed the way the database counts it. */
+export function stagedBytes(s: Pick<NewStaged, "size" | "manifest" | "readme" | "score">): number {
+  const bytes = (t: string): number => Buffer.byteLength(t, "utf8");
+
+  return s.size + bytes(JSON.stringify(s.manifest)) + (s.readme === null ? 0 : bytes(s.readme)) + (s.score === null ? 0 : bytes(JSON.stringify(s.score)));
+}
 const StagedRow = z.object({
   id: z.string(),
   package: z.string(),
@@ -244,6 +260,8 @@ export class Store {
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS users_auth_user ON users(auth_user_id) WHERE auth_user_id IS NOT NULL");
     // Tokens from npm's password login predate sign-in; mark them so they lose direct publish when legacy auth is off.
     this.db.exec("UPDATE tokens SET scope = 'legacy' WHERE scope = 'publish' AND label = 'cli login'");
+    // Uploads rejected or expired before payloads were purged on decision: keep only their audit fields.
+    this.db.exec("UPDATE staged SET manifest = '{}', readme = NULL, score = NULL WHERE status IN ('rejected', 'expired') AND (manifest != '{}' OR readme IS NOT NULL OR score IS NOT NULL)");
   }
 
   close(): void {
@@ -298,6 +316,30 @@ export class Store {
     const r = StagedRow.parse(row);
     return { ...r, manifest: JsonObject.parse(parseJson(r.manifest)), score: r.score ? parseJson(r.score) : null };
   }
+  /**
+   * Stores a staged upload only if nothing else waits for the same name@version and the quotas still allow
+   * it, all in one write transaction: two concurrent uploads cannot both pass the checks.
+   */
+  insertStagedWithin(s: NewStaged, limits: StageLimits): StageInsert {
+    return this.db
+      .transaction((): StageInsert => {
+        const now = s.staged_at;
+        const waiting = this.db.query("SELECT id FROM staged WHERE package = ? AND version = ? AND status = 'pending' AND expires_at > ? LIMIT 1").get(s.package, s.version, now);
+
+        if (waiting) return { kind: "duplicate", id: z.object({ id: z.string() }).parse(waiting).id };
+        const load = this.pendingStagedLoad({ user: s.staged_by, name: s.package, now });
+
+        if (load.byPackage >= limits.perPackage) return { kind: "over", quota: "package", load };
+
+        if (load.byUser >= limits.perUser) return { kind: "over", quota: "user", load };
+
+        if (load.bytesByUser + stagedBytes(s) > limits.bytesPerUser) return { kind: "over", quota: "bytes", load };
+        this.insertStaged(s);
+
+        return { kind: "staged" };
+      })
+      .immediate();
+  }
   insertStaged(s: NewStaged): void {
     this.db
       .query(
@@ -322,24 +364,34 @@ export class Store {
       .all(user, user)
       .map((r) => this.toStaged(r));
   }
+  /** Records a decision. A rejected upload keeps only its audit fields: the manifest, readme and score go. */
   decideStaged(id: string, d: { status: Exclude<StagedStatus, "pending">; at: number; by: string }): void {
-    this.db.query("UPDATE staged SET status = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(d.status, d.at, d.by, id);
+    const purge = d.status === "rejected" || d.status === "expired" ? ", manifest = '{}', readme = NULL, score = NULL" : "";
+
+    this.db.query(`UPDATE staged SET status = ?, decided_at = ?, decided_by = ?${purge} WHERE id = ? AND status = 'pending'`).run(d.status, d.at, d.by, id);
   }
-  /** Versions still waiting for approval (not expired at `now`): how many and how many bytes `user` staged, and how many wait for `name`. */
+  /**
+   * Versions still waiting for approval (not expired at `now`): how many and how many bytes `user` staged, and
+   * how many wait for `name`. Bytes count the tarball and the metadata the row keeps.
+   */
   pendingStagedLoad(input: { user: string; name: string; now: number }): StagedLoad {
     const Load = z.object({ n: z.number(), bytes: z.number().nullable() });
-    const mine = Load.parse(this.db.query("SELECT COUNT(*) AS n, SUM(size) AS bytes FROM staged WHERE status = 'pending' AND expires_at > ? AND staged_by = ?").get(input.now, input.user));
+    const mine = Load.parse(this.db.query(`SELECT COUNT(*) AS n, SUM(${STAGED_BYTES}) AS bytes FROM staged WHERE status = 'pending' AND expires_at > ? AND staged_by = ?`).get(input.now, input.user));
     const pkg = Load.parse(this.db.query("SELECT COUNT(*) AS n, NULL AS bytes FROM staged WHERE status = 'pending' AND expires_at > ? AND package = ?").get(input.now, input.name));
 
     return { byUser: mine.n, bytesByUser: mine.bytes ?? 0, byPackage: pkg.n };
   }
-  /** Marks pending versions past their deadline as expired; returns their ids. */
+  /** Marks pending versions past their deadline as expired and drops their manifest, readme and score; returns their ids. */
   expireStaged(now: number): string[] {
     const ids = this.db
       .query("SELECT id FROM staged WHERE status = 'pending' AND expires_at <= ?")
       .all(now)
       .map((r) => z.object({ id: z.string() }).parse(r).id);
-    if (ids.length > 0) this.db.query("UPDATE staged SET status = 'expired', decided_at = ?, decided_by = 'registry' WHERE status = 'pending' AND expires_at <= ?").run(now, now);
+    if (ids.length > 0) {
+      this.db
+        .query("UPDATE staged SET status = 'expired', decided_at = ?, decided_by = 'registry', manifest = '{}', readme = NULL, score = NULL WHERE status = 'pending' AND expires_at <= ?")
+        .run(now, now);
+    }
     return ids;
   }
 
