@@ -5,6 +5,7 @@ import { encodeName, fileApiPath, REGISTRY } from "./registry-url";
 import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
+import { RepositoryField } from "./repository";
 
 export type { Fetched } from "./registry-fetch";
 
@@ -31,6 +32,8 @@ const PackageInfo = z.object({
   source: z.enum(["local", "upstream"]),
   description: z.string(),
   readme: z.string(),
+  // added after apm-score-v5; an older registry leaves it out
+  repository: RepositoryField.nullish(),
   distTags: z.record(z.string(), z.string()),
   maintainers: z.array(z.string()),
   latest: z.string().nullable(),

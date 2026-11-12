@@ -755,6 +755,20 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
     });
   });
 
+// npm accepts "repository" as a string ("github:owner/repo", a git URL) or { url, directory }. The website
+// resolves a readme's relative links and images against it.
+const Repository = z.union([
+  z.string().transform((url) => ({ url, directory: null })),
+  z.object({ url: z.string(), directory: z.string().optional() }).transform((r) => ({ url: r.url, directory: r.directory ?? null })),
+]);
+
+/** The repository the latest version's manifest names, or null when it names none apm can read. */
+const repositoryOf = (v: VersionRecord | null): { url: string; directory: string | null } | null => {
+  const parsed = Repository.safeParse(v?.manifest.repository);
+
+  return parsed.success ? parsed.data : null;
+};
+
 const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -773,6 +787,7 @@ const packageResponse = (name: string) =>
       description: local?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
       keywords: local?.keywords ?? [],
       readme: local?.readme ?? (src.kind === "upstream" ? src.pkg.readme : ""),
+      repository: repositoryOf(latest0),
       distTags: src.distTags,
       maintainers: src.kind === "local" ? yield* store.owners(name) : src.pkg.maintainers,
       createdAt: local ? new Date(local.created_at).toISOString() : null,

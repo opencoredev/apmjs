@@ -16,6 +16,10 @@ import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { REGISTRY } from "@/lib/registry-url";
+import { cutReadme, EXTERNAL_REL, renderReadme } from "@/lib/readme";
+import { githubRepo } from "@/lib/repository";
+import { ReadmeView } from "@/components/readme-view";
+import { scoreLine, scoreLineText } from "@/lib/score-summary";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -212,19 +216,63 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
   );
 }
 
+/** The readme, collapsed: rendered from sanitized Markdown, with its source one tab away. Long readmes show
+ * their first README_PREVIEW_CHARS characters, cut at a block boundary, and link to the full text. */
+function ReadmeSection({ name, readme, repository }: { name: string; readme: string; repository: PackageInfo["repository"] }) {
+  const shown = cutReadme(readme, README_PREVIEW_CHARS);
+  const repo = githubRepo(repository);
+
+  const note = repo ? (
+    <a href={`https://github.com/${repo.owner}/${repo.repo}`} rel={EXTERNAL_REL} className="font-mono text-[13px] underline-offset-4 hover:text-foreground hover:underline">
+      github.com/{repo.owner}/{repo.repo}
+    </a>
+  ) : null;
+
+  return (
+    <details className="group rounded-xl border">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-[15px] select-none hover:bg-surface/60 [&::-webkit-details-marker]:hidden">
+        <span>
+          {readme.length > 600 ? "Show readme" : "Readme"} <span className="font-mono text-sm text-muted-foreground">{Math.ceil(readme.length / 1024)} kB</span>
+        </span>
+        <ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden />
+      </summary>
+      <ReadmeView rendered={renderReadme(shown, repo)} source={shown} note={note} />
+      {shown.length < readme.length && (
+        <p className="border-t px-4 py-3 text-sm text-muted-foreground">
+          Showing the first {Math.ceil(shown.length / 1024)} of {Math.ceil(readme.length / 1024)} kB.{" "}
+          <a href={`/api/readme?name=${encodeURIComponent(name)}`} className="text-foreground underline underline-offset-4">
+            Open the full readme
+          </a>
+        </p>
+      )}
+    </details>
+  );
+}
+
 /** The one line a phone shows beside the compact score: what kind of number it is and what it leaves out. */
 const SCORE_QUALIFIER = "Heuristic score; runtime behavior and dependency code not checked.";
 
-/** Phones only: the score in one line near the top, with its qualifier, linking down to the full report. */
+/** Phones only: the score in one line near the top, naming the signal that cost the most, linking down to the full report. */
 function ScoreSummary({ score, className }: { score: PackageInfo["score"]; className?: string }) {
-  const lost = score ? score.signals.filter((s) => s.points < 0) : [];
+  const line = scoreLine(score ? score.signals : null);
 
   return (
     <a href="#score" className={`flex min-h-12 items-center gap-3 rounded-xl border px-4 py-2.5 transition-colors hover:bg-surface/60 ${className ?? ""}`}>
       <ScoreBadge score={score?.score} grade={score?.grade} />
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="text-[15px] text-pretty">
-          {score === null ? "Not scored yet" : lost.length === 0 ? "No points lost" : `${lost.length} signal${lost.length === 1 ? "" : "s"}, ${lost.reduce((n, s) => n - s.points, 0)} points lost`}
+        <span className="text-[15px] leading-6 text-pretty">
+          {line.kind === "lost" ? (
+            <>
+              <span>{line.name}</span>
+              <span className="text-muted-foreground"> · </span>
+              <span className={`whitespace-nowrap tabular-nums ${line.possible ? "text-muted-foreground" : line.points >= 20 ? "text-bad" : "text-warn"}`}>
+                −{line.points} point{line.points === 1 ? "" : "s"}
+              </span>
+              {line.more > 0 && <span className="whitespace-nowrap text-muted-foreground"> +{line.more} more</span>}
+            </>
+          ) : (
+            scoreLineText(line)
+          )}
         </span>
         {score !== null && <span className="text-[13px] leading-5 text-pretty text-muted-foreground">{SCORE_QUALIFIER}</span>}
       </span>
@@ -399,23 +447,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
           {pkg.readme && (
             <section aria-labelledby="readme" className="order-6 lg:order-none">
               <SectionTitle id="readme">Readme</SectionTitle>
-              <details className="group rounded-xl border">
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-[15px] select-none hover:bg-surface/60 [&::-webkit-details-marker]:hidden">
-                  <span>
-                    {pkg.readme.length > 600 ? "Show readme" : "Readme"} <span className="font-mono text-sm text-muted-foreground">{Math.ceil(pkg.readme.length / 1024)} kB</span>
-                  </span>
-                  <ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden />
-                </summary>
-                <pre className="overflow-x-auto border-t bg-surface p-4 font-mono text-[13px] leading-relaxed whitespace-pre-wrap">{pkg.readme.slice(0, README_PREVIEW_CHARS)}</pre>
-                {pkg.readme.length > README_PREVIEW_CHARS && (
-                  <p className="border-t px-4 py-3 text-sm text-muted-foreground">
-                    Showing the first {Math.round(README_PREVIEW_CHARS / 1000)} kB.{" "}
-                    <a href={`/api/readme?name=${encodeURIComponent(pkg.name)}`} className="text-foreground underline underline-offset-4">
-                      Open the full readme
-                    </a>
-                  </p>
-                )}
-              </details>
+              <ReadmeSection name={pkg.name} readme={pkg.readme} repository={pkg.repository} />
             </section>
           )}
 

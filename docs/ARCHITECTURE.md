@@ -84,6 +84,8 @@ Better Auth handles OAuth, sessions, TOTP enrolment, passkeys and the device flo
 
 The website is Next.js 16 with shadcn, built by OpenNext through Alchemy's `Website.Nextjs`. `proxy.ts` forwards `/api/auth/*` and `/-/apm/v1/*` to the registry so the session cookie lives on the website's origin, and server components read the registry for package pages and search. Both go through `lib/registry-transport.ts`: inside the Worker that is the `REGISTRY` service binding, because Workers on one account can't fetch each other's public URLs and a binding skips the network hop; under `next dev` it is plain HTTP to `APM_REGISTRY`.
 
+A package's readme is publisher-written, so `lib/readme.ts` renders it on the server through unified (remark-gfm, rehype-raw, rehype-sanitize with GitHub's allow-list) into React elements, never inner HTML. Relative links and images resolve into the package's GitHub repository (the `repository` field of the package answer) or are dropped, images load over https only, external links get `rel="nofollow noopener noreferrer ugc"`, and every id is prefixed with `user-content-`.
+
 ## How `apm add` makes the package manager install what apm checked
 
 `apm add` asks the registry to resolve and score a package, then runs your package manager (bun, npm, pnpm or yarn) to install the exact version. The check only means something if the package manager then installs the same bytes from the same registry, for the package and for everything under it. Two things can break that:
