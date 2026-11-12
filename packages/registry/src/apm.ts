@@ -657,8 +657,12 @@ async function resolveResponse(env: Env, url: URL): Promise<Response> {
   const src = await lookup(env, name);
   if (!src) return fail(404, `No package named ${name}.`);
   const tagged = src.distTags[range];
+  // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
+  // below it, but a stable tag never falls back to a prerelease.
+  const base = (v: string): string => v.split("-")[0] ?? v;
+  const inChannel = (v: string, t: string): boolean => Bun.semver.order(v, t) <= 0 && (!v.includes("-") || (t.includes("-") && base(v) === base(t)));
   const matches = src.versions
-    .filter((v) => (tagged ? Bun.semver.order(v.version, tagged) <= 0 && !v.version.includes("-") : v.version === range || Bun.semver.satisfies(v.version, range)))
+    .filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || Bun.semver.satisfies(v.version, range)))
     .sort((a, b) => Bun.semver.order(b.version, a.version));
   const skipped: { version: string; reason: string }[] = [];
   let analyzedCount = 0;

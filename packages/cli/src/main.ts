@@ -143,7 +143,8 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
   const params = new URLSearchParams({ name, range: range ?? "latest" });
-  if (has(a, "no-cooldown")) params.set("cooldown", "0");
+  // --force overrides the score floor and the cooldown; revoked and yanked versions stay blocked
+  if (has(a, "no-cooldown") || force) params.set("cooldown", "0");
   else if (flag(a, "cooldown")) params.set("cooldown", flag(a, "cooldown") ?? "24h");
   if (force) params.set("floor", "0");
   else if (flag(a, "floor")) params.set("floor", flag(a, "floor") ?? "40");
