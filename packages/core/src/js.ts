@@ -1,7 +1,9 @@
 // Reads a parsed JavaScript or TypeScript program: what it calls, loads, reads and evaluates, and what each string
 // it holds is for. A string's role comes from where the code uses it: a module specifier loads a module, text passed
 // to eval, Function or vm runs as code, a command passed to exec or spawn runs as a shell command, a path passed to a
-// read is read, and a URL or request body is sent. Each role confirms only what fits it. Pure; nothing is run.
+// read is read, and a URL or request body is sent. Each role confirms only what fits it. What the tree reads only
+// adds to the floor (apm-score-v3's text rules over the program's code), and never removes from it. Pure; nothing
+// is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
 import type { Region } from "./lexer.ts";
@@ -66,29 +68,16 @@ interface TsEnumDeclaration extends Node {
   id: Identifier;
 }
 
-declare module "acorn" {
-  interface NodeTypes {
-    apm: TsExpression | TsImportEquals | TsExternalModuleReference | TsParameterProperty | JsxText | TsModuleDeclaration | TsEnumDeclaration;
-  }
+/** A class method's overload signature (`fetch(u: string): Promise<R>;`): Babel's value for a method with no body. */
+interface TsEmptyBody extends Node {
+  type: "TSEmptyBodyFunctionExpression";
 }
 
-/** The TypeScript nodes that run: casts and assertions wrap an expression, enums and namespaces make objects, `import x = require()` loads. */
-const RUNTIME_TS: ReadonlySet<string> = new Set([
-  "TSAsExpression",
-  "TSSatisfiesExpression",
-  "TSNonNullExpression",
-  "TSTypeAssertion",
-  "TSInstantiationExpression",
-  "TSEnumDeclaration",
-  "TSEnumBody",
-  "TSEnumMember",
-  "TSModuleDeclaration",
-  "TSModuleBlock",
-  "TSParameterProperty",
-  "TSExportAssignment",
-  "TSImportEqualsDeclaration",
-  "TSExternalModuleReference",
-]);
+declare module "acorn" {
+  interface NodeTypes {
+    apm: TsExpression | TsImportEquals | TsExternalModuleReference | TsParameterProperty | JsxText | TsModuleDeclaration | TsEnumDeclaration | TsEmptyBody;
+  }
+}
 
 /** Every object under a parsed program that has a string `type` and a numeric `start` is a node the parser built. */
 function isParsedNode(v: unknown): v is AnyNode {
@@ -121,9 +110,85 @@ function numberValue(n: Literal): number | null {
   return n.raw !== undefined && /^\.?\d/.test(n.raw) && n.bigint === undefined ? Number(n.value) : null;
 }
 
-/** Type-only syntax (annotations, interfaces, `declare` statements, `import type`): erased, so nothing in it runs. */
+/**
+ * The TypeScript nodes TypeScript's emit drops whole: annotations and every type, interfaces, type aliases, overload
+ * and `declare function` signatures, abstract members, index signatures, `implements` and `export as namespace`.
+ * A TypeScript node not listed here (an enum, a namespace, a parameter property, `import x = require()`, `export =`,
+ * a cast, or a node type this list does not know) is read as code.
+ */
+const ERASED_TS: ReadonlySet<string> = new Set([
+  "TSTypeAnnotation",
+  "TSTypeParameterDeclaration",
+  "TSTypeParameterInstantiation",
+  "TSTypeParameter",
+  "TSInterfaceDeclaration",
+  "TSInterfaceBody",
+  "TSInterfaceHeritage",
+  "TSClassImplements",
+  "TSExpressionWithTypeArguments",
+  "TSTypeAliasDeclaration",
+  "TSDeclareFunction",
+  "TSDeclareMethod",
+  "TSEmptyBodyFunctionExpression",
+  "TSAbstractMethodDefinition",
+  "TSIndexSignature",
+  "TSNamespaceExportDeclaration",
+  "TSPropertySignature",
+  "TSMethodSignature",
+  "TSCallSignatureDeclaration",
+  "TSConstructSignatureDeclaration",
+  // the types themselves
+  "TSAnyKeyword",
+  "TSBigIntKeyword",
+  "TSBooleanKeyword",
+  "TSIntrinsicKeyword",
+  "TSNeverKeyword",
+  "TSNullKeyword",
+  "TSNumberKeyword",
+  "TSObjectKeyword",
+  "TSStringKeyword",
+  "TSSymbolKeyword",
+  "TSUndefinedKeyword",
+  "TSUnknownKeyword",
+  "TSVoidKeyword",
+  "TSThisType",
+  "TSFunctionType",
+  "TSConstructorType",
+  "TSTypeReference",
+  "TSTypePredicate",
+  "TSTypeQuery",
+  "TSTypeLiteral",
+  "TSArrayType",
+  "TSTupleType",
+  "TSNamedTupleMember",
+  "TSOptionalType",
+  "TSRestType",
+  "TSUnionType",
+  "TSIntersectionType",
+  "TSConditionalType",
+  "TSInferType",
+  "TSParenthesizedType",
+  "TSTypeOperator",
+  "TSIndexedAccessType",
+  "TSMappedType",
+  "TSTemplateLiteralType",
+  "TSLiteralType",
+  "TSImportType",
+]);
+
+/** Abstract fields TypeScript also drops, unless one holds an initializer, which is read as code. */
+const ABSTRACT_FIELDS: ReadonlySet<string> = new Set(["TSAbstractPropertyDefinition", "TSAbstractAccessorProperty"]);
+
+/**
+ * Type-only syntax: what TypeScript's emit drops whole (`ERASED_TS`), a `declare` statement or field, `import type`
+ * and `export type`, and an overload signature in a class (a method with no body). Nothing in it runs.
+ */
 function isTypeOnly(n: AnyNode): boolean {
-  if (n.type.startsWith("TS") && !RUNTIME_TS.has(n.type)) return true;
+  if (ERASED_TS.has(n.type)) return true;
+
+  if (ABSTRACT_FIELDS.has(n.type)) return !("value" in n) || n.value === null || n.value === undefined;
+
+  if (n.type === "MethodDefinition" && childNodes(n).some((c) => c.type === "TSEmptyBodyFunctionExpression")) return true;
 
   if ("declare" in n && n.declare === true) return true;
 
@@ -975,10 +1040,20 @@ type Plan = { roles: Role[]; rest: Role | "inherit" };
 // ---------- the floor: the text rules, and what the tree can prove ----------
 //
 // Every parsed program is also read by the text rules, over its code with only comments and regex literals blanked:
-// what apm-score-v3 found there is the floor. A match stands unless the tree proves the token it rests on harmless:
-// a definition's name, a literal key, type-only syntax, a name bound in scope to a value the file makes, a string
-// whose value only ever reaches a comparison, nothing, or a place that does not run it. Failing to follow a value,
-// hitting a limit or meeting syntax apm does not model proves nothing, so the match stands.
+// what apm-score-v3 found there is the floor, and every match stands, confirmed, unless it lies wholly inside
+// TypeScript syntax that emits nothing (an annotation, an interface, a type alias, `import type`, a `declare`).
+// Those three (comments, regex bodies, erased types) are the only text the floor leaves out, because the parse says
+// none of it is code the program runs. The tree adds what it sees and chooses citations; it removes nothing.
+
+/**
+ * The proofs that rest on what the code does with a token rather than on how it is read: a definition's name or a
+ * written key, a binding that never changes, a value that goes nowhere, an argument a callee ignores, a builtin
+ * sink, a `data:` fetch, calling a Promise or generator. An independent review of apm-score-v7 built 39 programs
+ * where one of them removed a finding whose operation still ran (conversion hooks, a local `eval`, `with` writes,
+ * default-parameter scope, reflected names and keys, a builtin replaced from a file with no tree, a custom `fetch`).
+ * They are off and nothing turns them on. Each needs its own review and fuzz coverage before it can come back.
+ */
+const PRECISION_PROOFS: boolean = false;
 
 /** Each code signal as a bit, so a proof can say which signals it clears. */
 const SIGNAL_BIT: Record<CodeSignal, number> = { "shell-exec": 1, network: 2, "credential-access": 4, eval: 8, obfuscated: 16 };
@@ -1062,8 +1137,11 @@ function indexProgram(program: Program, strict: boolean): Index {
         ix.atoms.push({ start: n.start, end: n.end, node: n });
         break;
       case "Literal":
-        if ("regex" in n && n.regex) ix.regexes.push([n.start, n.end]);
-        else if (stringValue(n) !== null) ix.atoms.push({ start: n.start, end: n.end, node: n });
+        // `await /x/` is a regex in a module and a division in a script, where `await` is a name: a program run
+        // under the other goal reads that text as code, so it is not left out
+        if ("regex" in n && n.regex) {
+          if (ix.parentOf.get(n)?.type !== "AwaitExpression") ix.regexes.push([n.start, n.end]);
+        } else if (stringValue(n) !== null) ix.atoms.push({ start: n.start, end: n.end, node: n });
         break;
       case "WithStatement":
         ix.withs = true;
@@ -1124,17 +1202,16 @@ function indexProgram(program: Program, strict: boolean): Index {
   return ix;
 }
 
-/** Whether `at` falls inside one of the sorted, non-overlapping-or-nested `ranges`. */
-function inRanges(ranges: readonly Range[], at: number): boolean {
+/** Whether all of `[start, end)` sits inside one of the sorted ranges (which may nest). */
+function withinOne(ranges: readonly Range[], start: number, end: number): boolean {
   let lo = 0;
   let hi = ranges.length - 1;
   let found = -1;
 
-  // the last range that starts at or before `at`; nested ranges sit inside an earlier one, so walk back while they could hold it
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
 
-    if ((ranges[mid]?.[0] ?? Number.POSITIVE_INFINITY) <= at) {
+    if ((ranges[mid]?.[0] ?? Number.POSITIVE_INFINITY) <= start) {
       found = mid;
       lo = mid + 1;
     } else hi = mid - 1;
@@ -1143,7 +1220,7 @@ function inRanges(ranges: readonly Range[], at: number): boolean {
   for (let i = found; i >= 0 && i > found - 64; i--) {
     const r = ranges[i];
 
-    if (r && at >= r[0] && at < r[1]) return true;
+    if (r && start >= r[0] && end <= r[1]) return true;
   }
 
   return false;
@@ -2918,9 +2995,11 @@ class Reader {
   // ----- the floor -----
 
   /**
-   * The text rules over this program's code, with comments and regex literals blanked, as findings: `stands` with
-   * every proof, `sinkOnly` what only proofs resting on a global or builtin module removed. `eval` says whether an
-   * evaluator finding stands, which is a patch in itself (code apm did not read can replace any global).
+   * The text rules over this program's code, with comments and regex literals blanked, as findings: `stands` is
+   * every match outside erased TypeScript. With PRECISION_PROOFS off nothing else is judged harmless, so `sinkOnly`
+   * stays empty; with it on, `stands` keeps what every proof left and `sinkOnly` what only proofs resting on a global
+   * or builtin module removed. An evaluator finding that stands is a patch in itself (code apm did not read can
+   * replace any global).
    */
   floor(text: string, comments: readonly Range[]): Floor {
     const masked = blanked(text, [...comments, ...this.ix.regexes]);
@@ -2936,9 +3015,14 @@ class Reader {
     return { stands, sinkOnly: strict.filter((f) => f.confidence === "confirmed" && !sure.has(f.id)) };
   }
 
-  /** What a text-rule match over `[start, end)` means: `excluded` when the token it rests on is proven harmless for `id`. */
+  /**
+   * What a text-rule match over `[start, end)` means: `excluded` when all of it sits inside one piece of type-only
+   * syntax, which TypeScript erases; otherwise it stands as apm-score-v3 counted it (`unparsed`).
+   */
   private judge(start: number, end: number, id: CodeSignal | undefined, kind: Kind | "decoded" | undefined, allowSink: boolean): Region {
-    if (inRanges(this.ix.types, start)) return "excluded";
+    if (withinOne(this.ix.types, start, Math.max(end, start + 1))) return "excluded";
+
+    if (!PRECISION_PROOFS) return "unparsed";
     const group = this.anchor(start, Math.max(end, start + 1));
 
     if (group.length === 0) return "unparsed";
@@ -3844,7 +3928,8 @@ function readProgram(p: Parsed, text: string, depth: number, budget: Budget): Re
     r.read();
     const floor = r.floor(text, p.comments);
 
-    r.checkPatches();
+    // which builtins a file could replace matters only to proofs that rest on one
+    if (PRECISION_PROOFS) r.checkPatches();
 
     return { hits: r.hits, floor: floor.stands, sinkOnly: floor.sinkOnly, sinkOnlyHits: r.sinkOnlyHits, patched: r.patched, paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName };
   } catch (e) {

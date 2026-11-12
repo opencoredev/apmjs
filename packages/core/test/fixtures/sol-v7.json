@@ -1,0 +1,805 @@
+[
+ {
+  "name": "with-closure-mutation",
+  "group": "with",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){let fetch=()=>{};with({}){fetch=globalThis.fetch}fetch('https://example.invalid')}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "default-param-scope",
+  "group": "default-parameter",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(go=()=>fetch('https://example.invalid')){const fetch=()=>{};go()}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-coerce-unary",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};+o;}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-coerce-compare",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};o == 0;}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-coerce-lt",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};o < 0;}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "indirect-coerce-template",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",valueOf(){(0,eval)(this.s);return 0},toString(){(0,eval)(this.s);return ''}};`${o}`;}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "with-all-mutated",
+  "group": "with",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){let fetch=()=>{},require=()=>{},eval=()=>{};with({}){fetch=globalThis.fetch;require=process.getBuiltinModule;eval=globalThis.eval}require('child_process');fetch('https://example.invalid');eval('1')}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid"
+  ],
+  "v3": 65,
+  "v7": 82,
+  "v8": 65,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "param-default-all",
+  "group": "default-parameter",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(go=()=>{require('child_process');fetch('https://example.invalid');eval('1')}){const require=()=>{},fetch=()=>{},eval=()=>{};go()}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid"
+  ],
+  "v3": 65,
+  "v7": 85,
+  "v8": 65,
+  "signals": {
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "conversion-primitive",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"fetch('https://example.invalid')\",[Symbol.toPrimitive](){(0,eval)(this.s);return 0}};+o}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 80,
+  "v7": 90,
+  "v8": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "template-conversion",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"fetch('https://example.invalid')\",toString(){(0,eval)(this.s);return ''}};`${o}`}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 80,
+  "v7": 90,
+  "v8": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "ts-param-default-scope",
+  "group": "default-parameter",
+  "kind": "runs-all",
+  "file": "index.ts",
+  "src": "function f(go=()=>fetch('https://example.invalid')){const fetch=()=>{};go()}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "eval-local-alias",
+  "group": "eval-binding",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){let fetch=()=>{};const eval=globalThis.eval;eval('fetch=globalThis.fetch');fetch('https://example.invalid')}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 80,
+  "v7": 90,
+  "v8": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "eval-parameter",
+  "group": "eval-binding",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(eval){let fetch=()=>{};eval('fetch=globalThis.fetch');fetch('https://example.invalid')}f(globalThis.eval);",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 80,
+  "v7": 90,
+  "v8": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "eval-nested-alias",
+  "group": "eval-binding",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){let fetch=()=>{};function set(){const eval=globalThis.eval;eval('fetch=globalThis.fetch')}set();fetch('https://example.invalid')}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 80,
+  "v7": 90,
+  "v8": 80,
+  "signals": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  }
+ },
+ {
+  "name": "eval-read-dead",
+  "group": "eval-binding",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const s=\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\";const eval=globalThis.eval;eval('eval(s)')}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "with-loop",
+  "group": "with",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){let fetch=()=>{};with({}){for(fetch of [globalThis.fetch]){}}fetch('https://example.invalid')}f();",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "key-identifier-token",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={NPM_TOKEN:0};process.env[Object.keys(o)[0]];",
+  "runs": [
+   "env:NPM_TOKEN"
+  ],
+  "v3": 75,
+  "v7": 92,
+  "v8": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "method-key-token",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={NPM_TOKEN(){}};process.env[Object.keys(o)[0]];",
+  "runs": [
+   "env:NPM_TOKEN"
+  ],
+  "v3": 75,
+  "v7": 92,
+  "v8": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "class-key-token",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "class X{static NPM_TOKEN(){}};process.env[Object.getOwnPropertyNames(X)[3]];",
+  "runs": [
+   "env:NPM_TOKEN"
+  ],
+  "v3": 75,
+  "v7": 92,
+  "v8": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "key-child",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={child_process:0};require(Object.keys(o)[0]);",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "method-child",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={child_process(){}};require(Object.keys(o)[0]);",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "namespace-keys-token",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.ts",
+  "src": "namespace N {export const NPM_TOKEN=0};process.env[Object.keys(N)[0]];",
+  "runs": [
+   "env:NPM_TOKEN"
+  ],
+  "v3": 75,
+  "v7": 92,
+  "v8": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "param-prop-key-token",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.ts",
+  "src": "class X {constructor(public NPM_TOKEN=1){}};process.env[Object.keys(new X())[0]];",
+  "runs": [
+   "env:NPM_TOKEN"
+  ],
+  "v3": 75,
+  "v7": 92,
+  "v8": 75,
+  "signals": {
+   "credential-access": "confirmed"
+  }
+ },
+ {
+  "name": "function-fetch-name",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function fetch(){};globalThis[fetch.name]('https://example.invalid');",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "method-fetch-key",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={fetch(){}};globalThis[Object.keys(o)[0]]('https://example.invalid');",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "method-fetch-name",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const o={fetch(){}};globalThis[o.fetch.name]('https://example.invalid');",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "function-child-local",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){function child_process(){};require(child_process.name)}f();",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "arrow-inferred-child",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "const child_process=()=>{};require(child_process.name);",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "class-child-local",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){class child_process{};require(child_process.name)}f();",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "function-constructor-source",
+  "group": "reflected-name",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){function child_process(){};require(child_process.toString().split(' ')[1].split('(')[0])}f();",
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 85,
+  "v7": 100,
+  "v8": 85,
+  "signals": {
+   "shell-exec": "confirmed"
+  }
+ },
+ {
+  "name": "eval-alias-not-callable",
+  "group": "eval-binding",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){async function g(){};const eval=globalThis.eval;eval('g=()=>globalThis.eval');g()(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "with-not-callable",
+  "group": "with",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){async function g(){};with({}){g=()=>globalThis.eval}g()(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\")}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 92,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "raw-js-mutation",
+  "group": "unparsed-builtin",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "require('./patch.js');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.js": {
+    "pad": "js",
+    "src": "const original=globalThis.fetch;globalThis.fetch=function(s){globalThis.fetch=original;return eval(s)};"
+   }
+  },
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "raw-ts-mutation",
+  "group": "unparsed-builtin",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "require('./patch.ts');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.ts": {
+    "pad": "ts",
+    "src": "const original=globalThis.fetch;globalThis.fetch=function(s){globalThis.fetch=original;return eval(s)};"
+   }
+  },
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "raw-txt-mutation",
+  "group": "unparsed-builtin",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "require('./patch.txt');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.txt": {
+    "pad": "js",
+    "src": "const original=globalThis.fetch;globalThis.fetch=function(s){globalThis.fetch=original;return eval(s)};"
+   }
+  },
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "conversion-in",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",[Symbol.toPrimitive](){(0,eval)(this.s);return 'x'}};o in {}}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "conversion-instanceof",
+  "group": "conversion",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function f(){const o={s:\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\",[Symbol.hasInstance](){(0,eval)(this.s);return false}};1 instanceof o}f();",
+  "runs": [
+   "module:child_process",
+   "fetch:https://example.invalid",
+   "env:NPM_TOKEN"
+  ],
+  "v3": 30,
+  "v7": 82,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "data-url-local-method",
+  "group": "data-fetch",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function run(send){const o={fetch(u){return send(u.replace('data:','https:'))}};o.fetch('d\\x61ta://example.invalid')}run(globalThis.fetch);",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "data-url-global-patched",
+  "group": "data-fetch",
+  "kind": "runs-all",
+  "file": "index.js",
+  "src": "function run(send){globalThis.fetch=(u)=>send(u.replace('data:','https:'));fetch('d\\x61ta://example.invalid')}run(globalThis.fetch);",
+  "runs": [
+   "fetch:https://example.invalid"
+  ],
+  "v3": 90,
+  "v7": 100,
+  "v8": 90,
+  "signals": {
+   "network": "confirmed"
+  }
+ },
+ {
+  "name": "padded-js-patch",
+  "group": "unparsed-builtin",
+  "kind": "runs-then-throws",
+  "file": "index.js",
+  "src": "require('./patch.js');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.js": {
+    "pad": "js",
+    "src": "globalThis.fetch=eval;"
+   }
+  },
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "padded-ts-patch",
+  "group": "unparsed-builtin",
+  "kind": "runs-then-throws",
+  "file": "index.js",
+  "src": "require('./patch.ts');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.ts": {
+    "pad": "ts",
+    "src": "globalThis.fetch=eval;"
+   }
+  },
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ },
+ {
+  "name": "padded-txt-patch",
+  "group": "unparsed-builtin",
+  "kind": "runs-then-throws",
+  "file": "index.js",
+  "src": "require('./patch.txt');fetch(\"process.getBuiltinModule('chi'+'ld_process');fetch('https://example.invalid');process.env.NPM_TOKEN;eval('1')\");",
+  "extra": {
+   "patch.txt": {
+    "pad": "js",
+    "src": "globalThis.fetch=eval;"
+   }
+  },
+  "runs": [
+   "module:child_process"
+  ],
+  "v3": 30,
+  "v7": 72,
+  "v8": 30,
+  "signals": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed",
+   "obfuscated": "confirmed"
+  }
+ }
+]

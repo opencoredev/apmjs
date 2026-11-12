@@ -6,7 +6,10 @@
 // confidence and points written here, and never score above apm-score-v3, the last scorer that read every file raw.
 // `precision` fixtures are ones where v3 confirmed more than the code does; `why` says what v5 read instead. Since
 // apm-score-v7 a finding v3 made stands unless the tree proves it harmless; where that proof does not exist, `v7`,
-// `signals7` and `floor` give the score, the signals and the reason, and v7 equals v3 there.
+// `signals7` and `floor` give the score, the signals and the reason, and v7 equals v3 there. apm-score-v8 keeps
+// only the proofs that rest on how code is read (comments, regex bodies, erased types, JSON and declaration files);
+// where that changed a result, `v8`, `signals8` and `v8why` record it. No fixture scores above v3 unless `kept`
+// names the read-time proof that puts it there.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
@@ -25,6 +28,10 @@ const Fixture = z.object({
   v7: z.number().optional(),
   signals7: z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"])).optional(),
   floor: z.string().optional(),
+  v8: z.number().optional(),
+  signals8: z.partialRecord(z.enum(["shell-exec", "network", "credential-access", "eval", "obfuscated"]), z.enum(["confirmed", "possible"])).optional(),
+  v8why: z.string().optional(),
+  kept: z.enum(["comment", "regex", "type", "data"]).optional(),
 });
 
 const fixtures = z.array(Fixture).parse(fixtureData);
@@ -51,6 +58,8 @@ describe("the review's fixtures", () => {
     expect(fixtures.every((f) => f.kind === "detection" || (f.why ?? "").length > 0)).toBe(true);
     // every result v7 changed is explained, and each is v3's own
     expect(fixtures.every((f) => (f.v7 === undefined) === (f.floor === undefined) && (f.v7 === undefined || f.v7 === f.v3))).toBe(true);
+    // every result v8 changed says why, and none of them is above v3
+    expect(fixtures.every((f) => (f.v8 === undefined) === (f.v8why === undefined) && (f.v8 === undefined || f.v8 <= f.v3))).toBe(true);
   });
 
   for (const f of fixtures) {
@@ -58,7 +67,7 @@ describe("the review's fixtures", () => {
       const r = score(f);
       const found = Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]));
 
-      expect(found).toEqual(f.signals7 ?? f.signals);
+      expect(found).toEqual(f.signals8 ?? f.signals7 ?? f.signals);
 
       for (const s of r.signals) {
         if (!(s.id in POSSIBLE_POINTS)) continue;
@@ -68,13 +77,17 @@ describe("the review's fixtures", () => {
         expect(s.evidence.every((e) => e.includes("[possible:") === !confirmed)).toBe(true);
       }
 
-      const want = f.v7 ?? f.v5;
+      const want = f.v8 ?? f.v7 ?? f.v5;
 
       expect(r.score).toBe(want);
       // which side of the refusal floor it lands on is part of the claim
       expect(r.score < SCORE_FLOOR).toBe(want < SCORE_FLOOR);
 
+      // only a proof that rests on how the code is read can put a fixture above v3
+      if (f.kept === undefined) expect(r.score).toBeLessThanOrEqual(f.v3);
+
       if (f.kind === "detection") {
+        expect(f.kept).toBeUndefined();
         expect(r.score).toBeLessThanOrEqual(f.v3);
 
         if (f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);

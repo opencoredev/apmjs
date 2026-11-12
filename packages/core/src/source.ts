@@ -15,7 +15,7 @@ export { namedSignal, type CodeSignal, type Confidence, type TextFinding, type W
 export type { Imports } from "./js.ts";
 
 /**
- * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed; `c` and `python` are lexed for comments and strings;
+ * How a file is read: `js`, `jsx`, `ts` and `tsx` are parsed; `c` and `python` are read raw like `plain`;
  * `data` is JSON and type declarations (node parses JSON and never runs it, and a `.d.ts` file only describes code);
  * anything else is `plain`, read raw with every match counted.
  */
@@ -60,11 +60,11 @@ export function commentRanges(text: string, dialect: Dialect = "js"): Range[] {
 }
 
 /**
- * JavaScript with no tree: the text rules on the file as written (everything apm-score-v3 caught), and on its tokens
- * in plain form, which undo what only the tokenizer sees through: escaped names, escaped strings and comments between
- * joined pieces. The token pass adds only what the pass as written did not confirm, so no confirmed citation moves.
- * It reads in windows of about TOKEN_WINDOW characters that end only where a statement ends (tokens.ts), so a call
- * is never split from its arguments, whatever lies between them; each window also reaches TOKEN_OVERLAP back.
+ * JavaScript with no tree: the text rules on the whole file as written, however large (everything apm-score-v3
+ * caught), and on its tokens in plain form, which undo what only the tokenizer sees through: escaped names, escaped
+ * strings and comments between joined pieces. The token pass only adds: it adds what the pass as written did not
+ * confirm, so no confirmed citation moves. It reads in windows of about TOKEN_WINDOW characters that end where a
+ * statement ends, or past a token in a file without one (tokens.ts); each window also reaches TOKEN_OVERLAP back.
  */
 function scanUnparsed(text: string): FileScan {
   const raw = scanTextRules(text, "unparsed");
@@ -81,7 +81,7 @@ function scanUnparsed(text: string): FileScan {
   for (const w of tokenWindows(plain.length, tokens.cuts)) {
     const piece = plain.slice(w.from, w.end);
 
-    for (const f of scanTextRules(piece, "unparsed", { shown: text, offset: w.from })) if (!sure.has(f.id)) more.push(f);
+    for (const f of scanTextRules(piece, "unparsed", { shown: text, origin: (i) => tokens.origin(i + w.from) })) if (!sure.has(f.id)) more.push(f);
     const found = importsOf(joinStrings(piece).text);
 
     for (const p of found.paths) paths.add(p);
@@ -99,9 +99,9 @@ export const TOKEN_WINDOW = 4 * 1024 * 1024;
 const TOKEN_OVERLAP = 64 * 1024;
 
 /**
- * The windows the token pass reads, `[from, end)`: each ends at the first statement end (`cuts`) past `window`
- * characters from where the last one ended, or at the end of the text, and starts `overlap` before that. Exported
- * with its sizes as parameters so tests can place a construct on a boundary without a 4 MB file.
+ * The windows the token pass reads, `[from, end)`: each ends at the first cut (`cuts`) past `window` characters from
+ * where the last one ended, or at the end of the text, and starts `overlap` before that. Exported with its sizes as
+ * parameters so tests can place a construct on a boundary without a 4 MB file.
  */
 export function tokenWindows(length: number, cuts: readonly number[], window = TOKEN_WINDOW, overlap = TOKEN_OVERLAP): { from: number; end: number }[] {
   const out: { from: number; end: number }[] = [];
@@ -205,7 +205,7 @@ export function scanFile(text: string, lang: Lang): FileScan {
   // JSON and type declarations never run, so nothing in them is a load
   const imports = lang === "data" ? { paths: [], loads: [], dynamic: [] } : importsOf(joinStrings(text).text);
 
-  return { findings: scanTextRules(text, lang), imports, read: lang === "plain" ? "raw" : "lexed", rejected: false, notes: [], sinkOnly: [], patches: null };
+  return { findings: scanTextRules(text, lang), imports, read: lang === "data" ? "lexed" : "raw", rejected: false, notes: [], sinkOnly: [], patches: null };
 }
 
 /** The rule findings for one text read as `lang`. */

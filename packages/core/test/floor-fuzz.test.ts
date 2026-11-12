@@ -1,16 +1,21 @@
-// The floor, tested as a property: whatever the code is wrapped in, apm-score-v7 never scores a package above
-// apm-score-v3 (test/v3, copied from git history), the last scorer that read every file as raw text. Each case nests
-// two or three wrapper shapes taken from the four independent reviews (template tags, Function subclasses and
-// constructor chains, generators, Symbol keys, bind/apply/call/Reflect, Proxies, getters, namespaces, logical,
-// ternary and comma callees, shadowing decoys, `with`, exports wildcards, comments ended by every line terminator,
-// HTML comments, JSX text, padding past the parse limit, token-window boundaries) around an inert payload, and scores
-// the same package with both. Nothing is run: the payloads only name example.invalid, child_process and a token.
+// The floor, tested as a property: whatever the code is wrapped in, apm-score-v8 never scores a package above
+// apm-score-v3 (test/v3, copied from git history), the last scorer that read every file as raw text. There are no
+// exceptions. Each case nests two or three wrapper shapes taken from the five independent reviews (template tags,
+// Function subclasses and constructor chains, generators, Symbol keys, bind/apply/call/Reflect, Proxies, getters,
+// namespaces, logical, ternary and comma callees, shadowing decoys, `with`, exports wildcards, comments ended by every
+// line terminator, HTML comments, JSX text, padding past the parse limit, token-window boundaries) around an inert
+// payload, and scores the same package with both. The v7 review's seven families are here too: conversion hooks,
+// `with` writes to an outer binding, default-parameter scope, reflected names and keys, a locally bound eval, a custom
+// fetch handed a data: URL, and a builtin replaced from a file with no tree. Scoring runs nothing: the payloads only
+// name example.invalid, child_process and a token. Separately, each new shape is run once in a node:vm context
+// against recording stubs, to check it really runs its payload.
 //
 //   bun test packages/core/test/floor-fuzz.test.ts                                   fixed seed, CI size
 //   APM_FUZZ_CASES=10000 APM_FUZZ_SEED=random bun test packages/core/test/floor-fuzz.test.ts   long run
 //
 // A failure prints the seed, the case number and the shapes, so `APM_FUZZ_SEED=<seed>` replays it.
 import { describe, expect, test } from "bun:test";
+import vm from "node:vm";
 import { analyze, finalize, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
 import lexerData from "./fixtures/sol-lexer.json";
 import v5Data from "./fixtures/sol-parser-v5.json";
@@ -38,7 +43,7 @@ function tarOf(p: Pkg): TarEntry[] {
   return [entry("package.json", JSON.stringify(p.manifest)), ...Object.entries(p.files).map(([path, text]) => entry(path, text))];
 }
 
-function scoreV7(p: Pkg): ScoreReport {
+function scoreV8(p: Pkg): ScoreReport {
   return finalize(analyze({ name: "probe-pkg", manifest: p.manifest, files: tarOf(p), publisher: "a", previousPublishers: [] }), STATE);
 }
 
@@ -118,6 +123,68 @@ type CodeWrapper = { name: string; langs?: readonly Lang[]; wrap: (code: string)
 const ALL: readonly Lang[] = ["script", "module", "ts"];
 const SLOPPY: readonly Lang[] = ["script"];
 const NOT_TS: readonly Lang[] = ["script", "module"];
+
+// ---------- the v7 review's families: proofs v7 took that the code did not honour ----------
+
+/** A family a shape belongs to, so the coverage check can ask that each one is drawn. */
+type Family = "conversion" | "with" | "default-parameter" | "reflected" | "local-eval" | "custom-fetch" | "unparsed-patch";
+
+type FamilyWrapper = CodeWrapper & { family: Family };
+
+/** Indirect eval of an object's own `s`, from inside a conversion hook. */
+const RUN_S = "(0,eval)(this.s)";
+
+const FAMILY_WRAPPERS: readonly FamilyWrapper[] = [
+  // a value only converted, compared or tested runs its own hooks
+  { family: "conversion", name: "unary-to-primitive", wrap: (c) => `const o={s:${q(c)},[Symbol.toPrimitive](){${RUN_S};return 0}};+o;` },
+  { family: "conversion", name: "loose-equal-value-of", wrap: (c) => `const o={s:${q(c)},valueOf(){${RUN_S};return 0}};o==0;` },
+  { family: "conversion", name: "less-than-value-of", wrap: (c) => `const o={s:${q(c)},valueOf(){${RUN_S};return 0}};o<0;` },
+  { family: "conversion", name: "template-to-string", wrap: (c) => `const o={s:${q(c)},toString(){${RUN_S};return ''}};\`\${o}\`;` },
+  { family: "conversion", name: "in-key", wrap: (c) => `const o={s:${q(c)},[Symbol.toPrimitive](){${RUN_S};return 'k'}};o in {};` },
+  { family: "conversion", name: "instanceof-has-instance", wrap: (c) => `const o={s:${q(c)},[Symbol.hasInstance](){${RUN_S};return false}};1 instanceof o;` },
+  { family: "conversion", name: "string-concat-hook", wrap: (c) => `function f(){const o={s:${q(c)},toString(){${RUN_S};return ''}};String(o)}f();` },
+  // a write inside `with` that falls through to the outer binding
+  { family: "with", langs: SLOPPY, name: "with-write-outer", wrap: (c) => `function f(){let run=()=>{};with({}){run=globalThis.eval}run(${q(c)})}f();` },
+  { family: "with", langs: SLOPPY, name: "with-for-of-outer", wrap: (c) => `function f(){let run=()=>{};with({}){for(run of [globalThis.eval]);}run(${q(c)})}f();` },
+  { family: "with", langs: SLOPPY, name: "with-destructure-outer", wrap: (c) => `function f(){let run=()=>{};with({}){[run]=[globalThis.eval]}run(${q(c)})}f();` },
+  // a default parameter's closure sees the outer name, not the body's declaration
+  { family: "default-parameter", name: "default-closure", wrap: (c) => `function f(go=()=>Function(${q(c)})()){const Function=()=>{};go()}f();` },
+  { family: "default-parameter", name: "default-arrow", wrap: (c) => `const f=(go=()=>Function(${q(c)})())=>{const Function=()=>{};go()};f();` },
+  { family: "default-parameter", name: "default-destructured", wrap: (c) => `function f({go=()=>Function(${q(c)})()}={}){const Function=()=>{};go()}f();` },
+  // an intrinsic eval reached through a binding named eval is still a direct eval
+  { family: "local-eval", langs: SLOPPY, name: "local-eval-const", wrap: (c) => `function f(){const eval=globalThis.eval;eval(${q(c)})}f();` },
+  { family: "local-eval", langs: SLOPPY, name: "local-eval-parameter", wrap: (c) => `function f(eval){eval(${q(c)})}f(globalThis.eval);` },
+  { family: "local-eval", langs: SLOPPY, name: "local-eval-nested", wrap: (c) => `function f(){const e=globalThis.eval;function g(){const eval=e;eval(${q(c)})}g()}f();` },
+  { family: "local-eval", langs: SLOPPY, name: "local-eval-reads-dead", wrap: (c) => `function f(){const s=${q(c)};const eval=globalThis.eval;eval('eval(s)')}f();` },
+  // a fetch apm cannot identify, handed a data: URL, can turn it into anything
+  { family: "custom-fetch", name: "data-local-method", wrap: (c) => `function run(send){const o={fetch(u){return send(u.slice(5))}};o.fetch('data:'+${q(c)})}run(globalThis.eval);` },
+  { family: "custom-fetch", name: "data-global-replaced", wrap: (c) => `const original=globalThis.fetch;globalThis.fetch=function(u){globalThis.fetch=original;return (0,eval)(u.slice(5))};fetch('data:'+${q(c)});` },
+];
+
+/**
+ * Programs that hand a definition's name, a written key or a function's source to the code that runs it: they are
+ * their own payloads (a module load, a request, a token read), so they are drawn in place of a payload.
+ */
+const REFLECTED: readonly { name: string; langs?: readonly Lang[]; src: string }[] = [
+  { name: "key-listed-module", src: "const o={child_process:0};process.getBuiltinModule(Object.keys(o)[0]);" },
+  { name: "key-listed-token", src: "const o={NPM_TOKEN:0};process.env[Object.keys(o)[0]];" },
+  { name: "method-key-token", src: "const o={NPM_TOKEN(){}};process.env[Object.keys(o)[0]];" },
+  { name: "class-key-token", src: "class K{static NPM_TOKEN=1}process.env[Object.keys(K)[0]];" },
+  { name: "function-name-fetch", src: "function f(){function fetch(){}globalThis[fetch.name]('https://example.invalid')}f();" },
+  { name: "method-name-fetch", src: "const o={fetch(){}};globalThis[o.fetch.name]('https://example.invalid');" },
+  { name: "class-name-module", src: "function f(){class child_process{}process.getBuiltinModule(child_process.name)}f();" },
+  { name: "arrow-name-module", src: "function f(){const child_process=()=>{};process.getBuiltinModule(child_process.name)}f();" },
+  { name: "function-source-module", src: "function f(){function g(){child_process}process.getBuiltinModule(String(g).slice(13,26))}f();" },
+  { name: "namespace-keys-token", langs: ["ts"], src: "namespace N{export const NPM_TOKEN=1}process.env[Object.keys(N)[0]];" },
+  { name: "parameter-property-token", langs: ["ts"], src: "class C{constructor(public NPM_TOKEN=1){}}process.env[Object.keys(new C())[0]];" },
+];
+
+/** A package whose main file sends the payload through fetch, after a file with no tree replaced fetch with eval. */
+const UNPARSED_PATCHES: readonly { name: string; file: string; text: string }[] = [
+  { name: "patch-js-padded", file: "patch.js", text: `${"0;".repeat(240_001)}globalThis.fetch=eval;` },
+  { name: "patch-ts-comment", file: "patch.ts", text: `/*${"x".repeat(1024 * 1024)}*/\nglobalThis.fetch=eval;` },
+  { name: "patch-txt-padded", file: "patch.txt", text: `${"0;".repeat(240_001)}const original=globalThis.fetch;globalThis.fetch=function(s){globalThis.fetch=original;return eval(s)};` },
+];
 
 const CODE_WRAPPERS: readonly CodeWrapper[] = [
   { name: "eval", wrap: (c) => `eval(${q(c)});` },
@@ -201,6 +268,7 @@ const CODE_WRAPPERS: readonly CodeWrapper[] = [
   { name: "dead-at-top-read-later", wrap: (c) => `var s=${q(c)};setTimeout(()=>eval(s));` },
   { name: "namespace-merge", langs: ["ts"], wrap: (c) => `namespace X{export const go=eval}namespace X{go(${q(c)})}` },
   { name: "namespace-fetch", langs: ["ts"], wrap: (c) => `namespace X{export const fetch=eval}namespace X{fetch(${q(c)})}` },
+  ...FAMILY_WRAPPERS,
 ];
 
 /** A shape around a whole program: where it sits in the file, and what sits around it. */
@@ -231,8 +299,8 @@ const SURROUNDINGS: readonly Surrounding[] = [
   { name: "export", langs: ["module", "ts"], wrap: (c) => `export const x=1;${c}` },
 ];
 
-/** Shapes that change the package rather than the text: where the file lives, or how large it is. */
-type Layout = "main" | "padded" | "wildcard-export" | "window";
+/** Shapes that change the package rather than the text: where the file lives, how large it is, or what another file replaced. */
+type Layout = "main" | "padded" | "wildcard-export" | "window" | "unparsed-patch";
 
 // ---------- one case ----------
 
@@ -247,16 +315,24 @@ function makeCase(r: Rand): Case {
   const lang = pick(r, ["script", "script", "module", "ts"] as const);
   const fits = <S extends { langs?: readonly Lang[] }>(s: S): boolean => (s.langs ?? ALL).includes(lang);
   const names: string[] = [lang];
-  let code = pick(r, PAYLOADS);
+  const reflected = REFLECTED.filter(fits);
+  // a reflected-name program is its own payload; in TypeScript a namespace or a parameter property must stay unwrapped
+  const reflect = r() < 0.12 ? pick(r, reflected) : null;
+  let code = reflect ? reflect.src : pick(r, PAYLOADS);
 
-  names.push(`payload:${PAYLOADS.indexOf(code)}`);
+  names.push(reflect ? `reflected:${reflect.name}` : `payload:${PAYLOADS.indexOf(code)}`);
+
+  if (reflect) names.push("family:reflected");
   // two or three shapes in all: one or two around the code, then one around the program
-  const depth = r() < 0.5 ? 1 : 2;
+  const depth = reflect?.langs ? 0 : r() < 0.5 ? 1 : 2;
 
   for (let i = 0; i < depth; i++) {
-    const s = pick(r, CODE_WRAPPERS.filter(fits));
+    // a third of the shapes come from the v7 review's families
+    const s = r() < 0.33 ? pick(r, FAMILY_WRAPPERS.filter(fits)) : pick(r, CODE_WRAPPERS.filter(fits));
     code = s.wrap(code);
     names.push(s.name);
+
+    if ("family" in s) names.push(`family:${s.family}`);
   }
 
   const ctx = pick(r, SURROUNDINGS.filter(fits));
@@ -265,7 +341,7 @@ function makeCase(r: Rand): Case {
 
   names.push(ctx.name);
   const roll = r();
-  const layout: Layout = roll < 0.06 ? "padded" : roll < 0.1 ? "wildcard-export" : roll < 0.11 && lang === "ts" ? "window" : "main";
+  const layout: Layout = roll < 0.06 ? "padded" : roll < 0.1 ? "wildcard-export" : roll < 0.11 && lang === "ts" ? "window" : roll < 0.14 && lang !== "ts" && !jsx ? "unparsed-patch" : "main";
   let file = jsx ? "index.jsx" : FILES[lang];
 
   names.push(layout);
@@ -278,6 +354,16 @@ function makeCase(r: Rand): Case {
     file = "index.ts";
   }
 
+  if (layout === "unparsed-patch") {
+    // the program itself becomes a string the replaced fetch evaluates
+    const patch = pick(r, UNPARSED_PATCHES);
+    const main = `require('./${patch.file}');fetch(${q(src)});`;
+
+    names.push(patch.name, "family:unparsed-patch");
+
+    return { names, pkg: { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": main, [patch.file]: patch.text } } };
+  }
+
   if (layout === "wildcard-export") {
     const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", exports: { ".": "./index.js", "./*": { node: { require: "./docs/*.txt" } } } };
 
@@ -287,14 +373,14 @@ function makeCase(r: Rand): Case {
   return { names, pkg: single(file, src) };
 }
 
-function describeCase(seed: number, i: number, c: Case, v3: number, v7: ScoreReport): string {
-  const signals = v7.signals.map((s) => `${s.id}:${s.confidence}`).join(", ");
+function describeCase(seed: number, i: number, c: Case, v3: number, v8: ScoreReport): string {
+  const signals = v8.signals.map((s) => `${s.id}:${s.confidence}`).join(", ");
 
   const src = Object.entries(c.pkg.files)
     .map(([p, text]) => `${p}: ${text.length > 600 ? `${text.slice(0, 120)} … ${text.slice(-400)}` : text}`)
     .join("\n");
 
-  return `seed ${seed}, case ${i}: ${c.names.join(" > ")}\nv3 ${v3}, v7 ${v7.score} (${signals})\n${src}`;
+  return `seed ${seed}, case ${i}: ${c.names.join(" > ")}\nv3 ${v3}, v8 ${v8.score} (${signals})\n${src}`;
 }
 
 // ---------- the tests ----------
@@ -323,11 +409,11 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
       for (let i = 0; i < cases; i++) {
         const c = makeCase(r);
         const v3 = scoreV3(c.pkg);
-        const v7 = scoreV7(c.pkg);
+        const v8 = scoreV8(c.pkg);
 
         if (v3 < SCORE_FLOOR) refused++;
 
-        if (v7.score > v3) failures.push(describeCase(seed, i, c, v3, v7));
+        if (v8.score > v3) failures.push(describeCase(seed, i, c, v3, v8));
 
         if (failures.length >= 5) break;
       }
@@ -345,7 +431,8 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
 
     for (let i = 0; i < CI_CASES; i++) for (const n of makeCase(r).names) seen.add(n);
 
-    const missing = [...SURROUNDINGS.map((s) => s.name), ...PAYLOADS.map((_, i) => `payload:${i}`), "padded", "wildcard-export"].filter((n) => !seen.has(n));
+    const families: Family[] = ["conversion", "with", "default-parameter", "reflected", "local-eval", "custom-fetch", "unparsed-patch"];
+    const missing = [...SURROUNDINGS.map((s) => s.name), ...PAYLOADS.map((_, i) => `payload:${i}`), "padded", "wildcard-export", "unparsed-patch", ...families.map((f) => `family:${f}`)].filter((n) => !seen.has(n));
 
     expect(missing).toEqual([]);
   });
@@ -357,10 +444,65 @@ describe("the floor: no shape lifts a package above apm-score-v3", () => {
       for (const lang of s.langs ?? ALL) {
         const pkg = single(FILES[lang], s.wrap(FULL));
         const v3 = scoreV3(pkg);
-        const v7 = scoreV7(pkg);
+        const v8 = scoreV8(pkg);
 
-        expect(v7.score, `${lang}: v3 ${v3}`).toBeLessThanOrEqual(v3);
+        expect(v8.score, `${lang}: v3 ${v3}`).toBeLessThanOrEqual(v3);
       }
+    });
+  }
+
+  for (const s of REFLECTED) {
+    test(`alone: ${s.name}`, () => {
+      for (const lang of s.langs ?? ALL) {
+        const pkg = single(FILES[lang], s.src);
+
+        expect(scoreV8(pkg).score, lang).toBeLessThanOrEqual(scoreV3(pkg));
+      }
+    });
+  }
+
+  for (const p of UNPARSED_PATCHES) {
+    test(`alone: ${p.name}`, () => {
+      const pkg: Pkg = { manifest: { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js" }, files: { "index.js": `require('./${p.file}');fetch(${q(FULL)});`, [p.file]: p.text } };
+      const v3 = scoreV3(pkg);
+
+      expect(v3).toBeLessThan(SCORE_FLOOR);
+      expect(scoreV8(pkg).score).toBeLessThanOrEqual(v3);
+    });
+  }
+});
+
+// ---------- the new shapes run what they wrap ----------
+
+/**
+ * Runs `src` as a classic script in a fresh node:vm context whose process, fetch and module loading only record what
+ * they are asked for, and returns the record. Nothing reaches the network, the environment or a real module.
+ */
+function trace(src: string): string[] {
+  const calls: string[] = [];
+  const env = new Proxy({}, { get: (_t, k) => (calls.push(`env:${String(k)}`), undefined) });
+  const process = { env, getBuiltinModule: (m: string) => (calls.push(`module:${m}`), {}) };
+  const fetch = (u: string) => (calls.push(`fetch:${u}`), Promise.resolve());
+  const context = vm.createContext({ process, fetch, require: (m: string) => (calls.push(`module:${m}`), {}) });
+
+  vm.runInContext(src, context, { timeout: 1000 });
+
+  return calls;
+}
+
+describe("each new shape runs its payload (liveness, under recording stubs)", () => {
+  const all = ["module:child_process", "fetch:https://example.invalid", "env:NPM_TOKEN"];
+
+  for (const s of FAMILY_WRAPPERS) {
+    test(`runs: ${s.name}`, () => {
+      expect(trace(s.wrap(FULL))).toEqual(expect.arrayContaining(all));
+    });
+  }
+
+  for (const s of REFLECTED.filter((x) => !x.langs)) {
+    test(`runs: ${s.name}`, () => {
+      expect(trace(s.src).length).toBeGreaterThan(0);
+      expect(trace(s.src).every((c) => all.includes(c))).toBe(true);
     });
   }
 });

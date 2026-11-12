@@ -1,9 +1,9 @@
 // The text rules read over a whole text, the way apm-score-v3 read every file: the rules as written, then with split
 // strings joined (`'chi' + 'ld_process'`, `x['ex' + 'ec']`, `\x63hild`), then on strings decoded from base64, hex, char
 // codes and URI escapes. A dangerous name that had to be built or decoded also counts as obfuscation. Who reads the
-// text decides what each match means through `region`: install commands and shell scripts count every match, C and
-// Python are lexed, JavaScript with no tree is read as v3 read it, and a parsed program passes its own judge, which
-// keeps a match unless the tree proves it harmless (the floor, js.ts). Pure.
+// text decides what each match means through `region`: install commands, shell scripts, C, Python and JavaScript with
+// no tree count every match as v3 counted it, JSON and type declarations name things at most, and a parsed program
+// passes its own judge, which leaves out only what sits wholly in erased TypeScript types (the floor, js.ts). Pure.
 import { lex, type Lang as LexLang, type Lexed } from "./lexer.ts";
 import {
   encodedLiterals,
@@ -182,36 +182,29 @@ export function decodedStrings(text: string): Decoded[] {
 
 // ---------- reading text without a parser ----------
 
-/** How a file read with the text rules is read: lexed (C, Python), raw, or JavaScript that has no tree. */
-/** How a file read with the text rules is read: lexed (C, Python), raw, or JavaScript that has no tree. */
+/** How a file read with the text rules is read: as data (JSON, type declarations), raw, or JavaScript that has no tree. */
 export type TextLang = LexLang | "unparsed";
 
 function regionsOf(text: string, lang: TextLang): RegionOf {
   if (lang === "unparsed") return UNPARSED;
 
-  if (lang === "plain") return RAW;
+  // C, Python and any other text are read raw, as apm-score-v3 read them: a hand-written lexer is not a parse, and
+  // an install script can run either, so nothing in them is left out or made possible by where the lexer puts it
+  if (lang !== "data") return RAW;
   let lexed: Lexed | null = null;
 
-  // lexed once, and only when something matched. C and Python have no tree to prove a string harmless, so their
-  // comments are left out, shell text counts only where the lexer says it is a string (`a || sh` in code is not a
-  // pipe), and everything else is read as apm-score-v3 read it. JSON and type declarations never run, so what they
-  // name stays possible at most
-  return (index, _end, _id, kind) => {
-    const r = (lexed ??= lex(text, lang)).region(index);
-
-    if (lang === "data" || r === "excluded") return r;
-
-    return r === "code" && kind === "text" ? "excluded" : "unparsed";
-  };
+  // lexed once, and only when something matched: JSON and type declarations never run, so what they name stays
+  // possible at most
+  return (index) => (lexed ??= lex(text, lang)).region(index);
 }
 
 /**
- * How one text is read. `shown` and `offset`: `text` is a window of `shown` (the file as written) that starts at
- * `offset`, with every offset kept, so findings cite `shown`. `region` overrides what `lang` says each match means
+ * How one text is read. `shown` and `origin`: `text` is a window of `shown` (the file as written), and `origin` maps
+ * a position in `text` to `shown`, so findings cite `shown`. `region` overrides what `lang` says each match means
  * (a parsed program's judge). `encoded`: also look for long escape runs, long base64 and `_0x` identifier runs,
  * which are read on the file as written (by default, only when `text` is the file itself).
  */
-export type TextRead = { shown?: string; offset?: number; region?: RegionOf; encoded?: boolean };
+export type TextRead = { shown?: string; origin?: (index: number) => number; region?: RegionOf; encoded?: boolean };
 
 /**
  * The text rules on a whole text: install commands and shell scripts (`plain`), C and Python (comments and strings
@@ -224,8 +217,8 @@ export type TextRead = { shown?: string; offset?: number; region?: RegionOf; enc
 export function scanTextRules(text: string, lang: TextLang, read: TextRead = {}): TextFinding[] {
   const region = read.region ?? regionsOf(text, lang);
   const shown = read.shown;
-  const offset = read.offset ?? 0;
-  const place = (index: number): Where => (shown !== undefined ? lineOf(shown, index + offset) : lineOf(text, index));
+  const origin = read.origin ?? ((index: number) => index);
+  const place = (index: number): Where => (shown !== undefined ? lineOf(shown, origin(index)) : lineOf(text, index));
   const out = ruleHits(text, "as written", new Set(), region, place);
   const confirmed = (): Set<CodeSignal> => new Set(out.filter((f) => f.confidence === "confirmed").map((f) => f.id));
 

@@ -76,6 +76,11 @@ function babelParse(text: string, goal: Goal, base: readonly ParserPlugin[], dia
 
       if (!isProgram(program)) return "syntax";
 
+      // Babel keeps a hashbang as the program's interpreter, not as a comment; it is one all the same
+      const hashbang = file.program.interpreter;
+
+      if (hashbang?.start != null && hashbang.end != null) comments.unshift([hashbang.start, hashbang.end]);
+
       return { program, comments, goal, dialect };
     } catch {
       // the other decorator dialect, if any, is tried next
@@ -117,10 +122,41 @@ function parseTs(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
     if (hasHtmlComment(text, p.comments)) return "syntax";
     each(p);
 
-    return "parsed";
+    return alsoAsJs(text, each);
   }
 
   return "syntax";
+}
+
+/**
+ * A TypeScript file that is valid JavaScript as well runs as JavaScript wherever nothing strips its types (node
+ * before type stripping loads `require('./x.ts')` as JavaScript), and the two can mean different code:
+ * `f<import('child_process').T>(0)` is a call with a type argument in TypeScript and loads child_process in
+ * JavaScript. So when acorn accepts the file its JavaScript programs are read too, the same way a `.js` file's are.
+ */
+function alsoAsJs(text: string, each: ReadEach): ParseOutcome {
+  try {
+    const script = acornParse(text, "script", false);
+
+    if (script !== "syntax") {
+      if (each(script) || hasHtmlComment(text, script.comments)) {
+        const module = acornParse(text, "module", false);
+
+        if (module !== "syntax") each(module);
+      }
+
+      return "parsed";
+    }
+
+    const module = acornParse(text, "module", false);
+
+    if (module !== "syntax") each(module);
+  } catch (e) {
+    if (e instanceof TooLarge) return "too-large";
+    throw e;
+  }
+
+  return "parsed";
 }
 
 /**

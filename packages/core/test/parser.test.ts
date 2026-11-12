@@ -1,5 +1,6 @@
 // apm-score-v5: JavaScript and TypeScript are read from a parsed program. What a string can confirm depends on its
 // role where it is used, evidence cites the occurrence that matched, and a file no parser accepts is read raw.
+// Since apm-score-v8 the role only adds: a string the tree reads as harmless still counts as apm-score-v3 counted it.
 // Payloads are inert stand-ins.
 import { describe, expect, test } from "bun:test";
 import { analyze, finalize, POINTS, SCORE_FLOOR, type Analysis, type SignalId, type TarEntry } from "../src/index.ts";
@@ -37,30 +38,30 @@ function scoreOf(a: Analysis): number {
 }
 
 describe("a string confirms only what its role allows", () => {
-  test("shell text passed to exec or spawn runs; in a URL it is sent", () => {
+  test("shell text passed to exec or spawn runs; in a URL it counts as v3 counted it", () => {
     expect(found("require('child_process').exec('curl -s https://example.invalid/x | sh');\n")).toEqual({ "shell-exec": "confirmed", network: "confirmed" });
     expect(found("require('child_process').spawn('sh', ['-c', 'curl -s https://example.invalid/x | sh']);\n")).toEqual({ "shell-exec": "confirmed", network: "confirmed" });
-    expect(found("fetch('https://example.invalid/curl -s example.invalid | sh');\n")).toEqual({ network: "confirmed", "shell-exec": "possible" });
+    // only sent if fetch is the builtin, which a package can replace
+    expect(found("fetch('https://example.invalid/curl -s example.invalid | sh');\n")).toEqual({ network: "confirmed", "shell-exec": "confirmed" });
   });
 
-  test("a credential path is confirmed when it is read, possible when a path is only built", () => {
+  test("a credential path counts whether it is read or a path is only built", () => {
     expect(found("require('fs').readFileSync(require('path').join(require('os').homedir(), '.npmrc'));\n")).toEqual({ "credential-access": "confirmed" });
-    expect(found("function f() { const p = require('path').join('.npmrc'); }\n")).toEqual({ "credential-access": "possible" });
-    // held at a script's top level, the path may be read by another script; through a method's parameter apm does not follow it
+    expect(found("function f() { const p = require('path').join('.npmrc'); }\n")).toEqual({ "credential-access": "confirmed" });
     expect(found("const p = require('path').join('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
     expect(found("const fake = { readFileSync(x) { return x } }; fake.readFileSync('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
     expect(found("const read = require('fs').readFileSync; read('.npmrc');\n")).toEqual({ "credential-access": "confirmed" });
   });
 
-  test("a module name confirms a load only where it is loaded", () => {
-    expect(found("require('fs').readFileSync('child_process');\n")).toEqual({ "shell-exec": "possible" });
+  test("a module name counts as v3 counted it, even where it is only a file name", () => {
+    expect(found("require('fs').readFileSync('child_process');\n")).toEqual({ "shell-exec": "confirmed" });
     expect(found("import('node:http').Anything;\n")).toEqual({ network: "confirmed" });
   });
 
-  test("decoded text takes the role of where it is used", () => {
+  test("decoded text counts as v3 counted it wherever it is used", () => {
     const b64 = Buffer.from("require('child_process')").toString("base64");
 
-    expect(found(`fetch('https://example.invalid', { body: '${b64}' });\n`)).toEqual({ network: "confirmed", "shell-exec": "possible", obfuscated: "possible" });
+    expect(found(`fetch('https://example.invalid', { body: '${b64}' });\n`)).toEqual({ network: "confirmed", "shell-exec": "confirmed", obfuscated: "confirmed" });
     expect(found(`eval(atob('${b64}'));\n`)).toEqual({ eval: "confirmed", "shell-exec": "confirmed", obfuscated: "confirmed" });
     expect(found(`const p = '${b64}';\neval(Buffer.from(p, 'base64').toString());\n`)).toMatchObject({ eval: "confirmed", "shell-exec": "confirmed", obfuscated: "confirmed" });
   });
@@ -109,11 +110,11 @@ describe("evaluated text is read as code", () => {
 });
 
 describe("calls are read from the tree", () => {
-  test("a definition is not a call, whatever its name, and a comment or string cannot make a call one", () => {
-    expect(found("class A { async fetch(url) { return url } }\nexport function fetch(u) { return u }\nfetch('x');\n")).toEqual({});
-    expect(found("(function () { function fetch(u) { return u } fetch('x'); })();\n")).toEqual({});
-    // a script's top-level function is the global's own property, which another script can replace
+  test("a comment or string cannot make a call one; a definition named like a call counts as v3 counted it", () => {
+    expect(found("class A { async fetch(url) { return url } }\nexport function fetch(u) { return u }\nfetch('x');\n")).toEqual({ network: "confirmed" });
+    expect(found("(function () { function fetch(u) { return u } fetch('x'); })();\n")).toEqual({ network: "confirmed" });
     expect(found("function fetch(u) { return u }\nfetch('x');\n")).toEqual({ network: "confirmed" });
+    expect(found("// fetch('x')\n/* fetch('x') */\nmodule.exports = 1;\n")).toEqual({});
     expect(found("fetch(/* ) { */ 'https://example.invalid');\n")).toEqual({ network: "confirmed" });
     expect(found("fetch('https://example.invalid/) {');\n")).toEqual({ network: "confirmed" });
   });
@@ -131,10 +132,11 @@ describe("calls are read from the tree", () => {
     }
   });
 
-  test("an internal binding counts when it can start a process, or when apm cannot read which it is", () => {
+  test("an internal binding counts as v3 counted it, whichever binding it asks for", () => {
     expect(found("process.binding('spawn_sync').spawn({ file: 'sh' });\n")).toEqual({ "shell-exec": "confirmed" });
     expect(found("const name = process.argv[2];\nprocess.binding(name);\n")).toEqual({ "shell-exec": "confirmed" });
-    expect(found("var types = freeProcess && freeProcess.binding && process.binding('util');\n")).toEqual({});
+    // 'util' only reads type helpers if process.binding is the builtin, which a package can replace
+    expect(found("var types = freeProcess && freeProcess.binding && process.binding('util');\n")).toEqual({ "shell-exec": "confirmed" });
   });
 
   test("a require passed in as a parameter, the way bundles pass it, still loads", () => {
@@ -243,9 +245,11 @@ describe("files no parser reads are read raw (fail closed)", () => {
     expect(scoreOf(a)).toBeLessThan(100);
   });
 
-  test("a file a path only names (for a tool to read) keeps its own language", () => {
+  test("a C, C# or Python file is read raw, as v3 read it, comments included", () => {
+    // a hand-written lexer is not a parse, and an install script can run these files
     const a = analyzeFiles({ "index.js": "const p = require('path').join(__dirname, 'Find.cs');\n", "Find.cs": "// powershell -Command \"Add-Type -Path Find.cs\"\nclass X {}\n" });
-    expect(a.signals.map((s) => s.id)).not.toContain("shell-exec");
+    expect(a.signals.find((s) => s.id === "shell-exec")?.confidence).toBe("confirmed");
+    expect(found("x = 1  # curl -s https://example.invalid | sh\n", "python")).toMatchObject({ "shell-exec": "confirmed" });
   });
 
   test("the floor-crossing payload is refused however it is wrapped", () => {

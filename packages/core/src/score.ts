@@ -8,7 +8,7 @@ import { entryPoints, targetFiles } from "./entries.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
-import { langOf, scanFile, scanText, type Confidence, type TextFinding } from "./source.ts";
+import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type TextFinding } from "./source.ts";
 import type { TarEntry } from "./tarball.ts";
 
 export { isInlineDownload } from "./scripts.ts";
@@ -50,7 +50,7 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * its code (comments and regex literals left out) and lets the tree remove a finding only where it proves the token
  * harmless; a limit, a value it cannot follow or syntax it does not model leaves v3's finding standing.
  */
-export const SCORER = "apm-score-v7";
+export const SCORER = "apm-score-v8";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -87,7 +87,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -438,11 +438,19 @@ function collector(): Found {
   };
 }
 
+/**
+ * What a confirmed finding only a text rule made says after its snippet, so a reader of the evidence can tell it from
+ * a call or load the parsed program showed: apm counts every such match unless the parse puts it in a comment, a regex
+ * literal or a TypeScript type, which is also why a definition, a written key or a string only compared counts.
+ */
+export const TEXT_MATCH = " (text match: counted unless it sits in a comment, a regex or a type)";
+
 function describeFinding(where: string, f: TextFinding): string {
   const how = f.how === "as written" ? "" : ` (${f.how})`;
   const why = f.confidence === "possible" ? ` [possible: ${f.why}]` : "";
+  const text = f.confidence === "confirmed" && f.tree !== true ? TEXT_MATCH : "";
 
-  return `${where}:${f.line}: ${f.snippet}${how}${isTestPath(where) ? IN_TEST_FILE : ""}${why}`;
+  return `${where}:${f.line}: ${f.snippet}${how}${text}${isTestPath(where) ? IN_TEST_FILE : ""}${why}`;
 }
 
 function depNames(manifest: AnalyzeInput["manifest"], fields: readonly string[]): Set<string> {
@@ -599,7 +607,9 @@ export function analyze(input: AnalyzeInput): Analysis {
     const text = new TextDecoder().decode(f.data);
 
     const named = langOf(f.path, text);
-    const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : named;
+    // a type declaration code loads runs too (node strips its types, or older node runs it as JavaScript)
+    const declaration = named === "data" && /\.d\.[cm]?ts$/i.test(f.path);
+    const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : runsAsCode.has(f.path) && declaration ? "ts" : named;
     const scan = scanFile(text, lang);
 
     // a README or LICENSE a pattern exposes is not JavaScript: node would throw a SyntaxError, so nothing in it runs
@@ -614,7 +624,8 @@ export function analyze(input: AnalyzeInput): Analysis {
     for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
 
     if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
-    const imports = scan.imports;
+    // every path apm-score-v3's pattern finds in the text is reached too, so no file v3 read goes unread
+    const imports = scan.read === "parsed" ? { ...scan.imports, paths: [...new Set([...scan.imports.paths, ...importsOf(joinStrings(text).text).paths])] } : scan.imports;
 
     for (const d of imports.dynamic) if (reached) add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
 

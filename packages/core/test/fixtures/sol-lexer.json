@@ -409,7 +409,13 @@
   "signals": {
    "shell-exec": "possible",
    "network": "confirmed"
-  }
+  },
+  "v8": 75,
+  "signals8": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "kept-join-path",
@@ -440,7 +446,12 @@
   "v5": 95,
   "signals": {
    "shell-exec": "possible"
-  }
+  },
+  "v8": 85,
+  "signals8": {
+   "shell-exec": "confirmed"
+  },
+  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "kept-import-json",
@@ -454,7 +465,13 @@
   "signals": {
    "credential-access": "possible",
    "network": "confirmed"
-  }
+  },
+  "v8": 65,
+  "signals8": {
+   "credential-access": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the token name sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "computed-read",
@@ -816,7 +833,13 @@
   "v3": 65,
   "v4": 72,
   "v5": 100,
-  "signals": {}
+  "signals": {},
+  "v8": 65,
+  "signals8": {
+   "credential-access": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the fetch in the comment is still left out, but config.fetch('data:,') is a fetch call to v3's rules and the data: proof is off, so network counts, and so does credential access for the process.env dump next to it"
  },
  {
   "name": "hexident-comment",
@@ -827,7 +850,8 @@
   "v3": 90,
   "v4": 90,
   "v5": 100,
-  "signals": {}
+  "signals": {},
+  "kept": "comment"
  },
  {
   "name": "false-b64-fetch",
@@ -842,7 +866,14 @@
    "shell-exec": "possible",
    "network": "confirmed",
    "obfuscated": "possible"
-  }
+  },
+  "v8": 65,
+  "signals8": {
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  },
+  "v8why": "the base64 is a request body nothing decodes; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "false-kept-new-error",
@@ -856,7 +887,13 @@
   "signals": {
    "shell-exec": "possible",
    "network": "confirmed"
-  }
+  },
+  "v8": 75,
+  "signals8": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the shell text is an Error message fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "false-kept-method",
@@ -885,7 +922,8 @@
   "v3": 90,
   "v4": 100,
   "v5": 100,
-  "signals": {}
+  "signals": {},
+  "kept": "type"
  },
  {
   "name": "unicode-callee-escaped-fetch",
@@ -920,7 +958,12 @@
   "v3": 90,
   "v4": 90,
   "v5": 100,
-  "signals": {}
+  "signals": {},
+  "v8": 90,
+  "signals8": {
+   "network": "confirmed"
+  },
+  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review: a local fetch rewrote the URL into a request), so fetch( counts as v3 counted it"
  },
  {
   "name": "all-hidden-cr",
@@ -1097,7 +1140,13 @@
   "signals": {
    "credential-access": "possible",
    "network": "confirmed"
-  }
+  },
+  "v8": 65,
+  "signals8": {
+   "credential-access": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the token name sits in a request body fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "floor-bypass-cr",
@@ -1195,7 +1244,13 @@
   "signals": {
    "shell-exec": "possible",
    "network": "confirmed"
-  }
+  },
+  "v8": 75,
+  "signals8": {
+   "shell-exec": "confirmed",
+   "network": "confirmed"
+  },
+  "v8why": "the shell text sits in a URL fetch sends; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "false-credentials",
@@ -1228,7 +1283,14 @@
    "shell-exec": "possible",
    "network": "confirmed",
    "obfuscated": "possible"
-  }
+  },
+  "v8": 65,
+  "signals8": {
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "obfuscated": "confirmed"
+  },
+  "v8why": "the base64 is a request body nothing decodes; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "false-builtin-read",
@@ -1241,7 +1303,12 @@
   "v5": 95,
   "signals": {
    "shell-exec": "possible"
-  }
+  },
+  "v8": 85,
+  "signals8": {
+   "shell-exec": "confirmed"
+  },
+  "v8why": "'child_process' is a file name readFileSync reads, not a module load; that rests on the callee being the builtin, a proof apm-score-v8 does not take (a local or replaced function can do anything with it), so the text counts as apm-score-v3 counted it"
  },
  {
   "name": "false-member-ref",

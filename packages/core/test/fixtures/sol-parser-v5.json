@@ -450,7 +450,13 @@
   "v6": 90,
   "signals": {
    "eval": "confirmed"
-  }
+  },
+  "v8": 80,
+  "signals8": {
+   "network": "confirmed",
+   "eval": "confirmed"
+  },
+  "v8why": "the skipped-slot proof is off, so the string's fetch( counts as v3 counted it; the tree also confirms the eval.apply call, which v3's rules did not match, so it scores below v3"
  },
  {
   "name": "function-data-params",
@@ -475,7 +481,12 @@
   "v4": 100,
   "v5": 100,
   "v6": 100,
-  "signals": {}
+  "signals": {},
+  "v8": 90,
+  "signals8": {
+   "network": "confirmed"
+  },
+  "v8why": "fetch of a data: URL reads inline data only when fetch is the builtin; the data: proof is off (finding 7 of the v7 review), so fetch( counts as v3 counted it"
  },
  {
   "name": "data-upper",
@@ -829,7 +840,15 @@
    "credential-access": "possible",
    "shell-exec": "possible",
    "eval": "confirmed"
-  }
+  },
+  "v8": 40,
+  "signals8": {
+   "credential-access": "confirmed",
+   "shell-exec": "confirmed",
+   "network": "confirmed",
+   "eval": "confirmed"
+  },
+  "v8why": "the proof that eval.apply's skipped first slot passes undefined is off, so the string's names count as v3 counted them; the tree still confirms the eval.apply call, which v3's rules did not match, so it scores below v3"
  },
  {
   "name": "local-call-precision",
@@ -1353,7 +1372,8 @@
   "v6": 95,
   "signals": {
    "shell-exec": "possible"
-  }
+  },
+  "kept": "data"
  },
  {
   "name": "exports-condition-docs-payload-html",
@@ -1623,6 +1643,11 @@
   "v4": 90,
   "v5": 100,
   "v6": 100,
-  "signals": {}
+  "signals": {},
+  "v8": 90,
+  "signals8": {
+   "network": "confirmed"
+  },
+  "v8why": "the proof that a local var fetch is the function's own is off (shadowing proofs failed in findings 2 to 4 of the v7 review), so fetch( counts as v3 counted it"
  }
 ]

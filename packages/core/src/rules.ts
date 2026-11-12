@@ -45,9 +45,10 @@ const alt = (parts: string[]): RegExp => new RegExp(parts.join("|"), "g");
  * - `name`: a module name. Confirmed where it is loaded (`require('child_process')`); possible anywhere else.
  * - `text`: shell command text (`curl ... | sh`). Only strings hold it: confirmed when a call runs the string,
  *   possible otherwise. In code, `a || sh` is not a pipe.
- * - `alias`: a reference that gives the power without using it (`r = require`). Always possible.
- * Raw text (a shell script, an install command) confirms every kind but `alias`. JavaScript no parser could hold
- * as a tree is `unparsed`: every kind confirms there, aliases too, as apm-score-v3 read every file.
+ * - `alias`: a reference that gives the power without using it (`r = require`). Possible where a parsed program's
+ *   tree says it sits in code; confirmed in raw text, as apm-score-v3 counted it.
+ * Raw text (a shell script, an install command, a C, Python or other file) and JavaScript no parser could hold as a
+ * tree (`unparsed`) confirm every kind, aliases too, as apm-score-v3 read every file.
  * JavaScript and TypeScript are not matched with these patterns as code: js.ts reads them from the parsed program,
  * and uses the `name` and `text` patterns on the strings it finds.
  */
@@ -55,7 +56,57 @@ export type Kind = "code" | "name" | "text" | "alias";
 
 type Pattern = { kind: Kind; re: RegExp; why?: string };
 
-export const RULES: { id: Capability; patterns: Pattern[] }[] = [
+/**
+ * apm-score-v3's own patterns (`test/v3/source.ts`, commit 5437674), copied verbatim: each rule's `re` and its
+ * `docSafe` list. They come last in their rule, so they decide only where the patterns above found nothing, and they
+ * keep every raw read at least as strong as v3's was: v3 had no `data:` exception to `fetch(`, read `$fetch(` and
+ * `$eval(` as calls, `dns.lookup` without a call, and any name ending in `AWS_SECRET_ACCESS_KEY`.
+ */
+const V3_NET_MODULES = String.raw`(?:node:)?(?:https?|net|dgram|tls|http2|dns)(?:\/promises)?`;
+const V3_HTTP_CLIENTS = "(?:axios|undici|node-fetch|got|superagent|needle|phin|ky|ws)";
+const v3 = (re: RegExp): Pattern => ({ kind: "code", re: new RegExp(re.source, "g") });
+const v3Any = (parts: string[]): Pattern => ({ kind: "code", re: alt(parts) });
+
+const V3_PATTERNS: Record<Capability, Pattern[]> = {
+  "shell-exec": [
+    v3(/\bchild_process\b|\bexec(?:File)?Sync\s*\(|\bspawnSync\s*\(|\|\s*(?:ba|z)?sh\b|\bcurl\s+-?|\bwget\s+|\bpowershell\b|\bBun\.spawn\b|\bBun\.\$|\bDeno\.Command\b/),
+    v3(/\bprocess\s*\.\s*(?:binding|_linkedBinding|dlopen)\s*\(|\binternalBinding\s*\(/),
+  ],
+  network: [
+    v3(/\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\(\s*['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]\s*\)|from\s+['"](?:node:)?(?:https?|net|dgram|tls|http2)['"]|\bXMLHttpRequest\b|\bnew\s+WebSocket\b|\bcurl\s+|\bwget\s+|\bdns\.(?:resolve|lookup)\b|\bimport\s*\(\s*['"`]https?:\/\//),
+    v3Any([
+      String.raw`(?:require|import)\s*\(\s*['"\x60]${V3_NET_MODULES}['"\x60]\s*\)`,
+      String.raw`from\s+['"]${V3_NET_MODULES}['"]`,
+      String.raw`(?:require\s*\(\s*|from\s+|import\s*\(\s*)['"]${V3_HTTP_CLIENTS}['"]`,
+      String.raw`\bnew\s+(?:EventSource|RTCPeerConnection)\b`,
+      String.raw`\bsendBeacon\s*\(`,
+      String.raw`\bdns(?:\.promises)?\.(?:resolve\w*|lookup\w*|reverse)\s*\(`,
+    ]),
+  ],
+  "credential-access": [
+    v3(/\.npmrc\b|['"/]\.ssh\b|\bid_(?:rsa|ed25519|ecdsa)\b|\.aws\/credentials|AWS_SECRET_ACCESS_KEY|\bGITHUB_TOKEN\b|\bNPM_TOKEN\b|\bNODE_AUTH_TOKEN\b|JSON\.stringify\(\s*process\.env\s*\)|\.git-credentials|\.docker\/config\.json|\bLogin Data\b|\.config\/gcloud/),
+  ],
+  eval: [
+    v3(/(?<![\w.])eval\s*\(|\bnew\s+Function\s*\(|\bvm\.(?:runIn\w*Context|Script)\b|=\s*require\s*[;,\n]|\brequire\s*\(\s*String\.fromCharCode/),
+    v3Any([
+      String.raw`\.\s*eval\s*\(`,
+      String.raw`\(\s*0\s*,\s*eval\s*\)`,
+      String.raw`=\s*eval\s*[;,)\n]`,
+      String.raw`(?<![\w$.])Function\s*\(\s*(?!['"\x60]return this['"\x60]\s*\))['"\x60]`,
+      String.raw`\.\s*Function\s*\(\s*(?!['"\x60]return this['"\x60]\s*\))['"\x60]`,
+      String.raw`=\s*(?:globalThis|global|window|self)\s*\.\s*Function\s*[;,\n]`,
+      String.raw`\.constructor\s*\.\s*constructor\s*\(`,
+      String.raw`\bset(?:Timeout|Interval|Immediate)\s*\(\s*['"\x60]`,
+      String.raw`\bvm\.(?:compileFunction|SourceTextModule)\b`,
+      String.raw`\brunIn(?:This|New)Context\s*\(`,
+      String.raw`(?:require|import)\s*\(\s*['"](?:node:)?vm['"]\s*\)|from\s+['"](?:node:)?vm['"]`,
+      String.raw`\bmodule\s*\._compile\s*\(|\bModule\.prototype\._compile\b`,
+      String.raw`(?:globalThis|global|window|self)\s*\.\s*require\b`,
+    ]),
+  ],
+};
+
+const OWN_RULES: { id: Capability; patterns: Pattern[] }[] = [
   {
     id: "shell-exec",
     patterns: [
@@ -139,6 +190,9 @@ export const RULES: { id: Capability; patterns: Pattern[] }[] = [
     ],
   },
 ];
+
+/** Each rule's own patterns, then apm-score-v3's for the same signal. */
+export const RULES: { id: Capability; patterns: Pattern[] }[] = OWN_RULES.map((r) => ({ id: r.id, patterns: [...r.patterns, ...V3_PATTERNS[r.id]] }));
 
 /** Reading the whole environment: a credential grab when a network call sits right next to it. */
 export const WHOLE_ENV = /\bObject\.(?:keys|entries|values)\s*\(\s*process\.env\s*\)|\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+in\s+process\.env\b/g;
@@ -244,7 +298,7 @@ export function printable(s: string): boolean {
  */
 export type RegionOf = (index: number, end?: number, id?: CodeSignal, kind?: Kind | "decoded") => Region;
 
-/** A file read raw: no parser could follow it, so nothing is known and every match counts. */
+/** A file read raw: no parser could follow it, so nothing is known and every match counts, aliases too. */
 export const RAW: RegionOf = () => "raw";
 
 /** JavaScript with no tree: read raw, and every pattern counts as apm-score-v3 counted it, aliases included. */
@@ -255,7 +309,7 @@ const CONFIDENCE: Record<Kind, Partial<Record<Region, Confidence>>> = {
   code: { code: "confirmed", kept: "confirmed", raw: "confirmed", unparsed: "confirmed" },
   name: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", code: "possible", string: "possible" },
   text: { kept: "confirmed", raw: "confirmed", unparsed: "confirmed", string: "possible" },
-  alias: { code: "possible", kept: "possible", raw: "possible", unparsed: "confirmed" },
+  alias: { code: "possible", kept: "possible", raw: "confirmed", unparsed: "confirmed" },
 };
 
 export const IN_STRING = "only inside an ordinary string, not in code apm saw run";
@@ -386,8 +440,22 @@ export function encodedLiterals(text: string, region: RegionOf, place: (index: n
     break;
   }
 
+  if (out.length > 0) return out;
+
+  // apm-score-v3's rule, which counts escapes and base64 whatever they decode to
+  for (const m of text.matchAll(V3_ENCODED)) {
+    const r = region(m.index, m.index + 1, "obfuscated", "code");
+
+    if (r === "excluded") continue;
+    out.push(judged({ id: "obfuscated", ...place(m.index), how: "as written" }, r === "string" ? "possible" : "confirmed", "a long run of escapes or base64 sits in an ordinary string, and apm did not see code load or run it"));
+    break;
+  }
+
   return out;
 }
+
+/** apm-score-v3's `obfuscated` rule, verbatim: 40 `\x` escapes in a row, or a quoted base64 run of 2000+ characters. */
+const V3_ENCODED = /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/g;
 
 /** Where 40 or more `\x` escapes in a row spell readable text, or -1. */
 export function escapedTextAt(text: string): number {
