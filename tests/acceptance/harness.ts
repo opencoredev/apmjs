@@ -332,6 +332,9 @@ export type RawManifest = {
   module?: string;
   exports?: ExportsField;
   readme?: string;
+  homepage?: string;
+  bugs?: string | { url: string };
+  repository?: string | { type?: string; url: string; directory?: string };
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
 };

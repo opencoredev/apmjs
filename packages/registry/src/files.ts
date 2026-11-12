@@ -1,5 +1,7 @@
 // One file of a published version, as text, for the website's file view (evidence links open it at a line).
-// GET /-/apm/v1/file/<name>/<version>?path=<path in the tarball>
+// GET /-/apm/v1/file/<name>/<version>?path=<path in the tarball>              the whole file, up to 1 MB
+// GET /-/apm/v1/file/<name>/<version>?path=<path>&line=<n>&context=<k>        lines n-k to n+k, any size
+// GET /-/apm/v1/readme/<name>/<version>                                       the README npm would pick
 //
 // The bytes come from the same verified tarball the install routes serve: a local version's blob is checked
 // against its sha512 integrity, an upstream one is fetched and checked by Upstream.tarball. The path is looked up
@@ -15,6 +17,7 @@ import { Store, type VersionRecord } from "./db.ts";
 import { refuse } from "./errors.ts";
 import { sha256Hex, sha512 } from "./hash.ts";
 import { json } from "./http.ts";
+import { countLines, ExcerptLine, isUtf8, pickReadme, sliceLines } from "./file-text.ts";
 import { splitPath, versionOf } from "./server.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 
@@ -25,6 +28,7 @@ export const MAX_FILE_VIEW_BYTES = 1024 * 1024;
 const MAX_PATH_CHARS = 1024;
 
 const PREFIX = "/-/apm/v1/file/";
+const README_PREFIX = "/-/apm/v1/readme/";
 
 /** What the blob store keeps per tarball: every entry's path and size, duplicates included. */
 const FileIndex = z.object({ entries: z.array(z.object({ path: z.string(), size: z.number() })) });
@@ -68,7 +72,7 @@ const readCached = <S extends z.ZodType>(key: string, schema: S) =>
     return parsed.success ? parsed.data : null;
   });
 
-const writeCached = (key: string, value: FileIndex | FileBody) => Effect.flatMap(Blobs, (b) => b.put(key, new TextEncoder().encode(JSON.stringify(value))));
+const writeCached = (key: string, value: FileIndex | FileBody | LineCount | Block) => Effect.flatMap(Blobs, (b) => b.put(key, new TextEncoder().encode(JSON.stringify(value))));
 
 /** The version, local first, then upstream. */
 const findVersion = (name: string, version: string) =>
@@ -144,9 +148,18 @@ const entriesOf = (found: Found) =>
 /** The answer: the file's text, or why it isn't sent. */
 type FileAnswer = { name: string; version: string; path: string; size: number } & (FileBody | { kind: "too-large"; limit: number });
 
-const answerFor = (input: { found: Found; name: string; path: string }) =>
+/** One version's tarball as the file routes see it: checked, indexed, and its entries inflated at most once. */
+type Opened = {
+  label: string;
+  index: FileIndex;
+  /** The parsed entries; inflates the tarball on first use (the index may have come from the cache). */
+  entries: ReturnType<typeof entriesOf>;
+};
+
+/** Refuses a revoked version, checks it has a checksum, and reads (or builds and caches) its index of paths. */
+const open = (input: { found: Found; name: string }) =>
   Effect.gen(function* () {
-    const { found, name, path } = input;
+    const { found, name } = input;
     const v = found.v;
 
     if (v.status === "revoked" || v.status === "revoke-pending") return yield* Effect.fail(refuse(410, `${name}@${v.version} was revoked: ${v.status_reason ?? "no reason given"}`));
@@ -154,64 +167,235 @@ const answerFor = (input: { found: Found; name: string; path: string }) =>
 
     if (!digest) return yield* Effect.fail(refuse(422, "This version has no checksum, so its tarball cannot be verified."));
     const label = digestLabel(digest);
-    let entries: TarEntry[] | null = null;
+    let inflated: TarEntry[] | null = null;
+
+    const entries = Effect.gen(function* () {
+      inflated ??= yield* entriesOf(found);
+
+      return inflated;
+    });
+
     let index = yield* readCached(indexKey(label), FileIndex);
 
     if (!index) {
-      entries = yield* entriesOf(found);
-      index = { entries: entries.map((e) => ({ path: e.path, size: e.data.length })) };
+      index = { entries: (yield* entries).map((e) => ({ path: e.path, size: e.data.length })) };
       yield* writeCached(indexKey(label), index);
     }
 
-    const hits = index.entries.filter((e) => e.path === path);
-    const hit = hits[0];
-    const absent = refuse(404, `${name}@${v.version} has no file ${path}.`);
+    return { label, index, entries } satisfies Opened;
+  });
 
-    if (!hit) return yield* Effect.fail(absent);
+/** The one entry named exactly `path` in the index: a 404 when there is none, a 422 when there are two. */
+const entryAt = (input: { opened: Opened; name: string; version: string; path: string }) => {
+  const { opened, name, version, path } = input;
+  const hits = opened.index.entries.filter((e) => e.path === path);
+  const hit = hits[0];
 
-    if (hits.length > 1) return yield* Effect.fail(refuse(422, `${path} appears more than once in ${name}@${v.version}'s tarball, so apm can't say which one gets installed.`));
-    const head = { name, version: v.version, path, size: hit.size };
+  if (!hit) return Effect.fail(refuse(404, `${name}@${version} has no file ${path}.`));
+
+  if (hits.length > 1) return Effect.fail(refuse(422, `${path} appears more than once in ${name}@${version}'s tarball, so apm can't say which one gets installed.`));
+
+  return Effect.succeed(hit);
+};
+
+/** The inflated bytes of the entry named `path` (already known to be in the index exactly once). */
+const bytesAt = (input: { opened: Opened; name: string; version: string; path: string }) =>
+  Effect.gen(function* () {
+    const entry = (yield* input.opened.entries).find((e) => e.path === input.path);
+
+    if (!entry) return yield* Effect.fail(refuse(404, `${input.name}@${input.version} has no file ${input.path}.`));
+
+    return entry.data;
+  });
+
+const wholeFile = (input: { opened: Opened; name: string; version: string; path: string }) =>
+  Effect.gen(function* () {
+    const { opened, name, version, path } = input;
+    const hit = yield* entryAt(input);
+    const head = { name, version, path, size: hit.size };
 
     if (hit.size > MAX_FILE_VIEW_BYTES) return { ...head, kind: "too-large", limit: MAX_FILE_VIEW_BYTES } satisfies FileAnswer;
-    let body = yield* readCached(bodyKey(label, path), FileBody);
+    let body = yield* readCached(bodyKey(opened.label, path), FileBody);
 
     if (!body) {
-      entries ??= yield* entriesOf(found);
-      const entry = entries.find((e) => e.path === path);
-
-      if (!entry) return yield* Effect.fail(absent);
-      body = fileBody(entry.data);
-      yield* writeCached(bodyKey(label, path), body);
+      body = fileBody(yield* bytesAt(input));
+      yield* writeCached(bodyKey(opened.label, path), body);
     }
 
     return { ...head, ...body } satisfies FileAnswer;
   });
 
-const target = (url: URL) => {
-  const sp = splitPath(`/${url.pathname.slice(PREFIX.length)}`);
-  const version = sp?.rest[0];
-  const path = url.searchParams.get("path");
+const answerFor = (input: { found: Found; name: string; path: string }) =>
+  Effect.gen(function* () {
+    const opened = yield* open(input);
 
-  if (!sp || version === undefined || sp.rest.length !== 1) return Effect.fail(refuse(404, "Not found"));
+    return yield* wholeFile({ opened, name: input.name, version: input.found.v.version, path: input.path });
+  });
 
-  if (!path || path.length > MAX_PATH_CHARS || path.includes("\0")) return Effect.fail(refuse(400, `Name the file with ?path=, at most ${MAX_PATH_CHARS} characters.`));
+// ---------------------------------------------------------------------------------------------------------------
+// Excerpts: ?path=...&line=N&context=K returns lines N-K to N+K of a file of any size the tarball caps allow, so
+// a citation into a 20 MB bundle can be checked. Lines are numbered as the scorer numbers them (split on "\n",
+// a trailing newline makes no extra line). One line longer than MAX_EXCERPT_LINE_BYTES is cut there and reports
+// its full length. The answer is assembled from blocks of BLOCK_LINES lines cached per digest, path and block,
+// so the cache holds at most one copy of a file however many ranges are asked for.
 
-  return Effect.succeed({ name: sp.name, version, path });
+/** The most lines asked for on each side of `line`. */
+export const MAX_EXCERPT_CONTEXT = 100;
+
+/** Lines on each side of `line` when `context` is left out. */
+export const DEFAULT_EXCERPT_CONTEXT = 20;
+
+/** The most bytes of one line an excerpt returns (minified bundles put a whole program on one line). */
+export const MAX_EXCERPT_LINE_BYTES = 4096;
+
+const BLOCK_LINES = 100;
+
+/** What the blob store keeps per path for excerpts: whether it is text, and how many lines it has. */
+const LineCount = z.discriminatedUnion("kind", [z.object({ kind: z.literal("text"), lines: z.number() }), z.object({ kind: z.literal("binary") })]);
+
+type LineCount = z.infer<typeof LineCount>;
+
+const Block = z.object({ lines: z.array(ExcerptLine) });
+
+type Block = z.infer<typeof Block>;
+
+// the block size and line cap are in the key, so changing either never serves blocks cut the old way
+const countKey = (label: string, path: string) => `files/${label}/${sha256Hex(path)}.lines.json`;
+const blockKey = (label: string, path: string, block: number) => `files/${label}/${sha256Hex(path)}.b${BLOCK_LINES}x${MAX_EXCERPT_LINE_BYTES}-${block}.json`;
+
+type ExcerptAnswer = { name: string; version: string; path: string; size: number } & (
+  | { kind: "excerpt"; line: number; totalLines: number; from: number; to: number; lines: ExcerptLine[] }
+  | { kind: "binary" }
+);
+
+const excerptFor = (input: { found: Found; name: string; path: string; line: number; context: number }) =>
+  Effect.gen(function* () {
+    const { name, path, line, context } = input;
+    const version = input.found.v.version;
+    const opened = yield* open(input);
+    const hit = yield* entryAt({ opened, name, version, path });
+    const head = { name, version, path, size: hit.size };
+    let count: LineCount | null = yield* readCached(countKey(opened.label, path), LineCount);
+
+    if (!count) {
+      const data = yield* bytesAt({ opened, name, version, path });
+
+      count = isUtf8(data) ? { kind: "text", lines: countLines(data) } : { kind: "binary" };
+      yield* writeCached(countKey(opened.label, path), count);
+    }
+
+    if (count.kind === "binary") return { ...head, kind: "binary" } satisfies ExcerptAnswer;
+    const total = count.lines;
+
+    if (line > total) return yield* Effect.fail(refuse(416, `${path} has ${total} ${total === 1 ? "line" : "lines"}; there is no line ${line}.`, { lines: total }));
+    const from = Math.max(1, line - context);
+    const to = Math.min(total, line + context);
+    const lines: ExcerptLine[] = [];
+
+    for (let block = Math.floor((from - 1) / BLOCK_LINES); block <= Math.floor((to - 1) / BLOCK_LINES); block += 1) {
+      let cached: Block | null = yield* readCached(blockKey(opened.label, path, block), Block);
+
+      if (!cached) {
+        const data = yield* bytesAt({ opened, name, version, path });
+
+        cached = { lines: sliceLines({ data, from: block * BLOCK_LINES + 1, to: Math.min(total, (block + 1) * BLOCK_LINES), maxLineBytes: MAX_EXCERPT_LINE_BYTES }) };
+        yield* writeCached(blockKey(opened.label, path, block), cached);
+      }
+
+      lines.push(...cached.lines.filter((l) => l.n >= from && l.n <= to));
+    }
+
+    return { ...head, kind: "excerpt", line, totalLines: total, from, to, lines } satisfies ExcerptAnswer;
+  });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Readmes: GET /-/apm/v1/readme/<name>/<version> answers the version's README from its tarball, for packages whose
+// packument carries none. It is picked the way npm picks one when it fills in a manifest's readme
+// (@npmcli/package-json): files at the package root matching README or README.* (any case), where the first
+// with a markdown-like extension wins, else a file named exactly README.
+
+const readmeFor = (input: { found: Found; name: string }) =>
+  Effect.gen(function* () {
+    const opened = yield* open(input);
+    const version = input.found.v.version;
+    const path = pickReadme(opened.index.entries.map((e) => e.path));
+
+    if (path === null) return yield* Effect.fail(refuse(404, `${input.name}@${version} has no readme file.`));
+
+    return yield* wholeFile({ opened, name: input.name, version, path });
+  });
+
+/** A whole number in a query parameter, or null when it is absent; a failure when it is something else. */
+const wholeParam = (input: { url: URL; name: string; min: number; max: number }) => {
+  const raw = input.url.searchParams.get(input.name);
+
+  if (raw === null) return Effect.succeed(null);
+  const n = /^\d{1,9}$/.test(raw) ? Number(raw) : Number.NaN;
+
+  return n >= input.min && n <= input.max ? Effect.succeed(n) : Effect.fail(refuse(400, `${input.name} must be a whole number from ${input.min} to ${input.max}.`));
 };
 
-/** GET or HEAD /-/apm/v1/file/<name>/<version>?path=...; null for any other request. */
+/** What a file request asks for: the whole file, or the lines around one. */
+type Wanted = { kind: "file" } | { kind: "excerpt"; line: number; context: number };
+
+const target = (url: URL, prefix: string) =>
+  Effect.gen(function* () {
+    const sp = splitPath(`/${url.pathname.slice(prefix.length)}`);
+    const version = sp?.rest[0];
+
+    if (!sp || version === undefined || sp.rest.length !== 1) return yield* Effect.fail(refuse(404, "Not found"));
+
+    return { name: sp.name, version };
+  });
+
+const fileTarget = (url: URL) =>
+  Effect.gen(function* () {
+    const t = yield* target(url, PREFIX);
+    const path = url.searchParams.get("path");
+
+    if (!path || path.length > MAX_PATH_CHARS || path.includes("\0")) return yield* Effect.fail(refuse(400, `Name the file with ?path=, at most ${MAX_PATH_CHARS} characters.`));
+    const line = yield* wholeParam({ url, name: "line", min: 1, max: 999_999_999 });
+    const context = yield* wholeParam({ url, name: "context", min: 0, max: MAX_EXCERPT_CONTEXT });
+
+    if (line === null && context !== null) return yield* Effect.fail(refuse(400, "context needs a line."));
+    const wanted: Wanted = line === null ? { kind: "file" } : { kind: "excerpt", line, context: context ?? DEFAULT_EXCERPT_CONTEXT };
+
+    return { ...t, path, wanted };
+  });
+
+/** The version a route names, or a 404. */
+const versionNamed = (t: { name: string; version: string }) =>
+  Effect.gen(function* () {
+    const found = yield* findVersion(t.name, t.version);
+
+    return found ?? (yield* Effect.fail(refuse(404, `${t.name}@${t.version} not found.`)));
+  });
+
+/**
+ * GET or HEAD /-/apm/v1/file/<name>/<version>?path=...[&line=N[&context=K]] and /-/apm/v1/readme/<name>/<version>;
+ * null for any other request.
+ */
 export const fileRoute = (req: Request, url: URL) => {
-  if (!url.pathname.startsWith(PREFIX) || (req.method !== "GET" && req.method !== "HEAD")) return Effect.succeed(null);
+  const isFile = url.pathname.startsWith(PREFIX);
+
+  if ((!isFile && !url.pathname.startsWith(README_PREFIX)) || (req.method !== "GET" && req.method !== "HEAD")) return Effect.succeed(null);
   const bodyless = (res: Response): Response => (req.method === "HEAD" ? new Response(null, { status: res.status, headers: res.headers }) : res);
 
   return Effect.gen(function* () {
-    const t = yield* target(url);
-    const found = yield* findVersion(t.name, t.version);
+    let answer: FileAnswer | ExcerptAnswer;
 
-    if (!found) return yield* Effect.fail(refuse(404, `${t.name}@${t.version} not found.`));
-    const answer = yield* answerFor({ found, name: t.name, path: t.path });
+    if (isFile) {
+      const t = yield* fileTarget(url);
+      const found = yield* versionNamed(t);
+
+      answer = t.wanted.kind === "file" ? yield* answerFor({ found, name: t.name, path: t.path }) : yield* excerptFor({ found, name: t.name, path: t.path, ...t.wanted });
+    } else {
+      const t = yield* target(url, README_PREFIX);
+
+      answer = yield* readmeFor({ found: yield* versionNamed(t), name: t.name });
+    }
 
     // the bytes behind a digest never change; a version can still be revoked, so shared caches recheck soon
     return bodyless(json(answer, 200, { "cache-control": "public, max-age=300" }));
-  }).pipe(Effect.catchTag("HttpFailure", (f) => Effect.succeed(bodyless(json({ error: f.error }, f.status)))));
+  }).pipe(Effect.catchTag("HttpFailure", (f) => Effect.succeed(bodyless(json({ error: f.error, ...f.extra }, f.status)))));
 };

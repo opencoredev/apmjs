@@ -9,7 +9,9 @@ import { scriptLine } from "@/lib/evidence";
 import { chunkLines, displayLines } from "@/lib/file-lines";
 import { formatSize } from "@/lib/format";
 import { packagePath, scoreHref } from "@/lib/package-route";
-import { getFile, type FileAnswer } from "@/lib/registry";
+import { openingWindow } from "@/lib/file-excerpt";
+import { getExcerpt, getFile, type FileAnswer } from "@/lib/registry";
+import { ExcerptView } from "./file-excerpt";
 import { RegistryUnavailable } from "./registry-unavailable";
 import { LineFocus, type LineAnchor } from "./line-focus";
 
@@ -56,7 +58,7 @@ function FileText({ file }: { file: Extract<FileAnswer, { kind: "text" }> }) {
       {/* A keyboard user can scroll the code sideways once it has focus. */}
       <div role="region" aria-label={`Contents of ${file.path}`} tabIndex={0} className="overflow-x-auto outline-none focus-visible:ring-2 focus-visible:ring-inverse-muted focus-visible:ring-inset">
         <div className="relative w-max min-w-full py-3 font-mono text-[12.5px] leading-5">
-          <LineFocus total={lines.length} anchors={scriptAnchors(file.path, file.text)} />
+          <LineFocus last={lines.length} anchors={scriptAnchors(file.path, file.text)} />
           {chunks.map((c, i) => (
             // every block but the last skips layout and paint while off screen; its height is exact (rows x 20px)
             <div key={c.start} data-start={c.start} className={cn("flex", i < chunks.length - 1 && "file-chunk")}>
@@ -78,18 +80,41 @@ function Notice({ children }: { children: React.ReactNode }) {
   return <p className="rounded-xl bg-surface px-5 py-4 text-[15px] leading-6 text-pretty text-muted-foreground">{children}</p>;
 }
 
-function Body({ file }: { file: FileAnswer }) {
+const binaryNotice = (size: number) => <Notice>This is a binary file ({formatSize(size)}). The file view shows text files only.</Notice>;
+
+/**
+ * A file over the whole-file limit: the lines around the cited one (or the top, when no line is named), with
+ * controls that load more. A line past the end says so and shows the top instead.
+ */
+async function LargeFile({ file, line }: { file: Extract<FileAnswer, { kind: "too-large" }>; line: number | null }) {
+  const target = { name: file.name, version: file.version, path: file.path };
+  let got = await getExcerpt({ ...target, ...openingWindow(line) });
+  const pastEnd = line !== null && got.kind === "unavailable" && got.reason.kind === "status" && got.reason.status === 416;
+
+  if (pastEnd) got = await getExcerpt({ ...target, ...openingWindow(null) });
+  const why = `This file is ${formatSize(file.size)}, over the ${formatSize(file.limit)} the full view shows, so apm shows ${line !== null && !pastEnd ? "the lines around the cited one" : "it in parts"}. Lines longer than 4 kB are cut.`;
+
+  if (got.kind !== "ok") return <Notice>This file is {formatSize(file.size)} and its lines couldn&apos;t be read just now. Reload to try again.</Notice>;
+
+  if (got.value.kind === "binary") return binaryNotice(file.size);
+
+  return (
+    <>
+      {pastEnd && <Notice>This file has {got.value.totalLines.toLocaleString("en")} lines, so it has no line {line?.toLocaleString("en")}. It is shown from the top.</Notice>}
+      <ExcerptView excerpt={got.value} cited={pastEnd ? null : line} />
+      <p className="-mt-3 text-sm leading-6 text-pretty text-muted-foreground">{why}</p>
+    </>
+  );
+}
+
+function Body({ file, line }: { file: FileAnswer; line: number | null }) {
   switch (file.kind) {
     case "text":
       return <FileText file={file} />;
     case "binary":
-      return <Notice>This is a binary file ({formatSize(file.size)}). The file view shows text files only.</Notice>;
+      return binaryNotice(file.size);
     case "too-large":
-      return (
-        <Notice>
-          This file is {formatSize(file.size)}. The file view shows files up to {formatSize(file.limit)}.
-        </Notice>
-      );
+      return <LargeFile file={file} line={line} />;
     default: {
       const _exhaustive: never = file;
 
@@ -98,7 +123,8 @@ function Body({ file }: { file: FileAnswer }) {
   }
 }
 
-export async function FileView({ name, version, path }: Target) {
+/** One file of one version. `line` is the cited line from ?line=; only a file too large to show whole needs it. */
+export async function FileView({ name, version, path, line }: Target & { line: number | null }) {
   const got = await getFile({ name, version, path });
 
   if (got.kind === "missing") notFound();
@@ -119,7 +145,7 @@ export async function FileView({ name, version, path }: Target) {
 
   return (
     <FileShell name={name} version={version} path={path} meta={formatSize(got.value.size)}>
-      <Body file={got.value} />
+      <Body file={got.value} line={line} />
       <p className="text-sm leading-6 text-pretty text-muted-foreground">Shown as plain text from the published tarball, after apm checked it against the version&apos;s checksum. Nothing in it runs on this page.</p>
     </FileShell>
   );

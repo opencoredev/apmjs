@@ -9,12 +9,12 @@ import { fileHref, packagePath, parsePackageRoute, scoreHref } from "./package-r
 import { signInIntro } from "../components/sign-in-panel";
 
 describe("fileHref", () => {
-  test("opens a file of a version at a line", () => {
-    expect(fileHref({ name: "zod", version: "4.1.0", path: "lib/setup.js", line: 4 })).toBe("/package/zod/v/4.1.0/file/lib/setup.js#L4");
+  test("opens a file of a version at a line, named in the query too so a large file opens as an excerpt there", () => {
+    expect(fileHref({ name: "zod", version: "4.1.0", path: "lib/setup.js", line: 4 })).toBe("/package/zod/v/4.1.0/file/lib/setup.js?line=4#L4");
   });
 
   test("keeps a scope as its own segment and encodes each path segment", () => {
-    expect(fileHref({ name: "@acme/tool", version: "1.0.0-beta.1", path: "dist/a b#c.js", line: 12 })).toBe("/package/%40acme/tool/v/1.0.0-beta.1/file/dist/a%20b%23c.js#L12");
+    expect(fileHref({ name: "@acme/tool", version: "1.0.0-beta.1", path: "dist/a b#c.js", line: 12 })).toBe("/package/%40acme/tool/v/1.0.0-beta.1/file/dist/a%20b%23c.js?line=12#L12");
   });
 
   test("opens package.json at a script anchor, or at the top", () => {
@@ -28,7 +28,7 @@ describe("fileHref", () => {
 
   test("round-trips through the route parser", () => {
     const href = fileHref({ name: "@acme/tool", version: "2.0.0", path: "dist/a b#c.js", line: 3 }) ?? "";
-    const segs = href.split("#")[0]?.slice("/package/".length).split("/") ?? [];
+    const segs = href.split("?")[0]?.slice("/package/".length).split("/") ?? [];
     expect(parsePackageRoute(segs)).toEqual({ kind: "file", name: "@acme/tool", version: "2.0.0", path: "dist/a b#c.js" });
   });
 });
@@ -149,7 +149,7 @@ describe("AI review findings", () => {
       }),
     );
 
-    expect(html).toContain('href="/package/%40acme/tool/v/1.2.3/file/lib/run.js#L7"');
+    expect(html).toContain('href="/package/%40acme/tool/v/1.2.3/file/lib/run.js?line=7#L7"');
     expect(html).toContain(">lib/run.js:7</a>");
     // a path a browser would rewrite stays text, and the excerpt is escaped, never HTML
     expect(html).not.toContain("escape.js#L1");

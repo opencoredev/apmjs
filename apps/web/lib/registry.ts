@@ -1,7 +1,8 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
 import { z } from "zod";
-import { encodeName, fileApiPath, REGISTRY } from "./registry-url";
+import { encodeName, excerptApiPath, fileApiPath, readmeApiPath, REGISTRY } from "./registry-url";
+import { ExcerptAnswer } from "./file-excerpt";
 import { fetchJson, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
@@ -34,6 +35,9 @@ const PackageInfo = z.object({
   readme: z.string(),
   // added after apm-score-v5; an older registry leaves it out
   repository: RepositoryField.nullish(),
+  // added with the readme fallback; raw manifest strings, made safe by package-links.ts before they are links
+  homepage: z.string().nullish(),
+  bugs: z.string().nullish(),
   distTags: z.record(z.string(), z.string()),
   maintainers: z.array(z.string()),
   latest: z.string().nullable(),
@@ -136,6 +140,27 @@ export async function getFile(input: { name: string; version: string; path: stri
   const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS });
 
   if (result.kind === "unavailable") logUnavailable(path.split("?")[0] ?? path, result.reason);
+
+  return result;
+}
+
+/** Lines around one line of a file of any size (the file view's excerpt of a file over 1 MB). */
+export async function getExcerpt(input: { name: string; version: string; path: string; line: number; context: number }): Promise<Fetched<ExcerptAnswer>> {
+  const path = excerptApiPath(input);
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: ExcerptAnswer, timeoutMs: FILE_TIMEOUT_MS });
+
+  // a line past the end (416) is an answer the view explains, not an outage
+  if (result.kind === "unavailable" && !(result.reason.kind === "status" && result.reason.status === 416)) logUnavailable(path.split("?")[0] ?? path, result.reason);
+
+  return result;
+}
+
+/** The README npm would pick from a version's tarball, for packages whose packument has no readme. "missing" when there is none. */
+export async function getTarballReadme(input: { name: string; version: string }): Promise<Fetched<FileAnswer>> {
+  const path = readmeApiPath(input);
+  const result = await fetchJson({ url: `${REGISTRY}${path}`, schema: FileAnswer, maxBytes: FILE_MAX_BYTES, timeoutMs: FILE_TIMEOUT_MS });
+
+  if (result.kind === "unavailable") logUnavailable(path, result.reason);
 
   return result;
 }

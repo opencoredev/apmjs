@@ -5,6 +5,7 @@
 // #L12 (or a package.json anchor like #scripts.postinstall), places the highlight on that row and scrolls to it.
 // Clicking a line number moves the highlight there and puts #L<n> in the address bar. When the line is wider
 // than the code box (a phone, a minified file), a bar at the bottom of the screen shows all of it, wrapped.
+// An excerpt of a large file shows lines `first` to `last` only; the arithmetic starts at `first`.
 import { useEffect, useRef, useState } from "react";
 import { XIcon } from "lucide-react";
 
@@ -43,9 +44,20 @@ function overflows(body: HTMLElement, code: HTMLElement, text: string): boolean 
   return code.getBoundingClientRect().left - box.getBoundingClientRect().left + ctx.measureText(text).width > box.clientWidth;
 }
 
-export function LineFocus({ total, anchors }: { total: number; anchors: readonly LineAnchor[] }) {
+type Props = {
+  /** The first and last line shown. */
+  first?: number;
+  last: number;
+  anchors: readonly LineAnchor[];
+  /** The line to mark when the address names none (an excerpt opened with ?line= and no #L). */
+  fallback?: number | null;
+};
+
+export function LineFocus({ first = 1, last, anchors, fallback = null }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [cited, setCited] = useState<Cited | null>(null);
+  // an excerpt that grows ("Show more") re-places the mark without scrolling back to it
+  const scrolled = useRef(false);
 
   useEffect(() => {
     const mark = ref.current;
@@ -63,9 +75,9 @@ export function LineFocus({ total, anchors }: { total: number; anchors: readonly
       }
 
       const m = /^L(\d+)$/.exec(id);
-      const n = m ? Number(m[1]) : (anchors.find((a) => a.anchor === id)?.line ?? null);
+      const n = m ? Number(m[1]) : (anchors.find((a) => a.anchor === id)?.line ?? (id === "" ? fallback : null));
 
-      return n !== null && n >= 1 && n <= total ? n : null;
+      return n !== null && n >= first && n <= last ? n : null;
     };
 
     const show = (scroll: boolean) => {
@@ -79,7 +91,7 @@ export function LineFocus({ total, anchors }: { total: number; anchors: readonly
         return;
       }
 
-      mark.style.top = `${PAD + (line - 1) * ROW}px`;
+      mark.style.top = `${PAD + (line - first) * ROW}px`;
       mark.dataset.line = String(line);
 
       if (scroll) mark.scrollIntoView({ block: "center" });
@@ -95,13 +107,14 @@ export function LineFocus({ total, anchors }: { total: number; anchors: readonly
       const start = Number(gutter?.parentElement?.dataset.start);
 
       if (!gutter || !Number.isInteger(start)) return;
-      const line = Math.min(total, start + Math.max(0, Math.floor((e.clientY - gutter.getBoundingClientRect().top) / ROW)));
+      const line = Math.min(last, start + Math.max(0, Math.floor((e.clientY - gutter.getBoundingClientRect().top) / ROW)));
 
       window.history.replaceState(window.history.state, "", `#L${line}`);
       show(false);
     };
 
-    show(true);
+    show(!scrolled.current);
+    scrolled.current = true;
     window.addEventListener("hashchange", onHash);
     body.addEventListener("click", onClick);
 
@@ -109,7 +122,7 @@ export function LineFocus({ total, anchors }: { total: number; anchors: readonly
       window.removeEventListener("hashchange", onHash);
       body.removeEventListener("click", onClick);
     };
-  }, [total, anchors]);
+  }, [first, last, anchors, fallback]);
 
   return (
     <>

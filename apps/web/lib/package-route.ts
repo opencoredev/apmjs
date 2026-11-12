@@ -41,15 +41,16 @@ export function scoreHref(name: string, version: string): string {
 }
 
 /**
- * Where a file of a version opens: at a line (`#L12`), at a package.json script (`#scripts.postinstall`), or at
- * the top. Null when the path can't survive a URL: browsers resolve `.` and `..` segments (even encoded) before
- * the request is sent, so such a path would open a different file.
+ * Where a file of a version opens: at a line (`?line=12#L12`), at a package.json script (`#scripts.postinstall`),
+ * or at the top. The line is in the query as well as the fragment because a file over 1 MB opens as an excerpt
+ * around it, and the server only sees the query. Null when the path can't survive a URL: browsers resolve `.` and
+ * `..` segments (even encoded) before the request is sent, so such a path would open a different file.
  */
 export function fileHref(input: { name: string; version: string; path: string; line?: number | null; anchor?: string | null }): string | null {
   const parts = input.path.split("/");
 
   if (parts.some((p) => p === "" || p === "." || p === "..")) return null;
-  const at = input.line != null && input.line > 0 ? `#L${input.line}` : input.anchor ? `#${encodeURIComponent(input.anchor)}` : "";
+  const at = input.line != null && input.line > 0 ? `?line=${input.line}#L${input.line}` : input.anchor ? `#${encodeURIComponent(input.anchor)}` : "";
 
   return `${packagePath(input.name)}/v/${encodeURIComponent(input.version)}/file/${parts.map(encodeURIComponent).join("/")}${at}`;
 }

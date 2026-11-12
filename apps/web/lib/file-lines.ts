@@ -33,7 +33,12 @@ export function displayLines(text: string): string[] {
 
   if (lines.length > 1 && lines.at(-1) === "") lines.pop();
 
-  return lines.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l).replace(HIDDEN, visible));
+  return lines.map(displayLine);
+}
+
+/** One line as the file view draws it: a "\r" before its newline dropped, hidden characters as markers. */
+export function displayLine(line: string): string {
+  return (line.endsWith("\r") ? line.slice(0, -1) : line).replace(HIDDEN, visible);
 }
 
 export type Chunk = { start: number; text: string; numbers: string; count: number };

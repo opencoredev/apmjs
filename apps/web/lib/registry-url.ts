@@ -10,3 +10,13 @@ export function encodeName(name: string): string {
 export function fileApiPath(input: { name: string; version: string; path: string }): string {
   return `-/apm/v1/file/${encodeName(input.name)}/${encodeURIComponent(input.version)}?path=${encodeURIComponent(input.path)}`;
 }
+
+/** The registry path for lines `line - context` to `line + context` of one file of a version, any size. */
+export function excerptApiPath(input: { name: string; version: string; path: string; line: number; context: number }): string {
+  return `${fileApiPath(input)}&line=${input.line}&context=${input.context}`;
+}
+
+/** The registry path for the README npm would pick from a version's tarball. */
+export function readmeApiPath(input: { name: string; version: string }): string {
+  return `-/apm/v1/readme/${encodeName(input.name)}/${encodeURIComponent(input.version)}`;
+}

@@ -3,13 +3,17 @@ import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getEvents, getPackage, getReview, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
+import { packageLinks, type PackageLink } from "@/lib/package-links";
+import { PackageLinks } from "@/components/package-links";
 import { headerNotice } from "@/lib/review-schema";
 import { AiReviewSection } from "@/components/ai-review";
 import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
 import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
+import { citedLine } from "@/lib/file-excerpt";
 import { splitPossible, splitTestFile, summarizeLimitations } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
@@ -217,13 +221,30 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
   );
 }
 
+/** Where a readme read from the tarball came from, as a link to that file in the file view. */
+type TarballOrigin = { path: string; version: string };
+
 /** The readme, collapsed: rendered from sanitized Markdown, with its source one tab away. Long readmes show
  * their first README_PREVIEW_CHARS characters, cut at a block boundary, and link to the full text. */
-function ReadmeSection({ name, readme, repository }: { name: string; readme: string; repository: PackageInfo["repository"] }) {
+function ReadmeSection({ name, readme, repository, origin }: { name: string; readme: string; repository: PackageInfo["repository"]; origin: TarballOrigin | null }) {
   const shown = cutReadme(readme, README_PREVIEW_CHARS);
   const repo = githubRepo(repository);
+  const originHref = origin ? fileHref({ name, version: origin.version, path: origin.path }) : null;
+  const fullHref = originHref ?? `/api/readme?name=${encodeURIComponent(name)}`;
 
-  const note = repo ? (
+  const note = origin ? (
+    <span>
+      From{" "}
+      {originHref ? (
+        <a href={originHref} className="font-mono text-[13px] text-foreground underline-offset-4 hover:underline">
+          {origin.path}
+        </a>
+      ) : (
+        <span className="font-mono text-[13px]">{origin.path}</span>
+      )}{" "}
+      in the {origin.version} tarball
+    </span>
+  ) : repo ? (
     <a href={`https://github.com/${repo.owner}/${repo.repo}`} rel={EXTERNAL_REL} className="font-mono text-[13px] underline-offset-4 hover:text-foreground hover:underline">
       github.com/{repo.owner}/{repo.repo}
     </a>
@@ -241,12 +262,62 @@ function ReadmeSection({ name, readme, repository }: { name: string; readme: str
       {shown.length < readme.length && (
         <p className="border-t px-4 py-3 text-sm text-muted-foreground">
           Showing the first {Math.ceil(shown.length / 1024)} of {Math.ceil(readme.length / 1024)} kB.{" "}
-          <a href={`/api/readme?name=${encodeURIComponent(name)}`} className="text-foreground underline underline-offset-4">
+          <a href={fullHref} className="text-foreground underline underline-offset-4">
             Open the full readme
           </a>
         </p>
       )}
     </details>
+  );
+}
+
+type NoReadmeSource = Exclude<ReadmeSource, { kind: "packument" | "tarball" }>;
+
+/** Why there is no readme to render: a title and a sentence. */
+type NoReadmeCopy = { title: string; body: React.ReactNode };
+
+/** The sentence for a README that is there but not rendered, linking to the file view when it is only too large. */
+function UnreadableReadme({ name, source }: { name: string; source: Extract<ReadmeSource, { kind: "unreadable" }> }) {
+  const href = source.reason === "too-large" ? fileHref({ name, version: source.version, path: source.path }) : null;
+
+  return (
+    <>
+      The tarball&apos;s <span className="font-mono text-[13px]">{source.path}</span> is {source.reason === "binary" ? "not text" : `${formatSize(source.size)}, too large to render here`}.{" "}
+      {href && (
+        <a href={href} className="text-foreground underline underline-offset-4">
+          Open it in the file view
+        </a>
+      )}
+    </>
+  );
+}
+
+function noReadmeCopy({ name, source, hasLinks }: { name: string; source: NoReadmeSource; hasLinks: boolean }): NoReadmeCopy {
+  switch (source.kind) {
+    case "none":
+      return { title: "No readme published", body: `${name} has no readme in its registry entry or its tarball.${hasLinks ? " Its own links may have documentation:" : " It names no homepage or repository either."}` };
+    case "unknown":
+      return { title: "Readme not loaded", body: `The registry did not answer when apm looked for a README in the tarball. Reload to try again.${hasLinks ? " Meanwhile:" : ""}` };
+    case "unreadable":
+      return { title: "Readme not shown", body: <UnreadableReadme name={name} source={source} /> };
+    default: {
+      const _exhaustive: never = source;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** No readme to render: says why, and offers the package's own links instead. */
+function NoReadme({ name, source, links }: { name: string; source: NoReadmeSource; links: readonly PackageLink[] }) {
+  const { title, body } = noReadmeCopy({ name, source, hasLinks: links.length > 0 });
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border px-4 py-4 sm:px-5">
+      <p className="text-[15px] font-medium">{title}</p>
+      <p className="text-sm leading-6 text-pretty text-muted-foreground">{body}</p>
+      <PackageLinks links={links} className="mt-1" />
+    </div>
   );
 }
 
@@ -322,7 +393,7 @@ function describe(e: PackageEvent): string {
   }
 }
 
-type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[] }> };
+type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[]; line?: string | string[] }> };
 
 export default function PackagePage({ params, searchParams }: PageProps) {
   return (
@@ -369,7 +440,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
 
   if (!route) notFound();
 
-  if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} />;
+  if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
   const name = route.name;
   const found = await getPackage(name);
 
@@ -383,11 +454,16 @@ async function PackageContent({ params, searchParams }: PageProps) {
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
 
-  const [events, review, versionScore] = await Promise.all([
+  const [events, review, versionScore, tarballReadme] = await Promise.all([
     pkg.source === "local" ? getEvents(name) : Promise.resolve<Fetched<PackageEvent[]>>({ kind: "ok", value: [] }),
     version ? getReview(name, version) : Promise.resolve(none),
     version && !isLatest ? getVersionScore(name, version) : Promise.resolve(none),
+    // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
+    version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null),
   ]);
+
+  const readme = readmeSource({ packument: pkg.readme, version, tarball: tarballReadme });
+  const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
 
   let score = pkg.score;
 
@@ -422,6 +498,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
           </p>
         )}
         {pkg.description && <p className="max-w-2xl text-lg leading-8 text-pretty text-muted-foreground">{pkg.description}</p>}
+        <PackageLinks links={links} />
         {pkg.source === "upstream" && <p className="text-sm text-muted-foreground">Proxied from the public npm registry and scored by apm.</p>}
         {pulled.length > 0 && (
           <p className="max-w-2xl rounded-xl bg-warn-soft px-4 py-3 text-[15px] leading-6 text-pretty">
@@ -455,12 +532,14 @@ async function PackageContent({ params, searchParams }: PageProps) {
             </section>
           )}
 
-          {pkg.readme && (
-            <section aria-labelledby="readme" className="order-6 lg:order-none">
-              <SectionTitle id="readme">Readme</SectionTitle>
-              <ReadmeSection name={pkg.name} readme={pkg.readme} repository={pkg.repository} />
-            </section>
-          )}
+          <section aria-labelledby="readme" className="order-6 lg:order-none">
+            <SectionTitle id="readme">Readme</SectionTitle>
+            {readme.kind === "packument" || readme.kind === "tarball" ? (
+              <ReadmeSection name={pkg.name} readme={readme.text} repository={pkg.repository} origin={readme.kind === "tarball" ? { path: readme.path, version: readme.version } : null} />
+            ) : (
+              <NoReadme name={pkg.name} source={readme} links={links} />
+            )}
+          </section>
 
           <section aria-labelledby="versions" className="order-7 lg:order-none">
             <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>

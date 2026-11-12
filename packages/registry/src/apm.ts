@@ -769,6 +769,18 @@ const repositoryOf = (v: VersionRecord | null): { url: string; directory: string
   return parsed.success ? parsed.data : null;
 };
 
+/** A manifest URL field as written ("homepage", or "bugs" as a string or { url }); the website keeps only http(s). */
+const ManifestUrl = z.string().trim().min(1).max(2048);
+const Bugs = z.union([ManifestUrl, z.object({ url: ManifestUrl }).transform((b) => b.url)]);
+
+/** The homepage and issue tracker the latest version's manifest names, each null when absent or unreadable. */
+const linksOf = (v: VersionRecord | null) => {
+  const homepage = ManifestUrl.safeParse(v?.manifest.homepage);
+  const bugs = Bugs.safeParse(v?.manifest.bugs);
+
+  return { homepage: homepage.success ? homepage.data : null, bugs: bugs.success ? bugs.data : null };
+};
+
 const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -788,6 +800,7 @@ const packageResponse = (name: string) =>
       keywords: local?.keywords ?? [],
       readme: local?.readme ?? (src.kind === "upstream" ? src.pkg.readme : ""),
       repository: repositoryOf(latest0),
+      ...linksOf(latest0),
       distTags: src.distTags,
       maintainers: src.kind === "local" ? yield* store.owners(name) : src.pkg.maintainers,
       createdAt: local ? new Date(local.created_at).toISOString() : null,
