@@ -9,17 +9,17 @@ import { evidenceRoute } from "./evidence.ts";
 import { fileRoute } from "./files.ts";
 import { fail, routePath } from "./http.ts";
 import { reviewRoute } from "./review.ts";
-import { getRouteOf, NO_GET_ROUTE } from "./routes.ts";
+import { AUTH_PREFIX, getRouteOf, NO_GET_ROUTE } from "./routes.ts";
 import { callerOf, protocolRoute, type PackumentView } from "./server.ts";
 
 export const route = (req: Request) =>
   Effect.gen(function* () {
     const url = new URL(req.url);
-    const isAuth = url.pathname.startsWith("/api/auth/");
+    const isAuth = url.pathname.startsWith(AUTH_PREFIX);
     const { path, viaSafe } = routePath(url.pathname);
 
     // a read the GET table (routes.ts) does not list is answered here, before any module could answer it
-    if ((req.method === "GET" || req.method === "HEAD") && getRouteOf(isAuth ? url.pathname : path) === null) return fail(404, NO_GET_ROUTE);
+    if ((req.method === "GET" || req.method === "HEAD") && getRouteOf(url.pathname) === null) return fail(404, NO_GET_ROUTE);
 
     if (isAuth) return yield* (yield* Auth).handler(req);
 

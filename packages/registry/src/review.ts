@@ -23,7 +23,7 @@ import { splitPath, tagTarget, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
-import { INVALID_DEPENDENCY, isWithheld, WITHHELD_ISSUE } from "./withheld.ts";
+import { fileReferences, INVALID_DEPENDENCY, isWithheld, WITHHELD_ISSUE } from "./withheld.ts";
 
 export type ReviewSettings = {
   /** sha256 (hex) of the reviewer's service token. The token itself stays with the reviewer. */
@@ -613,9 +613,7 @@ function fileRefs(res: ReviewResult): (path: string) => string {
     ...(so ? so.findings.map((f) => f.file) : []),
   ];
 
-  const refs = new Map([...new Set(paths)].toSorted().map((p, i) => [p, `file ${i + 1}`]));
-
-  return (path) => refs.get(path) ?? "file";
+  return fileReferences(paths);
 }
 
 /** A finding of a withheld version: which file by reference, the line, and how bad; no sentence, quote or excerpt. */

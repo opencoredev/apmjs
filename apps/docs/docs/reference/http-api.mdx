@@ -11,7 +11,7 @@ The registry at `https://registry.apmjs.dev/` speaks the npm registry protocol, 
 
 - **Auth.** Send `Authorization: Bearer <token>` with the token from `apm login`. Routes marked "token" need one; the rest are public.
 - **Second factor.** Routes marked "factor" also need `otp` (a six-digit authenticator code) in the JSON body, or a website approval of that exact command made in the last 10 minutes.
-- **Errors.** A `GET` or `HEAD` of a path the registry has no read route for answers `404` before anything else runs. A failure answers JSON with an `error` message and the matching status: `400` bad input, `401` no token, `403` not allowed, `404` not found, `405` wrong method, `409` conflict, `410` revoked or expired, `413` too large, `422` refused by a check, `429` over a quota, `503` an upstream check could not run.
+- **Errors.** A `GET` or `HEAD` of a path the registry has no read route for answers `404` before anything else runs. A trailing slash, `%40` for `@` and `%2f` inside a scoped name name the same route. A failure answers JSON with an `error` message and the matching status: `400` bad input, `401` no token, `403` not allowed, `404` not found, `405` wrong method, `409` conflict, `410` revoked or expired, `413` too large, `422` refused by a check, `429` over a quota, `503` an upstream check could not run.
 - **Per-user answers** (account, staged uploads, tokens, login, and any `/-/` answer to a request carrying credentials) are sent with `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`.
 - **Source-bearing answers** (`/-/apm/v1/file/`, `/-/apm/v1/readme/`, `/-/apm/v1/score/`, `/-/apm/v1/packages/`, `/-/apm/v1/resolve` and `/-/apm/v1/review/`) are sent with `Cache-Control: private, no-store`: whether a version's source may be shown is decided on every request.
 - **Timing.** `GET` and `HEAD` answers under `/-/apm/v1/packages/`, `score/`, `review/`, `readme/` and `file/` carry a `Server-Timing` header only for the registry's operator, who sends the deploy's debug token as `x-apm-debug`. It gives the database's time (`db`), npm's packument fetched (`npm`) or read from the data center's cache (`npm-cache`), a version scored on read (`analysis`) and the whole answer's (`total`), each with its count. Anyone else gets no `Server-Timing`, because timing alone shows whether npm's answer was cached.
@@ -29,7 +29,7 @@ Prefix any path with `/~safe` to read through the safe view: `https://registry.a
 | `GET /-/ping` | none | `{}` |
 | `GET /<package>` | none | The package document (packument). Supports the abbreviated form (`Accept: application/vnd.npm.install-v1+json`) and `ETag`. Each version carries apm's score as `_apmScore`. |
 | `GET /<package>/<version or tag>` | none | One version's document. Revoked versions answer `404`. |
-| `GET /<package>/-/<file>.tgz` | none | The tarball, checked against its published sha512 before it is sent. A revoked version answers `410` with `{ error, revoked: true, revokeReason }`. |
+| `GET /<package>/-/<file>.tgz` | none | The tarball, checked against its published sha512 before it is sent. A revoked version answers `410` with `{ error, revoked: true, revokeReason }`; `error` is the line npm prints, so it ends with the owner's reason too. |
 | `PUT /<package>` | token | Publish one version. With a login token it is staged and answers `202` with `approvalUrl`, `expiresAt` and an `npm-notice` header holding the link. `npm deprecate` uses this route too; with a login token it needs a code in `npm-otp`. |
 | `GET /-/package/<package>/dist-tags` | none | The dist-tags. |
 | `PUT /-/package/<package>/dist-tags/<tag>` | token, factor | Move a tag. A login token needs a code (npm sends it as `npm-otp`). |
@@ -51,7 +51,7 @@ Packages that are not on apm are fetched from `https://registry.npmjs.org/`, che
 What `apm add` installs. Query: `name`, `range` (default `latest`), `cooldown` (`24h`, `90m`, `2d`, `0`; a bare number is hours; default 24h), `floor` (default `40`). A lower floor applies to the named package only; its dependencies are checked at 40 or the stricter floor.
 
 - `200`: `{ name, version, report, skipped, source, tree }`. `tree.packages` lists every package the registry walked; `tree.uncheckedDeps` lists those it could not score (git and URL specs, missing packages, past the 300-package walk limit).
-- `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's `reason`, and for a revoked or revoke-pending version the owner's words in `revokeReason`. When `newest` is revoked or pending revocation, its `report` is the score answer's withheld form (`redacted: true`, no evidence lines).
+- `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's `reason`, and for a revoked or revoke-pending version the owner's words in `revokeReason`. When `newest` is revoked or pending revocation, its `report` is the score answer's withheld form (`redacted: true`, no evidence lines, each skipped file named `file <n>`).
 - `404`: no such package.
 
 ### `GET /-/apm/v1/score/<package>[/<version or tag>]`

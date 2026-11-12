@@ -120,6 +120,14 @@ const CLEAN_MANIFEST: RawManifest = { name: NAME, version: CLEAN, description: "
 /** Every path in the marked tarball, for the file routes. */
 const FILE_PATHS = ["package.json", ...Object.keys(FILES)];
 
+/**
+ * A second package, revoked with the first: its one marked file is over the 32 MB the score reads of a file, so the
+ * score lists it as skipped by its path. The skip scores it under the floor, so it is a package of its own: the first
+ * one's resolve answers stay as they are. The file compresses to a few KB.
+ */
+const SKIPPED_PKG = "sweep-skipped";
+const SKIPPED_FILES = { "index.js": "module.exports = 1;\n", "lib/LEAKMARK-skipped-file.js": "// filler line\n".repeat(2_400_000) };
+
 // ---------- the stub model: flags anything marked, quotes the marked line, and words its finding with a marker ----------
 const FLAG = {
   verdict: "malicious",
@@ -188,6 +196,8 @@ const ALLOWED: readonly Allowed[] = [
       ["resolve", 422, /^skipped\.\d+\.revokeReason$/],
       ["resolve", 200, /^skipped\.\d+\.revokeReason$/],
       ["tarball", 410, /^revokeReason$/],
+      // npm prints a refused download's `error` and nothing else from the body
+      ["tarball", 410, /^error$/],
       ["file", 410, /^revokeReason$/],
       ["readme", 410, /^revokeReason$/],
     ] as const
@@ -385,6 +395,7 @@ beforeAll(async () => {
 
   // four days later, so the first marked version is past 72 hours when both are revoked
   clock += 4 * DAY;
+  must(`publish ${SKIPPED_PKG}`, await putPublish(reg, owner, { name: SKIPPED_PKG, version: CLEAN, license: "MIT", main: "index.js" }, { files: SKIPPED_FILES }), 201);
   const staged = await putPublish(reg, siteToken, marked(REVOKED), { files: FILES });
   const id = approvalId(JSON.stringify(staged.body));
 
@@ -496,6 +507,11 @@ function probes(): Probe[] {
       v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}`, "resolve", resolveStatus(range, false)),
       v1(`resolve?name=${NAME}&range=${encodeURIComponent(range)}&floor=0&cooldown=0`, "resolve", resolveStatus(range, true)),
     ]),
+    // the package whose score skipped a marked file: it scores under the floor, and resolve embeds its report
+    v1(`score/${SKIPPED_PKG}/${CLEAN}`, "score", 200),
+    v1(`packages/${SKIPPED_PKG}`, "package", 200),
+    v1(`resolve?name=${SKIPPED_PKG}&range=${CLEAN}`, "resolve", 422),
+    v1(`resolve?name=${SKIPPED_PKG}&range=${CLEAN}&floor=0&cooldown=0`, "resolve", (a) => (a.phase === "after" ? 422 : 200)),
     v1("me", "me", (a) => (a.caller === "maintainer" ? 200 : 401)),
     v1(`score/${NAME}`, "score", 200),
     ...specs.map((s) => v1(`score/${NAME}/${s}`, "score", 200)),
@@ -609,6 +625,7 @@ describe("a revoked or revoke-pending version's text", () => {
       "LEAKMARK-json",
       "LEAKMARK-bin-file",
       "LEAKMARK-filename",
+      "LEAKMARK-skipped-file",
       "LEAKMARK-review-issue",
       "LEAKMARK-deprecation",
     ]) {
@@ -621,14 +638,18 @@ describe("a revoked or revoke-pending version's text", () => {
   }, 120_000);
 
   test("is shown on no GET route after the revoke, to anyone, except where ALLOWED says why", async () => {
-    for (const version of [PENDING, REVOKED]) {
+    for (const [name, version, status] of [
+      [NAME, PENDING, "revoke-pending"],
+      [NAME, REVOKED, "revoked"],
+      [SKIPPED_PKG, CLEAN, "revoked"],
+    ] as const) {
       const r = await getJson(`${reg.url}-/apm/v1/revoke`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${owner}` },
-        body: JSON.stringify({ name: NAME, version, reason: `posts the environment (${REASON})`, password: PASSWORD }),
+        body: JSON.stringify({ name, version, reason: `posts the environment (${REASON})`, password: PASSWORD }),
       });
 
-      expect(dig(r.body, "status"), JSON.stringify(r.body)).toBe(version === PENDING ? "revoke-pending" : "revoked");
+      expect(dig(r.body, "status"), JSON.stringify(r.body)).toBe(status);
     }
 
     await reg.query("UPDATE packages SET dist_tags = dist_tags || $1::jsonb WHERE name = $2", [JSON.stringify(STALE_TAGS), NAME]);
@@ -773,6 +794,16 @@ describe("after the revoke, each answer keeps what was found", () => {
     const clean = await getJson(`${reg.url}-/apm/v1/score/${NAME}/${CLEAN}`);
 
     expect(dig(clean.body, "facts", "license")).toBe("MIT");
+  });
+
+  test("the score and resolve: a withheld version's skipped files keep their size and reason, each by a file reference", async () => {
+    const size = SKIPPED_FILES["lib/LEAKMARK-skipped-file.js"].length;
+    const want = [{ path: "file 1", size, reason: "too-large" }];
+    const score = await getJson(`${reg.url}-/apm/v1/score/${SKIPPED_PKG}/${CLEAN}`);
+    const resolve = await getJson(`${reg.url}-/apm/v1/resolve?name=${SKIPPED_PKG}&range=${CLEAN}`);
+
+    expect(dig(score.body, "skipped")).toEqual(want);
+    expect(dig(resolve.body, "newest", "report", "skipped")).toEqual(want);
   });
 
   test("a revoke-pending version's manifest is refused like a revoked one's; its tarball stays for lockfiles", async () => {

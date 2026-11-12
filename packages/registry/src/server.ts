@@ -1059,7 +1059,10 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
       if (!v) return fail(404, "Not found");
 
       if (v.status === "revoked") {
-        return fail(410, `${name}@${v.version} was revoked by its owner.`, { revoked: true, revokeReason: v.status_reason ?? "no reason given" });
+        const reason = v.status_reason ?? "no reason given";
+
+        // npm prints only `error`, so the owner's reason is in it too; revokeReason holds it alone for other clients
+        return fail(410, `${name}@${v.version} was revoked by its owner: ${reason}`, { revoked: true, revokeReason: reason });
       }
 
       if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);

@@ -14,6 +14,7 @@ import {
   type DismissedEvidence,
   type Facts,
   type Signal,
+  type SkippedFile,
 } from "@apm/core";
 import { z } from "zod";
 import type { VersionRecord } from "./db.ts";
@@ -34,14 +35,24 @@ export function withheldSignal(s: Signal): WithheldSignal {
   return { id: s.id, label: s.label, points: s.points, confidence: s.confidence, evidence: s.id === "revoked" ? [...s.evidence] : [] };
 }
 
-/**
- * A withheld version's dismissed items: the signal, line and the reviewer's reason; the quoted evidence goes, and each
- * file is a numbered reference ("file 2"), the same for one path throughout the list, since a path is the publisher's.
- */
-export function withheldDismissals(list: readonly DismissedEvidence[]): DismissedEvidence[] {
-  const refs = new Map([...new Set(list.map((d) => d.file))].toSorted().map((p, i) => [p, `file ${i + 1}`]));
+/** How a withheld version's answer names a file: a numbered reference ("file 2"), since a path is the publisher's text. */
+export type FileRef = (path: string) => string;
 
-  return list.map((d) => ({ signal: d.signal, file: refs.get(d.file) ?? "file", line: d.line, reason: d.reason, at: d.at, evidence: [] }));
+/** A reference for each path an answer names: sorted, numbered from 1, the same for one path throughout the answer. */
+export function fileReferences(paths: readonly string[]): FileRef {
+  const refs = new Map([...new Set(paths)].toSorted().map((p, i) => [p, `file ${i + 1}`]));
+
+  return (path) => refs.get(path) ?? "file";
+}
+
+/** A withheld version's dismissed items: the signal, line and the reviewer's reason; the quoted evidence goes. */
+export function withheldDismissals(list: readonly DismissedEvidence[], ref: FileRef): DismissedEvidence[] {
+  return list.map((d) => ({ signal: d.signal, file: ref(d.file), line: d.line, reason: d.reason, at: d.at, evidence: [] }));
+}
+
+/** The files a withheld version's score did not read: each by reference, with its size and why it was not read. */
+export function withheldSkipped(list: readonly SkippedFile[], ref: FileRef): SkippedFile[] {
+  return list.map((k) => ({ path: ref(k.path), size: k.size, reason: k.reason }));
 }
 
 /** The package row fields that say whose readme it is. */

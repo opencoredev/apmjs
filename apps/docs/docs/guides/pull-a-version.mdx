@@ -52,7 +52,7 @@ While a revoke is pending, the tarball stays downloadable for existing lockfiles
 
 Once a version is revoked:
 
-- its tarball answers `410 Gone`, on the plain registry and on `~safe`, with your reason in the body's `revokeReason` field (npm prints only the error line, "revoked by its owner");
+- its tarball answers `410 Gone`, on the plain registry and on `~safe`, with your reason in the error line npm prints (`revoked by its owner: <reason>`) and on its own in the body's `revokeReason` field;
 - `bun audit`, `npm audit` and `apm audit` report it as a critical advisory;
 - the [Bun scanner](/guides/bun-scanner) cancels any install that includes it.
 

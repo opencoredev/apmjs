@@ -5,7 +5,7 @@
 // bearer token. Revoking a version older than 72h or with dependents yanks it at once and turns into a
 // full revoke after 24h or when a second owner confirms. Incident has a preview and a 30-day window.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, getJson, installedVersion, dig, type Registry } from "./harness";
@@ -129,6 +129,26 @@ describe("revoke", () => {
     const tgz = await fetch(`${reg.url}hacked-lib/-/hacked-lib-2.0.1.tgz`);
     expect(tgz.status).toBe(410);
     expect(await tgz.text()).toContain("malicious postinstall");
+  });
+
+  test("npm shows the owner's reason when a lockfile asks for a revoked tarball", async () => {
+    const reason = "maintainer token stolen; malicious postinstall";
+    const tgz = await getJson(`${reg.url}hacked-lib/-/hacked-lib-2.0.1.tgz`);
+
+    expect(tgz.status).toBe(410);
+    // npm prints a refused download's `error` and nothing else from the body
+    expect(dig(tgz.body, "error")).toBe(`hacked-lib@2.0.1 was revoked by its owner: ${reason}`);
+    expect(dig(tgz.body, "revokeReason")).toBe(reason);
+
+    // the app locked to 2.0.1 before the revoke, installed again from its lockfile with an empty cache
+    const app = mkdtempSync(join(work, "app-ci-"));
+
+    for (const f of ["package.json", "package-lock.json", ".npmrc"]) copyFileSync(join(lockedNpmApp, f), join(app, f));
+    const sb = makeSandbox(reg, alice);
+    const ci = await run(["npm", "ci"], { cwd: app, env: sb.env });
+
+    expect(ci.code, ci.out).not.toBe(0);
+    expect(ci.out).toContain(reason);
   });
 
   test("a second owner's confirmation makes a pending revoke final at once", async () => {

@@ -5,7 +5,7 @@ import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type NewVersion, type StoreApi } from "../src/db.ts";
 import { searchPackages } from "../src/search.ts";
-import { eventDetailShown, packageTextShown, withheldDismissals, withheldLimitations } from "../src/withheld.ts";
+import { eventDetailShown, fileReferences, packageTextShown, withheldDismissals, withheldLimitations, withheldSkipped } from "../src/withheld.ts";
 
 const now = Date.parse("2026-11-12T00:00:00Z");
 
@@ -37,13 +37,23 @@ describe("withheldLimitations", () => {
 describe("withheldDismissals", () => {
   test("each dismissed item keeps its signal, line and reason; its path is a numbered reference and its evidence goes", () => {
     const item = (file: string, line: number) => ({ signal: "eval" as const, file, line, reason: "fixture", at: 1, evidence: [`${file}:${line}: eval(x)`] });
-    const out = withheldDismissals([item("lib/secret-sk_live_x.js", 3), item("index.js", 1), item("lib/secret-sk_live_x.js", 9)]);
+    const list = [item("lib/secret-sk_live_x.js", 3), item("index.js", 1), item("lib/secret-sk_live_x.js", 9)];
+    const out = withheldDismissals(list, fileReferences(list.map((d) => d.file)));
 
     expect(out).toEqual([
       { signal: "eval", file: "file 2", line: 3, reason: "fixture", at: 1, evidence: [] },
       { signal: "eval", file: "file 1", line: 1, reason: "fixture", at: 1, evidence: [] },
       { signal: "eval", file: "file 2", line: 9, reason: "fixture", at: 1, evidence: [] },
     ]);
+  });
+});
+
+describe("withheldSkipped", () => {
+  test("each file the score did not read keeps its size and reason; its path is the answer's reference for it", () => {
+    const ref = fileReferences(["lib/LEAKMARK-big.txt", "index.js"]);
+    const out = withheldSkipped([{ path: "lib/LEAKMARK-big.txt", size: 40_000_000, reason: "too-large" }], ref);
+
+    expect(out).toEqual([{ path: "file 2", size: 40_000_000, reason: "too-large" }]);
   });
 });
 

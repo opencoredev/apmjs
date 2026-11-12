@@ -64,7 +64,19 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { Upstream, type UpstreamPackage } from "./upstream.ts";
-import { eventDetailShown, isWithheld, StoredEventDetail, packageTextShown, readmeShown, withheldDismissals, withheldFacts, withheldLimitations, withheldSignal } from "./withheld.ts";
+import {
+  eventDetailShown,
+  fileReferences,
+  isWithheld,
+  StoredEventDetail,
+  packageTextShown,
+  readmeShown,
+  withheldDismissals,
+  withheldFacts,
+  withheldLimitations,
+  withheldSignal,
+  withheldSkipped,
+} from "./withheld.ts";
 
 const HOUR = 3_600_000;
 
@@ -98,16 +110,24 @@ function reviewable(v: VersionRecord, r: ScoreReport) {
   const d = digestOf(v);
   const head = { scorer: r.scorer, digest: d ? digestLabel(d) : null };
 
-  if (isWithheld(v.status)) return { ...head, redacted: true, signals: r.signals.map(withheldSignal), dismissed: withheldDismissals(r.dismissed ?? []) };
+  if (isWithheld(v.status)) return { ...head, redacted: true, signals: r.signals.map(withheldSignal), dismissed: withheldDismissals(r.dismissed ?? [], scoreFileRefs(r)) };
   const signals = r.signals.map(({ more: _more, fallback: _fallback, uncounted: _uncounted, sources: _sources, ...s }) => s);
 
   return { ...head, redacted: false, signals, dismissed: r.dismissed ?? [] };
 }
 
 /**
+ * A withheld version's file references in its score answer: one numbering for the dismissed items' files and the files
+ * the score did not read, so "file 2" is one file wherever the answer says it (withheld.ts).
+ */
+function scoreFileRefs(r: ScoreReport) {
+  return fileReferences([...(r.dismissed ?? []).map((d) => d.file), ...r.skipped.map((k) => k.path)]);
+}
+
+/**
  * The parts of a score report that do not quote the package's code: numbers, enums, paths and the not-checked list.
  * A stored not-checked entry and the license can carry manifest text (a dependency's URL, the license string), so a
- * withheld version's are rebuilt from fixed wording and structured fields (withheld.ts).
+ * withheld version's are rebuilt from fixed wording and structured fields, and its paths are references (withheld.ts).
  */
 function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
   const withheld = isWithheld(v.status);
@@ -117,7 +137,7 @@ function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
     grade: r.grade,
     facts: withheld ? withheldFacts(r.facts) : r.facts,
     notChecked: withheld ? withheldLimitations(r.notChecked, v.manifest) : r.notChecked,
-    skipped: r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })),
+    skipped: withheld ? withheldSkipped(r.skipped, scoreFileRefs(r)) : r.skipped.map((k) => ({ path: k.path, size: k.size, reason: k.reason })),
   };
 }
 
