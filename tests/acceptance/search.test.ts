@@ -98,12 +98,15 @@ describe("search merges local packages with the upstream's search", () => {
 describe("search when the upstream is down", () => {
   let broken: ReturnType<typeof Bun.serve>;
   let reg: Registry;
+  let down = false;
   beforeAll(async () => {
-    broken = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("down", { status: 503 }) });
+    // npm answers while the local package is published (no first publish goes through while npm can't
+    // be asked, scoped or not), then goes down before anyone searches.
+    broken = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => (down ? new Response("down", { status: 503 }) : Response.json({ error: "Not found" }, { status: 404 })) });
     reg = await startRegistry({ upstream: broken.url.toString() });
     const alice = await addUser(reg, "alice");
-    // An unscoped first publish is refused while npm can't be asked, so the local package is scoped.
     await publishLocal(reg, alice, "@alice/widget-local", "1.0.0");
+    down = true;
   });
   afterAll(async () => {
     await reg?.stop();
