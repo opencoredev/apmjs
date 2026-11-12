@@ -286,8 +286,21 @@ export function installedVersion(appDir: string, name: string): string | null {
 }
 
 // ---------- raw publishes, for tests that control every byte ----------
+/** A package.json "exports" value: a path, null, a list of fallbacks, or subpaths and conditions. */
+export type ExportsField = string | null | ExportsField[] | { [key: string]: ExportsField };
+
 /** The package.json fields raw-publish tests set. */
-export type RawManifest = { name: string; version: string; license?: string; main?: string; scripts?: Record<string, string>; dependencies?: Record<string, string> };
+export type RawManifest = {
+  name: string;
+  version: string;
+  license?: string;
+  main?: string;
+  module?: string;
+  exports?: ExportsField;
+  readme?: string;
+  scripts?: Record<string, string>;
+  dependencies?: Record<string, string>;
+};
 
 function tarHeader(path: string, size: number): Uint8Array {
   const h = new Uint8Array(512);
