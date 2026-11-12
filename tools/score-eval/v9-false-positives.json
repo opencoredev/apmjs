@@ -1,0 +1,7 @@
+[
+  {
+    "set": "corpus",
+    "id": "vite-8.3.8",
+    "reason": "vite is in the popular corpus. v9 scored 30 from capabilities alone: credential-access -25 for the text \".npmrc\" in a list of config file names, shell-exec, network, eval and obfuscated (WebAssembly blobs). v10 lists those as capabilities and finds no flow; v10 at aefeffc scored it 95 too."
+  }
+]

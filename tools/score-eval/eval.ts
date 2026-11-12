@@ -4,13 +4,16 @@
 // known-malicious samples the scorer's rules were not developed against, reported apart from the 40.
 // Usage, from the repo root:
 //   bun tools/score-eval/eval.ts <core src dir> <out.json> [extra .tgz ...]
-// Compare two scorers by running it on a checkout of each (`git worktree add /tmp/apm-v9 origin/main`) and then
-//   bun tools/score-eval/compare.ts <before.json> <after.json>
+// Each malicious and held-out sample is also tagged by whether its payload is in its own tarball (payload.ts), so
+// detection is reported on the samples a tarball scorer can see a payload in. Compare two scorers by running it on a
+// checkout of each (`git worktree add /tmp/apm-v9 origin/main`, which is v9, the scorer live now) and then
+//   bun tools/score-eval/compare.ts <v9.json> <after.json>
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { loadDir, loadTgz, type SampleFiles } from "../ai-review/samples.ts";
+import { payloadClass, type PayloadClass } from "./payload.ts";
 
 const [coreArg, outArg, ...extra] = process.argv.slice(2);
 
@@ -26,19 +29,20 @@ const Report = z.object({ score: z.number(), signals: z.array(z.object({ id: z.s
 const STATE = { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null };
 const MalIndex = z.array(z.object({ id: z.string(), root: z.string() }));
 
-type Row = { set: string; id: string; score: number; signals: { id: string; points: number; evidence: string[] }[]; capabilities: string[] };
+type Row = { set: string; id: string; score: number; signals: { id: string; points: number; evidence: string[] }[]; capabilities: string[]; payload?: PayloadClass };
 
 const rows: Row[] = [];
 
 
 function run(set: string, id: string, s: SampleFiles): void {
   const name = z.string().catch(id).parse(s.manifest.name);
+  const payload = set === "malicious" || set === "held-out" ? { payload: payloadClass(s) } : {};
 
   try {
     const r = Report.parse(core.finalize(core.analyze({ name, manifest: s.manifest, files: s.files, publisher: "a", previousPublishers: [] }), { ...STATE, status: "active" }));
-    rows.push({ set, id, score: r.score, signals: r.signals.map((x) => ({ ...x, evidence: x.evidence.slice(0, 3) })), capabilities: (r.capabilities ?? []).map((c) => c.id) });
+    rows.push({ set, id, score: r.score, signals: r.signals.map((x) => ({ ...x, evidence: x.evidence.slice(0, 3) })), capabilities: (r.capabilities ?? []).map((c) => c.id), ...payload });
   } catch (e) {
-    rows.push({ set, id, score: -1, signals: [{ id: `error: ${String(e).slice(0, 200)}`, points: 0, evidence: [] }], capabilities: [] });
+    rows.push({ set, id, score: -1, signals: [{ id: `error: ${String(e).slice(0, 200)}`, points: 0, evidence: [] }], capabilities: [], ...payload });
   }
 }
 
@@ -69,4 +73,4 @@ for (const f of extra) run("extra", basename(f), loadTgz(f));
 
 await Bun.write(outArg, JSON.stringify(rows, null, 1));
 
-for (const r of rows) console.log(`${r.set.padEnd(9)} ${String(r.score).padStart(3)} ${r.id.padEnd(48)} ${r.signals.map((s) => `${s.id}${s.points ? s.points : ""}`).join(" ")}`);
+for (const r of rows) console.log(`${r.set.padEnd(9)} ${String(r.score).padStart(3)} ${r.id.padEnd(48)} ${r.payload === "none" ? "[no payload] " : ""}${r.signals.map((s) => `${s.id}${s.points ? s.points : ""}`).join(" ")}`);
