@@ -4,6 +4,7 @@ import { accountRoute } from "./account.ts";
 import { apmExtensions, apmRoute, safeView, upstreamRoute } from "./apm.ts";
 import { Auth } from "./auth.ts";
 import { Clock } from "./clock.ts";
+import { routePath } from "./http.ts";
 import { reviewRoute } from "./review.ts";
 import { callerOf, protocolRoute, type PackumentView } from "./server.ts";
 
@@ -14,12 +15,10 @@ export const route = (req: Request) =>
     if (url.pathname.startsWith("/api/auth/")) return yield* (yield* Auth).handler(req);
 
     const caller = yield* callerOf(req);
-    let path = url.pathname;
+    const { path, viaSafe } = routePath(url.pathname);
     let view: PackumentView | undefined;
-    const viaSafe = path === "/~safe" || path.startsWith("/~safe/");
 
     if (viaSafe) {
-      path = path.slice("/~safe".length) || "/";
       url.pathname = path;
       view = safeView(yield* (yield* Clock).now);
     }

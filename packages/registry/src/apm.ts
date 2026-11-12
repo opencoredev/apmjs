@@ -46,6 +46,8 @@ import { newestFirst, order, satisfies } from "./semver.ts";
 import {
   highest,
   localSearchObjects,
+  lockOwned,
+  MAX_MANIFEST_BYTES,
   requireUser,
   searchPaging,
   servedVersions,
@@ -292,6 +294,9 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
     const pj = files.find((f) => f.path === "package.json");
 
     if (!pj) return { ok: false, status: 400, error: "The tarball has no package.json." } as const;
+
+    // this is the manifest apm stores and serves, so its cap is checked on its bytes before they are decoded
+    if (pj.data.length > MAX_MANIFEST_BYTES) return { ok: false, status: 413, error: `The tarball's package.json is over ${MAX_MANIFEST_BYTES / (1024 * 1024)} MB.` } as const;
     let tarManifest: unknown;
 
     try {
@@ -527,7 +532,8 @@ const handleState = (req: Request, caller: Caller, action: "yank" | "unyank" | "
 
     return yield* store.tx(
       Effect.gen(function* () {
-        yield* store.lockPackage(name);
+        // ownership again, under the lock: an owner removed while this waited must not finish the change
+        yield* lockOwned(name, user);
         const v = yield* versionOf(name, version);
 
         if (!v) return fail(404, `No version ${name}@${version}.`);
@@ -641,14 +647,17 @@ const handleIncident = (req: Request, caller: Caller) =>
 
     const statuses: Record<string, string> = {};
     yield* store.tx(
-      Effect.forEach(
-        targets,
-        (v) =>
-          Effect.map(revokeVersion(v, user, `incident: ${reason}`), (status) => {
-            statuses[`${v.package}@${v.version}`] = status;
-          }),
-        { discard: true },
-      ),
+      Effect.gen(function* () {
+        // each package is locked, in name order, and its ownership read again under the lock: a package the
+        // account stopped owning while this waited is left to its current owners
+        for (const name of [...owned].sort()) {
+          const pkg = yield* store.lockPackage(name);
+
+          if (!pkg || !(yield* store.owners(name)).includes(user)) continue;
+
+          for (const v of targets.filter((t) => t.package === name)) statuses[`${v.package}@${v.version}`] = yield* revokeVersion(v, user, `incident: ${reason}`);
+        }
+      }),
     );
     const tokensRevoked = yield* store.revokeTokensOf(user, at);
 
@@ -656,7 +665,7 @@ const handleIncident = (req: Request, caller: Caller) =>
       ok: true,
       user,
       since: new Date(since).toISOString(),
-      revoked: ids,
+      revoked: Object.keys(statuses),
       statuses,
       tokensRevoked,
       next: legacyAuth
@@ -675,25 +684,37 @@ const handleOwners = (req: Request, caller: Caller) =>
     yield* requireOwner(user, body.name);
 
     if (!(yield* store.getUser(body.user))) return fail(404, `No user ${body.user}.`);
+    const at = yield* now;
 
-    if (remove) {
-      const removed = yield* store.removeOwner(body.name, body.user);
+    const refused = yield* store.tx(
+      Effect.gen(function* () {
+        // ownership again, under the lock: an owner removed while this waited must not change the owners
+        yield* lockOwned(body.name, user);
 
-      switch (removed) {
-        case "removed":
-          break;
-        case "not-owner":
-          return fail(404, `${body.user} is not an owner of ${body.name}.`);
-        case "last-owner":
-          return fail(409, `${body.user} is the last owner of ${body.name}. Add another owner first: a package with no owners can never be published, yanked or revoked again.`);
-        default: {
-          const _exhaustive: never = removed;
+        if (remove) {
+          const removed = yield* store.removeOwner(body.name, body.user);
 
-          return _exhaustive;
-        }
-      }
-    } else yield* store.addOwner(body.name, body.user);
-    yield* store.addEvent({ package: body.name, kind: remove ? "owner-remove" : "owner-add", actor: user, at: yield* now, detail: { user: body.user } });
+          switch (removed) {
+            case "removed":
+              break;
+            case "not-owner":
+              return fail(404, `${body.user} is not an owner of ${body.name}.`);
+            case "last-owner":
+              return fail(409, `${body.user} is the last owner of ${body.name}. Add another owner first: a package with no owners can never be published, yanked or revoked again.`);
+            default: {
+              const _exhaustive: never = removed;
+
+              return _exhaustive;
+            }
+          }
+        } else yield* store.addOwner(body.name, body.user);
+        yield* store.addEvent({ package: body.name, kind: remove ? "owner-remove" : "owner-add", actor: user, at, detail: { user: body.user } });
+
+        return null;
+      }),
+    );
+
+    if (refused) return refused;
 
     return json({ ok: true, owners: yield* store.owners(body.name) });
   });

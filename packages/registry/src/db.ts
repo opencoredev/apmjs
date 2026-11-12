@@ -146,6 +146,10 @@ export type PasswordAttempt = "reserved" | "locked";
 // Serializes staged inserts so two concurrent uploads cannot both pass the quota checks (staged uploads are rare).
 const STAGED_INSERT_LOCK = 0x617_06d_5747;
 
+// The first key of the two-key advisory locks on blob keys ("blob"); the second is the key's hash. Two-key
+// advisory locks never conflict with one-key ones such as STAGED_INSERT_LOCK.
+const BLOB_LOCK_CLASS = 0x626c_6f62;
+
 /** One attempt taken from an account's second-factor budget, or the budget is spent. */
 export type Reservation = { kind: "locked" } | { kind: "reserved"; id: number };
 
@@ -202,6 +206,12 @@ export type StoreApi = {
   readonly expireStaged: (now: number) => Effect.Effect<{ id: string; tarball_key: string }[], StoreError>;
   /** Whether any version or pending staged row still points at this blob. */
   readonly blobReferenced: (key: string) => Effect.Effect<boolean, StoreError>;
+  /**
+   * Holds a tarball's blob key for the rest of the transaction. An upload holds it "shared" from writing the
+   * object until its version or staged row is inserted; cleanup holds it "exclusive" while it checks for
+   * references and deletes the object. So cleanup never deletes an object an upload is about to point at.
+   */
+  readonly lockBlob: (key: string, mode: "shared" | "exclusive") => Effect.Effect<void, StoreError>;
 
   readonly insertToken: (t: Token) => Effect.Effect<void, StoreError>;
   readonly getToken: (hash: string) => Effect.Effect<Token | null, StoreError>;
@@ -252,6 +262,8 @@ export type StoreApi = {
   readonly setUpstreamAnalysis: (input: { name: string; version: string; digest: string; analysis: unknown; at: number }) => Effect.Effect<void, StoreError>;
   /** Records that a version was sent for analysis; false when it was sent less than `staleMs` ago. */
   readonly claimAnalysisJob: (name: string, version: string, now: number, staleMs: number) => Effect.Effect<boolean, StoreError>;
+  /** Drops the reservation claimAnalysisJob made at `claimedAt` (when the queue refused the job); a newer claim stays. */
+  readonly releaseAnalysisJob: (name: string, version: string, claimedAt: number) => Effect.Effect<void, StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -485,6 +497,11 @@ const make = Effect.gen(function* () {
         changed,
       ),
 
+    lockBlob: (key, mode) =>
+      mode === "shared"
+        ? run("lockBlob: shared", sql`SELECT pg_advisory_xact_lock_shared(${BLOB_LOCK_CLASS}::int, hashtext(${key})) IS NULL AS locked`, none)
+        : run("lockBlob: exclusive", sql`SELECT pg_advisory_xact_lock(${BLOB_LOCK_CLASS}::int, hashtext(${key})) IS NULL AS locked`, none),
+
     insertToken: (t) =>
       run(
         "insertToken",
@@ -649,6 +666,9 @@ const make = Effect.gen(function* () {
             RETURNING package`,
         changed,
       ),
+
+    releaseAnalysisJob: (name, version, claimedAt) =>
+      run("releaseAnalysisJob", sql`DELETE FROM analysis_jobs WHERE package = ${name} AND version = ${version} AND queued_at = ${claimedAt}`, none),
 
     deleteAdvisoriesFor: (name, version) =>
       run("deleteAdvisoriesFor", sql`DELETE FROM advisories WHERE package = ${name} AND versions ? ${version}`, none),

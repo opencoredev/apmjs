@@ -31,7 +31,7 @@ Bun 1.4 runs everything; Alchemy's CLI runs under Bun too.
 
 ```sh
 bun install
-bun packages/infra/deploy.ts plan   --stage staging      # what would change
+bun packages/infra/deploy.ts plan   --stage staging      # what would change; changes nothing
 bun packages/infra/deploy.ts deploy --stage staging
 bun packages/infra/smoke.ts --stage staging              # check it with stock clients
 ```
@@ -55,7 +55,7 @@ Alchemy keeps what it deployed in `packages/infra/.alchemy/` on the machine that
 
 ## Migrations
 
-Migrations are SQL files in `packages/registry/migrations`, applied in order, each once, inside a transaction, before the Workers update. They only move forward. Write a new numbered file for every schema change; never edit one that has been applied to staging or production. A deploy whose code needs a new migration applies it first, so the old Worker runs briefly against the new schema: keep changes additive, and drop old columns or tables one release later.
+Migrations are SQL files in `packages/registry/migrations`, applied in order, each once, inside a transaction, before the Workers update. A run holds a Postgres advisory lock for its whole length, so two runs against one database take turns and the second finds nothing to do. `plan` only lists a missing database, pending migrations and a missing auth secret; `deploy` creates and applies them. They only move forward. Write a new numbered file for every schema change; never edit one that has been applied to staging or production. A deploy whose code needs a new migration applies it first, so the old Worker runs briefly against the new schema: keep changes additive, and drop old columns or tables one release later.
 
 ## Rolling back
 

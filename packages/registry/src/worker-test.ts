@@ -2,15 +2,17 @@
 // x-apm-test-now sets the registry clock for one request and x-apm-test-totp-now the wall clock authenticator
 // codes are checked against; POST /__test/mint issues a token without a login flow.
 // /__test/blobs lists the blob store's keys (GET) and overwrites one (PUT /__test/blobs/<key>), so tests can
-// tamper with stored bytes. POST /__test/sweep runs the cron's sweep at the test clock. All of it answers only to a caller holding TEST_CONTROL_SECRET, a binding the
-// deployed Worker does not have.
+// tamper with stored bytes. POST /__test/sweep runs the cron's sweep at the test clock. POST /__test/analysis-job runs
+// the queue consumer on one job and says whether it acked the message or asked for a retry. x-apm-test-queue: fail
+// makes the analysis queue refuse every send for that request. All of it answers only to a caller holding
+// TEST_CONTROL_SECRET, a binding the deployed Worker does not have.
 import { Effect } from "effect";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
-import worker, { handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
+import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
 
 /** A positive millisecond time from a test header, or null. */
 function timeHeader(req: Request, name: string): number | null {
@@ -83,6 +85,50 @@ async function blobControl(req: Request, env: TestEnv, path: string): Promise<Re
   return fail(405, "Method not allowed");
 }
 
+const JobBody = z.object({ name: z.string().min(1), version: z.string().min(1) });
+
+/** Runs the consumer on a one-message batch, the way the queue delivers it, and reports what it did with the message. */
+async function analysisJob(req: Request, env: TestEnv): Promise<Response> {
+  const job = JobBody.safeParse(await req.json());
+
+  if (!job.success) return fail(400, job.error.message);
+  let outcome: "ack" | "retry" | "none" = "none";
+
+  const message = {
+    id: "test",
+    timestamp: new Date(),
+    body: job.data,
+    attempts: 1,
+    ack: () => {
+      outcome = "ack";
+    },
+    retry: () => {
+      outcome = "retry";
+    },
+  } satisfies Message<unknown>;
+
+  const batch = {
+    queue: "test",
+    messages: [message],
+    metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+    ackAll: () => message.ack(),
+    retryAll: () => message.retry(),
+  } satisfies MessageBatch<unknown>;
+
+  await consume(batch, env);
+
+  return json({ outcome });
+}
+
+/** The env for one request: with x-apm-test-queue: fail, an analysis queue whose every send fails. */
+function envFor(req: Request, env: TestEnv): TestEnv {
+  if (req.headers.get("x-apm-test-queue") !== "fail") return env;
+
+  const refuse = (): Promise<never> => Promise.reject(new Error("test: the queue refused the message"));
+
+  return { ...env, ANALYSIS_QUEUE: { send: refuse, sendBatch: refuse, metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }) } };
+}
+
 export default {
   async fetch(req: Request, env: TestEnv, ctx: ExecutionContext): Promise<Response> {
     const secret = controlSecret(env);
@@ -94,6 +140,8 @@ export default {
 
     if (path === "/__test/blobs" || path.startsWith("/__test/blobs/")) return trusted ? blobControl(req, env, path) : fail(404, "Not found");
 
+    if (path === "/__test/analysis-job") return trusted && req.method === "POST" ? analysisJob(req, env) : fail(404, "Not found");
+
     if (path === "/__test/sweep") return trusted && req.method === "POST" ? sweep(env, clock).then(() => json({ ok: true })) : fail(404, "Not found");
 
     if (!trusted) return handle(req, env, clock, ctx);
@@ -101,8 +149,9 @@ export default {
     headers.delete("x-apm-test-control");
     headers.delete("x-apm-test-now");
     headers.delete("x-apm-test-totp-now");
+    headers.delete("x-apm-test-queue");
 
-    return handle(new Request(req, { headers }), env, clock, ctx);
+    return handle(new Request(req, { headers }), envFor(req, env), clock, ctx);
   },
   queue: worker.queue,
   scheduled: worker.scheduled,

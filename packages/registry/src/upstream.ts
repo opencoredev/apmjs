@@ -6,6 +6,7 @@ import { Blobs } from "./blobs.ts";
 import { Store, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
+import { readCapped } from "./http.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -91,8 +92,17 @@ function matches(bytes: Uint8Array, d: Digest): boolean {
  */
 export const MAX_UPSTREAM_TARBALL_BYTES = 32 * 1024 * 1024;
 
-/** "absent": the upstream does not list that version (now). "unavailable": it does, but apm could not get verified bytes. */
-export type UpstreamTarball = { kind: "ok"; bytes: Uint8Array; digest: Digest } | { kind: "absent" } | { kind: "unavailable"; reason: string };
+/**
+ * "absent": the upstream does not list that version (now). "unavailable": it does, but apm could not get verified
+ * bytes; `retryable` when asking again later may work (a network error, a 5xx, a 429, bytes that failed their
+ * checksum), not when it cannot (no checksum, too large, a URL apm will not fetch).
+ */
+export type UpstreamTarball = { kind: "ok"; bytes: Uint8Array; digest: Digest } | { kind: "absent" } | { kind: "unavailable"; reason: string; retryable: boolean };
+
+/** Upstream answers that may succeed when asked again. */
+function isTransientStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
 
 export type UpstreamAdvisories = { kind: "ok"; advisories: Record<string, unknown[]> } | { kind: "unavailable" };
 
@@ -100,31 +110,6 @@ export type UpstreamAdvisories = { kind: "ok"; advisories: Record<string, unknow
 const NPM_ORIGIN = "https://registry.npmjs.org";
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const MAX_HOPS = 5;
-
-/** The response body, or null once it passes `max` bytes (the rest is not read). */
-async function readCapped(res: Response, max: number): Promise<Uint8Array | null> {
-  if (!res.body) return new Uint8Array(0);
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = res.body.getReader();
-
-  for (;;) {
-    const { done, value } = await reader.read();
-
-    if (done) break;
-    total += value.length;
-
-    if (total > max) {
-      await reader.cancel();
-
-      return null;
-    }
-
-    chunks.push(value);
-  }
-
-  return Buffer.concat(chunks);
-}
 
 /** The parsed packument without apm's scores; scores are attached per request from the store. */
 type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[] };
@@ -226,35 +211,35 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         const origins: ReadonlySet<string> = new Set([new URL(baseUrl).origin, NPM_ORIGIN]);
 
         /** GET from the upstream's own origin (or npm's) only; each redirect hop is checked before it is followed. */
-        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | { kind: "unavailable"; reason: string }> => {
+        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | Extract<UpstreamTarball, { kind: "unavailable" }>> => {
           let current: URL;
 
           try {
             current = new URL(raw);
           } catch {
-            return { kind: "unavailable", reason: "the upstream lists a malformed tarball URL" };
+            return { kind: "unavailable", reason: "the upstream lists a malformed tarball URL", retryable: false };
           }
 
           for (let hop = 0; hop <= MAX_HOPS; hop++) {
-            if (!origins.has(current.origin)) return { kind: "unavailable", reason: `refusing to fetch a tarball from ${current.origin}, which is not the upstream registry` };
+            if (!origins.has(current.origin)) return { kind: "unavailable", reason: `refusing to fetch a tarball from ${current.origin}, which is not the upstream registry`, retryable: false };
             let res: Response;
 
             try {
               res = await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(30_000) });
             } catch {
-              return { kind: "unavailable", reason: "the tarball download failed" };
+              return { kind: "unavailable", reason: "the tarball download failed", retryable: true };
             }
 
             if (REDIRECTS.has(res.status)) {
               await res.body?.cancel();
               const location = res.headers.get("location");
 
-              if (!location) return { kind: "unavailable", reason: "a redirect without a location" };
+              if (!location) return { kind: "unavailable", reason: "a redirect without a location", retryable: false };
 
               try {
                 current = new URL(location, current);
               } catch {
-                return { kind: "unavailable", reason: "a redirect to a malformed URL" };
+                return { kind: "unavailable", reason: "a redirect to a malformed URL", retryable: false };
               }
 
               continue;
@@ -263,7 +248,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             if (res.status !== 200) {
               await res.body?.cancel();
 
-              return { kind: "unavailable", reason: `the upstream answered ${res.status}` };
+              return { kind: "unavailable", reason: `the upstream answered ${res.status}`, retryable: isTransientStatus(res.status) };
             }
 
             const declared = Number(res.headers.get("content-length") ?? 0);
@@ -271,17 +256,17 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             if (declared > MAX_UPSTREAM_TARBALL_BYTES) {
               await res.body?.cancel();
 
-              return { kind: "unavailable", reason: "the tarball is too large" };
+              return { kind: "unavailable", reason: "the tarball is too large", retryable: false };
             }
 
             const bytes = await readCapped(res, MAX_UPSTREAM_TARBALL_BYTES);
 
-            if (!bytes) return { kind: "unavailable", reason: "the tarball is too large" };
+            if (!bytes) return { kind: "unavailable", reason: "the tarball is too large", retryable: false };
 
             return { kind: "ok", bytes };
           }
 
-          return { kind: "unavailable", reason: "too many redirects" };
+          return { kind: "unavailable", reason: "too many redirects", retryable: false };
         };
 
         const now = Effect.sync(() => Date.now());
@@ -467,7 +452,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               if (!url || !rec) return { kind: "absent" } as const;
               const digest = digestOf(rec);
 
-              if (!digest) return { kind: "unavailable", reason: "the upstream publishes no checksum for this version" } as const;
+              if (!digest) return { kind: "unavailable", reason: "the upstream publishes no checksum for this version", retryable: false } as const;
               const key = upstreamBlobKey(digest);
               const cached = yield* blobs.bytes(key);
 
@@ -480,7 +465,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
               if (got.kind !== "ok") return got;
 
-              if (!matches(got.bytes, digest)) return { kind: "unavailable", reason: "the upstream tarball failed its integrity check" } as const;
+              if (!matches(got.bytes, digest)) return { kind: "unavailable", reason: "the upstream tarball failed its integrity check", retryable: true } as const;
               yield* blobs.put(key, got.bytes);
 
               return { kind: "ok", bytes: got.bytes, digest } as const;

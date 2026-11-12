@@ -42,7 +42,7 @@ jobs:
           export PATH="$PWD/node_modules/.bin:$PATH"
           for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Unit tests
-        run: bun test packages/cli/test packages/core/test packages/registry/test
+        run: bun test packages/cli/test packages/core/test packages/registry/test packages/infra/test
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web

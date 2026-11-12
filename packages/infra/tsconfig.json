@@ -13,5 +13,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["alchemy.run.ts", "deploy.ts"]
+  "include": ["alchemy.run.ts", "deploy.ts", "stage.ts", "test/**/*.ts"]
 }

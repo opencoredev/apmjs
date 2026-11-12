@@ -77,6 +77,10 @@ export type Registry = {
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
   /** Runs the cron's sweep at the test clock: expires staged versions and writes down matured revokes. */
   sweep: () => Promise<void>;
+  /** Test-only: the registry's Postgres, to hold a lock or change rows from a second connection mid-request. */
+  databaseUrl: string;
+  /** Test-only: runs the analysis queue's consumer on one job; "retry" when it handed the message back to the queue. */
+  analysisJob: (job: { name: string; version: string }) => Promise<"ack" | "retry">;
 };
 
 export type TokenScope = "publish" | "stage";
@@ -137,7 +141,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
 
-  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep };
+  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep, databaseUrl: srv.databaseUrl, analysisJob: srv.analysisJob };
 }
 
 /** The Worker variables that turn the AI review on, as the deploy sets them; none when it is off. */
@@ -322,6 +326,7 @@ export type ExportsField = string | null | ExportsField[] | { [key: string]: Exp
 export type RawManifest = {
   name: string;
   version: string;
+  description?: string;
   license?: string;
   main?: string;
   module?: string;

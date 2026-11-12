@@ -10,6 +10,13 @@ import { digestLabel, Upstream, type Digest, type UpstreamPackage } from "./upst
 
 export type AnalysisJob = { readonly name: string; readonly version: string };
 
+/**
+ * What a queued job came to. "stored": scored (now or before). "missing": the upstream does not list the version,
+ * or its tarball can never be read. "retry": the upstream could not be asked, or failed in a way that may pass,
+ * so the queue should deliver the job again.
+ */
+export type JobOutcome = "stored" | "missing" | "retry";
+
 /** Per request: analyze at most this many upstream tarballs inline. */
 export const INLINE_ANALYSES = 8;
 
@@ -64,14 +71,14 @@ export type AnalysisApi = {
   /** Queues a version for analysis unless it is already scored or queued. */
   readonly enqueue: (name: string, version: string) => Effect.Effect<void, StoreError>;
   /** The consumer's work: fetch, verify, analyze and store one version, without a budget. */
-  readonly runJob: (job: AnalysisJob) => Effect.Effect<"stored" | "missing", StoreError | BlobError>;
+  readonly runJob: (job: AnalysisJob) => Effect.Effect<JobOutcome, StoreError | BlobError>;
 };
 
 export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/registry/Analysis") {
   /** No upstream, nothing to score: local versions are scored when they are published. */
   static readonly none = Layer.succeed(
     Analysis,
-    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.void, runJob: () => Effect.succeed("missing" as const) }),
+    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.void, runJob: () => Effect.succeed<JobOutcome>("missing") }),
   );
 
   static layer(queue: Queue<AnalysisJob> | null): Layer.Layer<Analysis, never, Store | Upstream | Clock> {
@@ -94,8 +101,11 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
 
             if (!claimed) return;
             const job: AnalysisJob = { name, version };
+            // a job the queue refused is not on it, so its reservation goes too and the next request queues it again
             yield* Effect.tryPromise({ try: () => queue.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
-              Effect.catchTag("QueueError", (e) => Effect.logWarning("analysis queue send failed", { name, version, cause: String(e.cause) })),
+              Effect.catchTag("QueueError", (e) =>
+                Effect.logWarning("analysis queue send failed", { name, version, cause: String(e.cause) }).pipe(Effect.andThen(store.releaseAnalysisJob(name, version, now))),
+              ),
             );
           });
 
@@ -140,19 +150,46 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             }),
           enqueue,
           runJob: (job) =>
-            Effect.gen(function* () {
-              const pkg = yield* upstream.get(job.name);
-              const v = pkg?.versions.find((x) => x.version === job.version);
+            Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError> {
+              const probe = yield* upstream.probe(job.name);
 
-              if (!pkg || !v) return "missing" as const;
+              switch (probe.kind) {
+                case "unknown":
+                  return "retry";
+                case "absent":
+                  return "missing";
+                case "found":
+                  break;
+                default: {
+                  const _exhaustive: never = probe;
 
-              if (parseAnalysis(v.score)) return "stored" as const;
+                  return _exhaustive;
+                }
+              }
+
+              const pkg = probe.pkg;
+              const v = pkg.versions.find((x) => x.version === job.version);
+
+              if (!v) return "missing";
+
+              if (parseAnalysis(v.score)) return "stored";
               const got = yield* upstream.tarball(pkg, v.version);
 
-              if (got.kind !== "ok") return "missing" as const;
-              yield* analyzeAndStore(pkg, v, got);
+              switch (got.kind) {
+                case "absent":
+                  return "missing";
+                case "unavailable":
+                  return got.retryable ? "retry" : "missing";
+                case "ok":
+                  yield* analyzeAndStore(pkg, v, got);
 
-              return "stored" as const;
+                  return "stored";
+                default: {
+                  const _exhaustive: never = got;
+
+                  return _exhaustive;
+                }
+              }
             }),
         };
 

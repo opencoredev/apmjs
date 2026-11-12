@@ -36,11 +36,16 @@ export type WorkerRegistry = {
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
   /** Runs the cron's sweep (matured revokes, expired staged versions) at the test clock. */
   sweep: () => Promise<void>;
+  /** The registry's Postgres, for tests that hold a lock or change rows from another connection. */
+  databaseUrl: string;
+  /** Runs the analysis queue's consumer on one job, as the queue would deliver it; says whether it acked or asked for a retry. */
+  analysisJob: (job: { name: string; version: string }) => Promise<"ack" | "retry">;
 };
 
 const CONTROL = randomBytes(24).toString("hex");
 const BlobKeys = z.object({ keys: z.array(z.string()) });
 const Minted = z.object({ token: z.string() });
+const JobOutcome = z.object({ outcome: z.enum(["ack", "retry"]) });
 let bundle: Promise<string> | null = null;
 let counter = 0;
 
@@ -155,6 +160,20 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
       });
 
       if (res.status !== 200) throw new Error(`sweep failed: ${res.status}`);
+    },
+    databaseUrl: database.url,
+    analysisJob: async (job) => {
+      const res = await fetch(`${target}__test/analysis-job`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-apm-test-control": CONTROL },
+        body: JSON.stringify(job),
+      });
+
+      const body = JobOutcome.safeParse(await res.json());
+
+      if (res.status !== 200 || !body.success) throw new Error(`analysis job failed: ${res.status}`);
+
+      return body.data.outcome;
     },
     mint: async ({ user, scope }) => {
       const res = await fetch(`${target}__test/mint`, {

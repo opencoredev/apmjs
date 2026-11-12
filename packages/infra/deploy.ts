@@ -1,18 +1,19 @@
 // Deploys apm to Cloudflare: builds the registry Worker, migrates the stage's Neon database, then runs the
 // Alchemy stack. Secrets are read from ~/.config/apmjs and handed to the child process only; nothing prints them.
+// `plan` changes nothing: it reports a missing database, pending migrations and a missing auth secret, and
+// runs Alchemy's own plan.
 //
 //   bun packages/infra/deploy.ts plan    --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage production
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createHash, randomBytes } from "node:crypto";
-import { Client } from "pg";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { buildWorker } from "../registry/scripts/build.ts";
-import { migrate } from "../registry/scripts/migrate.ts";
+import { authSecret, prepareDatabase, type DatabaseReport } from "./stage.ts";
 
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
 const INFRA = import.meta.dirname;
@@ -64,18 +65,6 @@ function reviewSettings(stage: string) {
   return { hash: createHash("sha256").update(secretFile(`review-token-${stage}`)).digest("hex"), admins };
 }
 
-/** The auth secret signs sessions and encrypts TOTP secrets, so it is made once per stage and kept. */
-function authSecret(stage: string): string {
-  const name = `auth-secret-${stage}`;
-
-  if (!existsSync(join(SECRETS, name))) {
-    mkdirSync(SECRETS, { recursive: true, mode: 0o700 });
-    writeFileSync(join(SECRETS, name), `${randomBytes(48).toString("base64url")}\n`, { mode: 0o600 });
-  }
-
-  return secretFile(name);
-}
-
 /** The stage's database on the Neon endpoint, with TLS verified (Neon serves a public certificate). */
 function databaseUrl(neonUrl: string, database: string): string {
   const u = new URL(neonUrl);
@@ -85,16 +74,19 @@ function databaseUrl(neonUrl: string, database: string): string {
   return u.toString();
 }
 
-async function ensureDatabase(neonUrl: string, database: string): Promise<void> {
-  const c = new Client({ connectionString: databaseUrl(neonUrl, new URL(neonUrl).pathname.slice(1)) });
-  await c.connect();
+function describeDatabase(report: DatabaseReport, database: string): string {
+  switch (report.kind) {
+    case "missing":
+      return `database ${database}: missing; deploy creates it and applies ${report.pending.length} migration(s)\n`;
+    case "planned":
+      return report.pending.length === 0 ? "migrations: up to date\n" : `migrations: deploy would apply ${report.pending.join(", ")}\n`;
+    case "migrated":
+      return `${report.created ? `database ${database}: created\n` : ""}${report.applied.length === 0 ? "migrations: up to date\n" : `migrations: applied ${report.applied.join(", ")}\n`}`;
+    default: {
+      const _exhaustive: never = report;
 
-  try {
-    const exists = await c.query("SELECT 1 FROM pg_database WHERE datname = $1", [database]);
-
-    if (exists.rowCount === 0) await c.query(`CREATE DATABASE "${database.replace(/"/g, "")}"`);
-  } finally {
-    await c.end();
+      return _exhaustive;
+    }
   }
 }
 
@@ -119,11 +111,19 @@ const database = DATABASES[args.stage];
 
 process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"})\n`);
 
-await ensureDatabase(neonUrl, database);
+const report = await prepareDatabase({
+  action: args.action,
+  adminUrl: databaseUrl(neonUrl, new URL(neonUrl).pathname.slice(1)),
+  databaseUrl: databaseUrl(neonUrl, database),
+  database,
+});
 
-const applied = await migrate(databaseUrl(neonUrl, database));
+process.stdout.write(describeDatabase(report, database));
 
-process.stdout.write(applied.length === 0 ? "migrations: up to date\n" : `migrations: applied ${applied.join(", ")}\n`);
+const secret = authSecret({ action: args.action, dir: SECRETS, stage: args.stage });
+
+// a plan of a stage that has never been deployed has no secret yet; Alchemy plans with a stand-in
+if (secret.kind === "missing") process.stdout.write(`auth secret: missing; deploy creates ${join(SECRETS, `auth-secret-${args.stage}`)}\n`);
 
 const bundle = await buildWorker("worker");
 
@@ -152,7 +152,7 @@ const child = Bun.spawn(
       WORKERS_SUBDOMAIN: subdomain,
       NEON_URL: neonUrl,
       APM_DATABASE: database,
-      AUTH_SECRET: authSecret(args.stage),
+      AUTH_SECRET: secret.kind === "missing" ? "plan-only-stand-in-for-the-auth-secret-deploy-creates" : secret.value,
       GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
       REVIEW_TOKEN_HASH: review.hash,

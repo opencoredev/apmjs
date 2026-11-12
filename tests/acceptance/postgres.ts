@@ -106,6 +106,21 @@ async function makeTemplate(pg: Postgres): Promise<string> {
 }
 
 
+/** An empty database (no schema, no migrations), and a way to drop it. */
+export async function emptyDatabase(): Promise<{ url: string; drop: () => Promise<void> }> {
+  postgres ??= startPostgres();
+  const server = await postgres;
+  const db = `apm_empty_${process.pid}_${++counter}`;
+  await admin(server, (c) => c.query(`CREATE DATABASE ${db}`));
+
+  return {
+    url: server.adminUrl(db),
+    drop: async () => {
+      await admin(server, (c) => c.query(`DROP DATABASE IF EXISTS ${db} WITH (FORCE)`)).catch(() => {});
+    },
+  };
+}
+
 /** A fresh database with the registry's schema, and a way to drop it. */
 export async function freshDatabase(): Promise<{ url: string; drop: () => Promise<void> }> {
   postgres ??= startPostgres();

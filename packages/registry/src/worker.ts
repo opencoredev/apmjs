@@ -244,7 +244,7 @@ async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, 
 
 const Job = z.object({ name: z.string(), version: z.string() });
 
-/** Scores queued upstream versions. A failed job is retried by the queue. */
+/** Scores queued upstream versions. A failed job, or one whose upstream may answer later, is retried by the queue. */
 export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
@@ -261,11 +261,11 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
       Effect.flatMap(Analysis, (a) => a.runJob(job.data)).pipe(Effect.provide(servicesFor(env, settings, Clock.system)), Effect.scoped),
     );
 
-    if (Exit.isSuccess(exit)) message.ack();
-    else {
+    if (Exit.isFailure(exit)) {
       logFailure("analysis", { name: job.data.name, version: job.data.version }, Cause.pretty(exit.cause));
       message.retry();
-    }
+    } else if (exit.value === "retry") message.retry();
+    else message.ack();
   }
 }
 

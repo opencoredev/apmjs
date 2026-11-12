@@ -440,35 +440,45 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     const cleanManifest: Record<string, unknown> = { ...storedManifest };
 
     for (const k of ["_id", "dist", "_npmUser", "_attachments", "readme", "_resolved", "_integrity", "_from"]) delete cleanManifest[k];
+
+    // the cap above read the request's manifest; this one reads the manifest apm stores and serves (the tarball's)
+    if (utf8Bytes(JSON.stringify(cleanManifest)) > MAX_MANIFEST_BYTES) return fail(413, `package.json is over ${MAX_MANIFEST_BYTES / (1024 * 1024)} MB.`);
     const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
     const shasum = sha1Hex(tarball);
     const digest = sha512(tarball);
     const key = tarballKey(digest.hex);
-    yield* (yield* Blobs).put(key, tarball);
 
     if (staged) {
       const at = yield* clock.now;
       const id = randomId(12);
-      // the checks above ran before the analysis; these run again atomically with the insert
 
-      const stored = yield* store.insertStagedWithin(
-        {
-          id,
-          package: name,
-          version,
-          manifest: cleanManifest,
-          shasum,
-          integrity: digest.integrity,
-          size: tarball.length,
-          tarball_key: key,
-          tag,
-          readme,
-          score,
-          staged_by: user.user,
-          staged_at: at,
-          expires_at: at + STAGE_TTL_MS,
-        },
-        { perUser: MAX_STAGED_PER_USER, perPackage: MAX_STAGED_PER_PACKAGE, bytesPerUser: MAX_STAGED_BYTES_PER_USER },
+      // the blob is written and its staged row inserted under the blob's shared lock (see Store.lockBlob); the
+      // checks above ran before the analysis, and these run again atomically with the insert
+      const stored = yield* store.tx(
+        Effect.gen(function* () {
+          yield* store.lockBlob(key, "shared");
+          yield* (yield* Blobs).put(key, tarball);
+
+          return yield* store.insertStagedWithin(
+            {
+              id,
+              package: name,
+              version,
+              manifest: cleanManifest,
+              shasum,
+              integrity: digest.integrity,
+              size: tarball.length,
+              tarball_key: key,
+              tag,
+              readme,
+              score,
+              staged_by: user.user,
+              staged_at: at,
+              expires_at: at + STAGE_TTL_MS,
+            },
+            { perUser: MAX_STAGED_PER_USER, perPackage: MAX_STAGED_PER_PACKAGE, bytesPerUser: MAX_STAGED_BYTES_PER_USER },
+          );
+        }),
       );
 
       if (stored.kind !== "staged") {
@@ -500,6 +510,7 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
       score,
       publisher: user.user,
       detail: {},
+      upload: tarball,
     }).pipe(
       // the losing publish of a race leaves no blob behind unless another version holds the same bytes
       Effect.tapError(() => dropBlobIfUnused(key)),
@@ -545,16 +556,53 @@ function utf8Bytes(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
-/** Drops a tarball from the blob store once nothing points at it any more. */
+/**
+ * Takes the package's row lock, then checks that `user` still owns it. Call inside a transaction, before any
+ * change: an ownership check made before the lock may be stale by the time the lock is granted.
+ */
+export const lockOwned = (name: string, user: string): Effect.Effect<PackageRecord, HttpFailure | StoreError, Store> =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const pkg = yield* store.lockPackage(name);
+
+    if (!pkg) return yield* Effect.fail(refuse(404, `No package named ${name} on this registry.`));
+    const owners = yield* store.owners(name);
+
+    if (!owners.includes(user)) return yield* Effect.fail(refuse(403, `Only owners of ${name} can do this. Owners: ${owners.join(", ")}`));
+
+    return pkg;
+  });
+
+/** Whether stored tarball bytes are the ones the version was published with: its sha512 integrity, or the sha1 shasum when that is all it has. */
+function matchesPublished(bytes: Uint8Array, v: Pick<VersionRecord, "integrity" | "shasum">): boolean {
+  if (v.integrity.startsWith("sha512-")) return sha512(bytes).integrity === v.integrity;
+
+  return sha1Hex(bytes) === v.shasum;
+}
+
+/**
+ * Drops a tarball from the blob store once nothing points at it any more. The check and the delete hold the
+ * blob's lock exclusively, so an upload of the same bytes waits, or is waited for and then counted.
+ */
 export const dropBlobIfUnused = (key: string): Effect.Effect<void, StoreError | BlobError, Store | Blobs> =>
   Effect.gen(function* () {
-    if (yield* (yield* Store).blobReferenced(key)) return;
-    yield* (yield* Blobs).remove(key);
+    const store = yield* Store;
+    const blobs = yield* Blobs;
+
+    yield* store.tx(
+      Effect.gen(function* () {
+        yield* store.lockBlob(key, "exclusive");
+
+        if (yield* store.blobReferenced(key)) return;
+        yield* blobs.remove(key);
+      }),
+    );
   });
 
 /**
  * Makes a version live: version row, dist-tags, package metadata and the publish event, in one transaction
- * that holds the package row. The tarball is already in the blob store under its content key.
+ * that holds the package row. With `upload`, the tarball is written to the blob store in that transaction,
+ * under the blob's shared lock; without it, it is already there (an approved staged upload, whose row holds it).
  */
 export const commitVersion = (v: {
   name: string;
@@ -569,13 +617,20 @@ export const commitVersion = (v: {
   score: unknown;
   publisher: string;
   detail: Record<string, unknown>;
-}): Effect.Effect<void, HttpFailure | StoreError, Store | Clock> =>
+  upload?: Uint8Array;
+}): Effect.Effect<void, HttpFailure | StoreError | BlobError, Store | Clock | Blobs> =>
   Effect.gen(function* () {
     const store = yield* Store;
+    const blobs = yield* Blobs;
     const at = yield* (yield* Clock).now;
 
     const firstPublish = yield* store.tx(
       Effect.gen(function* () {
+        if (v.upload !== undefined) {
+          yield* store.lockBlob(v.tarballKey, "shared");
+          yield* blobs.put(v.tarballKey, v.upload);
+        }
+
         const created = yield* store.createPackage(v.name, at, v.publisher);
         const pkg = yield* store.lockPackage(v.name);
 
@@ -669,6 +724,7 @@ const handleMetadataUpdate = (name: string, body: PublishBody, user: string) =>
 
     const updated = yield* store.tx(
       Effect.gen(function* () {
+        yield* lockOwned(name, user);
         const changed: string[] = [];
 
         for (const [version, manifest] of asked) {
@@ -718,7 +774,7 @@ const handleDistTags = (req: Request, name: string, tag: string | undefined, cal
     if (!(yield* store.owners(name)).includes(caller.user)) return fail(403, "Not an owner");
 
     if (!tag) return fail(400, "Tag required");
-    const tags = { ...pkg.distTags };
+    let change: { kind: "set"; version: string } | { kind: "delete" };
 
     if (req.method === "PUT" || req.method === "POST") {
       if (!isValidTagName(tag)) return fail(400, tagNameError(tag));
@@ -736,22 +792,36 @@ const handleDistTags = (req: Request, name: string, tag: string | undefined, cal
       const denied = yield* liveChangeRefusal({ user: caller.user, scope: caller.scope, action: { kind: "dist-tag", name, tag, version }, otp: npmOtp(req) });
 
       if (denied) return otpFail(denied);
-      tags[tag] = version;
+      change = { kind: "set", version };
     } else if (req.method === "DELETE") {
       if (tag === "latest") return fail(400, "Cannot delete latest");
 
-      if (tagTarget(tags, tag) === undefined) return fail(404, `No dist-tag ${tag} on ${name}.`);
+      if (tagTarget(pkg.distTags, tag) === undefined) return fail(404, `No dist-tag ${tag} on ${name}.`);
       const denied = yield* liveChangeRefusal({ user: caller.user, scope: caller.scope, action: { kind: "dist-tag", name, tag, version: null }, otp: npmOtp(req) });
 
       if (denied) return otpFail(denied);
-      delete tags[tag];
+      change = { kind: "delete" };
     } else {
       return fail(405, "Method not allowed");
     }
 
     const at = yield* (yield* Clock).now;
-    yield* store.setDistTags(name, tags, at);
-    yield* store.addEvent({ package: name, kind: "dist-tag", actor: caller.user, at, detail: { tag, version: tags[tag] ?? null } });
+    const user = caller.user;
+
+    // the tags are re-read under the lock, so a concurrent change to another tag is kept
+    const tags = yield* store.tx(
+      Effect.gen(function* () {
+        const locked = yield* lockOwned(name, user);
+        const next = { ...locked.distTags };
+
+        if (change.kind === "set") next[tag] = change.version;
+        else delete next[tag];
+        yield* store.setDistTags(name, next, at);
+        yield* store.addEvent({ package: name, kind: "dist-tag", actor: user, at, detail: { tag, version: next[tag] ?? null } });
+
+        return next;
+      }),
+    );
 
     return json({ ok: true, ...tags });
   });
@@ -859,6 +929,8 @@ const handleRevPut = (req: Request, name: string, caller: Caller) =>
     const at = yield* (yield* Clock).now;
     yield* store.tx(
       Effect.gen(function* () {
+        yield* lockOwned(name, caller.user);
+
         for (const u of add) {
           yield* store.addOwner(name, u);
           yield* store.addEvent({ package: name, kind: "owner-add", actor: caller.user, at, detail: { user: u, via: "npm owner" } });
@@ -1041,13 +1113,29 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
       }
 
       if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
-      const blob = yield* (yield* Blobs).stream(v.tarball_key);
+      const blobs = yield* Blobs;
 
-      if (Option.isNone(blob)) return fail(404, "Tarball missing");
+      if (req.method === "HEAD") {
+        const head = yield* blobs.stream(v.tarball_key);
 
-      return new Response(req.method === "HEAD" ? null : blob.value.body, {
-        headers: { "content-type": "application/octet-stream", "content-length": String(blob.value.size) },
-      });
+        if (Option.isNone(head)) return fail(404, "Tarball missing");
+        yield* Effect.promise(() => head.value.body.cancel());
+
+        return new Response(null, { headers: { "content-type": "application/octet-stream", "content-length": String(head.value.size) } });
+      }
+
+      // the bytes are checked against the checksum the packument publishes before any of them are sent
+      const bytes = yield* blobs.bytes(v.tarball_key);
+
+      if (Option.isNone(bytes)) return fail(404, "Tarball missing");
+
+      if (!matchesPublished(bytes.value, v)) {
+        yield* Effect.logError("stored tarball failed its integrity check").pipe(Effect.annotateLogs({ name, version: v.version, key: v.tarball_key }));
+
+        return fail(500, `The stored tarball of ${name}@${v.version} does not match its published checksum, so it is not served.`);
+      }
+
+      return new Response(bytes.value, { headers: { "content-type": "application/octet-stream", "content-length": String(bytes.value.length) } });
     }
 
     if (!pkg) return fail(404, "Not found");

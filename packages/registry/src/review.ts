@@ -401,7 +401,11 @@ export const reviewLocalCommit = (v: { name: string; version: string; firstPubli
     yield* enqueue({ name: v.name, version: v.version, digest, source: "local", reasons });
   });
 
-/** Versions apm sees for the first time: the newest on first sight of a package, then every newer one. */
+/**
+ * Versions apm sees for the first time: the newest on first sight of a package, then every newer one. The
+ * high-water mark and the jobs commit together, so a failed enqueue leaves the versions unseen and the next
+ * fetch queues them. The download count (a network call) is read before the transaction.
+ */
 export const considerUpstream = (pkg: UpstreamPackage) =>
   Effect.gen(function* () {
     const found = yield* Effect.serviceOption(ReviewConfig);
@@ -409,43 +413,51 @@ export const considerUpstream = (pkg: UpstreamPackage) =>
     if (Option.isNone(found)) return;
     const settings = found.value;
     const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
     const versions = pkg.versions.filter((v) => v.published_at > 0);
     const newest = Math.max(0, ...versions.map((v) => v.published_at));
-
-    // claims the newer versions atomically, so two requests that fetched the same packument queue them once
-    const claimed = yield* query(
-      "considerUpstream: seen",
-      sql`WITH old AS (SELECT newest_at FROM review_seen WHERE package = ${pkg.name} FOR UPDATE)
-          INSERT INTO review_seen (package, newest_at) VALUES (${pkg.name}, ${newest})
-          ON CONFLICT (package) DO UPDATE SET newest_at = EXCLUDED.newest_at WHERE review_seen.newest_at < EXCLUDED.newest_at
-          RETURNING (SELECT newest_at FROM old) AS previous`,
-      one(z.object({ previous: Int.nullable() })),
-    );
-
-    if (!claimed) return;
-    const seen = claimed.previous;
     const latest = pkg.distTags.latest;
-    const fresh = seen === null ? versions.filter((v) => v.version === latest) : versions.filter((v) => v.published_at > seen);
+    const freshSince = (seen: number | null) => (seen === null ? versions.filter((v) => v.version === latest) : versions.filter((v) => v.published_at > seen));
 
-    if (fresh.length === 0) return;
-    let popular: boolean | null = null;
+    // the mark only moves forward, so when it already covers this packument there is nothing to claim
+    const mark = yield* query("considerUpstream: peek", sql`SELECT newest_at FROM review_seen WHERE package = ${pkg.name}`, one(z.object({ newest_at: Int })));
 
-    for (const v of fresh.slice(-20)) {
-      const digest = labelOf(v);
+    if (mark !== null && mark.newest_at >= newest) return;
 
-      if (!digest) continue;
-      const reasons: EnqueueReason[] = [];
+    if (freshSince(mark?.newest_at ?? null).length === 0) return;
+    const popular = ((yield* weeklyDownloads(pkg.name, settings)) ?? 0) >= settings.popularWeekly;
 
-      if (versions.length === 1) reasons.push("first-publish");
-      const prev = previousVersionOf(versions, v.version);
+    yield* store.tx(
+      Effect.gen(function* () {
+        // claims the newer versions atomically, so two requests that fetched the same packument queue them once
+        const claimed = yield* query(
+          "considerUpstream: seen",
+          sql`WITH old AS (SELECT newest_at FROM review_seen WHERE package = ${pkg.name} FOR UPDATE)
+              INSERT INTO review_seen (package, newest_at) VALUES (${pkg.name}, ${newest})
+              ON CONFLICT (package) DO UPDATE SET newest_at = EXCLUDED.newest_at WHERE review_seen.newest_at < EXCLUDED.newest_at
+              RETURNING (SELECT newest_at FROM old) AS previous`,
+          one(z.object({ previous: Int.nullable() })),
+        );
 
-      if (hasInstallScript(v) && (prev === null || !hasInstallScript(prev))) reasons.push("install-script");
-      popular ??= ((yield* weeklyDownloads(pkg.name, settings)) ?? 0) >= settings.popularWeekly;
+        if (!claimed) return;
 
-      if (popular) reasons.push("popular");
+        for (const v of freshSince(claimed.previous).slice(-20)) {
+          const digest = labelOf(v);
 
-      if (reasons.length > 0) yield* enqueue({ name: pkg.name, version: v.version, digest, source: "upstream", reasons });
-    }
+          if (!digest) continue;
+          const reasons: EnqueueReason[] = [];
+
+          if (versions.length === 1) reasons.push("first-publish");
+          const prev = previousVersionOf(versions, v.version);
+
+          if (hasInstallScript(v) && (prev === null || !hasInstallScript(prev))) reasons.push("install-script");
+
+          if (popular) reasons.push("popular");
+
+          if (reasons.length > 0) yield* enqueue({ name: pkg.name, version: v.version, digest, source: "upstream", reasons });
+        }
+      }),
+    );
   });
 
 // ---------- viewers ----------

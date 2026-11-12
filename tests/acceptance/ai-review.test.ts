@@ -504,4 +504,30 @@ describe("AI review", () => {
     expect(dig((await review("ai-review-outage-demo", "1.0.0")).body, "review", "state")).toBe("found-nothing");
     expect(model.stats.badKey).toBe(0);
   });
+
+  // review item 5: the high-water mark used to be committed before the jobs, so a failed insert lost the release for good
+  test("an upstream release whose enqueue failed is queued by the next fetch", async () => {
+    npm.packages.set("review-loss-lib", [{ version: "1.0.0", files: { "index.js": "module.exports = 'x';\n" }, at: "2026-11-06T00:00:00Z" }]);
+    npm.downloads.set("review-loss-lib", 50_000);
+    // a fault only this package's job hits: the insert into review_jobs fails
+    await reg.query(
+      `CREATE FUNCTION apm_test_refuse_job() RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN IF NEW.package = 'review-loss-lib' THEN RAISE EXCEPTION 'test: enqueue refused'; END IF; RETURN NEW; END $$`,
+    );
+    await reg.query("CREATE TRIGGER apm_test_refuse_job BEFORE INSERT ON review_jobs FOR EACH ROW EXECUTE FUNCTION apm_test_refuse_job()");
+
+    try {
+      expect((await getJson(`${reg.url}review-loss-lib`)).status).toBe(200);
+      // the policy runs after the response: it reads the download count, then tries to queue the job
+      expect(await until(async () => (await reg.query("SELECT 1 FROM review_downloads WHERE package = 'review-loss-lib'")).length > 0)).toBe(true);
+      await Bun.sleep(500);
+      expect(dig((await review("review-loss-lib", "1.0.0")).body, "status")).toBe("not-reviewed");
+    } finally {
+      await reg.query("DROP TRIGGER apm_test_refuse_job ON review_jobs");
+      await reg.query("DROP FUNCTION apm_test_refuse_job()");
+    }
+
+    expect((await getJson(`${reg.url}review-loss-lib`)).status).toBe(200);
+    expect(await until(async () => dig((await review("review-loss-lib", "1.0.0")).body, "status") === "queued")).toBe(true);
+  });
 });
