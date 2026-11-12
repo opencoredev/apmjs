@@ -359,8 +359,10 @@ function catalogMemo() {
   const get = (name: string) =>
     Effect.gen(function* () {
       if (!known.has(name)) yield* load([name]);
+      const found = known.get(name);
 
-      return known.get(name) ?? "unknown";
+      // null is a confirmed absence ("not on this registry or upstream"): only a name load left unread is unknown
+      return found === undefined ? "unknown" : found;
     });
 
   return { load, get };

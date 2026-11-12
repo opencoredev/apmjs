@@ -211,6 +211,14 @@ describe("the resolve walk bounds its database work", () => {
     });
   });
 
+  test("a dependency nobody has is reported as not existing, with no upstream configured", () =>
+    withDatabase({ local: [{ name: "root", dependencies: { "no-such-dep": "^1.0.0" } }] }, async (url) => {
+      const r = await resolve({ url, name: "root" });
+
+      expect(r.status).toBe(200);
+      expect(r.body.tree.uncheckedDeps).toEqual([{ dependency: "no-such-dep@^1.0.0", reason: "not on this registry or upstream" }]);
+    }));
+
   test("a long chain stops at the level limit and says so", () => {
     // c0 -> c1 -> ... -> c39: one package per level
     const chain: Pkg[] = Array.from({ length: 39 }, (_, i) => ({ name: `c${i}`, dependencies: { [`c${i + 1}`]: "^1.0.0" } }));
@@ -256,5 +264,25 @@ describe("the resolve walk bounds its database work", () => {
         // the root's catalog, then per level: this registry's packages (none here) and npm's analyses with dismissals
         expect(r.queries).toBeLessThanOrEqual(12);
       }));
+
+    test("a dependency npm answers 404 for is reported as not existing, not as npm being unreachable", () =>
+      withDatabase({ local: [{ name: "root", dependencies: { "up-leaf0": "^1.0.0", "no-such-dep": "^1.0.0" } }], upstream: [{ name: "up-leaf0" }] }, async (url) => {
+        const r = await resolve({ url, name: "root", npm: npm.url });
+
+        expect(r.status).toBe(200);
+        expect(r.body.tree.packages).toEqual([{ name: "up-leaf0", version: "1.0.0" }]);
+        expect(r.body.tree.uncheckedDeps).toEqual([{ dependency: "no-such-dep@^1.0.0", reason: "not on this registry or upstream" }]);
+      }));
+
+    test("a dependency npm could not answer for is reported as unknown, not as absent", () => {
+      const down = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("unavailable", { status: 503 }) });
+
+      return withDatabase({ local: [{ name: "root", dependencies: { "some-npm-dep": "^1.0.0" } }] }, async (url) => {
+        const r = await resolve({ url, name: "root", npm: down.url.href });
+
+        expect(r.status).toBe(200);
+        expect(r.body.tree.uncheckedDeps).toEqual([{ dependency: "some-npm-dep@^1.0.0", reason: "the upstream registry could not be asked" }]);
+      }).finally(() => down.stop(true));
+    });
   });
 });
