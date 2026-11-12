@@ -40,9 +40,11 @@ That is what makes the heaviest signals sure:
 
 Code a file keeps as text is read as a program too: a string it runs, a comment or regex it turns back into code with `String(fn)` or `.source` and runs (padding is squeezed out first), or a string that holds a program. What that code does counts where the file holds it, so code an install script runs still counts as install time. A program a module only exports as text (example code a generator ships) adds its risks, but not a confirmed flow.
 
-Small decoder functions a package defines (`h => h.replace(/../g, m => String.fromCharCode(parseInt(m, 16)))`) are run on the strings they are called with, so a name hidden behind one is read.
+Small decoder functions a package defines (`h => h.replace(/../g, m => String.fromCharCode(parseInt(m, 16)))`) are run on the strings they are called with, so a name hidden behind one is read. A decoder runs only regexes apm can prove take linear time: no groups, alternation or open-ended repeats, and at most one optional character. A decoder that runs out of steps or output before it returns is code apm did not finish reading.
 
-The analysis is bounded for any input: values another file gives are worked out once per export, with a work budget for the whole package, and the whole analysis has a time limit. When a budget or limit is reached, or code that runs is longer than apm reads, the result says so (`incomplete`, or `unanalyzed-files` for files nothing runs). It never reads as clean.
+The analysis is bounded for any input. Each file's work is counted: following values through it, running its decoders, and the code and decoded text it holds. Values another file gives are worked out once per export, with a work budget for the whole package, and the whole analysis has a time limit. When a budget or limit is reached, or code that runs is longer than apm reads, the result says so (`incomplete`, or `unanalyzed-files` for files nothing runs). It never reads as clean.
+
+Some versions can never be scored: a tarball over 32 MiB, or one that unpacks to more than 48 MiB, one the upstream lists with no checksum, one apm cannot read, or one whose analysis keeps running past the registry's CPU limit. The registry records why. The score page, `apm add`, `apm score` and the Bun scanner show that reason instead of "not scored yet". Installs through apm refuse the version, as they refuse any version with no score.
 
 Images, fonts, archives and WebAssembly are recognised by their bytes and skipped. Executables and native `.node` modules are listed as `binary`. A file over 32 MB, or code past the 200 MB total, is not read and marks the analysis `incomplete`, which on its own puts the version below the floor.
 

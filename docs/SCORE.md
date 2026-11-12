@@ -71,9 +71,19 @@ The calls it reports are the reader's own roles: an evaluator (eval under any na
 
 Code a file holds as text is read as a program of its own, cited at the line that holds it, so what runs at install is still install time: a string it hands an evaluator (decoded or not), text it recovers from its own source and runs (a function made a string with `String(fn)` or `fn.toString()`, a regex body through `.source`, the file read through `__filename` or `import.meta`, with the comment and regex delimiters taken out so what they held reads as the code it becomes), and a string that reads as a program used some other way (a builtin another file redefines as an evaluator can run it; only the risks such a string holds count, not its capabilities). A string a module only keeps as data (what it exports, directly or in object and array literals it exports with no method beside the string, as a code generator's examples are) adds its risks but not its flows: no confirmed flow comes from text that does not run. The same string written to a file and loaded is run code. Recovered text whose comments name nothing dangerous is prose and is left alone; recovered text that names a network, process, credential or code call is `runs-decoded-code` on top of whatever it does. Runs of whitespace in recovered text and in code run from strings are squeezed to one before the limits apply, so padding cannot push a payload out of view. Code held as text is followed three levels deep and up to 256 KB per file, and one string or one recovered range up to 256 KB; code that runs past any of these is `incomplete`, never dropped.
 
-Small decoder functions the program defines are run on the strings they are called with (`decode.ts`): a function of a few hundred characters whose body is expressions over strings, numbers and arrays (string and array methods, `String.fromCharCode`, `parseInt`, `atob`, `Buffer` decoding, arithmetic, and callbacks of those), so `require(g('6178696f73'))` reads as `require('axios')`. It gives up on anything else (a loop, a write, a call it does not know, a regex with a group or an open-ended repeat), and a step budget and length caps bound it.
+Small decoder functions the program defines are run on the strings they are called with (`decode.ts`): a function of a few hundred characters whose body is expressions over strings, numbers and arrays (string and array methods, `String.fromCharCode`, `parseInt`, `atob`, `Buffer` decoding, arithmetic, and callbacks of those), so `require(g('6178696f73'))` reads as `require('axios')`. A run ends one of three ways. **Decoded**: the string it returns. **Unsupported**: the function does something the decoder does not run (a loop, a write, a call it does not know, a `$` pattern in a replacement), and the value stays unknown as any other computed value does. **Exhausted**: it hit a limit, and the call is code apm did not finish reading, so the analysis is `incomplete`. The limits are 200,000 steps a call, 2,000,000 for every call in one file together, 64 KB of text (counted before `join` or `replace` builds a string), calls nested four deep, and the file's 256 KB of decoded text. A regex runs only if apm can prove it linear (`safeRegexCost`). That means characters, escapes, `.` and classes, each once or an exact `{n}` times (n at most 99, 64 characters wide in all), with at most one optional atom in the whole pattern and no groups, alternation, back-references, lookarounds, open or ranged repeats, or lazy quantifiers. Such a pattern tries at most two fixed paths from each start, and that work is charged to the step budget before the engine runs. Any other pattern is unsupported. Before this, `^(a?){40}a{20}$` passed the old check and backtracked 2^40 paths inside native `replace`, outside every budget.
 
-What stops it: a value followed more than 32 steps, a module apm cannot resolve, and obfuscator output, whose strings come from tables no flow analysis follows (there a hidden credential name still counts as a read). Past each, the text rules and the close-together rules above are the floor. A chain of values deep enough to exhaust the stack, the cross-file budget, and the analysis's time limit (`MAX_ANALYSIS_MS`, 90 s, a backstop: a file reached after it is not read) each make the analysis `incomplete` (or `unanalyzed-files` for files nothing runs); none of them reads as clean.
+What stops it: a value followed more than 32 steps, a module apm cannot resolve, and obfuscator output, whose strings come from tables no flow analysis follows (there a hidden credential name still counts as a read). Past each, the text rules and the close-together rules above are the floor. Each of these makes the analysis `incomplete`, or `unanalyzed-files` for files nothing runs, and none of them reads as clean:
+
+- a chain of values deep enough to exhaust the stack;
+- one file's flow work budget (`MAX_FLOW_WORK`: 16 million labels handled; the corpus's most is 5.7 million, execa's `lib/methods/main-async.js`);
+- the cross-file budget;
+- a decoder that hit a limit (above);
+- the analysis's time limit (`MAX_ANALYSIS_MS`, 90 s).
+
+The flow budget exists because imported helpers that pass each other's results multiply labels with every level: a generated 1.3 KB file ran for more than a minute without it.
+
+**Bounded, and how.** Every step inside one file has a work budget: the parse is linear, and flow, decoders, held code and decoded text are counted. So one file's cost is bounded by its size and those budgets, not by its shape. The 90 s time limit is checked between files: a file reached after it is not read. In a deployed Cloudflare Worker the clock does not advance while code runs, so the registry cannot rely on that check there. A run the platform stops for CPU is caught by the next run instead (below, "In the registry").
 
 Every risk signal cites its evidence the way v9's signals did, and an apm reviewer can dismiss evidence of the code risks (`credential-read`, `credential-mention`, `encoded-data`, `obfuscated`, `exfiltration`, `capture-endpoint`, `remote-shell`, `runs-decoded-code`, `install-network`, `install-shell`, `install-eval`) for one tarball digest, as before.
 
@@ -161,9 +171,37 @@ The third review of v10 (HOLD, safety 4/10) found ten more: re-export resolution
 
 The standing check (`tools/score-eval/compare.ts <v9.json> <now.json>`) lists every sample v9 refuses that the candidate passes and exits 1 unless each is a v9 false positive named in `tools/score-eval/v9-false-positives.json`. On these sets it is one: vite (v9 30 for `.npmrc` in a list of config names and its capabilities; 95 now, as at aefeffc). Among the probes it is none.
 
-Bounds: the cross-file fixed point takes 29 ms on the review's 45-file DAG, 25 ms on 53 files and 65 ms on 401; no probe takes more than 9 ms. The slowest real package is next 16.4.6 at 23 to 27 s on this machine (it was 27 s at aefeffc), which is why the time limit is 90 s. The default floor fuzz (300 cases) runs inside the 18 s core suite; 10,000 cases of seeds 31337 and 20261113 each took 128 s and found no missing v3 finding.
+Bounds: the cross-file fixed point takes 29 ms on the review's 45-file DAG, 25 ms on 53 files and 65 ms on 401; no probe takes more than 9 ms. The slowest real package is next 16.4.6 at 23 to 34 s on this machine (it was 27 s at aefeffc), which is why the time limit is 90 s; next is over both registry caps (41.6 MB compressed, 183 MB unpacked), so the registry never analyses it. Of the corpus tarballs under both caps, the largest is better-sqlite3 13.1.1 (11.0 MB compressed, 26.3 MB unpacked: 0.07 s to unpack and 0.58 s to analyse in workerd), and the slowest is three 0.187.0 (4.6 MB, 20.1 MB unpacked: 5.9 s in workerd). prisma-client 7.10.1 is under the download cap but unpacks to 71 MB, so it is recorded too large. The decoder and flow fixes changed no corpus score. The default floor fuzz (300 cases) runs inside the 18 s core suite; 10,000 cases of seeds 31337 and 20261113 each took 128 s and found no missing v3 finding.
 
 Benign cases that stay below 75: CLI `.npmrc` readers (npm, pnpm and yarn styles, 70: the read is `credential-read`, the named token they send is not exfiltration), an SDK config and two configs that read three token families and send one, and a package exporting example code (62: the text rule still sees three families, or an environment dump, beside a network call, at the possible-flow weight), and a code generator's examples (55: that text rule plus a credential path beside a read in the same strings).
+
+### In the registry
+
+An upstream version is analysed in the registry Worker. A request analyses at most eight tarballs of at most 4 MB itself, 15 s each; the rest go to the analysis queue, whose consumer takes one message per invocation and gives each analysis 90 s. The Worker's CPU limit is 5 minutes (`limits.cpu_ms` 300,000 in `packages/infra/alchemy.run.ts`, the paid plan's most), so the deadline leaves more than three minutes for the download, the unpack, the writes and a CPU slower than the one these times come from. Only CPU used is billed ($0.02 per million CPU-ms past the 30 million a month included), so the higher limit changes nothing for a run that finishes fast. A run that used all 5 minutes would cost about $0.006, against $0.0006 for one stopped at the old 30 s default.
+
+Since the clock does not move during code in a deployed Worker, the 90 s check cannot stop a run there, and a run the platform stops stores nothing. So each run is counted before it starts (`analysis_outcomes`, migration 0010):
+
+- If another run began under 6 minutes ago, it may still be going, and the job comes back after that.
+- The run after one that never stored anything reads at most 4 MB, and its analysis is `incomplete` with the reason.
+- The run after two such runs records `analysis-limit` without analysing.
+
+A version is therefore never left looking queued forever, and never scored clean on a reading that stopped short.
+
+Some versions can never be scored, and the registry records why, per scorer:
+
+- `too-large`: the tarball is over the 32 MiB download cap or the 48 MiB unpack cap. next 16.x is 43 MB and 192 MB.
+- `unavailable`: the upstream lists no checksum, or serves the tarball from a host apm will not fetch.
+- `unreadable`: not a gzip tar apm can read, or a path appears twice or escapes the package folder.
+- `analysis-limit`: the platform stopped its analysis twice.
+
+For such a version:
+
+- The score endpoint answers 422 with the reason, not 503 "queued, try again in a minute".
+- The website says it cannot be scored and why.
+- `apm add` and the `~safe` view skip it with the reason.
+- The Bun scanner lists it as unchecked with the reason. It warns, and cancels the install under `APM_SCANNER_STRICT=1`, as for any unchecked package.
+
+None of these is installed as if it passed.
 
 ## What it reads, in order
 
