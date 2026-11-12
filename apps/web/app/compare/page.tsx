@@ -1,6 +1,11 @@
 import { CheckIcon, EqualIcon, XIcon } from "lucide-react";
+import { pageMetadata } from "@/lib/agent/seo";
 
-export const metadata = { title: "npm vs apm" };
+export const metadata = pageMetadata({
+  title: "npm vs apm: what changes when you switch",
+  description: "What apm adds in front of npm: per-version security scores with cited evidence, a 24-hour cooldown, yank and revoke at any time, typosquat checks, and the same bun, npm and pnpm.",
+  path: "/compare",
+});
 
 /** `code` and **bold** spans inside comparison copy. */
 function Rich({ text, onSurface = false }: { text: string; onSurface?: boolean }) {

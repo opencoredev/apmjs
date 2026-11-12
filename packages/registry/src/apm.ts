@@ -1181,6 +1181,15 @@ const recentResponse = (url: URL) =>
     return json({ events });
   });
 
+/** GET /-/apm/v1/recent-packages: the npm packages scored most recently, newest first (the website's sitemap). */
+const recentPackagesResponse = (url: URL) =>
+  Effect.gen(function* () {
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50) || 50));
+    const rows = yield* (yield* Store).recentlyScored(limit);
+
+    return json({ packages: rows.map((r) => ({ name: r.package, at: new Date(r.at).toISOString() })) });
+  });
+
 // ---------- policy: ~safe view, resolve, scan ----------
 export type Policy = { cooldownMs: number; floor: number };
 
@@ -1773,6 +1782,8 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
     }
 
     if (rest === "recent") return yield* recentResponse(url);
+
+    if (rest === "recent-packages") return yield* recentPackagesResponse(url);
 
     if (rest === "resolve") return yield* resolveResponse(url);
 

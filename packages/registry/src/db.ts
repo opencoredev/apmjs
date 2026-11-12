@@ -366,6 +366,8 @@ export type StoreApi = {
   readonly eventsFor: (name: string) => Effect.Effect<EventRecord[], StoreError>;
   /** The latest events of `kinds`, leaving out those by `hiddenActors` or on packages under `hiddenScopes` (`@scope/`). */
   readonly recentEvents: (kinds: readonly string[], limit: number, hidden: RecentHidden) => Effect.Effect<EventRecord[], StoreError>;
+  /** npm packages this registry scored most recently (a package page or an install asked for them), newest first. */
+  readonly recentlyScored: (limit: number) => Effect.Effect<{ package: string; at: number }[], StoreError>;
 
   /** Better Auth's rows, read for apm's own account views. */
   readonly accountsOf: (authUserId: string) => Effect.Effect<Linked[], StoreError>;
@@ -900,6 +902,13 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             sql`SELECT * FROM events WHERE kind = ANY(${kinds}) AND NOT (actor = ANY(${hidden.actors})) AND NOT (split_part(package, '/', 1) || '/' = ANY(${hidden.scopes})) ORDER BY at DESC, id DESC LIMIT ${limit}`,
             all(EventRow),
           ),
+    // the inner LIMIT walks the analyzed_at index (migration 0008); grouping only that window keeps it cheap
+    recentlyScored: (limit) =>
+      run(
+        "recentlyScored",
+        sql`SELECT package, max(analyzed_at) AS at FROM (SELECT package, analyzed_at FROM upstream_analysis ORDER BY analyzed_at DESC LIMIT ${limit * 10}) recent GROUP BY package ORDER BY at DESC LIMIT ${limit}`,
+        all(z.object({ package: z.string(), at: Int })),
+      ),
 
     accountsOf: (authUserId) =>
       run(

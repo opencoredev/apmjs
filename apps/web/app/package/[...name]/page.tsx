@@ -3,7 +3,7 @@ import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getTarballReadme, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getPackage, getTarballReadme, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
@@ -30,6 +30,10 @@ import { githubRepo } from "@/lib/repository";
 import { ReadmeView } from "@/components/readme-view";
 import { scoreLine, scoreLineText } from "@/lib/score-summary";
 import { describeEvent } from "@/lib/package-events";
+import type { Metadata } from "next";
+import { JsonLd } from "@/components/json-ld";
+import { packageJsonLd, packageMetadata, pageMetadata } from "@/lib/agent/seo";
+import { canonicalPackagePath } from "@/lib/agent/site";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -450,6 +454,30 @@ function ScoreSummary({ score, className }: { score: PackageInfo["score"]; class
 
 type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[]; line?: string | string[] }> };
 
+/** Title, description, canonical URL and social cards. getPackage is cached per request, so the page reuses this read. */
+export async function generateMetadata({ params }: Pick<PageProps, "params">): Promise<Metadata> {
+  const route = parsePackageRoute((await params).name);
+
+  if (!route) return {};
+
+  if (route.kind === "file") {
+    // one file of one version: useful to follow from a score, too thin to rank on its own
+    return pageMetadata({
+      title: `${route.path} in ${route.name}@${route.version} · apm`,
+      description: `The file ${route.path} from ${route.name} ${route.version}, as published, with the lines apm's score cites.`,
+      path: fileHref({ name: route.name, version: route.version, path: route.path }) ?? packagePath(route.name),
+      noindex: true,
+    });
+  }
+
+  const found = await getPackage(route.name);
+
+  if (found.kind !== "ok") return pageMetadata({ title: `${route.name} · apm`, description: `The apm security score and install policy for ${route.name}.`, path: canonicalPackagePath(route.name) });
+  const pkg = found.value;
+
+  return packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
+}
+
 export default function PackagePage({ params, searchParams }: PageProps) {
   return (
     <Suspense
@@ -618,8 +646,23 @@ async function PackageContent({ params, searchParams }: PageProps) {
   const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
   const signInHref = `/signin?next=${encodeURIComponent(here)}`;
 
+  const repository = links.find((l) => l.kind === "repository")?.href ?? null;
+  const homepage = links.find((l) => l.kind === "homepage")?.href ?? null;
+
+  const structured = packageJsonLd({
+    name: pkg.name,
+    description: pkg.description,
+    latest: pkg.latest,
+    score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null,
+    license: pkg.facts?.license ?? null,
+    repository,
+    homepage,
+    maintainers: pkg.maintainers,
+  });
+
   return (
     <div className="flex flex-col gap-10 sm:gap-12">
+      <JsonLd data={structured} />
       <header className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>

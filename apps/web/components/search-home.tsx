@@ -618,7 +618,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
   return (
     <div className="flex flex-col">
-      <h1 className="sr-only">Search packages</h1>
+      <h1 className="sr-only">Search npm packages and check their security score</h1>
       <div role="search" className="relative">
         <SearchIcon className="pointer-events-none absolute top-1/2 left-5 size-5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <input

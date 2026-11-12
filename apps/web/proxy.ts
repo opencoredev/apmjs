@@ -1,4 +1,5 @@
-// Runs before routing (Next.js 16 "proxy", formerly middleware). Three jobs:
+// Runs before routing (Next.js 16 "proxy", formerly middleware). Three jobs, and a rewrite of
+// /package/<name>.md to the Markdown view for agents:
 //  1. Forwarding headers: drop every client-supplied one, so neither the registry nor the search rate
 //     limit trusts an address the client made up.
 //  2. Registry routes: /api/auth/* and /-/apm/v1/* are forwarded to the registry from here, with the
@@ -10,6 +11,7 @@
 //     Both checks are HEAD requests the registry answers without building the package answer or reading the
 //     file, and a package or file known to exist is answered from the edge cache (lib/package-status.ts).
 import { NextResponse, type NextRequest } from "next/server";
+import { markdownApiPath, markdownRoute } from "@/lib/agent/md-route";
 import { CLIENT_FORWARDING_HEADERS, edgeClientIp } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
 import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
@@ -46,6 +48,10 @@ export async function proxy(request: NextRequest): Promise<Response> {
   const { pathname } = request.nextUrl;
 
   if (isRegistryPath(pathname)) return forwardToRegistry(request, { registry: REGISTRY, headers, dev: process.env.NODE_ENV === "development" });
+  // /package/<name>.md and ?format=md: the Markdown view for agents, rendered by app/api/package-md
+  const md = request.method === "GET" || request.method === "HEAD" ? markdownRoute(request.nextUrl) : null;
+
+  if (md) return NextResponse.rewrite(new URL(markdownApiPath(md), request.url), { request: { headers } });
   const prefetch = request.headers.has("next-router-prefetch") || request.headers.get("purpose") === "prefetch";
   const checked = pathname.startsWith("/package/") && (request.method === "GET" || request.method === "HEAD") && !prefetch;
   const route = checked ? packageRoute(pathname) : undefined;

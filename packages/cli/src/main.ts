@@ -8,6 +8,7 @@ import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
+import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { bunKeyNames, findLockfile, isLockPm, lockedEntry, type LockNode, type LockPm } from "./lockfile.ts";
@@ -579,6 +580,19 @@ async function cmdName(a: Args): Promise<number> {
   return 0;
 }
 
+// ---------- explain / search (agent-facing; the work is in agent.ts) ----------
+function io(): AgentIo {
+  return { say, warn, emit, json: jsonMode, paint: { green, yellow, red, dim, bold, grade: gradeColor } };
+}
+
+async function cmdExplain(a: Args): Promise<number> {
+  return explainCommand({ api: new Api(config(process.cwd())), spec: a.positional[0], io: io() });
+}
+
+async function cmdSearch(a: Args): Promise<number> {
+  return searchCommand({ api: new Api(config(process.cwd())), words: a.positional, size: flag(a, "size"), io: io() });
+}
+
 // ---------- audit ----------
 /** Packages per scan request: what the registry checks without a token. */
 const SCAN_BATCH = 200;
@@ -992,6 +1006,8 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm x <pkg> [args]         show the risk card, then run it (bunx / npx)
   apm publish [--bump patch|minor|major] [--dry-run] [--tag t]
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
+  apm explain <pkg>[@range]  install, review-first or do-not-install, and why (exit 0, 3 or 1)
+  apm search <words>         search apm and npm, with scores
   apm audit                  installed versions vs revocations and advisories
   apm yank|unyank <pkg>@<v>  hide from new installs (lockfiles keep working)
   apm revoke <pkg>@<v> --reason "..."   pull a malicious version (asks for your authenticator code)
@@ -1007,7 +1023,7 @@ Registry: APM_REGISTRY or registry= in .npmrc (default ${DEFAULT_REGISTRY})`;
 const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebuild", "add", "remove", "rm", "uninstall", "link"]);
 
 // Commands that print one JSON document with --json (everything else is the package manager's).
-const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
+const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain", "search", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
 
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
@@ -1041,6 +1057,10 @@ async function main(a: Args): Promise<number> {
       return cmdScore(a);
     case "name":
       return cmdName(a);
+    case "explain":
+      return cmdExplain(a);
+    case "search":
+      return cmdSearch(a);
     case "audit":
       return cmdAudit();
     case "yank":

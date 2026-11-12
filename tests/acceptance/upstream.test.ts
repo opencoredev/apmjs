@@ -2,6 +2,7 @@
 // install gate and audit cover the packages people actually install, not only ones published to apm.
 // A second in-process registry stands in for registry.npmjs.org.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,6 +89,19 @@ describe("upstream proxy", () => {
     const bad = await getJson(`${reg.url}-/apm/v1/score/up-evil/1.0.0`);
     expect(bad.status).toBe(200);
     expect(Number(dig(bad.body, "score"))).toBeLessThan(40);
+  });
+
+  test("recent-packages lists the npm packages scored most recently, each once (the website's sitemap)", async () => {
+    const r = await getJson(`${reg.url}-/apm/v1/recent-packages?limit=10`);
+
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    const { packages } = z.object({ packages: z.array(z.object({ name: z.string(), at: z.string() })) }).parse(r.body);
+    const names = packages.map((p) => p.name);
+
+    expect(names).toContain("up-pkg");
+    expect(names).toContain("up-evil");
+    expect(new Set(names).size).toBe(names.length);
+    expect(Number.isNaN(Date.parse(packages[0]?.at ?? ""))).toBe(false);
   });
 
   test("the ~safe view applies the cooldown to upstream packages", async () => {

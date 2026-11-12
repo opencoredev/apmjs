@@ -1,5 +1,6 @@
 // Server-side client for the apm registry API. Responses are parsed at this boundary.
 import "server-only";
+import { cache } from "react";
 import { z } from "zod";
 import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
@@ -125,8 +126,11 @@ async function getJson<T>(
   return result;
 }
 
-/** A package's answer, with its readme and its latest score's evidence: read from the registry on every view. */
-export const getPackage = (name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo);
+/**
+ * A package's answer, with its readme and its latest score's evidence: read from the registry on every view, and
+ * shared within one request only (React cache), so the page and its metadata read it once.
+ */
+export const getPackage = cache((name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo));
 
 export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> {
   const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: { policy: POLICIES.events, keep: () => true } });

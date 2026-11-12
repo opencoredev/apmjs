@@ -30,6 +30,10 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 
 How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## For agents
+
+apm runs a read-only remote MCP server at `https://apmjs.dev/mcp` (tools: `search_packages`, `check_package`, `check_name`, `explain_install`, `get_file_excerpt`). Claude Code: `claude mcp add --transport http apm https://apmjs.dev/mcp`. Without MCP: `GET /api/explain?package=<name>`, `/package/<name>.md`, `/openapi.json`, `/llms.txt`, and `apm explain <pkg> --json`. Setup for Codex and Cursor and the details: [docs/AGENTS.md](docs/AGENTS.md).
+
 ## Run it
 
 The registry needs Postgres installed locally (`initdb` on PATH or under `/usr/lib/postgresql`), or a server in `APM_TEST_DATABASE_URL`.
