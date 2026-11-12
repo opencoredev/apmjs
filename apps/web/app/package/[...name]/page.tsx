@@ -1,10 +1,9 @@
 import { notFound } from "next/navigation";
 import { Suspense } from "react";
-import { z } from "zod";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getEvents, getPackage, getReview, getTarballReadme, getVersionScore, type Dismissed, type Facts, type Fetched, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
@@ -28,6 +27,7 @@ import { cutReadme, EXTERNAL_REL, renderReadme } from "@/lib/readme";
 import { githubRepo } from "@/lib/repository";
 import { ReadmeView } from "@/components/readme-view";
 import { scoreLine, scoreLineText } from "@/lib/score-summary";
+import { describeEvent } from "@/lib/package-events";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -401,56 +401,6 @@ function ScoreSummary({ score, className }: { score: PackageInfo["score"]; class
   );
 }
 
-/** The item a dismissal or its undo names, as the log shows it: "credential-access evidence (index.js:1)". */
-const EvidenceDetail = z.object({ signal: z.string(), file: z.string(), line: z.number() });
-
-function evidenceCited(e: PackageEvent): string {
-  const d = EvidenceDetail.safeParse(e.detail);
-
-  return d.success ? `${d.data.signal} evidence (${d.data.file}:${d.data.line})` : "evidence";
-}
-
-function describe(e: PackageEvent): string {
-  const field = (k: string): string => {
-    const val: unknown = typeof e.detail === "object" && e.detail !== null ? Reflect.get(e.detail, k) : undefined;
-
-    return typeof val === "string" ? val : "";
-  };
-
-  const v = field("version");
-  const why = field("reason") || field("message");
-  const reason = why ? `: ${why}` : "";
-
-  switch (e.kind) {
-    case "publish":
-      return `published ${v}`;
-    case "yank":
-      return `yanked ${v}${reason}`;
-    case "unyank":
-      return `restored ${v} to active`;
-    case "revoke":
-      return `revoked ${v}${reason}`;
-    case "revoke-pending":
-      return `started revoking ${v}${reason}`;
-    case "restore":
-      return `downgraded revoke of ${v} to a yank${reason}`;
-    case "deprecate":
-      return `deprecated ${v}${reason}`;
-    case "owner-add":
-      return `added owner ${field("user")}`;
-    case "owner-remove":
-      return `removed owner ${field("user")}`;
-    case "dist-tag":
-      return `tagged ${v} as ${field("tag")}`;
-    case "evidence-dismissed":
-      return `dismissed ${evidenceCited(e)} in ${v}${reason}`;
-    case "evidence-restored":
-      return `restored ${evidenceCited(e)} in ${v}`;
-    default:
-      return e.kind;
-  }
-}
-
 type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[]; line?: string | string[] }> };
 
 export default function PackagePage({ params, searchParams }: PageProps) {
@@ -629,7 +579,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
                 {events.value.slice(0, 15).map((e, i) => (
                   <li key={`${e.at}-${i}`} className="relative text-[15px] leading-6">
                     <span className="absolute top-2 -left-[25px] size-2 rounded-full bg-faint ring-4 ring-background" aria-hidden />
-                    <span className="font-mono text-[13px] text-muted-foreground">{e.actor}</span> {describe(e)}
+                    <span className="font-mono text-[13px] text-muted-foreground">{e.actor}</span> {describeEvent(e)}
                     <div className="text-sm text-muted-foreground">{ago(e.at)}</div>
                   </li>
                 ))}

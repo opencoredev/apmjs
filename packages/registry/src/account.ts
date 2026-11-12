@@ -1,11 +1,12 @@
-// Routes for people and the CLI login: the signed-in account, device login for `apm login`,
-// website confirmations of one CLI command, and staged versions waiting for a person to approve them.
+// Routes for people and the CLI login: the signed-in account, device login for `apm login`, second-factor
+// confirmations of one website action, website confirmations of one CLI command, and staged versions waiting for a
+// person to approve them.
 import { Effect, Option } from "effect";
 import { z } from "zod";
 import { finalize, parseAnalysis, readTarball, SCORE_FLOOR } from "@apm/core";
 import { publishRefusal } from "./access.ts";
-import { actionKey, commandLine, LiveAction } from "./actions.ts";
-import { Auth } from "./auth.ts";
+import { actionKey, commandLine, LiveAction, SessionAction, sessionActionKey } from "./actions.ts";
+import { Auth, PasskeyAssertion, type ConfirmFactor } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -14,10 +15,11 @@ import { refuse } from "./errors.ts";
 import { fail, json, parseOptionalBody } from "./http.ts";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { sha512, tarballKey } from "./hash.ts";
-import { GRANT_MS } from "./factors.ts";
+import { GRANT_MS, parseSixDigits } from "./factors.ts";
+import { requireSiteOrigin } from "./origin.ts";
 import { typedConfirmationReason } from "./approval.ts";
 import { commitVersion, dropBlobIfUnused, issueToken } from "./server.ts";
-import { ProofFields, secondFactor } from "./step-up.ts";
+import { ProofFields, refusedProof, secondFactor } from "./step-up.ts";
 
 export { typedConfirmationReason } from "./approval.ts";
 
@@ -25,6 +27,28 @@ const ApproveBody = z.object({ ...ProofFields, confirmName: z.string().optional(
 const VerifyBody = z.object({ ...ProofFields, command: LiveAction });
 const DeviceTokenBody = z.object({ deviceCode: z.string().min(1) });
 const RevokeTokenBody = z.object({ id: z.string().min(8) });
+const ChallengeBody = z.object({ action: SessionAction });
+
+/** One factor made for one action: a code from the app, a recovery code, or the answer to the passkey challenge made for it. */
+const ConfirmBody = z.object({
+  action: SessionAction,
+  code: z.string().optional(),
+  recovery: z.string().min(6).max(64).optional(),
+  passkey: z.object({ challengeId: z.string().min(1).max(64), response: PasskeyAssertion }).optional(),
+});
+
+function confirmFactor(body: z.infer<typeof ConfirmBody>): { kind: "ok"; factor: ConfirmFactor } | { kind: "refused"; message: string } {
+  const given = [body.code, body.recovery, body.passkey].filter((x) => x !== undefined).length;
+
+  if (given !== 1) return { kind: "refused", message: "Send one factor: a code from your authenticator app, a recovery code, or your passkey." };
+
+  if (body.passkey) return { kind: "ok", factor: { kind: "passkey", challengeId: body.passkey.challengeId, response: body.passkey.response } };
+
+  if (body.recovery !== undefined) return { kind: "ok", factor: { kind: "recovery", code: body.recovery.trim() } };
+  const code = parseSixDigits(body.code ?? "");
+
+  return code ? { kind: "ok", factor: { kind: "totp", code } } : { kind: "refused", message: "Send the 6-digit code from your authenticator app." };
+}
 
 const now = Effect.flatMap(Clock, (c) => c.now);
 
@@ -52,17 +76,10 @@ export const sweepStaged = Effect.gen(function* () {
   for (const row of expired) yield* dropBlobIfUnused(row.tarball_key);
 });
 
-/** Cookie-authenticated writes must come from the website (or the registry itself, for tests). */
-const checkOrigin = (req: Request) =>
-  Effect.gen(function* () {
-    const origin = req.headers.get("origin");
-
-    if (origin === null) return;
-    const { webUrl, baseUrl } = yield* RegistryConfig;
-    const allowed = new Set([new URL(webUrl).origin, new URL(baseUrl).origin]);
-
-    if (!allowed.has(origin)) return yield* Effect.fail(refuse(403, "Cross-site request refused."));
-  });
+/** Deletes passkey challenges and confirmations more than a day past their expiry. Runs from the cron. */
+export const sweepConfirmations = Effect.gen(function* () {
+  yield* (yield* Store).purgeConfirmations((yield* now) - 24 * 60 * 60_000);
+});
 
 const signedIn = (req: Request) =>
   Effect.gen(function* () {
@@ -244,7 +261,7 @@ export const accountRoute = (req: Request, url: URL) =>
     }
 
     if (rest === "account/tokens/revoke" && req.method === "POST") {
-      yield* checkOrigin(req);
+      yield* requireSiteOrigin(req);
       const who = yield* signedIn(req);
 
       if (!who.user) return fail(404, "No tokens on this account.");
@@ -258,13 +275,39 @@ export const accountRoute = (req: Request, url: URL) =>
       return json({ ok: true });
     }
 
+    // ---------- a second factor for one website action ----------
+    // A passkey check starts here: a challenge made for the named action, from this session, answerable once.
+    if (rest === "factor/passkey-challenge" && req.method === "POST") {
+      yield* requireSiteOrigin(req);
+      const who = yield* signedIn(req);
+      const body = yield* parseOptionalBody(req, ChallengeBody);
+      const { challengeId, options } = yield* (yield* Auth).passkeyChallenge({ session: who.s, action: sessionActionKey(body.action) });
+
+      return json({ challengeId, options });
+    }
+
+    // A code or the answer to that challenge confirms exactly the named action, once, from this session, for 5 minutes.
+    if (rest === "factor/confirm" && req.method === "POST") {
+      yield* requireSiteOrigin(req);
+      const who = yield* signedIn(req);
+      const body = yield* parseOptionalBody(req, ConfirmBody);
+      const factor = confirmFactor(body);
+
+      if (factor.kind === "refused") return fail(400, factor.message);
+      const confirmed = yield* (yield* Auth).confirm({ session: who.s, action: sessionActionKey(body.action), factor: factor.factor });
+
+      if (confirmed.kind !== "ok") return yield* Effect.fail(refusedProof(confirmed));
+
+      return json({ confirmation: confirmed.id, expiresAt: new Date(confirmed.expiresAt).toISOString() });
+    }
+
     // A person confirms one named CLI command; the CLI may then run that command once, within 10 minutes.
     if (rest === "verify" && req.method === "POST") {
-      yield* checkOrigin(req);
+      yield* requireSiteOrigin(req);
       const who = yield* signedIn(req);
       const body = yield* parseOptionalBody(req, VerifyBody);
       const command = body.command;
-      yield* secondFactor({ session: who.s, body, purpose: `confirm:${actionKey(command)}` });
+      yield* secondFactor({ session: who.s, body, action: { kind: "cli-confirm", command } });
       const { expiresAt } = yield* store.grant({ authUserId: who.s.authUserId, action: actionKey(command), at: yield* now });
 
       return json({ ok: true, command: commandLine(command), until: new Date(expiresAt).toISOString(), validForMs: GRANT_MS });
@@ -291,7 +334,7 @@ export const accountRoute = (req: Request, url: URL) =>
 
       if (!read && req.method !== "POST") return fail(405, "Method not allowed");
 
-      if (!read) yield* checkOrigin(req);
+      if (!read) yield* requireSiteOrigin(req);
       const who = yield* signedIn(req);
       const row = yield* store.getStaged(id);
 
@@ -339,7 +382,7 @@ export const accountRoute = (req: Request, url: URL) =>
         return fail(400, `${typed} Type the package name, ${row.package}, to approve it anyway.`);
       }
 
-      yield* secondFactor({ session: who.s, body, purpose: `approve:${id}` });
+      yield* secondFactor({ session: who.s, body, action: { kind: "approve", id } });
 
       if (yield* store.getVersion(row.package, row.version)) return fail(409, `${row.package}@${row.version} already exists. Versions are immutable; bump the version.`);
       const perm = yield* publishRefusal(row.package, row.staged_by);

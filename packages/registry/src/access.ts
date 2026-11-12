@@ -153,7 +153,7 @@ export const secondFactor = (input: { user: string; password?: string | undefine
       if (!code) return { status: 400, error: "--otp takes the 6-digit code from your authenticator app." };
 
       if (!authId) return { status: 401, error: "This account has no authenticator app to check a code against." };
-      const check = yield* Auth.use((auth) => auth.checkProof({ authUserId: authId, sessionToken: null, proof: { kind: "totp", code }, purpose: actionKey(input.action) }));
+      const check = yield* Auth.use((auth) => auth.checkCode({ authUserId: authId, proof: { kind: "totp", code } }));
 
       switch (check.kind) {
         case "ok":

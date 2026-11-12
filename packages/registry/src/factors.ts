@@ -1,12 +1,15 @@
 // Second-factor codes: parsing, RFC 4226/6238 checks and the proof a person offers for one action. Pure; the
-// ledger that remembers attempts, accepted steps, passkey checks and confirmations is ledger.ts.
+// ledger that remembers attempts, accepted steps, passkey challenges and confirmations is in db.ts.
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const MAX_FAILURES = 5;
 export const FAILURE_WINDOW_MS = 15 * 60_000;
 
-/** How long a passkey check on the website stays usable for the one action it is spent on. */
-export const PASSKEY_PROOF_MS = 5 * 60_000;
+/** How long a confirmation of one action (a code or passkey check made for it) waits for that action. */
+export const CONFIRMATION_MS = 5 * 60_000;
+
+/** How long a passkey challenge the registry made for one action can be answered. */
+export const CHALLENGE_MS = 5 * 60_000;
 
 /** How long a website confirmation of a CLI command waits for that command. */
 export const GRANT_MS = 10 * 60_000;
@@ -49,20 +52,41 @@ export function matchingStep(input: { key: Uint8Array; code: SixDigits; at: numb
   return found;
 }
 
-/** A second factor offered for one action: a TOTP code, a recovery code, or this session's passkey check. */
-export type FactorProof = { kind: "totp"; code: SixDigits } | { kind: "recovery"; code: string } | { kind: "passkey" };
+/** A confirmation id, as the registry hands it out: 22 base64url characters. */
+export type ConfirmationId = string & { readonly __brand: "ConfirmationId" };
 
-export type ProofCheck = { kind: "ok" } | { kind: "bad" } | { kind: "reused" } | { kind: "none" } | { kind: "locked" };
+export function isConfirmationId(s: string): s is ConfirmationId {
+  return /^[A-Za-z0-9_-]{22}$/.test(s);
+}
+
+/** A code typed for one action: from the authenticator app, or a recovery code. */
+export type CodeProof = { kind: "totp"; code: SixDigits } | { kind: "recovery"; code: string };
+
+/**
+ * A second factor offered for one action: a code sent with the action itself, or the id of a confirmation this
+ * session got for exactly this action beforehand (a code or a passkey check made for it).
+ */
+export type FactorProof = CodeProof | { kind: "confirmation"; id: ConfirmationId };
+
+/** How checking a code (or a passkey answer) ended. */
+export type CodeCheck = { kind: "ok" } | { kind: "bad" } | { kind: "reused" } | { kind: "none" } | { kind: "locked" };
+
+/** How checking any proof ended. `stale`: a confirmation or challenge for another action or session, used, or expired. */
+export type ProofCheck = CodeCheck | { kind: "stale" };
 
 /** The header the website sends the existing factor in, for account changes that need it. */
 export const PROOF_HEADER = "x-apm-second-factor";
 
-/** Parses the proof header: `totp:123456`, `recovery:abcde-12345` or `passkey`. */
+/** Parses the proof header: `totp:123456`, `recovery:abcde-12345` or `confirmation:<id>`. */
 export function parseProofHeader(value: string | null): FactorProof | null {
   if (value === null) return null;
   const v = value.trim();
 
-  if (v === "passkey") return { kind: "passkey" };
+  if (v.startsWith("confirmation:")) {
+    const id = v.slice(13);
+
+    return isConfirmationId(id) ? { kind: "confirmation", id } : null;
+  }
 
   if (v.startsWith("totp:")) {
     const code = parseSixDigits(v.slice(5));

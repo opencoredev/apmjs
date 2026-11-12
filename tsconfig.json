@@ -14,5 +14,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["scripts/dev-registry.ts", "packages/core/src/**/*.ts", "packages/cli/src/**/*.ts", "packages/bun-scanner/src/**/*.ts", "packages/ai-review/src/**/*.ts", "packages/registry/scripts/**/*.ts", "packages/*/test/**/*.ts", "apps/reviewer/src/**/*.ts", "tests/**/*.ts", "scripts/lint.ts", "oxlint.config.ts"]
+  "include": ["scripts/dev-registry.ts", "packages/core/src/**/*.ts", "packages/cli/src/**/*.ts", "packages/bun-scanner/src/**/*.ts", "packages/ai-review/src/**/*.ts", "packages/registry/scripts/**/*.ts", "packages/*/test/**/*.ts", "apps/reviewer/src/**/*.ts", "tests/**/*.ts", "apps/web/cloudflare-env.d.ts", "scripts/lint.ts", "oxlint.config.ts"]
 }

@@ -8,7 +8,7 @@ import { z } from "zod";
 import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
 import { digestLabel, digestOf } from "./digest.ts";
-import { FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, PASSKEY_PROOF_MS } from "./factors.ts";
+import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
 import { StoreError } from "./errors.ts";
 
 export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
@@ -175,6 +175,14 @@ export type NewVersion = Omit<VersionRecord, "status" | "status_reason" | "statu
 
 export type Linked = { provider: string; accountId: string };
 
+const PasskeyRow = z.object({ id: z.string(), credentialID: z.string(), publicKey: z.string(), counter: Int, transports: z.string().nullable() });
+
+/** One of an account's passkeys (Better Auth's table): the public key is base64 COSE, as WebAuthn registered it. */
+export type PasskeyRecord = z.infer<typeof PasskeyRow>;
+
+/** Faults a test can switch on for one request (worker-test.ts); the deployed Worker never passes any. */
+export type StoreFault = "event-insert";
+
 export type AuthProfile = { name: string; email: string; image: string | null };
 
 /** What is waiting for approval: versions and bytes one user staged, and versions waiting for one package. */
@@ -206,6 +214,15 @@ export type TwoFactorRecord = { secret: string; backupCodes: string; verified: b
 const scoreJson = ({ score }: Pick<NewStaged, "score">): string | null => (score === null || score === undefined ? null : JSON.stringify(score));
 
 const hashOf = (secret: string): string => createHash("sha256").update(secret).digest("hex");
+
+/** 16 random bytes as 22 base64url characters: a confirmation or challenge id. Only its hash is stored. */
+function newConfirmationId(): ConfirmationId {
+  const id = randomBytes(16).toString("base64url");
+
+  if (!isConfirmationId(id)) throw new Error("16 random bytes did not make a 22-character id");
+
+  return id;
+}
 
 export type StoreApi = {
   readonly tx: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreError, R>;
@@ -321,6 +338,8 @@ export type StoreApi = {
   readonly addDismissal: (d: DismissalKey & { reason: string; by: string; at: number }) => Effect.Effect<boolean, StoreError>;
   /** Undoes a live dismissal; the row it undid, or null when the item was not dismissed. */
   readonly restoreDismissal: (d: DismissalKey & { by: string; at: number }) => Effect.Effect<DismissalRecord | null, StoreError>;
+  /** The live (not undone) dismissal of exactly this item, or null. */
+  readonly liveDismissal: (d: DismissalKey) => Effect.Effect<DismissalRecord | null, StoreError>;
 
   readonly addEvent: (e: { package: string; kind: string; actor: string; at: number; detail?: unknown }) => Effect.Effect<void, StoreError>;
   readonly eventsFor: (name: string) => Effect.Effect<EventRecord[], StoreError>;
@@ -349,10 +368,25 @@ export type StoreApi = {
   readonly settleAttempt: (input: { id: number; authUserId: string; ok: boolean }) => Effect.Effect<void, StoreError>;
   /** Accepts a TOTP time step once: false when this step, or a later one, was already accepted. */
   readonly acceptStep: (input: { authUserId: string; step: number }) => Effect.Effect<boolean, StoreError>;
-  /** A passkey check made the session `sessionToken`; it can authorize one action from that session. */
-  readonly recordPasskeyProof: (input: { sessionToken: string; authUserId: string; at: number }) => Effect.Effect<void, StoreError>;
-  /** Spends this session's passkey check on `purpose`. False when there is none, it expired, or it was spent. */
-  readonly consumePasskeyProof: (input: { sessionToken: string; authUserId: string; purpose: string; at: number }) => Effect.Effect<boolean, StoreError>;
+  /** A WebAuthn challenge made for one action (`action`, its canonical key) from one session. Returns its id. */
+  readonly addPasskeyChallenge: (input: { sessionToken: string; authUserId: string; action: string; challenge: string; at: number }) => Effect.Effect<ConfirmationId, StoreError>;
+  /** Takes the challenge `id` made for exactly this session and action, once; null when there is none, it was used, or it expired. */
+  readonly takePasskeyChallenge: (input: { id: string; sessionToken: string; authUserId: string; action: string; at: number }) => Effect.Effect<string | null, StoreError>;
+  /** The account's passkeys, as WebAuthn verifies them. */
+  readonly passkeysOf: (authUserId: string) => Effect.Effect<PasskeyRecord[], StoreError>;
+  readonly setPasskeyCounter: (input: { id: string; counter: number }) => Effect.Effect<void, StoreError>;
+  /** A factor check made for one action from one session: what that action spends. */
+  readonly issueConfirmation: (input: {
+    sessionToken: string;
+    authUserId: string;
+    action: string;
+    factor: "totp" | "recovery" | "passkey";
+    at: number;
+  }) => Effect.Effect<{ id: ConfirmationId; expiresAt: number }, StoreError>;
+  /** Deletes passkey challenges and confirmations that expired before `before`: nothing can spend them any more. */
+  readonly purgeConfirmations: (before: number) => Effect.Effect<void, StoreError>;
+  /** Spends confirmation `id` on `action` from this session, once. False when it is for another session or action, was used, or expired. */
+  readonly consumeConfirmation: (input: { id: string; sessionToken: string; authUserId: string; action: string; at: number }) => Effect.Effect<boolean, StoreError>;
   /** A person confirmed one CLI command on the website. */
   readonly grant: (input: { authUserId: string; action: string; at: number }) => Effect.Effect<{ expiresAt: number }, StoreError>;
   /** Uses a confirmation of exactly this command, once. */
@@ -365,14 +399,14 @@ export class Store extends Context.Service<Store, StoreApi>()("@apm/registry/Sto
    * The store over a Postgres URL (Hyperdrive's connection string on Workers), one connection per request. The
    * layer also provides that connection's SqlClient, for modules that own their own tables (review.ts).
    */
-  static postgres(url: string): Layer.Layer<Store | SqlClient.SqlClient, StoreError> {
+  static postgres(url: string, faults: ReadonlySet<StoreFault> = new Set()): Layer.Layer<Store | SqlClient.SqlClient, StoreError> {
     return Layer.effectContext(
       Effect.gen(function* () {
         const services = yield* Layer.build(PgClient.layer({ url: Redacted.make(url), maxConnections: 1 })).pipe(
           Effect.mapError((cause) => new StoreError({ operation: "connect", cause })),
         );
 
-        const store = yield* make.pipe(Effect.provide(services));
+        const store = yield* make(faults).pipe(Effect.provide(services));
 
         return Context.add(services, Store, store);
       }),
@@ -386,7 +420,7 @@ const none = z.array(z.unknown()).transform(() => undefined);
 const changed = z.array(z.unknown()).transform((rows) => rows.length > 0);
 const count = z.array(z.unknown()).transform((rows) => rows.length);
 
-const make = Effect.gen(function* () {
+const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
   const run = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
@@ -782,10 +816,19 @@ const make = Effect.gen(function* () {
             RETURNING *`,
         one(DismissalRow),
       ),
+    liveDismissal: (d) =>
+      run(
+        "liveDismissal",
+        sql`SELECT * FROM evidence_dismissals
+            WHERE package = ${d.package} AND version = ${d.version} AND digest = ${d.digest} AND scorer = ${d.scorer}
+              AND signal = ${d.signal} AND file = ${d.file} AND line = ${d.line} AND restored_at IS NULL`,
+        one(DismissalRow),
+      ),
     addEvent: (e) =>
       run(
         "addEvent",
-        sql`INSERT INTO events (package, kind, actor, at, detail) VALUES (${e.package}, ${e.kind}, ${e.actor}, ${e.at}, ${JSON.stringify(e.detail ?? {})}::jsonb)`,
+        // a test's forced failure is a real statement error, so it aborts the transaction the way a lost insert would
+        faults.has("event-insert") ? sql`SELECT 1 / 0` : sql`INSERT INTO events (package, kind, actor, at, detail) VALUES (${e.package}, ${e.kind}, ${e.actor}, ${e.at}, ${JSON.stringify(e.detail ?? {})}::jsonb)`,
         none,
       ),
     eventsFor: (name) => run("eventsFor", sql`SELECT * FROM events WHERE package = ${name} ORDER BY at DESC, id DESC`, all(EventRow)),
@@ -890,22 +933,54 @@ const make = Effect.gen(function* () {
             RETURNING step`,
         changed,
       ),
-    recordPasskeyProof: (input) =>
-      run(
-        "recordPasskeyProof",
-        sql`INSERT INTO passkey_proofs (session_hash, auth_user_id, created_at, expires_at, used_at, used_for)
-            VALUES (${hashOf(input.sessionToken)}, ${input.authUserId}, ${input.at}, ${input.at + PASSKEY_PROOF_MS}, NULL, NULL)
-            ON CONFLICT (session_hash) DO UPDATE SET auth_user_id = EXCLUDED.auth_user_id, created_at = EXCLUDED.created_at,
-              expires_at = EXCLUDED.expires_at, used_at = NULL, used_for = NULL`,
+    addPasskeyChallenge: (input) => {
+      const id = newConfirmationId();
+
+      return run(
+        "addPasskeyChallenge",
+        sql`INSERT INTO passkey_challenges (id_hash, session_hash, auth_user_id, action, challenge, created_at, expires_at, used_at)
+            VALUES (${hashOf(id)}, ${hashOf(input.sessionToken)}, ${input.authUserId}, ${input.action}, ${input.challenge}, ${input.at}, ${input.at + CHALLENGE_MS}, NULL)`,
         none,
-      ),
-    consumePasskeyProof: (input) =>
+      ).pipe(Effect.as(id));
+    },
+    takePasskeyChallenge: (input) =>
       run(
-        "consumePasskeyProof",
-        sql`UPDATE passkey_proofs SET used_at = ${input.at}, used_for = ${input.purpose}
-            WHERE session_hash = ${hashOf(input.sessionToken)} AND auth_user_id = ${input.authUserId} AND used_at IS NULL
-              AND created_at <= ${input.at} AND expires_at > ${input.at}
-            RETURNING session_hash`,
+        "takePasskeyChallenge",
+        sql`UPDATE passkey_challenges SET used_at = ${input.at}
+            WHERE id_hash = ${hashOf(input.id)} AND session_hash = ${hashOf(input.sessionToken)} AND auth_user_id = ${input.authUserId}
+              AND action = ${input.action} AND used_at IS NULL AND created_at <= ${input.at} AND expires_at > ${input.at}
+            RETURNING challenge`,
+        one(z.object({ challenge: z.string() }).transform((r) => r.challenge)),
+      ),
+    passkeysOf: (authUserId) =>
+      run("passkeysOf", sql`SELECT id, "credentialID", "publicKey", counter, transports FROM passkey WHERE "userId" = ${authUserId} ORDER BY "createdAt", id`, all(PasskeyRow)),
+    setPasskeyCounter: (input) => run("setPasskeyCounter", sql`UPDATE passkey SET counter = ${input.counter} WHERE id = ${input.id}`, none),
+    issueConfirmation: (input) => {
+      const id = newConfirmationId();
+      const expiresAt = input.at + CONFIRMATION_MS;
+
+      return run(
+        "issueConfirmation",
+        sql`INSERT INTO factor_confirmations (id_hash, session_hash, auth_user_id, action, factor, created_at, expires_at, used_at)
+            VALUES (${hashOf(id)}, ${hashOf(input.sessionToken)}, ${input.authUserId}, ${input.action}, ${input.factor}, ${input.at}, ${expiresAt}, NULL)`,
+        none,
+      ).pipe(Effect.as({ id, expiresAt }));
+    },
+    purgeConfirmations: (before) =>
+      Effect.all(
+        [
+          run("purgeConfirmations: challenges", sql`DELETE FROM passkey_challenges WHERE expires_at < ${before}`, none),
+          run("purgeConfirmations: confirmations", sql`DELETE FROM factor_confirmations WHERE expires_at < ${before}`, none),
+        ],
+        { discard: true },
+      ),
+    consumeConfirmation: (input) =>
+      run(
+        "consumeConfirmation",
+        sql`UPDATE factor_confirmations SET used_at = ${input.at}
+            WHERE id_hash = ${hashOf(input.id)} AND session_hash = ${hashOf(input.sessionToken)} AND auth_user_id = ${input.authUserId}
+              AND action = ${input.action} AND used_at IS NULL AND created_at <= ${input.at} AND expires_at > ${input.at}
+            RETURNING id_hash`,
         changed,
       ),
     grant: (input) =>

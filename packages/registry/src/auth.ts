@@ -2,22 +2,25 @@
 // `apm login` uses. Better Auth's tables live in the registry's Postgres next to apm's own.
 // An apm name (and scope) is the lowercased GitHub login of the signed-in account; Vercel-only accounts
 // have no name until they link GitHub. apm checks second factors itself (factors.ts, the ledger in db.ts):
-// one attempt budget, each TOTP step once, passkey checks spent on one action.
+// one attempt budget, each TOTP step once, and every website factor check bound to the one action it was made
+// for: a code or a passkey check issues a confirmation for that session, action and parameters, used once. A
+// passkey check answers a challenge made for one named action, so a passkey sign-in never confirms anything.
 import { timingSafeEqual } from "node:crypto";
 import { Context, Effect, Layer, Result, Scope } from "effect";
 import { betterAuth } from "better-auth";
 import { genericOAuth, twoFactor, deviceAuthorization } from "better-auth/plugins";
-import { createAuthMiddleware } from "better-auth/api";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { passkey } from "@better-auth/passkey";
+import { generateAuthenticationOptions, verifyAuthenticationResponse, type PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/server";
 import { Pool } from "pg";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type Linked, type User } from "./db.ts";
 import { AuthError, type StoreError } from "./errors.ts";
-import { matchingStep, parseProofHeader, parseSixDigits, PROOF_HEADER, type FactorProof, type ProofCheck, type SixDigits } from "./factors.ts";
+import { isAccountChange, sessionActionKey } from "./actions.ts";
+import { matchingStep, parseProofHeader, parseSixDigits, PROOF_HEADER, type CodeCheck, type CodeProof, type ConfirmationId, type FactorProof, type ProofCheck, type SixDigits } from "./factors.ts";
 
-export { parseProofHeader, PROOF_HEADER, type FactorProof, type ProofCheck } from "./factors.ts";
+export { parseProofHeader, PROOF_HEADER, type CodeProof, type FactorProof, type ProofCheck } from "./factors.ts";
 
 export type GitHubEndpoints = { authorize: string; token: string; user: string; emails: string };
 
@@ -46,6 +49,27 @@ const ApiErrorShape = z.object({ body: z.object({ error: z.string() }).loose() }
 const RecoveryCodes = z.array(z.string());
 const EnrollBody = z.object({ code: z.string() });
 
+/** A WebAuthn assertion as the browser sends it (base64url fields), parsed before the library reads it. */
+export const PasskeyAssertion = z.object({
+  id: z.string().min(1).max(1024),
+  rawId: z.string().min(1).max(1024),
+  type: z.literal("public-key"),
+  response: z.object({
+    clientDataJSON: z.string().min(1).max(16_384),
+    authenticatorData: z.string().min(1).max(16_384),
+    signature: z.string().min(1).max(16_384),
+    userHandle: z.string().max(1024).optional(),
+  }),
+  authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
+});
+
+export type PasskeyAssertion = z.infer<typeof PasskeyAssertion>;
+
+/** A factor checked to confirm one action: a code, or the answer to a passkey challenge made for that action. */
+export type ConfirmFactor = CodeProof | { kind: "passkey"; challengeId: string; response: PasskeyAssertion };
+
+export type Confirmed = { kind: "ok"; id: ConfirmationId; expiresAt: number } | Exclude<ProofCheck, { kind: "ok" }>;
+
 export type SignedIn = { authUserId: string; sessionToken: string; signedInAt: number };
 
 export type DevicePoll = { kind: "pending" } | { kind: "slow_down" } | { kind: "denied" } | { kind: "expired" } | { kind: "approved"; authUserId: string };
@@ -65,11 +89,17 @@ export type AuthApi = {
   readonly profileOf: (authUserId: string) => Fx<{ name: string; email: string; image: string | null } | null>;
   readonly linked: (authUserId: string) => Fx<Linked[]>;
   readonly factors: (authUserId: string) => Fx<{ totp: boolean; passkeys: number }>;
+  /** Checks a code. Every TOTP and recovery-code check takes from one budget; a TOTP step is accepted once. */
+  readonly checkCode: (input: { authUserId: string; proof: CodeProof }) => Fx<CodeCheck>;
+  /** A WebAuthn challenge for one action (its canonical key) from this session, with the account's passkeys allowed. */
+  readonly passkeyChallenge: (input: { session: SignedIn; action: string }) => Fx<{ challengeId: ConfirmationId; options: PublicKeyCredentialRequestOptionsJSON }>;
+  /** Checks a factor made for one action from this session and issues the confirmation that action spends. */
+  readonly confirm: (input: { session: SignedIn; action: string; factor: ConfirmFactor }) => Fx<Confirmed>;
   /**
-   * Checks a proof and spends it on `purpose`. Every TOTP and recovery-code check takes from one budget;
-   * a TOTP step is accepted once; a passkey check is bound to the session it made (`sessionToken`).
+   * Whether `proof` authorizes `action` from this session, spending what it uses: a confirmation is spent only on the
+   * action and session it was issued for; a code sent with the action is checked and recorded as spent on it.
    */
-  readonly checkProof: (input: { authUserId: string; sessionToken: string | null; proof: FactorProof; purpose: string }) => Fx<ProofCheck>;
+  readonly authorize: (input: { session: SignedIn; action: string; proof: FactorProof }) => Fx<ProofCheck>;
   readonly startDevice: Fx<DeviceStart>;
   readonly pollDevice: (deviceCode: string) => Fx<DevicePoll>;
 };
@@ -143,6 +173,8 @@ function refusal(check: Exclude<ProofCheck, { kind: "ok" }>): Response {
       return jsonResponse({ error: "That code is not valid.", code: "INVALID_CODE" }, 401);
     case "none":
       return jsonResponse({ error: "Confirm with your passkey first, or use your authenticator app.", code: "NO_FACTOR" }, 401);
+    case "stale":
+      return jsonResponse({ error: "That confirmation is for another change, was already used, or expired. Confirm again.", code: "STALE_CONFIRMATION" }, 401);
     default: {
       const _exhaustive: never = check;
 
@@ -224,16 +256,8 @@ function buildBetterAuth(input: { pool: Pool; options: AuthOptions; baseURL: str
       passkey({ rpID: web.hostname, rpName: "apm", origin: web.origin }),
       deviceAuthorization({ expiresIn: "15m", interval: "1s", validateClient: (id) => id === CLI_CLIENT_ID }),
     ],
-    hooks: {
-      after: createAuthMiddleware(async (ctx) => {
-        // A passkey sign-in is a fresh second factor for one action, from the session it just made.
-        if (ctx.path === "/passkey/verify-authentication") {
-          const s = ctx.context.newSession;
-
-          if (s) await record(store.recordPasskeyProof({ sessionToken: s.session.token, authUserId: s.user.id, at: now() }));
-        }
-      }),
-    },
+    // A passkey sign-in makes a session and nothing else: a second factor for an action answers a challenge the
+    // registry made for that action (Auth.passkeyChallenge), never this route's.
   });
 }
 
@@ -334,22 +358,22 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
           });
 
         /** Runs one budgeted check: reserves an attempt first, settles it with the outcome. */
-        const budgeted = (authUserId: string, check: Fx<ProofCheck>): Fx<ProofCheck> =>
+        const budgeted = (authUserId: string, check: Fx<CodeCheck>): Fx<CodeCheck> =>
           Effect.gen(function* () {
             const r = yield* store.reserveAttempt({ authUserId, at: yield* clock.wallNow });
 
-            if (r.kind === "locked") return { kind: "locked" } satisfies ProofCheck;
+            if (r.kind === "locked") return { kind: "locked" } satisfies CodeCheck;
             const result = yield* check.pipe(Effect.onError(() => store.settleAttempt({ id: r.id, authUserId, ok: false }).pipe(Effect.ignore)));
             yield* store.settleAttempt({ id: r.id, authUserId, ok: result.kind === "ok" });
 
             return result;
           });
 
-        const checkTotp = (authUserId: string, code: SixDigits, phase: "enrolled" | "enrolling"): Fx<ProofCheck> =>
+        const checkTotp = (authUserId: string, code: SixDigits, phase: "enrolled" | "enrolling"): Fx<CodeCheck> =>
           Effect.gen(function* () {
             const row = yield* store.twoFactor(authUserId);
 
-            if (!row || row.verified !== (phase === "enrolled")) return { kind: "none" } satisfies ProofCheck;
+            if (!row || row.verified !== (phase === "enrolled")) return { kind: "none" } satisfies CodeCheck;
 
             return yield* budgeted(
               authUserId,
@@ -359,39 +383,39 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
                 // TOTP is anchored to wall-clock time, not the registry's clock.
                 const step = matchingStep({ key, code, at: yield* clock.wallNow });
 
-                if (step === null) return { kind: "bad" } satisfies ProofCheck;
+                if (step === null) return { kind: "bad" } satisfies CodeCheck;
 
-                return (yield* store.acceptStep({ authUserId, step })) ? ({ kind: "ok" } satisfies ProofCheck) : ({ kind: "reused" } satisfies ProofCheck);
+                return (yield* store.acceptStep({ authUserId, step })) ? ({ kind: "ok" } satisfies CodeCheck) : ({ kind: "reused" } satisfies CodeCheck);
               }),
             );
           });
 
-        const checkRecovery = (authUserId: string, code: string): Fx<ProofCheck> =>
+        const checkRecovery = (authUserId: string, code: string): Fx<CodeCheck> =>
           Effect.gen(function* () {
             const row = yield* store.twoFactor(authUserId);
 
-            if (!row || !row.verified) return { kind: "none" } satisfies ProofCheck;
+            if (!row || !row.verified) return { kind: "none" } satisfies CodeCheck;
 
             return yield* budgeted(
               authUserId,
               Effect.gen(function* () {
                 const decoded = RecoveryCodes.safeParse(JSON.parse(yield* decrypt(row.backupCodes)));
 
-                if (!decoded.success) return { kind: "bad" } satisfies ProofCheck;
+                if (!decoded.success) return { kind: "bad" } satisfies CodeCheck;
                 const codes = decoded.data;
                 const match = codes.find((c) => sameText(c, code));
 
-                if (match === undefined) return { kind: "bad" } satisfies ProofCheck;
+                if (match === undefined) return { kind: "bad" } satisfies CodeCheck;
                 const rest = yield* encrypt(JSON.stringify(codes.filter((c) => c !== match)));
                 // Compare-and-swap: of two requests spending the same code, one wins.
                 const swapped = yield* store.swapBackupCodes({ authUserId, expected: row.backupCodes, next: rest });
 
-                return swapped ? ({ kind: "ok" } satisfies ProofCheck) : ({ kind: "reused" } satisfies ProofCheck);
+                return swapped ? ({ kind: "ok" } satisfies CodeCheck) : ({ kind: "reused" } satisfies CodeCheck);
               }),
             );
           });
 
-        const checkProof = (input: { authUserId: string; sessionToken: string | null; proof: FactorProof; purpose: string }): Fx<ProofCheck> => {
+        const checkCode = (input: { authUserId: string; proof: CodeProof }): Fx<CodeCheck> => {
           const { authUserId, proof } = input;
 
           switch (proof.kind) {
@@ -399,18 +423,6 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
               return checkTotp(authUserId, proof.code, "enrolled");
             case "recovery":
               return checkRecovery(authUserId, proof.code);
-            case "passkey": {
-              const sessionToken = input.sessionToken;
-
-              if (sessionToken === null) return Effect.succeed({ kind: "none" });
-
-              return Effect.gen(function* () {
-                const spent = yield* store.consumePasskeyProof({ sessionToken, authUserId, purpose: input.purpose, at: yield* clock.now });
-
-                return spent ? ({ kind: "ok" } satisfies ProofCheck) : ({ kind: "none" } satisfies ProofCheck);
-              });
-            }
-
             default: {
               const _exhaustive: never = proof;
 
@@ -418,6 +430,99 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
             }
           }
         };
+
+        const web = new URL(input.baseURL);
+
+        const passkeyChallenge = (input: { session: SignedIn; action: string }) =>
+          Effect.gen(function* () {
+            const keys = yield* store.passkeysOf(input.session.authUserId);
+
+            const options = yield* Effect.tryPromise({
+              try: () => generateAuthenticationOptions({ rpID: web.hostname, userVerification: "preferred", allowCredentials: keys.map((k) => ({ id: k.credentialID })) }),
+              catch: (cause) => new AuthError({ operation: "passkeyChallenge", cause }),
+            });
+
+            const challengeId = yield* store.addPasskeyChallenge({
+              sessionToken: input.session.sessionToken,
+              authUserId: input.session.authUserId,
+              action: input.action,
+              challenge: options.challenge,
+              at: yield* clock.now,
+            });
+
+            return { challengeId, options };
+          });
+
+        /** Checks the answer to a challenge made for exactly this action and session, spending the challenge. */
+        const checkPasskey = (input: { session: SignedIn; action: string; challengeId: string; response: PasskeyAssertion }): Fx<ProofCheck> =>
+          Effect.gen(function* () {
+            const { session } = input;
+
+            const challenge = yield* store.takePasskeyChallenge({
+              id: input.challengeId,
+              sessionToken: session.sessionToken,
+              authUserId: session.authUserId,
+              action: input.action,
+              at: yield* clock.now,
+            });
+
+            if (challenge === null) return { kind: "stale" } satisfies ProofCheck;
+            // only this account's own passkeys answer for it
+            const key = (yield* store.passkeysOf(session.authUserId)).find((k) => k.credentialID === input.response.id);
+
+            if (!key) return { kind: "bad" } satisfies ProofCheck;
+
+            const verified = yield* Effect.promise(() =>
+              verifyAuthenticationResponse({
+                response: { ...input.response, clientExtensionResults: {} },
+                expectedChallenge: challenge,
+                expectedOrigin: web.origin,
+                expectedRPID: web.hostname,
+                credential: { id: key.credentialID, publicKey: new Uint8Array(Buffer.from(key.publicKey, "base64")), counter: key.counter },
+                requireUserVerification: false,
+              }).then(
+                (v) => (v.verified ? { kind: "verified" as const, counter: v.authenticationInfo.newCounter } : { kind: "refused" as const }),
+                () => ({ kind: "refused" as const }),
+              ),
+            );
+
+            if (verified.kind === "refused") return { kind: "bad" } satisfies ProofCheck;
+            yield* store.setPasskeyCounter({ id: key.id, counter: verified.counter });
+
+            return { kind: "ok" } satisfies ProofCheck;
+          });
+
+        const confirm = (input: { session: SignedIn; action: string; factor: ConfirmFactor }): Fx<Confirmed> =>
+          Effect.gen(function* () {
+            const { session, factor } = input;
+            const check = factor.kind === "passkey" ? yield* checkPasskey({ session, action: input.action, challengeId: factor.challengeId, response: factor.response }) : yield* checkCode({ authUserId: session.authUserId, proof: factor });
+
+            if (check.kind !== "ok") return check;
+
+            return {
+              kind: "ok",
+              ...(yield* store.issueConfirmation({ sessionToken: session.sessionToken, authUserId: session.authUserId, action: input.action, factor: factor.kind, at: yield* clock.now })),
+            } satisfies Confirmed;
+          });
+
+        const authorize = (input: { session: SignedIn; action: string; proof: FactorProof }): Fx<ProofCheck> =>
+          Effect.gen(function* () {
+            const { session, proof } = input;
+            let id: ConfirmationId;
+
+            if (proof.kind === "confirmation") id = proof.id;
+            else {
+              // a code sent with the action confirms that action alone: issued for it and spent on it in this request
+              const confirmed = yield* confirm({ session, action: input.action, factor: proof });
+
+              if (confirmed.kind !== "ok") return confirmed;
+              id = confirmed.id;
+            }
+
+            const spent = yield* store.consumeConfirmation({ id, sessionToken: session.sessionToken, authUserId: session.authUserId, action: input.action, at: yield* clock.now });
+
+            return spent ? ({ kind: "ok" } satisfies ProofCheck) : ({ kind: "stale" } satisfies ProofCheck);
+          });
 
         const sessionOf = (req: Request): Effect.Effect<SignedIn | null, AuthError> =>
           call("getSession", (auth) => auth.api.getSession({ headers: req.headers })).pipe(
@@ -467,6 +572,8 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
             if (!route || !route.methods.includes(req.method)) return jsonResponse({ error: "Not found" }, 404);
 
             if (route.gate === "factor-if-enrolled") {
+              // a change to how someone signs in comes from the website, checked before a code is spent on it
+              if (req.headers.get("origin") !== web.origin) return jsonResponse({ error: "Make this change from the website.", code: "CROSS_SITE" }, 403);
               const who = yield* sessionOf(req);
 
               if (who) {
@@ -482,7 +589,8 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
                     );
                   }
 
-                  const check = yield* checkProof({ authUserId: who.authUserId, sessionToken: who.sessionToken, proof, purpose: `account:${path}` });
+                  if (!isAccountChange(path)) return jsonResponse({ error: "Not found" }, 404);
+                  const check = yield* authorize({ session: who, action: sessionActionKey({ kind: "account", change: path }), proof });
 
                   if (check.kind !== "ok") return refusal(check);
                 }
@@ -501,7 +609,10 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
           profileOf: (authUserId) => store.authProfile(authUserId),
           linked: (authUserId) => store.accountsOf(authUserId),
           factors: (authUserId) => store.authFactors(authUserId),
-          checkProof,
+          checkCode,
+          passkeyChallenge,
+          confirm,
+          authorize,
           startDevice: call("deviceCode", (auth) => auth.api.deviceCode({ body: { client_id: CLI_CLIENT_ID } })).pipe(
             Effect.flatMap((raw) =>
               Effect.try({ try: () => DeviceStartShape.parse(raw), catch: (cause) => new AuthError({ operation: "deviceCode: parse", cause }) }),

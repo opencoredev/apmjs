@@ -8,6 +8,7 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
+import { ReviewDecision } from "./actions.ts";
 import { Auth, type SignedIn } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -15,6 +16,7 @@ import { Store, type User, type VersionRecord } from "./db.ts";
 import { refuse, StoreError, type AuthError, type HttpFailure } from "./errors.ts";
 import { randomId } from "./hash.ts";
 import { fail, json, parseBody } from "./http.ts";
+import { requireSiteOrigin } from "./origin.ts";
 import { order } from "./semver.ts";
 import { splitPath, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
@@ -504,17 +506,8 @@ function isAdmin(v: Viewer, settings: ReviewSettings): v is SessionViewer {
 const isMaintainer = (v: Viewer, name: string) =>
   v.kind === "user" ? Effect.map(Store.use((store) => store.owners(name)), (owners) => owners.includes(v.user.name)) : Effect.succeed(false);
 
-/** Cookie-authenticated writes must come from the website or the registry itself. */
-export const checkOrigin = (req: Request, v: Viewer) =>
-  Effect.gen(function* () {
-    const origin = req.headers.get("origin");
-
-    if (v.kind !== "user" || v.via.kind !== "session" || origin === null) return;
-    const { webUrl, baseUrl } = yield* RegistryConfig;
-    const allowed = new Set([new URL(webUrl).origin, new URL(baseUrl).origin]);
-
-    if (!allowed.has(origin)) return yield* Effect.fail(refuse(403, "Cross-site request refused."));
-  });
+/** Cookie-authenticated writes must come from the website (origin.ts); a token's requests are not a browser's. */
+export const checkOrigin = (req: Request, v: Viewer) => (v.kind === "user" && v.via.kind === "session" ? requireSiteOrigin(req) : Effect.void);
 
 function isService(req: Request, settings: ReviewSettings): boolean {
   const m = /^Bearer\s+(.+)$/i.exec(req.headers.get("authorization") ?? "");
@@ -771,14 +764,7 @@ const releaseResponse = (req: Request, id: string) =>
   });
 
 // ---------- second stage: the owner queue ----------
-const DecideBody = z.object({
-  name: z.string().min(1).max(214),
-  version: z.string().min(1).max(256),
-  digest: z.string().min(1).max(200),
-  decision: z.enum(["confirm", "dismiss"]),
-  note: z.string().max(2000).default(""),
-  ...ProofFields,
-});
+const DecideBody = ReviewDecision.extend(ProofFields);
 
 const queueResponse = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -817,7 +803,7 @@ const decideResponse = (req: Request, viewer: SessionViewer) =>
   Effect.gen(function* () {
     const d = yield* parseBody(req, DecideBody, MAX_REVIEW_BODY_BYTES);
     // a decision changes what the public sees: a fresh code or passkey check for exactly this one
-    yield* secondFactor({ session: viewer.via.session, body: d, purpose: `review:${JSON.stringify([d.name, d.version, d.digest, d.decision])}` });
+    yield* secondFactor({ session: viewer.via.session, body: d, action: { kind: "review-decision", name: d.name, version: d.version, digest: d.digest, decision: d.decision, note: d.note } });
     const r = yield* reviewFor(d.name, d.version, d.digest);
 
     if (!r) return fail(404, "No such review.");
@@ -825,7 +811,7 @@ const decideResponse = (req: Request, viewer: SessionViewer) =>
     if (r.human_state === "none") return fail(409, "This review found nothing; there is no flag to confirm or dismiss.");
     const sql = yield* SqlClient.SqlClient;
     const at = yield* (yield* Clock).now;
-    const note = d.note.trim() === "" ? null : d.note.trim();
+    const note = d.note === "" ? null : d.note;
     yield* query(
       "decide",
       sql`UPDATE reviews SET human_state = ${d.decision === "confirm" ? "confirmed" : "dismissed"}, human_by = ${viewer.githubLogin ?? viewer.user.name},

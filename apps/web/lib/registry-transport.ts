@@ -28,5 +28,5 @@ function binding(): RegistryBinding | null {
 export function registryFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
   const service = binding();
 
-  return service ? service.fetch(new Request(input, init)) : fetch(input, init);
+  return service ? service.fetch(new Request(input.toString(), init)) : fetch(input, init);
 }

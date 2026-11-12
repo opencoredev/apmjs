@@ -875,7 +875,8 @@ export function evidenceAt(evidence: string): { file: string; line: number } | n
  * what is left, falls back to its possible evidence when every confirmed item went, and goes when nothing is left
  * (so `finalize` scores without it). A dismissal names a scorer, and the registry hands over only those made for
  * this version's exact tarball digest, so none carries over to other bytes, another version or another scorer.
- * What was dismissed stays listed in `dismissed`, with the reason, so a page can show it struck through.
+ * What was dismissed stays listed in `dismissed`, with the reason, so a page can show it struck through and a
+ * reviewer can undo it; that includes a dismissed item of the possible evidence a signal falls back to.
  */
 export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismissal[]): Analysis {
   const mine = list.filter((d) => d.scorer === analysis.scorer && DISMISSABLE.has(d.signal));
@@ -887,6 +888,7 @@ export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismi
   for (const s of analysis.signals) {
     const own = mine.filter((d) => d.signal === s.id);
     const all = [...s.evidence, ...(s.more ?? [])];
+    const possible = s.fallback ?? [];
 
     const matchOf = (e: string): EvidenceDismissal | undefined => {
       const at = evidenceAt(e);
@@ -895,34 +897,37 @@ export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismi
     };
 
     const gone = own.length === 0 ? [] : all.filter((e) => matchOf(e) !== undefined);
+    // the possible evidence a confirmed signal falls back to can be dismissed too, and is listed like the rest
+    const goneFallback = own.length === 0 ? [] : possible.filter((e) => matchOf(e) !== undefined);
 
-    if (gone.length === 0) {
+    if (gone.length === 0 && goneFallback.length === 0) {
       signals.push(s);
       continue;
     }
 
     for (const d of own) {
-      const evidence = gone.filter((e) => matchOf(e) === d);
+      const evidence = [...gone, ...goneFallback].filter((e) => matchOf(e) === d);
 
       if (evidence.length > 0) dismissed.push({ signal: s.id, file: d.file, line: d.line, evidence, reason: d.reason, at: d.at });
     }
 
     const left = all.filter((e) => matchOf(e) === undefined);
+    const fallback = possible.filter((e) => matchOf(e) === undefined);
     const uncounted = s.uncounted ?? 0;
 
     if (left.length > 0 || uncounted > 0) {
-      const { more: _more, ...rest } = s;
+      const { more: _more, fallback: _fallback, ...rest } = s;
       // with evidence past what was kept, the label stays as the full list made it
-      const label = uncounted > 0 ? s.label : labelOf(s.id, s.confidence, left);
+      const label = uncounted > 0 || gone.length === 0 ? s.label : labelOf(s.id, s.confidence, left);
 
       const kept: Signal = { ...rest, label, evidence: left.slice(0, SHOWN_EVIDENCE) };
 
       if (left.length > SHOWN_EVIDENCE) kept.more = left.slice(SHOWN_EVIDENCE);
+
+      if (fallback.length > 0) kept.fallback = fallback;
       signals.push(kept);
       continue;
     }
-
-    const fallback = (s.fallback ?? []).filter((e) => matchOf(e) === undefined);
 
     if (s.confidence === "confirmed" && isCodeSignal(s.id) && fallback.length > 0) signals.push(signal(s.id, fallback, "possible"));
   }

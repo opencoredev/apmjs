@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScoreBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
-import { Account, AuthConfig, authClient, call, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
+import { Account, AuthConfig, call, passkeyConfirmation, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
 import { cn } from "@/lib/utils";
 
 type State =
@@ -43,7 +43,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
   const needsName = s.confirmation.kind === "typed";
   const nameOk = !needsName || typed === s.package;
 
-  async function approve(body: { code: string } | { passkey: true }, how: "code" | "passkey") {
+  async function approve(body: { code: string } | { confirmation: string }, how: "code" | "passkey") {
     setBusy(how);
     setError(null);
     // the registry reads confirmName only when the version needs it
@@ -58,15 +58,16 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     if (!nameOk) return setError(`Type ${s.package} to approve it.`);
     setBusy("passkey");
     setError(null);
-    const p = await authClient().signIn.passkey();
+    // the passkey check confirms this one upload, nothing else
+    const p = await passkeyConfirmation({ kind: "approve", id: s.id });
 
-    if (p.error) {
+    if (p.kind === "error") {
       setBusy(null);
 
-      return setError(p.error.message ?? "The passkey check did not finish.");
+      return setError(p.message);
     }
 
-    await approve({ passkey: true }, "passkey");
+    await approve({ confirmation: p.id }, "passkey");
   }
 
   async function reject() {

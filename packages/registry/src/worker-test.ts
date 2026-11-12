@@ -4,12 +4,13 @@
 // /__test/blobs lists the blob store's keys (GET) and overwrites one (PUT /__test/blobs/<key>), so tests can
 // tamper with stored bytes. POST /__test/sweep runs the cron's sweep at the test clock. POST /__test/analysis-job runs
 // the queue consumer on one job and says whether it acked the message or asked for a retry. x-apm-test-queue: fail
-// makes the analysis queue refuse every send for that request. All of it answers only to a caller holding
+// makes the analysis queue refuse every send for that request, and x-apm-test-fault: event-insert makes every
+// public-log insert fail inside Postgres for that request. All of it answers only to a caller holding
 // TEST_CONTROL_SECRET, a binding the deployed Worker does not have.
 import { Effect } from "effect";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
-import { Store } from "./db.ts";
+import { Store, type StoreFault } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
 import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
@@ -129,6 +130,11 @@ function envFor(req: Request, env: TestEnv): TestEnv {
   return { ...env, ANALYSIS_QUEUE: { send: refuse, sendBatch: refuse, metrics: () => Promise.resolve({ backlogCount: 0, backlogBytes: 0 }) } };
 }
 
+/** The store faults a trusted request asked for with x-apm-test-fault. */
+function faultsFor(req: Request): ReadonlySet<StoreFault> {
+  return req.headers.get("x-apm-test-fault") === "event-insert" ? new Set(["event-insert"]) : new Set();
+}
+
 export default {
   async fetch(req: Request, env: TestEnv, ctx: ExecutionContext): Promise<Response> {
     const secret = controlSecret(env);
@@ -150,8 +156,9 @@ export default {
     headers.delete("x-apm-test-now");
     headers.delete("x-apm-test-totp-now");
     headers.delete("x-apm-test-queue");
+    headers.delete("x-apm-test-fault");
 
-    return handle(new Request(req, { headers }), envFor(req, env), clock, ctx);
+    return handle(new Request(req, { headers }), envFor(req, env), clock, ctx, faultsFor(req));
   },
   queue: worker.queue,
   scheduled: worker.scheduled,

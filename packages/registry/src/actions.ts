@@ -92,3 +92,80 @@ export function commandLine(a: LiveAction): string {
 export function confirmUrl(webUrl: string, a: LiveAction): string {
   return `${webUrl}account?confirm=${Buffer.from(JSON.stringify(a)).toString("base64url")}`;
 }
+
+// ---------- website actions a second factor confirms ----------
+// A code or passkey check on the website confirms exactly one of these, from one session: the change, and every
+// parameter that decides what it does. The change spends a confirmation only when its own key is the same.
+
+const Digest = z.string().min(1).max(200);
+
+/** One evidence item: the version's exact tarball digest, the scorer that cited it, the signal, the file and the line. */
+export const EvidenceKey = z.object({
+  name: Name,
+  version: Version,
+  digest: Digest,
+  scorer: z.string().min(1).max(64),
+  signal: z.string().min(1).max(64),
+  file: z.string().min(1).max(1024),
+  line: z.number().int().min(1),
+});
+
+export type EvidenceKey = z.infer<typeof EvidenceKey>;
+
+/** Why a reviewer dismisses an item: shown in public. */
+export const DismissReason = z.string().trim().min(1, "Say why this evidence is wrong; the reason is shown in public.").max(2000);
+
+/** Why a reviewer undoes a dismissal: shown in public next to the dismissal's reason. */
+export const RestoreReason = z.string().trim().min(1, "Say why you are undoing this dismissal; the reason is shown in public.").max(2000);
+
+/** The account changes that add or remove a way in (auth.ts's gated Better Auth routes). */
+export const ACCOUNT_CHANGES = ["link-social", "two-factor/enable", "two-factor/disable", "passkey/verify-registration"] as const;
+
+export type AccountChange = (typeof ACCOUNT_CHANGES)[number];
+
+export function isAccountChange(path: string): path is AccountChange {
+  return ACCOUNT_CHANGES.some((c) => c === path);
+}
+
+export const ReviewDecision = z.object({
+  name: Name,
+  version: Version,
+  digest: Digest,
+  decision: z.enum(["confirm", "dismiss"]),
+  note: z.string().trim().max(2000).default(""),
+});
+
+export const SessionAction = z.discriminatedUnion("kind", [
+  /** Approving one staged upload; the row behind an id never changes. */
+  z.object({ kind: z.literal("approve"), id: z.string().min(1).max(64) }),
+  /** Confirming one CLI command on the website, which the CLI may then run once. */
+  z.object({ kind: z.literal("cli-confirm"), command: LiveAction }),
+  ReviewDecision.extend({ kind: z.literal("review-decision") }),
+  EvidenceKey.extend({ kind: z.literal("evidence-dismiss"), reason: DismissReason }),
+  EvidenceKey.extend({ kind: z.literal("evidence-restore"), reason: RestoreReason }),
+  z.object({ kind: z.literal("account"), change: z.enum(ACCOUNT_CHANGES) }),
+]);
+
+export type SessionAction = z.infer<typeof SessionAction>;
+
+/** The stored key of a website action: equal keys mean the same change with the same parameters. */
+export function sessionActionKey(a: SessionAction): string {
+  switch (a.kind) {
+    case "approve":
+      return JSON.stringify([a.kind, a.id]);
+    case "cli-confirm":
+      return JSON.stringify([a.kind, actionKey(a.command)]);
+    case "review-decision":
+      return JSON.stringify([a.kind, a.name, a.version, a.digest, a.decision, a.note]);
+    case "evidence-dismiss":
+    case "evidence-restore":
+      return JSON.stringify([a.kind, a.name, a.version, a.digest, a.scorer, a.signal, a.file, a.line, a.reason]);
+    case "account":
+      return JSON.stringify([a.kind, a.change]);
+    default: {
+      const _exhaustive: never = a;
+
+      return _exhaustive;
+    }
+  }
+}

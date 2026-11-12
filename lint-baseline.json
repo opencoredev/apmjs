@@ -3,10 +3,6 @@
     "apps/web/app/approve/[id]/approve-view.tsx": {
       "shadcn/no-restyle": 2
     },
-    "apps/web/app/package/[...name]/page.tsx": {
-      "anti-slop/no-reflect-get": 1,
-      "anti-slop/no-runtime-typeof": 2
-    },
     "apps/web/app/publish/publish-view.tsx": {
       "anti-slop/no-known-value-widening": 7,
       "shadcn/no-restyle": 1

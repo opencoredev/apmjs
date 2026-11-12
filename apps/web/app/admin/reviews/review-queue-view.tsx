@@ -11,7 +11,7 @@ import { packagePath } from "@/lib/package-route";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { authClient, call } from "@/lib/account";
+import { call, passkeyConfirmation } from "@/lib/account";
 import { ago } from "@/lib/format";
 import { coverageText, notReadText, PrivateReview, PublicReview } from "@/lib/review-schema";
 
@@ -39,8 +39,8 @@ function label(i: Item): string {
   return i.private.reason === "unsettled" ? "Flagged, then cleared on retry" : "No answer";
 }
 
-// Each decision needs a fresh second factor: a code typed now, or a passkey check made for it.
-type Factor = { kind: "code"; code: string } | { kind: "passkey" } | { kind: "error"; message: string };
+// Each decision needs a fresh second factor: a code typed now, or a passkey check made for exactly that decision.
+type Factor = { kind: "code"; code: string } | { kind: "confirmation"; id: string } | { kind: "error"; message: string };
 
 function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
   const [note, setNote] = useState("");
@@ -50,17 +50,17 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const files = item.public.notRead.flatMap((n) => (n.kind === "file" ? [notReadText(n)] : []));
 
-  async function factor(): Promise<Factor> {
+  async function factor(decision: "confirm" | "dismiss"): Promise<Factor> {
     if (!usePasskey) return /^\d{6}$/.test(code) ? { kind: "code", code } : { kind: "error", message: "Enter the 6-digit code from your authenticator app." };
-    const p = await authClient().signIn.passkey();
+    const p = await passkeyConfirmation({ kind: "review-decision", name: item.name, version: item.version, digest: item.digest, decision, note: note.trim() });
 
-    return p.error ? { kind: "error", message: p.error.message ?? "The passkey check did not finish." } : { kind: "passkey" };
+    return p.kind === "ok" ? { kind: "confirmation", id: p.id } : p;
   }
 
   async function decide(decision: "confirm" | "dismiss") {
     setBusy(decision);
     setError(null);
-    const f = await factor();
+    const f = await factor(decision);
 
     if (f.kind === "error") {
       setBusy(null);
@@ -68,7 +68,7 @@ function Pending({ item, onDone }: { item: Item; onDone: () => void }) {
       return setError(f.message);
     }
 
-    const proof = f.kind === "code" ? { code: f.code } : { passkey: true };
+    const proof = f.kind === "code" ? { code: f.code } : { confirmation: f.id };
     const r = await call("review-admin/decide", z.object({ ok: z.boolean() }), { method: "POST", body: { name: item.name, version: item.version, digest: item.digest, decision, note, ...proof } });
 
     setBusy(null);

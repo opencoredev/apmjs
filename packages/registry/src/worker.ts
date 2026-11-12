@@ -5,12 +5,12 @@ import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Analysis, type AnalysisJob } from "./analysis.ts";
 import { matureRevocations } from "./apm.ts";
-import { sweepStaged } from "./account.ts";
+import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig, type RegistrySettings } from "./config.ts";
-import { Store } from "./db.ts";
+import { Store, type StoreFault } from "./db.ts";
 import type { HttpFailure, InfraError } from "./errors.ts";
 import { fail, failureResponse, withPrivacyHeaders, withSlash } from "./http.ts";
 import { route } from "./router.ts";
@@ -169,10 +169,10 @@ function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<
 export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis | Auth;
 
 /** Every service a request uses, over this Worker's bindings. The Postgres connection lives as long as the request. */
-export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null) {
+export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, faults: ReadonlySet<StoreFault> = new Set()) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
-  const core = Layer.mergeAll(Store.postgres(databaseUrl), Blobs.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
+  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults), Blobs.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
@@ -191,12 +191,21 @@ function logFailure(event: string, fields: LogFields, error: string): void {
   console.error(JSON.stringify({ level: "error", event, ...fields, error }));
 }
 
-/** Runs the router for one request. `clock` is the system clock in production. Per-user answers are marked private, whichever route made them. */
-export async function handle(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system, ctx: ExecutionContext | null = null): Promise<Response> {
-  return withPrivacyHeaders(req, await respond(req, rawEnv, clock, ctx));
+/**
+ * Runs the router for one request. `clock` is the system clock in production, and `faults` is empty there: only the
+ * test entry (worker-test.ts) switches one on. Per-user answers are marked private, whichever route made them.
+ */
+export async function handle(
+  req: Request,
+  rawEnv: RawEnv,
+  clock: Layer.Layer<Clock> = Clock.system,
+  ctx: ExecutionContext | null = null,
+  faults: ReadonlySet<StoreFault> = new Set(),
+): Promise<Response> {
+  return withPrivacyHeaders(req, await respond(req, rawEnv, clock, ctx, faults));
 }
 
-async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, ctx: ExecutionContext | null): Promise<Response> {
+async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, ctx: ExecutionContext | null, faults: ReadonlySet<StoreFault>): Promise<Response> {
   const parsed = WorkerEnv.safeParse(rawEnv);
 
   if (!parsed.success) {
@@ -231,7 +240,7 @@ async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, 
         return fail(500, "Internal error");
       }),
     ),
-    Effect.provide(servicesFor(env, settings, clock, ctx === null ? null : (work) => ctx.waitUntil(work))),
+    Effect.provide(servicesFor(env, settings, clock, ctx === null ? null : (work) => ctx.waitUntil(work), faults)),
     Effect.scoped,
   );
 
@@ -270,13 +279,13 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
   }
 }
 
-/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline. */
+/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. */
 export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged, sweepConfirmations], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

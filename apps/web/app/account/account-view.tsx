@@ -16,10 +16,12 @@ import {
   commandFromLink,
   commandText,
   linkProvider,
+  passkeyConfirmation,
   PROVIDER_LABEL,
   proofHeaders,
   type FactorProof,
   type LiveAction,
+  type SessionAction,
 } from "@/lib/account";
 import { cn } from "@/lib/utils";
 
@@ -54,13 +56,14 @@ function hasFactor(a: Account): boolean {
 }
 
 /**
- * Asks for the factor the account already has: a code from the app (or a recovery code), or a passkey check.
- * `run` gets the proof and returns an error message, or null when it worked.
+ * Asks for the factor the account already has: a code from the app (or a recovery code), or a passkey check made
+ * for exactly `confirms`. `run` gets the proof and returns an error message, or null when it worked.
  */
 function FactorPrompt({
   account,
   config,
   action,
+  confirms,
   busyLabel,
   allowRecovery = false,
   run,
@@ -68,6 +71,8 @@ function FactorPrompt({
   account: Account;
   config: AuthConfig;
   action: string;
+  /** The change the factor is for: a passkey check confirms this one alone. */
+  confirms: SessionAction;
   busyLabel: string;
   allowRecovery?: boolean;
   run: (proof: FactorProof) => Promise<string | null>;
@@ -98,15 +103,15 @@ function FactorPrompt({
   async function withPasskey() {
     setBusy("passkey");
     setError(null);
-    const p = await authClient().signIn.passkey();
+    const p = await passkeyConfirmation(confirms);
 
-    if (p.error) {
+    if (p.kind === "error") {
       setBusy(null);
 
-      return setError(p.error.message ?? "The passkey check did not finish.");
+      return setError(p.message);
     }
 
-    const message = await run({ kind: "passkey" });
+    const message = await run({ kind: "confirmation", id: p.id });
     setBusy(null);
 
     if (message) setError(message);
@@ -268,7 +273,7 @@ function TotpSetup({ account, config, onEnabled }: { account: Account; config: A
       return (
         <div className="flex flex-col gap-2">
           <p className="text-sm text-muted-foreground">Confirm with your passkey to add an authenticator app.</p>
-          <FactorPrompt account={account} config={config} action="Set up" busyLabel="Starting…" run={(p) => start(p)} />
+          <FactorPrompt account={account} config={config} action="Set up" confirms={{ kind: "account", change: "two-factor/enable" }} busyLabel="Starting…" run={(p) => start(p)} />
         </div>
       );
     }
@@ -325,13 +330,14 @@ function ConfirmCommand({ command, account, config, onDone }: { command: LiveAct
           account={account}
           config={config}
           action="Approve command"
+          confirms={{ kind: "cli-confirm", command }}
           busyLabel="Approving…"
           run={async (proof) => {
             if (proof.kind === "recovery") return "Use a code from your app or your passkey for this.";
 
             const r = await call("verify", z.object({ ok: z.boolean(), command: z.string(), until: z.string() }), {
               method: "POST",
-              body: { command, ...(proof.kind === "totp" ? { code: proof.code } : { passkey: true }) },
+              body: { command, ...(proof.kind === "totp" ? { code: proof.code } : { confirmation: proof.id }) },
             });
 
             if (r.kind === "ok") {
@@ -384,7 +390,7 @@ function AddPasskey({ account, config, onDone }: { account: Account; config: Aut
   return (
     <div className="flex flex-col gap-2">
       <p className="text-sm text-muted-foreground">Confirm it&apos;s you before adding another passkey.</p>
-      <FactorPrompt account={account} config={config} action="Add passkey" busyLabel="Adding…" run={(p) => add(p)} />
+      <FactorPrompt account={account} config={config} action="Add passkey" confirms={{ kind: "account", change: "passkey/verify-registration" }} busyLabel="Adding…" run={(p) => add(p)} />
     </div>
   );
 }
@@ -409,6 +415,7 @@ function TurnOffTotp({ account, config, onDone }: { account: Account; config: Au
         account={account}
         config={config}
         action="Turn off 2FA"
+        confirms={{ kind: "account", change: "two-factor/disable" }}
         busyLabel="Turning off…"
         allowRecovery
         run={async (proof) => {
@@ -639,7 +646,14 @@ export function AccountView() {
         {linking !== null && (
           <div className="flex flex-col gap-2">
             <p className="text-sm text-muted-foreground">Confirm it&apos;s you before linking {PROVIDER_LABEL[linking]}: it becomes another way to sign in.</p>
-            <FactorPrompt account={a} config={config} action={`Link ${PROVIDER_LABEL[linking]}`} busyLabel="Opening…" run={(p) => link(linking, p)} />
+            <FactorPrompt
+              account={a}
+              config={config}
+              action={`Link ${PROVIDER_LABEL[linking]}`}
+              confirms={{ kind: "account", change: "link-social" }}
+              busyLabel="Opening…"
+              run={(p) => link(linking, p)}
+            />
           </div>
         )}
       </Section>

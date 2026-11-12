@@ -113,3 +113,33 @@ describe("dismissed evidence", () => {
     expect(after.signals[0]).toMatchObject({ id: "network", confidence: "possible", points: -3, evidence: ["data.json:2: fetch [possible: in JSON]"] });
   });
 });
+
+describe("dismissed fallback evidence", () => {
+  const base = scored({ "index.js": "module.exports = { deny: ['.env', '.npmrc'] };\n" });
+  const confirmed = "index.js:1: fetch(u) (text match: counted unless it sits in a comment, a regex or a type)";
+  const possible = "data.json:2: fetch [possible: in JSON]";
+  const withFallback: Analysis = { ...base, signals: [{ id: "network", label: "x", points: -10, confidence: "confirmed", evidence: [confirmed], fallback: [possible] }] };
+  const onFallback = { scorer: base.scorer, signal: "network", file: "data.json", line: 2, reason: "a JSON fixture", at: 1 };
+  const onConfirmed = { scorer: base.scorer, signal: "network", file: "index.js", line: 1, reason: "a comment", at: 2 };
+
+  test("a dismissed fallback item is listed while the confirmed evidence still stands, and is no longer a fallback", () => {
+    const after = applyDismissals(withFallback, [onFallback]);
+
+    expect(after.dismissed).toEqual([{ signal: "network", file: "data.json", line: 2, evidence: [possible], reason: "a JSON fixture", at: 1 }]);
+    expect(after.signals).toEqual([{ id: "network", label: "x", points: -10, confidence: "confirmed", evidence: [confirmed] }]);
+  });
+
+  test("with the confirmed item dismissed too, both are listed and the signal goes", () => {
+    const after = applyDismissals(withFallback, [onFallback, onConfirmed]);
+
+    expect(after.signals).toEqual([]);
+    expect((after.dismissed ?? []).map((d) => `${d.file}:${d.line}`).sort()).toEqual(["data.json:2", "index.js:1"]);
+  });
+
+  test("dismissed after the signal fell back, the fallback item is listed too", () => {
+    const after = applyDismissals(withFallback, [onConfirmed, onFallback]);
+
+    expect(after.signals).toEqual([]);
+    expect(after.dismissed?.find((d) => d.file === "data.json")).toMatchObject({ evidence: [possible], reason: "a JSON fixture" });
+  });
+});

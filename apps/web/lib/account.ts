@@ -4,6 +4,7 @@
 
 import { createAuthClient } from "better-auth/react";
 import { passkeyClient } from "@better-auth/passkey/client";
+import { startAuthentication } from "@simplewebauthn/browser";
 import { z } from "zod";
 import "./zod-csp";
 
@@ -13,7 +14,7 @@ function makeClient() {
 
 let client: ReturnType<typeof makeClient> | null = null;
 
-/** Better Auth's browser client, made on first use (it needs window.location). Used for passkeys. */
+/** Better Auth's browser client, made on first use (it needs window.location). Used to add a passkey. */
 export function authClient(): ReturnType<typeof makeClient> {
   client ??= makeClient();
 
@@ -131,16 +132,68 @@ export async function call<T>(path: string, schema: z.ZodType<T>, init: { method
   return parsed.success ? { kind: "ok", value: parsed.data } : { kind: "error", status: res.status, message: "The registry sent an answer this page does not understand." };
 }
 
-/** A second factor for an account change: a code from the app, a recovery code, or the passkey check just made. */
-export type FactorProof = { kind: "totp"; code: string } | { kind: "recovery"; code: string } | { kind: "passkey" };
+/**
+ * A second factor for one change: a code from the app or a recovery code, sent with the change itself, or the id of
+ * the confirmation a passkey check made for exactly that change (`passkeyConfirmation`).
+ */
+export type FactorProof = { kind: "totp"; code: string } | { kind: "recovery"; code: string } | { kind: "confirmation"; id: string };
 
 /** The header the registry reads a factor proof from on account changes. */
 export function proofHeaders(proof: FactorProof | null): Headers {
   const headers = new Headers();
 
-  if (proof !== null) headers.set("x-apm-second-factor", proof.kind === "passkey" ? "passkey" : `${proof.kind}:${proof.code.trim()}`);
+  if (proof !== null) headers.set("x-apm-second-factor", proof.kind === "confirmation" ? `confirmation:${proof.id}` : `${proof.kind}:${proof.code.trim()}`);
 
   return headers;
+}
+
+/** The fields one evidence item is named by. Mirrors the registry's EvidenceKey (packages/registry/src/actions.ts). */
+export type EvidenceKey = { name: string; version: string; digest: string; scorer: string; signal: string; file: string; line: number };
+
+/**
+ * A website change a second factor confirms, with every parameter that decides what it does. Mirrors the registry's
+ * SessionAction: a confirmation of one of these is spent only by exactly this change.
+ */
+export type SessionAction =
+  | { kind: "approve"; id: string }
+  | { kind: "cli-confirm"; command: LiveAction }
+  | { kind: "review-decision"; name: string; version: string; digest: string; decision: "confirm" | "dismiss"; note: string }
+  | ({ kind: "evidence-dismiss" | "evidence-restore"; reason: string } & EvidenceKey)
+  | { kind: "account"; change: "link-social" | "two-factor/enable" | "two-factor/disable" | "passkey/verify-registration" };
+
+/** The WebAuthn request options the registry makes (PublicKeyCredentialRequestOptionsJSON), as the browser library takes them. */
+const RequestOptions = z.object({
+  challenge: z.string(),
+  timeout: z.number().optional(),
+  rpId: z.string().optional(),
+  userVerification: z.enum(["required", "preferred", "discouraged"]).optional(),
+  allowCredentials: z
+    .array(z.object({ id: z.string(), type: z.literal("public-key"), transports: z.array(z.enum(["ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb"])).optional() }))
+    .optional(),
+});
+
+const Challenge = z.object({ challengeId: z.string(), options: RequestOptions });
+const Confirmation = z.object({ confirmation: z.string() });
+
+/**
+ * A passkey check for one change: the registry makes a challenge for exactly `action` from this session, the
+ * browser's passkey answers it, and the registry hands back a confirmation that only `action` can spend, once.
+ */
+export async function passkeyConfirmation(action: SessionAction): Promise<{ kind: "ok"; id: string } | { kind: "error"; message: string }> {
+  const challenge = await call("factor/passkey-challenge", Challenge, { method: "POST", body: { action } });
+
+  if (challenge.kind !== "ok") return { kind: "error", message: challenge.kind === "error" ? challenge.message : "Sign in again." };
+  let response: unknown;
+
+  try {
+    response = await startAuthentication({ optionsJSON: challenge.value.options });
+  } catch (e) {
+    return { kind: "error", message: e instanceof Error && e.name === "NotAllowedError" ? "The passkey check was cancelled." : "The passkey check did not finish." };
+  }
+
+  const confirmed = await call("factor/confirm", Confirmation, { method: "POST", body: { action, passkey: { challengeId: challenge.value.challengeId, response } } });
+
+  return confirmed.kind === "ok" ? { kind: "ok", id: confirmed.value.confirmation } : { kind: "error", message: confirmed.kind === "error" ? confirmed.message : "Sign in again." };
 }
 
 /** POST to Better Auth's own routes. */

@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { Effect } from "effect";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { GRANT_MS, MAX_FAILURES, PASSKEY_PROOF_MS, matchingStep, parseProofHeader, parseSixDigits, type SixDigits } from "../src/factors.ts";
-import { actionKey, commandLine, confirmUrl, LiveAction } from "../src/actions.ts";
+import { CHALLENGE_MS, CONFIRMATION_MS, GRANT_MS, MAX_FAILURES, matchingStep, parseProofHeader, parseSixDigits, type SixDigits } from "../src/factors.ts";
+import { actionKey, commandLine, confirmUrl, LiveAction, sessionActionKey, type SessionAction } from "../src/actions.ts";
 import { Store, type StoreApi } from "../src/db.ts";
 import type { StoreError } from "../src/errors.ts";
 import { legacyAuthRefusal, isPublicHttps } from "../src/startup.ts";
@@ -133,19 +133,81 @@ describe("accepted steps", () => {
   });
 });
 
-describe("passkey proofs and CLI confirmations", () => {
-  test("a passkey check is bound to its session and spent on one action", async () => {
+const evidence = { name: "a", version: "1.0.0", digest: "sha512-x", scorer: "apm-score-v8", signal: "credential-access", file: "index.js", line: 1 };
+
+describe("confirmations of one website action", () => {
+  test("a confirmation is spent only by its own session and action, once, within its window", async () => {
     await withLedger(async (ledger) => {
-      await run(ledger.recordPasskeyProof({ sessionToken: "s1", authUserId: "u", at: 0 }));
-      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s2", authUserId: "u", purpose: "approve:a", at: 1 }))).toBe(false);
-      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "other", purpose: "approve:a", at: 1 }))).toBe(false);
-      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:a", at: 1 }))).toBe(true);
-      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s1", authUserId: "u", purpose: "approve:b", at: 2 }))).toBe(false);
-      await run(ledger.recordPasskeyProof({ sessionToken: "s3", authUserId: "u", at: 0 }));
-      expect(await run(ledger.consumePasskeyProof({ sessionToken: "s3", authUserId: "u", purpose: "x", at: PASSKEY_PROOF_MS }))).toBe(false);
+      const dismissA = sessionActionKey({ kind: "evidence-dismiss", ...evidence, reason: "a deny list" });
+      const dismissB = sessionActionKey({ kind: "evidence-dismiss", ...evidence, line: 2, reason: "a deny list" });
+      const c = await run(ledger.issueConfirmation({ sessionToken: "s1", authUserId: "u", action: dismissA, factor: "passkey", at: 0 }));
+
+      expect(c.expiresAt).toBe(CONFIRMATION_MS);
+      expect(await run(ledger.consumeConfirmation({ id: c.id, sessionToken: "s2", authUserId: "u", action: dismissA, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeConfirmation({ id: c.id, sessionToken: "s1", authUserId: "other", action: dismissA, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeConfirmation({ id: c.id, sessionToken: "s1", authUserId: "u", action: dismissB, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeConfirmation({ id: c.id, sessionToken: "s1", authUserId: "u", action: dismissA, at: 1 }))).toBe(true);
+      expect(await run(ledger.consumeConfirmation({ id: c.id, sessionToken: "s1", authUserId: "u", action: dismissA, at: 2 }))).toBe(false);
+      const late = await run(ledger.issueConfirmation({ sessionToken: "s1", authUserId: "u", action: dismissA, factor: "totp", at: 0 }));
+
+      expect(await run(ledger.consumeConfirmation({ id: late.id, sessionToken: "s1", authUserId: "u", action: dismissA, at: CONFIRMATION_MS }))).toBe(false);
     });
   });
 
+  test("a passkey challenge is answerable once, for the session and action it was made for", async () => {
+    await withLedger(async (ledger) => {
+      const approve = sessionActionKey({ kind: "approve", id: "abc" });
+      const id = await run(ledger.addPasskeyChallenge({ sessionToken: "s1", authUserId: "u", action: approve, challenge: "ch", at: 0 }));
+
+      expect(await run(ledger.takePasskeyChallenge({ id, sessionToken: "s1", authUserId: "u", action: sessionActionKey({ kind: "approve", id: "abd" }), at: 1 }))).toBeNull();
+      expect(await run(ledger.takePasskeyChallenge({ id, sessionToken: "s2", authUserId: "u", action: approve, at: 1 }))).toBeNull();
+      expect(await run(ledger.takePasskeyChallenge({ id, sessionToken: "s1", authUserId: "u", action: approve, at: 1 }))).toBe("ch");
+      expect(await run(ledger.takePasskeyChallenge({ id, sessionToken: "s1", authUserId: "u", action: approve, at: 2 }))).toBeNull();
+      const old = await run(ledger.addPasskeyChallenge({ sessionToken: "s1", authUserId: "u", action: approve, challenge: "ch2", at: 0 }));
+
+      expect(await run(ledger.takePasskeyChallenge({ id: old, sessionToken: "s1", authUserId: "u", action: approve, at: CHALLENGE_MS }))).toBeNull();
+    });
+  });
+
+  test("expired challenges and confirmations are purged; live ones stay usable", async () => {
+    await withLedger(async (ledger) => {
+      const approve = sessionActionKey({ kind: "approve", id: "abc" });
+      const old = await run(ledger.issueConfirmation({ sessionToken: "s1", authUserId: "u", action: approve, factor: "totp", at: 0 }));
+      const live = await run(ledger.issueConfirmation({ sessionToken: "s1", authUserId: "u", action: approve, factor: "totp", at: 10 * CONFIRMATION_MS }));
+      const challenge = await run(ledger.addPasskeyChallenge({ sessionToken: "s1", authUserId: "u", action: approve, challenge: "ch", at: 10 * CONFIRMATION_MS }));
+
+      await run(ledger.purgeConfirmations(10 * CONFIRMATION_MS));
+      expect(await run(ledger.consumeConfirmation({ id: old.id, sessionToken: "s1", authUserId: "u", action: approve, at: 1 }))).toBe(false);
+      expect(await run(ledger.consumeConfirmation({ id: live.id, sessionToken: "s1", authUserId: "u", action: approve, at: 10 * CONFIRMATION_MS + 1 }))).toBe(true);
+      expect(await run(ledger.takePasskeyChallenge({ id: challenge, sessionToken: "s1", authUserId: "u", action: approve, at: 10 * CONFIRMATION_MS + 1 }))).toBe("ch");
+    });
+  });
+
+  test("keys tell every parameter apart: the evidence key, the reason, the decision, the command", () => {
+    const keys = (
+      [
+        { kind: "evidence-dismiss", ...evidence, reason: "r" },
+        { kind: "evidence-dismiss", ...evidence, reason: "r2" },
+        { kind: "evidence-dismiss", ...evidence, digest: "sha512-y", reason: "r" },
+        { kind: "evidence-dismiss", ...evidence, scorer: "apm-score-v7", reason: "r" },
+        { kind: "evidence-dismiss", ...evidence, signal: "network", reason: "r" },
+        { kind: "evidence-dismiss", ...evidence, file: "b.js", reason: "r" },
+        { kind: "evidence-restore", ...evidence, reason: "r" },
+        { kind: "review-decision", name: "a", version: "1.0.0", digest: "d", decision: "confirm", note: "" },
+        { kind: "review-decision", name: "a", version: "1.0.0", digest: "d", decision: "dismiss", note: "" },
+        { kind: "approve", id: "abc" },
+        { kind: "cli-confirm", command: { kind: "revoke", name: "a", version: "1.0.0" } },
+        { kind: "cli-confirm", command: { kind: "restore", name: "a", version: "1.0.0" } },
+        { kind: "account", change: "two-factor/disable" },
+        { kind: "account", change: "link-social" },
+      ] satisfies SessionAction[]
+    ).map(sessionActionKey);
+
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe("CLI confirmations", () => {
   test("a CLI confirmation covers its named command once, within its window", async () => {
     await withLedger(async (ledger) => {
       const revoke = actionKey({ kind: "revoke", name: "@a/b", version: "1.0.0" });
@@ -173,12 +235,13 @@ describe("actions", () => {
 });
 
 describe("proof header", () => {
-  test("parses totp, recovery and passkey proofs and nothing else", () => {
+  test("parses totp, recovery and confirmation proofs and nothing else", () => {
     expect(parseProofHeader("totp:123456")).toEqual({ kind: "totp", code: sixDigits("123456") });
     expect(parseProofHeader("recovery:abCDe-12345")).toEqual({ kind: "recovery", code: "abCDe-12345" });
-    expect(parseProofHeader("passkey")).toEqual({ kind: "passkey" });
+    expect(parseProofHeader("confirmation:AAAAAAAAAAAAAAAAAAAAAA")).toMatchObject({ kind: "confirmation", id: "AAAAAAAAAAAAAAAAAAAAAA" });
 
-    for (const bad of [null, "", "totp: ", "totp:12345", "recovery:", "recovery:a b", "password:x"]) expect(parseProofHeader(bad)).toBeNull();
+    // a bare "passkey" no longer stands for a check the session made at some point
+    for (const bad of [null, "", "passkey", "confirmation:", "confirmation:short", "totp: ", "totp:12345", "recovery:", "recovery:a b", "password:x"]) expect(parseProofHeader(bad)).toBeNull();
   });
 });
 
