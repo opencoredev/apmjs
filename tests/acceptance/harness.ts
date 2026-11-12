@@ -75,6 +75,8 @@ export type Registry = {
   blobs: { keys: () => Promise<string[]>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
   /** Test-only: runs one SQL statement against the registry's Postgres database and returns its rows. */
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
+  /** Runs the cron's sweep at the test clock: expires staged versions and writes down matured revokes. */
+  sweep: () => Promise<void>;
 };
 
 export type TokenScope = "publish" | "stage";
@@ -135,7 +137,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
 
-  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query };
+  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep };
 }
 
 /** The Worker variables that turn the AI review on, as the deploy sets them; none when it is off. */
@@ -313,8 +315,21 @@ export function installedVersion(appDir: string, name: string): string | null {
 }
 
 // ---------- raw publishes, for tests that control every byte ----------
+/** A package.json "exports" value: a path, null, a list of fallbacks, or subpaths and conditions. */
+export type ExportsField = string | null | ExportsField[] | { [key: string]: ExportsField };
+
 /** The package.json fields raw-publish tests set. */
-export type RawManifest = { name: string; version: string; license?: string; main?: string; scripts?: Record<string, string>; dependencies?: Record<string, string> };
+export type RawManifest = {
+  name: string;
+  version: string;
+  license?: string;
+  main?: string;
+  module?: string;
+  exports?: ExportsField;
+  readme?: string;
+  scripts?: Record<string, string>;
+  dependencies?: Record<string, string>;
+};
 
 function tarHeader(path: string, size: number): Uint8Array {
   const h = new Uint8Array(512);

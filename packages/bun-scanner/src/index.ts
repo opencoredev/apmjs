@@ -124,12 +124,24 @@ async function askAll(registry: string, packages: Bun.Security.Package[]): Promi
   return { kind: "advisories", advisories, unchecked };
 }
 
+/**
+ * A version a registry serves: strict semver, prereleases and build metadata included. Bun.semver.satisfies(v, "*")
+ * is false for every prerelease, so it cannot tell registry versions from git, file and link specs.
+ */
+export function isRegistryVersion(version: string): boolean {
+  return /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version);
+}
+
 /** The scan itself, with its inputs explicit so tests can drive it. */
 export async function scanPackages(input: { packages: Bun.Security.Package[]; env: Env; cwd: string; warn: (line: string) => void }): Promise<Bun.Security.Advisory[]> {
-  // git, file and link dependencies are not on a registry
-  const onRegistry = input.packages.filter((p) => Bun.semver.satisfies(p.version, "*"));
+  // git, file and link dependencies are not on a registry: nothing can vouch for them, so each is reported
+  const onRegistry = input.packages.filter((p) => isRegistryVersion(p.version));
   const registry = configuredRegistry({ env: input.env, cwd: input.cwd });
-  const unchecked: Unchecked[] = [];
+
+  const unchecked: Unchecked[] = input.packages
+    .filter((p) => !isRegistryVersion(p.version))
+    .map((p) => ({ id: `${p.name}@${p.version}`, reason: "not a registry version (git, file or link dependency), so no registry can check it" }));
+
   const out: Bun.Security.Advisory[] = [];
 
   if (!registry) {

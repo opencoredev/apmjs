@@ -34,6 +34,8 @@ export type WorkerRegistry = {
   blobs: { keys: () => Promise<string[]>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
   /** Runs one SQL statement against this registry's database and returns its rows. */
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
+  /** Runs the cron's sweep (matured revokes, expired staged versions) at the test clock. */
+  sweep: () => Promise<void>;
 };
 
 const CONTROL = randomBytes(24).toString("hex");
@@ -145,6 +147,14 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
       } finally {
         await c.end();
       }
+    },
+    sweep: async () => {
+      const res = await fetch(`${target}__test/sweep`, {
+        method: "POST",
+        headers: { "x-apm-test-control": CONTROL, "x-apm-test-now": String(opts.now ? opts.now() : Date.now()) },
+      });
+
+      if (res.status !== 200) throw new Error(`sweep failed: ${res.status}`);
     },
     mint: async ({ user, scope }) => {
       const res = await fetch(`${target}__test/mint`, {

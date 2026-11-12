@@ -5,7 +5,7 @@ import { z } from "zod";
 import { finalize, parseAnalysis, readTarball, SCORE_FLOOR } from "@apm/core";
 import { publishRefusal } from "./access.ts";
 import { actionKey, commandLine, LiveAction } from "./actions.ts";
-import { Auth, type SignedIn } from "./auth.ts";
+import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -14,14 +14,13 @@ import { refuse } from "./errors.ts";
 import { fail, json, parseOptionalBody } from "./http.ts";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { sha512, tarballKey } from "./hash.ts";
-import { GRANT_MS, parseSixDigits, type FactorProof, type ProofCheck } from "./factors.ts";
+import { GRANT_MS } from "./factors.ts";
 import { typedConfirmationReason } from "./approval.ts";
 import { commitVersion, dropBlobIfUnused, issueToken } from "./server.ts";
+import { ProofFields, secondFactor } from "./step-up.ts";
 
 export { typedConfirmationReason } from "./approval.ts";
 
-/** A second factor sent by the website: a TOTP code typed now, or the passkey check this session just made. */
-const ProofFields = { code: z.string().optional(), passkey: z.literal(true).optional() };
 const ApproveBody = z.object({ ...ProofFields, confirmName: z.string().optional() });
 const VerifyBody = z.object({ ...ProofFields, command: LiveAction });
 const DeviceTokenBody = z.object({ deviceCode: z.string().min(1) });
@@ -31,21 +30,6 @@ const now = Effect.flatMap(Clock, (c) => c.now);
 
 /** File contents the approval page shows, at most. */
 const MAX_FILE_TEXT = 512 * 1024;
-
-type ProofFieldValues = { code?: string | undefined; passkey?: true | undefined };
-
-/** The website's proof fields as a proof: a malformed code is an error, not "no code". */
-function proofOf(body: ProofFieldValues): { kind: "ok"; proof: FactorProof } | { kind: "missing" } | { kind: "malformed" } {
-  if (body.code !== undefined) {
-    const code = parseSixDigits(body.code);
-
-    return code ? { kind: "ok", proof: { kind: "totp", code } } : { kind: "malformed" };
-  }
-
-  if (body.passkey) return { kind: "ok", proof: { kind: "passkey" } };
-
-  return { kind: "missing" };
-}
 
 function looksBinary(data: Uint8Array): boolean {
   const head = data.subarray(0, 8000);
@@ -155,37 +139,6 @@ const stagedDetail = (row: StagedRecord) =>
       analysis: report === null || entries === null ? "incomplete" : "complete",
       confirmation: typed === null ? { kind: "plain" } : { kind: "typed", reason: typed },
     };
-  });
-
-function refused(check: Exclude<ProofCheck, { kind: "ok" }>) {
-  switch (check.kind) {
-    case "bad":
-      return refuse(401, "That code is not valid. Use the current 6-digit code from your authenticator app.");
-    case "reused":
-      return refuse(401, "That code was already used. Wait for the next code from your authenticator app.");
-    case "locked":
-      return refuse(429, "Too many wrong codes. Wait 15 minutes and try again.");
-    case "none":
-      return refuse(401, "Confirm it's you: enter the code from your authenticator app, or use your passkey.");
-    default: {
-      const _exhaustive: never = check;
-
-      return _exhaustive;
-    }
-  }
-}
-
-/** A second factor for one action, from this session: a code typed now, or this session's own passkey check. */
-const secondFactor = (s: SignedIn, body: ProofFieldValues, purpose: string) =>
-  Effect.gen(function* () {
-    const p = proofOf(body);
-
-    if (p.kind === "malformed") return yield* Effect.fail(refuse(400, "Send the 6-digit code from your authenticator app."));
-
-    if (p.kind === "missing") return yield* Effect.fail(refuse(401, "Confirm it's you: enter the code from your authenticator app, or use your passkey."));
-    const check = yield* (yield* Auth).checkProof({ authUserId: s.authUserId, sessionToken: s.sessionToken, proof: p.proof, purpose });
-
-    if (check.kind !== "ok") return yield* Effect.fail(refused(check));
   });
 
 /** The account and login routes under /-/apm/v1/; null when the path is not one of them. */
@@ -311,7 +264,7 @@ export const accountRoute = (req: Request, url: URL) =>
       const who = yield* signedIn(req);
       const body = yield* parseOptionalBody(req, VerifyBody);
       const command = body.command;
-      yield* secondFactor(who.s, body, `confirm:${actionKey(command)}`);
+      yield* secondFactor({ session: who.s, body, purpose: `confirm:${actionKey(command)}` });
       const { expiresAt } = yield* store.grant({ authUserId: who.s.authUserId, action: actionKey(command), at: yield* now });
 
       return json({ ok: true, command: commandLine(command), until: new Date(expiresAt).toISOString(), validForMs: GRANT_MS });
@@ -386,7 +339,7 @@ export const accountRoute = (req: Request, url: URL) =>
         return fail(400, `${typed} Type the package name, ${row.package}, to approve it anyway.`);
       }
 
-      yield* secondFactor(who.s, body, `approve:${id}`);
+      yield* secondFactor({ session: who.s, body, purpose: `approve:${id}` });
 
       if (yield* store.getVersion(row.package, row.version)) return fail(409, `${row.package}@${row.version} already exists. Versions are immutable; bump the version.`);
       const perm = yield* publishRefusal(row.package, row.staged_by);

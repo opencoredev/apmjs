@@ -52,7 +52,7 @@ The layers live for one request. `Store` opens one Postgres connection through H
 
 The schema is SQL in `packages/registry/migrations`, applied in order by `scripts/migrate.ts` and recorded in `apm_migrations`. Times are milliseconds in `bigint` columns; manifests, scores and dist-tags are `jsonb`. Better Auth's tables come from its own generator (`0002_better_auth.sql`).
 
-Publishing is one transaction that creates or locks the package row, rechecks ownership, inserts the version (the primary key decides a race: the loser gets 409 and its blob is dropped when nothing else uses it), moves dist-tags and logs the event. Approving a staged version decides the staged row and commits the version in the same transaction.
+Publishing is one transaction that creates or locks the package row, rechecks ownership, inserts the version (the primary key decides a race: the loser gets 409 and its blob is dropped when nothing else uses it), moves dist-tags and logs the event. Approving a staged version decides the staged row and commits the version in the same transaction. A staged upload is inserted in one transaction that takes an advisory lock, rechecks that nothing waits for the same name@version and that the per-account and per-package quotas still allow it; the byte quota counts the tarball plus the manifest, readme and score the row keeps. A rejected or expired upload keeps only its audit fields. Wrong passwords are counted with one upsert before the hash check, so concurrent guesses all count. Per-user answers get `Cache-Control: private, no-store` and `Vary: Authorization, Cookie` in `worker.ts`, whichever route made them.
 
 ### Version states
 
@@ -80,13 +80,36 @@ Better Auth handles OAuth, sessions, TOTP enrolment, passkeys and the device flo
 
 The website is Next.js 16 with shadcn, built by OpenNext through Alchemy's `Website.Nextjs`. `proxy.ts` forwards `/api/auth/*` and `/-/apm/v1/*` to the registry so the session cookie lives on the website's origin, and server components read the registry for package pages and search. Both go through `lib/registry-transport.ts`: inside the Worker that is the `REGISTRY` service binding, because Workers on one account can't fetch each other's public URLs and a binding skips the network hop; under `next dev` it is plain HTTP to `APM_REGISTRY`.
 
+## How `apm add` makes the package manager install what apm checked
+
+`apm add` asks the registry to resolve and score a package, then runs your package manager (bun, npm, pnpm or yarn) to install the exact version. The check only means something if the package manager then installs the same bytes from the same registry, for the package and for everything under it. Two things can break that:
+
+- A config file sends a scope to another registry. A project `.npmrc` line like `@someone:registry=https://elsewhere/` applies to every package in that scope, including dependencies several levels down.
+- A lockfile pins a package to another registry's tarball. bun, npm and pnpm reuse a locked `resolved` URL and integrity even when told a different registry, so a committed lockfile can bring in bytes apm never saw.
+
+`apm add` closes both, in this order:
+
+1. **Bind every scope in the tree.** The resolve answer lists every package the registry walked under the added ones (`tree.packages`). apm pins each scope among them, plus the added packages' own scopes, to the checked registry: `--registry` and `--@scope:registry` flags for npm and pnpm, and the matching `npm_config_*`/`BUN_CONFIG_REGISTRY` variables in the child environment. If an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere, apm refuses before it installs anything.
+2. **Check the added packages' existing lockfile entries.** An entry for an added name@version whose integrity differs from what the checked registry serves is refused before anything is fetched.
+3. **Install with scripts held back.** bun, npm and pnpm run with `--ignore-scripts`, so no `preinstall`, `install` or `postinstall` script runs yet.
+4. **Verify every installed node.** apm reads the lockfile the install wrote (`bun.lock`, `package-lock.json` or `pnpm-lock.yaml`, or npm's and pnpm's copy in `node_modules` when the project lockfile is off), walks it from the added packages to every package under them, and compares each node's integrity with the one the checked registry serves for that name@version. Git, file and link dependencies are not on a registry; the resolve step already lists them as not checked.
+5. **Then run the scripts, or undo the install.** If every node matches, apm runs the held-back scripts: `npm rebuild <packages with install scripts>`, `pnpm rebuild --pending`, and for bun, which only runs scripts while installing a package, it removes those packages' directories and runs `bun install --frozen-lockfile` from the verified lockfile. Each package manager's own script policy still applies (bun's `trustedDependencies`, pnpm's `onlyBuiltDependencies`). If any node does not match, apm puts `package.json` and the lockfile back, removes the unverified packages from `node_modules`, names each one, and exits non-zero. Their scripts never ran.
+
+If apm cannot read the lockfile after the install, it refuses and does not run the scripts.
+
+Limits:
+
+- yarn gets steps 1 and 2 only. apm does not read `yarn.lock`, so yarn installs run their scripts as usual.
+- `apm x` (bunx, npx, pnpm dlx) gets step 1 only. Those tools install into their own cache with no project lockfile to verify.
+- The tree walk stops after 300 packages; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it.
+
 ## Tests
 
-The acceptance suite (`tests/acceptance`, 220 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
+The acceptance suite (`tests/acceptance`, 258 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:
 
-- `packages/registry/scripts/build.ts` bundles the Worker with rolldown and the Cloudflare plugin set Alchemy uses. The deploy uploads `dist/worker.js` as built (`bundle: false`); the suite runs `dist/worker-test.js`, which imports that entry and adds three test controls.
+- `packages/registry/scripts/build.ts` bundles the Worker with rolldown and the Cloudflare plugin set Alchemy uses. The deploy uploads `dist/worker.js` as built (`bundle: false`); the suite runs `dist/worker-test.js`, which imports that entry and adds test-only controls.
 - Miniflare runs the bundle in workerd with R2, the analysis queue and its consumer, and Hyperdrive simulated locally. Hyperdrive points at a real Postgres 18 cluster the suite starts with `initdb` (`tests/acceptance/postgres.ts`), or at `APM_TEST_DATABASE_URL`. Each registry gets a copy of one migrated template database.
-- A small proxy in front of Miniflare stamps the test's clocks on every request (`x-apm-test-now`, `x-apm-test-totp-now`), so tests keep moving time with `clock += DAY` while stock clients make the requests. The test entry honours those headers, `/__test/mint` and `/__test/blobs` only for callers holding a per-run secret that the deployed Worker never has.
+- A small proxy in front of Miniflare stamps the test's clocks on every request (`x-apm-test-now`, `x-apm-test-totp-now`), so tests keep moving time with `clock += DAY` while stock clients make the requests. The test entry honours those headers, `/__test/mint`, `/__test/blobs` and `/__test/sweep` (the cron's sweep at the test clock) only for callers holding a per-run secret that the deployed Worker never has.
 
 Why not PGlite: Miniflare's Hyperdrive simulation connects over TCP, so PGlite would need its socket server, which serves one connection at a time, while a request here can hold two (the store and Better Auth) and the queue consumer runs in parallel. PGlite is also not Postgres 18. This machine has Postgres 18 installed, CI installs it from PGDG, and Neon runs 18, so the suite tests the same SQL that production runs. Why not `wrangler dev`: Miniflare's API starts in well under a second per registry, takes bindings as plain options and needs no config file per test.
 

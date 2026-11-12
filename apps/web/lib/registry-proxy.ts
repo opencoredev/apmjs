@@ -13,8 +13,13 @@ export function isRegistryPath(pathname: string): boolean {
 // What the old rewrite allowed: long enough for a slow OAuth exchange, short enough to free the socket.
 const FORWARD_TIMEOUT_MS = 30_000;
 
-// Per-hop headers, and ones fetch() has already applied (the body arrives decoded and re-framed).
-const HOP_BY_HOP = ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authenticate", "proxy-authorization", "content-encoding", "content-length"];
+// Per-hop headers: they describe one connection, never the message.
+const HOP_BY_HOP = ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authenticate", "proxy-authorization"];
+
+// The request body is streamed on as the browser sent it, so its content-encoding stays true; only its
+// framing changes. fetch() decodes a response body, so the response loses its encoding and length.
+const REQUEST_DROP = [...HOP_BY_HOP, "content-length"];
+const RESPONSE_DROP = [...HOP_BY_HOP, "content-encoding", "content-length"];
 
 export type ForwardOptions = {
   registry: string;
@@ -36,7 +41,7 @@ export async function forwardToRegistry(request: Request, opts: ForwardOptions):
 
   const headers = new Headers(opts.headers);
 
-  for (const name of HOP_BY_HOP) headers.delete(name);
+  for (const name of REQUEST_DROP) headers.delete(name);
   // As the old rewrite did: the browser's Host goes on as X-Forwarded-Host, and X-Forwarded-Proto and
   // -Port stay as Next.js set them. The registry's configured public URL still decides its own links.
   headers.set("x-forwarded-host", opts.headers.get("host") ?? url.host);
@@ -62,7 +67,7 @@ export async function forwardToRegistry(request: Request, opts: ForwardOptions):
 
   const out = new Headers(upstream.headers);
 
-  for (const name of HOP_BY_HOP) out.delete(name);
+  for (const name of RESPONSE_DROP) out.delete(name);
 
   return withSiteHeaders(new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out }), opts.dev);
 }

@@ -22,6 +22,37 @@ export function fail(status: number, error: string, extra: ErrorExtra = {}): Res
   return json({ error, ...extra }, status);
 }
 
+// Answers that belong to whoever asked: the account, sessions, staged versions, tokens, step-ups and login.
+const PER_USER_PATHS = ["/api/auth/", "/-/whoami", "/-/user/", "/-/npm/v1/", "/-/apm/v1/account", "/-/apm/v1/staged", "/-/apm/v1/verify", "/-/apm/v1/login/", "/-/apm/v1/review"];
+
+/**
+ * Marks per-user answers `Cache-Control: private, no-store` and `Vary: Authorization, Cookie`, so no shared
+ * cache keeps one: every answer on a per-user path, and any other /-/ answer to a request that carried
+ * credentials. Packuments and tarballs are the same for everyone and keep their own caching.
+ */
+export function withPrivacyHeaders(req: Request, res: Response): Response {
+  const path = new URL(req.url).pathname;
+  const credentialed = req.headers.has("authorization") || req.headers.has("cookie");
+
+  if (!PER_USER_PATHS.some((p) => path.startsWith(p)) && !(credentialed && path.startsWith("/-/"))) return res;
+  // some answers (redirects, fetched responses) have immutable headers, so the answer is rebuilt around a copy
+  const headers = new Headers(res.headers);
+
+  const vary = new Set(
+    (headers.get("vary") ?? "")
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => v !== ""),
+  );
+
+  vary.add("Authorization");
+  vary.add("Cookie");
+  headers.set("cache-control", "private, no-store");
+  headers.set("vary", [...vary].join(", "));
+
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 export function failureResponse(f: HttpFailure): Response {
   return fail(f.status, f.error, f.extra ?? {});
 }

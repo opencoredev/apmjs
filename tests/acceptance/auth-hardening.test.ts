@@ -323,7 +323,7 @@ describe("TOTP attempt budget", () => {
     expect(statuses.filter((s) => s === 401).length, statuses.join(",")).toBeLessThanOrEqual(5);
     expect(statuses.filter((s) => s === 429).length, statuses.join(",")).toBeGreaterThanOrEqual(15);
     // the website shares the budget: even a valid code is refused while locked
-    const web = await a.b.json("-/apm/v1/verify", { method: "POST", body: { code: totp(a.secret), command: { kind: "incident" } } });
+    const web = await a.b.json("-/apm/v1/verify", { method: "POST", body: { code: totp(a.secret), command: { kind: "incident", since: new Date(Date.now() - 3_600_000).toISOString(), dryRun: false } } });
     expect(web.status).toBe(429);
   });
 });

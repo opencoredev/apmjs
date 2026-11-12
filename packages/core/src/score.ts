@@ -4,7 +4,8 @@
 // What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
-import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, type SkippedFile } from "./limits.ts";
+import { entryPoints } from "./entries.ts";
+import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook } from "./scripts.ts";
 import { importsOf, joinStrings, scanText, type TextFinding } from "./source.ts";
@@ -53,7 +54,7 @@ const FactsSchema = z.object({
   dependencyCount: z.number(),
 });
 
-const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(["too-large", "over-budget"]) });
+const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(SKIP_REASONS) });
 
 /** What a static read of the tarball cannot see. Shown with every score; docs/SCORE.md explains each. */
 export const NOT_CHECKED: readonly string[] = [
@@ -262,19 +263,11 @@ export function scriptTargets(cmd: string): string[] {
   return out;
 }
 
-function stringsIn(v: unknown, out: string[]): void {
-  if (typeof v === "string") out.push(v);
-  else if (Array.isArray(v)) for (const x of v) stringsIn(x, out);
-  else if (isRecord(v)) for (const x of Object.values(v)) stringsIn(x, out);
-}
-
-/** Entry points, most direct first: bin, then main, module, browser and exports. */
+/** Entry points, most direct first, from the same collector the publish check uses. */
 function declaredEntries(manifest: Record<string, unknown>): string[] {
-  const out: string[] = [];
-
-  for (const k of ["bin", "main", "module", "browser", "exports"] as const) stringsIn(manifest[k], out);
-
-  return out.filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
+  return entryPoints(manifest)
+    .map((e) => e.path)
+    .filter((p) => p.startsWith(".") || /^[\w@]/.test(p));
 }
 
 function dirOf(p: string): string {

@@ -10,7 +10,7 @@ import type { Analysis } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig, type NamePolicy } from "./config.ts";
-import { Store, type PackageRecord, type StoredScope, type VersionRecord } from "./db.ts";
+import { Store, type PackageRecord, type StagedLoad, type StoredScope, type VersionRecord } from "./db.ts";
 import { refuse, type BlobError, type HttpFailure, type InfraError, type StoreError } from "./errors.ts";
 import { randomId, sha1Hex, sha256Hex, sha512, tarballKey } from "./hash.ts";
 import { notify } from "./hooks.ts";
@@ -45,6 +45,10 @@ export const MAX_STAGED_BYTES_PER_USER = 256 * 1024 * 1024;
 
 /** Versions of one package that may wait for approval at once. */
 export const MAX_STAGED_PER_PACKAGE = 5;
+
+/** The most readme and manifest text one version may store (npm's own readme cap is far lower in practice). */
+export const MAX_README_BYTES = 1024 * 1024;
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 // ---------- names ----------
 const NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
@@ -360,9 +364,14 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     if (perm) return fail(perm.status, perm.error);
 
     if (!body._attachments || Object.keys(body._attachments).length === 0) {
-      const denied = yield* liveChangeRefusal({ user: user.user, scope: user.scope, action: { kind: "deprecate", name }, otp: npmOtp(req) });
+      // the versions and messages that would change are what a second factor authorizes; no change needs none
+      const [first, ...rest] = yield* deprecationChanges(name, body);
 
-      if (denied) return otpFail(denied);
+      if (first) {
+        const denied = yield* liveChangeRefusal({ user: user.user, scope: user.scope, action: { kind: "deprecate", name, changes: [first, ...rest] }, otp: npmOtp(req) });
+
+        if (denied) return otpFail(denied);
+      }
 
       return yield* handleMetadataUpdate(name, body, user.user);
     }
@@ -391,6 +400,12 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     if (existing && (yield* store.getVersion(name, version))) {
       return fail(409, `Cannot publish over existing version ${name}@${version}. Versions are immutable; bump the version.`);
     }
+
+    const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
+
+    if (readme !== null && utf8Bytes(readme) > MAX_README_BYTES) return fail(413, `The readme is over ${MAX_README_BYTES / (1024 * 1024)} MB. Shorten it or link to longer docs.`);
+
+    if (utf8Bytes(JSON.stringify(manifest)) > MAX_MANIFEST_BYTES) return fail(413, `package.json is over ${MAX_MANIFEST_BYTES / (1024 * 1024)} MB.`);
 
     const staged = TOKEN_CAPABILITIES[user.scope].publish === "staged";
 
@@ -426,7 +441,6 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
 
     for (const k of ["_id", "dist", "_npmUser", "_attachments", "readme", "_resolved", "_integrity", "_from"]) delete cleanManifest[k];
     const tag = Object.keys(body["dist-tags"])[0] ?? "latest";
-    const readme = body.readme ?? (typeof manifest.readme === "string" ? manifest.readme : null);
     const shasum = sha1Hex(tarball);
     const digest = sha512(tarball);
     const key = tarballKey(digest.hex);
@@ -435,22 +449,36 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     if (staged) {
       const at = yield* clock.now;
       const id = randomId(12);
-      yield* store.insertStaged({
-        id,
-        package: name,
-        version,
-        manifest: cleanManifest,
-        shasum,
-        integrity: digest.integrity,
-        size: tarball.length,
-        tarball_key: key,
-        tag,
-        readme,
-        score,
-        staged_by: user.user,
-        staged_at: at,
-        expires_at: at + STAGE_TTL_MS,
-      });
+      // the checks above ran before the analysis; these run again atomically with the insert
+
+      const stored = yield* store.insertStagedWithin(
+        {
+          id,
+          package: name,
+          version,
+          manifest: cleanManifest,
+          shasum,
+          integrity: digest.integrity,
+          size: tarball.length,
+          tarball_key: key,
+          tag,
+          readme,
+          score,
+          staged_by: user.user,
+          staged_at: at,
+          expires_at: at + STAGE_TTL_MS,
+        },
+        { perUser: MAX_STAGED_PER_USER, perPackage: MAX_STAGED_PER_PACKAGE, bytesPerUser: MAX_STAGED_BYTES_PER_USER },
+      );
+
+      if (stored.kind !== "staged") {
+        yield* dropBlobIfUnused(key);
+
+        return stored.kind === "duplicate"
+          ? fail(409, `${name}@${version} is already waiting for approval: ${yield* approvalUrl(stored.id)}`)
+          : fail(429, yield* quotaMessage({ name, quota: stored.quota, load: stored.load }));
+      }
+
       const link = yield* approvalUrl(id);
       const expiresAt = new Date(at + STAGE_TTL_MS).toISOString();
       // bun prints this header as "note: ...", npm as "npm notice ...": that is how the link reaches a person.
@@ -480,20 +508,42 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     return json({ ok: true, id: name, rev: `${yield* clock.now}`, success: true, score, warnings }, 201, warningText ? { "npm-notice": warningText } : {});
   });
 
-/** Why one more staged upload of `size` bytes would go over a quota, or null. */
+/** Why one more staged upload of `size` tarball bytes would go over a quota, or null. A fast check before the analysis. */
 const stageQuotaRefusal = (input: { user: string; name: string; size: number }) =>
   Effect.gen(function* () {
     const load = yield* (yield* Store).pendingStagedLoad({ user: input.user, name: input.name, now: yield* (yield* Clock).now });
-    const where = `Approve or reject them at ${(yield* RegistryConfig).webUrl}publish, or wait for them to expire (24h).`;
 
-    if (load.byPackage >= MAX_STAGED_PER_PACKAGE) return `${input.name} already has ${load.byPackage} versions waiting for approval, the most one package may have. ${where}`;
+    if (load.byPackage >= MAX_STAGED_PER_PACKAGE) return yield* quotaMessage({ name: input.name, quota: "package", load });
 
-    if (load.byUser >= MAX_STAGED_PER_USER) return `You already have ${load.byUser} versions waiting for approval, the most one account may have. ${where}`;
+    if (load.byUser >= MAX_STAGED_PER_USER) return yield* quotaMessage({ name: input.name, quota: "user", load });
 
-    if (load.bytesByUser + input.size > MAX_STAGED_BYTES_PER_USER) return `Your versions waiting for approval would take more than ${MAX_STAGED_BYTES_PER_USER / (1024 * 1024)} MB. ${where}`;
+    if (load.bytesByUser + input.size > MAX_STAGED_BYTES_PER_USER) return yield* quotaMessage({ name: input.name, quota: "bytes", load });
 
     return null;
   });
+
+const quotaMessage = (input: { name: string; quota: "package" | "user" | "bytes"; load: StagedLoad }): Effect.Effect<string, never, RegistryConfig> =>
+  Effect.map(RegistryConfig, (config) => {
+    const where = `Approve or reject them at ${config.webUrl}publish, or wait for them to expire (24h).`;
+
+    switch (input.quota) {
+      case "package":
+        return `${input.name} already has ${input.load.byPackage} versions waiting for approval, the most one package may have. ${where}`;
+      case "user":
+        return `You already have ${input.load.byUser} versions waiting for approval, the most one account may have. ${where}`;
+      case "bytes":
+        return `Your versions waiting for approval would take more than ${MAX_STAGED_BYTES_PER_USER / (1024 * 1024)} MB. ${where}`;
+      default: {
+        const _exhaustive: never = input.quota;
+
+        return _exhaustive;
+      }
+    }
+  });
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
 
 /** Drops a tarball from the blob store once nothing points at it any more. */
 export const dropBlobIfUnused = (key: string): Effect.Effect<void, StoreError | BlobError, Store | Blobs> =>
@@ -523,6 +573,7 @@ export const commitVersion = (v: {
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* (yield* Clock).now;
+
     const firstPublish = yield* store.tx(
       Effect.gen(function* () {
         const created = yield* store.createPackage(v.name, at, v.publisher);
@@ -573,7 +624,31 @@ export const commitVersion = (v: {
         return created;
       }),
     );
+
     yield* notify((h) => h.afterCommit, { name: v.name, version: v.version, firstPublish });
+  });
+
+/** The deprecation message a metadata PUT sets on a version: a non-empty string, or null to take it off. */
+function deprecationOf(manifest: { readonly deprecated?: unknown }): string | null {
+  const dep = z.string().min(1).safeParse(manifest.deprecated);
+
+  return dep.success ? dep.data : null;
+}
+
+/** What a metadata PUT (npm deprecate) would change: each existing version whose message differs. */
+const deprecationChanges = (name: string, body: PublishBody) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const changes: { version: string; message: string | null }[] = [];
+
+    for (const [version, manifest] of Object.entries(body.versions)) {
+      const v = yield* store.getVersion(name, version);
+      const next = deprecationOf(manifest);
+
+      if (v && next !== v.deprecated) changes.push({ version, message: next });
+    }
+
+    return changes;
   });
 
 const handleMetadataUpdate = (name: string, body: PublishBody, user: string) =>
@@ -591,6 +666,7 @@ const handleMetadataUpdate = (name: string, body: PublishBody, user: string) =>
 
     if (missing.length > 0) return fail(404, `${name} has no version ${missing.join(", ")}. Nothing was changed.`, { missing });
     const at = yield* (yield* Clock).now;
+
     const updated = yield* store.tx(
       Effect.gen(function* () {
         const changed: string[] = [];
@@ -599,8 +675,7 @@ const handleMetadataUpdate = (name: string, body: PublishBody, user: string) =>
           const v = yield* store.getVersion(name, version);
 
           if (!v) continue;
-          const dep = manifest.deprecated;
-          const next = typeof dep === "string" && dep.length > 0 ? dep : null;
+          const next = deprecationOf(manifest);
 
           if (next !== v.deprecated) {
             yield* store.setDeprecated(name, version, next);

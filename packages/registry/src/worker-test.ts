@@ -1,8 +1,8 @@
-// The acceptance suite's entry: the production Worker plus two test-only controls, never deployed.
+// The acceptance suite's entry: the production Worker plus test-only controls, never deployed.
 // x-apm-test-now sets the registry clock for one request and x-apm-test-totp-now the wall clock authenticator
 // codes are checked against; POST /__test/mint issues a token without a login flow.
 // /__test/blobs lists the blob store's keys (GET) and overwrites one (PUT /__test/blobs/<key>), so tests can
-// tamper with stored bytes. All of it answers only to a caller holding TEST_CONTROL_SECRET, a binding the
+// tamper with stored bytes. POST /__test/sweep runs the cron's sweep at the test clock. All of it answers only to a caller holding TEST_CONTROL_SECRET, a binding the
 // deployed Worker does not have.
 import { Effect } from "effect";
 import { z } from "zod";
@@ -10,7 +10,7 @@ import { Clock } from "./clock.ts";
 import { Store } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
-import worker, { handle, parseEnv, servicesFor, type RawEnv } from "./worker.ts";
+import worker, { handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
 
 /** A positive millisecond time from a test header, or null. */
 function timeHeader(req: Request, name: string): number | null {
@@ -93,6 +93,8 @@ export default {
     if (path === "/__test/mint") return trusted ? mint(req, env, clock) : fail(404, "Not found");
 
     if (path === "/__test/blobs" || path.startsWith("/__test/blobs/")) return trusted ? blobControl(req, env, path) : fail(404, "Not found");
+
+    if (path === "/__test/sweep") return trusted && req.method === "POST" ? sweep(env, clock).then(() => json({ ok: true })) : fail(404, "Not found");
 
     if (!trusted) return handle(req, env, clock, ctx);
     const headers = new Headers(req.headers);

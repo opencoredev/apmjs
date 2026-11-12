@@ -8,7 +8,7 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
-import { Auth } from "./auth.ts";
+import { Auth, type SignedIn } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { Store, type User, type VersionRecord } from "./db.ts";
@@ -17,6 +17,7 @@ import { randomId } from "./hash.ts";
 import { fail, json, parseBody } from "./http.ts";
 import { order } from "./semver.ts";
 import { splitPath, tarballUrl, type Caller } from "./server.ts";
+import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 
 export type ReviewSettings = {
@@ -448,7 +449,11 @@ export const considerUpstream = (pkg: UpstreamPackage) =>
   });
 
 // ---------- viewers ----------
-type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: "token" | "session" };
+/** Who is asking. A website session carries its sign-in, which review decisions check a fresh factor against. */
+type Viewer = { kind: "anon" } | { kind: "user"; user: User; githubLogin: string | null; via: { kind: "token" } | { kind: "session"; session: SignedIn } };
+
+/** A viewer signed in on the website. */
+type SessionViewer = Extract<Viewer, { kind: "user" }> & { via: { kind: "session"; session: SignedIn } };
 
 const viewerOf = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
@@ -457,7 +462,7 @@ const viewerOf = (req: Request, caller: Caller) =>
     if (caller.kind === "user") {
       const user = yield* store.getUser(caller.user);
 
-      return user ? ({ kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: "token" } satisfies Viewer) : ({ kind: "anon" } satisfies Viewer);
+      return user ? ({ kind: "user", user, githubLogin: user.github_login?.toLowerCase() ?? null, via: { kind: "token" } } satisfies Viewer) : ({ kind: "anon" } satisfies Viewer);
     }
 
     const auth = yield* Auth;
@@ -469,15 +474,19 @@ const viewerOf = (req: Request, caller: Caller) =>
     if (!user) return { kind: "anon" } satisfies Viewer;
     const login = yield* auth.gitHubNameOf(s.authUserId);
 
-    return { kind: "user", user, githubLogin: login?.toLowerCase() ?? null, via: "session" } satisfies Viewer;
+    return { kind: "user", user, githubLogin: login?.toLowerCase() ?? null, via: { kind: "session", session: s } } satisfies Viewer;
   });
 
 function adminsOf(settings: ReviewSettings): ReadonlySet<string> {
   return new Set(settings.admins.map((a) => a.trim().toLowerCase()).filter((a) => a !== ""));
 }
 
-function isAdmin(v: Viewer, settings: ReviewSettings): boolean {
-  return v.kind === "user" && v.githubLogin !== null && adminsOf(settings).has(v.githubLogin);
+/**
+ * One of apm's reviewers, signed in on the website. A token never counts, not even the reviewer's own:
+ * a stolen `apm login` or CI token must not read the private queue or clear a flag.
+ */
+function isAdmin(v: Viewer, settings: ReviewSettings): v is SessionViewer {
+  return v.kind === "user" && v.via.kind === "session" && v.githubLogin !== null && adminsOf(settings).has(v.githubLogin);
 }
 
 const isMaintainer = (v: Viewer, name: string) =>
@@ -488,7 +497,7 @@ const checkOrigin = (req: Request, v: Viewer) =>
   Effect.gen(function* () {
     const origin = req.headers.get("origin");
 
-    if (v.kind !== "user" || v.via !== "session" || origin === null) return;
+    if (v.kind !== "user" || v.via.kind !== "session" || origin === null) return;
     const { webUrl, baseUrl } = yield* RegistryConfig;
     const allowed = new Set([new URL(webUrl).origin, new URL(baseUrl).origin]);
 
@@ -756,6 +765,7 @@ const DecideBody = z.object({
   digest: z.string().min(1).max(200),
   decision: z.enum(["confirm", "dismiss"]),
   note: z.string().max(2000).default(""),
+  ...ProofFields,
 });
 
 const queueResponse = Effect.gen(function* () {
@@ -791,9 +801,11 @@ const queueResponse = Effect.gen(function* () {
   );
 });
 
-const decideResponse = (req: Request, viewer: Extract<Viewer, { kind: "user" }>) =>
+const decideResponse = (req: Request, viewer: SessionViewer) =>
   Effect.gen(function* () {
     const d = yield* parseBody(req, DecideBody, MAX_REVIEW_BODY_BYTES);
+    // a decision changes what the public sees: a fresh code or passkey check for exactly this one
+    yield* secondFactor({ session: viewer.via.session, body: d, purpose: `review:${JSON.stringify([d.name, d.version, d.digest, d.decision])}` });
     const r = yield* reviewFor(d.name, d.version, d.digest);
 
     if (!r) return fail(404, "No such review.");
@@ -845,7 +857,12 @@ export const reviewRoute = (
 
       if (viewer.kind !== "user") return fail(401, "Sign in first.");
 
-      if (!isAdmin(viewer, settings)) return fail(403, "Only apm's reviewers can see this queue.");
+      if (!isAdmin(viewer, settings)) {
+        return fail(
+          403,
+          viewer.via.kind === "token" ? "The review queue is on the website only: sign in there. Tokens cannot read it or decide." : "Only apm's reviewers can see this queue.",
+        );
+      }
 
       if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return yield* queueResponse;
 

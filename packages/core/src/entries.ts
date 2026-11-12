@@ -1,37 +1,122 @@
-// Entry points declared in package.json that must exist in the tarball.
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+// Entry points package.json declares. One collector for both users: the publish check (each must exist in
+// the tarball) and the scorer (what runs is read first), so the two lists cannot drift apart.
+import { z } from "zod";
 
 function stripDot(p: string): string {
   return p.replace(/^\.\//, "").replace(/^\//, "");
 }
 
-export function entryPaths(manifest: Record<string, unknown>): { field: string; path: string }[] {
-  const out: { field: string; path: string }[] = [];
+/** A path package.json names, and the field it came from (`exports["."].import`, `bin.cli`). */
+export type EntryPoint = { field: string; path: string };
 
-  if (typeof manifest.main === "string") out.push({ field: "main", path: manifest.main });
+/** An `exports` value read into what matters here: a path, fallbacks, or subpaths and conditions. */
+type ExportsTree = { kind: "path"; path: string } | { kind: "list"; items: ExportsTree[] } | { kind: "map"; entries: [string, ExportsTree][] } | { kind: "none" };
 
-  if (typeof manifest.types === "string") out.push({ field: "types", path: manifest.types });
+const ExportsTree: z.ZodType<ExportsTree> = z.lazy(() =>
+  z.union([
+    z.string().transform((path): ExportsTree => ({ kind: "path", path })),
+    z.array(ExportsTree).transform((items): ExportsTree => ({ kind: "list", items })),
+    z.record(z.string(), ExportsTree).transform((o): ExportsTree => ({ kind: "map", entries: Object.entries(o) })),
+    // null blocks a subpath; anything else is not a target
+    z.unknown().transform((): ExportsTree => ({ kind: "none" })),
+  ]),
+);
 
-  if (typeof manifest.typings === "string") out.push({ field: "typings", path: manifest.typings });
+/** A field that is a path, or a map of names to paths (bin, browser). Values that are not paths are dropped. */
+const PathOrMap = z
+  .union([z.string().transform((path) => ({ kind: "path" as const, path })), z.record(z.string(), z.unknown()).transform((o) => ({ kind: "map" as const, o }))])
+  .optional()
+  .catch(undefined);
 
-  if (typeof manifest.bin === "string") out.push({ field: "bin", path: manifest.bin });
+const OptionalPath = z.string().optional().catch(undefined);
 
-  if (isRecord(manifest.bin)) for (const [k, v] of Object.entries(manifest.bin)) if (typeof v === "string") out.push({ field: `bin.${k}`, path: v });
+const Fields = z.object({
+  bin: PathOrMap,
+  main: OptionalPath,
+  module: OptionalPath,
+  browser: PathOrMap,
+  exports: ExportsTree.optional(),
+  types: OptionalPath,
+  typings: OptionalPath,
+});
+
+function exportTargets(tree: ExportsTree, field: string, out: EntryPoint[]): void {
+  switch (tree.kind) {
+    case "path":
+      out.push({ field, path: tree.path });
+
+      return;
+    case "list":
+      tree.items.forEach((x, i) => exportTargets(x, `${field}[${i}]`, out));
+
+      return;
+    case "map":
+      for (const [k, x] of tree.entries) exportTargets(x, `${field}[${JSON.stringify(k)}]`, out);
+
+      return;
+    case "none":
+      return;
+    default: {
+      const _exhaustive: never = tree;
+
+      return _exhaustive;
+    }
+  }
+}
+
+function pathsIn(field: string, v: z.infer<typeof PathOrMap>, keyed: (k: string) => string): EntryPoint[] {
+  if (v === undefined) return [];
+
+  if (v.kind === "path") return [{ field, path: v.path }];
+
+  return Object.entries(v.o).flatMap(([k, x]) => {
+    const p = z.string().safeParse(x);
+
+    return p.success ? [{ field: keyed(k), path: p.data }] : [];
+  });
+}
+
+/**
+ * Every entry point, most direct first: bin, main, module, browser, exports (every subpath and condition),
+ * then types and typings. `browser` may map paths to other paths or to false; its string values are listed.
+ */
+export function entryPoints(manifest: Record<string, unknown>): EntryPoint[] {
+  const m = Fields.parse(manifest);
+  const out: EntryPoint[] = [...pathsIn("bin", m.bin, (k) => `bin.${k}`)];
+
+  for (const [field, path] of [["main", m.main], ["module", m.module]] as const) if (path !== undefined) out.push({ field, path });
+
+  out.push(...pathsIn("browser", m.browser, (k) => `browser[${JSON.stringify(k)}]`));
+
+  if (m.exports) exportTargets(m.exports, "exports", out);
+
+  for (const [field, path] of [["types", m.types], ["typings", m.typings]] as const) if (path !== undefined) out.push({ field, path });
 
   return out;
 }
 
+/**
+ * Entries that must name a file in the tarball. Not checked: `browser` (a bundler's remapping, which may
+ * name other packages), subpath patterns with `*`, folder mappings ending in "/", and exports targets that
+ * do not start with "./" (node rejects those itself).
+ */
+function mustExist(e: EntryPoint): boolean {
+  if (e.field.startsWith("browser") || e.path.includes("*") || e.path.endsWith("/")) return false;
+
+  return !e.field.startsWith("exports") || e.path.startsWith("./");
+}
+
 /** Entries whose target is not among `files` (node's extension and index lookup applied). */
-export function missingEntries(manifest: Record<string, unknown>, files: readonly { path: string }[]): { field: string; path: string }[] {
+export function missingEntries(manifest: Record<string, unknown>, files: readonly { path: string }[]): EntryPoint[] {
   const have = new Set(files.map((f) => f.path));
 
-  return entryPaths(manifest).filter(({ path }) => {
-    const p = stripDot(path);
+  return entryPoints(manifest)
+    .filter(mustExist)
+    .filter(({ path }) => {
+      const p = stripDot(path);
 
-    if (have.has(p)) return false;
+      if (have.has(p)) return false;
 
-    return ![".js", ".json", ".node", "/index.js", "/index.json"].some((ext) => have.has(p + ext));
-  });
+      return ![".js", ".json", ".node", "/index.js", "/index.json"].some((ext) => have.has(p + ext));
+    });
 }

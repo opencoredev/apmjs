@@ -13,7 +13,7 @@ import { silentLogger } from "../../apps/reviewer/src/log.ts";
 import { modelClient } from "../../apps/reviewer/src/model.ts";
 import { registryClient } from "../../apps/reviewer/src/registry.ts";
 import { runOnce, type WorkerDeps } from "../../apps/reviewer/src/worker.ts";
-import { dig, getJson, startRegistry, type Registry } from "./harness";
+import { deviceLogin, dig, enableTotp, getJson, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
 
 // ---------- a tar writer ----------
 type TarFile = { path: string; data: string };
@@ -228,7 +228,13 @@ let stateDir: string;
 let clock = Date.parse("2026-11-12T10:00:00Z");
 let alice: string;
 let bob: string;
-let admin: string;
+let gh: FakeGitHub;
+
+// apm's reviewer: a website session with an authenticator app, and the same person's CLI tokens
+let adminBrowser: Browser;
+let adminSecret: string;
+let adminStageToken: string;
+let adminPublishToken: string;
 
 function reviewer(over: Partial<WorkerDeps> = {}): WorkerDeps {
   return {
@@ -273,23 +279,28 @@ beforeAll(async () => {
   ]);
   npm.downloads.set("popular-lib", 50_000);
   npm.downloads.set("quiet-lib", 3);
+  gh = startFakeGitHub();
   reg = await startRegistry({
     now: () => clock,
+    github: gh,
     upstream: npm.url,
     upstreamTtlMs: 1,
     review: { serviceTokenHash: sha256(SERVICE_TOKEN), admins: ["octo-admin"], downloadsUrl: `${npm.url}downloads/point/last-week/`, requestsPerHour: 2 },
   });
   alice = await reg.mintToken({ user: "alice", scope: "publish" });
   bob = await reg.mintToken({ user: "bob", scope: "publish" });
-  admin = await reg.mintToken({ user: "octo", scope: "publish" });
-  // admins are named by GitHub login, which sign-in records; set it directly for the test user
-  await reg.query("UPDATE users SET github_login = 'octo-admin' WHERE name = 'octo'");
+  // admins are named by GitHub login, which sign-in records
+  adminBrowser = await signInWithGitHub(reg, gh, "octo-admin");
+  adminSecret = await enableTotp(adminBrowser);
+  adminStageToken = (await deviceLogin(adminBrowser)).token;
+  adminPublishToken = await reg.mintToken({ user: "octo-admin", scope: "publish" });
 });
 
 afterAll(async () => {
   await reg.stop();
   await model.server.stop(true);
   await npm.server.stop(true);
+  await gh.stop();
   rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -362,22 +373,32 @@ describe("AI review", () => {
 
     expect((await getJson(queue)).status).toBe(401);
     expect((await getJson(queue, { headers: { authorization: `Bearer ${bob}` } })).status).toBe(403);
-    const q = await getJson(queue, { headers: { authorization: `Bearer ${admin}` } });
+
+    // the queue and its decisions are for the website: no token of the reviewer's opens them
+    for (const t of [adminStageToken, adminPublishToken]) expect((await getJson(queue, { headers: { authorization: `Bearer ${t}` } })).status).toBe(403);
+    const q = await adminBrowser.json("-/apm/v1/review-admin/queue");
 
     expect(q.status).toBe(200);
     expect(dig(q.body, "pending", 0, "name")).toBe("ai-review-telemetry-demo");
     expect(dig(q.body, "secondStage")).toBeNull();
     const digest = dig(q.body, "pending", 0, "digest");
 
+    const decision = { name: "ai-review-telemetry-demo", version: "1.0.0", digest, decision: "confirm", note: "Checked by hand." };
+
     const decide = (token: string): Promise<{ status: number; body: unknown }> =>
       getJson(`${reg.url}-/apm/v1/review-admin/decide`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({ name: "ai-review-telemetry-demo", version: "1.0.0", digest, decision: "confirm", note: "Checked by hand." }),
+        body: JSON.stringify(decision),
       });
 
     expect((await decide(bob)).status).toBe(403);
-    expect((await decide(admin)).status).toBe(200);
+    expect((await decide(adminStageToken)).status).toBe(403);
+    expect((await decide(adminPublishToken)).status).toBe(403);
+    // a decision needs a fresh code from the reviewer's authenticator app
+    expect((await adminBrowser.json("-/apm/v1/review-admin/decide", { method: "POST", body: decision })).status).toBe(401);
+    expect(dig((await review("ai-review-telemetry-demo", "1.0.0")).body, "review", "state")).toBe("under-review");
+    expect((await adminBrowser.json("-/apm/v1/review-admin/decide", { method: "POST", body: { ...decision, code: totp(adminSecret) } })).status).toBe(200);
     const after = await review("ai-review-telemetry-demo", "1.0.0");
 
     expect(dig(after.body, "review", "state")).toBe("confirmed");

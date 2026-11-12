@@ -134,11 +134,26 @@ export type AuthProfile = { name: string; email: string; image: string | null };
 /** What is waiting for approval: versions and bytes one user staged, and versions waiting for one package. */
 export type StagedLoad = { byUser: number; bytesByUser: number; byPackage: number };
 
+/** Most versions waiting per account and per package, and most bytes (tarballs plus metadata) per account. */
+export type StageLimits = { perUser: number; perPackage: number; bytesPerUser: number };
+
+/** How an atomic staged insert went: stored, already waiting for this name@version, or over a quota. */
+export type StageInsert = { kind: "staged" } | { kind: "duplicate"; id: string } | { kind: "over"; quota: "package" | "user" | "bytes"; load: StagedLoad };
+
+/** One password attempt counted before the hash check, or the account is locked out. */
+export type PasswordAttempt = "reserved" | "locked";
+
+// Serializes staged inserts so two concurrent uploads cannot both pass the quota checks (staged uploads are rare).
+const STAGED_INSERT_LOCK = 0x617_06d_5747;
+
 /** One attempt taken from an account's second-factor budget, or the budget is spent. */
 export type Reservation = { kind: "locked" } | { kind: "reserved"; id: number };
 
 /** Better Auth's TOTP row: the encrypted secret and recovery codes, and whether setup finished. */
 export type TwoFactorRecord = { secret: string; backupCodes: string; verified: boolean };
+
+/** A staged score as the jsonb text the row stores, or null. */
+const scoreJson = ({ score }: Pick<NewStaged, "score">): string | null => (score === null || score === undefined ? null : JSON.stringify(score));
 
 const hashOf = (secret: string): string => createHash("sha256").update(secret).digest("hex");
 
@@ -160,16 +175,30 @@ export type StoreApi = {
   /** Wrong passwords for `user` in the current window: the count and when the window started. */
   readonly passwordFailures: (user: string) => Effect.Effect<{ count: number; since: number } | null, StoreError>;
   readonly setPasswordFailures: (user: string, f: { count: number; since: number } | null) => Effect.Effect<void, StoreError>;
+  /**
+   * Counts one password attempt before it is checked, in one statement: "locked" when the account already has
+   * `max` failures inside the window. Concurrent guesses each take one, so none sees a stale count. A correct
+   * password clears the count afterwards (setPasswordFailures(user, null)).
+   */
+  readonly reservePasswordAttempt: (input: { user: string; now: number; max: number; windowMs: number }) => Effect.Effect<PasswordAttempt, StoreError>;
 
   readonly insertStaged: (s: NewStaged) => Effect.Effect<void, StoreError>;
+  /**
+   * Stores a staged upload only if nothing else waits for the same name@version and the quotas still allow it,
+   * in one transaction serialized with every other staged insert: two concurrent uploads cannot both pass.
+   */
+  readonly insertStagedWithin: (s: NewStaged, limits: StageLimits) => Effect.Effect<StageInsert, StoreError>;
   readonly getStaged: (id: string) => Effect.Effect<StagedRecord | null, StoreError>;
   readonly pendingStaged: (name: string, version: string, now: number) => Effect.Effect<StagedRecord | null, StoreError>;
   readonly pendingFor: (user: string, now: number) => Effect.Effect<StagedRecord[], StoreError>;
-  /** Moves a pending row to a final status; false when it was no longer pending. */
+  /** Moves a pending row to a final status; false when it was no longer pending. A rejected upload keeps only its audit fields. */
   readonly decideStaged: (id: string, d: { status: Exclude<StagedStatus, "pending">; at: number; by: string }) => Effect.Effect<boolean, StoreError>;
-  /** Versions still waiting for approval at `now`: how many and how many bytes `user` staged, and how many wait for `name`. */
+  /**
+   * Versions still waiting for approval at `now`: how many and how many bytes `user` staged, and how many wait
+   * for `name`. Bytes count the tarball and the metadata the row keeps (manifest, readme, score).
+   */
   readonly pendingStagedLoad: (input: { user: string; name: string; now: number }) => Effect.Effect<StagedLoad, StoreError>;
-  /** Marks pending rows past their deadline as expired; returns their tarball keys. */
+  /** Marks pending rows past their deadline as expired and drops their manifest, readme and score; returns their tarball keys. */
   readonly expireStaged: (now: number) => Effect.Effect<{ id: string; tarball_key: string }[], StoreError>;
   /** Whether any version or pending staged row still points at this blob. */
   readonly blobReferenced: (key: string) => Effect.Effect<boolean, StoreError>;
@@ -276,6 +305,7 @@ export class Store extends Context.Service<Store, StoreApi>()("@apm/registry/Sto
         const services = yield* Layer.build(PgClient.layer({ url: Redacted.make(url), maxConnections: 1 })).pipe(
           Effect.mapError((cause) => new StoreError({ operation: "connect", cause })),
         );
+
         const store = yield* make.pipe(Effect.provide(services));
 
         return Context.add(services, Store, store);
@@ -304,6 +334,30 @@ const make = Effect.gen(function* () {
     );
 
   const getPackage = (name: string) => run("getPackage", sql`SELECT * FROM packages WHERE name = ${name}`, one(PackageOut));
+
+  const insertStaged = (s: NewStaged) =>
+    run(
+      "insertStaged",
+      sql`INSERT INTO staged (id, package, version, manifest, shasum, integrity, size, tarball_key, tag, readme, score, staged_by, staged_at, expires_at)
+          VALUES (${s.id}, ${s.package}, ${s.version}, ${JSON.stringify(s.manifest)}::jsonb, ${s.shasum}, ${s.integrity}, ${s.size}, ${s.tarball_key}, ${s.tag},
+                  ${s.readme}, ${scoreJson(s)}::jsonb, ${s.staged_by}, ${s.staged_at}, ${s.expires_at})`,
+      none,
+    );
+
+  // Bytes a staged row holds count the tarball and the metadata kept with it: manifest, readme and score.
+  const pendingStagedLoad = (input: { user: string; name: string; now: number }) =>
+    run(
+      "pendingStagedLoad",
+      sql`SELECT
+            (SELECT count(*) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND staged_by = ${input.user}) AS by_user,
+            (SELECT COALESCE(sum(size + octet_length(manifest::text) + COALESCE(octet_length(readme), 0) + COALESCE(octet_length(score::text), 0)), 0) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND staged_by = ${input.user}) AS bytes_by_user,
+            (SELECT count(*) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND package = ${input.name}) AS by_package`,
+      z.tuple([z.object({ by_user: Int, bytes_by_user: Int.or(z.string().transform(Number)), by_package: Int })]).transform(([row]) => ({
+        byUser: row.by_user,
+        bytesByUser: row.bytes_by_user,
+        byPackage: row.by_package,
+      })),
+    );
 
   const api: StoreApi = {
     tx: (effect) => sql.withTransaction(effect).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "transaction", cause })))),
@@ -342,13 +396,53 @@ const make = Effect.gen(function* () {
             none,
           ),
 
-    insertStaged: (s) =>
+    reservePasswordAttempt: (input) =>
       run(
-        "insertStaged",
-        sql`INSERT INTO staged (id, package, version, manifest, shasum, integrity, size, tarball_key, tag, readme, score, staged_by, staged_at, expires_at)
-            VALUES (${s.id}, ${s.package}, ${s.version}, ${JSON.stringify(s.manifest)}::jsonb, ${s.shasum}, ${s.integrity}, ${s.size}, ${s.tarball_key}, ${s.tag},
-                    ${s.readme}, ${s.score === null || s.score === undefined ? null : JSON.stringify(s.score)}::jsonb, ${s.staged_by}, ${s.staged_at}, ${s.expires_at})`,
-        none,
+        "reservePasswordAttempt",
+        // one upsert under the row lock: a live window at the limit changes nothing and returns no row
+        sql`INSERT INTO password_failures AS f ("user", count, since) VALUES (${input.user}, 1, ${input.now})
+            ON CONFLICT ("user") DO UPDATE SET
+              count = CASE WHEN ${input.now} - f.since < ${input.windowMs} THEN f.count + 1 ELSE 1 END,
+              since = CASE WHEN ${input.now} - f.since < ${input.windowMs} THEN f.since ELSE ${input.now} END
+            WHERE NOT (${input.now} - f.since < ${input.windowMs} AND f.count >= ${input.max})
+            RETURNING count`,
+        changed.transform((reserved): PasswordAttempt => (reserved ? "reserved" : "locked")),
+      ),
+
+    insertStaged: (s) => insertStaged(s),
+    insertStagedWithin: (s, limits) =>
+      api.tx(
+        Effect.gen(function* () {
+          yield* run("insertStagedWithin: lock", sql`SELECT pg_advisory_xact_lock(${STAGED_INSERT_LOCK})`, none);
+          const now = s.staged_at;
+
+          const waiting = yield* run(
+            "insertStagedWithin: pending",
+            sql`SELECT id FROM staged WHERE package = ${s.package} AND version = ${s.version} AND status = 'pending' AND expires_at > ${now} LIMIT 1`,
+            one(z.object({ id: z.string() })),
+          );
+
+          if (waiting) return { kind: "duplicate", id: waiting.id } satisfies StageInsert;
+          const load = yield* pendingStagedLoad({ user: s.staged_by, name: s.package, now });
+
+          if (load.byPackage >= limits.perPackage) return { kind: "over", quota: "package", load } satisfies StageInsert;
+
+          if (load.byUser >= limits.perUser) return { kind: "over", quota: "user", load } satisfies StageInsert;
+          // this upload's bytes, counted by the database the way pendingStagedLoad counts the rows it keeps
+
+          const bytes = yield* run(
+            "insertStagedWithin: bytes",
+            sql`SELECT ${s.size}::bigint + octet_length(${JSON.stringify(s.manifest)}::jsonb::text)
+                  + COALESCE(octet_length(${s.readme}::text), 0)
+                  + COALESCE(octet_length(${scoreJson(s)}::jsonb::text), 0) AS bytes`,
+            z.tuple([z.object({ bytes: Int.or(z.string().transform(Number)) })]).transform(([row]) => row.bytes),
+          );
+
+          if (load.bytesByUser + bytes > limits.bytesPerUser) return { kind: "over", quota: "bytes", load } satisfies StageInsert;
+          yield* insertStaged(s);
+
+          return { kind: "staged" } satisfies StageInsert;
+        }),
       ),
     getStaged: (id) => run("getStaged", sql`SELECT * FROM staged WHERE id = ${id}`, one(StagedRow)),
     pendingStaged: (name, version, now) =>
@@ -369,26 +463,17 @@ const make = Effect.gen(function* () {
     decideStaged: (id, d) =>
       run(
         "decideStaged",
-        sql`UPDATE staged SET status = ${d.status}, decided_at = ${d.at}, decided_by = ${d.by} WHERE id = ${id} AND status = 'pending' RETURNING id`,
+        d.status === "approved"
+          ? sql`UPDATE staged SET status = ${d.status}, decided_at = ${d.at}, decided_by = ${d.by} WHERE id = ${id} AND status = 'pending' RETURNING id`
+          : sql`UPDATE staged SET status = ${d.status}, decided_at = ${d.at}, decided_by = ${d.by}, manifest = '{}'::jsonb, readme = NULL, score = NULL
+                WHERE id = ${id} AND status = 'pending' RETURNING id`,
         changed,
       ),
-    pendingStagedLoad: (input) =>
-      run(
-        "pendingStagedLoad",
-        sql`SELECT
-              (SELECT count(*) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND staged_by = ${input.user}) AS by_user,
-              (SELECT COALESCE(sum(size), 0) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND staged_by = ${input.user}) AS bytes_by_user,
-              (SELECT count(*) FROM staged WHERE status = 'pending' AND expires_at > ${input.now} AND package = ${input.name}) AS by_package`,
-        z.tuple([z.object({ by_user: Int, bytes_by_user: Int.or(z.string().transform(Number)), by_package: Int })]).transform(([row]) => ({
-          byUser: row.by_user,
-          bytesByUser: row.bytes_by_user,
-          byPackage: row.by_package,
-        })),
-      ),
+    pendingStagedLoad: (input) => pendingStagedLoad(input),
     expireStaged: (now) =>
       run(
         "expireStaged",
-        sql`UPDATE staged SET status = 'expired', decided_at = ${now}, decided_by = 'registry'
+        sql`UPDATE staged SET status = 'expired', decided_at = ${now}, decided_by = 'registry', manifest = '{}'::jsonb, readme = NULL, score = NULL
             WHERE status = 'pending' AND expires_at <= ${now} RETURNING id, tarball_key`,
         all(z.object({ id: z.string(), tarball_key: z.string() })),
       ),

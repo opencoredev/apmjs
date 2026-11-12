@@ -32,7 +32,7 @@ import {
   type TarEntry,
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
-import type { LiveAction } from "./actions.ts";
+import { canonicalSince, type LiveAction } from "./actions.ts";
 import { Analysis, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
@@ -326,7 +326,7 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
       } as const;
     }
 
-    const warnings = secrets.skipped.map((f) => `${describeSkip(f)} was too large to scan for secrets; check it yourself.`);
+    const warnings = secrets.skipped.map((f) => `${describeSkip(f)} was not scanned for secrets; check it yourself.`);
 
     const missing = missingEntries(tarManifest, files);
 
@@ -613,7 +613,6 @@ const handleIncident = (req: Request, caller: Caller) =>
     const store = yield* Store;
     const { legacyAuth } = yield* RegistryConfig;
     const body = yield* parseBody(req, IncidentBody);
-    const user = yield* reauth(caller, { password: body.password, otp: body.otp }, { kind: "incident" });
     // `since` is exclusive: pass the time of the last publish you trust.
     const since = Date.parse(body.since);
 
@@ -621,6 +620,9 @@ const handleIncident = (req: Request, caller: Caller) =>
     const at = yield* now;
 
     if (at - since > INCIDENT_WINDOW_MS) return fail(400, "Incident response reaches back at most 30 days. Revoke older versions one by one (apm revoke).");
+    // the range and whether it is a preview are part of what the second factor authorizes
+    const command: LiveAction = { kind: "incident", since: canonicalSince(body.since), dryRun: body.dryRun === true };
+    const user = yield* reauth(caller, { password: body.password, otp: body.otp }, command);
     const reason = body.reason ?? "account compromised";
     const published = (yield* store.publishedSince(user, since)).filter((v) => v.status !== "revoked");
     // only packages the account still owns: a former owner's old publishes are the current owners' call
@@ -1037,7 +1039,8 @@ type TreeBlock = { name: string; version: string; reason: string; via: string[] 
 /** A dependency the walk could not score: a git or URL spec, a missing package, a failed analysis or the walk's limit. */
 type UncheckedDep = { dependency: string; reason: string; via: string[] };
 
-type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[] };
+/** `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry. */
+type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; packages: { name: string; version: string }[] };
 
 const MAX_UNCHECKED_LISTED = 50;
 
@@ -1052,6 +1055,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
     const at = yield* now;
     const blocks: TreeBlock[] = [];
     const uncheckedDeps: UncheckedDep[] = [];
+    const packages: Tree["packages"] = [];
     let unchecked = 0;
 
     const miss = (dependency: string, reason: string, via: string[]): void => {
@@ -1096,6 +1100,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
 
       if (seen.has(key)) continue;
       seen.add(key);
+      packages.push({ name: dep.name, version: picked.v.version });
       let v = picked.v;
 
       if (!parseAnalysis(v.score) && analyses < limits.maxAnalyses) {
@@ -1124,7 +1129,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits = { maxNodes: 30
       if (item.via.length < 12) for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key] });
     }
 
-    const tree: Tree = { blocks, unchecked, uncheckedDeps };
+    const tree: Tree = { blocks, unchecked, uncheckedDeps, packages };
 
     return tree;
   });
@@ -1233,10 +1238,12 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
     if (!r) return unchecked(src.kind === "upstream" ? "not scored yet: queued for analysis" : "could not be analyzed");
 
     if (r.score >= SCORE_FLOOR) return { kind: "clean" } satisfies ScanOne;
+
     const why = r.signals
       .filter((s) => s.points < 0)
       .map((s) => s.id)
       .join(", ");
+
     const advisory: ScanAdvisory = {
       package: p.name,
       version: p.version,

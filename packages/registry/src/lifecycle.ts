@@ -7,10 +7,10 @@ import type { VersionStatus } from "./db.ts";
 const HOUR = 3_600_000;
 export const DAY = 24 * HOUR;
 
-/** A revoke of an old or depended-on version waits this long before it becomes final. */
+/** A revoke of a version older than FRESH_MS waits this long before it becomes final. */
 export const PENDING_MS = DAY;
 
-/** Revokes of versions younger than this take effect at once. */
+/** Revokes of versions younger than this take effect at once, dependents or not. */
 export const FRESH_MS = 72 * HOUR;
 
 export type LifecycleEvent =

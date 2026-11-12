@@ -302,6 +302,15 @@ export function ApproveView() {
   }
 
   const { staged: s, account, config } = state;
+
+  return <StagedReview s={s} account={account} config={config} onDecided={(status) => setState({ kind: "decided", status, name: s.package, version: s.version })} />;
+}
+
+/**
+ * What a person reads before approving: the facts, the risk summary with every signal and what was not
+ * checked, and the files, all above the approve and reject controls. Exported for the rendering test.
+ */
+export function StagedReview({ s, account, config, onDecided }: { s: StagedDetail; account: Account; config: AuthConfig; onDecided: (status: "approved" | "rejected") => void }) {
   const pending = s.status === "pending" && Date.parse(s.expiresAt) > Date.now();
   const risks = s.score?.signals.filter((x) => x.points < 0) ?? [];
   const notes = s.score?.signals.filter((x) => x.points >= 0) ?? [];
@@ -389,7 +398,7 @@ export function ApproveView() {
         )}
       </section>
 
-      {pending && <Confirm s={s} account={account} config={config} onDecided={(status) => setState({ kind: "decided", status, name: s.package, version: s.version })} />}
+      {pending && <Confirm s={s} account={account} config={config} onDecided={onDecided} />}
     </div>
   );
 }

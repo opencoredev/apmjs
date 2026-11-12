@@ -12,7 +12,7 @@ import { Clock } from "./clock.ts";
 import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { Store } from "./db.ts";
 import type { HttpFailure, InfraError } from "./errors.ts";
-import { fail, failureResponse, withSlash } from "./http.ts";
+import { fail, failureResponse, withPrivacyHeaders, withSlash } from "./http.ts";
 import { route } from "./router.ts";
 import { legacyAuthRefusal } from "./startup.ts";
 import { ReleaseHooks } from "./hooks.ts";
@@ -190,8 +190,12 @@ function logFailure(event: string, fields: LogFields, error: string): void {
   console.error(JSON.stringify({ level: "error", event, ...fields, error }));
 }
 
-/** Runs the router for one request. `clock` is the system clock in production. */
+/** Runs the router for one request. `clock` is the system clock in production. Per-user answers are marked private, whichever route made them. */
 export async function handle(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system, ctx: ExecutionContext | null = null): Promise<Response> {
+  return withPrivacyHeaders(req, await respond(req, rawEnv, clock, ctx));
+}
+
+async function respond(req: Request, rawEnv: RawEnv, clock: Layer.Layer<Clock>, ctx: ExecutionContext | null): Promise<Response> {
   const parsed = WorkerEnv.safeParse(rawEnv);
 
   if (!parsed.success) {
@@ -266,12 +270,12 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
 }
 
 /** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline. */
-export async function sweep(rawEnv: RawEnv): Promise<void> {
+export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, Clock.system)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));
