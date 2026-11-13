@@ -209,7 +209,7 @@ export type AnalysisApi = {
    * The version as stored: with its analysis, or `unscorable` for one this scorer can never score. One with neither is
    * queued (unless it was queued less than REQUEUE_AFTER_MS ago) and comes back unscored; nothing is analysed here.
    */
-  readonly ensure: (pkg: UpstreamPackage, v: VersionRecord) => Effect.Effect<VersionRecord, StoreError | BlobError>;
+  readonly ensure: (pkg: Pick<UpstreamPackage, "name">, v: VersionRecord) => Effect.Effect<VersionRecord, StoreError | BlobError>;
   /**
    * The cron sweep's half: requeues every run that began at least RUN_WINDOW_MS ago and never stored anything (the
    * platform stopped it). How the queue's next run of it reads depends on how many runs before it stored nothing (planFor). Returns how many

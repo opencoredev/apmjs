@@ -26,7 +26,10 @@ const POOL = new MemoryPool();
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DAY = 86_400_000;
 
-/** `pad`: bytes of description its npm packument carries, which the registry keeps. */
+/**
+ * `pad`: bytes of postinstall script its npm packument's version carries, which the registry keeps and so does a walk's
+ * summary of the package (walk-catalog.ts), so the walk holds it for as long as it holds the package.
+ */
 type Pkg = { name: string; dependencies?: Record<string, string>; pad?: number };
 
 const encoder = new TextEncoder();
@@ -89,9 +92,8 @@ async function seed(url: string, input: { local: readonly Pkg[]; upstream: reado
 /** The packument the stand-in sends: one version, and the padding a package asks for. */
 type FakePackument = {
   name: string;
-  description?: string;
   "dist-tags": Record<string, string>;
-  versions: Record<string, Manifest & { dist: { tarball: string; shasum: string; integrity: string } }>;
+  versions: Record<string, Manifest & { dist: { tarball: string; shasum: string; integrity: string }; scripts?: { postinstall: string } }>;
   time: Record<string, string>;
 };
 
@@ -112,14 +114,16 @@ function fakeNpm(pkgs: readonly Pkg[]) {
       // the walk never downloads a tarball: its analysis is stored
       const dist = { tarball: `https://npm.invalid/${name}/-/${name}-1.0.0.tgz`, shasum: "1".repeat(40), integrity: integrityOf(name) };
 
+      const version: FakePackument["versions"][string] = { ...manifestOf(p), dist };
+
+      if (p.pad !== undefined) version.scripts = { postinstall: "d".repeat(p.pad) };
+
       const packument: FakePackument = {
         name,
         "dist-tags": { latest: "1.0.0" },
-        versions: { "1.0.0": { ...manifestOf(p), dist } },
+        versions: { "1.0.0": version },
         time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() },
       };
-
-      if (p.pad !== undefined) packument.description = "d".repeat(p.pad);
 
       return Response.json(packument);
     },
@@ -378,6 +382,7 @@ function recording(npm: string, reads: LeasedRead[]) {
         probe: (n, lease) => Effect.suspend(() => (note("probe", lease), u.probe(n, lease))),
         probeWithin: (n, lease) => Effect.suspend(() => (note("probeWithin", lease), u.probeWithin(n, lease))),
         probeMany: (ns, lease) => Effect.suspend(() => (note("probeMany", lease), u.probeMany(ns, lease))),
+        summaries: (ns, lease, keep) => Effect.suspend(() => (note("summaries", lease), u.summaries(ns, lease, keep))),
         listing: (n, lease) => Effect.suspend(() => (note("listing", lease), u.listing(n, lease))),
         get: (n, lease) => Effect.suspend(() => (note("get", lease), u.get(n, lease))),
         devDependencies: (n, lease) => Effect.suspend(() => (note("devDependencies", lease), u.devDependencies(n, lease))),
@@ -432,7 +437,7 @@ describe("every packument a request reads is under the request's lease", () => {
       // on 6862fc7 the root was read with probe() and get() under no budget
       expect(leased.reads.length).toBeGreaterThan(1);
       expect(leased.reads.every((x) => x.lease.root === leased.request)).toBe(true);
-      expect(leased.reads.map((x) => x.method)).toContain("probeMany");
+      expect(leased.reads.map((x) => x.method)).toContain("summaries");
       expect(leased.request.peakTaken).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
       // the big root's 10 MiB leaves the walk room for about five fewer; on 6862fc7 both walks checked as many
       expect(bigChecked).toBeGreaterThanOrEqual(1);

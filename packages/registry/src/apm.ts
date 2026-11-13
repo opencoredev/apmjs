@@ -72,7 +72,8 @@ import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
-import { tooLargeText, Upstream, type BudgetedProbe, type UpstreamPackage } from "./upstream.ts";
+import { tooLargeText, Upstream, type Summarized, type Summary, type UpstreamPackage } from "./upstream.ts";
+import { summarize, summaryVersion, type Catalog } from "./walk-catalog.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -207,8 +208,10 @@ const lookup = (name: string, lease: Lease) =>
  * weight: an upper bound on its heap (packument-read.ts, WEIGHTS), every read in flight and each parse's moment
  * included. Every handler reads under one lease of the isolate's memory pool (memory.ts, RequestMemory) with this
  * limit, which the pool's own (POOL_WEIGHT, shared by every request and the isolate cache) bounds in turn. Cached with
- * its records and scored, in MiB: next 26.6, @types/node 20.8, typescript 20.6, react 13.6, so next, react and
- * typescript fit together. A dependency past it is reported unchecked, with a warning, never passed.
+ * its records and scored, in MiB: next 26.6, @types/node 20.8, typescript 20.6, react 13.6. A walk, its root and a
+ * scan hold one of these only while it is read and keep only the versions they pick (walk-catalog.ts), so a walk of
+ * next's 50 packages peaks near 41 MiB, one read at a time, and holds 0.1 MiB once answered. A dependency past it is
+ * reported unchecked, with a warning, never passed.
  */
 export const REQUEST_METADATA_WEIGHT = REQUEST_WEIGHT;
 
@@ -235,8 +238,50 @@ const lookupWithin = (name: string, lease: Lease) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
+    const p = yield* upstream.probeWithin(name, lease);
 
-    return lookupOf(yield* upstream.probeWithin(name, lease));
+    switch (p.kind) {
+      case "found":
+        return upstreamSource(p.pkg);
+      case "absent":
+        return null;
+      case "unknown":
+      case "over-budget":
+        return p.kind;
+      default: {
+        const _exhaustive: never = p;
+
+        return _exhaustive;
+      }
+    }
+  });
+
+/**
+ * A package summarized (walk-catalog.ts), keeping only the versions `select` picks from it: its packument is held
+ * only while it is read, and the summary stays taken from `lease`. A local package's versions come from the database
+ * and are not charged, as they never were. "over-budget" when it did not fit `lease`.
+ */
+const catalogWithin = (name: string, lease: Lease, select: (full: Catalog) => VersionRecord[]) =>
+  Effect.gen(function* () {
+    const pkg = yield* (yield* Store).getPackage(name);
+
+    if (pkg) {
+      const full = localSource(pkg, yield* versionsOf(name));
+
+      return summarize({ ...full, versions: select(full) }).summary;
+    }
+
+    const upstream = yield* upstreamOrNull;
+
+    if (!upstream) return null;
+
+    const got = yield* upstream.summaries([name], lease, (up) => {
+      const full = upstreamSource(up);
+
+      return summarize({ kind: full.kind, name: full.name, distTags: full.distTags, versions: select(full) });
+    });
+
+    return lookupOf(got.get(name));
   });
 
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
@@ -259,8 +304,8 @@ const lookupOrUnknown = (name: string, lease: Lease) =>
   });
 
 /** Makes sure an upstream version has a stored analysis (now, or queued); returns the version with it. */
-const ensureAnalyzed = (src: Source, v: VersionRecord) =>
-  src.kind === "local" || parseAnalysis(v.score) ? Effect.succeed(v) : Effect.flatMap(Analysis, (a) => a.ensure(src.pkg, v));
+const ensureAnalyzed = (src: Catalog, v: VersionRecord) =>
+  src.kind === "local" || parseAnalysis(v.score) ? Effect.succeed(v) : Effect.flatMap(Analysis, (a) => a.ensure({ name: src.name }, v));
 
 // ---------- publish guard ----------
 const INSTALL_KEYS = ["preinstall", "install", "postinstall"] as const;
@@ -315,16 +360,16 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
  * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
  * `over-budget`: the request held as much package metadata as it may (REQUEST_METADATA_WEIGHT), so it was not read.
  */
-type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string } | { kind: "over-budget"; reason: string };
+type Picked = { kind: "found"; src: Catalog; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string } | { kind: "over-budget"; reason: string };
 
 const missing = (reason: string): Picked => ({ kind: "missing", reason });
-const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, v });
+const found = (src: Catalog, v: VersionRecord): Picked => ({ kind: "found", src, v });
 
 /**
  * A package's catalog as a lookup finds it: here or upstream, nowhere (null), upstream could not be asked, or the
  * request had no room left to hold it (REQUEST_METADATA_WEIGHT).
  */
-type Lookup = Source | null | "unknown" | "over-budget";
+type Lookup = Catalog | null | "unknown" | "over-budget";
 
 /** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
 const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
@@ -360,13 +405,13 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord)
   return best ? found(src, best) : missing(`no installable version matches ${describeDependency(dep)}`);
 }
 
-/** An upstream probe as a lookup; a name the batch has no answer for counts as "upstream could not be asked". */
-function lookupOf(p: BudgetedProbe | undefined): Lookup {
+/** An upstream summary as a lookup; a name the batch has no answer for counts as "upstream could not be asked". */
+function lookupOf(p: Summarized<Catalog> | undefined): Lookup {
   if (p === undefined) return "unknown";
 
   switch (p.kind) {
     case "found":
-      return upstreamSource(p.pkg);
+      return p.summary;
     case "absent":
       return null;
     case "unknown":
@@ -381,52 +426,92 @@ function lookupOf(p: BudgetedProbe | undefined): Lookup {
   }
 }
 
+/** What decides a pick: the package and the range or tag, not the alias it is installed under. */
+const pickKey = (dep: RegistryDependency): string => `${dep.name}\u0000${dep.kind === "tag" ? `tag:${dep.tag}` : dep.range}`;
+
 /**
- * The catalogs one request reads, each name once. `load` reads a batch of names in a fixed number of statements
- * (this registry's packages, versions and dismissals, then npm's packuments and their analyses); `get` reads a name
- * no batch has.
+ * Each pick of `deps` (all of one package) from its full catalog, keeping of the catalog only the version each picks:
+ * none of it refers to `full`, so the packument it came from can be let go. What the kept versions weigh is the
+ * summary's weight (walk-catalog.ts).
  */
-function catalogMemo(lease: Lease) {
-  const known = new Map<string, Lookup>();
+function picksFrom(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean): Summary<Map<string, Picked>> {
+  const picks = new Map<string, Picked>();
+  let weight = 0;
 
-  const load = (names: readonly string[]) =>
+  for (const dep of deps) {
+    const p = pickFrom(full, dep, keep);
+
+    if (p.kind !== "found") {
+      picks.set(pickKey(dep), p);
+      continue;
+    }
+
+    const one = summaryVersion(p.v);
+    weight += one.weight;
+    picks.set(pickKey(dep), found({ kind: full.kind, name: full.name, distTags: {}, versions: [one.summary] }, one.summary));
+  }
+
+  return { summary: picks, weight };
+}
+
+/**
+ * The picks one walk makes, each package and range once. `load` reads the packages a batch of dependencies needs in a
+ * fixed number of statements (this registry's packages, versions and dismissals, then npm's analyses and packuments)
+ * and keeps of each only the versions its ranges pick (picksFrom): what stays taken from `lease` is those, and a
+ * packument is held only while it is read and picked from. `pick` loads a dependency no batch had.
+ */
+function pickMemo(lease: Lease, keep: (v: VersionRecord) => boolean) {
+  const known = new Map<string, Picked>();
+
+  const load = (deps: readonly RegistryDependency[]) =>
     Effect.gen(function* () {
-      const wanted = [...new Set(names)].filter((n) => !known.has(n));
+      const byName = new Map<string, RegistryDependency[]>();
 
-      if (wanted.length === 0) return;
-      const at = yield* now;
-      const local = yield* (yield* Store).catalogsOf(wanted);
+      for (const d of deps) {
+        if (known.has(pickKey(d))) continue;
+        const list = byName.get(d.name) ?? [];
 
-      for (const [name, c] of local) {
-        known.set(name, localSource(c.pkg, c.versions.map((v) => atTime(v, at))));
+        if (!list.some((x) => pickKey(x) === pickKey(d))) list.push(d);
+        byName.set(d.name, list);
       }
 
-      const rest = wanted.filter((n) => !local.has(n));
+      if (byName.size === 0) return;
+      const at = yield* now;
+      const local = yield* (yield* Store).catalogsOf([...byName.keys()]);
+
+      for (const [name, c] of local) {
+        const picks = picksFrom(localSource(c.pkg, c.versions.map((v) => atTime(v, at))), byName.get(name) ?? [], keep);
+
+        for (const [k, p] of picks.summary) known.set(k, p);
+      }
+
+      const rest = [...byName.keys()].filter((n) => !local.has(n));
       const upstream = yield* upstreamOrNull;
 
       if (rest.length === 0) return;
+      const got = upstream ? yield* upstream.summaries<Map<string, Picked>>(rest, lease, (up) => picksFrom(upstreamSource(up), byName.get(up.name) ?? [], keep)) : null;
 
-      if (!upstream) {
-        for (const n of rest) known.set(n, null);
+      for (const name of rest) {
+        const answer = got === null ? { kind: "absent" as const } : got.get(name);
 
-        return;
+        for (const d of byName.get(name) ?? []) {
+          // a package npm had: its picks; otherwise every range of it is picked from what the lookup came to
+          if (answer?.kind === "found") known.set(pickKey(d), answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT });
+          else known.set(pickKey(d), pickFrom(answer === undefined ? "unknown" : answer.kind === "absent" ? null : answer.kind, d, keep));
+        }
       }
-
-      const probes = yield* upstream.probeMany(rest, lease);
-
-      for (const n of rest) known.set(n, lookupOf(probes.get(n)));
     });
 
-  const get = (name: string) =>
+  const pick = (dep: RegistryDependency) =>
     Effect.gen(function* () {
-      if (!known.has(name)) yield* load([name]);
-      const found = known.get(name);
+      if (!known.has(pickKey(dep))) yield* load([dep]);
+      // only a dependency a load left unread is unknown
+      const got: Picked = known.get(pickKey(dep)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT };
 
-      // null is a confirmed absence ("not on this registry or upstream"): only a name load left unread is unknown
-      return found === undefined ? "unknown" : found;
+      return got;
     });
 
-  return { load, get };
+  return { load, pick };
 }
 
 /** Each checked dependency may mean an upstream download and analysis, so publish checks a bounded number. */
@@ -1671,15 +1756,13 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
     };
 
     const seen = new Set<string>();
-    // every catalog the walk reads, it holds until it answers: together they stay under maxWeight, inside the
-    // request's lease, so the root and its reloads count beside them (review of 6862fc7, finding 4)
-    const catalogs = catalogMemo(lease.child(limits.maxWeight));
+    // every catalog the walk reads, it holds (summarized) until it answers: together they stay under maxWeight, inside
+    // the request's lease, so the root and its reloads count beside them (review of 6862fc7, finding 4)
+    const catalogs = pickMemo(lease.child(limits.maxWeight), (v) => v.status === "active");
     let overBudget = false;
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
-    const active = (v: VersionRecord): boolean => v.status === "active";
-    // what decides the pick: the package and the range or tag, not the alias it is installed under
-    const lookupKey = (dep: RegistryDependency): string => `${dep.name}\u0000${dep.kind === "tag" ? `tag:${dep.tag}` : dep.range}`;
+    const lookupKey = pickKey;
     let lookups = 0;
     let analyses = 0;
     let loadedLevel = 0;
@@ -1694,9 +1777,9 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
       warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${rest} more ${rest === 1 ? "dependency was" : "dependencies were"} not checked: ${reason}`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     };
 
-    /** The names a level still needs, from `qi` on, for at most as many new lookups as the budget has left. */
-    const levelNames = (qi: number, level: number): string[] => {
-      const names = new Set<string>();
+    /** The dependencies a level still needs, from `qi` on, for at most as many new lookups as the budget has left. */
+    const levelDeps = (qi: number, level: number): RegistryDependency[] => {
+      const deps: RegistryDependency[] = [];
       const keys = new Set<string>();
 
       for (let j = qi; j < queue.length && keys.size < limits.maxLookups - lookups; j++) {
@@ -1704,12 +1787,12 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
 
         if (!next || next.level !== level) break;
 
-        if (!isRegistryDependency(next.dep) || resolved.has(lookupKey(next.dep))) continue;
+        if (!isRegistryDependency(next.dep) || resolved.has(lookupKey(next.dep)) || keys.has(lookupKey(next.dep))) continue;
         keys.add(lookupKey(next.dep));
-        names.add(next.dep.name);
+        deps.push(next.dep);
       }
 
-      return [...names];
+      return deps;
     };
 
     for (let qi = 0; qi < queue.length; qi++) {
@@ -1744,12 +1827,12 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
 
         // the first lookup of a level reads every catalog the level needs in one batch
         if (item.level > loadedLevel) {
-          yield* catalogs.load(levelNames(qi, item.level));
+          yield* catalogs.load(levelDeps(qi, item.level));
           loadedLevel = item.level;
         }
 
         lookups++;
-        picked = pickFrom(yield* catalogs.get(dep.name), dep, active);
+        picked = yield* catalogs.pick(dep);
         resolved.set(lookupKey(dep), picked);
       }
 
@@ -1932,27 +2015,39 @@ type ResolveMode = { strict: boolean; final: boolean };
  * One pass of resolve over `src`. Its walk holds what it reads under a child of `lease`, given back when the pass has
  * its answer: what it returns refers to no catalog.
  */
-const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode; lease: Lease }) =>
+const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Catalog; mode: ResolveMode; lease: Lease }) =>
   Effect.suspend(() => {
     const walk = input.lease.child();
 
     return resolveWalk({ ...input, lease: walk }).pipe(Effect.ensuring(Effect.sync(() => walk.release())));
   });
 
-const resolveWalk = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode; lease: Lease }) =>
+/** The versions of a resolve's root it skips at most before it answers that none passes the policy. */
+const MAX_ROOT_SKIPPED = 20;
+
+/**
+ * The versions a resolve of `range` looks at, newest first: those in range, or for a tag those in its channel, and no
+ * more than it can skip (MAX_ROOT_SKIPPED), so the root's summary keeps only these.
+ */
+function rootCandidates(src: Catalog, range: string): VersionRecord[] {
+  const tagged = tagTarget(src.distTags, range);
+  // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
+  // below it, but a stable tag never falls back to a prerelease.
+  const base = (v: string): string => v.split("-")[0] ?? v;
+  const inChannel = (v: string, t: string): boolean => order(v, t) <= 0 && (!v.includes("-") || (t.includes("-") && base(v) === base(t)));
+
+  return src.versions
+    .filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range)))
+    .sort((a, b) => newestFirst(a.version, b.version))
+    .slice(0, MAX_ROOT_SKIPPED);
+}
+
+const resolveWalk = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Catalog; mode: ResolveMode; lease: Lease }) =>
   Effect.gen(function* () {
     const { name, range, policy, treePolicy, src, mode, lease } = input;
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
-    const tagged = tagTarget(src.distTags, range);
-    // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
-    // below it, but a stable tag never falls back to a prerelease.
-    const base = (v: string): string => v.split("-")[0] ?? v;
-    const inChannel = (v: string, t: string): boolean => order(v, t) <= 0 && (!v.includes("-") || (t.includes("-") && base(v) === base(t)));
-
-    const matches = src.versions
-      .filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range)))
-      .sort((a, b) => newestFirst(a.version, b.version));
+    const matches = rootCandidates(src, range);
 
     const skipped: { version: string; reason: string; revokeReason: string | null }[] = [];
     let analyzedCount = 0;
@@ -2029,7 +2124,7 @@ const resolveWalk = (input: { name: string; range: string; policy: Policy; treeP
 
       skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
 
-      if (skipped.length >= 20) break;
+      if (skipped.length >= MAX_ROOT_SKIPPED) break;
     }
 
     const newest = matches[0];
@@ -2080,20 +2175,24 @@ export const resolveResponse = (url: URL) =>
     const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
 
     // the root is read under the request's lease, each read of it under a child given back when a newer read replaces
-    // it, beside the walks (review of 6862fc7, finding 4)
+    // it, beside the walks (review of 6862fc7, finding 4). It is summarized as the walk's catalogs are: its packument
+    // is held only while it is read, so the walk has the room the packument took
     const lease = yield* RequestMemory;
     let rootLease = lease.child();
-    // one variable holds the root, so a catalog its lease gave back is never still reachable
-    let src = yield* lookupOrUnknown(name, rootLease);
+    // one variable holds the root, so a catalog its lease gave back is never still reachable; a root that did not fit
+    // could not be looked up, as before
+    const candidates = (full: Catalog) => rootCandidates(full, range);
+    const first = yield* catalogWithin(name, rootLease, candidates);
+    let src: Catalog | null | "unknown" = first === "over-budget" ? "unknown" : first;
 
     /** The root read afresh: the catalog it replaces is given back. */
     const reload = Effect.gen(function* () {
       const next = lease.child();
-      const got = yield* lookup(name, next);
+      const got = yield* catalogWithin(name, next, candidates);
       rootLease.release();
       rootLease = next;
 
-      return got;
+      return got === "unknown" || got === "over-budget" ? null : got;
     });
 
     // the package itself could not be looked up: there is no version to install, and a retry may find one
@@ -2197,7 +2296,8 @@ const scanOne = (p: { name: string; version: string }, strict: boolean, at: numb
       advisory: { package: p.name, version: p.version, level, description: `${warningLines(warning).slice(0, -1).join("\n")}${strict ? "" : "\napm lets it install; APM_SCANNER_STRICT=1 refuses it."}`, url: warning.url },
     });
 
-    const src = yield* lookupWithin(p.name, lease);
+    // only the version asked about is kept of its package
+    const src = yield* catalogWithin(p.name, lease, (full) => full.versions.filter((v) => v.version === p.version));
 
     if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 

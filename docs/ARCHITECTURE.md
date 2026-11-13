@@ -70,6 +70,7 @@ Everything an isolate holds of npm's package metadata is leased from one pool of
 - every key it parses, until the next key at its depth replaces it; a key at the root, or in a version document whose fields a profile lists, that is longer than any listed name is never built;
 - each read's fixed working set while it runs (`READ_OVERHEAD_WEIGHT`, 192 KiB; 144 KiB measured);
 - converting a read into a package (`packageMoment`), before anything is built from it;
+- what a resolve walk, its root and a scan keep of each package: only the versions they pick from it (`walk-catalog.ts`; the root's newest 20 candidates, a scan's one version), with each manifest cut down to its dependency, platform and install-script fields. Its packument is held only while it is read and picked from, and one the isolate cache already has stays the cache's, never charged to the request. next and its 50 packages hold 0.1 MiB once picked, against 26.6 MiB for next's packument alone;
 - the served packument's per-version lists and what streaming it holds (`streamWeight`, from the longest member the reader saw), until its last byte is sent;
 - the package page's answer (`GET /-/apm/v1/packages/<name>`): its version rows, and what streaming it holds, counted from its serialized size before a byte is written (`longestPiece`). A readme or description is written 64 KiB at a time, never as one string, and the request's lease stays open until the last byte is sent or the client cancels;
 - the isolate cache's entries (32 MiB at most, `CACHE_WEIGHT`);
@@ -138,7 +139,7 @@ Limits:
 
 - yarn gets steps 1 and 2 only. apm does not read `yarn.lock`, so yarn installs run their scripts as usual.
 - `apm x` (bunx, npx, pnpm dlx) gets step 1 only. Those tools install into their own cache with no project lockfile to verify.
-- The tree walk stops after 300 packages, 400 dependency lookups (failed ones included) or 32 levels, whichever comes first; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it. Each name is read once per walk, and a level's names in one batch.
+- The tree walk stops after 300 packages, 400 dependency lookups (failed ones included) or 32 levels, whichever comes first; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it. Each name and range is picked once per walk, and a level's packages are read in one batch; a range a later level asks of a package read earlier reads it again, usually from the isolate cache.
 
 ## Tests
 

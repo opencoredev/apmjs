@@ -145,8 +145,10 @@ describe("the reader takes no read without a lease", () => {
     type Leased = { [K in "probe" | "probeWithin" | "listing" | "probeMany" | "devDependencies" | "get"]: Parameters<UpstreamApi[K]> extends [...unknown[], Lease] ? true : false };
 
     const leased: Leased = { probe: true, probeWithin: true, listing: true, probeMany: true, devDependencies: true, get: true };
+    // summaries takes what to keep of each package after its lease
+    const summaries: Parameters<UpstreamApi["summaries"]>[1] extends Lease ? true : false = true;
 
-    expect(Object.values(leased).every(Boolean)).toBe(true);
+    expect([...Object.values(leased), summaries].every(Boolean)).toBe(true);
   });
 });
 

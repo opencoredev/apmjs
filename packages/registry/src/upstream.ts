@@ -66,6 +66,12 @@ export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" }
  */
 export type BudgetedProbe = Probe | { kind: "over-budget" };
 
+/** What a caller of summaries keeps of a package, and what it weighs (an upper bound on its heap, as WEIGHTS). */
+export type Summary<S> = { readonly summary: S; readonly weight: number };
+
+/** A summaries answer for one name: BudgetedProbe, with what the caller kept in place of the package. */
+export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" };
+
 // One object of the upstream's /-/v1/search answer. Read loosely: extra fields (downloads, flags, links)
 // pass through untouched so the merged answer keeps npm's wire format.
 const UpSearchObject = z
@@ -439,6 +445,16 @@ export type UpstreamApi = {
    * packument kept counts against `lease`, cached ones included, and a name past it is "over-budget".
    */
   readonly probeMany: (names: readonly string[], lease: Lease) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
+  /**
+   * probeMany for a caller that needs only part of each package (the resolve walk, its root, a scan): `keep` is handed
+   * each package with its analyses as soon as it is read, and only what it returns stays taken from `lease`. A package
+   * the isolate cache has stays the cache's: it is never held by `lease`, and is pinned while it is kept so the pool
+   * cannot take it back meanwhile. One read from npm is held under a child of `lease` only while it is converted and
+   * kept, then left to the isolate cache (which keeps it if it fits, beside older entries). Names
+   * that did not fit beside the others read at the same time are read again one at a time. `keep` must return
+   * nothing that refers to the package, or that memory would be held with nothing counting it.
+   */
+  readonly summaries: <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage) => Summary<S>) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
@@ -825,6 +841,66 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scoredPackage(l.pkg, scores.get(name) ?? none) : l]));
           });
 
+        const summaries = <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage) => Summary<S>): Effect.Effect<Map<string, Summarized<S>>, StoreError> =>
+          Effect.gen(function* () {
+            const wanted = [...new Set(names)];
+            // read before the packuments, so each package is kept the moment it is read: a name npm has no package for
+            // costs an empty row
+            const analyses = yield* store.upstreamAnalysesOf(wanted);
+            const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
+
+            /**
+             * What `keep` returns for `pkg`, its weight taken from `lease`. The scored copy keep is handed is charged
+             * while it runs unless the read already charged it (`copyCharged`: listed takes it with the package).
+             */
+            const kept = (name: string, pkg: CachedPackage, copyCharged: boolean): Summarized<S> => {
+              const copy = copyCharged ? 0 : pkg.versions.length * SCORED_WEIGHT;
+
+              if (!lease.take(copy)) return { kind: "over-budget" };
+              const scored = scoredPackage(pkg, analyses.get(name) ?? none);
+              const made = scored.kind === "found" ? keep(scored.pkg) : null;
+              lease.give(copy);
+
+              if (made === null) return { kind: "unknown" };
+
+              return lease.take(made.weight) ? { kind: "found", summary: made.summary } : { kind: "over-budget" };
+            };
+
+            const one = (name: string): Effect.Effect<Summarized<S>> =>
+              Effect.gen(function* () {
+                const cached = probeCacheFor(lease.pool, baseUrl, ttlMs).entry(name, yield* now);
+
+                if (cached !== undefined) {
+                  if (cached.value.kind !== "found") return cached.value;
+                  // pinned while it is kept, so the pool cannot take the cache's block back meanwhile, by a lease with
+                  // no limit of its own: the block is already in the pool, so pinning it takes nothing from the
+                  // request, whose lease counts only what it keeps
+                  const pin = lease.pool.backgroundLease();
+
+                  if (cached.block !== null) pin.hold(cached.block);
+
+                  try {
+                    return kept(name, cached.value.pkg, false);
+                  } finally {
+                    pin.release();
+                  }
+                }
+
+                // read under a child, which holds the package (and the cache beside it) only until it is kept
+                const read = lease.child();
+
+                return yield* Effect.map(listed(name, read), (l): Summarized<S> => (l.kind === "found" ? kept(name, l.pkg, true) : l)).pipe(Effect.ensuring(Effect.sync(() => read.release())));
+              });
+
+            const first = yield* Effect.forEach(wanted, (name) => Effect.map(one(name), (s) => [name, s] as const), { concurrency: PROBE_CONCURRENCY });
+            const out = new Map<string, Summarized<S>>(first);
+
+            // a name that did not fit beside the reads in flight with it may fit alone, beside only what was kept
+            for (const [name, s] of first) if (s.kind === "over-budget") out.set(name, yield* one(name));
+
+            return out;
+          });
+
         /**
          * Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate.
          * Converting them is charged (packageMoment) before it is done, and stays charged with the read while the
@@ -914,6 +990,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           probeWithin,
           listing,
           probeMany,
+          summaries,
           devDependencies,
           get: (name, lease) => Effect.map(probe(name, lease), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
