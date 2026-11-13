@@ -11,6 +11,7 @@ import { readCapped, streamedJson, streamWeight } from "./http.ts";
 import { CACHE_WEIGHT, type Block, type Lease, type MemoryPool } from "./memory.ts";
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
+import { reviewSummary, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -65,9 +66,6 @@ export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" }
  * well have answered.
  */
 export type BudgetedProbe = Probe | { kind: "over-budget" };
-
-/** What a caller of summaries keeps of a package, and what it weighs (an upper bound on its heap, as WEIGHTS). */
-export type Summary<S> = { readonly summary: S; readonly weight: number };
 
 /** A summaries answer for one name: BudgetedProbe, with what the caller kept in place of the package. */
 export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" };
@@ -723,8 +721,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
         /**
          * The review's look at a package npm just sent runs after the response: it gets a lease of its own that holds
-         * the package and the copy it is given, released when it is done (worker.ts). Not looked at when that does not
-         * fit; the next fetch of the package looks again.
+         * what it is given, released when it is done (worker.ts). It is given only what it reads (reviewSummary), so its
+         * lease does not keep the whole package for as long as it runs: the package is pinned while that is cut from
+         * it, then left to the request and the isolate cache. Not looked at when that does not fit; the next fetch of
+         * the package looks again.
          */
         const fetched = (pkg: CachedPackage, block: Block, pool: MemoryPool) =>
           Effect.gen(function* () {
@@ -732,14 +732,16 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (Option.isNone(hooks)) return;
             const held = pool.backgroundLease();
+            const looked = held.hold(block) ? reviewSummary(pkg) : null;
+            held.drop(block);
 
-            if (!held.hold(block) || !held.take(pkg.versions.length * SCORED_WEIGHT)) {
+            if (looked === null || !held.take(looked.weight)) {
               held.release();
 
               return;
             }
 
-            yield* hooks.value.upstreamFetched({ ...pkg, versions: pkg.versions.map((v) => ({ ...v, score: null })) }, held);
+            yield* hooks.value.upstreamFetched(looked.summary, held);
           });
 
         /**

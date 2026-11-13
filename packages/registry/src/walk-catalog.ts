@@ -1,17 +1,30 @@
-// What the resolve walk, its root and a scan keep of each package they read: its dist-tags and, for each version, its
-// record with a manifest cut down to what installing it reads. A packument is held whole only while it is read and cut
-// down (Upstream.summaries); the walk keeps the summary, which weighs a small part of it (next: 26.6 MiB cached, a few
-// MiB summarized), so a walk over next and its tree holds the tree's summaries, not their packuments.
+// What the resolve walk, its root, a scan and the AI review's look at a fetched package keep of each package they
+// read: for the versions they pick, the record with a manifest cut down to the fields they read. A packument is held
+// whole only while it is read and cut down (Upstream.summaries); what is kept weighs a small part of it (next: 26.6 MiB
+// cached; the walk keeps one version of it, the review's look under 1 KiB a version), so the isolate's pool holds the
+// tree's summaries, not their packuments.
 import { z } from "zod";
 import { WEIGHTS } from "./packument-read.ts";
-import { RECORD_WEIGHT, type Summary } from "./upstream.ts";
 import type { VersionRecord } from "./db.ts";
+import type { UpstreamPackage } from "./upstream.ts";
+
+/** What a reader keeps of a package, and what it weighs (an upper bound on its heap, as WEIGHTS). */
+export type Summary<S> = { readonly summary: S; readonly weight: number };
 
 /**
- * The manifest fields a summary keeps: what decides what a version installs and where (the walk reads dependencies and
- * optionalDependencies, a withheld version's report names them), and its install scripts.
+ * What a kept version's record holds beside its strings and manifest: the record object and its blob key, as a cached
+ * package's record is charged (upstream.ts, RECORD_WEIGHT, measured in workerd at 284 bytes at most).
+ */
+const RECORD_WEIGHT = 384;
+
+/**
+ * The manifest fields a summary keeps beside its install scripts: what decides what a version installs and where (the
+ * walk reads dependencies and optionalDependencies, a withheld version's report names them).
  */
 export const SUMMARY_MANIFEST_FIELDS = ["dependencies", "optionalDependencies", "peerDependencies", "peerDependenciesMeta", "os", "cpu"] as const;
+
+/** The manifest fields the AI review's look keeps beside its install scripts (review.ts, hasInstallScript). */
+const REVIEW_MANIFEST_FIELDS = ["hasInstallScript"] as const;
 
 /** A package as a walk keeps it: where it was read from, its dist-tags and its versions with summarized manifests. */
 export type Catalog = { kind: "local" | "upstream"; name: string; distTags: Record<string, string>; versions: VersionRecord[] };
@@ -54,11 +67,11 @@ type Manifest = VersionRecord["manifest"];
 /** The install scripts of a manifest, each kept only when it is text, as the publish guard reads them. */
 const InstallScripts = z.object({ preinstall: z.string().optional().catch(undefined), install: z.string().optional().catch(undefined), postinstall: z.string().optional().catch(undefined) });
 
-/** A manifest cut down to SUMMARY_MANIFEST_FIELDS and its install scripts (the fields are shared, not copied). */
-function summaryManifest(m: Manifest): Manifest {
+/** A manifest cut down to `fields` and its install scripts (the fields are shared, not copied). */
+function summaryManifest(m: Manifest, fields: readonly string[]): Manifest {
   const out: Manifest = {};
 
-  for (const k of SUMMARY_MANIFEST_FIELDS) if (m[k] !== undefined) out[k] = m[k];
+  for (const k of fields) if (m[k] !== undefined) out[k] = m[k];
   const scripts = InstallScripts.safeParse(m.scripts);
 
   if (scripts.success) {
@@ -75,8 +88,8 @@ function summaryManifest(m: Manifest): Manifest {
  * (they outlive the packument they came from once the isolate cache lets it go) and the summary. Its score, read from
  * the database, is shared with the store's answer and not counted here, as the packument it came with never counted it.
  */
-export function summaryVersion(v: VersionRecord): Summary<VersionRecord> {
-  const manifest = summaryManifest(v.manifest);
+export function summaryVersion(v: VersionRecord, fields: readonly string[] = SUMMARY_MANIFEST_FIELDS): Summary<VersionRecord> {
+  const manifest = summaryManifest(v.manifest, fields);
   const strings = [v.version, v.shasum, v.integrity, v.published_by, v.deprecated, v.status_reason].reduce((n, s) => n + (s === null ? 0 : stringWeight(s)), 0);
 
   return { summary: { ...v, manifest }, weight: RECORD_WEIGHT + strings + jsonWeight(JSON.stringify(manifest)) };
@@ -97,4 +110,25 @@ export function summarize(input: Catalog): Summary<Catalog> {
   }
 
   return { summary: { kind: input.kind, name: input.name, distTags: input.distTags, versions }, weight };
+}
+
+/**
+ * What the AI review's look at a package npm just sent reads of it (review.ts, considerUpstream): its name, dist-tags
+ * and every version's record with only its install scripts, unscored. It runs after the response and may take seconds;
+ * handed this, its lease holds under 1 KiB a version (next: 3.2 MiB) instead of the whole package (26.6 MiB), which the
+ * isolate cache may then give back while a walk needs the room.
+ */
+export function reviewSummary(pkg: Pick<UpstreamPackage, "name" | "distTags"> & { readonly versions: readonly Omit<VersionRecord, "score">[] }): Summary<UpstreamPackage> {
+  const versions: VersionRecord[] = [];
+  let weight = WEIGHTS.container + jsonWeight(JSON.stringify(pkg.distTags)) + stringWeight(pkg.name);
+
+  for (const v of pkg.versions) {
+    const one = summaryVersion({ ...v, score: null }, REVIEW_MANIFEST_FIELDS);
+    versions.push(one.summary);
+    weight += WEIGHTS.key + one.weight;
+  }
+
+  const summary: UpstreamPackage = { name: pkg.name, distTags: pkg.distTags, description: "", readme: "", maintainers: [], versions, tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
+
+  return { summary, weight };
 }

@@ -20,6 +20,7 @@ import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
+import { ReleaseHooks } from "../src/hooks.ts";
 import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
 import { Upstream, type UpstreamPackage } from "../src/upstream.ts";
 import { summarize } from "../src/walk-catalog.ts";
@@ -210,6 +211,31 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
     expect(second.peakTaken).toBeLessThan(1 * MiB);
     expect(pool.cache().taken).toBe(cached);
     second.release();
+    expect(pool.charged).toBe(cached);
+  }, 120_000);
+
+  test("the review's look at next is handed what it reads, so it does not keep next's packument while it runs", async () => {
+    const pool = new MemoryPool();
+    const looks: { pkg: UpstreamPackage; held: Lease }[] = [];
+    const hooks = Layer.succeed(ReleaseHooks, ReleaseHooks.of({ afterCommit: () => Effect.void, upstreamFetched: (pkg, held) => Effect.sync(() => void looks.push({ pkg, held })) }));
+    const request = pool.request();
+    const keep = (pkg: UpstreamPackage) => summarize({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: [] });
+    await Effect.runPromise(Effect.flatMap(Upstream, (up) => up.summaries(["next"], request, keep)).pipe(Effect.provideService(RequestMemory, request), Effect.provide(Layer.merge(layers(), hooks)), Effect.scoped));
+    request.release();
+    const look = looks[0];
+
+    if (!look) throw new Error("the review was not handed next");
+    const cached = pool.cache().taken;
+    process.stdout.write(`[walk-memory] the review's look at next holds ${(look.held.taken / MiB).toFixed(2)} MiB beside the cache's ${(cached / MiB).toFixed(1)} MiB\n`);
+    // what considerUpstream reads: every version, each with its publish time and digest
+    expect(look.pkg.versions.length).toBe(Object.keys(next.versions).length);
+    expect(look.pkg.versions.find((v) => v.version === latest)?.integrity).toMatch(/^sha512-/);
+    expect(look.pkg.distTags.latest).toBe(latest);
+    // under 1 KiB a version, against 6.6 KiB a version for next's packument; on ed380b3 it held all 26.6 MiB
+    expect(look.held.taken).toBeLessThan(look.pkg.versions.length * 1024);
+    expect(look.held.taken).toBeLessThan(cached / 5);
+    look.held.release();
+    // the cache's entry is the only holder of next's packument now, so the pool may take it back
     expect(pool.charged).toBe(cached);
   }, 120_000);
 

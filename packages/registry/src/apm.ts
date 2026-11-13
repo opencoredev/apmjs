@@ -72,8 +72,8 @@ import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
-import { tooLargeText, Upstream, type Summarized, type Summary, type UpstreamPackage } from "./upstream.ts";
-import { summarize, summaryVersion, type Catalog } from "./walk-catalog.ts";
+import { tooLargeText, Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
+import { summarize, summaryVersion, type Catalog, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
   fileReferences,
