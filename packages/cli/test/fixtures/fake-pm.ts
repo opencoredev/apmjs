@@ -37,7 +37,8 @@ const [pm = "npm", ...args] = process.argv.slice(2);
 const dir = process.env.APM_FAKE_DIR ?? "";
 const cwd = process.cwd();
 
-appendFileSync(join(dir, "pm.log"), `${JSON.stringify({ pm, args, cwd })}\n`);
+// `production`: pnpm reads a production install from npm_config_production, which apm sets for its rebuild
+appendFileSync(join(dir, "pm.log"), `${JSON.stringify({ pm, args, cwd, production: process.env.npm_config_production })}\n`);
 
 const scenario = Scenario.parse(JSON.parse(readFileSync(join(dir, "scenario.json"), "utf8")));
 const ran = (what: string): void => appendFileSync(join(dir, "scripts-ran"), `${what}\n`);

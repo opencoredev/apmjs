@@ -16,7 +16,7 @@ import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerr
 import { addArgs, detectPm, frozenInstallArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
 import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Placed } from "./verify.ts";
-import { devGroup, omitArgs } from "./groups.ts";
+import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts";
 import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
@@ -807,11 +807,13 @@ type Released = { code: number; reinstalled: boolean; notRun: string[] };
  * checked lockfile after apm removed them (bun runs scripts only while it installs a package). A local package's
  * location comes from the lockfile's edges, not its version (finding 7). A folder outside node_modules (a link) is the
  * project's own: apm runs none of its scripts and says so. A rebuild fetches nothing: the registry is pinned in its
- * environment, as for every package manager apm runs.
+ * environment, as for every package manager apm runs. `group`: the dependency groups the install left out, which
+ * every rebuild and second install is told again (review of efef668, finding 1).
  */
-async function releaseScripts(input: { pm: LockPm; root: string; members: readonly string[]; fresh: readonly Placed[]; installed: readonly { path: string; name: string; version: string }[]; registry: string; scopes: string[]; quiet: boolean }): Promise<Released> {
+async function releaseScripts(input: { pm: LockPm; root: string; members: readonly string[]; fresh: readonly Placed[]; installed: readonly { path: string; name: string; version: string }[]; registry: string; scopes: string[]; group: DevGroup; quiet: boolean }): Promise<Released> {
   const { pm, root } = input;
-  const env = pmEnv(input.registry, input.scopes);
+  const omission = releaseOmission(pm, input.group);
+  const env = { ...pmEnv(input.registry, input.scopes), ...omission.env };
   const opts = { cwd: root, env, stdoutToStderr: jsonMode || input.quiet };
   const inModules = input.fresh.filter((p) => p.path.startsWith("node_modules/") || p.path.includes("/node_modules/"));
   const notRun = input.fresh.filter((p) => !inModules.includes(p)).map((p) => `${idOf(p)} (${p.path}) is a folder of your own, linked in: apm does not run its scripts`);
@@ -823,9 +825,9 @@ async function releaseScripts(input: { pm: LockPm; root: string; members: readon
     case "npm": {
       const dirs = inModules.map((p) => join(realRoot, ...p.path.split("/")));
 
-      say(dim(`→ npm rebuild ${inModules.map((p) => p.path).join(" ")}`));
+      say(dim(`→ npm rebuild ${[...omission.args, ...inModules.map((p) => p.path)].join(" ")}`));
 
-      return { code: (await runCmd(["npm", "rebuild", ...dirs], opts)).code, reinstalled: false, notRun };
+      return { code: (await runCmd(["npm", "rebuild", ...omission.args, ...dirs], opts)).code, reinstalled: false, notRun };
     }
 
     case "pnpm": {
@@ -852,7 +854,7 @@ async function releaseScripts(input: { pm: LockPm; root: string; members: readon
       }
 
       if (again.length === 0) return { code: 0, reinstalled: false, notRun };
-      const cmd = ["bun", "install", "--frozen-lockfile", ...registryArgs("bun", input.registry, input.scopes)];
+      const cmd = ["bun", "install", "--frozen-lockfile", ...omission.args, ...registryArgs("bun", input.registry, input.scopes)];
 
       say(dim(`→ ${cmd.join(" ")}  (installs ${again.map(idOf).join(", ")} again, running their install scripts; bun also runs your package.json's own install scripts)`));
 
@@ -918,7 +920,8 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
   const t = targets(layout);
   // a production install leaves devDependencies out: the whole lockfile is still checked, the install is told so, and
   // the check of what was installed lets them be missing (review of 2b7767f, finding 3)
-  const group = devGroup({ pm, root: layout.root, env: env(), production: flag(a, "omit") === "dev" || has(a, "prod") || has(a, "production") });
+  // read from the environment the install itself gets
+  const group = devGroup({ pm, root: layout.root, env: pmEnv(registry, input.scopes), production: flag(a, "omit") === "dev" || has(a, "prod") || has(a, "production") });
   const omit = omitArgs(pm, group);
   const copy = copyProject(layout);
 
@@ -1092,7 +1095,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     // bun installs packages again to run their scripts: what node_modules held just before is the baseline the second
     // check holds it to, so nothing new beside it passes as left from before (review of 2b7767f, finding 6)
     const beforeRelease = pm === "bun" ? installedPackages(layout.root, memberDirs).found : [];
-    const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, installed: held.installed, registry, scopes, quiet: false });
+    const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, installed: held.installed, registry, scopes, group, quiet: false });
 
     for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 
@@ -1529,7 +1532,7 @@ async function cmdX(a: Args): Promise<number> {
 
     // bun installs packages again to run their scripts: the second check holds node_modules to what it held just before
     const beforeRelease = xpm === "bun" ? installedPackages(dir, []).found : [];
-    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, installed: held.installed, registry: cfg.registry, scopes, quiet: true });
+    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, installed: held.installed, registry: cfg.registry, scopes, group: { kind: "include" }, quiet: true });
 
     for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 

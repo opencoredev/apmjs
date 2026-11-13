@@ -221,7 +221,7 @@ const Json = z.object({
     .nullish(),
 });
 
-type Run = { code: number; text: string; out: string; json: z.infer<typeof Json> | null; pmCalls: { args: string[]; cwd: string }[]; scripts: string[]; dir: string; fake: string; leftInTmp: string[] };
+type Run = { code: number; text: string; out: string; json: z.infer<typeof Json> | null; pmCalls: { args: string[]; cwd: string; production?: string }[]; scripts: string[]; dir: string; fake: string; leftInTmp: string[] };
 
 /** package.json fields a test project sets besides its name. */
 type PackageFields = { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; workspaces?: string[]; description?: string };
@@ -303,7 +303,7 @@ async function apmRun(input: {
 
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   const text = out + err;
-  const pmCalls = existsSync(join(fake, "pm.log")) ? readFileSync(join(fake, "pm.log"), "utf8").trim().split("\n").map((l) => z.object({ args: z.array(z.string()), cwd: z.string() }).parse(JSON.parse(l))) : [];
+  const pmCalls = existsSync(join(fake, "pm.log")) ? readFileSync(join(fake, "pm.log"), "utf8").trim().split("\n").map((l) => z.object({ args: z.array(z.string()), cwd: z.string(), production: z.string().optional() }).parse(JSON.parse(l))) : [];
   let json: z.infer<typeof Json> | null = null;
 
   if (cmd === "add") {
@@ -1025,22 +1025,23 @@ describe("review of 2b7767f", () => {
     const devonly = { name: "devonly", version: "1.0.0" };
     const tarball = (n: { name: string; version: string }): string => `${server.url.href}${n.name}/-/${n.name}-${n.version}.tgz`;
 
-    const locks: Record<Pm, () => string> = {
-      npm: () =>
+    // `script`: tool has an install script, so apm releases it after the check (a rebuild, or bun's second install)
+    const locks: Record<Pm, (script?: boolean) => string> = {
+      npm: (script) =>
         JSON.stringify({
           name: "project",
           lockfileVersion: 3,
           requires: true,
-          packages: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } }, "node_modules/tool": { version: "1.0.0", resolved: tarball(tool), integrity: integrity(tool) }, "node_modules/devonly": { version: "1.0.0", resolved: tarball(devonly), integrity: integrity(devonly), dev: true } },
+          packages: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } }, "node_modules/tool": { version: "1.0.0", resolved: tarball(tool), integrity: integrity(tool), hasInstallScript: script }, "node_modules/devonly": { version: "1.0.0", resolved: tarball(devonly), integrity: integrity(devonly), dev: true, hasInstallScript: script } },
         }),
-      pnpm: () =>
+      pnpm: (script) =>
         JSON.stringify({
           lockfileVersion: "9.0",
           importers: { ".": { dependencies: { tool: { specifier: "1.0.0", version: "1.0.0" } }, devDependencies: { devonly: { specifier: "1.0.0", version: "1.0.0" } } } },
-          packages: { "tool@1.0.0": { resolution: { integrity: integrity(tool) } }, "devonly@1.0.0": { resolution: { integrity: integrity(devonly) } } },
+          packages: { "tool@1.0.0": { resolution: { integrity: integrity(tool) }, requiresBuild: script }, "devonly@1.0.0": { resolution: { integrity: integrity(devonly) }, requiresBuild: script } },
           snapshots: { "tool@1.0.0": {}, "devonly@1.0.0": {} },
         }),
-      bun: () => JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } } }, packages: { tool: ["tool@1.0.0", "", {}, integrity(tool)], devonly: ["devonly@1.0.0", "", {}, integrity(devonly)] } }),
+      bun: (script) => JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } } }, packages: { tool: ["tool@1.0.0", "", { hasInstallScript: script }, integrity(tool)], devonly: ["devonly@1.0.0", "", { hasInstallScript: script }, integrity(devonly)] } }),
     };
 
     // how each package manager is asked for a production install, and the flag apm hands its frozen install
@@ -1065,6 +1066,29 @@ describe("review of 2b7767f", () => {
         expect(r.pmCalls.find((c) => c.cwd === r.dir)?.args, JSON.stringify(r.pmCalls)).toContain(ask.flag);
       });
 
+      // review of efef668, finding 1: the release keeps the omission, so bun's second install does not put devonly back
+      // asked by apm's own flag, which is in no environment the rebuild could inherit
+      test(`${pm}: the command that runs tool's held install script is told the omission again (on efef668: neither bun's second install nor npm's and pnpm's rebuild was)`, async () => {
+        const ask = asks[pm];
+        const r = await apmRun({ pm, pkg: { devDependencies: { devonly: "1.0.0" } }, before: null, after: { top: ["tool"], nodes: [tool] }, spec: "tool", strict: true, lockText: locks[pm](true), args: [pm === "npm" ? "--omit=dev" : pm === "pnpm" ? "--prod" : "--production"], scenario: { modules: [{ path: "node_modules/tool", ...tool }] } });
+        const inProject = r.pmCalls.filter((c) => c.cwd === r.dir);
+        const release = inProject.at(-1);
+
+        expect(r.code, r.text).toBe(0);
+        expect(r.json?.installed?.stage).toBe("done");
+        // the frozen install, then the release: npm and pnpm rebuild, bun installs again with scripts on
+        expect(inProject.length, JSON.stringify(r.pmCalls)).toBe(2);
+        expect(r.scripts.length, r.text).toBe(1);
+
+        if (pm === "pnpm") {
+          expect(release?.args[0]).toBe("rebuild");
+          expect(release?.production, JSON.stringify(release)).toBe("true");
+        } else {
+          expect(release?.args[0]).toBe(pm === "npm" ? "rebuild" : "install");
+          expect(release?.args, JSON.stringify(release)).toContain(ask.flag);
+        }
+      });
+
       test(`${pm}: without it, the same tree is missing the devDependency and is refused`, async () => {
         const r = await apmRun({ pm, pkg: { devDependencies: { devonly: "1.0.0" } }, before: null, after: { top: ["tool"], nodes: [tool] }, spec: "tool", strict: true, lockText: locks[pm](), scenario: { modules: [{ path: "node_modules/tool", ...tool }] } });
 
@@ -1072,6 +1096,32 @@ describe("review of 2b7767f", () => {
         expect(r.text).toContain("devonly (devonly@1.0.0), which your project needs, is not installed");
       });
     }
+  });
+
+  test("review of efef668, finding 2: strict npm, devonly left out, leaf below it installed without its child: refused at verify, no rebuild (on efef668: exit 0, npm rebuild node_modules/leaf)", async () => {
+    for (const id of ["prod@1.0.0", "devonly@1.0.0", "leaf@1.0.0", "child@1.0.0"]) states.set(id, "clean");
+    const entry = (name: string, extra: { dev?: true; dependencies?: Record<string, string>; hasInstallScript?: true } = {}) => ({ version: "1.0.0", resolved: `${server.url.href}${name}/-/${name}-1.0.0.tgz`, integrity: integrity({ name, version: "1.0.0" }), ...extra });
+
+    const lock = JSON.stringify({
+      name: "project",
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        "": { name: "project", dependencies: { prod: "1.0.0" }, devDependencies: { devonly: "1.0.0" } },
+        "node_modules/prod": entry("prod"),
+        "node_modules/devonly": entry("devonly", { dev: true, dependencies: { leaf: "1.0.0" } }),
+        "node_modules/leaf": entry("leaf", { dev: true, dependencies: { child: "1.0.0" }, hasInstallScript: true }),
+        "node_modules/child": entry("child", { dev: true }),
+      },
+    });
+
+    const r = await apmRun({ pm: "npm", pkg: { devDependencies: { devonly: "1.0.0" } }, before: null, after: { top: [], nodes: [] }, spec: "prod", strict: true, lockText: lock, env: { npm_config_omit: "dev" }, scenario: { modules: [{ path: "node_modules/prod", name: "prod", version: "1.0.0" }, { path: "node_modules/leaf", name: "leaf", version: "1.0.0" }] } });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.json?.installed?.stage).toBe("verify");
+    expect(r.text).toContain("child (child@1.0.0), which leaf@1.0.0 (node_modules/leaf) needs, is not installed");
+    expect(r.pmCalls.filter((c) => c.args[0] === "rebuild"), JSON.stringify(r.pmCalls)).toEqual([]);
+    expect(r.scripts).toEqual([]);
   });
 
   test("finding 5: pnpm leaves held the script of a version with an older copy, and says how to run it (on 2b7767f: pnpm rebuild leaf@1.0.0 ran both)", async () => {

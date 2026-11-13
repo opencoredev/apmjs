@@ -7,7 +7,7 @@
 // Real npm, pnpm and bun against the real registry. The registry's resolve walk predicts leaf@1.1.0 (old, clean); the
 // package managers keep or pin leaf@1.0.0, published an hour ago. Payloads are inert: install scripts write a marker.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -38,7 +38,7 @@ async function publish(spec: Parameters<typeof writePackage>[1]): Promise<void> 
 const marked = (mark: string, files: Record<string, string> = {}) => ({ scripts: { postinstall: "node mark.js" }, files: { "index.js": "module.exports = 1;\n", "mark.js": `require('fs').writeFileSync(require('path').join(process.env.APM_TEST_MARKS, '${mark}'), 'ran');\n`, ...files } });
 
 /** Every package with an install script: trusted (bun) and allowed to build (pnpm 10), so a test sees each script that runs. */
-const BUILT = ["transitive-root", "rtransitive-root", "peer-root", "override-root", "unlocked-plugin", "up", "nest-old", "nest-new", "nleaf", "ws-root"];
+const BUILT = ["transitive-root", "rtransitive-root", "peer-root", "override-root", "unlocked-plugin", "up", "nest-old", "nest-new", "nleaf", "ws-root", "devscript"];
 
 beforeAll(async () => {
   reg = await startRegistry({ now: () => clock });
@@ -68,6 +68,8 @@ beforeAll(async () => {
   await publish({ name: "helper-bin", version: "1.0.0", extra: { bin: { "helper-say": "say.js" } }, files: { "index.js": "module.exports = 1;\n", "say.js": "#!/usr/bin/env node\nconsole.log('helper says ' + process.argv.slice(2).join(' '));\n" } });
   // a project's devDependency, and a package it shares with the production graph
   await publish({ name: "devtool", version: "1.0.0", dependencies: { nleaf: "^1.0.0" } });
+  // a devDependency with an install script: a production install must neither install it nor run it
+  await publish({ name: "devscript", version: "1.0.0", ...marked("devscript") });
   await publish({ name: "xtool", version: "1.0.0", dependencies: { "helper-bin": "1.0.0" }, extra: { bin: { xtool: "cli.js" } }, files: { "index.js": "module.exports = 1;\n", "cli.js": "#!/usr/bin/env node\nrequire('child_process').execFileSync('helper-say', process.argv.slice(2), { stdio: 'inherit' });\n" } });
   clock += 10 * DAY;
   // an hour old: inside the 24-hour cooldown, and what the package managers below install
@@ -95,7 +97,7 @@ const Json = z.object({
 type Project = { root: string; app: string; env: Record<string, string>; marks: string; read: (file: string) => string | null; hash: () => ReturnType<typeof treeHash> };
 
 /** package.json fields a test project sets besides its dependencies. */
-type ProjectFields = { overrides?: Record<string, string>; resolutions?: Record<string, string>; pnpm?: { overrides: Record<string, string> }; dirty?: boolean; devDependencies?: Record<string, string> };
+type ProjectFields = { overrides?: Record<string, string>; resolutions?: Record<string, string>; pnpm?: { overrides: Record<string, string> }; dirty?: boolean; devDependencies?: Record<string, string>; npmrc?: (root: string) => string };
 
 /**
  * A project with `deps`, installed by `pm` itself when `install` is set (scripts on, then the markers cleared, so a test
@@ -112,6 +114,9 @@ async function project(input: { pm: Pm; deps: Record<string, string>; extra?: Pr
   mkdirSync(app, { recursive: true });
   writeProjectConfig(root, reg, alice);
 
+  // more .npmrc settings (a pnpm linker, say), after the registry's
+  if (input.extra?.npmrc !== undefined) appendFileSync(join(root, ".npmrc"), input.extra.npmrc(root));
+
   if (input.workspace) {
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "ws-top", version: "1.0.0", private: true, workspaces: ["packages/*"], ...trust }, null, 2));
     writeFileSync(join(root, "pnpm-workspace.yaml"), `packages:\n  - packages/*\nonlyBuiltDependencies:\n${BUILT.map((b) => `  - ${b}`).join("\n")}\n`);
@@ -119,7 +124,7 @@ async function project(input: { pm: Pm; deps: Record<string, string>; extra?: Pr
     writeFileSync(join(root, "packages", "other", "package.json"), JSON.stringify({ name: "other-member", version: "1.0.0", dependencies: { "nest-old": "1.0.0" } }, null, 2));
     writeFileSync(join(app, "package.json"), JSON.stringify({ name: "app-member", version: "1.0.0", dependencies: input.deps }, null, 2));
   } else {
-    const { dirty: _dirty, ...extra } = input.extra ?? {};
+    const { dirty: _dirty, npmrc: _npmrc, ...extra } = input.extra ?? {};
 
     writeFileSync(join(app, "package.json"), JSON.stringify({ name: "consumer-app", version: "1.0.0", private: true, dependencies: input.deps, ...trust, ...extra, pnpm: trust.pnpm }, null, 2));
   }
@@ -385,6 +390,49 @@ describe.each(PMS)("apm add with the real %s: a production install", (pm) => {
       if (pm !== "bun") expect(existsSync(join(p.root, "node_modules", "devtool")), r.out).toBe(false);
       // nleaf, which nest-old needs too, stays (pnpm keeps a package no folder lists directly in its store)
       expect(existsSync(join(p.root, "node_modules", ...(pm === "pnpm" ? [".pnpm", "nleaf@1.0.0", "node_modules"] : []), "nleaf", "package.json")), r.out).toBe(true);
+    });
+  }
+});
+
+// Review of efef668, finding 1: the add's own package has an install script, so apm releases it after the check, and
+// the project's devDependency has one too. The release (bun's second install, npm's and pnpm's rebuild) keeps the
+// production install's omission: devscript is neither installed nor run.
+describe.each(PMS)("apm add with the real %s: a production install that runs a script", (pm) => {
+  const asks: Record<Pm, { env: Record<string, string>; args: string[] }> = {
+    npm: { env: { npm_config_omit: "dev" }, args: [] },
+    pnpm: { env: { npm_config_production: "true" }, args: [] },
+    bun: { env: {}, args: ["--production"] },
+  };
+
+  test("up's script runs; devscript is not installed and its script never runs (on efef668, bun: devscript installed and run)", async () => {
+    const ask = asks[pm];
+    const p = await project({ pm, deps: {}, extra: { devDependencies: { devscript: "1.0.0" } }, install: false });
+    const r = await add({ ...p, env: { ...p.env, ...ask.env } }, ["up@1.0.0", "--pm", pm, ...ask.args]);
+
+    expect(r.code, r.out).toBe(0);
+    expect(r.json.installed?.stage, r.out).toBe("done");
+    expect(r.ran, r.out).toEqual(["up1"]);
+    expect(existsSync(join(p.root, "node_modules", "devscript")), r.out).toBe(false);
+  });
+});
+
+// Review of efef668, finding 5: pnpm's hoisted linker and a virtual store outside the project leave a .pnpm with only
+// its lock.yaml. Strict mode checks everything there is and passes.
+describe("apm add --strict with the real pnpm's other layouts", () => {
+  // what this add installs, and so whose scripts run: hoisted, pnpm moves nleaf@1.0.0 under nest-old to put nleaf@2.0.0
+  // at the top, so that copy is new too; the store keeps the old nleaf@1.0.0 where it was, and its script does not run
+  for (const [layout, npmrc, fresh] of [
+    ["node-linker=hoisted", () => "node-linker=hoisted\n", ["nest-new", "nleaf1", "nleaf2"]],
+    ["a virtual store outside the project", (root: string) => `virtual-store-dir=${root}-store\n`, ["nest-new", "nleaf2"]],
+  ] as const) {
+    test(`${layout}: a clean add passes and runs its scripts (on efef668: refused, node_modules/.pnpm not read)`, async () => {
+      const p = await project({ pm: "pnpm", deps: { "nest-old": "1.0.0" }, extra: { npmrc }, install: true });
+      const r = await add(p, ["nest-new", "--pm", "pnpm", "--strict"]);
+
+      expect(r.code, r.out).toBe(0);
+      expect(r.json.installed?.stage, r.out).toBe("done");
+      expect(r.out).not.toContain("not read:");
+      expect(r.ran, r.out).toEqual([...fresh]);
     });
   }
 });
