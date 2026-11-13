@@ -80,7 +80,7 @@ import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
-import { jsonBound, keptSummary, keptVersion, summaryVersion, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
+import { jsonBound, keptSummary, keptVersion, summaryVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -281,23 +281,37 @@ function rowWeights(v: VersionRecord): RowWeights {
 
 /**
  * The versions `select` picks of a local package, summarized under `lease`. Every version is read first as a head
- * (number, age, state), then only the picked ones whole, each charged while it is read: on 93274c8 a resolve of a
- * package with 230 versions read 2,300 whole rows over ten pages and charged none of them (finding 5). null when they
- * did not fit.
+ * (number, age, state), then only the picked ones whole: on 93274c8 a resolve of a package with 230 versions read 2,300
+ * whole rows over ten pages and charged none of them (finding 5). The picked rows' sizes are read first, and what
+ * reading them whole holds is reserved from those before any of them is sent; once they are here, the reservation is
+ * settled to what they weigh. On 1924692 the rows were read, then charged, so a one-byte pool still got a whole row
+ * (review of 1924692, finding 4). null when they did not fit.
  */
 const localWithin = (pkg: PackageRecord, lease: Lease, select: Select) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
     const heads = (yield* store.versionHeads(pkg.name)).map((h) => atTime(h, at));
-    const picked = select({ distTags: pkg.distTags, versions: heads });
-    const rows = new Map((yield* store.versionsIn(pkg.name, picked.map((h) => h.version))).map((v) => [v.version, atTime(v, at)]));
+    const picked = select({ distTags: pkg.distTags, versions: heads }).map((h) => h.version);
+    const reserved = (yield* store.versionSizes(pkg.name, picked)).reduce((n, s) => n + textReadWeight(s.manifest) + textReadWeight(s.score), 0);
+
+    if (!lease.take(reserved)) return null;
+    const got = yield* store.versionsIn(pkg.name, picked).pipe(Effect.onError(() => Effect.sync(() => lease.give(reserved))));
+    const rows = new Map(got.map((v) => [v.version, atTime(v, at)]));
     // in the order `select` wants them (a root's candidates, newest first)
-    const versions = picked.flatMap((h) => rows.get(h.version) ?? []);
+    const versions = picked.flatMap((version) => rows.get(version) ?? []);
     const weights = versions.map(rowWeights);
     const read = weights.reduce((n, w) => n + w.manifest + w.score, 0);
 
-    if (!lease.take(read)) return null;
+    // settled to what the rows weigh: a bound the sizes missed (a row changed between the reads, a number's longest
+    // text) is taken on top, or the read gives up
+    if (read > reserved && !lease.take(read - reserved)) {
+      lease.give(reserved);
+
+      return null;
+    }
+
+    if (read < reserved) lease.give(reserved - read);
     const kept = keptSummary({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions }, lease);
     // the whole manifests are given back once cut down; the scores stay, kept with the summary
     const scores = weights.reduce((n, w) => n + w.score, 0);

@@ -9,7 +9,7 @@
 // the weight was taken only after the summary existed, so the pool's peak missed it (review of 2fbf383, finding 3).
 import { z } from "zod";
 import { WEIGHTS } from "./packument-read.ts";
-import type { VersionRecord } from "./db.ts";
+import type { TextSize, VersionRecord } from "./db.ts";
 import type { Lease } from "./memory.ts";
 import type { UpstreamPackage } from "./upstream.ts";
 
@@ -75,6 +75,17 @@ export function jsonWeight(json: string): number {
   }
 
   return 2 * json.length * WEIGHTS.text + nodes * (WEIGHTS.container + WEIGHTS.dictKey) + objects * WEIGHTS.hiddenClass;
+}
+
+/**
+ * An upper bound on what reading a JSON column whose text the database measured (Store.versionSizes) holds at once:
+ * jsonWeight of that text, counted from its size (UTF-8 bytes are never fewer than its UTF-16 units), and the text
+ * itself while it is parsed (WEIGHTS.parse). Reserved before the row is read, so it is charged before it exists.
+ */
+export function textReadWeight(size: TextSize): number {
+  const parsed = 2 * size.octets * WEIGHTS.text + (1 + size.separators) * (WEIGHTS.container + WEIGHTS.dictKey) + size.objects * WEIGHTS.hiddenClass;
+
+  return parsed + WEIGHTS.parse * size.octets * WEIGHTS.text;
 }
 
 /** What one UTF-16 unit takes in JSON text at most: a quote, a backslash and the short escapes 2, other controls and any surrogate 6. */

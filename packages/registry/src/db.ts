@@ -88,6 +88,33 @@ const VersionHeadRow = VersionRow.pick({ version: true, published_at: true, seq:
 
 export type VersionHead = z.infer<typeof VersionHeadRow>;
 
+/**
+ * What a column's JSON text holds, counted in the database without sending the text: its length in UTF-8 bytes (never
+ * fewer than its UTF-16 units), the colons, commas and `[` in it, and the `{`. jsonWeight's terms (walk-catalog.ts).
+ */
+const TextSize = z.object({ octets: z.number().int().min(0), separators: z.number().int().min(0), objects: z.number().int().min(0) });
+
+export type TextSize = z.infer<typeof TextSize>;
+
+const VersionSizeRow = z
+  .object({
+    version: z.string(),
+    manifest_octets: z.number().int().min(0),
+    manifest_separators: z.number().int().min(0),
+    manifest_objects: z.number().int().min(0),
+    score_octets: z.number().int().min(0),
+    score_separators: z.number().int().min(0),
+    score_objects: z.number().int().min(0),
+  })
+  .transform((r) => ({
+    version: r.version,
+    manifest: TextSize.parse({ octets: r.manifest_octets, separators: r.manifest_separators, objects: r.manifest_objects }),
+    score: TextSize.parse({ octets: r.score_octets, separators: r.score_separators, objects: r.score_objects }),
+  }));
+
+/** The size of a version row's manifest and score, as versionSizes reads them: what reading the row whole holds. */
+export type VersionSize = z.output<typeof VersionSizeRow>;
+
 /** A version as far as the package text it wrote goes (withheld.ts): its description and keywords, unparsed. */
 const TextSourceRow = VersionRow.pick({ package: true, status: true, status_at: true, published_at: true, seq: true })
   .extend({ description: z.unknown(), keywords: z.unknown() })
@@ -352,6 +379,11 @@ export type StoreApi = {
   readonly versionHeads: (name: string) => Effect.Effect<VersionHead[], StoreError>;
   /** The given versions of a package, whole, in publish order; one it does not have is left out. */
   readonly versionsIn: (name: string, versions: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
+  /**
+   * The size of each given version's manifest and score, counted in the database, so a reader can reserve memory for
+   * the rows before versionsIn sends them. One it does not have is left out.
+   */
+  readonly versionSizes: (name: string, versions: readonly string[]) => Effect.Effect<VersionSize[], StoreError>;
   /**
    * Several packages' catalogs in a fixed number of statements (packages, versions, dismissals): each name this
    * registry has, with its dist-tags and its versions as listVersions gives them. Names it does not have are left out.
@@ -809,6 +841,21 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       versions.length === 0
         ? Effect.succeed([])
         : Effect.flatMap(run("versionsIn", sql`SELECT * FROM versions WHERE package = ${name} AND version = ANY(${[...versions]}) ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
+    versionSizes: (name, versions) =>
+      versions.length === 0
+        ? Effect.succeed([])
+        : run(
+            "versionSizes",
+            sql`SELECT version,
+                       octet_length(m)::int AS manifest_octets,
+                       (octet_length(m) - octet_length(translate(m, ':,[', '')))::int AS manifest_separators,
+                       (octet_length(m) - octet_length(replace(m, '{', '')))::int AS manifest_objects,
+                       octet_length(s)::int AS score_octets,
+                       (octet_length(s) - octet_length(translate(s, ':,[', '')))::int AS score_separators,
+                       (octet_length(s) - octet_length(replace(s, '{', '')))::int AS score_objects
+                FROM (SELECT version, manifest::text AS m, coalesce(score::text, '') AS s FROM versions WHERE package = ${name} AND version = ANY(${[...versions]})) AS t`,
+            all(VersionSizeRow),
+          ),
     catalogsOf: (names) =>
       Effect.gen(function* () {
         const out = new Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>();

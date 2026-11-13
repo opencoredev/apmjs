@@ -183,8 +183,11 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     return Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   };
 
-  /** Whole version rows (manifest and score) the store has read since the counter was reset, by any read. */
-  const whole = { rows: 0 };
+  /**
+   * Whole version rows (manifest and score) the store has read since the counter was reset, by any read, and what the
+   * request's pool had charged when each versionsIn read began.
+   */
+  const whole: { rows: number; chargedAtRead: number[]; pool: MemoryPool | null } = { rows: 0, chargedAtRead: [], pool: null };
 
   /** The real store, counting every whole version row it reads. */
   const countingStore = () =>
@@ -203,7 +206,12 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
           return Store.of({
             ...real,
             listVersions: (n) => Effect.map(real.listVersions(n), counted),
-            versionsIn: (n, vs) => Effect.map(real.versionsIn(n, vs), counted),
+            versionsIn: (n, vs) =>
+              Effect.suspend(() => {
+                whole.chargedAtRead.push(whole.pool?.charged ?? -1);
+
+                return Effect.map(real.versionsIn(n, vs), counted);
+              }),
             getVersion: (n, v) => Effect.map(real.getVersion(n, v), (row) => (row === null ? null : (counted([row])[0] ?? null))),
             catalogsOf: (ns) => Effect.map(real.catalogsOf(ns), (m) => (counted([...m.values()].flatMap((c) => c.versions)), m)),
             activeVersionsOf: (ns) => Effect.map(real.activeVersionsOf(ns), counted),
@@ -214,6 +222,7 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     );
 
   const resolve = async (name: string, params: Record<string, string> = {}, pool: MemoryPool = POOL) => {
+    whole.pool = pool;
     const u = new URL(`http://registry.test/-/apm/v1/resolve?${new URLSearchParams({ name, range: "latest", ...params })}`);
     const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, raw: await res.text() })));
     const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: null, legacyAuth: false, namePolicy: "open", admins: [] } as const;
@@ -419,6 +428,28 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       // on 93274c8: 0, nothing a local page held was charged
       expect(pool.peakCharged).toBeGreaterThan(0);
       expect(pool.charged).toBe(0);
+    });
+
+    // review of 1924692, finding 4: the picked rows were read whole, then charged, so a one-byte pool still got one
+    test("the picked rows are reserved before they are read: a one-byte pool refuses before any whole row comes", async () => {
+      whole.rows = 0;
+      whole.chargedAtRead = [];
+      const tiny = new MemoryPool(1);
+      const r = await resolve("fresh-root", {}, tiny);
+
+      // on 1924692: 503 too, but after one whole row was read with nothing charged
+      expect(r.status).toBe(503);
+      expect(whole.rows).toBe(0);
+      expect(whole.chargedAtRead).toEqual([]);
+      expect(tiny.charged).toBe(0);
+
+      // with room, the rows' reservation is already taken when the read begins
+      whole.chargedAtRead = [];
+      const roomy = new MemoryPool();
+      expect((await resolve("fresh-root", {}, roomy)).status).toBe(200);
+      expect(whole.chargedAtRead.length).toBeGreaterThan(0);
+      expect(whole.chargedAtRead.every((c) => c > 0)).toBe(true);
+      expect(roomy.charged).toBe(0);
     });
   });
 
