@@ -17,7 +17,7 @@ const inventory = new Map(files.map((f) => [relative(cwd, join(dir, f)), invento
 // TMPDIR that is removed afterwards, so repeated runs can't fill /tmp.
 const scratch = mkdtempSync(join(tmpdir(), "apm-score-run-"));
 const junitPath = join(scratch, "junit.xml");
-const proc = Bun.spawn(["bun", "test", "--timeout", "90000", "--reporter=junit", `--reporter-outfile=${junitPath}`, relative(cwd, dir) || "."], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, NO_COLOR: "1", TMPDIR: scratch } });
+const proc = Bun.spawn(["bun", "test", "--preload", join(import.meta.dir, "score-preload.ts"), "--timeout", "90000", "--reporter=junit", `--reporter-outfile=${junitPath}`, relative(cwd, dir) || "."], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, NO_COLOR: "1", TMPDIR: scratch } });
 let text: string;
 let junit = "";
 let exitCode: number;

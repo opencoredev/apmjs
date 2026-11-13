@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { declaredLines, declaredTests, focusedLines, gateScore } from "../../../scripts/score-gate.ts";
+import { declaredLines, declaredTests, focusedLines, gateScore, inventoryOf } from "../../../scripts/score-gate.ts";
 
 const SCORE = join(import.meta.dir, "..", "..", "..", "scripts", "score.ts");
 const base = mkdtempSync(join(tmpdir(), "apm-score-gate-"));
@@ -64,10 +64,30 @@ describe("scripts/score.ts", () => {
     const only = "import {describe,test,expect} from 'bun:test';\ndescribe.each([1,2,3])('row %s',()=>{\n  test.only('runs',()=>expect(1).toBe(1));\n});\ntest('must not disappear',()=>{throw new Error('unrun');});\n";
     const r = await score({ "only.test.ts": only });
 
-    expect(r.score, r.out).toBe("1");
+    // the run cannot narrow to the focused test (score-preload.ts makes .only an error), so the ordinary one runs too
+    expect(Number(r.score), r.out).toBeGreaterThanOrEqual(1);
     expect(r.code).toBe(1);
     expect(r.out).toContain("(focused) acceptance/only.test.ts:3");
-    expect(r.out).toContain("(not run) acceptance/only.test.ts:5: the test declared there never ran");
+    expect(r.out).toContain("(fail) must not disappear");
+  });
+
+  // review of efef668, finding 4: the reviewer's counterexample, a renamed import with .only.each
+  test("an aliased check.only.each fails the gate, and the ordinary check still runs (on efef668: 0, exit 0)", async () => {
+    const alias = "import {test as check,describe,expect} from 'bun:test';\ndescribe('aliased tests',()=>{\n  check.only.each([1,2,3])('focused %s',n=>expect(n).toBeGreaterThan(0));\n  check('must not disappear',()=>{throw new Error('unrun');});\n});\n";
+    const r = await score({ "alias.test.ts": alias });
+
+    expect(Number(r.score), r.out).toBeGreaterThanOrEqual(1);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("(focused) acceptance/alias.test.ts:3");
+    expect(r.out).toMatch(/declared=2 /);
+  });
+
+  test("a focus the source hides from the inventory still fails the run: .only reached through a function argument", async () => {
+    const hidden = "import { test } from 'bun:test';\nconst focus = (t: typeof test) => t.only;\nfocus(test)('focused', () => {});\ntest('ordinary', () => { throw new Error('unrun'); });\n";
+    const r = await score({ "hidden.test.ts": hidden });
+
+    expect(Number(r.score), r.out).toBeGreaterThanOrEqual(1);
+    expect(r.code).toBe(1);
   });
 
   test("a describe.only focuses the run too", async () => {
@@ -117,6 +137,42 @@ describe("gateScore", () => {
 
   test("focus is found in test.only, it.only, describe.only and .only( forms, not in comments", () => {
     expect(focusedLines('test.only("a", f);\nit.only("b", f);\ndescribe.only("c", f);\ndescribe.each([1]).only("d", f);\n// test.only is refused\ntest("e", f);\n')).toEqual([1, 2, 3, 4]);
+  });
+
+  test("review of efef668, finding 4: tests and focus found through renamed imports, namespaces, require and aliases", () => {
+    const src = [
+      "import { test as check, it as spec, describe as group } from 'bun:test';",
+      "import * as bt from 'bun:test';",
+      "const { test: t2 } = require('bun:test');",
+      "const fit = check.only;",
+      "const later = t3;",
+      "const t3 = bt.test;",
+      "group('g', () => {",
+      "  check('a', f);",
+      "  spec.skip('b', f);",
+      "  check.only.each([1, 2])('c %d', f);",
+      "  bt.it('d', f);",
+      "  t2.if(true)('e', f);",
+      "  fit('f', f);",
+      "  later('g', f);",
+      "  bt['test']['only']('h', f);",
+      "  group.each([1])('i', () => {});",
+      "  check.each.only;",
+      "  other('not a test', f);",
+      "  (check as typeof check).todo('j');",
+      "});",
+      "// check.only in a comment is not a focus",
+      "const s = 'check.only(\"not code\")';",
+    ].join("\n");
+
+    const inv = inventoryOf(src);
+
+    expect(inv.declared).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 19]);
+    expect(inv.focused).toEqual([4, 10, 13, 15]);
+  });
+
+  test("a renamed import declares tests under its new name", () => {
+    expect(inventoryOf("import { test as check } from 'bun:test';\ncheck('a', f);\n").declared).toEqual([2]);
   });
 
   test("declarations count test.each and test.skip, not describe", () => {
