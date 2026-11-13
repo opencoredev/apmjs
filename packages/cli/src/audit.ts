@@ -172,7 +172,21 @@ export function installedPackages(root: string, members: readonly string[] = [])
   // pnpm's virtual store outside the project (virtual-store-dir): its packages are installed too, at paths from "../"
   const external = externalStore(root);
 
-  if (external !== null && once(external)) visitStore(external, 0);
+  switch (external.kind) {
+    case "none":
+      break;
+    case "store":
+      if (once(external.path)) visitStore(external.path, 0);
+      break;
+    case "unreadable":
+      unchecked.push({ id: rel(external.path), reason: external.reason });
+      break;
+    default: {
+      const _exhaustive: never = external;
+
+      return _exhaustive;
+    }
+  }
 
   return { packages, found, unchecked };
 }
@@ -180,23 +194,57 @@ export function installedPackages(root: string, members: readonly string[] = [])
 const ModulesYaml = z.object({ virtualStoreDir: z.string() }).loose();
 
 /**
- * The virtual store pnpm's node_modules/.modules.yaml names, when it is a directory outside node_modules (pnpm's
- * virtual-store-dir). Null for the usual node_modules/.pnpm, or when there is no such file.
+ * pnpm's virtual store outside the project, as node_modules/.modules.yaml names it (virtual-store-dir). `none`: no
+ * such file, the usual store inside node_modules, or a store that is not there. `unreadable`: the file or the store
+ * could not be inspected (review of a24c6aa, finding 5): a parent directory that denies search hid the store, and the
+ * strict check went on as if there were none. It is reported at the path apm tried.
  */
-function externalStore(root: string): string | null {
+type ExternalStore = { kind: "none" } | { kind: "store"; path: string } | { kind: "unreadable"; path: string; reason: string };
+
+/** A failed file system call's error code, as node gives it. */
+const Errno = z.object({ code: z.string() });
+
+function externalStore(root: string): ExternalStore {
   const nm = join(root, "node_modules");
+  const file = join(nm, ".modules.yaml");
+  let text: string;
 
   try {
-    const m = ModulesYaml.safeParse(Bun.YAML.parse(readFileSync(join(nm, ".modules.yaml"), "utf8")));
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    const code = Errno.safeParse(e).data?.code ?? "unknown error";
 
-    if (!m.success) return null;
-    const store = realOf(resolve(nm, m.data.virtualStoreDir));
-    const inside = realOf(nm);
-
-    return isDir(store) && store !== inside && !store.startsWith(`${inside}${sep}`) ? store : null;
-  } catch {
-    return null;
+    return code === "ENOENT" || code === "ENOTDIR" ? { kind: "none" } : { kind: "unreadable", path: file, reason: `pnpm's metadata could not be read (${code})` };
   }
+
+  let parsed: unknown;
+
+  try {
+    parsed = Bun.YAML.parse(text);
+  } catch {
+    return { kind: "unreadable", path: file, reason: "pnpm's metadata is not YAML" };
+  }
+
+  const m = ModulesYaml.safeParse(parsed);
+
+  // a .modules.yaml that names no virtual store is not one apm can follow; the store, if any, is node_modules/.pnpm
+  if (!m.success) return { kind: "none" };
+  const store = resolve(nm, m.data.virtualStoreDir);
+  const [real, inside] = [realOf(store), realOf(nm)];
+
+  // the usual node_modules/.pnpm: the walk of node_modules reads it, and reports what it cannot
+  if (real === inside || real.startsWith(`${inside}${sep}`)) return { kind: "none" };
+  let isDirectory: boolean;
+
+  try {
+    isDirectory = statSync(store).isDirectory();
+  } catch (e) {
+    const code = Errno.safeParse(e).data?.code ?? "unknown error";
+
+    return code === "ENOENT" || code === "ENOTDIR" ? { kind: "none" } : { kind: "unreadable", path: store, reason: `pnpm's virtual store could not be inspected (${code})` };
+  }
+
+  return isDirectory ? { kind: "store", path: real } : { kind: "unreadable", path: store, reason: "pnpm's virtual store is not a directory" };
 }
 
 function isLink(p: string): boolean {

@@ -3,7 +3,7 @@
 import { describe, test, expect } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { installedPackages, isValidRange } from "../src/audit.ts";
 import { childEnv, isSecretEnvKey, registryArgs, scopeOverrides, scopesOf } from "../src/child.ts";
 import { isApmToken, loadConfig } from "../src/config.ts";
@@ -171,6 +171,45 @@ describe("installedPackages", () => {
     const ids = installedPackages(root).unchecked.map((u) => u.id).sort();
 
     expect(ids).toEqual([join("node_modules", ".bun", "lock.yaml"), join("node_modules", ".pnpm", "payload.js"), join("node_modules", ".pnpm", "x@1.0.0")]);
+  });
+
+  // review of a24c6aa, finding 5: a configured external store that cannot be inspected is not "no store"
+  test("an external store behind a parent that denies search, or pnpm metadata that cannot be read, is reported (on a24c6aa: nothing)", () => {
+    const root = dir();
+    const nm = join(root, "node_modules");
+    const parent = join(root, "private");
+    const store = join(parent, "store");
+
+    mkdirSync(store, { recursive: true });
+    mkdirSync(nm, { recursive: true });
+    writeFileSync(join(store, "payload.js"), "x");
+    writeFileSync(join(nm, ".modules.yaml"), `virtualStoreDir: ${store}\n`);
+
+    // readable: the store is walked and its unknown file reported
+    expect(installedPackages(root).unchecked.map((u) => u.reason)).toEqual(["not a package directory of the package store"]);
+    chmodSync(parent, 0o000);
+
+    try {
+      expect(installedPackages(root).unchecked).toEqual([{ id: relative(root, store), reason: "pnpm's virtual store could not be inspected (EACCES)" }]);
+    } finally {
+      chmodSync(parent, 0o700);
+    }
+
+    chmodSync(join(nm, ".modules.yaml"), 0o000);
+
+    try {
+      expect(installedPackages(root).unchecked).toEqual([{ id: join("node_modules", ".modules.yaml"), reason: "pnpm's metadata could not be read (EACCES)" }]);
+    } finally {
+      chmodSync(join(nm, ".modules.yaml"), 0o600);
+    }
+
+    writeFileSync(join(nm, ".modules.yaml"), "virtualStoreDir: [unclosed\n");
+    expect(installedPackages(root).unchecked).toEqual([{ id: join("node_modules", ".modules.yaml"), reason: "pnpm's metadata is not YAML" }]);
+    writeFileSync(join(nm, ".modules.yaml"), `virtualStoreDir: ${join(store, "payload.js")}\n`);
+    expect(installedPackages(root).unchecked).toEqual([{ id: relative(root, join(store, "payload.js")), reason: "pnpm's virtual store is not a directory" }]);
+    // a store that is not there holds nothing: no store
+    writeFileSync(join(nm, ".modules.yaml"), `virtualStoreDir: ${join(parent, "gone")}\n`);
+    expect(installedPackages(root).unchecked).toEqual([]);
   });
 
   test("a store that cannot be listed is still reported", () => {

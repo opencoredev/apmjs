@@ -1212,3 +1212,40 @@ describe("review of 2b7767f", () => {
     expect(r.leftInTmp.some((x) => x.startsWith("apm-backup")), r.text).toBe(true);
   });
 });
+
+// Review of a24c6aa, finding 5: a pnpm virtual store outside the project, behind a parent directory that denies
+// search, read as no store at all: strict mode found nothing unreadable, finished and ran tool's script.
+describe("review of a24c6aa", () => {
+  test("finding 5: an external store behind a parent that denies search is unreadable, and strict refuses before any script (on a24c6aa: done, pnpm rebuild ran)", async () => {
+    for (const denied of [false, true]) {
+      let parent = "";
+
+      const prepare = (dir: string): void => {
+        parent = join(dir, "..", "private");
+        const store = join(parent, "store");
+
+        mkdirSync(store, { recursive: true });
+        writeFileSync(join(store, "payload.js"), "unexplained");
+        mkdirSync(join(dir, "node_modules", ".pnpm"), { recursive: true });
+        writeFileSync(join(dir, "node_modules", ".pnpm", "lock.yaml"), "lockfileVersion: '9.0'\n");
+        writeFileSync(join(dir, "node_modules", ".modules.yaml"), `virtualStoreDir: ${store}\n`);
+
+        if (denied) chmodSync(parent, 0o000);
+      };
+
+      let r: Run;
+
+      try {
+        r = await apmRun({ pm: "pnpm", pkg: {}, before: null, after: { top: ["tool"], nodes: [{ name: "tool", version: "1.0.0", script: true }] }, spec: "tool", strict: true, scenario: { keep: true }, prepare });
+      } finally {
+        if (parent !== "") chmodSync(parent, 0o700);
+      }
+
+      // readable: the unknown payload.js is reported; denied: the store itself, at the path apm tried
+      expect(r.code, r.text).toBe(1);
+      expect(r.json?.installed?.stage, r.text).toBe("verify");
+      expect(r.scripts, r.text).toEqual([]);
+      expect(r.text).toContain(denied ? "pnpm's virtual store could not be inspected (EACCES)" : "payload.js");
+    }
+  });
+});
