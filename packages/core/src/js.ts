@@ -6,6 +6,7 @@
 // is run.
 import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberExpression, NewExpression, Node, Pattern, Program, SpreadElement, TaggedTemplateExpression, TemplateLiteral } from "acorn";
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
+import { Allowance, charge, chargeNow, chargeText, CHARS_PER_UNIT, inPhase } from "./meter.ts";
 import { MAX_DECODER_STEPS, runDecoder, type Known } from "./decode.ts";
 import { Flow, FlowExhausted, MAX_FLOW_WORK, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
@@ -248,7 +249,10 @@ function newScope(parent: Scope | null, kind: Scope["kind"]): Scope {
 function varScope(s: Scope): Scope {
   let cur = s;
 
-  while (cur.kind !== "function" && cur.parent) cur = cur.parent;
+  while (cur.kind !== "function" && cur.parent) {
+    charge("scope", 1);
+    cur = cur.parent;
+  }
 
   return cur;
 }
@@ -414,6 +418,8 @@ function buildScopes(program: Program): Scopes {
   const stack: [AnyNode, Scope][] = [[program, root]];
 
   const push = (scope: Scope, nodes: readonly (AnyNode | null | undefined)[]): void => {
+    charge("scope", nodes.length);
+
     for (const c of nodes) if (c) stack.push([c, scope]);
   };
 
@@ -427,6 +433,8 @@ function buildScopes(program: Program): Scopes {
 
   for (let item = stack.pop(); item; item = stack.pop()) {
     const [n, scope] = item;
+
+    charge("scope", 2);
 
     if (isTypeOnly(n)) continue;
 
@@ -581,6 +589,8 @@ function lookup(scopeOf: ReadonlyMap<AnyNode, Scope>, id: Identifier): Binding |
   let crossedWith = false;
 
   for (let s = scopeOf.get(id) ?? null; s; s = s.parent) {
+    // one scope looked in: a name used deep inside nested functions climbs every one of them
+    chargeNow(1);
     const b = s.names.get(id.name);
 
     if (b) return crossedWith ? "dynamic" : b;
@@ -688,7 +698,27 @@ const MAX_EVAL_DEPTH = 3;
  * limits it ran into. A limit never hides anything: what was past it is read as unknown, so only the text rules (the
  * floor every finding starts from) judge it, and the limit is named in the score's not-checked list.
  */
-type Budget = { decoded: number; notes: Set<string>; decoder: { steps: number } };
+type Budget = {
+  decoded: number;
+  notes: Set<string>;
+  decoder: Allowance;
+  /** Constant strings the file's reading may build (constant folding), carved out of the meter. */
+  fold: Allowance;
+  /** Limits a nested reading (code run from a string) hit that make the file incomplete, for the outer reader. */
+  stopped: string[];
+};
+
+/**
+ * Characters of constant strings one file's reading may build, all strings together: a million, and 16 for each
+ * character of the file. A string is built from pieces the file holds, so ordinary code builds about as much as it
+ * holds; `const s1=s0+s0` doubled 23 times builds 16 million characters from 435 bytes.
+ */
+const FOLD_BASE_CHARS = 1024 * 1024;
+const FOLD_CHARS_PER_CHAR = 16;
+
+function foldUnits(fileChars: number): number {
+  return Math.ceil((FOLD_BASE_CHARS + FOLD_CHARS_PER_CHAR * fileChars) / CHARS_PER_UNIT);
+}
 
 /**
  * Why a reading stopped short, as the not-checked list names it, followed by the files. Past each limit the text rules
@@ -701,6 +731,7 @@ const LIMIT_NOTES = {
   depth: "values nested more than 24 levels deep",
   evalDepth: "code run from a string more than 3 levels deep",
   decoded: "more than 256 KB of decoded text in one file",
+  fold: "constant strings built past the file's allowance (a million characters and 16 for each of the file's)",
   flow: "a value passed through more than 32 steps",
 } as const;
 
@@ -855,6 +886,7 @@ function refKey(r: Ref): string {
  * was not followed is left to the text rules.
  */
 function distinct(refs: readonly Ref[], notes?: Set<string>): Ref[] {
+  chargeNow(1 + refs.length);
   const out: Ref[] = [];
   const seen = new Set<string>();
   const nodes = new Set<AnyNode | null>();
@@ -1144,12 +1176,14 @@ class Reader {
     private readonly depth: number,
     private readonly budget: Budget,
   ) {
-    this.scopes = buildScopes(program);
+    this.scopes = inPhase("scope", () => buildScopes(program));
   }
 
   read(): void {
-    this.markData();
-    this.visit(this.program, "plain");
+    inPhase("read", () => {
+      this.markData();
+      this.visit(this.program, "plain");
+    });
 
     for (const at of this.envDumps) {
       const near = this.netCalls.filter((c) => Math.abs(c.at - at) <= NEAR);
@@ -1164,15 +1198,17 @@ class Reader {
     if (this.depth > 0) return;
 
     try {
-      this.flow = new Flow({
-        program: this.program,
-        calls: this.sites,
-        refsOf: (n) => this.resolveAll(n),
-        bindingOf: (id) => this.bindingOf(id),
-        str: (n) => this.str(n),
-        returnedBy: (fn) => returnedBy(fn).nodes,
-        limit: () => this.budget.notes.add(LIMIT_NOTES.flow),
-      }).read();
+      this.flow = inPhase("flow", () =>
+        new Flow({
+          program: this.program,
+          calls: this.sites,
+          refsOf: (n) => this.resolveAll(n),
+          bindingOf: (id) => this.bindingOf(id),
+          str: (n) => this.str(n),
+          returnedBy: (fn) => returnedBy(fn).nodes,
+          limit: () => this.budget.notes.add(LIMIT_NOTES.flow),
+        }).read(),
+      );
 
       // text the program writes to a file and then loads runs as code
       for (const w of this.flow.ranWritten) this.hold(w.at, w.code, "run");
@@ -1298,6 +1334,7 @@ class Reader {
     if (cached) return cached;
 
     if (this.tooDeep()) return [UNKNOWN_REF];
+    chargeNow(2);
     // a value that refers back to itself reads as unknown
     this.resolveCache.set(node, [UNKNOWN_REF]);
     this.resolving++;
@@ -1744,6 +1781,7 @@ class Reader {
     const cached = this.strCache.get(n);
 
     if (cached !== undefined) return cached;
+    chargeNow(2);
     this.strCache.set(n, null);
     const s = this.tooDeep() ? null : this.strNode(n);
     this.strCache.set(n, s);
@@ -1771,6 +1809,8 @@ class Reader {
         if ((!l || l.numeric) && (!r || r.numeric)) return null;
         const a = l ?? unknownStr();
         const b = r ?? unknownStr();
+
+        if (!this.folds(a.value.length + b.value.length, n.start)) return null;
 
         return { value: a.value + b.value, exact: a.exact && b.exact, how: strongerHow(strongerHow(a.how, b.how), "after joining strings"), pieces: a.pieces + b.pieces, via: a.via ?? b.via, numeric: false };
       }
@@ -1837,6 +1877,8 @@ class Reader {
 
       if (!q) continue;
       const cooked = q.value.cooked ?? q.value.raw;
+
+      if (!this.folds(value.length + cooked.length, n.start)) return null;
       value += cooked;
 
       if (cooked) {
@@ -1851,6 +1893,7 @@ class Reader {
       const s = this.str(e);
 
       if (s) {
+        if (!this.folds(value.length + s.value.length, n.start)) return null;
         value += s.value;
         pieces += s.pieces;
         how = strongerHow(how, s.how);
@@ -1867,10 +1910,12 @@ class Reader {
     return known ? { value, exact, how, pieces, via, numeric: false } : null;
   }
 
+  /** A decoded string the file's decoded-text budget still has room for; null (and the limit noted) when it has none. */
   private decoded(value: string | null, from: Str, via: string): Str | null {
     if (value === null) return null;
 
-    if (this.budget.decoded <= 0) {
+    // the whole result must fit: one large decode cannot go past what is left
+    if (value.length > this.budget.decoded) {
       this.budget.notes.add(LIMIT_NOTES.decoded);
 
       return null;
@@ -1879,6 +1924,51 @@ class Reader {
     this.budget.decoded -= value.length;
 
     return { value, exact: true, how: "decoded", pieces: from.pieces, via, numeric: false };
+  }
+
+  /**
+   * Runs a built-in decoder (`atob`, `Buffer.from(…, 'base64' | 'hex')`, URI decoding) on `from` once the file's
+   * decoded-text budget has room for what it can give, which is never longer than its input: so the check comes before
+   * the decode does any work, and a decode past the budget is code apm did not read, which makes the file incomplete.
+   */
+  private decodedBy(from: Str, via: string, at: number, decode: () => string | null): Str | null {
+    if (from.value.length > this.budget.decoded) {
+      this.budget.notes.add(LIMIT_NOTES.decoded);
+      this.stop(at, `decodes ${via} past the ${MAX_DECODED_BYTES / 1024} KB of decoded text apm reads in one file, so what it decodes there was not read`);
+
+      return null;
+    }
+
+    chargeText("decode", from.value.length, 3);
+
+    return this.decoded(decode(), from, via);
+  }
+
+  /** A limit that leaves code unread: the file is incomplete. A nested reading hands it to the outer one. */
+  private stop(at: number, why: string): void {
+    if (this.depth > 0) {
+      if (this.budget.stopped.length < MAX_EXECUTED) this.budget.stopped.push(why);
+    } else if (this.unread.length < MAX_EXECUTED && !this.unread.some((u) => u.why === why)) this.unread.push({ at, why });
+  }
+
+  /**
+   * Charges building a constant string of `chars` characters to the file's folding allowance (and so the meter) before
+   * it is built. Past the allowance the string is unknown and the file is incomplete: `const s1=s0+s0` doubled 23
+   * times would build 8 MB from 435 bytes.
+   */
+  private folds(chars: number, at: number): boolean {
+    const units = Math.ceil(chars / CHARS_PER_UNIT) + 1;
+
+    if (this.budget.fold.fits(units)) {
+      this.budget.fold.take(units);
+
+      return true;
+    }
+
+    this.budget.notes.add(LIMIT_NOTES.fold);
+    this.stop(at, "builds constant strings past what apm works out in one file (a million characters and 16 for each of the file's), so the strings past that are not known");
+
+    return false;
   }
 
   private strCall(n: CallExpression): Str | null {
@@ -1891,7 +1981,7 @@ class Reader {
     const args = n.arguments.filter((a): a is Expression => a.type !== "SpreadElement");
     const a0 = args[0] ? this.str(args[0]) : null;
 
-    if (name === "atob") return a0?.exact ? this.decoded(decodeBase64(a0.value), a0, "base64") : null;
+    if (name === "atob") return a0?.exact ? this.decodedBy(a0, "base64", n.start, () => decodeBase64(a0.value)) : null;
 
     if (name === "Buffer.from") {
       if (!a0?.exact) return null;
@@ -1899,9 +1989,9 @@ class Reader {
 
       if (!enc) return a0;
 
-      if (enc.value === "base64" || enc.value === "base64url") return this.decoded(decodeBase64(a0.value), a0, "base64");
+      if (enc.value === "base64" || enc.value === "base64url") return this.decodedBy(a0, "base64", n.start, () => decodeBase64(a0.value));
 
-      if (enc.value === "hex") return /^(?:[0-9a-fA-F]{2})+$/.test(a0.value) ? this.decoded(Buffer.from(a0.value, "hex").toString("latin1"), a0, "hex") : null;
+      if (enc.value === "hex") return this.decodedBy(a0, "hex", n.start, () => (/^(?:[0-9a-fA-F]{2})+$/.test(a0.value) ? Buffer.from(a0.value, "hex").toString("latin1") : null));
 
       return a0;
     }
@@ -1911,11 +2001,13 @@ class Reader {
     if (name === "decodeURIComponent" || name === "decodeURI" || name === "unescape") {
       if (!a0?.exact) return null;
 
-      try {
-        return this.decoded(name === "unescape" ? unescape(a0.value) : decodeURIComponent(a0.value), a0, "URI escapes");
-      } catch {
-        return null;
-      }
+      return this.decodedBy(a0, "URI escapes", n.start, () => {
+        try {
+          return name === "unescape" ? unescape(a0.value) : decodeURIComponent(a0.value);
+        } catch {
+          return null;
+        }
+      });
     }
 
     if (name === "String") return a0;
@@ -1932,6 +2024,9 @@ class Reader {
 
       if (!parts) return null;
       const sep = a0?.exact ? a0.value : ",";
+
+      // the length is known before the string is built: charged first, and refused past the file's allowance
+      if (!this.folds(parts.reduce((k, p) => k + p.value.length, 0) + sep.length * Math.max(0, parts.length - 1), n.start)) return null;
 
       return { value: parts.map((p) => p.value).join(sep), exact: parts.every((p) => p.exact), how: "after joining strings", pieces: parts.reduce((k, p) => k + p.pieces, 0), via: null, numeric: false };
     }
@@ -1951,6 +2046,7 @@ class Reader {
         for (const a of args) {
           const s = this.str(a);
 
+          if (!this.folds(out.value.length + (s?.value ?? UNKNOWN).length, n.start)) return null;
           out = { value: out.value + (s?.value ?? UNKNOWN), exact: out.exact && (s?.exact ?? false), how: "after joining strings", pieces: out.pieces + (s?.pieces ?? 0), via: out.via, numeric: false };
         }
 
@@ -2125,7 +2221,10 @@ class Reader {
       }
     }
 
-    if (!codes || codes.length === 0 || codes.some((c) => c < 0 || c > 0xffff)) return null;
+    if (!codes || codes.length === 0) return null;
+    chargeNow(codes.length);
+
+    if (codes.some((c) => c < 0 || c > 0xffff)) return null;
     const from: Str = { value: "", exact: true, how: "as written", pieces: codes.length, via: null, numeric: false };
 
     return this.decoded(String.fromCharCode(...codes.slice(0, 65536)), from, "char codes");
@@ -2136,6 +2235,9 @@ class Reader {
   private stringAt(s: Str, n: AnyNode, role: Role, raw: string | null): void {
     if (role === "none" || s.numeric) return;
     const at = n.start;
+
+    // the tests below each read the string once
+    chargeText("read", s.value.length + (raw?.length ?? 0), 8);
 
     if (raw !== null && escapedTextAt(raw) >= 0) this.add("obfuscated", at, STRENGTH.string, "as written", "confirmed", "");
 
@@ -2173,9 +2275,13 @@ class Reader {
 
     // a payload that is still encoded: decoded here only to see what it hides; apm did not see the code decode it
     if (BASE64.test(s.value) && /[0-9+/=]/.test(s.value)) {
-      const plain = decodeBase64(s.value);
+      // decoded only while the budget has room for all of it (a base64 string decodes to three quarters of its length)
+      const room = Math.ceil((s.value.length * 3) / 4) <= this.budget.decoded;
 
-      if (plain && printable(plain) && this.budget.decoded <= 0) this.budget.notes.add(LIMIT_NOTES.decoded);
+      if (room) chargeText("decode", s.value.length, 3);
+      const plain = room ? decodeBase64(s.value) : null;
+
+      if (!room) this.budget.notes.add(LIMIT_NOTES.decoded);
       else if (plain && printable(plain)) {
         this.budget.decoded -= plain.length;
         this.decodedText({ value: plain, exact: true, how: "decoded", pieces: 1, via: "base64", numeric: false }, at, "plain");
@@ -2191,6 +2297,8 @@ class Reader {
   /** Keeps code held in a string for score.ts to read, within the file's decoded-text budget. */
   private hold(at: number, code: string, origin: Executed["origin"]): void {
     if (this.depth > 0) return;
+
+    if (code.length > MAX_HELD_CHARS) chargeText("held", code.length, 2);
     const held = code.length > MAX_HELD_CHARS ? squeeze(code) : code;
 
     // code it runs is never dropped unread: past either limit, the analysis says so
@@ -3145,6 +3253,7 @@ function innerHits(code: string, depth: number, budget: Budget): Inner {
 
   if (depth <= MAX_EVAL_DEPTH && budget.decoded > 0) {
     budget.decoded -= code.length;
+    chargeText("held", code.length);
     const r = readText(code, "js", depth, budget);
 
     if (r.outcome === "parsed") {
@@ -3197,7 +3306,7 @@ function bestPerSignal(hits: readonly Hit[]): Hit[] {
  * the caller then reads it raw, the way apm-score-v3 read every file.
  */
 export function scanJs(text: string, dialect: Dialect): JsScan {
-  const budget: Budget = { decoded: MAX_DECODED_BYTES, notes: new Set(), decoder: { steps: MAX_FILE_DECODER_STEPS } };
+  const budget: Budget = { decoded: MAX_DECODED_BYTES, notes: new Set(), decoder: new Allowance("decode", MAX_FILE_DECODER_STEPS), fold: new Allowance("fold", foldUnits(text.length)), stopped: [] };
   const r = readText(text, dialect, 0, budget);
 
   if (r.outcome !== "parsed") return { kind: "failed", reason: r.outcome };
@@ -3243,6 +3352,9 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
 
   const unread: Unread[] = once(r.reads.flatMap((x) => x.unread), (u) => `${u.at}`).map((u) => ({ ...lineOf(text, u.at), why: u.why }));
 
+  // a limit code run from a string hit, cited at the file's first line since that code has no line of its own here
+  for (const why of new Set(budget.stopped)) unread.push({ ...lineOf(text, 0), why: `code it runs from a string ${why}` });
+
   for (const rec of once(r.reads.flatMap((x) => x.flow.recovered), (x) => `${x.at} ${x.ranges.join(";")}`)) {
     for (const [from, to] of rec.ranges) {
       const got = leftOut ? recoveredText(text, leftOut, from, to) : null;
@@ -3277,6 +3389,10 @@ function recoveredText(text: string, l: LeftOut, from: number, to: number): { co
   // what the comments and regex bodies in the range hold; recovered text matters only when they name a dangerous call
   const pieces: string[] = [];
   const blanks: Range[] = [];
+
+  // every comment and regex is looked at for each range, and the range's text is copied, blanked and squeezed
+  charge("held", l.comments.length + l.regexes.length);
+  chargeText("held", to - from, 4);
 
   for (const [a, b] of l.comments) {
     if (a < from || b > to) continue;

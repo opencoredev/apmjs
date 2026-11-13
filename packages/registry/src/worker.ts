@@ -312,13 +312,18 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
   }
 }
 
-/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. */
+/** Requeues analyses the platform stopped: every run that began and never stored anything (analysis.ts, `recover`). */
+const recoverAnalyses = Effect.flatMap(Analysis, (a) => a.recover).pipe(
+  Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "analysis-recover", requeued: n }))) : Effect.void)),
+);
+
+/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. Requeues analyses the platform stopped. */
 export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged, sweepConfirmations], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

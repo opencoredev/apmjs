@@ -13,6 +13,8 @@ export { decodedStrings, joinStrings, type Built, type Decoded, type Joined } fr
 
 export { namedSignal, type CodeSignal, type Confidence, type Hidden, type TextFinding, type Where } from "./rules.ts";
 
+import { chargeText } from "./meter.ts";
+
 export type { Command, EnvRead, ExecutedCode, FlowFinding, Imports, Unread } from "./js.ts";
 
 /**
@@ -24,6 +26,8 @@ export type Lang = Dialect | "c" | "python" | "json" | "declaration" | "plain";
 
 /** The language a file is read as: by extension, then by a node/bun/deno shebang. */
 export function langOf(path: string, text: string): Lang {
+  chargeText("text", path.length, 9);
+
   if (/\.json$/i.test(path)) return "json";
 
   if (/\.d\.[cm]?ts$/i.test(path)) return "declaration";
@@ -40,7 +44,14 @@ export function langOf(path: string, text: string): Lang {
 
   if (/\.py$/i.test(path)) return "python";
 
-  if (!/\.[^/]+$/.test(path) && /^#!.*\b(?:node|bun|deno)\b/.test(text)) return "js";
+  if (!/\.[^/]+$/.test(path) && text.startsWith("#!")) {
+    // the shebang test reads the first line
+    const eol = text.indexOf("\n");
+
+    chargeText("text", eol === -1 ? text.length : eol, 4);
+
+    if (/^#!.*\b(?:node|bun|deno)\b/.test(text)) return "js";
+  }
 
   return "plain";
 }
@@ -71,6 +82,8 @@ export function commentRanges(text: string, dialect: Dialect = "js"): Range[] {
  */
 function scanUnparsed(text: string): FileScan {
   const raw = scanTextRules(text);
+  // the copy of each window and the joining of its imports, on top of what the rules charge
+  chargeText("text", text.length, 3);
   const rawImports = importsOf(joinStrings(text).text);
   const tokens = tokenText(text);
 
@@ -116,10 +129,15 @@ const TOKEN_OVERLAP = 64 * 1024;
  */
 export function tokenWindows(length: number, cuts: readonly number[], window = TOKEN_WINDOW, overlap = TOKEN_OVERLAP): { from: number; end: number }[] {
   const out: { from: number; end: number }[] = [];
+  let ci = 0;
 
   for (let start = 0; start < length; ) {
     const target = start + window;
-    const end = target >= length ? length : (cuts.find((c) => c >= target) ?? length);
+    // the cuts are in order, so the search starts where the last one stopped
+
+    while (ci < cuts.length && (cuts[ci] ?? length) < target) ci++;
+    chargeText("text", 1);
+    const end = target >= length ? length : (cuts[ci] ?? length);
 
     out.push({ from: Math.max(0, start - overlap), end });
     start = end;
@@ -130,7 +148,9 @@ export function tokenWindows(length: number, cuts: readonly number[], window = T
 
 // ---------- what a file loads ----------
 const STATIC_IMPORT = /(?:\brequire(?:\.resolve)?\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*['"\x60](\.{1,2}\/[^'"\x60\n]+)['"\x60]/g;
-const DIRNAME_JOIN = /\b[\w$]+\.(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*['"][^'"\n]+['"]\s*)+)\)/g;
+// `(?<![\w$])`, not `\b`: `\b` falls between every `a` and `$` of `a$a$…`, and each start there scanned to the end
+
+const DIRNAME_JOIN = /(?<![\w$])[\w$]+\.(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*['"][^'"\n]+['"]\s*)+)\)/g;
 const DIRNAME_PLUS = /\b__dirname\s*\+\s*['"](\/[^'"\n]+)['"]/g;
 const CALL = /(?<![\w$.])(?:require|import)\s*\(/g;
 
@@ -140,6 +160,8 @@ const CALL = /(?<![\w$.])(?:require|import)\s*\(/g;
  * Run it on joined text so `require('./lib/' + 'x')` is a literal.
  */
 export function importsOf(text: string): Imports {
+  // the four patterns' passes; each match's own work is charged as it is read
+  chargeText("text", text.length, 4);
   const paths: string[] = [];
 
   for (const m of text.matchAll(STATIC_IMPORT)) if (m[1]) paths.push(m[1]);
@@ -147,6 +169,7 @@ export function importsOf(text: string): Imports {
   const loads = [...paths];
 
   for (const m of text.matchAll(DIRNAME_JOIN)) {
+    chargeText("text", m[0].length, 3);
     const segs = [...(m[1] ?? "").matchAll(/['"]([^'"\n]+)['"]/g)].map((s) => s[1] ?? "");
     paths.push(`./${segs.join("/")}`);
   }
@@ -155,6 +178,8 @@ export function importsOf(text: string): Imports {
   const dynamic: Imports["dynamic"] = [];
 
   for (const m of text.matchAll(CALL)) {
+    // the 12 characters before the call and the 200 after it, read by up to seven patterns
+    chargeText("text", 212, 8);
     const before = text.slice(Math.max(0, m.index - 12), m.index);
 
     if (/function\s*$/.test(before)) continue;

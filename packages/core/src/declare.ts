@@ -1,6 +1,7 @@
 // The capabilities a package declares in its package.json (`"apm": { "capabilities": { … } }`), read into one shape.
 // A declaration says what the package means to do; apm-score-v10 compares it with what the code shows. Pure.
 import { z } from "zod";
+import { wildcardMatch } from "./glob.ts";
 
 export const CAPABILITY_IDS = ["network", "env", "filesystem", "shell", "eval", "native", "install"] as const;
 
@@ -68,7 +69,6 @@ export function declarationOf(manifest: { readonly apm?: unknown }): Declaration
 /** Whether `name` matches a declared pattern: exact, or `*` standing for any run of characters (`AWS_*`, `*.amazonaws.com`). */
 export function matchesPattern(name: string, pattern: string): boolean {
   if (!pattern.includes("*")) return name === pattern;
-  const re = new RegExp(`^${pattern.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`);
 
-  return re.test(name);
+  return wildcardMatch(name, pattern);
 }

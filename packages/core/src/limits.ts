@@ -11,15 +11,16 @@ export const MAX_ANALYZED_FILE_BYTES = 32 * 1024 * 1024;
 export const MAX_SCANNED_BYTES = 200 * 1024 * 1024;
 
 /**
- * Wall-clock time one analysis may take. Every step of the analysis is bounded by input size and by work budgets, so
- * this is a backstop: a file reached after it is not read, and the analysis says so (incomplete or unanalyzed-files).
+ * The time limit analyses had before the work meter (meter.ts) replaced it. Kept only to describe the files an analysis
+ * stored then skipped for time; no analysis is cut by time now, since a deployed Worker's clock does not move while
+ * code runs.
  */
 export const MAX_ANALYSIS_MS = 90_000;
 
 /**
  * "too-large": one file over MAX_ANALYZED_FILE_BYTES. "over-budget": the analysis had read MAX_SCANNED_BYTES already.
  * "compressed": an archive (gzip, zip, bzip2, xz, 7z, zstd) whose contents the secret scan cannot read.
- * "over-time": the analysis had run for MAX_ANALYSIS_MS already.
+ * "over-time": the analysis had run for MAX_ANALYSIS_MS already (only in analyses stored before the work meter).
  */
 export const SKIP_REASONS = ["too-large", "over-budget", "compressed", "over-time"] as const;
 

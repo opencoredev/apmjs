@@ -24,7 +24,8 @@ let outsiderSecret: string;
 type Item = { name: string; version: string; digest: string; scorer: string; signal: string; file: string; line: number };
 
 async function score(name: string, version: string): Promise<{ status: number; body: unknown }> {
-  return getJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`);
+  // a token caller's request analyses an upstream version inline; an anonymous one only queues it
+  return getJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`, { headers: { authorization: `Bearer ${alice}` } });
 }
 
 /** The credential item a version's score cites, as the version page names it. */

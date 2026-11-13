@@ -1,6 +1,7 @@
 // Entry points package.json declares. One collector for both users: the publish check (each must exist in
 // the tarball) and the scorer (what runs is read first), so the two lists cannot drift apart.
 import { z } from "zod";
+import { sameSubstitution } from "./glob.ts";
 
 function stripDot(p: string): string {
   return p.replace(/^\.\//, "").replace(/^\//, "");
@@ -129,9 +130,6 @@ export function missingEntries(manifest: Record<string, unknown>, files: readonl
 /** What an entry's target names: one path, or every file of `paths` a pattern or folder mapping matches. */
 export type Target = { kind: "path"; path: string } | { kind: "files"; files: string[] };
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 /**
  * The files a target names. A pattern (`./docs/*.txt`) names every file it matches, with each `*` standing for the
@@ -142,15 +140,10 @@ export function targetFiles(target: string, paths: readonly string[]): Target {
   const t = stripDot(target);
 
   if (target.includes("*")) {
-    // the first `*` captures the substitution; every later one must be the same text
-    const body = t
-      .split("*")
-      .map((part, i) => (i === 0 ? "" : i === 1 ? "(.+)" : "\\1") + escapeRegExp(part))
-      .join("");
+    // every `*` stands for the same non-empty text, as node substitutes it
+    const parts = t.split("*");
 
-    const re = new RegExp(`^${body}$`);
-
-    return { kind: "files", files: paths.filter((p) => re.test(p)) };
+    return { kind: "files", files: paths.filter((p) => sameSubstitution(p, parts)) };
   }
 
   if (target.endsWith("/") && target.startsWith("./")) return { kind: "files", files: paths.filter((p) => p.startsWith(t)) };

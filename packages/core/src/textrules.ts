@@ -4,6 +4,7 @@
 // confirmed wherever it sits, comments, regex bodies, types and JSON included (apm-score-v9); a parsed program only
 // says which of those a match sits in, so the evidence can name it. Pure.
 import { encodedLiterals, envExfil, hexIdentifierRun, lineOf, namedSignal, printable, ruleHits, type Hidden, type TextFinding, v3Encoded, type Where } from "./rules.ts";
+import { chargeText } from "./meter.ts";
 
 // ---------- joining split strings ----------
 const LIT = String.raw`(?:'[^'\\\n]*'|"[^"\\\n]*"|\x60[^\x60\\$\n]*\x60)`;
@@ -29,6 +30,8 @@ type Edit = { start: number; end: number; length: number };
 type Tracked = { text: string; edits: Edit[] };
 
 function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string[]) => string | null): Tracked {
+  // the match pass, and the text copied into the result
+  chargeText("text", text.length, 2);
   const edits: Edit[] = [];
   let out = "";
   let last = 0;
@@ -37,6 +40,7 @@ function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string
     const replacement = fn(m[0], m.slice(1).map((g) => g ?? ""));
 
     if (replacement === null) continue;
+    chargeText("text", m[0].length + replacement.length, 2);
     out += text.slice(last, m.index) + replacement;
     edits.push({ start: m.index, end: m.index + m[0].length, length: replacement.length });
     last = m.index + m[0].length;
@@ -47,6 +51,7 @@ function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string
 
 /** Maps a position in the edited text back to the original: inside a replacement, the replacement's start. */
 function traceBack(edits: readonly Edit[], index: number): number {
+  chargeText("text", edits.length * 8);
   let shift = 0;
 
   for (const e of edits) {
@@ -73,6 +78,8 @@ export type Built = { value: string; index: number };
 export type Joined = { text: string; built: Built[]; origin: (index: number) => number };
 
 export function joinStrings(text: string): Joined {
+  // the three `includes` tests
+  chargeText("text", text.length, 3);
   const built: Built[] = [];
   const passes: Edit[][] = [];
   let out = text;
@@ -93,7 +100,11 @@ export function joinStrings(text: string): Joined {
       return quote(unescapeJs(body));
     });
 
-    for (const e of step.edits) built.push({ value: unescapeJs(text.slice(e.start + 1, e.end - 1)), index: e.start });
+    for (const e of step.edits) {
+      chargeText("text", e.end - e.start, 3);
+      built.push({ value: unescapeJs(text.slice(e.start + 1, e.end - 1)), index: e.start });
+    }
+
     passes.push(step.edits);
     out = step.text;
   }
@@ -103,6 +114,7 @@ export function joinStrings(text: string): Joined {
     const step = replaceTracked(out, CHAIN, (m) => quote([...m.matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("")));
 
     for (const e of step.edits) {
+      chargeText("text", e.end - e.start, 3);
       const value = [...before.slice(e.start, e.end).matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("");
       built.push({ value, index: toOriginal(e.start, passes.length) });
     }
@@ -129,6 +141,8 @@ export type Decoded = { value: string; how: string; index: number };
 
 /** Strings hidden by base64, hex or char codes, decoded when the result is readable text. Bounded per file. */
 export function decodedStrings(text: string): Decoded[] {
+  // the three patterns' passes; what each match decodes is charged as it is decoded
+  chargeText("text", text.length, 4);
   const out: Decoded[] = [];
   let budget = MAX_DECODED_BYTES;
 
@@ -145,13 +159,18 @@ export function decodedStrings(text: string): Decoded[] {
 
     // identifiers and alphabets are base64-shaped too; real payloads mix cases and digits
     if (raw.length % 4 === 1 || !/[0-9+/=]/.test(raw)) continue;
+    chargeText("text", raw.length, 3);
     push(Buffer.from(raw, "base64").toString("latin1"), "base64", m.index);
   }
 
-  for (const m of text.matchAll(/(['"])((?:[0-9a-fA-F]{2}){4,32768})\1\s*,\s*['"]hex['"]/g)) push(Buffer.from(m[2] ?? "", "hex").toString("latin1"), "hex", m.index);
+  for (const m of text.matchAll(/(['"])((?:[0-9a-fA-F]{2}){4,32768})\1\s*,\s*['"]hex['"]/g)) {
+    chargeText("text", m[0].length, 3);
+    push(Buffer.from(m[2] ?? "", "hex").toString("latin1"), "hex", m.index);
+  }
 
   if (text.includes("fromCharCode")) {
     for (const m of text.matchAll(/fromCharCode\s*\(\s*((?:\d{1,3}\s*,\s*){2,}\d{1,3})\s*\)|\[\s*((?:\d{2,3}\s*,\s*){3,}\d{2,3})\s*\]/g)) {
+      chargeText("text", m[0].length, 4);
       const codes = (m[1] ?? m[2] ?? "").split(",").map((n) => Number(n.trim()));
 
       if (codes.every((c) => c >= 32 && c < 127)) push(String.fromCharCode(...codes), "char codes", m.index);
@@ -228,6 +247,7 @@ export function scanTextRules(text: string, read: TextRead = {}): TextFinding[] 
   }
 
   for (const d of decodedStrings(joined.text)) {
+    chargeText("text", d.value.length, 2);
     const where = at(d.index);
     const named = namedSignal(d.value);
     const hits = ruleHits(d.value, "decoded", new Set());

@@ -3,6 +3,8 @@
 // `node -e` as base64. Also the commands a binding.gyp runs. Pure.
 import { z } from "zod";
 import { decodedStrings } from "./source.ts";
+import { wildcardMatch } from "./glob.ts";
+import { chargeText } from "./meter.ts";
 
 /**
  * When npm runs a lifecycle script. "install": every install of the tarball. "git": when the package is
@@ -64,9 +66,7 @@ function referencedScripts(cmd: string, scripts: Scripts): string[] {
 
   for (const m of cmd.matchAll(RUN_ALL)) {
     for (const pattern of (m[1] ?? "").trim().split(/\s+/)) {
-      const re = new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
-
-      for (const name of Object.keys(scripts)) if (re.test(name)) out.push(name);
+      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push(name);
     }
   }
 
@@ -184,7 +184,39 @@ export function gypCommands(text: string): string[] {
   for (const m of text.matchAll(/<!@?\(([^)]*)\)/g)) out.push(m[1] ?? "");
 
   for (const m of text.matchAll(/['"]action['"]\s*:\s*\[([^\]]*)\]/g)) {
-    out.push([...(m[1] ?? "").matchAll(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g)].map((s) => s[1] ?? s[2] ?? "").join(" "));
+    out.push(quotedStrings(m[1] ?? "").join(" "));
+  }
+
+  return out;
+}
+
+/**
+ * The bodies of the single- and double-quoted strings in `s`, backslash escapes kept, as
+ * `/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g` finds them, in one pass. That regex scanned to the end from every quote
+ * of an unterminated run (`'\'\'\'…`), quadratic in it. Once a quote character has been read to the end of `s` without
+ * closing, every later one of that character would be too (its read is the end of the first one's), so it is skipped.
+ */
+function quotedStrings(s: string): string[] {
+  const out: string[] = [];
+  const open = new Set<string>();
+
+  chargeText("text", s.length, 3);
+
+  for (let i = 0; i < s.length; i++) {
+    const q = s[i];
+
+    if ((q !== "'" && q !== '"') || open.has(q)) continue;
+    let j = i + 1;
+
+    while (j < s.length && s[j] !== q) j += s[j] === "\\" ? 2 : 1;
+
+    if (j >= s.length) {
+      open.add(q);
+      continue;
+    }
+
+    out.push(s.slice(i + 1, j));
+    i = j;
   }
 
   return out;

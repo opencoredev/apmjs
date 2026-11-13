@@ -6,7 +6,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
-import { getJson, pkgTgz, startRegistry, type Registry } from "./harness";
+import { addUser, getJson, pkgTgz, startRegistry, type Registry } from "./harness";
 
 const clock = Date.parse("2026-11-01T00:00:00Z");
 
@@ -83,9 +83,12 @@ describe("versions that can never be scored", () => {
     await npm?.stop(true);
   });
 
-  /** Every surface's answer for one version that can never be scored, checked against the reason it should give. */
-  async function expectUnscorable(name: string, reason: string, words: string): Promise<void> {
-    const score = await getJson(`${reg.url}-/apm/v1/score/${name}/1.0.0`);
+  /**
+   * Every surface's answer for one version that can never be scored, checked against the reason it should give. `token`:
+   * the first read is a token caller's, whose request finds out itself (an anonymous one only queues the version).
+   */
+  async function expectUnscorable(name: string, reason: string, words: string, token?: string): Promise<void> {
+    const score = await getJson(`${reg.url}-/apm/v1/score/${name}/1.0.0`, token ? { headers: { authorization: `Bearer ${token}` } } : {});
     const body = ScoreAnswer.parse(score.body);
 
     // before: 503 with pending: true and "queued for analysis. Try again in a minute", for ever
@@ -128,12 +131,12 @@ describe("versions that can never be scored", () => {
   }, 60_000);
 
   test("a tarball over the 48 MiB unpack cap is recorded on the request that first reads it", async () => {
-    // small enough to analyze inline, so the score request itself finds out
-    await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB");
+    // small enough to analyze inline, so a token caller's score request itself finds out
+    await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB", await addUser(reg, "first-reader"));
   }, 60_000);
 
   test("a version the upstream lists without a checksum is recorded unavailable", async () => {
-    await expectUnscorable("no-checksum", "unavailable", "no checksum");
+    await expectUnscorable("no-checksum", "unavailable", "no checksum", await addUser(reg, "checksum-reader"));
   }, 60_000);
 
   test("a run the platform stopped is followed by a smaller run that is incomplete, never clean", async () => {
@@ -152,7 +155,7 @@ describe("versions that can never be scored", () => {
   test("after two stopped runs the third records that the version cannot be scored, without analysing", async () => {
     await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-twice', '1.0.0', 'apm-score-v10', 2, $1)", [clock - 60 * 60_000]);
     expect(await reg.analysisJob({ name: "stopped-twice", version: "1.0.0" })).toBe("ack");
-    await expectUnscorable("stopped-twice", "analysis-limit", "ran past the registry's 5-minute CPU limit");
+    await expectUnscorable("stopped-twice", "analysis-limit", "were stopped by the platform before they finished");
     expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'stopped-twice'"))).toEqual([{ starts: 3, outcome: "analysis-limit" }]);
   }, 60_000);
 

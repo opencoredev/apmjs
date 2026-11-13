@@ -7,6 +7,7 @@ import type { AnyNode, CallExpression, Identifier, MemberExpression, NewExpressi
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
 import { CREDENTIAL_NAME, secretFamily } from "./facts.ts";
 import type { Binding, Ref, Role } from "./js.ts";
+import { Allowance, chargeNow } from "./meter.ts";
 
 /**
  * What a value carries:
@@ -152,7 +153,7 @@ const FS_MODULES: ReadonlySet<string> = new Set(["fs", "fs/promises", "fs-extra"
 const NET_TOOL = /^(?:.*[/\\])?(?:curl|wget|nc|ncat|netcat|xh|scp|sftp)(?:\.exe)?$/i;
 
 /** A command line that starts such a program, after the words that only start what follows them. */
-const NET_TOOL_COMMAND = /(?:^|[;&|(`]\s*|\$\(\s*)(?:(?:sudo|nohup|setsid|env|exec|command|time|nice)\s+)*(?:\S*\/)?(?:curl|wget|nc|ncat|netcat)(?:\.exe)?\s/i;
+const NET_TOOL_COMMAND = /(?:^|[;&|(`]\s*|\$\(\s*)(?:(?:sudo|nohup|setsid|env|exec|command|time|nice)\s+)*(?:[^\s;&|(`]*\/)?(?:curl|wget|nc|ncat|netcat)(?:\.exe)?\s/i;
 
 /** Words that only start the program named after them. */
 const LAUNCH_WORDS: ReadonlySet<string> = new Set(["sudo", "nohup", "setsid", "env", "exec", "command", "nice", "time", "stdbuf"]);
@@ -165,16 +166,22 @@ const PARAM = /^param:(\d+):(\d+)((?:\|[^|]*)*)$/;
 const PARAMISH = /^(?:read:)*param:/;
 
 /**
- * Work one program's flow reading may do, counted in labels handled: a taint asked, and each label a member read or a
- * call's substitution goes through. Calls of imported helpers that pass each other's results can multiply labels with
- * every level, so a 1 KB file could take minutes without it. The most any file in the 70-package corpus takes is
- * 5.7 million (execa's lib/methods/main-async.js, 1.3 s); past this budget apm stops following values in the file,
- * and the analysis is incomplete (js.ts).
+ * Work one program's flow reading may do, in meter units (meter.ts) and carved out of the analysis's meter: a taint
+ * asked, each label a member read or a call's substitution goes through (more for a label rebuilt with a name), and the
+ * matching of written files and commands. Calls of imported helpers that pass each other's results can multiply labels
+ * with every level, so a 1 KB file could take minutes without it. Past this allowance apm stops following values in
+ * the file, and the analysis is incomplete (js.ts); the corpus's most is in docs/SCORE.md.
  */
-export const MAX_FLOW_WORK = 16_000_000;
+export const MAX_FLOW_WORK = 64_000_000;
 
 /** Thrown when a program's flow reading spends MAX_FLOW_WORK. */
 export class FlowExhausted extends Error {}
+
+/**
+ * Units of flow work one label costs where it is rebuilt or matched (memberOf, substituteOne), on top of one per
+ * character eighth of its text: label strings are built and tested, where a tree step only follows a pointer.
+ */
+const LABEL_UNITS = 3;
 
 /** How many members one parameter label records before it stops adding them. */
 const MAX_PARAM_PATH = 4;
@@ -191,8 +198,22 @@ function rel(spec: string): boolean {
   return spec.startsWith("./") || spec.startsWith("../");
 }
 
+/**
+ * Adds `value` to the list kept under `key`, in place. Copying the list on every add (what this was) made indexing 6,000
+ * calls of one function copy 18 million entries.
+ */
+function appendTo<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  chargeNow(1);
+  const list = map.get(key);
+
+  if (list) list.push(value);
+  else map.set(key, [value]);
+}
+
 function union(...sets: Labels[]): Set<Label> {
   const out = new Set<Label>();
+
+  chargeNow(sets.reduce((n, s) => n + 1 + s.size, 0));
 
   for (const s of sets) for (const l of s) out.add(l);
 
@@ -200,6 +221,7 @@ function union(...sets: Labels[]): Set<Label> {
 }
 
 function without(set: Labels, drop: (l: Label) => boolean): Set<Label> {
+  chargeNow(1 + set.size);
   const out = new Set<Label>();
 
   for (const l of set) if (!drop(l)) out.add(l);
@@ -219,6 +241,7 @@ function isDeferred(l: Label): boolean {
 
 /** What reading a path that carries `path` gives: a credential file's contents, or a read worked out later. */
 function readOf(path: Labels): Set<Label> {
+  chargeNow(1 + path.size);
   const out = new Set<Label>();
 
   if (path.has("cred-path")) out.add("cred");
@@ -270,8 +293,8 @@ type RunTarget = { path: PathRef; kind: "js" | "program" };
 /** Reads where values go in one program. Built once per program, after the reader has visited it. */
 export class Flow {
   private readonly memo = new Map<AnyNode, Labels>();
-  /** Work done so far, against MAX_FLOW_WORK. */
-  private work = 0;
+  /** Work done so far, against MAX_FLOW_WORK: an allowance carved out of the analysis's meter. */
+  private readonly work = new Allowance("flow", MAX_FLOW_WORK);
   private readonly bindingMemo = new Map<Binding, Labels>();
   private readonly returnMemo = new Map<AnyNode, Labels>();
   private readonly assigns = new Map<Binding, AnyNode[]>();
@@ -306,9 +329,7 @@ export class Flow {
 
   /** Charges `n` units of work; past the budget the reading stops. */
   private spend(n: number): void {
-    this.work += n;
-
-    if (this.work > MAX_FLOW_WORK) throw new FlowExhausted();
+    if (!this.work.take(n)) throw new FlowExhausted();
   }
 
   read(): FlowRead {
@@ -334,15 +355,15 @@ export class Flow {
       if (callee.type === "Identifier") {
         const b = this.host.bindingOf(callee);
 
-        if (b !== null && b !== "dynamic") this.callsByBinding.set(b, [...(this.callsByBinding.get(b) ?? []), site]);
+        if (b !== null && b !== "dynamic") appendTo(this.callsByBinding, b, site);
       }
 
-      for (const fn of this.localFunctions(callee)) this.callsOf.set(fn, [...(this.callsOf.get(fn) ?? []), site]);
+      for (const fn of this.localFunctions(callee)) appendTo(this.callsOf, fn, site);
 
       for (const slot of site.slots) {
         if (!slot) continue;
 
-        for (const fn of this.localFunctions(slot)) this.callbacksOf.set(fn, [...(this.callbacksOf.get(fn) ?? []), site]);
+        for (const fn of this.localFunctions(slot)) appendTo(this.callbacksOf, fn, site);
       }
 
       this.indexCall(site);
@@ -377,7 +398,7 @@ export class Flow {
         const event = slot(0);
         const e = event ? this.host.str(event) : null;
 
-        if (root) this.emits.set(root, [...(this.emits.get(root) ?? []), { event: e?.exact ? e.value : null, args: site.slots.slice(1) }]);
+        if (root) appendTo(this.emits, root, { event: e?.exact ? e.value : null, args: site.slots.slice(1) });
       }
 
       // a stream written to: `src.pipe(w)`, `w.write(data)`, `w.end(data)`
@@ -476,7 +497,7 @@ export class Flow {
   private mutate(target: AnyNode | null, name: string | null, value: AnyNode): void {
     const root = target ? this.rootBinding(target) : null;
 
-    if (root) this.mutations.set(root, [...(this.mutations.get(root) ?? []), { name, value }]);
+    if (root) appendTo(this.mutations, root, { name, value });
   }
 
   /** A member's name: as written, a computed key apm can work out, or the one string of an array key (`o[['x']]`). */
@@ -564,7 +585,7 @@ export class Flow {
   private assignTo(id: Identifier, value: AnyNode): void {
     const b = this.host.bindingOf(id);
 
-    if (b !== null && b !== "dynamic") this.assigns.set(b, [...(this.assigns.get(b) ?? []), value]);
+    if (b !== null && b !== "dynamic") appendTo(this.assigns, b, value);
   }
 
   private param(fn: AnyNode, p: AnyNode, index: number): void {
@@ -966,7 +987,8 @@ export class Flow {
    * path or text; an element taken by index or in a loop is. The rest stays with the value (`res.data`).
    */
   private memberOf(base: Labels, name: string | null, key: Labels): Set<Label> {
-    this.spend(1 + base.size);
+    // each label is looked at, and a parameter's or an import's is rebuilt with the name on it
+    this.spend(1 + base.size * (LABEL_UNITS + Math.ceil((name?.length ?? 0) / 8)));
     const named = name !== null && !/^\d+$/.test(name);
     // a named entry of what a credential file holds (`rc['//registry.npmjs.org/:_authToken']`) is one token, sent the
     // way a CLI sends its own: the file's whole contents, or a line of it taken by index, stay `cred`
@@ -975,6 +997,7 @@ export class Flow {
     // a member of a parameter is recorded on its label, so each call takes that member of its own argument
     for (const l of base) {
       if (!l.startsWith("param:")) continue;
+      this.spend(Math.ceil(l.length / 8));
       out.delete(l);
       out.add(l.split("|").length > MAX_PARAM_PATH ? l : `param:${l.slice("param:".length)}|${encodeURIComponent(name ?? "*")}`);
     }
@@ -1117,6 +1140,8 @@ export class Flow {
       return inner ? readOf(this.substituteOne(inner, param)) : new Set([l]);
     }
 
+    // the label is matched, split and its member names decoded
+    this.spend(LABEL_UNITS + Math.ceil(l.length / 8));
     const m = PARAM.exec(l);
     const base = m ? param(Number(m[1]), Number(m[2])) : null;
 
@@ -1327,6 +1352,7 @@ export class Flow {
     const out: Sink[] = [];
 
     const keep = (kind: Sink["kind"], at: number, labels: Labels, relevant: (l: Label) => boolean): void => {
+      this.spend(1 + labels.size);
       const list = [...this.concrete(labels)].filter(relevant);
 
       if (list.length > 0 && out.length < 400) out.push({ kind, at, labels: list });
@@ -1392,10 +1418,14 @@ export class Flow {
 
   /** A sink for a file the program wrote with downloaded data and then runs; written text it runs is read as code. */
   private ranFile(t: RunTarget, at: number, keep: (kind: Sink["kind"], at: number, labels: Labels, relevant: (l: Label) => boolean) => void): void {
+    // every file the program writes is matched against every file it runs: charged per pair
     for (const w of this.written) {
+      this.spend(1);
+
       if (!this.samePath(t.path, w.path)) continue;
 
       for (const d of w.data) {
+        this.spend(1);
         keep(t.kind === "js" ? "code" : "file", at, this.taint(d), (l) => l === "net" || l === "net-field" || isSymbolic(l));
         const text = t.kind === "js" ? this.host.str(d) : null;
 
@@ -1422,6 +1452,8 @@ export class Flow {
     const sb = this.host.str(b);
 
     if (!sa || !sb) return false;
+    // the two paths are trimmed, unquoted, compared and split: a few passes over each
+    this.spend(Math.ceil((sa.value.length + sb.value.length) / 8) + 1);
     const pa = normPath(sa.value);
     const pb = normPath(sb.value);
 
@@ -1461,6 +1493,7 @@ export class Flow {
     const out: RunTarget[] = [{ path: { node: first }, kind: "program" }];
 
     for (const text of texts.slice(0, 8)) {
+      this.spend(Math.ceil(text.value.length / 8) + 1);
       // a command line: the program after the words that only start it (`setsid nohup ./agent -c x`)
       const words = text.value.split(/[\s;&|]+/).filter((w) => w.length > 0);
       let i = 0;
@@ -1508,6 +1541,8 @@ export class Flow {
 
     const s = this.host.str(slot);
 
+    this.spend(Math.ceil((s?.value.length ?? 0) / 8) + 1);
+
     return s === null || (!s.exact && WRAPPER_ONLY.test(s.value.split(UNKNOWN).join("")));
   }
 
@@ -1529,10 +1564,13 @@ export class Flow {
       for (const l of this.concrete(this.paramTaint(p))) whole.add(l);
 
       for (const c of calls) {
+        this.spend(1);
         const arg = c.slots[p.index];
 
         if (!arg) continue;
         const inner = this.commandLabels(arg, depth + 1);
+
+        this.spend(inner.whole.size + inner.part.size);
 
         for (const l of inner.whole) whole.add(l);
 
@@ -1543,6 +1581,8 @@ export class Flow {
     }
 
     const s = this.host.str(slot);
+
+    this.spend(Math.ceil((s?.value.length ?? 0) / 8) + 1);
     const whole = s === null || (!s.exact && WRAPPER_ONLY.test(s.value.split(UNKNOWN).join("")));
     const labels = this.concrete(this.taint(slot));
 
@@ -1578,7 +1618,11 @@ export class Flow {
       site.slots.forEach((slot, i) => {
         if (!slot || (site.roles[i] !== "code" && !unnamed)) return;
 
-        const ranges = [...this.concrete(this.taint(slot))].flatMap((l): [number, number][] => {
+        const labels = this.concrete(this.taint(slot));
+
+        this.spend(1 + labels.size);
+
+        const ranges = [...labels].flatMap((l): [number, number][] => {
           const m = /^src:(\d+):(\d+)$/.exec(l);
 
           return m ? [[Number(m[1]), Number(m[2])]] : [];
@@ -1634,15 +1678,27 @@ export class Flow {
     const all = new Set<Label>();
 
     const of = (n: AnyNode, into: Set<Label>, depth: number): void => {
-      for (const l of this.concrete(this.taint(n))) into.add(l);
+      const own = this.concrete(this.taint(n));
 
-      for (const fn of n.type === "FunctionDeclaration" ? [n] : this.localFunctions(n)) for (const l of this.concrete(this.returnTaint(fn))) into.add(l);
+      this.spend(1 + own.size);
+
+      for (const l of own) into.add(l);
+
+      for (const fn of n.type === "FunctionDeclaration" ? [n] : this.localFunctions(n)) {
+        const returned = this.concrete(this.returnTaint(fn));
+
+        this.spend(1 + returned.size);
+
+        for (const l of returned) into.add(l);
+      }
+
       const t = unwrap(n);
 
       if (t.type === "ObjectExpression" && depth < 3) for (const p of t.properties) if (p.type === "Property") of(p.value, into, depth + 1);
     };
 
     for (const e of this.exported) {
+      this.spend(1 + (out.get(e.name)?.length ?? 0) * 2);
       const labels = new Set<Label>(out.get(e.name) ?? []);
 
       of(e.node, labels, 0);
@@ -1651,6 +1707,7 @@ export class Flow {
       for (const l of labels) all.add(l);
     }
 
+    this.spend(1 + all.size);
     out.set("", [...all]);
 
     return out;

@@ -7,6 +7,7 @@
 // (`sends-*`, `runs-download`, `reads-credential`); score.ts turns those into facts. Pure.
 import type { Command } from "./js.ts";
 import { escapedTextAt, hexIdentifierRun, lineOf, longBase64Text, type Hidden } from "./rules.ts";
+import { chargeText } from "./meter.ts";
 
 export const FACT_KINDS = [
   "env",
@@ -152,6 +153,8 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
     if (n >= MAX_PER_KIND || !inCode(index)) return false;
     counts.set(kind, n + 1);
     const where = lineOf(text, index);
+
+    if (text.length >= SMALL_FILE) chargeText("text", 2 * NEAR_NETWORK, 2);
     const near = text.length < SMALL_FILE || NETWORK_CALL.test(text.slice(Math.max(0, index - NEAR_NETWORK), index + NEAR_NETWORK));
     out.push(name === undefined ? { kind, ...where, text: isText, near } : { kind, ...where, name, text: isText, near });
 
@@ -159,10 +162,13 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   };
 
   const each = (re: RegExp, fn: (m: RegExpExecArray) => void): void => {
+    chargeText("text", text.length);
     re.lastIndex = 0;
     let tries = 0;
 
     for (let m = re.exec(text); m; m = re.exec(text)) {
+      chargeText("text", m[0].length + 32);
+
       if (m[0].length === 0) re.lastIndex++;
       else fn(m);
 
@@ -195,12 +201,15 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   // a credential path near a read: in a file with no tree that is the read; in a parsed file the flow analysis shows
   // the reads, and the window is only a supplement (a deny list beside a generic read names the path and reads nothing)
   each(CREDENTIAL_PATH, (m) => {
+    chargeText("text", 2 * READ_WINDOW + m[0].length, 2);
     const window = text.slice(Math.max(0, m.index - READ_WINDOW), m.index + m[0].length + READ_WINDOW);
 
     if (READ_NEAR.test(window)) push(isText ? "credential-read" : "credential-near", m.index);
   });
   each(HOST_INFO, (m) => push("host-info", m.index));
   each(EVAL_VALUE, (m) => {
+    chargeText("text", FETCH_WINDOW, 2);
+
     if (NETWORK_CALL.test(text.slice(Math.max(0, m.index - FETCH_WINDOW), m.index))) push("fetched-code", m.index);
   });
   each(DETACHED, (m) => push("detached", m.index));
@@ -209,6 +218,7 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   // a parsed file's commands are what it hands a process; text that only prints such a command (install instructions) is not one
   if (commands) {
     for (const c of commands) {
+      chargeText("text", c.value.length);
       REMOTE_SHELL.lastIndex = 0;
 
       if (REMOTE_SHELL.test(c.value) && (counts.get("remote-shell") ?? 0) < MAX_PER_KIND) {
@@ -224,6 +234,8 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   const escapes = escapedTextAt(text);
 
   if (escapes >= 0) push("obfuscator", escapes, "\\x escapes that spell text");
+
+  chargeText("text", text.length);
 
   for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
     if (longBase64Text(m[1] ?? "")) {

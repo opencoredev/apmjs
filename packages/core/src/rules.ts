@@ -1,5 +1,6 @@
 // The text rules every reader shares: what each code signal matches, how sure a match is in each place it can sit,
 // where a position is (line and snippet), and the names that count when a string is built or decoded. Pure.
+import { chargeText } from "./meter.ts";
 
 /**
  * Text a parsed program does not run as written, where a text match can still sit and still counts (apm-score-v9):
@@ -217,6 +218,7 @@ const NAMED: { id: Capability; re: RegExp }[] = [
 
 /** The dangerous thing a built or decoded string names, if any: `'child_process'`, `'fetch'`. */
 export function namedSignal(s: string): Capability | null {
+  chargeText("text", s.length, NAMED.length + 1);
   const t = s.trim();
 
   return NAMED.find((n) => n.re.test(t))?.id ?? null;
@@ -238,6 +240,7 @@ export function moduleSignal(spec: string): Capability | null {
 
 /** obfuscator.io output: twenty or more `_0x1a2b` identifiers. Counted in one linear pass. Returns the first one's index, or -1. */
 export function hexIdentifierRun(text: string): number {
+  chargeText("text", text.length);
   const re = /_0x[0-9a-f]{4,}/g;
   let first = -1;
   let n = 0;
@@ -251,6 +254,34 @@ export function hexIdentifierRun(text: string): number {
   return -1;
 }
 
+/** The texts whose newline offsets were last worked out, newest first: lineOf is asked about a few texts in turn. */
+/** A line as snippets show it, and the whole of it trimmed when that is short enough to show whole. */
+type Line = { whole: string; short: string | null };
+
+type LineIndex = { text: string; starts: number[]; lines: Map<number, Line> };
+
+const LINE_INDEX: LineIndex[] = [];
+
+/**
+ * Where each line of `text` starts (0, then one past each `\n`), and each line's text as a snippet shows it, made the
+ * first time it is asked for. Built in one pass (charged) and kept for a few texts, so many findings on one long line
+ * read it once.
+ */
+function lineIndex(text: string): LineIndex {
+  for (const e of LINE_INDEX) if (e.text === text) return e;
+  chargeText("text", text.length, 2);
+  const starts = [0];
+
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) starts.push(i + 1);
+  const entry = { text, starts, lines: new Map<number, Line>() };
+
+  LINE_INDEX.unshift(entry);
+
+  if (LINE_INDEX.length > 4) LINE_INDEX.pop();
+
+  return entry;
+}
+
 /** A line number and the text around a position, trimmed to about 80 characters, and the left-out text it sits in. */
 export type Where = { line: number; snippet: string; hidden?: Hidden };
 
@@ -260,19 +291,45 @@ export type Where = { line: number; snippet: string; hidden?: Hidden };
  * comment that looks like it runs to the end of the line can stop early.
  */
 export function lineOf(text: string, index: number): Where {
-  let line = 1;
+  // the line is found in the text's newline index (built once per text), then read three times
+  const index_ = lineIndex(text);
+  const starts = index_.starts;
+  let lo = 0;
+  let hi = starts.length - 1;
 
-  for (let i = text.indexOf("\n"); i !== -1 && i < index; i = text.indexOf("\n", i + 1)) line++;
+  chargeText("text", 160 + 32 * Math.ceil(Math.log2(starts.length + 1)));
+
+  // the last line that starts at or before the position: one more than the newlines before it
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+
+    if ((starts[mid] ?? 0) <= index) lo = mid;
+    else hi = mid - 1;
+  }
+
+  const line = lo + 1;
   const start = text.lastIndexOf("\n", index - 1) + 1;
   const end = text.indexOf("\n", index);
 
   // a CRLF line's \r is its own end; any other carriage return or separator is inside the line
-  const whole = text
-    .slice(start, end === -1 ? undefined : end)
-    .replace(/\r$/, "")
-    .replace(/[\r\u2028\u2029]/g, "↵");
+  let known = index_.lines.get(start);
 
-  if (whole.trim().length <= 80) return { line, snippet: whole.trim() };
+  if (known === undefined) {
+    chargeText("text", (end === -1 ? text.length : end) - start, 5);
+
+    const read = text
+      .slice(start, end === -1 ? undefined : end)
+      .replace(/\r$/, "")
+      .replace(/[\r\u2028\u2029]/g, "↵");
+
+    const trimmed = read.trim();
+
+    known = { whole: read, short: trimmed.length <= 80 ? trimmed : null };
+    index_.lines.set(start, known);
+  }
+
+  if (known.short !== null) return { line, snippet: known.short };
+  const whole = known.whole;
   const col = index - start;
   const from = Math.max(0, col - 30);
   const to = from + 80;
@@ -283,6 +340,8 @@ export function lineOf(text: string, index: number): Where {
 
 /** Whether a decoded string reads as text: at least 95% printable ASCII, tabs and newlines. */
 export function printable(s: string): boolean {
+  chargeText("text", s.length);
+
   if (s.length < 4) return false;
   let ok = 0;
 
@@ -295,6 +354,9 @@ export function printable(s: string): boolean {
   return ok / s.length >= 0.95;
 }
 
+/** How many patterns the rules hold, all told: each is one linear pass over a text. */
+const RULE_PATTERNS = RULES.reduce((n, r) => n + r.patterns.length, 0);
+
 const IN_STRING = "only inside an ordinary string, not in code apm saw run";
 
 /**
@@ -304,6 +366,8 @@ const IN_STRING = "only inside an ordinary string, not in code apm saw run";
  * original text has it) and what left-out text it sits in.
  */
 export function ruleHits(text: string, how: How, skip: ReadonlySet<CodeSignal>, place: (index: number) => Where = (i) => lineOf(text, i)): TextFinding[] {
+  // every pattern of every rule may read the whole text
+  chargeText("text", text.length, RULE_PATTERNS);
   const out: TextFinding[] = [];
 
   for (const rule of RULES) {
@@ -347,6 +411,7 @@ export type StringMatch = { id: Capability; kind: Kind; index: number };
 
 /** The first match of each rule's `name` and `text` patterns in `value`; code and alias patterns describe code, not text. */
 export function stringMatches(value: string): StringMatch[] {
+  chargeText("text", value.length, RULE_PATTERNS);
   const out: StringMatch[] = [];
 
   for (const rule of RULES) {
@@ -371,7 +436,10 @@ const NETWORK_NEAR = RULES.filter((r) => r.id === "network").flatMap((r) => r.pa
 export function envExfil(text: string): number {
   let tries = 0;
 
+  chargeText("text", text.length);
+
   for (const m of text.matchAll(WHOLE_ENV)) {
+    chargeText("text", 2 * NEAR, NETWORK_NEAR.length + 1);
     const window = text.slice(Math.max(0, m.index - NEAR), m.index + NEAR);
 
     if (NETWORK_NEAR.some((re) => re.test(window))) return m.index;
@@ -391,6 +459,7 @@ export function encodedLiterals(text: string, place: (index: number) => Where = 
   const escapes = escapedTextAt(text);
 
   if (escapes >= 0) return [{ id: "obfuscated", ...place(escapes), how: "as written", confidence: "confirmed" }];
+  chargeText("text", text.length);
 
   for (const m of text.matchAll(/['"]([A-Za-z0-9+/]{2000,}={0,2})['"]/g)) {
     if (longBase64Text(m[1] ?? "")) return [{ id: "obfuscated", ...place(m.index), how: "as written", confidence: "confirmed" }];
@@ -406,12 +475,17 @@ const V3_ENCODED = /(?:\\x[0-9a-f]{2}){40}|['"][A-Za-z0-9+/]{2000,}={0,2}['"]/g;
 
 /** Where apm-score-v3's `obfuscated` rule first matches `text`, or -1. */
 export function v3Encoded(text: string): number {
+  chargeText("text", text.length);
+
   return firstMatch(V3_ENCODED, text);
 }
 
 /** Where 40 or more `\x` escapes in a row spell readable text, or -1. */
 export function escapedTextAt(text: string): number {
+  chargeText("text", text.length);
+
   for (const m of text.matchAll(/(?:\\x[0-9a-fA-F]{2}){40,}/g)) {
+    chargeText("text", Math.min(m[0].length, 4000), 3);
     const value = m[0].slice(0, 4000).replace(/\\x([0-9a-fA-F]{2})/g, (_, h: string) => String.fromCharCode(Number.parseInt(h, 16)));
 
     if (printable(value)) return m.index;
@@ -423,6 +497,7 @@ export function escapedTextAt(text: string): number {
 /** Whether a base64 body of 2000+ characters decodes to readable text rather than WebAssembly, a font or other data. */
 export function longBase64Text(raw: string): boolean {
   if (raw.length < 2000) return false;
+  chargeText("text", 4000, 3);
   const head = raw.slice(0, 4000);
   const value = Buffer.from(head.slice(0, head.length - (head.length % 4)), "base64").toString("latin1");
 

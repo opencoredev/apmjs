@@ -74,13 +74,14 @@ export default Alchemy.Stack(
         ...review,
         ...debug,
       },
-      // Writes down pending revokes past 24h and expired staged versions; reads already treat them as final.
+      // Writes down pending revokes past 24h and expired staged versions (reads already treat them as final), and
+      // requeues analyses the platform stopped before they stored anything.
       crons: ["*/10 * * * *"],
-      // 5 minutes of CPU per invocation, the paid plan's most (the default is 30 s). One queued analysis gets all of it
-      // (batchSize 1 below) against an analyser deadline of 90 s, and a request that analyzes up to 8 small tarballs
-      // inline (15 s each) fits too. Only CPU used is billed: past 30 M CPU-ms a month, $0.02 per million, so a run that
-      // used the whole 5 minutes would cost $0.006. A run the platform stops anyway is caught by the next one
-      // (packages/registry/src/analysis.ts). Keep in step with WORKER_CPU_MS there.
+      // 5 minutes of CPU per invocation, the paid plan's most (the default is 30 s). Nothing depends on it: every analysis
+      // is bounded by its work meter (@apm/core meter.ts), whose full allowance is under 25 s of CPU, so a run fits the
+      // default limit too; an anonymous request analyses nothing, and a signed-in one at most two versions, each under
+      // a quarter of the meter. Only CPU used is billed. A run the platform stops anyway is requeued by the cron's sweep
+      // (packages/registry/src/analysis.ts).
       limits: { cpuMs: 300_000 },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
       // staging has no custom domain: undefined leaves workers.dev as the only address

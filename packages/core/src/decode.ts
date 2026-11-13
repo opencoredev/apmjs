@@ -7,6 +7,7 @@
 // not finish reading. Regexes run only from a subset apm can prove linear (safeRegexCost), and their work is charged to
 // the step budget, so no input can make it slow. Pure.
 import type { AnyNode, CallExpression, Identifier } from "acorn";
+import { Allowance, charge, MeterExhausted } from "./meter.ts";
 
 type Env = ReadonlyMap<string, Value>;
 
@@ -64,10 +65,22 @@ const LIMITS = {
 /** Steps the decoder may still take: this call's, and what the caller's allowance has left, whichever is smaller. */
 type State = { steps: number; max: number; depth: number; host: DecodeHost };
 
-function spend(state: State, n: number): void {
-  state.steps += n;
+/** The run in progress, whose steps `work` charges; decoders nest (a constant's value can come from another one). */
+let active: State | null = null;
 
-  if (state.steps > state.max) throw new Exhausted(LIMITS.steps);
+/** Characters a decoder step may build or copy; past that, building or copying counts more steps. */
+const CHARS_PER_STEP = 16;
+
+/** Charges the run in progress for building or copying `chars` characters or list items. */
+function work(chars: number): void {
+  if (active && chars > CHARS_PER_STEP) spend(active, Math.ceil(chars / CHARS_PER_STEP));
+}
+
+function spend(state: State, n: number): void {
+  // the call's own limit first: a step it may not take is not charged to the meter
+  if (state.steps + n > state.max) throw new Exhausted(LIMITS.steps);
+  charge("decode", n);
+  state.steps += n;
 }
 
 /**
@@ -140,17 +153,27 @@ export function safeRegexCost(pattern: string, flags: string): number | null {
   return Math.max(1, width) * (optional + 1);
 }
 
-const str = (v: string): Value => ({ k: "str", v });
+const str = (v: string): Value => {
+  work(v.length);
+
+  return { k: "str", v };
+};
+
 const num = (v: number): Value => ({ k: "num", v });
 const known = (v: Known): Value => (v.kind === "text" ? str(v.value) : num(v.value));
 
 /**
  * The string `fn` returns for `args`, run as a pure decoder. `allowance` is the steps the caller still lets decoders
- * take (a file's budget across every call); what this call takes is subtracted from it.
+ * take (a file's budget across every call, carved out of the meter); what this call takes is counted against it.
+ * Every step is charged to the meter as it is taken.
  */
-export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost, allowance: { steps: number } = { steps: MAX_DECODER_STEPS }): DecodeResult {
-  if (allowance.steps <= 0) return { kind: "exhausted", limit: LIMITS.steps };
-  const state: State = { steps: 0, max: Math.min(MAX_DECODER_STEPS, allowance.steps), depth: 0, host };
+export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost, allowance: Allowance = new Allowance("decode", MAX_DECODER_STEPS)): DecodeResult {
+  if (allowance.left <= 0) return { kind: "exhausted", limit: LIMITS.steps };
+  // the arguments are copied in
+  charge("decode", 1 + args.reduce((n, a) => n + (a.kind === "text" ? Math.ceil(a.value.length / 32) : 1), 0));
+  const state: State = { steps: 0, max: Math.min(MAX_DECODER_STEPS, allowance.left), depth: 0, host };
+  const outer = active;
+  active = state;
 
   try {
     const out = call(fn, args.map(known), new Map(), state);
@@ -159,6 +182,9 @@ export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost
 
     return out.v.length <= MAX_CHARS ? { kind: "decoded", value: out.v } : { kind: "exhausted", limit: LIMITS.chars };
   } catch (e) {
+    // the analysis's meter running out ends the analysis, not just this decoder
+    if (e instanceof MeterExhausted) throw e;
+
     if (e instanceof Exhausted) return { kind: "exhausted", limit: e.limit };
 
     // a builtin refusing an argument list too long, or a stack too deep: a size limit, not a program apm does not run
@@ -167,7 +193,8 @@ export function runDecoder(fn: AnyNode, args: readonly Known[], host: DecodeHost
     // Unsupported, or a builtin refusing its input (a bad encoding, a malformed URI escape): not a decoder apm runs
     return { kind: "unsupported" };
   } finally {
-    allowance.steps -= state.steps;
+    active = outer;
+    allowance.count(state.steps);
   }
 }
 
@@ -235,6 +262,8 @@ function text(v: Value): string {
         ",",
       );
     case "bytes":
+      work(v.latin1.length * 2);
+
       return Buffer.from(v.latin1, "latin1").toString("utf8");
     case "fn":
     case "re":
@@ -271,12 +300,14 @@ function truthy(v: Value): boolean {
 
 function capped(s: string): Value {
   if (s.length > MAX_CHARS) throw new Exhausted(LIMITS.chars);
+  work(s.length);
 
   return str(s);
 }
 
 function list(v: Value[]): Value {
   if (v.length > MAX_CHARS) throw new Exhausted(LIMITS.chars);
+  work(v.length);
 
   return { k: "list", v };
 }
@@ -290,6 +321,8 @@ function joined(pieces: readonly string[], sep: string): string {
 
     if (total > MAX_CHARS) throw new Exhausted(LIMITS.chars);
   }
+
+  work(total + pieces.length);
 
   return pieces.join(sep);
 }
@@ -341,6 +374,9 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
         const e = n.expressions[i];
 
         if (e) out += text(evaluate(e, env, state));
+
+        // built as it goes: refused as soon as it is too long, not once it is whole
+        if (out.length > MAX_CHARS) throw new Exhausted(LIMITS.chars);
       });
 
       return capped(out);
@@ -376,11 +412,23 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
       if (n.object.type === "Super") throw new Unsupported();
       const obj = evaluate(n.object, env, state);
       const key = n.computed ? evaluate(n.property, env, state) : n.property.type === "Identifier" ? str(n.property.name) : NOTHING;
-      const items = obj.k === "str" ? obj.v.split("").map(str) : obj.k === "list" ? obj.v : null;
+      // a string's length or one character, read in place (splitting the string for each read cost its length a read)
 
-      if (items && key.k === "str" && key.v === "length") return num(items.length);
+      if (obj.k === "str") {
+        if (key.k === "str" && key.v === "length") return num(obj.v.length);
 
-      if (items && key.k === "num") return items[key.v] ?? NOTHING;
+        if (key.k === "num") {
+          const c = Number.isInteger(key.v) && key.v >= 0 ? obj.v[key.v] : undefined;
+
+          return c === undefined ? NOTHING : str(c);
+        }
+
+        throw new Unsupported();
+      }
+
+      if (obj.k === "list" && key.k === "str" && key.v === "length") return num(obj.v.length);
+
+      if (obj.k === "list" && key.k === "num") return obj.v[key.v] ?? NOTHING;
       throw new Unsupported();
     }
 
@@ -465,12 +513,24 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
   if (callee.type === "MemberExpression" && !callee.computed && callee.object.type === "Identifier" && callee.property.type === "Identifier" && !env.has(callee.object.name)) {
     const name = `${callee.object.name}.${callee.property.name}`;
 
-    if (name === "String.fromCharCode") return capped(String.fromCharCode(...args.flatMap((a) => (a.k === "list" ? a.v.map(number) : [number(a)]))));
+    if (name === "String.fromCharCode") {
+      work(args.reduce((n, a) => n + (a.k === "list" ? a.v.length : 1), 0) * 2);
+
+      return capped(String.fromCharCode(...args.flatMap((a) => (a.k === "list" ? a.v.map(number) : [number(a)]))));
+    }
 
     if (name === "Buffer.from") {
-      if (a0.k === "list") return { k: "bytes", latin1: String.fromCharCode(...a0.v.map((x) => number(x) & 255)) };
+      if (a0.k === "list") {
+        work(a0.v.length * 2);
 
-      return { k: "bytes", latin1: Buffer.from(text(a0), encoding(a1)).toString("latin1") };
+        return { k: "bytes", latin1: String.fromCharCode(...a0.v.map((x) => number(x) & 255)) };
+      }
+
+      const input = text(a0);
+
+      work(input.length * 2);
+
+      return { k: "bytes", latin1: Buffer.from(input, encoding(a1)).toString("latin1") };
     }
   }
 
@@ -481,16 +541,24 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
 
     switch (callee.name) {
       case "parseInt":
+        work(text(a0).length);
+
         return num(Number.parseInt(text(a0), a1 === undefined ? 10 : number(a1)));
       case "Number":
         return num(number(a0));
       case "String":
         return str(text(a0));
       case "atob":
+        work(text(a0).length * 2);
+
         return str(Buffer.from(text(a0), "base64").toString("latin1"));
       case "decodeURIComponent":
+        work(text(a0).length * 2);
+
         return str(decodeURIComponent(text(a0)));
       case "unescape":
+        work(text(a0).length * 2);
+
         return str(unescape(text(a0)));
       default: {
         const fn = state.host.localFunction(callee);
@@ -509,6 +577,7 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
   switch (recv.k) {
     case "bytes":
       if (method !== "toString") throw new Unsupported();
+      work(recv.latin1.length * 2);
 
       return capped(Buffer.from(recv.latin1, "latin1").toString(encoding(args[0])));
     case "num":
@@ -532,6 +601,9 @@ function index(a: readonly Value[], i: number): number | undefined {
 }
 
 function stringMethod(s: string, method: string, a: readonly Value[], state: State): Value {
+  // every method here reads the string at most once more than the result it builds (charged as that is made)
+  work(s.length);
+
   switch (method) {
     case "replace":
     case "replaceAll": {
@@ -598,6 +670,8 @@ function stringMethod(s: string, method: string, a: readonly Value[], state: Sta
 }
 
 function arrayMethod(arr: Value[], method: string, a: readonly Value[], state: State): Value {
+  work(arr.length);
+
   switch (method) {
     case "join": {
       const sep = a[0];

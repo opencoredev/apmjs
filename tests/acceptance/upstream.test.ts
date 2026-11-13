@@ -84,10 +84,16 @@ describe("upstream proxy", () => {
   });
 
   test("upstream versions get scored on demand", async () => {
-    const good = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.1.0`);
+    // an anonymous request never analyses: the version is queued, and the answer says so
+    const anonymous = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.0.0`);
+    expect(anonymous.status, JSON.stringify(anonymous.body)).toBe(503);
+    expect(dig(anonymous.body, "pending")).toBe(true);
+    // a token caller's request analyses it inline
+    const signedIn = { headers: { authorization: `Bearer ${alice}` } };
+    const good = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.1.0`, signedIn);
     expect(good.status, JSON.stringify(good.body)).toBe(200);
     expect(Number(dig(good.body, "score"))).toBeGreaterThanOrEqual(85);
-    const bad = await getJson(`${reg.url}-/apm/v1/score/up-evil/1.0.0`);
+    const bad = await getJson(`${reg.url}-/apm/v1/score/up-evil/1.0.0`, signedIn);
     expect(bad.status).toBe(200);
     expect(Number(dig(bad.body, "score"))).toBeLessThan(40);
   });
@@ -142,8 +148,9 @@ describe("upstream proxy", () => {
   });
 
   test("popular-scores answers every named package in one response", async () => {
-    // popular-scores reads stored analyses only: score up-pkg's latest first, as a visit to its page would
-    expect((await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.2.0`)).status).toBe(200);
+    // popular-scores reads stored analyses only: score up-pkg's latest first, as a signed-in caller's request would
+    // (an anonymous one only queues it)
+    expect((await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.2.0`, { headers: { authorization: `Bearer ${alice}` } })).status).toBe(200);
     const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg,up-evil,nope-not-here`);
 
     expect(r.status, JSON.stringify(r.body)).toBe(200);

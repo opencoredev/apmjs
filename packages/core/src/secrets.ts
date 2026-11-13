@@ -1,5 +1,6 @@
 // Finds secrets that should never ship in a package tarball. Pure: file list in, findings out.
 import { MAX_ANALYZED_FILE_BYTES, type SkippedFile } from "./limits.ts";
+import { chargeText, metered, type Meter } from "./meter.ts";
 
 export type FileLike = { path: string; data: Uint8Array };
 
@@ -27,13 +28,15 @@ const CONTENT_RULES: { kind: string; re: RegExp }[] = [
   { kind: "Anthropic key", re: /\bsk-ant-[A-Za-z0-9_-]{32,}\b/ },
   { kind: "registry auth token", re: /_authToken\s*=\s*[^\s$]{8,}/ },
   // npm's basic auth: "//host/:_auth=base64(user:pass)" or ":_password=base64(pass)"
-  { kind: "registry password", re: /\/\/[^\s:]+:_(?:auth|password)\s*=\s*[^\s$]{4,}/ },
+  // the host is matched looking back from `:_`, so each start is tried once (a forward `//[^\s:]+` from every `//` of
+  // `////…` scanned to the end of the file from each)
+  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)\s*=\s*[^\s$]{4,}/ },
   { kind: "Slack webhook", re: /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_/-]{20,}/ },
   { kind: "Discord webhook", re: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]{20,}/ },
 ];
 
 // In an .npmrc the auth keys need no registry prefix: "_auth=..." on its own line is a default credential.
-const NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^\s*_(?:auth|password)\s*=\s*[^\s$]{4,}/m }];
+const NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)\s*=\s*[^\s$]{4,}/m }];
 
 // Magic bytes of archives whose contents the scan cannot read.
 const ARCHIVES: readonly (readonly number[])[] = [
@@ -55,7 +58,11 @@ function basename(p: string): string {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
-export function findSecrets(files: readonly FileLike[]): SecretScan {
+export function findSecrets(files: readonly FileLike[], meter?: Meter): SecretScan {
+  return metered(meter, () => scanSecrets(files));
+}
+
+function scanSecrets(files: readonly FileLike[]): SecretScan {
   const out: SecretFinding[] = [];
   const skipped: SkippedFile[] = [];
 
@@ -89,8 +96,11 @@ export function findSecrets(files: readonly FileLike[]): SecretScan {
 
     // every other file is read, NUL bytes and all: latin1 maps each byte to one character, so the ASCII
     // patterns match in text and binary files alike
-    const text = Buffer.from(f.data.buffer, f.data.byteOffset, f.data.byteLength).toString("latin1");
     const rules = base === ".npmrc" || base === "npmrc" ? [...NPMRC_RULES, ...CONTENT_RULES] : CONTENT_RULES;
+
+    // the latin1 decode and one linear pass per rule
+    chargeText("text", f.data.length, rules.length + 1);
+    const text = Buffer.from(f.data.buffer, f.data.byteOffset, f.data.byteLength).toString("latin1");
 
     for (const rule of rules) {
       if (rule.re.test(text)) {

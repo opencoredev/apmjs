@@ -1,5 +1,6 @@
 // Small helpers over parsed programs, shared by the reader (js.ts) and the flow analysis (flow.ts). Pure.
 import type { AnyNode } from "acorn";
+import { chargeNow } from "./meter.ts";
 
 /** Stands for a piece of a string apm cannot know (`'curl ' + url`), so the rest can still be read. */
 export const UNKNOWN = "__apm__";
@@ -13,9 +14,15 @@ function isParsedNode(v: unknown): v is AnyNode {
 /** A node's child nodes, in source order: every field holding a node or a list of nodes. */
 export function childNodes(n: AnyNode): AnyNode[] {
   const out: AnyNode[] = [];
+  const values = Object.values(n);
 
-  for (const v of Object.values(n)) {
+  // every walk over a tree goes through here: one unit for the node, and one for each field looked at
+  chargeNow(1 + values.length);
+
+  for (const v of values) {
     if (Array.isArray(v)) {
+      chargeNow(v.length);
+
       for (const x of v) if (isParsedNode(x)) out.push(x);
     } else if (isParsedNode(v)) out.push(v);
   }
@@ -28,6 +35,8 @@ export function unwrap(n: AnyNode): AnyNode {
   let cur = n;
 
   for (;;) {
+    chargeNow(1);
+
     if (cur.type === "ChainExpression") cur = cur.expression;
     else if (cur.type === "TSAsExpression" || cur.type === "TSSatisfiesExpression" || cur.type === "TSNonNullExpression" || cur.type === "TSTypeAssertion" || cur.type === "TSInstantiationExpression") cur = cur.expression;
     else return cur;

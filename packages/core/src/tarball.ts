@@ -2,6 +2,7 @@
 // Every header is validated and every limit is enforced, so a hostile archive gets a typed
 // error, never a hang or an unbounded allocation.
 import { gunzipSync } from "node:zlib";
+import { chargeText, metered, type Meter } from "./meter.ts";
 
 export type TarEntry = { path: string; size: number; mode: number; data: Uint8Array };
 
@@ -42,17 +43,44 @@ function hasCode(e: unknown): e is { code: unknown } {
   return typeof e === "object" && e !== null && "code" in e;
 }
 
-/** Inflates gzip, refusing output larger than `maxBytes`. */
-export function gunzipCapped(bytes: Uint8Array, maxBytes: number): Uint8Array {
-  try {
-    return new Uint8Array(gunzipSync(bytes, { maxOutputLength: maxBytes }));
-  } catch (e) {
-    if (e instanceof RangeError || (hasCode(e) && e.code === "ERR_BUFFER_TOO_LARGE")) {
-      throw new ArchiveError("too-large", `inflates to more than ${Math.floor(maxBytes / (1024 * 1024))} MB`);
-    }
+/**
+ * The size a gzip stream says it inflates to: its trailer's ISIZE, the length mod 2^32 of the last member. npm, yarn,
+ * pnpm and bun all pack one member, so for a tarball this is its length.
+ */
+function trailerSize(bytes: Uint8Array): number | null {
+  if (bytes.length < 18 || bytes[0] !== 0x1f || bytes[1] !== 0x8b) return null;
+  const at = bytes.length - 4;
 
-    throw new ArchiveError("invalid", `not valid gzip: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  return ((bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8) | ((bytes[at + 2] ?? 0) << 16)) + (bytes[at + 3] ?? 0) * 0x1000000;
+}
+
+/** Units of meter the inflate of one character costs, against a text pass's one per CHARS_PER_UNIT (meter.ts). */
+const GUNZIP_PASSES = 2;
+
+/**
+ * Inflates gzip, refusing output larger than `maxBytes`. The trailer says how large the output is, so that much is
+ * charged to the meter before anything is inflated and the inflate is held to it: a stream that inflates past what its
+ * trailer says is refused as invalid, so the charge always covers the work.
+ */
+export function gunzipCapped(bytes: Uint8Array, maxBytes: number, meter?: Meter): Uint8Array {
+  return metered(meter, () => {
+    const size = trailerSize(bytes);
+
+    if (size === null) throw new ArchiveError("invalid", "not valid gzip: no gzip header and trailer");
+
+    if (size > maxBytes) throw new ArchiveError("too-large", `inflates to more than ${Math.floor(maxBytes / (1024 * 1024))} MB`);
+    chargeText("gunzip", Math.max(size, bytes.length), GUNZIP_PASSES);
+
+    try {
+      return new Uint8Array(gunzipSync(bytes, { maxOutputLength: Math.max(1, size) }));
+    } catch (e) {
+      if (e instanceof RangeError || (hasCode(e) && e.code === "ERR_BUFFER_TOO_LARGE")) {
+        throw new ArchiveError("invalid", `not valid gzip: it inflates to more than the ${size} bytes its trailer says`);
+      }
+
+      throw new ArchiveError("invalid", `not valid gzip: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  });
 }
 
 function readString(buf: Uint8Array, start: number, len: number): string {
@@ -92,7 +120,11 @@ function invalid(message: string): ArchiveError {
 }
 
 /** Parses an uncompressed tar. Strips the leading "package/" (or any single top dir) from paths. */
-export function readTar(tar: Uint8Array): TarEntry[] {
+export function readTar(tar: Uint8Array, meter?: Meter): TarEntry[] {
+  return metered(meter, () => readTarMetered(tar));
+}
+
+function readTarMetered(tar: Uint8Array): TarEntry[] {
   const entries: TarEntry[] = [];
   let off = 0;
   let headers = 0;
@@ -101,6 +133,9 @@ export function readTar(tar: Uint8Array): TarEntry[] {
 
   while (off + 512 <= tar.length) {
     const header = tar.subarray(off, off + 512);
+
+    // a header: the zero test, the checksum and the fields each read its 512 bytes once
+    chargeText("tar", 512, 4);
 
     if (header.every((b) => b === 0)) break;
     headers++;
@@ -124,14 +159,13 @@ export function readTar(tar: Uint8Array): TarEntry[] {
     off = dataStart + Math.ceil(size / 512) * 512;
 
     if (type === "L") {
+      chargeText("tar", data.length);
       longName = readString(data, 0, data.length);
       continue;
     }
 
     if (type === "x") {
-      const text = new TextDecoder().decode(data);
-      const m = /\d+ path=([^\n]*)\n/.exec(text);
-      paxPath = m?.[1] ?? null;
+      paxPath = paxPathOf(data, off);
       continue;
     }
 
@@ -148,6 +182,8 @@ export function readTar(tar: Uint8Array): TarEntry[] {
     paxPath = null;
     const slash = full.indexOf("/");
     full = slash >= 0 ? full.slice(slash + 1) : full;
+    // the entry's bytes are copied out of the archive
+    chargeText("tar", size + full.length);
     entries.push({ path: full, size, mode, data: new Uint8Array(data) });
   }
 
@@ -158,12 +194,58 @@ export function readTar(tar: Uint8Array): TarEntry[] {
  * Parses a gzip'd tar within `maxBytes` (MAX_UNPACKED_BYTES unless a host with less memory passes a lower cap).
  * Throws ArchiveError for anything it will not read.
  */
-export function readTarball(tgz: Uint8Array, maxBytes: number = MAX_UNPACKED_BYTES): TarEntry[] {
-  return readTar(gunzipCapped(tgz, Math.min(maxBytes, MAX_UNPACKED_BYTES)));
+export function readTarball(tgz: Uint8Array, maxBytes: number = MAX_UNPACKED_BYTES, meter?: Meter): TarEntry[] {
+  return metered(meter, () => readTarMetered(gunzipCapped(tgz, Math.min(maxBytes, MAX_UNPACKED_BYTES))));
+}
+
+const DIGIT_0 = 0x30;
+const SPACE = 0x20;
+const EQUALS = 0x3d;
+const NEWLINE = 0x0a;
+
+/**
+ * The `path` of a PAX extended header, or null when it sets none. A PAX header is a run of records, each
+ * `<length> <key>=<value>\n` where `<length>` counts the whole record, digits and newline included. They are read with
+ * one cursor that only moves forward, a record at a time, and a header that is not such a run is refused: a search
+ * for `path=` anywhere in it (what this was before) tried every digit as a record's start, and a payload of repeated
+ * digits made that quadratic. `at` is the header's offset, for the error.
+ */
+function paxPathOf(data: Uint8Array, at: number): string | null {
+  chargeText("tar", data.length, 2);
+  let path: string | null = null;
+  let pos = 0;
+
+  while (pos < data.length) {
+    // a trailing NUL pad after the last record is allowed
+    if (data[pos] === 0) break;
+    let len = 0;
+    let digits = 0;
+
+    for (let c = data[pos + digits]; c !== undefined && c >= DIGIT_0 && c <= DIGIT_0 + 9; c = data[pos + digits]) {
+      len = len * 10 + (c - DIGIT_0);
+      digits++;
+
+      if (digits > 12) throw invalid(`bad pax record length at byte ${at}`);
+    }
+
+    const end = pos + len;
+
+    if (digits === 0 || data[pos + digits] !== SPACE || len <= digits + 3 || end > data.length || data[end - 1] !== NEWLINE) throw invalid(`malformed pax record at byte ${at}`);
+    const record = data.subarray(pos + digits + 1, end - 1);
+    const eq = record.indexOf(EQUALS);
+
+    if (eq <= 0) throw invalid(`malformed pax record at byte ${at}`);
+
+    if (eq === 4 && record[0] === 0x70 && record[1] === 0x61 && record[2] === 0x74 && record[3] === 0x68) path = new TextDecoder().decode(record.subarray(eq + 1));
+    pos = end;
+  }
+
+  return path;
 }
 
 /** Paths that appear more than once, or that try to escape the package folder. */
 export function ambiguousPaths(entries: readonly TarEntry[]): string[] {
+  for (const e of entries) chargeText("tar", e.path.length, 4);
   const seen = new Set<string>();
   const bad = new Set<string>();
 

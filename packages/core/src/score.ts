@@ -5,7 +5,8 @@
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
-import { describeSkip, MAX_ANALYSIS_MS, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
+import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
+import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
@@ -636,10 +637,15 @@ export type AnalyzeInput = {
   uncheckedDependencies?: readonly string[];
   /** How many bytes of file content one analysis reads. Defaults to MAX_SCANNED_BYTES. */
   maxScannedBytes?: number;
-  /** Steps the flow analysis across files may take. Defaults to MAX_CROSS_FILE_STEPS. */
+  /** Steps the flow analysis across files may take, carved out of the meter. Defaults to MAX_CROSS_FILE_STEPS. */
   maxCrossFileSteps?: number;
-  /** Milliseconds one analysis may run before it stops reading files. Defaults to MAX_ANALYSIS_MS. */
-  maxAnalysisMs?: number;
+  /**
+   * The work meter this analysis charges (meter.ts). A caller that unpacked the tarball under it passes it on, so the
+   * unpack and the analysis share one bound. Without one, the analysis gets a meter of `maxWork` units.
+   */
+  meter?: Meter;
+  /** Units of work one analysis may spend when no `meter` is given. Defaults to MAX_ANALYSIS_WORK. */
+  maxWork?: number;
   /**
    * Limits the caller hit before this analysis ran, each said as evidence of `incomplete`: the registry re-runs an
    * analysis the platform stopped on a smaller budget, and says so, since the reading it can afford is not the whole.
@@ -679,20 +685,32 @@ type Found = {
 };
 
 function collector(): Found {
-  const found = new Map<SignalId, { confirmed: string[]; possible: string[] }>();
+  const found = new Map<SignalId, { confirmed: string[]; possible: string[]; has: Set<string> }>();
   const rank = new Map<string, number>();
   // the call or load a parsed program showed comes before a text match, and a text match in code before one in a
   // comment, a regex or a type, so the shown evidence cites the most direct line
-  const ranked = (list: readonly string[]): string[] => [...list].sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+
+  const ranked = (list: readonly string[]): string[] => {
+    charge("score", list.length * Math.max(1, Math.ceil(Math.log2(list.length + 1))));
+
+    return [...list].sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+  };
 
   return {
     add(id, ev, confidence = "confirmed", cited = "tree") {
-      const entry = found.get(id) ?? { confirmed: [], possible: [] };
+      chargeText("score", ev.length, 3);
+      const entry = found.get(id) ?? { confirmed: [], possible: [], has: new Set() };
       const list = entry[confidence];
+      const key = `${confidence}\u0000${ev}`;
 
       rank.set(ev, Math.min(rank.get(ev) ?? CITED_RANK[cited], CITED_RANK[cited]));
 
-      if (!list.includes(ev)) list.push(ev);
+      // a set, not a search of the list: a file can give thousands of pieces of evidence
+      if (!entry.has.has(key)) {
+        entry.has.add(key);
+        list.push(ev);
+      }
+
       found.set(id, entry);
     },
     has: (id) => found.has(id),
@@ -870,6 +888,9 @@ function readLikeV3(w: V3Walk): V3Skips {
     scanned += f.data.length;
     // keyed by the entry, not its path: only these bytes' own read can stand in for reading them
     const known = w.readWhole.get(f);
+
+    // decoding the bytes, and what this walk reads of a file the first walk did not read whole
+    chargeText("text", f.data.length, known === undefined ? TEXT_PASSES_PER_FILE : 1);
     let text: string | null = null;
     const textOf = (): string => (text ??= new TextDecoder().decode(f.data));
 
@@ -942,7 +963,62 @@ export class AmbiguousPathsError extends Error {
  * files share a path or a path escapes the package folder.
  */
 export function analyze(input: AnalyzeInput): Analysis {
+  const meter = input.meter ?? new Meter(input.maxWork ?? MAX_ANALYSIS_WORK);
+  let read: Analysis;
+
+  try {
+    read = withMeter(meter, () => analyzeMetered(input));
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+
+    return unfinishedAnalysis({ name: input.name, manifest: input.manifest, files: input.files, phase: e.phase, limit: e.limit, because: input.incompleteBecause });
+  }
+
+  // a throw some step swallowed still left the meter spent: what came back is not a finished reading
+  const spentIn = meter.exhausted;
+
+  return spentIn === null ? read : unfinishedAnalysis({ name: input.name, manifest: input.manifest, files: input.files, phase: spentIn, limit: meter.limit, because: input.incompleteBecause });
+}
+
+/** What `unfinishedAnalysis` needs: the version, where its meter ran out, and limits the caller hit before. */
+export type Unfinished = { name: string; manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; phase: Phase; limit: number; because?: readonly string[] | undefined };
+
+/** The `incomplete` evidence for a meter that ran out in `phase`. */
+export function meterEvidence(phase: Phase, limit: number): string {
+  return `analysis work limit: apm stopped reading this version while ${PHASE_NAMES[phase]}, at the ${limit.toLocaleString("en-US")} units one analysis may spend, so nothing it holds was cleared`;
+}
+
+/**
+ * The analysis of a version whose meter ran out: `incomplete`, naming the phase, and nothing that reads as a pass. What
+ * the reading found before it stopped is not reported, since half a reading cannot be weighed; the score is below the
+ * floor on `incomplete` alone. It charges nothing, so it can be built on a spent meter.
+ */
+export function unfinishedAnalysis(u: Unfinished): Analysis {
+  const evidence = [meterEvidence(u.phase, u.limit), ...(u.because ?? [])];
+
+  return {
+    scorer: SCORER,
+    signals: [signal("incomplete", evidence)],
+    facts: factsOf(u.manifest, u.files),
+    notChecked: [...NOT_CHECKED, `everything past the analysis work limit (${PHASE_NAMES[u.phase]})`],
+    skipped: [],
+    capabilities: [],
+    declaration: { kind: "none", notes: [] },
+  };
+}
+
+/**
+ * Linear passes the analysis makes over each file's text outside the parser and the text rules (which charge their
+ * own): decoding the bytes, choosing the language, the facts, v3's imports and the joined text they are read from.
+ */
+const TEXT_PASSES_PER_FILE = 4;
+
+function analyzeMetered(input: AnalyzeInput): Analysis {
   const { manifest, files } = input;
+
+  // the per-file bookkeeping below (the path map, sorting, the order of reading, the facts) for every file
+  for (const f of files) chargeText("score", f.path.length + 64, 12);
+  chargeText("score", JSON.stringify(manifest).length, 8);
   const ambiguous = ambiguousPaths(files);
 
   if (ambiguous.length > 0) throw new AmbiguousPathsError(ambiguous);
@@ -984,7 +1060,6 @@ export function analyze(input: AnalyzeInput): Analysis {
   // through a path apm can resolve; then every other file that could be code, whatever its name.
   // A byte budget, not a file count, bounds the work, so filler files can only push out other filler.
   const budget = input.maxScannedBytes ?? MAX_SCANNED_BYTES;
-  const deadline = performance.now() + (input.maxAnalysisMs ?? MAX_ANALYSIS_MS);
   const installTargets = new Set<string>();
   const first: string[] = [];
 
@@ -1063,7 +1138,8 @@ export function analyze(input: AnalyzeInput): Analysis {
     }
 
     heldBytes.set(path, spent + e.code.length);
-    const scan = scanFile(e.code, "js");
+    chargeText("held", e.code.length, TEXT_PASSES_PER_FILE);
+    const scan = inPhase("held", () => scanFile(e.code, "js"));
     const facts = fileFacts.get(path) ?? [];
     const snippet = `${e.snippet}${HELD_NOTES[e.origin]}`;
 
@@ -1105,13 +1181,10 @@ export function analyze(input: AnalyzeInput): Analysis {
       return;
     }
 
-    if (performance.now() > deadline) {
-      (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-time" });
-
-      return;
-    }
-
     scanned += f.data.length;
+    // decoding the bytes, choosing the language, and the passes below over the whole text: the file's facts, v3's
+    // imports and the joined text it reads them from
+    chargeText("text", f.data.length, TEXT_PASSES_PER_FILE);
     // read whatever the bytes are: skipping "non-text" would let a NUL byte hide code
     const text = new TextDecoder().decode(f.data);
 
@@ -1125,7 +1198,12 @@ export function analyze(input: AnalyzeInput): Analysis {
 
     for (const finding of scan.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, citedAs(finding));
 
-    for (const note of scan.notes) limits.set(note, [...(limits.get(note) ?? []), f.path]);
+    for (const note of scan.notes) {
+      const list = limits.get(note);
+
+      if (list) list.push(f.path);
+      else limits.set(note, [f.path]);
+    }
 
     if (lang !== "json" && lang !== "declaration") {
       if (scan.read === "raw") rawFiles.add(f.path);
@@ -1220,7 +1298,7 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
 
-  const cross = addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps);
+  const cross = inPhase("cross-file", () => addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps));
 
   if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
@@ -1231,9 +1309,8 @@ export function analyze(input: AnalyzeInput): Analysis {
   for (const list of [unanalyzed, v3.unanalyzed]) {
     if (list.length === 0) continue;
     const bytes = list.reduce((n, s) => n + s.size, 0);
-    const limit = list.some((s) => s.reason === "over-time") ? `${(input.maxAnalysisMs ?? MAX_ANALYSIS_MS) / 1000} s analysis time limit` : `${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget`;
 
-    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${limit} (first: ${list[0]?.path ?? ""})`);
+    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
   }
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
@@ -1253,7 +1330,10 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
-  const assessed = assess({
+  // scoring weighs every fact of every file, every edge between files and every piece of evidence
+  charge("score", [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0));
+
+  const assessed = inPhase("score", () => assess({
     found,
     fileFacts,
     edges,
@@ -1271,14 +1351,14 @@ export function analyze(input: AnalyzeInput): Analysis {
     gyp: gyp !== undefined,
     binPaths: new Set(entryPoints(manifest).flatMap((e) => (e.field.startsWith("bin") ? [joinPath("", e.path)] : []))),
     declaration: declarationOf(manifest),
-  });
+  }));
 
   const signals = assessed.signals;
 
   const notChecked = [
     ...NOT_CHECKED,
     ...[...limits].map(([note, paths]) => `${note} (${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ` and ${paths.length - 3} more files` : ""})`),
-    ...[unanalyzed, v3.unanalyzed].flatMap((list) => (list.length === 0 ? [] : list.some((s) => s.reason === "over-time") ? [`${list.length} file(s) not analyzed: the analysis reached its time limit first`] : [`${list.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`])),
+    ...[unanalyzed, v3.unanalyzed].flatMap((list) => (list.length === 0 ? [] : [`${list.length} file(s) not analyzed: the package is larger than the ${(budget / (1024 * 1024)).toFixed(1)} MB one analysis reads`])),
     ...(input.uncheckedDependencies ?? []).map((d) => `dependency ${d}`),
   ];
 
@@ -1334,8 +1414,17 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
   for (const [path, { flows }] of fileFlows) {
     const facts = fileFacts.get(path) ?? [];
 
+    // facts of each kind counted once, not by filtering the list for every one
+    const counts = new Map<Fact["kind"], number>();
+
+    for (const x of facts) counts.set(x.kind, (counts.get(x.kind) ?? 0) + 1);
+
     const fact = (kind: Fact["kind"], f: FlowFinding, name: string): void => {
-      if (facts.filter((x) => x.kind === kind).length < MAX_FLOW_FACTS) facts.push({ kind, line: f.line, snippet: f.snippet, name, text: false, near: true });
+      const n = counts.get(kind) ?? 0;
+
+      if (n >= MAX_FLOW_FACTS) return;
+      counts.set(kind, n + 1);
+      facts.push({ kind, line: f.line, snippet: f.snippet, name, text: false, near: true });
     };
 
     for (const f of flows) {
@@ -1345,6 +1434,7 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
         if (labels.has("env")) fact("sends-env", f, "sends the whole environment in a request");
 
         if (labels.has("cred")) fact("sends-credential", f, "sends what it read from a credential file");
+        charge("cross-file", labels.size);
         const families = new Set([...labels].flatMap((l) => (l.startsWith("secret:") ? [l.slice("secret:".length)] : [])));
 
         if (families.size >= 3) fact("sends-secrets", f, `sends ${[...families].join(", ")} tokens in one request`);

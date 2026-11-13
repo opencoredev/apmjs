@@ -14,7 +14,7 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  // packages/registry/test/tree-walk.test.ts imports Worker modules: packages/registry/tsconfig.test.json checks it with Workers types
-  "exclude": ["packages/registry/test/tree-walk.test.ts"],
+  // these registry tests import Worker modules: packages/registry/tsconfig.test.json checks them with Workers types
+  "exclude": ["packages/registry/test/tree-walk.test.ts", "packages/registry/test/analysis-recovery.test.ts"],
   "include": ["scripts/dev-registry.ts", "packages/core/src/**/*.ts", "packages/cli/src/**/*.ts", "packages/bun-scanner/src/**/*.ts", "packages/ai-review/src/**/*.ts", "packages/registry/scripts/**/*.ts", "packages/*/test/**/*.ts", "apps/reviewer/src/**/*.ts", "tests/**/*.ts", "apps/web/cloudflare-env.d.ts", "scripts/lint.ts", "oxlint.config.ts"]
 }

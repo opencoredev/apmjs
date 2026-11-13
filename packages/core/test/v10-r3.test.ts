@@ -77,11 +77,11 @@ describe("1: resolution across files is bounded", () => {
     expect(scoreOf(a)).toBeLessThan(SCORE_FLOOR);
   });
 
-  test("past the time limit the files left are listed as not analyzed, never read as clean", () => {
-    const a = analyze({ ...inputOf({ "index.js": "module.exports = 1;", "lib/a.js": "module.exports = 2;" }), maxAnalysisMs: -1 });
+  test("past the work meter the analysis is incomplete, naming the phase, never read as clean", () => {
+    const a = analyze({ ...inputOf({ "index.js": "module.exports = 1;", "lib/a.js": "module.exports = 2;" }), maxWork: 10 });
 
-    expect(a.skipped.some((s) => s.reason === "over-time")).toBe(true);
-    expect(risk(a, "incomplete") ?? risk(a, "unanalyzed-files")).toBeDefined();
+    expect(risk(a, "incomplete")?.evidence[0]).toContain("analysis work limit");
+    expect(scoreOf(a)).toBeLessThan(SCORE_FLOOR);
   });
 });
 

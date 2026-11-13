@@ -377,6 +377,12 @@ export type StoreApi = {
   readonly startAnalysis: (input: { name: string; version: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
   /** Takes back the start `startAnalysis` counted, for a run that ended with an error it reported (not a platform stop). */
   readonly abandonAnalysis: (name: string, version: string) => Effect.Effect<void, StoreError>;
+  /**
+   * Runs `startAnalysis` counted that began at or before `before` and never ended: no outcome, and no analysis of the
+   * version by the current scorer. The record a run leaves before it starts, so the cron sweep finds what the platform
+   * stopped (analysis.ts, `recover`). Oldest first, at most `limit`.
+   */
+  readonly unfinishedAnalyses: (input: { before: number; limit: number }) => Effect.Effect<{ name: string; version: string }[], StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -967,6 +973,15 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         "abandonAnalysis",
         sql`UPDATE analysis_outcomes SET starts = GREATEST(starts - 1, 0), started_at = NULL WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL`,
         none,
+      ),
+    unfinishedAnalyses: ({ before, limit }) =>
+      run(
+        "unfinishedAnalyses",
+        sql`SELECT o.package AS name, o.version FROM analysis_outcomes o
+            WHERE o.scorer = ${SCORER} AND o.outcome IS NULL AND o.started_at IS NOT NULL AND o.started_at <= ${before}
+              AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = o.package AND a.version = o.version AND a.scorer = ${SCORER})
+            ORDER BY o.started_at LIMIT ${limit}`,
+        all(z.object({ name: z.string(), version: z.string() })),
       ),
 
     deleteAdvisoriesFor: (name, version) =>

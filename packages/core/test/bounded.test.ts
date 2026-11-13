@@ -8,12 +8,13 @@ import { join } from "node:path";
 import { z } from "zod";
 import { MAX_DECODER_STEPS, runDecoder, safeRegexCost, type Known } from "../src/decode.ts";
 import { analyze, finalize, SCORE_FLOOR, type TarEntry } from "../src/index.ts";
+import { Allowance } from "../src/meter.ts";
 
 const RUNNER = join(import.meta.dir, "fixtures", "bounded-run.ts");
 
 const Result = z.array(z.object({ ms: z.number(), score: z.number(), signals: z.array(z.object({ id: z.string(), points: z.number(), evidence: z.array(z.string()) })) }));
 
-type Case = { files: Record<string, string>; maxAnalysisMs?: number };
+type Case = { files: Record<string, string>; maxWork?: number };
 
 /**
  * Runs the cases in a child process killed after `killMs`: an analysis that never returns cannot be interrupted from
@@ -67,11 +68,11 @@ const REVIEWER_PATTERN = `^${"a?".repeat(40)}a{20}$`;
 const REVIEWER_PACKAGE = `function g(h){return h.replace(/${REVIEWER_PATTERN}/,'')}require(g('${"a".repeat(40)}!'))`;
 
 describe("P1: a regex the decoder runs stays inside its budgets", () => {
-  test("the reviewer's 184-byte package finishes inside a 100 ms analysis budget", async () => {
+  test("the reviewer's 184-byte package finishes inside a small work meter", async () => {
     // the review's package was 184 bytes; this spelling of it is 180
     expect(REVIEWER_PACKAGE.length).toBeLessThan(200);
     // before the fix this ran for minutes: native replace backtracked 2^40 paths outside the step counter
-    const { wallMs, results } = await runBounded([{ files: { "index.js": REVIEWER_PACKAGE }, maxAnalysisMs: 100 }], 20_000);
+    const { wallMs, results } = await runBounded([{ files: { "index.js": REVIEWER_PACKAGE }, maxWork: 50_000_000 }], 20_000);
     const [r] = results;
 
     expect(r?.ms ?? Infinity).toBeLessThan(1_000);
@@ -154,7 +155,7 @@ describe("P1: a regex the decoder runs stays inside its budgets", () => {
       files[`f${i}.js`] = `function g(h){return h.replace(/${p}/g,'')}module.exports=[${inputs.map((x) => `require(g('${x}'))`).join(",")}]`;
     });
 
-    const { wallMs, results } = await runBounded([{ files, maxAnalysisMs: 5_000 }], 60_000);
+    const { wallMs, results } = await runBounded([{ files, maxWork: 200_000_000 }], 60_000);
 
     expect(results[0]?.ms ?? Infinity).toBeLessThan(5_000);
     expect(wallMs).toBeLessThan(30_000);
@@ -182,7 +183,7 @@ describe("P2: a decoder that hits its limit makes the analysis incomplete", () =
 
     expect(steps).toMatchObject({ kind: "exhausted" });
     expect(deep).toMatchObject({ kind: "exhausted" });
-    expect(runDecoder(fnOf("function g(h){return h}"), [text("x")], host, { steps: 0 })).toMatchObject({ kind: "exhausted" });
+    expect(runDecoder(fnOf("function g(h){return h}"), [text("x")], host, new Allowance("decode", 0))).toMatchObject({ kind: "exhausted" });
   });
 
   test("a file's shared decoder allowance and its decoded-text budget are limits the analysis reports", () => {

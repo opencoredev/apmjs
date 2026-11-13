@@ -4,6 +4,7 @@
 // re-export DAG costs one visit per edge, not one per path through it, and a cycle ends when nothing new arrives. A
 // package-wide work budget bounds it; when the budget runs out the caller is told, and reports the analysis incomplete.
 import type { Exports, Label } from "./flow.ts";
+import { Allowance } from "./meter.ts";
 
 /** How a relative module specifier in one file names another file of the package, or undefined when it names none. */
 export type ResolveModule = (fromPath: string, spec: string) => string | undefined;
@@ -18,29 +19,60 @@ export const MAX_CROSS_FILE_STEPS = 2_000_000;
 
 const IMPORT = /^import:(.*)#([^#]*?)(\+?)$/;
 
+/** Thrown inside the resolution when its allowance is spent; `resolve` catches it, so every step stops there. */
+class Spent extends Error {}
+
 export class CrossFile {
   private readonly nodes = new Map<string, ExportNode>();
   private readonly pending: string[] = [];
-  private steps = 0;
+  private readonly steps: Allowance;
   /** Whether the budget ran out: then some labels were not followed to the end. */
   exhausted = false;
 
   constructor(
     private readonly exportsOf: (path: string) => Exports | undefined,
     private readonly resolveModule: ResolveModule,
-    private readonly maxSteps: number = MAX_CROSS_FILE_STEPS,
-  ) {}
+    maxSteps: number = MAX_CROSS_FILE_STEPS,
+  ) {
+    this.steps = new Allowance("cross-file", maxSteps);
+  }
 
-  /** What `labels`, found in the file at `path`, carry once every import and read is followed. */
+  /**
+   * What `labels`, found in the file at `path`, carry once every import and read is followed. Once the allowance is
+   * spent (here or in an earlier call) nothing more is followed: what it returns is what it had, and `exhausted` says so.
+   */
   resolve(path: string, labels: readonly Label[]): Set<Label> {
-    const terms = labels.flatMap((l) => this.term(path, l) ?? []);
-
-    this.settle();
     const out = new Set<Label>();
 
-    for (const t of terms) for (const l of this.evaluate(t)) out.add(l);
+    if (this.exhausted) return out;
+
+    try {
+      this.step(1 + labels.length);
+      const terms = labels.flatMap((l) => this.term(path, l) ?? []);
+
+      this.settle();
+
+      for (const t of terms) {
+        const value = this.evaluate(t);
+
+        this.step(value.size);
+
+        for (const l of value) out.add(l);
+      }
+    } catch (e) {
+      if (!(e instanceof Spent)) throw e;
+    }
 
     return out;
+  }
+
+  /** Spends `n` steps of the allowance (and so the meter); past it the resolution stops, at this step. */
+  private step(n: number): void {
+    if (this.steps.take(n)) return;
+    this.exhausted = true;
+    this.pending.length = 0;
+
+    throw new Spent();
   }
 
   private nodeKey(path: string, name: string): string {
@@ -49,6 +81,9 @@ export class CrossFile {
 
   /** The term for one label in one file, creating the export nodes it refers to; null for an import of no file. */
   private term(path: string, l: Label): Term | null {
+    // the label is read by a pattern and its module resolved
+    this.step(1 + Math.ceil(l.length / 32));
+
     if (l.startsWith("import:")) {
       // `import:<spec>#<name>`, and `+` for a named member of that export (which is not a credential path)
       const m = IMPORT.exec(l);
@@ -94,27 +129,33 @@ export class CrossFile {
       const n = this.nodes.get(key);
 
       if (!n) continue;
-
-      if (this.steps > this.maxSteps) {
-        this.exhausted = true;
-        this.pending.length = 0;
-
-        return;
-      }
+      this.step(1);
 
       if (n.terms === null) {
         const terms = (this.exportsOf(n.path)?.get(n.name) ?? []).flatMap((l) => this.term(n.path, l) ?? []);
 
         n.terms = terms;
 
-        for (const t of terms) for (const dep of nodesOf(t)) this.nodes.get(dep)?.dependents.add(key);
+        for (const t of terms) {
+          this.step(1);
+
+          for (const dep of nodesOf(t)) this.nodes.get(dep)?.dependents.add(key);
+        }
       }
 
       const before = n.value.size;
 
-      for (const t of n.terms) for (const l of this.evaluate(t)) n.value.add(l);
+      for (const t of n.terms) {
+        const value = this.evaluate(t);
+
+        // every label of the value is looked at to add it
+        this.step(value.size);
+
+        for (const l of value) n.value.add(l);
+      }
 
       if (n.value.size === before) continue;
+      this.step(n.dependents.size);
 
       for (const d of n.dependents) {
         if (queued.has(d)) continue;
@@ -125,7 +166,7 @@ export class CrossFile {
   }
 
   private evaluate(t: Term): ReadonlySet<Label> {
-    this.steps++;
+    this.step(1);
 
     switch (t.kind) {
       case "label":
@@ -134,6 +175,8 @@ export class CrossFile {
         const value = this.nodes.get(t.node)?.value ?? new Set<Label>();
 
         if (!t.deeper || !value.has("cred-path")) return value;
+        // a copy of the value, less one label
+        this.step(value.size);
         const out = new Set(value);
 
         out.delete("cred-path");

@@ -185,9 +185,17 @@ describe("scans reuse stored analyses", () => {
 
   test("a second scan of the same upstream version downloads nothing", async () => {
     const body = { packages: [{ name: "cached-up", version: "1.0.0" }] };
-    expect((await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body))).status).toBe(200);
+    // an anonymous scan analyses nothing itself: the version is queued, and nothing is downloaded for it here
+    const before = tarballFetches;
+    const anonymous = await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body));
+    expect(anonymous.status).toBe(200);
+    expect(JSON.stringify(anonymous.body)).toContain("queued");
+    expect(tarballFetches).toBe(before);
+    // a token caller's scan analyses it once; the next scan, anonymous or not, reuses the stored analysis
+    const tok = await addUser(reg, "scanner", PASSWORD);
+    expect((await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body, tok))).status).toBe(200);
     const after = tarballFetches;
-    expect(after).toBe(1);
+    expect(after).toBeGreaterThan(before);
     expect((await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body))).status).toBe(200);
     expect(tarballFetches).toBe(after);
   });

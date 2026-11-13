@@ -68,7 +68,7 @@ function resolvedOf(c: z.infer<typeof Case>["resolve"]): ResolvedInput {
       return {
         kind: "ok",
         version: c.version,
-        report: c.score === null ? null : { score: c.score, grade: grade(c.score), signals: c.lost.map((l, i) => ({ id: `s${i}`, label: l.label, points: l.points, evidence: [], confidence: "confirmed" as const })) },
+        report: c.score === null ? null : { score: c.score, grade: grade(c.score), signals: c.lost.map((l, i) => ({ id: `s${i}`, label: l.label, points: l.points, evidence: [], confidence: "confirmed" as const })), capabilities: [] },
         skipped: c.skipped,
         deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews },
       };

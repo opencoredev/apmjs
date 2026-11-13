@@ -4,6 +4,7 @@
 import { parse as parseBabel, type ParserPlugin } from "@babel/parser";
 import { Parser, type Options, type Program } from "acorn";
 import jsx from "acorn-jsx";
+import { charge, chargeText, MeterExhausted } from "./meter.ts";
 
 /** How a file is parsed: by extension, then by content (a `.js` file holding JSX). */
 export type Dialect = "js" | "jsx" | "ts" | "tsx";
@@ -31,6 +32,15 @@ export const MAX_PARSED_TS_BYTES = 1024 * 1024;
 
 const JsxParser = Parser.extend(jsx());
 
+/** Units of meter one acorn token costs (meter.ts): reading it and building its share of the tree. */
+const PARSE_UNITS_PER_TOKEN = 4;
+
+/**
+ * Units Babel is charged per character of a try, as text passes (CHARS_PER_UNIT characters a unit): Babel builds about
+ * three times acorn's tree, and a file has up to one token a character.
+ */
+const BABEL_PASSES = 64;
+
 class TooLarge extends Error {}
 
 function acornParse(text: string, goal: Goal, withJsx: boolean): Parsed | "syntax" {
@@ -43,18 +53,27 @@ function acornParse(text: string, goal: Goal, withJsx: boolean): Parsed | "synta
     allowHashBang: true,
     // node wraps CommonJS in a function, so `return` at the top of a file is allowed
     allowReturnOutsideFunction: goal === "script",
-    onComment: (_block, _text, start, end) => comments.push([start, end]),
+    onComment: (_block, _text, start, end) => {
+      chargeText("parse", end - start);
+      comments.push([start, end]);
+    },
     onToken: () => {
+      // a token read and its share of the tree built: what the parse costs grows with tokens, not characters
+      charge("parse", PARSE_UNITS_PER_TOKEN);
+
       if (++tokens > MAX_PARSED_TOKENS) throw new TooLarge();
     },
   };
+
+  // the scan over the characters, which a run of blanks or one long string makes larger than its tokens
+  chargeText("parse", text.length);
 
   try {
     const program = (withJsx ? JsxParser : Parser).parse(text, options);
 
     return { program, comments, goal, dialect: withJsx ? "jsx" : "js" };
   } catch (e) {
-    if (e instanceof TooLarge) throw e;
+    if (e instanceof TooLarge || e instanceof MeterExhausted) throw e;
 
     return "syntax";
   }
@@ -69,6 +88,9 @@ const DECORATORS: readonly ParserPlugin[] = ["decorators-legacy", "decorators"];
 
 function babelParse(text: string, goal: Goal, base: readonly ParserPlugin[], dialect: Dialect): Parsed | "syntax" {
   for (const decorators of DECORATORS) {
+    // Babel has no token hook: a try is charged for the most it can read, every character as a token
+    chargeText("parse", text.length, BABEL_PASSES);
+
     try {
       const file = parseBabel(text, { sourceType: goal, plugins: [...base, decorators], allowReturnOutsideFunction: goal === "script", attachComment: false, errorRecovery: false });
       const comments: Range[] = (file.comments ?? []).map((c) => [c.start ?? 0, c.end ?? 0]);
@@ -82,7 +104,8 @@ function babelParse(text: string, goal: Goal, base: readonly ParserPlugin[], dia
       if (hashbang?.start != null && hashbang.end != null) comments.unshift([hashbang.start, hashbang.end]);
 
       return { program, comments, goal, dialect };
-    } catch {
+    } catch (e) {
+      if (e instanceof MeterExhausted) throw e;
       // the other decorator dialect, if any, is tried next
     }
   }
@@ -100,6 +123,8 @@ function isProgram(v: unknown): v is Program {
 
 /** Whether a comment is an HTML-like one (`<!--`, or `-->` at the start of a line), which only scripts have. */
 function hasHtmlComment(text: string, comments: readonly Range[]): boolean {
+  charge("parse", comments.length);
+
   return comments.some(([start]) => text.startsWith("<!--", start) || text.startsWith("-->", start));
 }
 

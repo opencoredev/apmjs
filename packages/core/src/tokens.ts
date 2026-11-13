@@ -6,6 +6,7 @@
 // every position back to the file as written, so evidence cites the file. The text rules then read the result the
 // way they read any raw text. Pure.
 import { tokTypes as tt, tokenizer, type Token } from "acorn";
+import { chargeText, MeterExhausted } from "./meter.ts";
 
 /** How many times the tokenizer may skip a character it cannot read (a decorator's `@`, Flow syntax) and go on. */
 const MAX_RESUMES = 64;
@@ -130,12 +131,18 @@ export function tokenText(text: string, cutStep = CUT_STEP): TokenText | null {
   };
 
   while (from < text.length) {
+    // each start copies the rest of the text and reads it again from there
+    chargeText("text", text.length - from, 2);
+
     try {
       const tokens = tokenizer(from === 0 ? text : text.slice(from), { ecmaVersion: "latest", sourceType: "module", allowHashBang: true, allowReturnOutsideFunction: true, allowAwaitOutsideFunction: true });
 
       for (let t = tokens.getToken(); t.type !== tt.eof; t = tokens.getToken()) {
         const start = from + t.start;
         const end = from + t.end;
+
+        // a token: its slice, its plain form and its write, and the gap before it
+        chargeText("text", (end - last) * 3 + 64);
         const source = text.slice(start, end);
         const form = plainForm(t, source);
         gap(last, start);
@@ -161,6 +168,7 @@ export function tokenText(text: string, cutStep = CUT_STEP): TokenText | null {
       done = true;
       break;
     } catch (e) {
+      if (e instanceof MeterExhausted) throw e;
       // acorn's SyntaxError carries the offset it stopped at; the character there is kept and reading goes on after it
       const at = e instanceof SyntaxError && "pos" in e && Number.isInteger(e.pos) ? from + Number(e.pos) : -1;
 

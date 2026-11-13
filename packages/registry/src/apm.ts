@@ -11,6 +11,8 @@ import {
   describeSkip,
   finalize,
   findSecrets,
+  Meter,
+  MeterExhausted,
   httpStatusOf,
   isRegistryDependency,
   parseAnalysis,
@@ -29,6 +31,7 @@ import {
   type DependencyRisk,
   type RegistryDependency,
   type ScoreReport,
+  type SecretScan,
   type TarEntry,
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
@@ -408,13 +411,20 @@ const checkDependencies = (manifest: Record<string, unknown>) =>
     return { risky, unchecked };
   });
 
+/** A publish whose unpack or secret scan alone spends the work meter: never the case for a tarball under the caps. */
+const OVER_METER = { ok: false, status: 413, error: "Refusing to read the tarball: it is more than apm can analyze." } as const;
+
 const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existing }) =>
   Effect.gen(function* () {
+    // one work meter for the unpack, the secret scan and the analysis, as for an upstream version (analysis.ts)
+    const meter = new Meter();
     let files: TarEntry[];
 
     try {
-      files = readTarball(tarball, WORKER_MAX_UNPACKED_BYTES);
+      files = readTarball(tarball, WORKER_MAX_UNPACKED_BYTES, meter);
     } catch (e) {
+      if (e instanceof MeterExhausted) return OVER_METER;
+
       if (e instanceof ArchiveError) return { ok: false, status: httpStatusOf(e), error: `Refusing to read the tarball: ${e.message}.` } as const;
 
       return { ok: false, status: 400, error: "The tarball is not a valid gzip'd tar." } as const;
@@ -460,7 +470,14 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
       } as const;
     }
 
-    const secrets = findSecrets(files);
+    let secrets: SecretScan;
+
+    try {
+      secrets = findSecrets(files, meter);
+    } catch (e) {
+      if (e instanceof MeterExhausted) return OVER_METER;
+      throw e;
+    }
 
     if (secrets.findings.length > 0) {
       return {
@@ -539,6 +556,7 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
       riskyDependencies: deps.risky,
       addedDependencies,
       uncheckedDependencies: deps.unchecked,
+      meter,
     });
 
     const served: Record<string, unknown> = { ...tarManifest };
@@ -1258,7 +1276,7 @@ export const nameReport = (q: string, user: string | null, part: NamePart | null
   });
 
 /** The apm account of a website session, when the request carries one; a request without cookies never builds Better Auth. */
-const sessionUser = (req: Request) =>
+export const sessionUser = (req: Request) =>
   Effect.gen(function* () {
     if (!req.headers.has("cookie")) return null;
     const auth = yield* Auth;
