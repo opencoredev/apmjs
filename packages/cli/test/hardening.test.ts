@@ -1,7 +1,7 @@
 // Unit tests for the pieces behind the CLI hardening: token binding, child env, scope overrides,
 // audit's directory walk and range parsing. The acceptance suite drives the same paths end to end.
 import { describe, test, expect } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installedPackages, isValidRange } from "../src/audit.ts";
@@ -141,6 +141,50 @@ describe("installedPackages", () => {
 
     expect(ids).toContain(".odd");
     expect(ids).toContain("broken");
+  });
+
+  // review of efef668, finding 5: pnpm with node-linker=hoisted, or a virtual store outside the project, leaves a
+  // .pnpm holding only its lock.yaml
+  test("a .pnpm holding only pnpm's lock.yaml, or nothing, is metadata (on efef668: unknown package store layout)", () => {
+    const meta = dir();
+    const empty = dir();
+
+    mkdirSync(join(meta, "node_modules", ".pnpm"), { recursive: true });
+    writeFileSync(join(meta, "node_modules", ".pnpm", "lock.yaml"), "lockfileVersion: '9.0'\n");
+    writeJson(join(meta, "node_modules", "a", "package.json"), { name: "a", version: "1.0.0" });
+    mkdirSync(join(empty, "node_modules", ".pnpm"), { recursive: true });
+
+    expect(installedPackages(meta).unchecked).toEqual([]);
+    expect(installedPackages(meta).found.map((f) => f.name)).toEqual(["a"]);
+    expect(installedPackages(empty).unchecked).toEqual([]);
+  });
+
+  test("anything else in a store is reported: an unknown file, a directory with no node_modules, a lock.yaml that is a directory", () => {
+    const root = dir();
+    const store = join(root, "node_modules", ".pnpm");
+
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, "lock.yaml"), "x");
+    writeFileSync(join(store, "payload.js"), "x");
+    mkdirSync(join(store, "x@1.0.0", "lib"), { recursive: true });
+    mkdirSync(join(root, "node_modules", ".bun", "lock.yaml"), { recursive: true });
+    const ids = installedPackages(root).unchecked.map((u) => u.id).sort();
+
+    expect(ids).toEqual([join("node_modules", ".bun", "lock.yaml"), join("node_modules", ".pnpm", "payload.js"), join("node_modules", ".pnpm", "x@1.0.0")]);
+  });
+
+  test("a store that cannot be listed is still reported", () => {
+    const root = dir();
+    const store = join(root, "node_modules", ".pnpm");
+
+    mkdirSync(store, { recursive: true });
+    chmodSync(store, 0o000);
+
+    try {
+      expect(installedPackages(root).unchecked).toEqual([{ id: join("node_modules", ".pnpm"), reason: "could not be listed (EACCES)" }]);
+    } finally {
+      chmodSync(store, 0o700);
+    }
   });
 });
 

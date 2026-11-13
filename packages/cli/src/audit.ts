@@ -2,7 +2,7 @@
 // nested layout, pnpm's .pnpm store and bun's .bun store, where it is, and what could not be read. A directory that
 // cannot be listed, or a package directory with no package.json, is never an empty one (review of 2a098b1, finding 4).
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 
 /** A package directory in node_modules: its real path from the root's real path ("/"-separated), and its package.json's name and version. */
@@ -19,7 +19,18 @@ const MAX_DEPTH = 8;
 
 // Metadata files and folders the package managers keep in node_modules; none of them hold packages.
 const METADATA = new Set([".bin", ".cache", ".package-lock.json", ".modules.yaml", ".yarn-state.yml", ".yarn-integrity", ".vite", ".tmp", ".staging", ".ignored", ".pnpm-workspace-state.json", ".pnpm-workspace-state-v1.json"]);
+
+// Files a package store (.pnpm, .bun) keeps beside its package directories: pnpm's copy of the lockfile it installed.
+const STORE_METADATA = new Set(["lock.yaml"]);
 const PackageJson = z.object({ name: z.string(), version: z.string() });
+
+function isFile(p: string): boolean {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
 
 function isDir(p: string): boolean {
   try {
@@ -108,28 +119,24 @@ export function installedPackages(root: string, members: readonly string[] = [])
     if (isDir(dir)) visitModules(join(dir, "node_modules"), depth + 1);
   };
 
-  // pnpm: node_modules/.pnpm/<id>/node_modules/<name>; bun's isolated linker: node_modules/.bun/<id>/node_modules/<name>
+  // pnpm: node_modules/.pnpm/<id>/node_modules/<name>; bun's isolated linker: node_modules/.bun/<id>/node_modules/<name>.
+  // pnpm keeps a .pnpm with only its lock.yaml when the packages live elsewhere (node-linker=hoisted, or a virtual store
+  // outside the project): that is metadata, not an unread store (review of efef668, finding 5). Anything else in a store
+  // that is no package directory is reported, as is a store that cannot be listed.
   const visitStore = (store: string, depth: number): void => {
-    let found = false;
-
     for (const id of list(store)) {
       const p = join(store, id);
 
       if (id === "node_modules") {
-        found = true;
         visitModules(p, depth + 1);
         continue;
       }
 
       const nm = join(p, "node_modules");
 
-      if (isDir(nm)) {
-        found = true;
-        visitModules(nm, depth + 1);
-      }
+      if (isDir(nm)) visitModules(nm, depth + 1);
+      else if (!(STORE_METADATA.has(id) && isFile(p))) unchecked.push({ id: rel(p), reason: "not a package directory of the package store" });
     }
-
-    if (!found) unchecked.push({ id: rel(store), reason: "unknown package store layout" });
   };
 
   const visitModules = (nm: string, depth: number): void => {
@@ -162,8 +169,34 @@ export function installedPackages(root: string, members: readonly string[] = [])
   visitModules(join(root, "node_modules"), 0);
 
   for (const m of members) visitModules(join(root, m, "node_modules"), 0);
+  // pnpm's virtual store outside the project (virtual-store-dir): its packages are installed too, at paths from "../"
+  const external = externalStore(root);
+
+  if (external !== null && once(external)) visitStore(external, 0);
 
   return { packages, found, unchecked };
+}
+
+const ModulesYaml = z.object({ virtualStoreDir: z.string() }).loose();
+
+/**
+ * The virtual store pnpm's node_modules/.modules.yaml names, when it is a directory outside node_modules (pnpm's
+ * virtual-store-dir). Null for the usual node_modules/.pnpm, or when there is no such file.
+ */
+function externalStore(root: string): string | null {
+  const nm = join(root, "node_modules");
+
+  try {
+    const m = ModulesYaml.safeParse(Bun.YAML.parse(readFileSync(join(nm, ".modules.yaml"), "utf8")));
+
+    if (!m.success) return null;
+    const store = realOf(resolve(nm, m.data.virtualStoreDir));
+    const inside = realOf(nm);
+
+    return isDir(store) && store !== inside && !store.startsWith(`${inside}${sep}`) ? store : null;
+  } catch {
+    return null;
+  }
 }
 
 function isLink(p: string): boolean {
