@@ -15,7 +15,7 @@ import { scanTextRules } from "./textrules.ts";
 import { ambiguousPaths, type TarEntry } from "./tarball.ts";
 import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
 import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
-import type { Exports, Label } from "./flow.ts";
+import { boundOf, PRECISION_BOUNDS, type Bound, type Exports, type Label, type Sink } from "./flow.ts";
 import { CrossFile, MAX_CROSS_FILE_STEPS } from "./xfile.ts";
 
 export { CAPABILITY_IDS, declarationOf, type CapabilityId, type Declaration } from "./declare.ts";
@@ -1350,7 +1350,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
 
-  const cross = inPhase("cross-file", () => addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps));
+  const { cross, cut } = inPhase("cross-file", () => addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps));
+
+  for (const why of cut) add("incomplete", why);
 
   if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
@@ -1451,13 +1453,51 @@ const HELD_RISKS: ReadonlySet<Fact["kind"]> = new Set(["env-dump", "credential-r
 /** At most this many flow facts of one kind per file. */
 const MAX_FLOW_FACTS = 40;
 
+/** At most this many reasons one file's cut flows make the analysis incomplete: one is enough to say so. */
+const MAX_CUT_REASONS = 5;
+
+/**
+ * What a flow cut at a precision bound may carry that makes its call a reason the analysis is incomplete, by what the
+ * call does: a request may send the whole environment or a credential file's contents; a call that runs, loads or
+ * executes may run downloaded data or this program's own source; a call apm could not name may do either. A read is
+ * not among them (opening a path sends and runs nothing), and neither is one named token or a cut value with none of
+ * these, which stay a note.
+ */
+function cutCarries(kind: Sink["kind"], labels: ReadonlySet<Label>): string[] {
+  const out: string[] = [];
+  const has = (l: Label): boolean => labels.has(l);
+  const sends = kind === "request" || kind === "bounded";
+  const runs = kind === "code" || kind === "shell" || kind === "file" || kind === "splice" || kind === "bounded";
+
+  if (sends && (has("env") || has("env-key"))) out.push("the whole environment");
+
+  if (sends && has("cred")) out.push("a credential file's contents");
+
+  if (runs && (has("net") || has("net-field"))) out.push("what a network response gave");
+
+  if (runs && [...labels].some((l) => l.startsWith("src:"))) out.push("its own source");
+
+  return out;
+}
+
+/** What a cut flow's reason says the call does with it. */
+const CUT_CALL: Record<Sink["kind"], string> = {
+  code: "what this call runs as code",
+  shell: "what this call runs as a command",
+  request: "what this call sends",
+  read: "the path this call opens",
+  file: "the file this call runs",
+  splice: "what this call puts into a command",
+  bounded: "apm could not tell what this call does, and what it is given",
+};
+
 /**
  * What reached a call in each parsed file, as facts: the whole environment, a credential file's contents or three
  * families of tokens sent in a request; a credential path opened by a read; downloaded data run as code or as a
  * command. What a relative import carries is what that file exports (worked out the same way, through its own imports),
  * so a read in one file and a request in another are one flow.
  */
-function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>, maxSteps?: number): CrossFile {
+function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>, maxSteps?: number): { cross: CrossFile; cut: string[] } {
   const cross = new CrossFile(
     (path) => fileFlows.get(path)?.exports,
     (from, spec) => resolveIn(byPath, joinPath(dirOf(from), spec))?.path,
@@ -1465,6 +1505,7 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
   );
 
   const resolve = (path: string, labels: readonly Label[]): Set<Label> => cross.resolve(path, labels);
+  const cut: string[] = [];
 
   for (const [path, { flows }] of fileFlows) {
     const facts = fileFacts.get(path) ?? [];
@@ -1482,8 +1523,29 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
       facts.push({ kind, line: f.line, snippet: f.snippet, name, text: false, near: true });
     };
 
+    let cutReasons = 0;
+
     for (const f of flows) {
       const labels = resolve(path, f.labels);
+      const bounds = [...labels].flatMap((l): Bound[] => {
+        const b = boundOf(l);
+
+        return b === null ? [] : [b];
+      });
+
+      // a value cut at a bound may carry more than apm saw: when what it carries is what a stealer sends, or code to
+      // run, apm cannot say the call is harmless, nor that it does what the labels say, so the analysis is incomplete
+      if (bounds.length > 0) {
+        const carried = cutCarries(f.kind, labels);
+
+        if (carried.length > 0) {
+          if (cutReasons++ < MAX_CUT_REASONS) cut.push(`${path}:${f.line}: ${f.snippet} (apm stopped following a value here at ${[...new Set(bounds)].map((b) => PRECISION_BOUNDS[b]).join(" and ")}; ${CUT_CALL[f.kind]} may be ${carried.join(" or ")})`);
+
+          continue;
+        }
+      }
+
+      if (f.kind === "bounded") continue;
 
       if (f.kind === "request") {
         if (labels.has("env")) fact("sends-env", f, "sends the whole environment in a request");
@@ -1503,7 +1565,7 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
     fileFacts.set(path, facts);
   }
 
-  return cross;
+  return { cross, cut };
 }
 
 // ---------- apm-score-v10: capabilities and risk signals ----------
@@ -1720,9 +1782,11 @@ function assess(input: AssessInput): Assessed {
     const secrets = list.filter((f) => f.kind === "env" && f.name !== undefined && secretFamily(f.name) !== null);
     const families = new Set(secrets.map((f) => secretFamily(f.name ?? "")));
     const install = installFiles.has(path);
-    const dump = list.find((f) => f.kind === "env-dump");
-    const credentialRead = list.find((f) => f.kind === "credential-read");
-    const host = install ? list.find((f) => f.kind === "host-info") : undefined;
+    // of each kind, one beside a network call if there is one: the first may be far from it and a later one not
+    const pick = (kind: Fact["kind"]): Fact | undefined => list.find((f) => f.kind === kind && f.near) ?? list.find((f) => f.kind === kind);
+    const dump = pick("env-dump");
+    const credentialRead = pick("credential-read");
+    const host = install ? pick("host-info") : undefined;
 
     const harvest: [Fact, string] | undefined = dump
       ? [dump, "reads the whole environment"]

@@ -8,7 +8,7 @@ import type { AnyNode, CallExpression, Expression, Identifier, Literal, MemberEx
 import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
 import { Allowance, charge, chargeNow, chargeText, CHARS_PER_UNIT, inPhase } from "./meter.ts";
 import { MAX_DECODER_STEPS, runDecoder, type Known } from "./decode.ts";
-import { Flow, FlowExhausted, MAX_FLOW_WORK, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
+import { Flow, FlowExhausted, limitOf, MAX_FLOW_WORK, PRECISION_BOUNDS, type Bound, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
 import { parseEach, type Dialect, type ParseOutcome, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
 import {
@@ -195,7 +195,8 @@ export type Ref =
   | { kind: "global"; path: string; built: boolean }
   | { kind: "module"; spec: string; path: string; built: boolean }
   | { kind: "local"; fn: boolean; obj: LocalObj | null }
-  | { kind: "unknown"; name: string | null; owner: string | null; built: boolean };
+  /** `limit`: the reader stopped resolving here at a precision bound, so the value was cut, not merely unknown. */
+  | { kind: "unknown"; name: string | null; owner: string | null; built: boolean; limit: Bound | null };
 
 /** A value this file makes, read through the node that made it; `instance` is an object a local class constructs. */
 type LocalObj = { node: AnyNode; binding: Binding | null; instance: boolean };
@@ -725,14 +726,15 @@ function foldUnits(fileChars: number): number {
  * judged the code; the website says so once ("apm read those files with its text rules") and lists these as details.
  */
 const LIMIT_NOTES = {
-  candidates: "an expression with more than 6 possible values",
-  returns: "a function with more than 32 return statements",
-  thisWrites: "a constructor that sets one field more than 8 times",
-  depth: "values nested more than 24 levels deep",
+  candidates: PRECISION_BOUNDS.candidates,
+  returns: PRECISION_BOUNDS.returns,
+  thisWrites: PRECISION_BOUNDS.thisWrites,
+  depth: PRECISION_BOUNDS.depth,
   evalDepth: "code run from a string more than 3 levels deep",
   decoded: "more than 256 KB of decoded text in one file",
   fold: "constant strings built past the file's allowance (a million characters and 16 for each of the file's)",
-  flow: "a value passed through more than 32 steps",
+  flow: PRECISION_BOUNDS.steps,
+  assignments: PRECISION_BOUNDS.assignments,
 } as const;
 
 /** Every reading-limit note, word for word: the fixed part of a "<limit> (<files>)" not-checked entry. */
@@ -851,10 +853,15 @@ const MAX_CANDIDATES = 6;
 const MAX_RETURNS = 32;
 const MAX_THIS_WRITES = 8;
 
-const UNKNOWN_REF: Ref = { kind: "unknown", name: null, owner: null, built: false };
+const UNKNOWN_REF: Ref = { kind: "unknown", name: null, owner: null, built: false, limit: null };
 
-function unknownNamed(name: string | null, owner: string | null = null, built = false): Ref {
-  return { kind: "unknown", name, owner, built };
+function unknownNamed(name: string | null, owner: string | null = null, built = false, limit: Bound | null = null): Ref {
+  return { kind: "unknown", name, owner, built, limit };
+}
+
+/** The unknown value that stands for what the reader did not resolve past a precision bound. */
+function cutRef(limit: Bound): Ref {
+  return { kind: "unknown", name: null, owner: null, built: false, limit };
 }
 
 /** How much a reference says, for when one has to stand for several: a platform API, then a module, then a name. */
@@ -877,7 +884,7 @@ function rankOf(r: Ref): number {
 }
 
 function refKey(r: Ref): string {
-  return r.kind === "local" ? "" : `${r.kind}:${nameOf(r)}:${r.kind === "unknown" ? (r.owner ?? "") : ""}:${String(r.built)}`;
+  return r.kind === "local" ? "" : `${r.kind}:${nameOf(r)}:${r.kind === "unknown" ? `${r.owner ?? ""}:${r.limit ?? ""}` : ""}:${String(r.built)}`;
 }
 
 /**
@@ -905,7 +912,7 @@ function distinct(refs: readonly Ref[], notes?: Set<string>): Ref[] {
     }
 
     if (out.length >= MAX_CANDIDATES) {
-      out.push(UNKNOWN_REF);
+      out.push(cutRef("candidates"));
       notes?.add(LIMIT_NOTES.candidates);
       break;
     }
@@ -1004,8 +1011,8 @@ function operands(n: AnyNode): AnyNode[] | null {
 /** Expressions found under a limit, and whether there were more than it allows (then the rest are unknown). */
 type Found = { nodes: AnyNode[]; more: boolean };
 
-/** The expressions a function's own `return` statements give (not those of functions inside it), up to MAX_RETURNS. */
-function returnedBy(fn: AnyNode): Found {
+/** The expressions a function's own `return` statements give (not those of functions inside it), up to `max`. */
+function returnedBy(fn: AnyNode, max = MAX_RETURNS): Found {
   if (fn.type === "ArrowFunctionExpression" && fn.body.type !== "BlockStatement") return { nodes: [fn.body], more: false };
   const out: AnyNode[] = [];
   const stack: AnyNode[] = [...functionBody(fn)];
@@ -1014,7 +1021,7 @@ function returnedBy(fn: AnyNode): Found {
     if (n.type === "ReturnStatement") {
       if (!n.argument) continue;
 
-      if (out.length >= MAX_RETURNS) return { nodes: out, more: true };
+      if (out.length >= max) return { nodes: out, more: true };
       out.push(n.argument);
       continue;
     }
@@ -1205,8 +1212,9 @@ class Reader {
           refsOf: (n) => this.resolveAll(n),
           bindingOf: (id) => this.bindingOf(id),
           str: (n) => this.str(n),
-          returnedBy: (fn) => returnedBy(fn).nodes,
-          limit: () => this.budget.notes.add(LIMIT_NOTES.flow),
+          // the flow follows every return: each is read once per function, so no bound is needed there
+          returnedBy: (fn) => returnedBy(fn, Number.POSITIVE_INFINITY).nodes,
+          limit: (bound) => this.budget.notes.add(PRECISION_BOUNDS[bound]),
         }).read(),
       );
 
@@ -1333,7 +1341,7 @@ class Reader {
 
     if (cached) return cached;
 
-    if (this.tooDeep()) return [UNKNOWN_REF];
+    if (this.tooDeep()) return [cutRef("depth")];
     chargeNow(2);
     // a value that refers back to itself reads as unknown
     this.resolveCache.set(node, [UNKNOWN_REF]);
@@ -1390,7 +1398,7 @@ class Reader {
           // the binding that holds a value this file makes also holds the writes made to it later
           if (r.kind === "local" && r.obj && r.obj.binding === null && (r.obj.node === init || r.obj.instance)) return { ...r, obj: { ...r.obj, binding: b } };
 
-          return r.kind === "unknown" && r.name === null ? unknownNamed(b.name, null, r.built) : r;
+          return r.kind === "unknown" && r.name === null ? unknownNamed(b.name, null, r.built, r.limit) : r;
         });
       }
 
@@ -1437,7 +1445,7 @@ class Reader {
 
     if (cached) return cached;
 
-    if (this.tooDeep()) return [unknownNamed(prop)];
+    if (this.tooDeep()) return [unknownNamed(prop, null, false, "depth")];
     this.memberCache.set(obj.node, byKey);
     byKey.set(key, [unknownNamed(prop)]);
     this.resolving++;
@@ -1506,7 +1514,7 @@ class Reader {
   private calledRefs(fn: Ref, prop: string, owner: string | null): Ref[] {
     if (fn.kind !== "local" || !fn.obj) return [unknownNamed(prop, owner)];
 
-    return this.returnsOf(fn.obj.node).map((r) => (r.kind === "unknown" ? unknownNamed(prop, owner, r.built) : r));
+    return this.returnsOf(fn.obj.node).map((r) => (r.kind === "unknown" ? unknownNamed(prop, owner, r.built, r.limit) : r));
   }
 
   /** What a function's returns give, cached per function. */
@@ -1518,7 +1526,7 @@ class Reader {
     const returned = returnedBy(fn);
 
     if (returned.more) this.budget.notes.add(LIMIT_NOTES.returns);
-    const all = [...returned.nodes.flatMap((r) => this.resolveAll(r)), ...(returned.more ? [UNKNOWN_REF] : [])];
+    const all = [...returned.nodes.flatMap((r) => this.resolveAll(r)), ...(returned.more ? [cutRef("returns")] : [])];
     const refs = all.length === 0 ? [{ kind: "local", fn: false, obj: null } satisfies Ref] : distinct(all, this.budget.notes);
     this.returnCache.set(fn, refs);
 
@@ -1532,7 +1540,7 @@ class Reader {
    */
   private ownMember(node: AnyNode, prop: string, instance = false): Ref[] | null {
     // spreads, prototypes and superclasses can refer back to themselves
-    if (this.tooDeep()) return [unknownNamed(prop)];
+    if (this.tooDeep()) return [unknownNamed(prop, null, false, "depth")];
     this.resolving++;
 
     try {
@@ -1608,7 +1616,7 @@ class Reader {
 
           if (set.more) this.budget.notes.add(LIMIT_NOTES.thisWrites);
 
-          if (set.nodes.length > 0) return [...set.nodes.flatMap((v) => this.resolveAll(v)), ...(set.more ? [UNKNOWN_REF] : [])];
+          if (set.nodes.length > 0) return [...set.nodes.flatMap((v) => this.resolveAll(v)), ...(set.more ? [cutRef("thisWrites")] : [])];
         }
 
         // inherited: from a class this file defines, or told by name from one it does not
@@ -2792,7 +2800,7 @@ class Reader {
     for (const a of call.others) this.visit(a, "plain");
     call.slots.forEach((slot, i) => slot && this.sinkArg(slot, roleOf(i)));
 
-    if (this.depth === 0) this.sites.push({ node: n, slots: call.slots, roles: call.slots.map((_, i) => roleOf(i)), network: plans.some((p) => p.rest === "request") });
+    if (this.depth === 0) this.sites.push({ node: n, slots: call.slots, roles: call.slots.map((_, i) => roleOf(i)), network: plans.some((p) => p.rest === "request"), limit: limitOf(call.refs) });
   }
 
   /** What one callee does with a call: the signals it confirms, and what each argument is for. */
@@ -3071,7 +3079,7 @@ function member(base: Ref, prop: string, built: boolean): Ref {
       // x.constructor.constructor is Function, whatever x is
       if (prop === "constructor" && base.name === "constructor") return { kind: "global", path: "Function", built: base.built || built };
 
-      return { kind: "unknown", name: prop, owner: base.name, built: base.built || built };
+      return { kind: "unknown", name: prop, owner: base.name, built: base.built || built, limit: base.limit };
     default: {
       const _exhaustive: never = base;
 

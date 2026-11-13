@@ -52,6 +52,9 @@ const NETWORK_CALL =
 /** At most this many facts of one kind per file: enough to name what a file does, bounded on a 30 MB bundle. */
 const MAX_PER_KIND = 40;
 
+/** What a stealer collects: past MAX_PER_KIND, these are still recorded where they sit beside a network call. */
+const PLACED_PAST_CAP: ReadonlySet<FactKind> = new Set(["env-dump", "credential-read", "host-info"]);
+
 /** Literal environment reads: `process.env.X`, `process.env?.X`, `process.env['X']`, `Bun.env.X`, `Deno.env.get('X')`. */
 const ENV_READ = /\b(?:process\s*\.\s*env|Bun\s*\.\s*env)\s*(?:\?\.\s*|\.\s*)([A-Za-z_$][\w$]*)|\b(?:process\s*\.\s*env|Bun\s*\.\s*env)\s*(?:\?\.)?\[\s*(['"`])([^'"`\n]{1,100})\2\s*\]|\bDeno\s*\.\s*env\s*\.\s*get\s*\(\s*(['"`])([^'"`\n]{1,100})\4/g;
 
@@ -151,15 +154,24 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
   const isText = hidden === undefined;
   const inCode = (index: number): boolean => hidden?.(index) === undefined;
 
+  const nearCounts = new Map<FactKind, number>();
+
   const push = (kind: FactKind, index: number, name?: string): boolean => {
     const n = counts.get(kind) ?? 0;
 
-    if (n >= MAX_PER_KIND || !inCode(index)) return false;
-    counts.set(kind, n + 1);
-    const where = lineOf(text, index);
+    if (!inCode(index)) return false;
+    // past MAX_PER_KIND, a harvest kind is still placed: one beside a network call is recorded (up to MAX_PER_KIND
+    // more), so forty far ones cannot hide the one next to the request
+    if (n >= MAX_PER_KIND && (!PLACED_PAST_CAP.has(kind) || (nearCounts.get(kind) ?? 0) >= MAX_PER_KIND || text.length < SMALL_FILE)) return false;
 
     if (text.length >= SMALL_FILE) chargeText("text", 2 * NEAR_NETWORK, 2);
     const near = text.length < SMALL_FILE || NETWORK_CALL.test(text.slice(Math.max(0, index - NEAR_NETWORK), index + NEAR_NETWORK));
+
+    if (n >= MAX_PER_KIND && !near) return false;
+    counts.set(kind, n + 1);
+
+    if (near) nearCounts.set(kind, (nearCounts.get(kind) ?? 0) + 1);
+    const where = lineOf(text, index);
     out.push(name === undefined ? { kind, ...where, text: isText, near } : { kind, ...where, name, text: isText, near });
 
     return true;

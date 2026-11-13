@@ -28,15 +28,59 @@ import { Allowance, chargeNow } from "./meter.ts";
  *   function that starts at offset `<fn>`, while its body is read. A call to that function puts what its own argument
  *   carries in its place, so one call's argument never reaches another call's result; a sink in the body takes what
  *   every call passes. These never leave this file (`concrete`).
+ * - `limit:<bound>`: apm stopped following part of this value at a precision bound (`PRECISION_BOUNDS`). The value keeps
+ *   every label apm saw up to there, and for a value cut at its steps, every label the code under the cut names; but
+ *   what was cut may carry more. A cut value with a sensitive label that reaches a call that sends, runs or loads makes
+ *   the analysis incomplete (score.ts); any other cut stays a note.
  */
-export type Label = "env" | "env-key" | "cred-path" | "cred" | "net" | "net-field" | "conn" | `secret:${string}` | `src:${number}:${number}` | `import:${string}` | `read:${string}` | `param:${string}`;
+export type Label = "env" | "env-key" | "cred-path" | "cred" | "net" | "net-field" | "conn" | `secret:${string}` | `src:${number}:${number}` | `import:${string}` | `read:${string}` | `param:${string}` | `limit:${Bound}`;
+
+/**
+ * The bounds on precision past which a value or a call is not followed further, as a report names each. They fire in
+ * most large bundles, so hitting one is a note; a cut value that may carry what a stealer sends, or downloaded code,
+ * into a call that sends, runs or loads it is not (see `Label`).
+ */
+export const PRECISION_BOUNDS = {
+  candidates: "an expression with more than 6 possible values",
+  returns: "a function with more than 32 return statements",
+  thisWrites: "a constructor that sets one field more than 8 times",
+  depth: "values nested more than 24 levels deep",
+  steps: "a value passed through more than 32 steps",
+  assignments: "a command variable given more than 8 values",
+} as const;
+
+export type Bound = keyof typeof PRECISION_BOUNDS;
+
+const BOUNDS: readonly Bound[] = ["candidates", "returns", "thisWrites", "depth", "steps", "assignments"];
+
+/** The bound a `limit:` label names, or null for any other label. */
+export function boundOf(l: Label): Bound | null {
+  if (!l.startsWith("limit:")) return null;
+  const name = l.slice("limit:".length);
+
+  return BOUNDS.find((b) => b === name) ?? null;
+}
+
+function limitLabel(b: Bound): Label {
+  return `limit:${b}`;
+}
+
+/** The bound the reader cut one of these references at, if it cut any: then the value or callee may be anything. */
+export function limitOf(refs: readonly Ref[]): Bound | null {
+  for (const r of refs) if (r.kind === "unknown" && r.limit !== null) return r.limit;
+
+  return null;
+}
 
 type Labels = ReadonlySet<Label>;
 
 const NONE: Labels = new Set();
 
-/** One call the reader read, with what each argument is for (see `Role` in js.ts) and whether it makes a request. */
-export type CallSite = { node: CallExpression | NewExpression; slots: readonly (AnyNode | null)[]; roles: readonly Role[]; network: boolean };
+/**
+ * One call the reader read, with what each argument is for (see `Role` in js.ts), whether it makes a request, and the
+ * bound its callee was cut at, if one was: then the call may be one that sends or runs what it is given.
+ */
+export type CallSite = { node: CallExpression | NewExpression; slots: readonly (AnyNode | null)[]; roles: readonly Role[]; network: boolean; limit: Bound | null };
 
 /** What the flow analysis needs from the reader: its program, its calls and its name resolution. */
 export type FlowHost = {
@@ -45,17 +89,20 @@ export type FlowHost = {
   refsOf: (n: AnyNode) => readonly Ref[];
   bindingOf: (id: Identifier) => Binding | "dynamic" | null;
   str: (n: AnyNode) => { value: string; exact: boolean } | null;
+  /** Every expression a function's own `return` statements give, with no bound: each is followed once (`returnTaint`). */
   returnedBy: (fn: AnyNode) => readonly AnyNode[];
-  /** Called when a value is followed further than the analysis goes; past it the value carries nothing. */
-  limit: () => void;
+  /** Called when the flow hits a precision bound: `steps` past MAX_DEPTH (`cut`), `assignments` past MAX_VALUES. */
+  limit: (bound: Bound) => void;
 };
 
 /**
  * A value that reached a call that does something with it: `code` runs it, `shell` runs it as a whole command,
  * `request` sends it, `read` opens it as a path, `file` runs a program from a file it was written to, `splice` is part
- * of a longer command a shell runs (it may run as a command; apm cannot tell). `labels` is what it carried.
+ * of a longer command a shell runs (it may run as a command; apm cannot tell), `bounded` is a call apm could not name
+ * past a precision bound (it may send, run or load what it is given; it is only ever a reason the analysis is
+ * incomplete, never a finding). `labels` is what it carried.
  */
-export type Sink = { kind: "code" | "shell" | "request" | "read" | "file" | "splice"; at: number; labels: Label[] };
+export type Sink = { kind: "code" | "shell" | "request" | "read" | "file" | "splice" | "bounded"; at: number; labels: Label[] };
 
 /** A string the program writes to a file and then loads as code: score.ts reads it as code that runs. */
 export type RanWritten = { at: number; code: string };
@@ -71,8 +118,14 @@ export type Exports = ReadonlyMap<string, readonly Label[]>;
 
 export type FlowRead = { sinks: Sink[]; recovered: Recovered[]; exports: Exports; env: EnvUse[]; ranWritten: RanWritten[] };
 
-/** How many steps one value is followed through before it is taken to carry nothing. */
+/** How many steps one value is followed through before the rest of it is read by `cut`. */
 const MAX_DEPTH = 32;
+
+/** The most values of one command variable read for the program it runs (`valuesOf`). */
+const MAX_VALUES = 8;
+
+/** The most nodes `cut` visits for one value past MAX_DEPTH; it is memoized, so each node is cut once. */
+const MAX_CUT_NODES = 4096;
 
 /** Calls that hand back what they are given, whole: serializers, encoders, copies, path builders. */
 const PASS_GLOBALS: ReadonlySet<string> = new Set([
@@ -246,7 +299,11 @@ function readOf(path: Labels): Set<Label> {
 
   if (path.has("cred-path")) out.add("cred");
 
-  for (const l of path) if (isDeferred(l)) out.add(`read:${l}`);
+  for (const l of path) {
+    if (isDeferred(l)) out.add(`read:${l}`);
+    // what reading a path cut at a bound gives is cut too
+    else if (isLimit(l)) out.add(l);
+  }
 
   return out;
 }
@@ -275,7 +332,12 @@ function propName(n: AnyNode): string | null {
 
 /** The labels a call that does not hand its arguments back whole still passes on: what data a helper may return. */
 function passedThrough(l: Label): boolean {
-  return l === "net" || l === "net-field" || l === "cred" || l === "cred-path" || l.startsWith("secret:") || isDeferred(l);
+  return l === "net" || l === "net-field" || l === "cred" || l === "cred-path" || l.startsWith("secret:") || isDeferred(l) || isLimit(l);
+}
+
+/** Whether a label says the value was cut at a precision bound. */
+export function isLimit(l: Label): boolean {
+  return l.startsWith("limit:");
 }
 
 /** What a command string carries as the whole command, and as part of a longer one. */
@@ -293,6 +355,9 @@ type RunTarget = { path: PathRef; kind: "js" | "program" };
 /** Reads where values go in one program. Built once per program, after the reader has visited it. */
 export class Flow {
   private readonly memo = new Map<AnyNode, Labels>();
+  /** The nodes whose taint is being worked out now: their memo entry is a placeholder, not their value. */
+  private readonly active = new Set<AnyNode>();
+  private readonly cutMemo = new Map<AnyNode, Labels>();
   /** Work done so far, against MAX_FLOW_WORK: an allowance carved out of the analysis's meter. */
   private readonly work = new Allowance("flow", MAX_FLOW_WORK);
   private readonly bindingMemo = new Map<Binding, Labels>();
@@ -716,13 +781,14 @@ export class Flow {
     this.spend(1);
 
     if (this.depth > MAX_DEPTH) {
-      this.host.limit();
+      this.host.limit("steps");
 
-      return NONE;
+      return this.cut(node);
     }
 
     // a value that refers back to itself carries what the rest of it does
     this.memo.set(node, NONE);
+    this.active.add(node);
     this.depth++;
 
     try {
@@ -732,7 +798,125 @@ export class Flow {
       return out;
     } finally {
       this.depth--;
+      this.active.delete(node);
     }
+  }
+
+  /**
+   * What a value apm stopped following at MAX_DEPTH may carry: `limit:steps`, and every label the code under it names,
+   * read without the recursion `taint` uses (so it cannot overflow the stack): what each name, member and call under it
+   * resolves to, what the bindings it reads are given, and what the local functions it calls return. A named member
+   * drops what one member of a value never is (one variable is not the environment), as `memberOf` does. This is wider
+   * than `taint`, never narrower, up to MAX_CUT_NODES nodes; the label says the value was cut either way.
+   */
+  private cut(start: AnyNode): Labels {
+    const cached = this.cutMemo.get(start);
+
+    if (cached) return cached;
+    const out = new Set<Label>([limitLabel("steps")]);
+    const seen = new Set<AnyNode>();
+    const stack: { n: AnyNode; named: boolean }[] = [{ n: start, named: false }];
+
+    // a parameter's label means "what each call passes" only inside its function's body; carried past the cut it would
+    // be substituted at every call of every function the value reaches, so the cut keeps only what the code names
+    const add = (labels: Labels, named: boolean): void => {
+      for (const l of labels) {
+        if (l.startsWith("param:") || PARAMISH.test(l)) continue;
+
+        if (!named || !(l === "env" || l === "env-key" || l === "conn" || l === "cred-path" || l === "cred" || l.startsWith("src:"))) out.add(l);
+      }
+    };
+
+    for (let item = stack.pop(); item && seen.size < MAX_CUT_NODES; item = stack.pop()) {
+      const { named } = item;
+      const n = unwrap(item.n);
+
+      if (seen.has(n)) continue;
+      seen.add(n);
+      this.spend(1);
+      const done = this.memo.get(n);
+
+      // a value already worked out in full is what it is
+      if (done && !this.active.has(n)) {
+        add(done, named);
+        continue;
+      }
+
+      const push = (...nodes: (AnyNode | null | undefined)[]): void => {
+        for (const x of nodes) if (x) stack.push({ n: x, named });
+      };
+
+      switch (n.type) {
+        case "FunctionExpression":
+        case "ArrowFunctionExpression":
+        case "FunctionDeclaration":
+        case "ClassExpression":
+        case "ClassDeclaration":
+          continue;
+        case "Identifier": {
+          add(this.refLabels(n), named);
+          const b = this.host.bindingOf(n);
+
+          if (b === null || b === "dynamic") continue;
+          const known = this.bindingMemo.get(b);
+
+          if (known && known !== NONE) {
+            add(known, named);
+            continue;
+          }
+
+          for (let o: Binding["origin"] | null = b.origin; o; ) {
+            if (o.kind === "value") push(o.init === n ? null : o.init);
+            else if (o.kind === "member") push(o.base);
+            else if (o.kind === "module" && rel(o.spec)) out.add(importLabel(o.spec, o.path));
+
+            if (o.kind === "default") push(o.fallback);
+            o = o.kind === "default" ? o.inner : null;
+          }
+
+          push(...(this.assigns.get(b) ?? []), ...(this.mutations.get(this.find(b)) ?? []).map((m) => m.value));
+          const loop = this.loops.get(b);
+
+          if (loop) push(loop.right);
+          continue;
+        }
+
+        case "MemberExpression": {
+          add(this.refLabels(n), named);
+
+          if (n.object.type === "Super") continue;
+          const name = this.keyName(n);
+
+          stack.push({ n: n.object, named: named || (name !== null && !/^\d+$/.test(name)) });
+
+          if (n.computed) push(n.property);
+          continue;
+        }
+
+        case "CallExpression":
+        case "NewExpression": {
+          add(this.refLabels(n), named);
+
+          if (n.callee.type === "Super") continue;
+          const callee = unwrap(n.callee);
+
+          push(...n.arguments);
+
+          for (const fn of this.localFunctions(callee)) push(...this.host.returnedBy(fn));
+
+          // a method of a value gives data drawn from it (`res.text()`)
+          if (callee.type === "MemberExpression" && callee.object.type !== "Super") push(callee.object);
+          continue;
+        }
+
+        default:
+          push(...childNodes(n));
+      }
+    }
+
+    this.cutMemo.set(start, out);
+
+    return out;
   }
 
   private taintNode(n: AnyNode): Labels {
@@ -902,6 +1086,10 @@ export class Flow {
       if (r.kind === "global" && (r.path === "process.env" || r.path === "Bun.env")) out.add("env");
 
       if (r.kind === "module" && rel(r.spec)) out.add(importLabel(r.spec, r.path));
+
+      // the reader stopped resolving this value at a bound: what it was cut from may be anything. A call's value is
+      // what `callTaint` reads from every return of the functions it calls, and it marks a callee cut at a bound
+      if (r.kind === "unknown" && r.limit !== null && n.type !== "CallExpression" && n.type !== "NewExpression") out.add(limitLabel(r.limit));
     }
 
     return out;
@@ -1218,6 +1406,14 @@ export class Flow {
       for (const l of labels) out.add(l);
     };
 
+    // a callee the reader cut at a bound may hand back what it is given, whole
+    const cutAt = site?.limit ?? limitOf(refs);
+
+    if (cutAt !== null) {
+      out.add(limitLabel(cutAt));
+      add(argsTaint());
+    }
+
     if ((site?.network && !this.isAddressLookup(n)) || this.isHttpClient(n) || (n.type === "NewExpression" && refs.some((r) => r.kind === "global" && /^(?:WebSocket|XMLHttpRequest|EventSource)$/.test(r.path)))) {
       out.add("net");
       out.add("conn");
@@ -1351,14 +1547,17 @@ export class Flow {
   private sinks(): Sink[] {
     const out: Sink[] = [];
 
+    // a value cut at a bound keeps its `limit:` label, so score.ts can tell what reached the call may carry more
     const keep = (kind: Sink["kind"], at: number, labels: Labels, relevant: (l: Label) => boolean): void => {
       this.spend(1 + labels.size);
-      const list = [...this.concrete(labels)].filter(relevant);
+      const list = [...this.concrete(labels)].filter((l) => relevant(l) || isLimit(l));
 
-      if (list.length > 0 && out.length < 400) out.push({ kind, at, labels: list });
+      if (list.some((l) => !isLimit(l)) && out.length < 400) out.push({ kind, at, labels: list });
     };
 
     const runs = (l: Label): boolean => l === "net" || l === "net-field" || isSymbolic(l);
+    // what may make a call apm could not name a reason for an incomplete analysis (score.ts says which ones do)
+    const sensitive = (l: Label): boolean => l === "env" || l === "env-key" || l === "cred" || l === "net" || l === "net-field" || l.startsWith("src:") || isSymbolic(l);
 
     for (const site of this.host.calls) {
       const n = site.node;
@@ -1407,8 +1606,24 @@ export class Flow {
       if (writes || this.isHttpClient(n)) for (const a of n.arguments) for (const l of this.taint(a.type === "SpreadElement" ? a.argument : a)) request.add(l);
       keep("request", at, request, (l) => l === "env" || l === "cred" || l.startsWith("secret:") || isSymbolic(l));
 
+      // a callee the reader cut at a bound may be one that sends, runs or loads what it is given
+      if (site.limit !== null) {
+        const cutAt = new Set<Label>([limitLabel(site.limit)]);
+
+        for (const slot of site.slots) if (slot) keep("bounded", at, union(this.taint(slot), cutAt), sensitive);
+      }
+
       // a file the program wrote, then loads as code or runs as a program
-      for (const t of this.runTargets(site)) this.ranFile(t, at, keep);
+      const targets = this.runTargets(site);
+
+      for (const t of targets.targets) this.ranFile(t, at, keep);
+
+      // a command variable given more values than apm reads may run any file the program wrote
+      if (targets.cut) {
+        const cutAt = new Set<Label>([limitLabel("assignments")]);
+
+        for (const w of this.written) for (const d of w.data) keep("bounded", at, union(this.taint(d), cutAt), runs);
+      }
     }
 
     for (const n of this.dynamicImports) if (n.type === "ImportExpression") this.ranFile({ path: { node: n.source }, kind: "js" }, n.start, keep);
@@ -1463,20 +1678,24 @@ export class Flow {
     return na.length >= 2 && !na.includes(UNKNOWN) && na === baseName(pb);
   }
 
-  /** The files a call runs: what a loader, `fork` or a Worker loads, what an interpreter is given, the program run. */
-  private runTargets(site: CallSite): RunTarget[] {
+  /**
+   * The files a call runs: what a loader, `fork` or a Worker loads, what an interpreter is given, the program run.
+   * `cut` says the command came from a variable given more values than `valuesOf` reads.
+   */
+  private runTargets(site: CallSite): { targets: RunTarget[]; cut: boolean } {
     const n = site.node;
+    const none = { targets: [], cut: false };
 
-    if (n.callee.type === "Super") return [];
+    if (n.callee.type === "Super") return none;
     const refs = this.host.refsOf(unwrap(n.callee));
     const first = site.slots[0] ?? null;
 
-    if (!first) return [];
+    if (!first) return none;
     const loads = refs.some((r) => (r.kind === "global" && LOADERS.has(r.path)) || (r.kind === "unknown" && r.name === "require" && r.owner === null) || (r.kind === "module" && r.spec === "child_process" && r.path === "fork") || (r.kind === "module" && r.spec === "worker_threads" && r.path === "Worker") || (r.kind === "global" && r.path === "Worker"));
 
-    if (loads) return [{ path: { node: first }, kind: "js" }];
+    if (loads) return { targets: [{ path: { node: first }, kind: "js" }], cut: false };
 
-    if (site.roles[0] !== "shell") return [];
+    if (site.roles[0] !== "shell") return none;
     // `spawn(process.execPath, [file])`, `execFile('node', [file])`: the interpreter runs the file it is given
     const prog = this.host.str(first);
     const execPath = this.host.refsOf(first).some((r) => r.kind === "global" && (r.path === "process.execPath" || r.path === "process.argv0" || r.path === "process.argv.0"));
@@ -1485,14 +1704,15 @@ export class Flow {
       const list = site.slots[1] ? unwrap(site.slots[1]) : null;
       const arg = list?.type === "ArrayExpression" ? list.elements.find((e) => e && e.type !== "SpreadElement" && !this.host.str(e)?.value.startsWith("-")) : null;
 
-      return arg && arg.type !== "SpreadElement" ? [{ path: { node: arg }, kind: "js" }] : [];
+      return { targets: arg && arg.type !== "SpreadElement" ? [{ path: { node: arg }, kind: "js" }] : [], cut: false };
     }
 
     // a variable set to one command or another (`let command = ''; … command = `setsid nohup ./npm …``): each of them
-    const texts = prog ? [prog] : this.valuesOf(first).flatMap((v) => this.host.str(v) ?? []);
+    const values = prog ? { nodes: [], more: false } : this.valuesOf(first);
+    const texts = prog ? [prog] : values.nodes.flatMap((v) => this.host.str(v) ?? []);
     const out: RunTarget[] = [{ path: { node: first }, kind: "program" }];
 
-    for (const text of texts.slice(0, 8)) {
+    for (const text of texts) {
       this.spend(Math.ceil(text.value.length / 8) + 1);
       // a command line: the program after the words that only start it (`setsid nohup ./agent -c x`)
       const words = text.value.split(/[\s;&|]+/).filter((w) => w.length > 0);
@@ -1508,19 +1728,22 @@ export class Flow {
       } else if (word && words.length > 1) out.push({ path: { text: word }, kind: "program" });
     }
 
-    return out;
+    return { targets: out, cut: values.more };
   }
 
-  /** The values a name is given: its initializer and every assignment to it (a few at most). */
-  private valuesOf(n: AnyNode): AnyNode[] {
+  /** The values a name is given: its initializer and every assignment to it, the first MAX_VALUES; `more` if it has more. */
+  private valuesOf(n: AnyNode): { nodes: AnyNode[]; more: boolean } {
     const t = unwrap(n);
 
-    if (t.type !== "Identifier") return [];
+    if (t.type !== "Identifier") return { nodes: [], more: false };
     const b = this.host.bindingOf(t);
 
-    if (b === null || b === "dynamic") return [];
+    if (b === null || b === "dynamic") return { nodes: [], more: false };
+    const all = [...(b.origin.kind === "value" && b.origin.init !== t ? [b.origin.init] : []), ...(this.assigns.get(b) ?? [])];
 
-    return [...(b.origin.kind === "value" && b.origin.init !== t ? [b.origin.init] : []), ...(this.assigns.get(b) ?? [])].slice(0, 8);
+    if (all.length > MAX_VALUES) this.host.limit("assignments");
+
+    return { nodes: all.slice(0, MAX_VALUES), more: all.length > MAX_VALUES };
   }
 
   /**
