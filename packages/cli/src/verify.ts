@@ -226,9 +226,28 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
 
     // a member is a folder the lockfile installs for: its edges are its importer's. A package outside the project (an
     // external store) is walked like any other: where it lives decides only what apm may remove
-    if (member !== null || visited.has(`${target.key}\0${at}`)) return;
-    visited.add(`${target.key}\0${at}`);
-    queue.push({ key: target.key, dir: at });
+    if (member === null) walkFrom(target, at);
+  };
+
+  /** Queues a placed package's own edges, once per place. */
+  const walkFrom = (n: LockNode, at: string): void => {
+    if (visited.has(`${n.key}\0${at}`)) return;
+    visited.add(`${n.key}\0${at}`);
+    queue.push({ key: n.key, dir: at });
+  };
+
+  // every queued package's edges, and theirs in turn; resumes where it stopped when more are queued
+  let walked = 0;
+
+  const walk = (): void => {
+    for (; walked < queue.length; walked++) {
+      const item = queue[walked];
+      const n = item === undefined ? undefined : byKey.get(item.key);
+
+      if (item === undefined || n === undefined) continue;
+
+      for (const dep of n.deps) follow({ label: `${idOf(n)} (${rel(item.dir)})`, dir: item.dir }, dep);
+    }
   };
 
   for (const imp of input.importers) {
@@ -239,14 +258,7 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     for (const dep of imp.deps) follow({ label: imp.dir === "" ? "your project" : imp.dir, dir }, dep);
   }
 
-  for (let i = 0; i < queue.length; i++) {
-    const item = queue[i];
-    const n = item === undefined ? undefined : byKey.get(item.key);
-
-    if (item === undefined || n === undefined) continue;
-
-    for (const dep of n.deps) follow({ label: `${idOf(n)} (${rel(item.dir)})`, dir: item.dir }, dep);
-  }
+  walk();
 
   // npm's lockfile keys are install paths: each one there must hold its locked version, with the integrity npm recorded
   const hoisted = input.pm === "npm" || (input.pm === "bun" && !existsSync(join(root, "node_modules", ".bun")));
@@ -285,7 +297,12 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     }
 
     place(n, at, m);
+    // installed where the lockfile puts it, but reached by no edge from a folder (its devDependency ancestor left out):
+    // present, so its own edges are checked like any other's before a script runs (review of efef668, finding 2)
+    walkFrom(n, at);
   }
+
+  walk();
 
   // everything else node_modules holds
   const expected = new Set([...[...placed.values()].map((p) => p.path), ...memberDirs]);

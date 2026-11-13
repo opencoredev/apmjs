@@ -520,6 +520,65 @@ describe("finding 3: a production install leaves devDependencies out", () => {
     expect(verify({ pm: "bun", root: p2, file: "bun.lock", text: bun, omitDev: true }).problems).toEqual([]);
     expect(verify({ pm: "bun", root: p2, file: "bun.lock", text: bun, omitDev: false }).kind).toBe("mismatch");
   });
+
+  // review of efef668, finding 2: devonly -> leaf -> child; a production install left devonly out, and leaf is there
+  describe("an installed package below a devDependency that was left out has its own edges checked", () => {
+    const npmTree = npmLock({
+      "": { name: "p", dependencies: { prod: "1.0.0" }, devDependencies: { devonly: "1.0.0" } },
+      "node_modules/prod": { version: "1.0.0", resolved: "https://r.test/prod/-/prod-1.0.0.tgz", integrity: sha("p") },
+      "node_modules/devonly": { version: "1.0.0", resolved: "https://r.test/devonly/-/devonly-1.0.0.tgz", integrity: sha("d"), dev: true, dependencies: { leaf: "1.0.0" } },
+      "node_modules/leaf": { version: "1.0.0", resolved: "https://r.test/leaf/-/leaf-1.0.0.tgz", integrity: sha("l"), dev: true, dependencies: { child: "1.0.0" } },
+      "node_modules/child": { version: "1.0.0", resolved: "https://r.test/child/-/child-1.0.0.tgz", integrity: sha("c"), dev: true },
+    });
+
+    const bunTree = JSON.stringify({
+      lockfileVersion: 1,
+      workspaces: { "": { name: "p", dependencies: { prod: "1.0.0" }, devDependencies: { devonly: "1.0.0" } } },
+      packages: { prod: ["prod@1.0.0", "", {}, sha("p")], devonly: ["devonly@1.0.0", "", { dependencies: { leaf: "1.0.0" } }, sha("d")], leaf: ["leaf@1.0.0", "", { dependencies: { child: "1.0.0" } }, sha("l")], child: ["child@1.0.0", "", {}, sha("c")] },
+    });
+
+    const cases = [
+      { pm: "npm", file: "package-lock.json", text: npmTree },
+      { pm: "bun", file: "bun.lock", text: bunTree },
+    ] as const;
+
+    for (const c of cases) {
+      test(`${c.pm}: leaf without its child is a mismatch (on efef668: verified)`, () => {
+        const root = project();
+
+        pkg(join(root, "node_modules", "prod"), "prod", "1.0.0");
+        pkg(join(root, "node_modules", "leaf"), "leaf", "1.0.0", { scripts: { postinstall: "node x.js" } });
+        const r = verify({ pm: c.pm, root, file: c.file, text: c.text, omitDev: true });
+
+        expect(r.kind).toBe("mismatch");
+        expect(r.problems).toContain("child (child@1.0.0), which leaf@1.0.0 (node_modules/leaf) needs, is not installed");
+      });
+
+      test(`${c.pm}: leaf with its child, and the whole dev graph left out, are both verified`, () => {
+        const whole = project();
+        const none = project();
+
+        pkg(join(whole, "node_modules", "prod"), "prod", "1.0.0");
+        pkg(join(whole, "node_modules", "leaf"), "leaf", "1.0.0");
+        pkg(join(whole, "node_modules", "child"), "child", "1.0.0");
+        pkg(join(none, "node_modules", "prod"), "prod", "1.0.0");
+
+        expect(verify({ pm: c.pm, root: whole, file: c.file, text: c.text, omitDev: true }).problems).toEqual([]);
+        expect(verify({ pm: c.pm, root: none, file: c.file, text: c.text, omitDev: true }).problems).toEqual([]);
+      });
+
+      test(`${c.pm}: leaf's child at the wrong version is a mismatch`, () => {
+        const root = project();
+
+        pkg(join(root, "node_modules", "prod"), "prod", "1.0.0");
+        pkg(join(root, "node_modules", "leaf"), "leaf", "1.0.0");
+        pkg(join(root, "node_modules", "leaf", "node_modules", "child"), "child", "6.6.6");
+        pkg(join(root, "node_modules", "child"), "child", "1.0.0");
+
+        expect(verify({ pm: c.pm, root, file: c.file, text: c.text, omitDev: true }).problems.some((p) => p.includes("resolves child to child@6.6.6"))).toBe(true);
+      });
+    }
+  });
 });
 
 describe("finding 4: pnpm file-tarball dependencies keep their edges", () => {
