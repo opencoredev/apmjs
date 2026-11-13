@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { declaredTests, gateScore } from "../../../scripts/score-gate.ts";
+import { declaredLines, declaredTests, focusedLines, gateScore } from "../../../scripts/score-gate.ts";
 
 const SCORE = join(import.meta.dir, "..", "..", "..", "scripts", "score.ts");
 const base = mkdtempSync(join(tmpdir(), "apm-score-gate-"));
@@ -60,6 +60,23 @@ describe("scripts/score.ts", () => {
     expect(r.code).toBe(1);
   });
 
+  test("review of 2b7767f, finding 8: test.only inside describe.each leaves an ordinary test unrun; the gate names both and fails (on 2b7767f: 0, exit 0)", async () => {
+    const only = "import {describe,test,expect} from 'bun:test';\ndescribe.each([1,2,3])('row %s',()=>{\n  test.only('runs',()=>expect(1).toBe(1));\n});\ntest('must not disappear',()=>{throw new Error('unrun');});\n";
+    const r = await score({ "only.test.ts": only });
+
+    expect(r.score, r.out).toBe("1");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("(focused) acceptance/only.test.ts:3");
+    expect(r.out).toContain("(not run) acceptance/only.test.ts:5: the test declared there never ran");
+  });
+
+  test("a describe.only focuses the run too", async () => {
+    const r = await score({ "d.test.ts": 'import { describe, test } from "bun:test";\ndescribe.only("a", () => {\n  test("x", () => {});\n});\n' });
+
+    expect(r.score, r.out).toBe("1");
+    expect(r.code).toBe(1);
+  });
+
   test("everything passing, describe.each included: 0, exit 0", async () => {
     const r = await score({ "pass.test.ts": each.replace("not.toBe(2)", "toBeGreaterThan(0)") });
 
@@ -69,18 +86,37 @@ describe("scripts/score.ts", () => {
 });
 
 describe("gateScore", () => {
-  const declared = new Map([["a.test.ts", 2]]);
-  const passing = '<testcase name="one" file="a.test.ts" /><testcase name="two" file="a.test.ts" />';
+  const inventory = new Map([["a.test.ts", { declared: [1, 2], focused: [] }]]);
+  const passing = '<testcase name="one" file="a.test.ts" line="1" /><testcase name="two" file="a.test.ts" line="2" />';
 
   test("a (fail) line, a fail count or a nonzero exit each make the score at least 1", () => {
-    expect(gateScore({ declared, junit: passing, console: "", exitCode: 0 }).score).toBe(0);
-    expect(gateScore({ declared, junit: passing, console: "(fail) somewhere > x\n", exitCode: 0 }).score).toBe(1);
-    expect(gateScore({ declared, junit: passing, console: " 1 fail\n", exitCode: 0 }).score).toBe(1);
-    expect(gateScore({ declared, junit: passing, console: "", exitCode: 1 }).score).toBe(1);
+    expect(gateScore({ inventory, junit: passing, console: "", exitCode: 0 }).score).toBe(0);
+    expect(gateScore({ inventory, junit: passing, console: "(fail) somewhere > x\n", exitCode: 0 }).score).toBe(1);
+    expect(gateScore({ inventory, junit: passing, console: " 1 fail\n", exitCode: 0 }).score).toBe(1);
+    expect(gateScore({ inventory, junit: passing, console: "", exitCode: 1 }).score).toBe(1);
   });
 
   test("skipped and todo tests did not pass", () => {
-    expect(gateScore({ declared, junit: '<testcase name="one" file="a.test.ts" /><testcase name="two" file="a.test.ts"><skipped /></testcase>', console: "", exitCode: 0 }).score).toBe(1);
+    expect(gateScore({ inventory, junit: '<testcase name="one" file="a.test.ts" line="1" /><testcase name="two" file="a.test.ts" line="2"><skipped /></testcase>', console: "", exitCode: 0 }).score).toBe(1);
+  });
+
+  test("finding 8: extra runs of one declared test do not stand in for another that never ran", () => {
+    const g = gateScore({ inventory, junit: '<testcase name="one" file="a.test.ts" line="1" /><testcase name="one" file="a.test.ts" line="1" /><testcase name="one" file="a.test.ts" line="1" />', console: "", exitCode: 0 });
+
+    expect(g.score).toBe(1);
+    expect(g.files[0]?.missing).toEqual([2]);
+  });
+
+  test("finding 8: a focused file fails the gate even when every case passed", () => {
+    expect(gateScore({ inventory: new Map([["a.test.ts", { declared: [1, 2], focused: [1] }]]), junit: passing, console: "", exitCode: 0 }).score).toBe(1);
+  });
+
+  test("a declaration's line is the line its name starts on, as bun reports it", () => {
+    expect(declaredLines('test("a", () => {});\ntest(\n  "b",\n  () => {},\n);\ntest.each([\n  [1],\n])("c %d", () => {});\n')).toEqual([1, 3, 8]);
+  });
+
+  test("focus is found in test.only, it.only, describe.only and .only( forms, not in comments", () => {
+    expect(focusedLines('test.only("a", f);\nit.only("b", f);\ndescribe.only("c", f);\ndescribe.each([1]).only("d", f);\n// test.only is refused\ntest("e", f);\n')).toEqual([1, 2, 3, 4]);
   });
 
   test("declarations count test.each and test.skip, not describe", () => {
