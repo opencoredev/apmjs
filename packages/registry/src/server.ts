@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
-import { isValidTagName, isValidVersion } from "@apm/core";
+import { isValidTagName, isValidVersion, servableManifest } from "@apm/core";
 import { hashPassword } from "better-auth/crypto";
 import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CAPABILITIES, type AccessServices, type Refusal as AccessRefusal, type TokenScope } from "./access.ts";
 import type { Analysis } from "./analysis.ts";
@@ -239,7 +239,7 @@ export type Extensions = {
 
 export function versionDoc(base: string, pkg: PackageRecord, v: VersionRecord, now: number, ext: Extensions = {}): Record<string, unknown> {
   const doc: Record<string, unknown> = {
-    ...v.manifest,
+    ...servableManifest(v.manifest),
     name: pkg.name,
     version: v.version,
     _id: `${pkg.name}@${v.version}`,

@@ -33,6 +33,7 @@ import {
   type ScoreReport,
   type SecretScan,
   type TarEntry,
+  servableManifest,
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
@@ -2111,7 +2112,9 @@ function upstreamPackument(base: string, src: Extract<Source, { kind: "upstream"
 
   for (const v of kept) {
     // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
-    const doc: Record<string, unknown> = { ...v.manifest, dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
+    // a manifest past the limits apm reads is served without the fields past them: serializing it whole recurses
+    // deep enough to overflow the stack and fail the request for every version of the package
+    const doc: Record<string, unknown> = { ...servableManifest(v.manifest), dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
     const r = reportFor(v, at);
 
     if (r) doc._apmScore = compact(r);

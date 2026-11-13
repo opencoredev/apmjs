@@ -14,7 +14,7 @@ export { POPULAR_NAMES } from "./popular.ts";
 
 export * from "./entries.ts";
 
-export { boundedManifest, MANIFEST_LIMITS, measureManifest, ManifestTooLargeError, type ManifestReading } from "./manifest.ts";
+export { boundedManifest, MANIFEST_LIMITS, measureManifest, ManifestTooLargeError, servableManifest, TRIMMED_FIELD, type ManifestReading } from "./manifest.ts";
 
 export { READING_LIMITS } from "./js.ts";
 

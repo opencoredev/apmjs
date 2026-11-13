@@ -109,3 +109,38 @@ export function boundedManifest(manifest: Manifest): Manifest {
 
   return out;
 }
+
+/** The field a served manifest carries when apm left fields out of it (servableManifest), saying which and why. */
+export const TRIMMED_FIELD = "_apmTrimmed";
+
+/**
+ * `manifest` when it is within MANIFEST_LIMITS. Otherwise a copy holding each top-level field that is within the limits
+ * on its own, and TRIMMED_FIELD naming the limit and the fields left out, so that a registry can serialize it (with
+ * JSON.stringify, which recurses) and a client can see what is missing. Install-time fields (dependencies, bin,
+ * scripts, dist) are kept unless they are themselves past a limit; a client reads `exports` and the rest from the
+ * tarball's own package.json. Charges nothing.
+ */
+export function servableManifest(manifest: Manifest): Manifest {
+  const whole = measureManifest(manifest, { charged: false });
+
+  if (whole.kind === "ok") return manifest;
+  const out: Manifest = {};
+  const left: string[] = [];
+  let values = 0;
+  let chars = 0;
+
+  for (const k in manifest) {
+    if (!Object.hasOwn(manifest, k)) continue;
+    const field = measureManifest({ [k]: Object.getOwnPropertyDescriptor(manifest, k)?.value }, { charged: false });
+
+    if (field.kind === "ok" && values + field.values <= MANIFEST_LIMITS.values && chars + field.chars <= MANIFEST_LIMITS.chars) {
+      values += field.values;
+      chars += field.chars;
+      out[k] = manifest[k];
+    } else if (left.length < 20) left.push(k);
+  }
+
+  out[TRIMMED_FIELD] = `${whole.text}, past what apm serves; left out: ${left.join(", ")}`;
+
+  return out;
+}
