@@ -66,6 +66,8 @@ beforeAll(async () => {
   await publish({ name: "nest-new", version: "1.0.0", dependencies: { nleaf: "^2.0.0" }, ...marked("nest-new") });
   // apm x: a tool whose binary runs its dependency's binary, found on PATH
   await publish({ name: "helper-bin", version: "1.0.0", extra: { bin: { "helper-say": "say.js" } }, files: { "index.js": "module.exports = 1;\n", "say.js": "#!/usr/bin/env node\nconsole.log('helper says ' + process.argv.slice(2).join(' '));\n" } });
+  // a project's devDependency, and a package it shares with the production graph
+  await publish({ name: "devtool", version: "1.0.0", dependencies: { nleaf: "^1.0.0" } });
   await publish({ name: "xtool", version: "1.0.0", dependencies: { "helper-bin": "1.0.0" }, extra: { bin: { xtool: "cli.js" } }, files: { "index.js": "module.exports = 1;\n", "cli.js": "#!/usr/bin/env node\nrequire('child_process').execFileSync('helper-say', process.argv.slice(2), { stdio: 'inherit' });\n" } });
   clock += 10 * DAY;
   // an hour old: inside the 24-hour cooldown, and what the package managers below install
@@ -93,7 +95,7 @@ const Json = z.object({
 type Project = { root: string; app: string; env: Record<string, string>; marks: string; read: (file: string) => string | null; hash: () => ReturnType<typeof treeHash> };
 
 /** package.json fields a test project sets besides its dependencies. */
-type ProjectFields = { overrides?: Record<string, string>; resolutions?: Record<string, string>; pnpm?: { overrides: Record<string, string> }; dirty?: boolean };
+type ProjectFields = { overrides?: Record<string, string>; resolutions?: Record<string, string>; pnpm?: { overrides: Record<string, string> }; dirty?: boolean; devDependencies?: Record<string, string> };
 
 /**
  * A project with `deps`, installed by `pm` itself when `install` is set (scripts on, then the markers cleared, so a test
@@ -356,4 +358,33 @@ describe.each(PMS)("apm x with the real %s", (pm) => {
     // its directory is gone: nothing of apm-x is left under TMPDIR
     expect(readdirSync(tmpdir()).filter((d) => d.startsWith("apm-x-")), r.out).toEqual([]);
   });
+});
+
+// Review of 2b7767f, finding 3: a production install leaves devDependencies out, and apm add must accept that it did
+describe.each(PMS)("apm add with the real %s: a production install", (pm) => {
+  const asks: Record<Pm, { env: Record<string, string>; args: string[] }[]> = {
+    npm: [
+      { env: { npm_config_omit: "dev" }, args: [] },
+      { env: {}, args: ["--omit=dev"] },
+    ],
+    pnpm: [{ env: { npm_config_production: "true" }, args: [] }],
+    bun: [{ env: {}, args: ["--production"] }],
+  };
+
+  for (const ask of asks[pm]) {
+    test(`${Object.entries(ask.env).map(([k, v]) => `${k}=${v}`).join(" ") || ask.args.join(" ")}: the add passes, its devDependency is not installed, the shared nleaf stays (on 2b7767f: refused after the write)`, async () => {
+      const p = await project({ pm, deps: { "nest-old": "1.0.0" }, extra: { devDependencies: { devtool: "1.0.0" } }, install: true });
+      const r = await add({ ...p, env: { ...p.env, ...ask.env } }, ["up@1.0.0", "--pm", pm, ...ask.args]);
+
+      expect(r.code, r.out).toBe(0);
+      expect(r.json.installed?.stage, r.out).toBe("done");
+      expect(r.out).toContain("leaves devDependencies out of this install");
+      expect(p.read("package.json")).toContain('"up"');
+
+      // npm and pnpm remove the devDependency they no longer install; bun leaves what is there
+      if (pm !== "bun") expect(existsSync(join(p.root, "node_modules", "devtool")), r.out).toBe(false);
+      // nleaf, which nest-old needs too, stays (pnpm keeps a package no folder lists directly in its store)
+      expect(existsSync(join(p.root, "node_modules", ...(pm === "pnpm" ? [".pnpm", "nleaf@1.0.0", "node_modules"] : []), "nleaf", "package.json")), r.out).toBe(true);
+    });
+  }
 });
