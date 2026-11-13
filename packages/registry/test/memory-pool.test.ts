@@ -286,7 +286,7 @@ describe("requests that read at once share the pool (review of 6862fc7, finding 
 const REAL = process.env.APM_PACKUMENTS ?? join(homedir(), ".cache", "apm-packuments");
 
 describe.skipIf(!existsSync(REAL))("real packuments under one request's lease", () => {
-  test("next, react and typescript fit in one walk, with their shared-cache copies written beside it", async () => {
+  test("next, react and typescript fit in one walk beside a 4 MiB root, with their shared-cache copies written beside it", async () => {
     const db = await freshDatabase();
     const npm = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => new Response(Bun.file(join(REAL, `${new URL(req.url).pathname.slice(1)}.json`))) });
     const written: string[] = [];
@@ -305,6 +305,8 @@ describe.skipIf(!existsSync(REAL))("real packuments under one request's lease", 
     try {
       const pool = new MemoryPool();
       const walk = pool.request();
+      // the resolve's root, held under the same request lease (review of 747a032, finding 5: at 64 MiB a 1 MiB root left next unchecked)
+      expect(walk.take(4 * MiB)).toBe(true);
       const noBlobs = Layer.succeed(Blobs, Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }));
       const layers = Layer.provide(Upstream.layer(npm.url.href, 60_000, (w) => works.push(w)), Layer.mergeAll(Store.postgres(db.url), noBlobs));
       const got = await Effect.runPromise(Effect.flatMap(Upstream, (up) => up.probeMany(["next", "react", "typescript"], walk)).pipe(Effect.provide(layers), Effect.scoped));

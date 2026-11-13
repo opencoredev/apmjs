@@ -17,8 +17,9 @@
 // and its children's. What does not fit is refused at once, never waited for: the caller reports the package as not
 // checked (over-budget), as it does when one request has used its own limit.
 //
-// The claim: the sum of every open lease's own weight and every held block's weight never passes the pool's limit,
-// and every allocation that grows with a packument's size is charged to a lease before it is made (docs/ARCHITECTURE.md).
+// The claim: the sum of every open lease's own weight and every held block's weight never passes the pool's limit.
+// Charging covers the reads, their parsed values and the cache; the known gaps where memory outlives its charge are
+// listed in docs/ARCHITECTURE.md ("Known gaps").
 import { Context, Effect, Layer } from "effect";
 
 const MiB = 1024 * 1024;
@@ -26,8 +27,12 @@ const MiB = 1024 * 1024;
 /** All the package metadata an isolate holds at once, leaving 48 of its 128 MiB to the runtime and other work. */
 export const POOL_WEIGHT = 80 * MiB;
 
-/** The most one request holds (a resolve walk, a scan, the packument route): next, react and typescript fit together. */
-export const REQUEST_WEIGHT = 64 * MiB;
+/**
+ * The most one request holds (a resolve walk, a scan, the packument route). next, react and typescript together hold
+ * 60.7 MiB (63.4 at peak); at 64 MiB a root of 1 MiB beside them left next unchecked, so 72 MiB leaves room for a root
+ * of up to about 8 MiB (71.4 MiB at peak), inside the 80 MiB pool.
+ */
+export const REQUEST_WEIGHT = 72 * MiB;
 
 /** The most the isolate cache keeps. Oldest go first, and the pool takes them back when a read needs the room. */
 export const CACHE_WEIGHT = 32 * MiB;
