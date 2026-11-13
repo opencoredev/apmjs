@@ -6,7 +6,7 @@ import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, apm, getJson, installedVersion, dig, type Registry } from "./harness";
+import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, apm, getJson, scoredJson, installedVersion, dig, type Registry } from "./harness";
 
 const DAY = 24 * 60 * 60 * 1000;
 const HOUR = 60 * 60 * 1000;
@@ -88,12 +88,16 @@ describe("upstream proxy", () => {
     const anonymous = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.0.0`);
     expect(anonymous.status, JSON.stringify(anonymous.body)).toBe(503);
     expect(dig(anonymous.body, "pending")).toBe(true);
-    // a token caller's request analyses it inline
+    // a token caller's request queues it too, and the queue's run scores it (review of 5b5b492, finding 3: no request
+    // analyses inline, so every attempt is recorded before the upstream is asked)
     const signedIn = { headers: { authorization: `Bearer ${alice}` } };
-    const good = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.1.0`, signedIn);
+    const first = await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.1.0`, signedIn);
+    expect(first.status, JSON.stringify(first.body)).toBe(503);
+    expect(dig(first.body, "pending")).toBe(true);
+    const good = await scoredJson(`${reg.url}-/apm/v1/score/up-pkg/1.1.0`, signedIn);
     expect(good.status, JSON.stringify(good.body)).toBe(200);
     expect(Number(dig(good.body, "score"))).toBeGreaterThanOrEqual(85);
-    const bad = await getJson(`${reg.url}-/apm/v1/score/up-evil/1.0.0`, signedIn);
+    const bad = await scoredJson(`${reg.url}-/apm/v1/score/up-evil/1.0.0`, signedIn);
     expect(bad.status).toBe(200);
     expect(Number(dig(bad.body, "score"))).toBeLessThan(40);
   });
@@ -148,9 +152,8 @@ describe("upstream proxy", () => {
   });
 
   test("popular-scores answers every named package in one response", async () => {
-    // popular-scores reads stored analyses only: score up-pkg's latest first, as a signed-in caller's request would
-    // (an anonymous one only queues it)
-    expect((await getJson(`${reg.url}-/apm/v1/score/up-pkg/1.2.0`, { headers: { authorization: `Bearer ${alice}` } })).status).toBe(200);
+    // popular-scores reads stored analyses only: score up-pkg's latest first, as the queue would after any request
+    expect((await scoredJson(`${reg.url}-/apm/v1/score/up-pkg/1.2.0`)).status).toBe(200);
     const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg,up-evil,nope-not-here`);
 
     expect(r.status, JSON.stringify(r.body)).toBe(200);

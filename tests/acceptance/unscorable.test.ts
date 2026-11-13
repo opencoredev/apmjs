@@ -9,7 +9,7 @@ import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addUser, apm, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, writeConsumer, type Registry } from "./harness";
+import { apm, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, writeConsumer, type Registry } from "./harness";
 
 const clock = Date.parse("2026-11-01T00:00:00Z");
 
@@ -152,12 +152,14 @@ describe("versions that can never be scored", () => {
   }, 60_000);
 
   test("a tarball over the 48 MiB unpack cap is recorded on the request that first reads it", async () => {
-    // small enough to analyze inline, so a token caller's score request itself finds out
-    await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB", await addUser(reg, "first-reader"));
+    // the queue's run finds out, as it does for every version (no request analyses inline)
+    expect(await reg.analysisJob({ name: "over-unpack", version: "1.0.0" })).toBe("ack");
+    await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB");
   }, 60_000);
 
   test("a version the upstream lists without a checksum is recorded unavailable", async () => {
-    await expectUnscorable("no-checksum", "unavailable", "no checksum", await addUser(reg, "checksum-reader"));
+    expect(await reg.analysisJob({ name: "no-checksum", version: "1.0.0" })).toBe("ack");
+    await expectUnscorable("no-checksum", "unavailable", "no checksum");
   }, 60_000);
 
   test("a run the platform stopped is followed by a smaller run that is incomplete, never clean", async () => {

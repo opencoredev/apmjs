@@ -1,7 +1,9 @@
-// Scoring upstream versions. An anonymous request never analyses anything: a version with no stored analysis is queued,
-// and the answer says so. A signed-in or token caller's request analyses at most INLINE_ANALYSES small tarballs
-// itself, each under a quarter of the work meter; everything else goes to the analysis queue, whose consumer runs one
-// analysis per invocation under the whole meter.
+// Scoring upstream versions. A request never analyses anything, whoever sends it: a version with no stored analysis is
+// queued, and the answer says so (callers that wait, such as resolve, poll the store). The analysis queue's consumer
+// runs one analysis per invocation under the whole meter, and records each run before it asks the upstream anything,
+// so every attempt leaves a record (review of 5b5b492, finding 3: an inline run downloaded first and recorded later,
+// so a run stopped inside the download left nothing behind). A registry with no queue records the job all the same,
+// and its cron sweep runs it.
 //
 // Every analysis is metered by counted work (the meter in @apm/core), not by time: in a deployed Worker the clock does
 // not move while code runs. The meter is not a proof: work it misses is stopped by the platform's default 30 s CPU
@@ -14,7 +16,7 @@
 // its start and counts a fetch failure, and after MAX_FETCH_FAILURES of them the version is settled as unavailable, as
 // is one the upstream no longer lists. A version is never left looking queued forever, and never scored clean on a
 // reading that stopped short.
-import { Context, Effect, Layer, Ref, Semaphore } from "effect";
+import { Context, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type Unscorable, type VersionRecord } from "./db.ts";
@@ -39,12 +41,6 @@ export type JobOutcome = "stored" | "unscorable" | "missing" | "retry" | "busy";
 /** What analyzeAndStore came to: stored (scored, or failed past its retries), unscorable, or to be run again. */
 type Stored = { kind: "stored" | "unscorable" | "retry"; v: VersionRecord };
 
-/** Per request from a signed-in or token caller: analyze at most this many upstream tarballs inline. Anonymous: none. */
-export const INLINE_ANALYSES = 2;
-
-/** Tarballs larger than this (compressed) always go to the queue. */
-export const INLINE_MAX_BYTES = 4 * 1024 * 1024;
-
 /**
  * The most a tarball may inflate to on a Worker. A Worker has 128 MB, and the parser keeps the inflated archive
  * and each entry's bytes, so this stays well under half of it. Larger archives are refused (publish) or recorded as
@@ -60,9 +56,6 @@ export const WORKER_CPU_MS = 30_000;
  * unit measured (docs/SCORE.md). A run that costs more is stopped by the platform and recovered by the sweep.
  */
 export const QUEUE_WORK = MAX_ANALYSIS_WORK;
-
-/** Per inline analysis: a quarter of the meter, so the INLINE_ANALYSES a request may run stay under half of it. */
-export const INLINE_WORK = MAX_ANALYSIS_WORK / 4;
 
 /** A run begun less than this long ago may still be going: a full meter's CPU, plus the download and the writes. */
 export const RUN_WINDOW_MS = 6 * 60_000;
@@ -111,11 +104,7 @@ const GONE: Record<"package" | "version" | "tarball", Unscorable> = {
   tarball: { reason: "unavailable", detail: "the upstream registry no longer serves this version's tarball" },
 };
 
-/**
- * What one run came to. `scored` with `spent` when the meter ran out, the unpack or the analysis: the analysis is then
- * `incomplete`, naming the phase. An inline run that spends its quarter of the meter is not stored; the queue's run,
- * with the whole meter, decides.
- */
+/** What one run came to. `scored` with `spent` when the meter ran out, the unpack or the analysis: the analysis is then `incomplete`, naming the phase. */
 export type TarballAnalysis = { kind: "scored"; analysis: Scored; spent: boolean } | { kind: "unscorable"; unscorable: Unscorable } | { kind: "failed"; errorClass: string };
 
 /**
@@ -173,16 +162,10 @@ function analyzeOrThrow(pkg: UpstreamPackage, v: VersionRecord, bytes: Uint8Arra
 
 export type AnalysisApi = {
   /**
-   * Makes sure an upstream version has a stored analysis and returns the version with it. For a caller this request
-   * let analyse inline (`allowInline`), small tarballs are analyzed now while its budget lasts; everything else is
-   * queued and comes back unscored. A version that can never be scored comes back with `unscorable`.
+   * The version as stored: with its analysis, or `unscorable` for one this scorer can never score. One with neither is
+   * queued (unless it was queued less than REQUEUE_AFTER_MS ago) and comes back unscored; nothing is analysed here.
    */
   readonly ensure: (pkg: UpstreamPackage, v: VersionRecord) => Effect.Effect<VersionRecord, StoreError | BlobError>;
-  /**
-   * Lets this request analyse up to INLINE_ANALYSES versions inline, when `signedIn` says the caller is signed in or
-   * sent a token. It is asked only when an analysis would run. Without this call, every analysis is queued.
-   */
-  readonly allowInline: (signedIn: Effect.Effect<boolean>) => Effect.Effect<void>;
   /**
    * The cron sweep's half: requeues every run that began at least RUN_WINDOW_MS ago and never stored anything (the
    * platform stopped it). The queue's next run of it reads less and is incomplete, and the one after records the
@@ -199,7 +182,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
   /** No upstream, nothing to score: local versions are scored when they are published. */
   static readonly none = Layer.succeed(
     Analysis,
-    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), allowInline: () => Effect.void, enqueue: () => Effect.void, runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
+    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.void, runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
   );
 
   /** `queue`: the analysis queue's producer, or null for a registry with none. */
@@ -210,23 +193,19 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         const store = yield* Store;
         const upstream = yield* Upstream;
         const clock = yield* Clock;
-        // nothing inline until the request says its caller is signed in; then up to INLINE_ANALYSES
-        const budget = yield* Ref.make(0);
-        const signedIn = yield* Ref.make<Effect.Effect<boolean> | null>(null);
-        // One inline download and analysis at a time: a request may look up many packages at once (scan), and
-        // each analysis holds a tarball and its inflated files in the Worker's 128 MB.
-        const inline = yield* Semaphore.make(1);
         const timeAnalysis = timed(yield* timingOrNull, "analysis");
 
-        /** Queues a version unless it was queued less than REQUEUE_AFTER_MS ago. True when it is on the queue now. */
+        /**
+         * Queues a version unless it was queued less than REQUEUE_AFTER_MS ago. True when it is on the queue now. With no
+         * queue the job is recorded all the same (analysis_jobs), and the cron sweep runs it once REQUEUE_AFTER_MS pass.
+         */
         const enqueue = (name: string, version: string): Effect.Effect<boolean, StoreError> =>
           Effect.gen(function* () {
-            if (queue === null) return false;
             const now = yield* clock.now;
             const claimed = yield* store.claimAnalysisJob(name, version, now, REQUEUE_AFTER_MS);
 
             // claimed by an earlier request, whose job is on the queue
-            if (!claimed) return true;
+            if (!claimed || queue === null) return true;
             const job: AnalysisJob = { name, version };
 
             // a job the queue refused is not on it, so its reservation goes too and the next request queues it again
@@ -238,16 +217,6 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             );
           });
 
-        /**
-         * An inline run gives its work to the queue on purpose: queued first, then its start taken back, so the queued
-         * run starts afresh with the whole meter. Not queued (no queue, or the send failed), the start stays and the
-         * sweep picks the version up.
-         */
-        const giveToQueue = (name: string, version: string): Effect.Effect<void, StoreError> =>
-          Effect.gen(function* () {
-            if (yield* enqueue(name, version)) yield* store.abandonAnalysis(name, version);
-          });
-
         const markUnscorable = (pkg: UpstreamPackage, v: VersionRecord, unscorable: Unscorable): Effect.Effect<VersionRecord, StoreError> =>
           Effect.gen(function* () {
             yield* store.setUnscorable({ name: pkg.name, version: v.version, unscorable, at: yield* clock.now });
@@ -257,14 +226,12 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
           });
 
         /**
-         * Analyzes bytes and stores what it came to. An inline run that spends its share of the meter stores nothing: it
-         * queues the version, whose queued run has the whole meter, and takes its start back once the job is queued. A
-         * run that fails with an error keeps its start counted (failAnalysis); after MAX_FAILED_RUNS failed runs the
-         * version is stored as incomplete, naming the error's class. A run that fails in a way it cannot report (a store
-         * error, a platform stop) leaves its start for the sweep.
+         * Analyzes bytes and stores what it came to. A run that fails with an error keeps its start counted
+         * (failAnalysis); after MAX_FAILED_RUNS failed runs the version is stored as incomplete, naming the error's class.
+         * A run that fails in a way it cannot report (a store error, a platform stop) leaves its start for the sweep.
          */
-        const analyzeAndStore = (pkg: UpstreamPackage, v: VersionRecord, got: { bytes: Uint8Array; digest: Digest }, plan: RunPlan, run: "inline" | "queued"): Effect.Effect<Stored, StoreError> =>
-          Effect.gen(function* (): Effect.fn.Return<Stored, StoreError> {
+        const analyzeAndStore = (pkg: UpstreamPackage, v: VersionRecord, got: { bytes: Uint8Array; digest: Digest }, plan: RunPlan): Effect.Effect<Stored, StoreError> =>
+          timeAnalysis(Effect.gen(function* (): Effect.fn.Return<Stored, StoreError> {
             const result = analyzeUpstreamTarball(pkg, v, got.bytes, plan);
 
             switch (result.kind) {
@@ -273,7 +240,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               case "failed": {
                 const failures = yield* store.failAnalysis({ name: pkg.name, version: v.version, errorClass: result.errorClass, now: yield* clock.now, runMs: RUN_WINDOW_MS });
 
-                yield* Effect.logWarning("analysis failed", { name: pkg.name, version: v.version, errorClass: result.errorClass, failures, run });
+                yield* Effect.logWarning("analysis failed", { name: pkg.name, version: v.version, errorClass: result.errorClass, failures });
 
                 if (failures !== null && failures >= MAX_FAILED_RUNS) {
                   // nothing of the version is read again, its manifest included: reading it may be what failed
@@ -285,19 +252,11 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                   return { kind: "stored", v };
                 }
 
-                // the next delivery runs it again; an inline failure is queued for that delivery
-                if (run === "inline") yield* enqueue(pkg.name, v.version);
-
+                // the next delivery runs it again
                 return { kind: "retry", v };
               }
 
               case "scored":
-                if (result.spent && run === "inline") {
-                  yield* giveToQueue(pkg.name, v.version);
-
-                  return { kind: "retry", v };
-                }
-
                 yield* store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis: result.analysis, at: yield* clock.now });
                 v.score = result.analysis;
 
@@ -308,26 +267,11 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                 return _exhaustive;
               }
             }
-          });
+          }));
 
         /** What a tarball the upstream will never serve in a checkable form, or one too large to fetch, is: recorded. */
         const refused = (got: { kind: "too-large"; bytes: number | null } | { kind: "unavailable"; reason: string }): Unscorable =>
           got.kind === "too-large" ? { reason: "too-large", detail: tooLargeText(got.bytes) } : { reason: "unavailable", detail: got.reason };
-
-        /** Whether this request may analyse one more version inline: its caller is signed in and its budget lasts. */
-        const mayInline = Effect.gen(function* () {
-          const check = yield* Ref.get(signedIn);
-
-          if (check === null) return false;
-          // asked once per request, when the first analysis would run
-          const ok = yield* check;
-
-          yield* Ref.set(signedIn, Effect.succeed(ok));
-
-          if (!ok) return false;
-
-          return (yield* Ref.getAndUpdate(budget, (n) => Math.max(0, n - 1))) > 0;
-        });
 
         /** A queued version the upstream no longer serves: settled, so neither the queue nor the sweep tries it again. */
         const settleGone = (job: AnalysisJob, unscorable: Unscorable): Effect.Effect<void, StoreError> =>
@@ -433,13 +377,12 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
             }
 
-            const stored = yield* analyzeAndStore(pkg, v, got, analyses === 1 ? { maxWork: QUEUE_WORK } : RERUN, "queued");
+            const stored = yield* analyzeAndStore(pkg, v, got, analyses === 1 ? { maxWork: QUEUE_WORK } : RERUN);
 
             return stored.kind;
           });
 
         const api: AnalysisApi = {
-          allowInline: (check) => Ref.set(signedIn, check).pipe(Effect.andThen(Ref.set(budget, INLINE_ANALYSES))),
           recover: Effect.gen(function* () {
             const now = yield* clock.now;
             const runs = yield* store.unfinishedAnalyses({ before: now - RUN_WINDOW_MS, limit: RECOVER_PER_SWEEP, now });
@@ -455,69 +398,13 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
 
             return runs.length + accepted.length;
           }),
+          // every cache miss goes to the queue, which records each run before it fetches anything
           ensure: (pkg, v) =>
             Effect.gen(function* () {
               if (parseAnalysis(v.score) || v.unscorable) return v;
+              yield* enqueue(pkg.name, v.version);
 
-              // anonymous, or past this request's budget: queued, and the answer says so
-              if (!(yield* mayInline)) {
-                yield* enqueue(pkg.name, v.version);
-
-                return v;
-              }
-
-              return yield* inline.withPermits(1)(
-                timeAnalysis(Effect.gen(function* () {
-                  const got = yield* upstream.tarball(pkg, v.version);
-
-                  switch (got.kind) {
-                    // the queue's run settles it or tries again, and records each try: an inline request records nothing
-                    case "absent":
-                      yield* enqueue(pkg.name, v.version);
-
-                      return v;
-                    case "unavailable":
-                      if (!got.retryable) return yield* markUnscorable(pkg, v, refused(got));
-                      yield* enqueue(pkg.name, v.version);
-
-                      return v;
-                    case "too-large":
-                      return yield* markUnscorable(pkg, v, refused(got));
-                    case "ok":
-                      break;
-                    default: {
-                      const _exhaustive: never = got;
-
-                      return _exhaustive;
-                    }
-                  }
-
-                  if (got.bytes.length > INLINE_MAX_BYTES) {
-                    yield* enqueue(pkg.name, v.version);
-
-                    return v;
-                  }
-
-                  // the record of this run, before anything is analysed: a run the platform stops leaves it for the sweep
-                  const begun = yield* store.startAnalysis({ name: pkg.name, version: v.version, now: yield* clock.now, runMs: RUN_WINDOW_MS });
-
-                  // another run may be going, or the version was decided meanwhile: the queue's run settles it
-                  if (begun.kind !== "started") {
-                    yield* enqueue(pkg.name, v.version);
-
-                    return v;
-                  }
-
-                  // an earlier run was stopped, or could not fetch it: the queue's run decides, on its own budget
-                  if (begun.starts - begun.fetchFailures !== 1) {
-                    yield* giveToQueue(pkg.name, v.version);
-
-                    return v;
-                  }
-
-                  return (yield* analyzeAndStore(pkg, v, got, { maxWork: INLINE_WORK }, "inline")).v;
-                })),
-              );
+              return v;
             }),
           enqueue,
           runJob,

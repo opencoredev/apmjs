@@ -258,7 +258,7 @@ describe("review 7: a transient analysis failure is retried, not recorded as don
 
   beforeAll(async () => {
     tarballs.set("flaky-tarball", { bytes: tgzOf("flaky-tarball", { "index.js": "module.exports = 1;\n" }), status: 503, downloads: 0 });
-    // over the inline limit (4 MB compressed): scored only on the queue
+    // a large tarball (4 MB compressed), scored on the queue like every other
     tarballs.set("big-tarball", { bytes: tgzOf("big-tarball", { "index.js": "module.exports = 1;\n", "data.txt": randomBytes(4 * 1024 * 1024).toString("base64") }), status: 200, downloads: 0 });
     npm = Bun.serve({
       port: 0,

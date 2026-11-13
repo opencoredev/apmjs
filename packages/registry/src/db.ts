@@ -387,11 +387,6 @@ export type StoreApi = {
    */
   readonly failFetch: (input: { name: string; version: string; errorClass: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
   /**
-   * Takes back the start `startAnalysis` counted, for an inline run that gave its work to the queue on purpose (it
-   * spent its share of the meter, or another run had begun). Only for work already queued: a failed run is `failAnalysis`.
-   */
-  readonly abandonAnalysis: (name: string, version: string) => Effect.Effect<void, StoreError>;
-  /**
    * Records that a run failed with an error it reported: its start stays counted, `errorClass` is kept, and the run
    * counts as ended (started `runMs` before `now`), so the next delivery or the sweep may start it again. Returns how
    * many runs of it have failed, this one included; null when the version already has an outcome.
@@ -1022,12 +1017,6 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL
             RETURNING fetch_failures`,
         one(z.object({ fetch_failures: Int })).transform((row) => row?.fetch_failures ?? null),
-      ),
-    abandonAnalysis: (name, version) =>
-      run(
-        "abandonAnalysis",
-        sql`UPDATE analysis_outcomes SET starts = GREATEST(starts - 1, 0), started_at = NULL WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL`,
-        none,
       ),
     failAnalysis: ({ name, version, errorClass, now, runMs }) =>
       run(

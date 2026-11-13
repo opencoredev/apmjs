@@ -2,8 +2,7 @@
 // answered only on a path the GET table (routes.ts) lists.
 import { Effect } from "effect";
 import { accountRoute } from "./account.ts";
-import { Analysis } from "./analysis.ts";
-import { apmExtensions, apmRoute, safeView, sessionUser, upstreamRoute } from "./apm.ts";
+import { apmExtensions, apmRoute, safeView, upstreamRoute } from "./apm.ts";
 import { Auth } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { evidenceRoute } from "./evidence.ts";
@@ -25,22 +24,6 @@ export const route = (req: Request) =>
     if (isAuth) return yield* (yield* Auth).handler(req);
 
     const caller = yield* callerOf(req);
-    // an anonymous request never analyses anything: a version with no stored analysis is queued. A token caller, or a
-    // website session (looked up only once an analysis would run), may have a few analysed inline.
-    const auth = yield* Effect.context<Auth>();
-
-    const signedIn: Effect.Effect<boolean> =
-      caller.kind === "user"
-        ? Effect.succeed(true)
-        : !req.headers.has("cookie")
-          ? Effect.succeed(false)
-          : sessionUser(req).pipe(
-              Effect.map((user) => user !== null),
-              Effect.catch(() => Effect.succeed(false)),
-              Effect.provide(auth),
-            );
-
-    yield* (yield* Analysis).allowInline(signedIn);
     let view: PackumentView | undefined;
 
     if (viaSafe) {

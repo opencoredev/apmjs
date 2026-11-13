@@ -425,6 +425,21 @@ export function encodePkg(name: string): string {
 }
 
 /** Pulls a nested field from unknown JSON without casts. */
+/**
+ * GETs a score or version answer until the analysis queue has stored the version: no request analyses anything, so a
+ * version not scored yet answers 503 `pending` until the queue's run (a second or so here) stores it.
+ */
+export async function scoredJson(url: string, init?: RequestInit, timeoutMs = 30_000): Promise<{ status: number; body: unknown }> {
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    const got = await getJson(url, init);
+
+    if (!(got.status === 503 && dig(got.body, "pending") === true) || Date.now() > deadline) return got;
+    await Bun.sleep(250);
+  }
+}
+
 export function dig(v: unknown, ...path: (string | number)[]): unknown {
   let cur: unknown = v;
 

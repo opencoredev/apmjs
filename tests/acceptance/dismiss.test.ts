@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { deviceLogin, dig, enableTotp, getJson, pkgTgz, putPublish, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
+import { deviceLogin, dig, enableTotp, getJson, pkgTgz, scoredJson, putPublish, signInWithGitHub, startFakeGitHub, startRegistry, totp, type Browser, type FakeGitHub, type Registry } from "./harness";
 
 const DENY = "module.exports = { deny: ['.env', '.env.*', '.npmrc'] };\n";
 
@@ -24,8 +24,8 @@ let outsiderSecret: string;
 type Item = { name: string; version: string; digest: string; scorer: string; signal: string; file: string; line: number };
 
 async function score(name: string, version: string): Promise<{ status: number; body: unknown }> {
-  // a token caller's request analyses an upstream version inline; an anonymous one only queues it
-  return getJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`, { headers: { authorization: `Bearer ${alice}` } });
+  // a request queues an upstream version, and the queue's run scores it
+  return scoredJson(`${reg.url}-/apm/v1/score/${encodeURIComponent(name)}/${version}`, { headers: { authorization: `Bearer ${alice}` } });
 }
 
 /** The credential item a version's score cites, as the version page names it. */

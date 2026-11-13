@@ -1,9 +1,9 @@
 // Criterion 1 of apm-score-v10, the registry's half. A run the platform stops mid-analysis always ends in a stored
 // outcome: its record exists before it analyses anything (startAnalysis), the cron sweep (Analysis.recover) requeues
 // it, the next run reads less and is incomplete, and after a second stop the version is recorded as one that cannot be
-// scored. And no anonymous request analyses anything: its cache misses are queued, and only a signed-in or token
-// caller's request analyses at most two versions inline. The store is the real Postgres one; the upstream and the queue
-// are recording stubs, and the "platform stop" is a stub that ends the run between its start and its store.
+// scored. And no request analyses anything, signed in or not: its cache misses are queued, and the queue's run records
+// itself before it asks the upstream anything (review of 5b5b492, finding 3). The store is the real Postgres one; the
+// upstream and the queue are recording stubs, and the "platform stop" is a stub that ends the run where it is armed.
 import { describe, expect, test } from "bun:test";
 import { Cause, Effect, Exit, Layer } from "effect";
 import { gzipSync } from "node:zlib";
@@ -12,7 +12,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, INLINE_ANALYSES, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { Upstream, type Probe, type UpstreamPackage } from "../src/upstream.ts";
@@ -163,30 +163,18 @@ class PlatformStop extends Error {
   }
 }
 
-/**
- * The real store, except that once `stop.armed` is set, the first write of a result stops the run: the write never
- * happens, and nothing after it reaches the database either (the error handler that would take the start back runs
- * in a Worker that no longer exists).
- */
+/** The real store, except that once `stop.armed` is set, the first write of a result stops the run: the write never happens. */
 function stoppingStore(stop: { armed: boolean }) {
   return Layer.effect(
     Store,
     Effect.gen(function* () {
       const real = yield* Store;
-      let stopped = false;
-
-      const halt = (): Effect.Effect<never> =>
-        Effect.suspend(() => {
-          stopped = true;
-
-          return Effect.die(new PlatformStop());
-        });
+      const halt = (): Effect.Effect<never> => Effect.die(new PlatformStop());
 
       return Store.of({
         ...real,
         setUpstreamAnalysis: (input) => (stop.armed ? halt() : real.setUpstreamAnalysis(input)),
         setUnscorable: (input) => (stop.armed ? halt() : real.setUnscorable(input)),
-        abandonAnalysis: (name, version) => (stopped ? Effect.void : real.abandonAnalysis(name, version)),
       });
     }),
   );
@@ -232,16 +220,8 @@ describe("a run the platform stops always ends in a stored outcome", () => {
 
       if (!v) throw new Error("no version");
 
-      // a token caller's request analyses it inline, and the platform stops the run before it stores anything
-      const first = await Effect.runPromiseExit(
-        Effect.gen(function* () {
-          const a = yield* Analysis;
-
-          yield* a.allowInline(Effect.succeed(true));
-
-          return yield* a.ensure(pkg, v);
-        }).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue, stop })), Effect.scoped),
-      );
+      // the queue's run of it, and the platform stops the run before it stores anything
+      const first = await Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob({ name: pkg.name, version: v.version })).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue, stop })), Effect.scoped));
 
       expect(Exit.isFailure(first) && Cause.pretty(first.cause).includes(STOPPED)).toBe(true);
       // what the stop left: the run's record, nothing stored, nothing queued
@@ -306,45 +286,95 @@ describe("a run the platform stops always ends in a stored outcome", () => {
   }, 120_000);
 });
 
-describe("no anonymous inline analysis", () => {
-  test("an anonymous request queues every cache miss and downloads nothing; a signed-in one analyses two, then queues", async () => {
+describe("no request analyses anything", () => {
+  test("anonymous or signed in, every cache miss is queued and nothing is downloaded or recorded as a run", async () => {
     await withRig(async (db, sql) => {
       const names = ["p1", "p2", "p3", "p4"];
       const up = upstreamStub(names);
       const q = queueStub();
 
-      const request = (signedIn: boolean | null) =>
-        Effect.gen(function* () {
-          const a = yield* Analysis;
+      const request = Effect.gen(function* () {
+        const a = yield* Analysis;
+        const out: string[] = [];
 
-          if (signedIn !== null) yield* a.allowInline(Effect.succeed(signedIn));
-          const out: string[] = [];
+        for (const n of names) {
+          const pkg = up.pkgOf(n);
+          const v = pkg?.versions[0];
 
-          for (const n of names) {
-            const pkg = up.pkgOf(n);
-            const v = pkg?.versions[0];
+          if (!pkg || !v) continue;
+          const got = yield* a.ensure(pkg, v);
 
-            if (!pkg || !v) continue;
-            const got = yield* a.ensure(pkg, v);
+          out.push(got.score ? "scored" : "queued");
+        }
 
-            out.push(got.score ? "scored" : "queued");
-          }
+        return out;
+      }).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped);
 
-          return out;
-        }).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped);
-
-      // no grant (an anonymous request), and a cookie that is no session: everything queued, nothing downloaded
-      expect(await Effect.runPromise(request(null))).toEqual(["queued", "queued", "queued", "queued"]);
-      expect(await Effect.runPromise(request(false))).toEqual(["queued", "queued", "queued", "queued"]);
+      expect(await Effect.runPromise(request)).toEqual(["queued", "queued", "queued", "queued"]);
+      // asked again before REQUEUE_AFTER_MS: still queued, sent once
+      expect(await Effect.runPromise(request)).toEqual(["queued", "queued", "queued", "queued"]);
       expect(up.downloads).toEqual([]);
       expect(q.sent.map((j) => j.name)).toEqual(names);
       expect(await sql("SELECT 1 FROM analysis_outcomes")).toEqual([]);
+    });
+  }, 120_000);
 
-      // a token or signed-in caller: INLINE_ANALYSES analysed inline, the rest queued
-      await sql("DELETE FROM analysis_jobs");
-      expect(INLINE_ANALYSES).toBe(2);
-      expect(await Effect.runPromise(request(true))).toEqual(["scored", "scored", "queued", "queued"]);
-      expect(up.downloads).toEqual(["p1", "p2"]);
+  // Review of 5b5b492, finding 3: a signed-in request analysed inline and downloaded before it recorded the attempt, so
+  // three runs stopped inside upstream.tarball left no outcome row, no reservation and no queued job. Requests no longer
+  // analyse; the queue's run records its start before it fetches, so each stop leaves a record the sweep requeues.
+  test("a run stopped inside the tarball fetch leaves its record, and the sweep requeues it", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["fetch-stop"]);
+      const q = queueStub();
+      const pkg = up.pkgOf("fetch-stop");
+      const v = pkg?.versions[0];
+
+      if (!pkg || !v) throw new Error("no package");
+      const broken = Layer.effect(
+        Upstream,
+        Effect.gen(function* () {
+          const real = yield* Upstream;
+
+          return Upstream.of({ ...real, tarball: () => Effect.die(new PlatformStop()) });
+        }),
+      ).pipe(Layer.provide(up.layer));
+
+      // a request queues it
+      await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.ensure(pkg, v)).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: broken, queue: q.queue })), Effect.scoped));
+      expect(q.sent).toEqual([{ name: "fetch-stop", version: "1.0.0" }]);
+
+      for (let i = 0; i < 2; i++) {
+        const exit = await Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob({ name: "fetch-stop", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + i * (RUN_WINDOW_MS + 1), upstream: broken, queue: q.queue })), Effect.scoped));
+
+        expect(Exit.isFailure(exit)).toBe(true);
+      }
+
+      expect(Outcome.parse(await sql("SELECT starts, started_at, outcome FROM analysis_outcomes WHERE package = 'fetch-stop'"))).toEqual([{ starts: 2, started_at: T0 + RUN_WINDOW_MS + 1, outcome: null }]);
+      await sql("UPDATE analysis_jobs SET queued_at = 0 WHERE package = 'fetch-stop'");
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(swept).toBe(1);
+      expect(q.sent.length).toBe(2);
+      // the third run, with the upstream back, is the rerun: it reads less and stores incomplete, never clean
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "fetch-stop", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS + 1, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("unscorable");
+      expect(Outcome.parse(await sql("SELECT starts, started_at, outcome FROM analysis_outcomes WHERE package = 'fetch-stop'"))[0]).toMatchObject({ starts: 3, outcome: "analysis-limit" });
+    });
+  }, 120_000);
+
+  test("with no queue the job is recorded, and the cron sweep runs it", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["local-pkg"]);
+      const pkg = up.pkgOf("local-pkg");
+      const v = pkg?.versions[0];
+
+      if (!pkg || !v) throw new Error("no package");
+      await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.ensure(pkg, v)).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: null })), Effect.scoped));
+      expect(up.downloads).toEqual([]);
+      expect(await sql("SELECT package FROM analysis_jobs")).toEqual([{ package: "local-pkg" }]);
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + REQUEUE_AFTER_MS + 1, upstream: up.layer, queue: null })), Effect.scoped));
+
+      expect(swept).toBe(1);
+      expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'local-pkg'")).length).toBe(1);
     });
   }, 120_000);
 });
@@ -399,34 +429,6 @@ describe("a run that fails with an error ends in a stored outcome", () => {
       expect(swept).toBe(1);
       expect(Failures.parse(await sql("SELECT starts, failures, last_error, started_at, outcome FROM analysis_outcomes WHERE package = 'throws-pkg'"))[0]).toMatchObject({ starts: 2, failures: 2 });
       expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'throws-pkg'")).length).toBe(1);
-    });
-  }, 120_000);
-
-  test("inline: a failed run keeps its start, is queued, and the version stays unscored, never clean", async () => {
-    await withRig(async (db, sql) => {
-      const up = upstreamStub([], ["throws-pkg"]);
-      const q = queueStub();
-      const pkg = up.pkgOf("throws-pkg");
-      const v = pkg?.versions[0];
-
-      if (!pkg || !v) throw new Error("no package");
-
-      const got = await Effect.runPromise(
-        Effect.gen(function* () {
-          const a = yield* Analysis;
-
-          yield* a.allowInline(Effect.succeed(true));
-
-          return yield* a.ensure(pkg, v);
-        }).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped),
-      );
-
-      expect(got.score).toBeNull();
-      expect(q.sent).toEqual([{ name: "throws-pkg", version: "1.0.0" }]);
-      expect(Failures.parse(await sql("SELECT starts, failures, last_error, started_at, outcome FROM analysis_outcomes WHERE package = 'throws-pkg'"))[0]).toMatchObject({ starts: 1, failures: 1, last_error: "RangeError" });
-
-      // the queued run is the second failure
-      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "throws-pkg", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 30_000, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("stored");
     });
   }, 120_000);
 });
