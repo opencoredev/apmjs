@@ -8,7 +8,8 @@ import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
 import { readCapped } from "./http.ts";
-import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptBudget, type KeptPackument, type PackumentRead } from "./packument-read.ts";
+import { streamedJson } from "./http.ts";
+import { DEV_DEPENDENCIES, KeptBudget, MAX_PACKUMENT_WEIGHT, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { createHash } from "node:crypto";
 
@@ -120,12 +121,87 @@ const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const MAX_HOPS = 5;
 
 /** The parsed packument without apm's scores; scores are attached per request from the store. */
-type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[] };
+export type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[] };
 
 type CachedProbe = { kind: "found"; pkg: CachedPackage } | { kind: "absent" };
 
 /** The package as npm lists it, without apm's scores: what a route needs that reads only versions and checksums. */
 export type UpstreamListing = CachedProbe | { kind: "unknown" };
+
+/**
+ * The package apm caches, read from the packument readPackument kept: each version npm lists with a valid document,
+ * in publish order. Null when the packument is not one.
+ */
+export function cachedPackage(name: string, body: KeptPackument): CachedPackage | null {
+  const parsed = UpPackument.safeParse(body);
+
+  if (!parsed.success) return null;
+  const raw = parsed.data;
+  const tarballs = new Map<string, string>();
+  const versions: Omit<VersionRecord, "score" | "seq">[] = [];
+
+  for (const [v, rawDoc] of Object.entries(raw.versions)) {
+    const one = UpVersion.safeParse(rawDoc);
+
+    if (!one.success) continue;
+    const doc = one.data;
+    tarballs.set(v, doc.dist.tarball);
+    const manifest: Record<string, unknown> = { ...doc };
+    delete manifest.dist;
+    const shasum = doc.dist.shasum ?? "";
+    const integrity = doc.dist.integrity ?? "";
+    const digest = digestOf({ integrity, shasum });
+    versions.push({
+      package: name,
+      version: v,
+      manifest,
+      shasum,
+      integrity,
+      size: 0,
+      tarball_key: digest ? upstreamBlobKey(digest) : "",
+      published_at: Date.parse(raw.time[v] ?? "") || 0,
+      published_by: doc._npmUser?.name ?? "upstream",
+      deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
+      status: "active",
+      status_reason: null,
+      status_at: null,
+      status_by: null,
+    });
+  }
+
+  // npm has no insert order: an upstream version's seq is its place in publish order
+  const ordered = versions.toSorted((a, b) => a.published_at - b.published_at).map((v, seq) => ({ ...v, seq }));
+
+  return {
+    name,
+    distTags: raw["dist-tags"],
+    description: raw.description ?? "",
+    readme: raw.readme ?? "",
+    maintainers: (raw.maintainers ?? []).map((m) => m.name),
+    versions: ordered,
+    tarballs,
+  };
+}
+
+/**
+ * A cached package with its analyses: an analysis counts only for the exact bytes it read, by the current scorer; a
+ * version it decided it can never score says why.
+ */
+export function scoredPackage(pkg: CachedPackage, { scores, unscorable }: UpstreamAnalyses): Probe {
+  return {
+    kind: "found",
+    pkg: {
+      ...pkg,
+      versions: pkg.versions.map((v) => {
+        const d = digestOf(v);
+        const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
+        const why = score === null ? unscorable.get(v.version) : undefined;
+
+        return why ? { ...v, score, unscorable: why } : { ...v, score };
+      }),
+    },
+  };
+}
 
 /** How long an upstream answer is trusted before it is fetched again. */
 export const DEFAULT_TTL_MS = 60_000;
@@ -135,10 +211,32 @@ const PROBE_CONCURRENCY = 6;
 const MAX_ENTRIES = 500;
 
 /**
- * The most packument the isolate keeps, counted as the JSON readPackument kept: parsed, it is held at about one and a
- * half times that (next: 15 MB kept, 22 MB held), and an isolate has 128 MB for every request it runs. Oldest go first.
+ * The most package metadata the isolate keeps, as weight (packageWeight): an upper bound on its heap, which an isolate
+ * has 128 MB of for every request it runs. next weighs 26 MiB cached (14 MiB of heap in workerd). Oldest go first.
  */
-export const PROBE_CACHE_BYTES = 16 * 1024 * 1024;
+export const PROBE_CACHE_WEIGHT = 32 * 1024 * 1024;
+
+/**
+ * What a cached package holds for each version beside the packument it was read from (cachedPackage: the version's
+ * record, its tarball's URL and blob key), as weight. Measured in workerd: at most 284 bytes (react).
+ */
+export const RECORD_WEIGHT = 384;
+
+/** What a request's copy of a cached package with its scores holds for each version (scoredPackage; measured: 108 bytes). */
+export const SCORED_WEIGHT = 160;
+
+/**
+ * What reading a packument into a cached package holds for a moment for each version beyond its record: the schema's
+ * copy of `versions` and the records before they are put in publish order (measured, with the shallow copy of each
+ * version document the reader counts in versionDocs: 1,130 bytes a version of next beside its packument).
+ */
+const MOMENT_WEIGHT = RECORD_WEIGHT + 64;
+
+/** What a package read from `read` weighs once cached: the packument and each version's record. */
+export const packageWeight = (read: { readonly weight: number; readonly versionCount: number }): number => read.weight + read.versionCount * RECORD_WEIGHT;
+
+/** What reading `read` into a cached package holds for a moment beside packageWeight: given back once it is read. */
+export const packageMoment = (read: { readonly versionCount: number; readonly versionDocs: number }): number => read.versionDocs + read.versionCount * MOMENT_WEIGHT;
 
 /**
  * Answers from the public registry, kept for a minute per Worker isolate. Only public data lives here, never
@@ -210,7 +308,7 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   const known = isolateCaches.get(key);
 
   if (known) return known;
-  const made: Caches = { probes: new IsolateCache(ttlMs, PROBE_CACHE_BYTES), searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
+  const made: Caches = { probes: new IsolateCache(ttlMs, PROBE_CACHE_WEIGHT), searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
   isolateCaches.set(key, made);
 
   return made;
@@ -240,12 +338,13 @@ export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Reque
   new Request(`https://upstream-cache.apmjs.internal/${profile === DEV_DEPENDENCIES ? "v2-dev" : "v2"}/${encodeURIComponent(url)}`);
 
 /**
- * What asking for a packument came to. "ok": what readPackument kept, `kept` bytes of it. "status": npm answered
- * something other than a 200 with a body. "refused": npm answered, but readPackument refused it (too large, not JSON),
- * so it is an answer apm cannot use. "over-budget": the request's KeptBudget had no room for it.
+ * What asking for a packument came to. "ok": what readPackument kept, and what it weighs (`read`), taken from the
+ * budget it was read under. "status": npm answered something other than a 200 with a body. "refused": npm answered,
+ * but readPackument refused it (too large, not JSON), so it is an answer apm cannot use. "over-budget": the request's
+ * KeptBudget had no room for it.
  */
 type PackumentAnswer =
-  | { kind: "ok"; body: KeptPackument; fetchedAt: number; kept: number }
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }> }
   | { kind: "status"; status: number; fetchedAt: number }
   | { kind: "refused"; fetchedAt: number }
   | { kind: "over-budget" };
@@ -272,9 +371,10 @@ export type UpstreamApi = {
   readonly probeMany: (names: readonly string[], budget?: KeptBudget) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
-   * packument apm serves adds them back. Null when npm could not be asked or the read was refused.
+   * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
+   * `budget` (the request's, beside the packument it holds); what it weighs stays taken from `budget`.
    */
-  readonly devDependencies: (name: string) => Effect.Effect<ReadonlyMap<string, unknown> | null>;
+  readonly devDependencies: (name: string, budget?: KeptBudget) => Effect.Effect<ReadonlyMap<string, unknown> | null>;
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   readonly get: (name: string) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
@@ -407,7 +507,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
         /** A packument read as an answer. One it refused is logged; one past the request's budget is not an error. */
         const answerOf = (url: string, read: PackumentRead, fetchedAt: number): PackumentAnswer => {
-          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, kept: read.keptBytes };
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read };
 
           if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
@@ -457,7 +557,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
               if (shared && background && read.kind === "ok") {
                 const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(now) };
-                background(shared.put(key, new Response(JSON.stringify(read.body), { headers })).catch(() => undefined));
+                // written a version at a time, as it is put, so the copy is never held whole as one string
+                background(shared.put(key, streamedJson(read.body, "versions", headers)).catch(() => undefined));
               }
 
               return answerOf(url, read, now);
@@ -465,96 +566,66 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             catch: (cause) => cause,
           });
 
-        /** A packument answer read into the package apm caches. */
-        const packageOf = (name: string, answer: Exclude<PackumentAnswer, { kind: "over-budget" }>): CachedProbe | { kind: "unknown" } => {
-          if (answer.kind === "status") return answer.status === 404 ? { kind: "absent" } : { kind: "unknown" };
-
-          if (answer.kind === "refused") return { kind: "unknown" };
-          const parsed = UpPackument.safeParse(answer.body);
-
-          if (!parsed.success) return { kind: "unknown" };
-          const raw = parsed.data;
-          const tarballs = new Map<string, string>();
-          const versions: Omit<VersionRecord, "score" | "seq">[] = [];
-
-          for (const [v, rawDoc] of Object.entries(raw.versions)) {
-            const one = UpVersion.safeParse(rawDoc);
-
-            if (!one.success) continue;
-            const doc = one.data;
-            tarballs.set(v, doc.dist.tarball);
-            const manifest: Record<string, unknown> = { ...doc };
-            delete manifest.dist;
-            const shasum = doc.dist.shasum ?? "";
-            const integrity = doc.dist.integrity ?? "";
-            const digest = digestOf({ integrity, shasum });
-            versions.push({
-              package: name,
-              version: v,
-              manifest,
-              shasum,
-              integrity,
-              size: 0,
-              tarball_key: digest ? upstreamBlobKey(digest) : "",
-              published_at: Date.parse(raw.time[v] ?? "") || 0,
-              published_by: doc._npmUser?.name ?? "upstream",
-              deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
-              status: "active",
-              status_reason: null,
-              status_at: null,
-              status_by: null,
-            });
-          }
-
-          // npm has no insert order: an upstream version's seq is its place in publish order
-          const ordered = versions.toSorted((a, b) => a.published_at - b.published_at).map((v, seq) => ({ ...v, seq }));
-
-          return {
-            kind: "found",
-            pkg: {
-              name,
-              distTags: raw["dist-tags"],
-              description: raw.description ?? "",
-              readme: raw.readme ?? "",
-              maintainers: (raw.maintainers ?? []).map((m) => m.name),
-              versions: ordered,
-              tarballs,
-            },
-          };
-        };
+        /** An answer that is not a packument: absent when npm said 404, unknown otherwise. */
+        const packageOf = (answer: Extract<PackumentAnswer, { kind: "status" | "refused" }>): CachedProbe | { kind: "unknown" } =>
+          answer.kind === "status" && answer.status === 404 ? { kind: "absent" } : { kind: "unknown" };
 
         /**
          * The packument as npm lists it, from the isolate cache or npm, without its analyses. With a budget, what this
-         * request now holds is taken from it: a cached packument's weight, or what a fresh read kept.
+         * request now holds is taken from it: a package's weight (packageWeight) and its scored copy (SCORED_WEIGHT),
+         * for a cached one and a fresh one alike. Without one, a fresh read is held to MAX_PACKUMENT_WEIGHT on its own.
          */
         const listed = (name: string, budget: KeptBudget | null): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
           Effect.gen(function* () {
             const t = yield* now;
             const cached = caches.probes.entry(name, t);
 
-            if (cached !== undefined) return budget && !budget.take(cached.weight) ? { kind: "over-budget" as const } : cached.value;
+            if (cached !== undefined) {
+              const held = cached.weight + (cached.value.kind === "found" ? cached.value.pkg.versions.length * SCORED_WEIGHT : 0);
+
+              return budget && !budget.take(held) ? { kind: "over-budget" as const } : cached.value;
+            }
 
             // nothing more fits: npm is not asked at all
             if (budget?.exhausted) return { kind: "over-budget" as const };
+            const within = budget ?? new KeptBudget(MAX_PACKUMENT_WEIGHT);
 
-            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: TRIMMED, budget }).pipe(
+            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: TRIMMED, budget: within }).pipe(
               Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })),
             );
 
-            if (answer.kind === "over-budget") return answer;
-            const fresh = packageOf(name, answer);
-            const kept = answer.kind === "ok" ? answer.kept : 0;
+            if (answer.kind === "over-budget") return budget ? answer : { kind: "unknown" as const };
+            let fresh: CachedProbe | { kind: "unknown" };
+            let weight = 0;
 
-            if (fresh.kind === "unknown") {
+            if (answer.kind === "ok") {
+              const { read } = answer;
+              const held = packageWeight(read) - read.weight + read.versionCount * SCORED_WEIGHT;
+              const moment = packageMoment(read);
+
+              if (!within.take(held + moment)) {
+                within.give(read.weight);
+
+                if (budget) return { kind: "over-budget" as const };
+                console.error(JSON.stringify({ level: "error", event: "upstream-packument", error: "packument-too-large", url: `${baseUrl}${encodeName(name)}`, over: "weight", bytes: within.taken + held + moment, limit: within.limit }));
+
+                return { kind: "unknown" as const };
+              }
+
+              const pkg = cachedPackage(name, answer.body);
+              within.give(moment);
+              fresh = pkg ? { kind: "found", pkg } : { kind: "unknown" };
+              weight = packageWeight(read);
+
               // nothing of it is held
-              budget?.give(kept);
+              if (!pkg) within.give(read.weight + held);
+            } else fresh = packageOf(answer);
 
-              return fresh;
-            }
+            if (fresh.kind === "unknown") return fresh;
 
             // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
-            // takes room from older ones (PROBE_CACHE_BYTES)
-            caches.probes.set(name, fresh, answer.fetchedAt, kept);
+            // takes room from older ones (PROBE_CACHE_WEIGHT)
+            caches.probes.set(name, fresh, answer.fetchedAt, weight);
 
             if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
 
@@ -566,29 +637,13 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           // with no budget there is nothing to be over
           Effect.map(listed(name, null), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        // an analysis counts only for the exact bytes it read, by the current scorer; a version it decided it can never
-        // score says why
-        const scored = (pkg: CachedPackage, { scores, unscorable }: UpstreamAnalyses): Probe => ({
-          kind: "found",
-          pkg: {
-            ...pkg,
-            versions: pkg.versions.map((v) => {
-              const d = digestOf(v);
-              const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
-              const why = score === null ? unscorable.get(v.version) : undefined;
-
-              return why ? { ...v, score, unscorable: why } : { ...v, score };
-            }),
-          },
-        });
-
         const probe = (name: string): Effect.Effect<Probe, StoreError> =>
           Effect.gen(function* () {
             const listed = yield* listing(name);
 
             if (listed.kind !== "found") return listed;
 
-            return scored(listed.pkg, yield* store.upstreamAnalyses(name));
+            return scoredPackage(listed.pkg, yield* store.upstreamAnalyses(name));
           });
 
         const probeWithin = (name: string, budget: KeptBudget): Effect.Effect<BudgetedProbe, StoreError> =>
@@ -597,7 +652,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (l.kind !== "found") return l;
 
-            return scored(l.pkg, yield* store.upstreamAnalyses(name));
+            return scoredPackage(l.pkg, yield* store.upstreamAnalyses(name));
           });
 
         const probeMany = (names: readonly string[], budget?: KeptBudget): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
@@ -609,19 +664,25 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const scores = yield* store.upstreamAnalysesOf(found);
             const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
 
-            return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scored(l.pkg, scores.get(name) ?? none) : l]));
+            return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scoredPackage(l.pkg, scores.get(name) ?? none) : l]));
           });
 
         /** Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate. */
-        const devDependencies = (name: string): Effect.Effect<ReadonlyMap<string, unknown> | null> =>
+        const devDependencies = (name: string, budget?: KeptBudget): Effect.Effect<ReadonlyMap<string, unknown> | null> =>
           Effect.gen(function* () {
             const t = yield* now;
-            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: DEV_DEPENDENCIES, budget: null }).pipe(Effect.orElseSucceed(() => null));
+            const within = budget ?? new KeptBudget(MAX_PACKUMENT_WEIGHT);
+            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: DEV_DEPENDENCIES, budget: within }).pipe(Effect.orElseSucceed(() => null));
 
             if (answer?.kind !== "ok") return null;
             const parsed = DevDependencies.safeParse(answer.body);
 
-            if (!parsed.success) return null;
+            if (!parsed.success) {
+              within.give(answer.read.weight);
+
+              return null;
+            }
+
             const out = new Map<string, unknown>();
 
             for (const [version, doc] of Object.entries(parsed.data.versions)) {

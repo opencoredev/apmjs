@@ -3,19 +3,25 @@
 // as JSON.parse does, and refuses a packument past any of its bounds (read, kept bytes, kept nodes, depth, a shared
 // budget) instead of holding it.
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   DEV_DEPENDENCIES,
   DROPPED_VERSION_FIELDS,
   KeptBudget,
+  MAX_KEPT_PACKUMENT_NODES,
   MAX_PACKUMENT_DEPTH,
+  MAX_PACKUMENT_WEIGHT,
   readPackument,
+  SLAB_BYTES,
   type JsonValue,
   type KeptPackument,
   type PackumentLimits,
 } from "../src/packument-read.ts";
 
-const LIMITS: PackumentLimits = { maxBytes: 10_000_000, maxKeptBytes: 1_000_000, maxKeptNodes: 100_000, maxDepth: 1_000 };
+const LIMITS: PackumentLimits = { maxBytes: 10_000_000, maxKeptBytes: 1_000_000, maxKeptNodes: 100_000, maxWeight: 100_000_000, maxDepth: 1_000 };
 
 function streamOf(text: string | Uint8Array, chunk: number): ReadableStream<Uint8Array> {
   const bytes = text instanceof Uint8Array ? text : new TextEncoder().encode(text);
@@ -59,6 +65,27 @@ function expected(packument: JsonValue): KeptPackument {
   }
 
   return out;
+}
+
+/**
+ * What the DEV_DEPENDENCIES profile should keep: JSON.parse's `versions` as it is when it is not an object, else each
+ * version that is an object with only its devDependencies, and no version that is not one.
+ */
+function expectedDev(packument: JsonValue): KeptPackument {
+  if (!isJsonObject(packument)) throw new Error("not an object");
+  const versions = packument.versions;
+
+  if (versions === undefined) return {};
+
+  if (!isJsonObject(versions)) return { versions };
+
+  return {
+    versions: Object.fromEntries(
+      Object.entries(versions)
+        .filter(([, d]) => isJsonObject(d))
+        .map(([v, d]) => [v, isJsonObject(d) ? Object.fromEntries(Object.entries(d).filter(([f]) => f === "devDependencies")) : d]),
+    ),
+  };
 }
 
 /** What res.text() and JSON.parse made of these bytes before the reader: the value, or not ok when JSON.parse throws. */
@@ -190,18 +217,68 @@ describe("readPackument", () => {
     expect((await readPackument(streamOf(dropped, 512), { limits: { ...LIMITS, maxKeptNodes: 1_000 } })).kind).toBe("ok");
   });
 
+  // Review of f0e533a, finding 3: a version a profile does not keep (not an object, under DEV_DEPENDENCIES) left an
+  // earlier one of the same key in place, where JSON.parse gives the later
+  test("a later version of the same key replaces an earlier one, whatever its type, under both profiles", async () => {
+    for (const text of [
+      '{"versions":{"1.0.0":{"devDependencies":{"old":"1"}},"1.0.0":null}}',
+      '{"versions":{"1.0.0":{"devDependencies":{"old":"1"}},"2.0.0":{},"1.0.0":"x","1.0.0":[1]}}',
+      '{"versions":{"1.0.0":{"devDependencies":{"old":"1"}},"1.0.0":null,"1.0.0":{"devDependencies":{"new":"2"}}}}',
+    ]) {
+      const want = JSON.parse(text);
+
+      expect(await readPackument(streamOf(text, 3), { limits: LIMITS, profile: DEV_DEPENDENCIES })).toMatchObject({ kind: "ok", body: expectedDev(want) });
+      expect(await readPackument(streamOf(text, 3), { limits: LIMITS })).toMatchObject({ kind: "ok", body: expected(want) });
+    }
+
+    const dev = await readPackument(streamOf('{"versions":{"1.0.0":{"devDependencies":{"old":"1"}},"1.0.0":null}}', 5), { limits: LIMITS, profile: DEV_DEPENDENCIES });
+
+    expect(dev.kind === "ok" ? dev.body : null).toEqual({ versions: {} });
+  });
+
+  // Review of f0e533a, finding 2: each fragment of a kept part was kept as its own Uint8Array, so a string sent a
+  // byte at a time cost a typed array a byte (the heap is measured in packument-heap.workerd.test.ts)
+  test("kept parts longer than a slab, sent a byte at a time and in odd pieces, are read whole", async () => {
+    const long = "é€😀x".repeat(Math.ceil((2.5 * SLAB_BYTES) / 10));
+    const versions = { "1.0.0": { name: "p", version: "1.0.0", dist: { tarball: "t" }, list: Array.from({ length: 30_000 }, (_, i) => ({ [`k${i % 7}`]: i })) } };
+    const text = JSON.stringify({ name: "p", description: long, versions });
+
+    for (const chunk of [1, 7, SLAB_BYTES - 1, SLAB_BYTES + 1]) {
+      expect(await readPackument(streamOf(text, chunk), { limits: { ...LIMITS, maxBytes: 2e7, maxKeptBytes: 1e7 } })).toMatchObject({ kind: "ok", body: expected(JSON.parse(text)) });
+    }
+  });
+
+  // Review of f0e533a, finding 1: kept bytes alone were charged, so a packument cheap as text and dear as objects
+  // (1.49 million empty arrays: 4.5 MB of text, 30 MB of heap) was read and held
+  test("a packument whose parsed weight passes MAX_PACKUMENT_WEIGHT is refused, under the node cap", async () => {
+    const count = 1_490_000;
+    const text = `{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"t"},"x":[${"[],".repeat(count - 1)}[]]}}}`;
+    const r = await readPackument(streamOf(text, 65_536));
+
+    expect(count).toBeLessThan(MAX_KEPT_PACKUMENT_NODES);
+    expect(r).toMatchObject({ kind: "too-large", over: "weight", limit: MAX_PACKUMENT_WEIGHT });
+  });
+
   test("reads in flight together share a budget, and a refused one gives back what it took", async () => {
     const one = (n: number): string => JSON.stringify({ name: `p${n}`, description: "D".repeat(30_000), versions: {} });
-    const budget = new KeptBudget(70_000);
+    // alone, one read holds its 30 KB description as text and as the string it is parsed into, and twice more while it
+    // is parsed: 120 KB at that moment, and what it holds after, 30 KB, is all it keeps taken
+    const alone = new KeptBudget(125_000);
+
+    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, budget: alone })).kind).toBe("ok");
+    expect(alone.taken).toBeLessThan(31_000);
+    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, budget: new KeptBudget(115_000) })).kind).toBe("too-large");
+    // three in step hold one another's text: the first to parse finds no room, the two after it do
+    const budget = new KeptBudget(160_000);
     const reads = await Promise.all([1, 2, 3].map((n) => readPackument(streamOf(one(n), 1_024), { limits: LIMITS, budget })));
 
-    // each fits its own cap; two fit the budget, the third would pass it
     expect(reads.map((r) => r.kind).toSorted()).toEqual(["ok", "ok", "too-large"]);
-    expect(reads.find((r) => r.kind === "too-large")).toMatchObject({ over: "budget", limit: 70_000 });
-    // the two that were kept stay taken; the refused one's partial take was given back
-    const kept = reads.reduce((n, r) => n + (r.kind === "ok" ? r.keptBytes : 0), 0);
+    expect(reads.find((r) => r.kind === "too-large")).toMatchObject({ over: "budget", limit: 160_000 });
+    // the two that were kept stay taken, at what they weigh now; the refused one's partial take was given back
+    const kept = reads.reduce((n, r) => n + (r.kind === "ok" ? r.weight : 0), 0);
 
     expect(budget.taken).toBe(kept);
+    expect(kept).toBeLessThan(2 * 31_000);
   });
 
   for (const [what, text] of [
@@ -403,4 +480,45 @@ describe("readPackument against JSON.parse, on a fuzz corpus", () => {
     expect(valid).toBeGreaterThan(2_000);
     expect(invalid).toBeGreaterThan(1_500);
   });
+
+  test("3,000 documents under DEV_DEPENDENCIES: the same verdict, and when valid each version's devDependencies", async () => {
+    const next = rng(0xdec0_2026);
+    let valid = 0;
+
+    for (let i = 0; i < 3_000; i++) {
+      const base = packumentLike(next);
+      const text = i % 3 === 0 ? base : mutate(next, base);
+      const bytes = new TextEncoder().encode(text);
+      const want = oracle(bytes);
+      const got = await readPackument(streamOf(bytes, 1 + Math.floor(next() * 40)), { limits: LIMITS, profile: DEV_DEPENDENCIES });
+
+      if (want.ok && isJsonObject(want.value)) {
+        valid++;
+        expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "ok" });
+
+        if (got.kind === "ok") expect({ i, body: got.body }).toEqual({ i, body: expectedDev(want.value) });
+      } else expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "invalid" });
+    }
+
+    expect(valid).toBeGreaterThan(1_000);
+  });
+});
+
+// The real packuments the reader is checked against, saved from registry.npmjs.org (not in the repository: 118 MB).
+const REAL = process.env.APM_PACKUMENTS ?? join(homedir(), ".cache", "apm-packuments");
+
+describe.skipIf(!existsSync(REAL))("readPackument against JSON.parse, on real packuments", () => {
+  for (const name of ["_types_node", "aws-sdk", "esbuild", "lodash", "next", "react", "typescript", "vite"]) {
+    test(`${name}: what JSON.parse gives, under both profiles, within the default limits`, async () => {
+      const file = Bun.file(join(REAL, `${name}.json`));
+      const want = oracle(new Uint8Array(await file.arrayBuffer()));
+
+      if (!want.ok) throw new Error(`${name} is not JSON`);
+      const trimmed = await readPackument(file.stream());
+      const dev = await readPackument(file.stream(), { profile: DEV_DEPENDENCIES });
+
+      expect(trimmed).toMatchObject({ kind: "ok", body: expected(want.value) });
+      expect(dev).toMatchObject({ kind: "ok", body: expectedDev(want.value) });
+    }, 120_000);
+  }
 });

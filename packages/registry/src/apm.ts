@@ -46,7 +46,7 @@ import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
-import { fail, json, parseBody, streamedJson } from "./http.ts";
+import { fail, json, LazyMembers, parseBody, streamedJson } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
@@ -202,16 +202,17 @@ const lookup = (name: string) =>
   });
 
 /**
- * The package metadata one resolve walk, or one scan, holds at most, counted as the JSON readPackument kept (parsed,
- * about one and a half times this). A walk holds every catalog it read until it answers, and the isolate cache's
- * eviction frees none a request still holds, so without this a tree of big packuments (next 15 MB, typescript 11,
- * @types/node 11, react 7) could take a Worker's 128 MB with the requests beside it. A dependency past it is reported
- * unchecked, with a warning, never passed.
+ * The package metadata one request holds at most (a resolve walk, a scan, or the packument route's two reads), as
+ * weight: an upper bound on its heap (packument-read.ts, WEIGHTS), every read in flight and each parse's moment
+ * included. A walk holds every catalog it read until it answers, and the isolate cache's eviction frees none a request
+ * still holds, so without this a tree of big packuments could take a Worker's 128 MB with the requests beside it.
+ * Cached with its records and scored, in MiB: next 26.6, @types/node 20.8, typescript 20.6, react 13.6, so next, react
+ * and typescript fit together. A dependency past it is reported unchecked, with a warning, never passed.
  */
-export const REQUEST_KEPT_BYTES = 40 * 1024 * 1024;
+export const REQUEST_METADATA_WEIGHT = 64 * 1024 * 1024;
 
-/** Why a dependency past REQUEST_KEPT_BYTES was not checked. */
-export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_KEPT_BYTES / (1024 * 1024)} MB of package metadata in one request, and this package's did not fit`;
+/** Why a dependency past REQUEST_METADATA_WEIGHT was not checked. */
+export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_METADATA_WEIGHT / (1024 * 1024)} MB of package metadata in one request, and this package's did not fit`;
 
 /** Like lookupOrUnknown, under a request's budget for the package metadata it holds (scan: one lease per package). */
 const lookupWithin = (name: string, budget: KeptBudget) =>
@@ -300,7 +301,7 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
 
 /**
  * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
- * `over-budget`: the request held as much package metadata as it may (REQUEST_KEPT_BYTES), so it was not read.
+ * `over-budget`: the request held as much package metadata as it may (REQUEST_METADATA_WEIGHT), so it was not read.
  */
 type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string } | { kind: "over-budget"; reason: string };
 
@@ -309,7 +310,7 @@ const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, 
 
 /**
  * A package's catalog as a lookup finds it: here or upstream, nowhere (null), upstream could not be asked, or the
- * request had no room left to hold it (REQUEST_KEPT_BYTES).
+ * request had no room left to hold it (REQUEST_METADATA_WEIGHT).
  */
 type Lookup = Source | null | "unknown" | "over-budget";
 
@@ -1585,9 +1586,9 @@ export const MAX_WALK_LOOKUPS = 400;
  */
 export const MAX_WALK_LEVELS = 32;
 
-export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number; maxKeptBytes: number };
+export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number; maxWeight: number };
 
-const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxKeptBytes: REQUEST_KEPT_BYTES };
+const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxWeight: REQUEST_METADATA_WEIGHT };
 
 /**
  * Walks the dependency tree the package manager would install (newest active version matching each
@@ -1618,8 +1619,8 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
     };
 
     const seen = new Set<string>();
-    // every catalog the walk reads, it holds until it answers: together they stay under maxKeptBytes
-    const catalogs = catalogMemo(new KeptBudget(limits.maxKeptBytes));
+    // every catalog the walk reads, it holds until it answers: together they stay under maxWeight
+    const catalogs = catalogMemo(new KeptBudget(limits.maxWeight));
     let overBudget = false;
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
@@ -2194,7 +2195,7 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
     // the packuments of the packages being checked at once share one budget; each gives its share back when it is done
-    const budget = new KeptBudget(REQUEST_KEPT_BYTES);
+    const budget = new KeptBudget(REQUEST_METADATA_WEIGHT);
 
     const results = yield* Effect.forEach(
       packages.slice(0, cap),
@@ -2344,6 +2345,11 @@ const ABBREV = [
  * licenseText, readme and readmeFilename (readPackument, DROPPED_VERSION_FIELDS); the full packument adds back each
  * version's devDependencies from a read of their own (`devDependencies`; null when that read failed, and then they are
  * left out too). The abbreviated one has none of them.
+ *
+ * `versions` and `time` are LazyMembers: each version's document is made as streamedJson writes it, so the answer
+ * never holds a copy of every one at once. What can fail is done before the first byte: each manifest is made
+ * servable (servableManifest, which walks it without recursion) here, so what is made later is copies of values within
+ * MANIFEST_LIMITS, which JSON.stringify writes without fail.
  */
 function upstreamPackument(input: {
   base: string;
@@ -2358,44 +2364,52 @@ function upstreamPackument(input: {
   // a version an apm reviewer confirmed malicious is not offered, in any view (confirmed.ts)
   const offered = src.versions.filter((v) => !confirmed.has(v.version));
   const kept = view ? offered.filter(view.keep) : offered;
-  const versions: Record<string, unknown> = {};
-  const time: Record<string, string> = {};
 
-  for (const v of kept) {
-    // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
-    // a manifest past the limits apm reads is served without the fields past them: serializing it whole recurses
-    // deep enough to overflow the stack and fail the request for every version of the package
+  // a manifest past the limits apm reads is served without the fields past them: serializing it whole recurses deep
+  // enough to overflow the stack and fail the request for every version of the package. devDependencies read apart
+  // pass the same limits as the rest of the manifest.
+  const manifests = kept.map((v) => {
     const dev = abbreviated ? undefined : devDependencies?.get(v.version);
-    // devDependencies read apart pass the same limits as the rest of the manifest
-    const manifest = dev === undefined ? v.manifest : { ...v.manifest, devDependencies: dev };
-    const doc: Record<string, unknown> = { ...servableManifest(manifest), dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
-    const r = reportFor(v, at);
 
-    if (r) doc._apmScore = compact(r);
+    return servableManifest(dev === undefined ? v.manifest : { ...v.manifest, devDependencies: dev });
+  });
 
-    if (abbreviated) {
+  function* versionDocs(): Generator<readonly [string, Record<string, unknown>]> {
+    for (const [i, v] of kept.entries()) {
+      // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
+      const doc: Record<string, unknown> = { ...manifests[i], dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
+      const r = reportFor(v, at);
+
+      if (r) doc._apmScore = compact(r);
+
+      if (!abbreviated) {
+        yield [v.version, doc];
+        continue;
+      }
+
       const slim: Record<string, unknown> = {};
 
       for (const k of ABBREV) if (k in doc) slim[k] = doc[k];
       slim.dist = doc.dist;
-      versions[v.version] = slim;
-    } else {
-      versions[v.version] = doc;
+      yield [v.version, slim];
     }
-
-    if (v.published_at) time[v.version] = new Date(v.published_at).toISOString();
   }
 
+  function* times(): Generator<readonly [string, string]> {
+    for (const v of kept) if (v.published_at) yield [v.version, new Date(v.published_at).toISOString()];
+  }
+
+  const versions = new LazyMembers(versionDocs);
   let distTags = { ...src.distTags };
 
   if (view || confirmed.size > 0) {
-    const keptIds = kept.map((v) => v.version);
+    const keptIds = new Set(kept.map((v) => v.version));
     const tags: Record<string, string> = {};
 
-    for (const [t, v] of Object.entries(distTags)) if (keptIds.includes(v)) tags[t] = v;
+    for (const [t, v] of Object.entries(distTags)) if (keptIds.has(v)) tags[t] = v;
 
     if (!tags.latest) {
-      const h = highest(keptIds);
+      const h = highest([...keptIds]);
 
       if (h) tags.latest = h;
     }
@@ -2411,7 +2425,7 @@ function upstreamPackument(input: {
     description: src.pkg.description,
     "dist-tags": distTags,
     versions,
-    time,
+    time: new LazyMembers(times),
     // npm's readme has no known owner here, so it is hidden while any version is withheld (withheld.ts)
     readme: readmeShown({ readme: src.pkg.readme, readme_version: null }, src.versions).text,
     maintainers: src.pkg.maintainers.map((name) => ({ name })),
@@ -2433,11 +2447,13 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const sp = splitPath(p);
 
     if (!sp || (yield* (yield* Store).getPackage(sp.name))) return null;
-    const src = yield* lookupOrUnknown(sp.name);
+    // the packument and the devDependencies the full one adds back are held together until the answer is sent
+    const budget = new KeptBudget(REQUEST_METADATA_WEIGHT);
+    const src = yield* lookupWithin(sp.name, budget);
 
-    // npm could not be asked, or answered with a packument apm refused to read: a registry error the client retries,
-    // never "Not found", which npm reports as a package that does not exist
-    if (src === "unknown") return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
+    // client retries, never "Not found", which npm reports as a package that does not exist
+    if (src === "unknown" || src === "over-budget") return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
 
     if (!src || src.kind !== "upstream") return null;
     const at = yield* now;
@@ -2500,7 +2516,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
 
     // the full packument (npm view, yarn 1) adds back each version's devDependencies, read apart so the registry's own
     // reads stay small; a HEAD sends no body, so it reads none
-    const devDependencies = abbreviated || req.method === "HEAD" ? null : yield* upstream.devDependencies(src.name);
+    const devDependencies = abbreviated || req.method === "HEAD" ? null : yield* upstream.devDependencies(src.name, budget);
     const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions), devDependencies });
 
     return streamedJson(body, "versions", { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });

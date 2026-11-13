@@ -7,18 +7,22 @@
 // as the UTF-8 decode does). It keeps only the parts a profile names (KeepProfile): TRIMMED, what the registry reads,
 // is the top-level fields in TOP_FIELDS and each version's document without the fields in DROPPED_VERSION_FIELDS.
 // Each kept part is parsed on its own with JSON.parse, and duplicate keys resolve as JSON.parse resolves them: the last
-// one wins, a second `versions` object included.
+// one wins, a second `versions` object included, and a version a profile does not keep removes an earlier one.
 //
 // What it holds is bounded, and each bound is checked before the memory it guards is taken:
 // - maxBytes: bytes read. Reading costs CPU, not memory.
 // - maxKeptBytes: the text of the kept parts, the copies it holds until it parses them.
-// - maxKeptNodes: values and keys inside the kept parts, and the entries it builds around them: the parsed objects
-//   cost memory per node, not per byte (`[[[[]]]]` is 8 bytes of text and 4 arrays).
-// - maxDepth: open containers anywhere, discarded ones included. Each costs one byte of a stack that grows to at most
+// - maxKeptNodes: values and keys inside the kept parts, and the entries it builds around them.
+// - maxWeight: what the kept parts cost once parsed, as an upper bound on V8's heap (WEIGHTS), the moment of each parse
+//   included. Parsed, a value costs memory per node, not per byte: `[[],[],...]` is 3 bytes of text and 20 bytes of
+//   heap an array, and objects whose keys come in ever new orders cost V8 a new hidden class each.
+// - maxDepth: open containers anywhere, discarded ones included. Each costs nine bytes of stacks that grow to at most
 //   this; nothing else is allocated for a container it discards.
-// - budget (optional): kept bytes shared with every other read of one request (KeptBudget), so a walk that reads
-//   several packuments at once holds no more than it allows in all.
-// A packument past any of them is refused as too-large, never held.
+// - budget (optional): weight shared with every other read of one request (KeptBudget), so a walk that reads several
+//   packuments at once holds no more than it allows in all.
+// A packument past any of them is refused as too-large, never held. The text it keeps is copied into fixed-size slabs
+// (SLAB_BYTES), so what it allocates for a kept part depends on the part's length, never on how many pieces the
+// stream delivered it in.
 import { z } from "zod";
 
 /** Top-level packument fields the registry reads (upstream.ts, UpPackument); everything else is skipped. */
@@ -61,31 +65,75 @@ export const MAX_PACKUMENT_BYTES = 160 * 1024 * 1024;
 export const MAX_KEPT_PACKUMENT_BYTES = 24 * 1024 * 1024;
 
 /**
- * The most values and keys kept from one packument. next keeps 15 MB in 0.8 million nodes, typescript 11 MB in 0.55
- * million, and next's devDependencies alone (DEV_DEPENDENCIES) 17.5 MB in 1.2 million: real packuments reach the kept
- * bytes cap first. Parsed, a node costs V8 16 to 40 bytes beside its text, so a packument built to be cheap as text
- * and dear as objects (`[[],[],...]`) is refused here, at most about 50 MB of objects, before it is parsed.
+ * The most values and keys kept from one packument. Of the real packuments the reader is checked against, next keeps
+ * the most: 0.80 million under TRIMMED, and 1.18 million for its devDependencies alone (DEV_DEPENDENCIES). This bounds
+ * the reader's work; the memory a node costs is charged as weight (MAX_PACKUMENT_WEIGHT).
  */
 export const MAX_KEPT_PACKUMENT_NODES = 1_500_000;
 
 /**
- * The deepest nesting read, discarded regions included. Each open container costs one byte, so this is 100 KB at
- * most. A real version document nests a few levels; one built to nest 50,000 levels deep is still read, and served
- * without the field past the limits apm reads (deep-packument.test.ts).
+ * The most one packument may weigh (WEIGHTS): an upper bound on the heap it is held in once parsed, each parse's
+ * moment included. In MiB, with the heap workerd holds it in: next 24.5 under TRIMMED (13.4), @types/node 19.6 (12.9),
+ * typescript 18.6 (11.4), and next's devDependencies 32.0 (16.9), the most of any real one.
+ */
+export const MAX_PACKUMENT_WEIGHT = 48 * 1024 * 1024;
+
+/**
+ * The deepest nesting read, discarded regions included. Each open container costs nine bytes of the scanner's stacks
+ * (its kind, and the hidden class and member count of an object JSON.parse will build), so this is 900 KB at most. A
+ * real version document nests a few levels; one built to nest 50,000 levels deep is still read, and served without
+ * the field past the limits apm reads (deep-packument.test.ts).
  */
 export const MAX_PACKUMENT_DEPTH = 100_000;
 
-export type PackumentLimits = { readonly maxBytes: number; readonly maxKeptBytes: number; readonly maxKeptNodes: number; readonly maxDepth: number };
+export type PackumentLimits = { readonly maxBytes: number; readonly maxKeptBytes: number; readonly maxKeptNodes: number; readonly maxWeight: number; readonly maxDepth: number };
 
 export const PACKUMENT_LIMITS: PackumentLimits = {
   maxBytes: MAX_PACKUMENT_BYTES,
   maxKeptBytes: MAX_KEPT_PACKUMENT_BYTES,
   maxKeptNodes: MAX_KEPT_PACKUMENT_NODES,
+  maxWeight: MAX_PACKUMENT_WEIGHT,
   maxDepth: MAX_PACKUMENT_DEPTH,
 };
 
 /**
- * Kept bytes several reads share: one request's walk, say, that reads packuments a few at once and holds every one
+ * What a kept part is charged, in bytes, as an upper bound on what V8 holds it in. Measured in workerd
+ * (packument-heap.workerd.test.ts), after a full GC, against the shapes that cost it most for their text:
+ * - text: each byte of a kept part while it is held as text, until it is parsed. Once parsed, each byte of a string's
+ *   content, twice for a string with a character past U+00FF (V8 holds it two bytes a character). Quotes, commas and
+ *   the keys of an object whose hidden class was seen cost nothing parsed.
+ * - parse: each byte of a kept part twice more while it is parsed. Held text, the parsed value (charged as it was read)
+ *   and this cover what a parse holds at once: the slabs and their joined copy, the joined copy and its decoded
+ *   string (two bytes a character at most), or that string and the value parsed from it.
+ * - value: a string, number, true, false or null inside a kept part (a short string: 24 bytes of heap; a number V8
+ *   boxes, 16).
+ * - container: an array or object inside a kept part, or one the reader builds (an empty array: 20 bytes; an empty
+ *   object, 32).
+ * - key: a member of a kept object, or of one the reader builds: a slot. dictKey: a member of an object with dictAt
+ *   members or more, which V8 keeps as a dictionary (an entry of three slots, at half load at most: 52 bytes of heap a
+ *   member whose value is `{}`, against 32 below dictAt).
+ * - hiddenClass: the first object, in this read, whose keys up to some member come in that order. V8 gives each such order
+ *   a hidden class of its own: `[{"k0":0},{"k1":0},...]` is 112 bytes of heap an object, and a version whose only
+ *   field has a name of its own 125. The key's text is charged with it. Orders are told apart by a hash of their key
+ *   bytes, seeded per read, and the set of hashes is charged here too.
+ * Real packuments weigh 1.5 to 1.9 times their heap under TRIMMED (MAX_PACKUMENT_WEIGHT).
+ */
+export const WEIGHTS = { text: 1, parse: 2, value: 20, container: 40, key: 8, dictKey: 28, dictAt: 128, hiddenClass: 128 } as const;
+
+/** What the `count`th member of an object adds to its weight: past dictAt, the members before it become entries too. */
+function memberWeight(count: number): number {
+  if (count < WEIGHTS.dictAt) return WEIGHTS.key;
+
+  if (count > WEIGHTS.dictAt) return WEIGHTS.dictKey;
+
+  return WEIGHTS.dictKey + (WEIGHTS.dictAt - 1) * (WEIGHTS.dictKey - WEIGHTS.key);
+}
+
+/** The size of the slabs kept text is copied into. */
+export const SLAB_BYTES = 64 * 1024;
+
+/**
+ * Weight (WEIGHTS) several reads share: one request's walk, say, that reads packuments a few at once and holds every one
  * until it answers. Each read takes from it as it keeps, gives back what it took if it is refused, and leaves what it
  * took taken when it succeeds (the caller holds that packument now). Single-threaded, so reads in flight together
  * see each other's takes. A lease (`lease()`) takes through its parent and gives all it took back at once, for a
@@ -101,7 +149,7 @@ export class KeptBudget {
     this.parent = parent;
   }
 
-  /** Takes `n` bytes, or nothing and false when that would pass this budget's limit or its parent's. */
+  /** Takes `n`, or nothing and false when that would pass this budget's limit or its parent's. */
   take(n: number): boolean {
     if (this.used + n > this.limit) return false;
 
@@ -135,14 +183,17 @@ export class KeptBudget {
 }
 
 /** Which bound a refused packument passed. */
-export type TooLargeOver = "read" | "kept" | "nodes" | "depth" | "budget";
+export type TooLargeOver = "read" | "kept" | "nodes" | "weight" | "depth" | "budget";
 
 /**
- * What reading a packument came to. "ok": the kept fields, as one object. "too-large": it passed a bound (`over`) at
- * `bytes` (or nodes, or levels) of `limit`. "invalid": not JSON, or JSON that is not an object.
+ * What reading a packument came to. "ok": the kept fields, as one object, and what it weighs (WEIGHTS; what it holds
+ * now, the parses' moments left out). `versionCount`: the entries of its `versions`; `versionDocs`: the part of the
+ * weight that is the version documents' own objects and members, what a shallow copy of each would weigh.
+ * "too-large": it passed a bound (`over`) at `bytes` (or nodes, or levels, or weight) of `limit`. "invalid": not JSON,
+ * or JSON that is not an object.
  */
 export type PackumentRead =
-  | { kind: "ok"; body: KeptPackument; bytes: number; keptBytes: number; keptNodes: number }
+  | { kind: "ok"; body: KeptPackument; bytes: number; keptBytes: number; keptNodes: number; weight: number; versionCount: number; versionDocs: number }
   | { kind: "too-large"; over: TooLargeOver; bytes: number; limit: number }
   | { kind: "invalid"; reason: string };
 
@@ -209,8 +260,8 @@ const isDigit = (b: number): boolean => b >= ZERO && b <= NINE;
 
 const isSpace = (b: number): boolean => b === 0x20 || b === 0x0a || b === 0x0d || b === 0x09;
 
-/** A value being kept: its bytes so far, where it goes once it ends, and the depth it started at. */
-type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "key"; readonly name: string; readonly parts: Uint8Array[]; from: number };
+/** A value being kept: where it goes once it ends, and the depth it started at. Its bytes so far are in the slabs. */
+type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "key"; readonly name: string; from: number };
 
 class InvalidPackument extends Error {}
 
@@ -229,17 +280,69 @@ class TooLarge extends Error {
 
 const decoder = new TextDecoder();
 
-function joined(parts: readonly Uint8Array[]): string {
-  if (parts.length === 1 && parts[0]) return decoder.decode(parts[0]);
-  const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let at = 0;
+/**
+ * The text of the part being kept, copied into slabs of SLAB_BYTES as it arrives: a part delivered a byte at a time
+ * takes as many slabs as one delivered whole. take() lets the slabs go once the part is decoded, and keeps one for the
+ * next part, so a read of many small parts allocates one slab.
+ */
+class Slabs {
+  private full: Uint8Array[] = [];
+  private current: Uint8Array | null = null;
+  private used = 0;
+  private spare: Uint8Array | null = null;
+  /** Bytes appended since the last take(). */
+  length = 0;
 
-  for (const p of parts) {
-    all.set(p, at);
-    at += p.length;
+  append(part: Uint8Array): void {
+    let from = 0;
+
+    while (from < part.length) {
+      let slab = this.current;
+
+      if (!slab || this.used === SLAB_BYTES) {
+        if (slab) this.full.push(slab);
+        slab = this.spare ?? new Uint8Array(SLAB_BYTES);
+        this.spare = null;
+        this.current = slab;
+        this.used = 0;
+      }
+
+      const n = Math.min(SLAB_BYTES - this.used, part.length - from);
+      slab.set(part.subarray(from, from + n), this.used);
+      this.used += n;
+      from += n;
+    }
+
+    this.length += part.length;
   }
 
-  return decoder.decode(all);
+  /** The bytes appended since the last call, as text. */
+  take(): string {
+    const { full, current, used, length } = this;
+    this.full = [];
+    this.current = null;
+    this.used = 0;
+    this.length = 0;
+
+    if (!current) return "";
+    // the slab still being filled is the next part's: the text is decoded from it before anything is appended
+    this.spare = current;
+
+    if (full.length === 0) return decoder.decode(current.subarray(0, used));
+    const all = new Uint8Array(length);
+    let at = 0;
+
+    for (const slab of full) {
+      all.set(slab, at);
+      at += slab.length;
+    }
+
+    all.set(current.subarray(0, used), at);
+    // the full slabs go before the text is decoded, so they, the joined copy and the text are never held at once
+    full.length = 0;
+
+    return decoder.decode(all);
+  }
 }
 
 function parsed(text: string): JsonValue {
@@ -254,18 +357,64 @@ function parsed(text: string): JsonValue {
   }
 }
 
+const FNV_PRIME = 0x01000193;
+
+/** `h` continued with the UTF-16 code units of `s`: the hidden classes of the objects the reader builds itself. */
+function hashString(h: number, s: string): number {
+  let out = h;
+
+  for (let i = 0; i < s.length; i++) out = Math.imul(out ^ s.charCodeAt(i), FNV_PRIME);
+
+  return Math.imul(out ^ QUOTE, FNV_PRIME);
+}
+
+/** The value of one hex digit (isHex has checked it is one). */
+const hexValue = (b: number): number => (b <= NINE ? b - ZERO : (b | 0x20) - 0x61 + 10);
+
+/** Weight is taken from the shared budget in steps of about this much, and always before a parse. */
+const FLUSH_WEIGHT = 64 * 1024;
+
+/** A version entry a later occurrence of its key removed (a profile that does not keep it). */
+const DROPPED: unique symbol = Symbol("dropped");
+
+type Versions = Map<string, JsonValue | typeof DROPPED>;
+
+function* live(versions: Versions): Generator<[string, JsonValue]> {
+  for (const [key, value] of versions) if (value !== DROPPED) yield [key, value];
+}
+
 class Scanner {
   private state = S_BOM;
-  /** The open containers, one byte each (OBJECT or ARRAY); grown on demand, never past maxDepth. */
+  /** The open containers, one byte each (OBJECT or ARRAY); grown on demand with the stacks beside it, never past maxDepth. */
   private kinds = new Uint8Array(64);
+  /** For an object inside a kept part, the hidden class its keys so far give it (WEIGHTS) and its members so far. */
+  private classOf = new Int32Array(64);
+  private members = new Int32Array(64);
   private depth = 0;
   /** In a string: whether it is an object key. In S_HEX: hex digits still to come. In S_LITERAL: the literal and how far. */
   private stringIsKey = false;
   private hexLeft = 0;
+  private hex = 0;
   private literal: readonly number[] = TRUE;
   private literalAt = 0;
   private numberState = N_MINUS;
   private capture: Capture | null = null;
+  private readonly slabs = new Slabs();
+  /** Where in the stream this chunk starts, and the string being read does. */
+  private base = 0;
+  private stringStart = 0;
+  /** The string being read has a character past U+00FF (V8 holds it two bytes a character). */
+  private wide = false;
+  /** The string being read is a key inside a kept part: its bytes are hashed into keyHash. */
+  private hashing = false;
+  private keyHash = 0;
+  /** Hidden classes seen in this read, as 30-bit hashes, and the seed that makes them unguessable. */
+  private readonly classes = new Set<number>();
+  private readonly seed: number;
+  /** The hidden classes of the objects the reader builds: the root, the `versions` object and the version document. */
+  private topClass: number;
+  private versionsClass: number;
+  private fieldsClass: number;
   /** The key of the member being read at the root, in `versions`, and in a version document. */
   private rootKey: string | null = null;
   private versionKey: string | null = null;
@@ -274,11 +423,19 @@ class Scanner {
   private inVersions = false;
   private inVersion = false;
   private readonly top: [string, JsonValue][] = [];
-  private versions: [string, JsonValue][] = [];
+  private versions: Versions = new Map();
   private fields: [string, JsonValue][] = [];
   bytes = 0;
   keptBytes = 0;
   keptNodes = 0;
+  weight = 0;
+  versionCount = 0;
+  versionDocs = 0;
+  /** The objects and members of the version documents built so far in this `versions`, and in this document. */
+  private docsWeight = 0;
+  private docWeight = 0;
+  /** Weight charged and not yet taken from the shared budget. */
+  private pending = 0;
   /** What this read took from the shared budget, given back if it is refused. */
   taken = 0;
 
@@ -290,6 +447,10 @@ class Scanner {
     this.limits = input.limits;
     this.profile = input.profile;
     this.budget = input.budget;
+    this.seed = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0x811c9dc5;
+    this.topClass = this.seed;
+    this.versionsClass = this.seed;
+    this.fieldsClass = this.seed;
   }
 
   feed(chunk: Uint8Array): void {
@@ -297,42 +458,66 @@ class Scanner {
 
     if (this.bytes > this.limits.maxBytes) throw new TooLarge({ over: "read", bytes: this.bytes, limit: this.limits.maxBytes });
     const n = chunk.length;
+    this.base = this.bytes - n;
 
     for (let i = 0; i < n; i++) {
       let b = chunk[i] ?? 0;
 
       switch (this.state) {
         case S_STRING: {
-          // the common case, read in a tight loop: bytes that are neither a quote, a backslash nor a control character
-          while (b !== QUOTE && b !== BACKSLASH && b >= 0x20) {
-            i++;
+          if (this.capture === null) {
+            // the common case, read in a tight loop: bytes that are neither a quote, a backslash nor a control character
+            while (b !== QUOTE && b !== BACKSLASH && b >= 0x20) {
+              i++;
 
-            if (i >= n) break;
-            b = chunk[i] ?? 0;
+              if (i >= n) break;
+              b = chunk[i] ?? 0;
+            }
+          } else {
+            // kept: a lead byte from 0xc4 starts a character past U+00FF; a key's bytes are hashed for its hidden class
+            while (b !== QUOTE && b !== BACKSLASH && b >= 0x20) {
+              if (b >= 0xc4) this.wide = true;
+
+              if (this.hashing) this.keyHash = Math.imul(this.keyHash ^ b, FNV_PRIME);
+              i++;
+
+              if (i >= n) break;
+              b = chunk[i] ?? 0;
+            }
           }
 
           if (i >= n) break;
 
           if (b === QUOTE) this.stringEnded(chunk, i);
-          else if (b === BACKSLASH) this.state = S_ESCAPE;
-          else throw new InvalidPackument("a control character in a string");
+          else if (b === BACKSLASH) {
+            this.hashByte(b);
+            this.state = S_ESCAPE;
+          } else throw new InvalidPackument("a control character in a string");
 
           break;
         }
 
         case S_ESCAPE:
+          this.hashByte(b);
+
           if (b === 0x75) {
             this.state = S_HEX;
             this.hexLeft = 4;
+            this.hex = 0;
           } else if (isEscape(b)) this.state = S_STRING;
           else throw new InvalidPackument("an invalid escape in a string");
 
           break;
         case S_HEX:
           if (!isHex(b)) throw new InvalidPackument("an invalid \\u escape in a string");
+          this.hashByte(b);
+          this.hex = this.hex * 16 + hexValue(b);
           this.hexLeft--;
 
-          if (this.hexLeft === 0) this.state = S_STRING;
+          if (this.hexLeft === 0) {
+            if (this.hex > 0xff) this.wide = true;
+            this.state = S_STRING;
+          }
 
           break;
         case S_NUMBER:
@@ -354,7 +539,7 @@ class Scanner {
           break;
         case S_BOM: {
           // the byte order mark the UTF-8 decode of res.text() skips, at the very start only
-          const offset = this.bytes - n + i;
+          const offset = this.base + i;
 
           if (offset < BOM.length && b === BOM[offset]) break;
 
@@ -406,14 +591,29 @@ class Scanner {
       this.keep(chunk.subarray(this.capture.from));
       this.capture.from = 0;
     }
+
+    this.flush();
   }
 
   finish(): KeptPackument {
     if (this.state === S_BOM && this.bytes === 0) throw new InvalidPackument("the packument is empty");
 
     if (this.state !== S_DONE) throw new InvalidPackument("the packument ends early");
+    this.flush();
 
     return Object.fromEntries(this.top);
+  }
+
+  private hashByte(b: number): void {
+    if (this.hashing) this.keyHash = Math.imul(this.keyHash ^ b, FNV_PRIME);
+  }
+
+  /** A string starts at `at`: a key when `isKey`. */
+  private stringStarted(at: number, isKey: boolean): void {
+    this.stringIsKey = isKey;
+    this.stringStart = this.base + at;
+    this.wide = false;
+    this.state = S_STRING;
   }
 
   /** A value starts with byte `b` at `at`. */
@@ -422,8 +622,7 @@ class Scanner {
 
     if (b === QUOTE) {
       this.valueStarted(at, null);
-      this.stringIsKey = false;
-      this.state = S_STRING;
+      this.stringStarted(at, false);
     } else if (b === OPEN_OBJECT || b === OPEN_ARRAY) {
       const kind = b === OPEN_OBJECT ? OBJECT : ARRAY;
       this.valueStarted(at, kind);
@@ -445,18 +644,23 @@ class Scanner {
     if (isSpace(b)) return;
 
     if (b !== QUOTE) throw new InvalidPackument("expected a key");
-    this.stringIsKey = true;
-    this.state = S_STRING;
+    this.stringStarted(at, true);
 
     if (this.capture) {
+      // a member of an object JSON.parse builds: its key, and the hidden class its keys so far give the object
       this.node();
+      const count = (this.members[this.depth - 1] ?? 0) + 1;
+      this.members[this.depth - 1] = count;
+      this.charge(memberWeight(count));
+      this.hashing = true;
+      this.keyHash = this.seed;
 
       return;
     }
 
     // keys matter only where the reader decides what to keep
     if (this.depth === 1 || (this.depth === 2 && this.inVersions) || (this.depth === 3 && this.inVersion)) {
-      this.capture = { depth: this.depth, into: "key", name: "", parts: [], from: at };
+      this.capture = { depth: this.depth, into: "key", name: "", from: at };
     }
   }
 
@@ -537,14 +741,24 @@ class Scanner {
   }
 
   private stringEnded(chunk: Uint8Array, quoteAt: number): void {
+    const c = this.capture;
+    // a string inside a kept part, as V8 will hold it: its content, two bytes a character when wide
+    const content = c && c.into !== "key" ? (this.base + quoteAt - 1 - this.stringStart) * (this.wide ? 2 : 1) * WEIGHTS.text : 0;
+
     if (this.stringIsKey) {
       this.state = S_COLON;
-      const c = this.capture;
+
+      if (this.hashing) {
+        this.hashing = false;
+
+        // a key is held once for every object of its hidden class
+        if (this.keyed(this.depth - 1, Math.imul(this.keyHash ^ QUOTE, FNV_PRIME))) this.charge(content);
+      }
 
       if (!c || c.into !== "key" || c.depth !== this.depth) return;
       this.keep(chunk.subarray(c.from, quoteAt + 1));
       this.capture = null;
-      const key = z.string().safeParse(parsed(joined(c.parts)));
+      const key = z.string().safeParse(this.parseKept());
 
       if (!key.success) throw new InvalidPackument("a key that is not a string");
 
@@ -555,20 +769,50 @@ class Scanner {
       return;
     }
 
+    this.charge(content);
     this.state = S_AFTER;
     this.valueEnded(chunk, quoteAt + 1);
+  }
+
+  /** The object at `level` of the stack has one more key, hashed `keyHash`: whether that makes a new hidden class. */
+  private keyed(level: number, keyHash: number): boolean {
+    const next = Math.imul((this.classOf[level] ?? 0) ^ keyHash, FNV_PRIME);
+    this.classOf[level] = next;
+
+    return this.newClass(next);
+  }
+
+  /** Whether `hiddenClass` is new in this read; a new one is charged. */
+  private newClass(hiddenClass: number): boolean {
+    const key = hiddenClass >>> 2;
+
+    if (this.classes.has(key)) return false;
+    this.classes.add(key);
+    this.charge(WEIGHTS.hiddenClass);
+
+    return true;
   }
 
   private open(kind: number): void {
     if (this.depth >= this.limits.maxDepth) throw new TooLarge({ over: "depth", bytes: this.depth + 1, limit: this.limits.maxDepth });
 
     if (this.depth >= this.kinds.length) {
-      const grown = new Uint8Array(Math.min(this.kinds.length * 2, this.limits.maxDepth));
-      grown.set(this.kinds);
-      this.kinds = grown;
+      const size = Math.min(this.kinds.length * 2, this.limits.maxDepth);
+      const kinds = new Uint8Array(size);
+      kinds.set(this.kinds);
+      this.kinds = kinds;
+      const classes = new Int32Array(size);
+      classes.set(this.classOf);
+      this.classOf = classes;
+      const members = new Int32Array(size);
+      members.set(this.members);
+      this.members = members;
     }
 
     this.kinds[this.depth] = kind;
+    // an object JSON.parse builds starts with no keys
+    this.classOf[this.depth] = this.seed;
+    this.members[this.depth] = 0;
     this.depth++;
     this.state = kind === OBJECT ? S_KEY_OR_CLOSE : S_VALUE_OR_CLOSE;
   }
@@ -587,7 +831,14 @@ class Scanner {
 
     if (this.depth === 2 && this.inVersion) {
       this.inVersion = false;
-      this.entry(this.versions, this.versionKey, Object.fromEntries(this.fields));
+      const key = this.versionKey;
+
+      if (key === null) throw new InvalidPackument("a member with no key");
+      // the version document, and its entry in `versions`
+      this.node();
+      this.charge(WEIGHTS.container);
+      this.docsWeight += this.docWeight + WEIGHTS.container;
+      this.versionEntry(key, Object.fromEntries(this.fields));
       this.fields = [];
 
       return;
@@ -595,8 +846,12 @@ class Scanner {
 
     if (this.depth === 1 && this.inVersions) {
       this.inVersions = false;
-      this.entry(this.top, "versions", Object.fromEntries(this.versions));
-      this.versions = [];
+      this.node();
+      this.charge(WEIGHTS.container);
+      this.topEntry("versions", Object.fromEntries(live(this.versions)));
+      this.versionCount = this.versions.size;
+      this.versionDocs = this.docsWeight;
+      this.versions = new Map();
 
       return;
     }
@@ -611,25 +866,90 @@ class Scanner {
     if (this.keptNodes > this.limits.maxKeptNodes) throw new TooLarge({ over: "nodes", bytes: this.keptNodes, limit: this.limits.maxKeptNodes });
   }
 
-  private entry(into: [string, JsonValue][], key: string | null, value: JsonValue): void {
-    if (key === null) throw new InvalidPackument("a member with no key");
-    this.node();
-    into.push([key, value]);
+  /** Weight charged (or given back, when negative), checked against maxWeight and taken from the budget in steps. */
+  private charge(n: number): void {
+    this.weight += n;
+
+    if (this.weight > this.limits.maxWeight) throw new TooLarge({ over: "weight", bytes: this.weight, limit: this.limits.maxWeight });
+    this.pending += n;
+
+    if (this.pending >= FLUSH_WEIGHT || this.pending < 0) this.flush();
+  }
+
+  /** What was charged since the last flush, taken from the budget (or given back). */
+  private flush(): void {
+    const n = this.pending;
+    this.pending = 0;
+
+    if (!this.budget || n === 0) return;
+
+    if (n < 0) {
+      this.budget.give(-n);
+      this.taken += n;
+
+      return;
+    }
+
+    if (!this.budget.take(n)) throw new TooLarge({ over: "budget", bytes: this.budget.taken + n, limit: this.budget.limit });
+    this.taken += n;
+  }
+
+  /**
+   * The `count`th key of an object the reader builds, and the `hiddenClass` it gives the object: with its text (two
+   * bytes a character at most) when that is new.
+   */
+  private member(key: string, hiddenClass: number, count: number): void {
+    this.charge(memberWeight(count));
+
+    if (this.newClass(hiddenClass)) this.charge(2 * key.length * WEIGHTS.text);
+  }
+
+  private topEntry(key: string, value: JsonValue): void {
+    this.topClass = hashString(this.topClass, key);
+    this.member(key, this.topClass, this.top.length + 1);
+    this.top.push([key, value]);
+  }
+
+  private versionEntry(key: string, value: JsonValue): void {
+    this.versionsClass = hashString(this.versionsClass, key);
+    this.member(key, this.versionsClass, this.versions.size + 1);
+    this.versions.set(key, value);
+  }
+
+  private fieldEntry(key: string, value: JsonValue): void {
+    this.fieldsClass = hashString(this.fieldsClass, key);
+    this.docWeight += memberWeight(this.fields.length + 1);
+    this.member(key, this.fieldsClass, this.fields.length + 1);
+    this.fields.push([key, value]);
   }
 
   private keep(part: Uint8Array): void {
     if (part.length === 0) return;
-    this.keptBytes += part.length;
 
-    if (this.keptBytes > this.limits.maxKeptBytes) throw new TooLarge({ over: "kept", bytes: this.keptBytes, limit: this.limits.maxKeptBytes });
+    if (this.capture?.into !== "key") {
+      this.keptBytes += part.length;
 
-    if (this.budget) {
-      if (!this.budget.take(part.length)) throw new TooLarge({ over: "budget", bytes: this.budget.taken + part.length, limit: this.budget.limit });
-      this.taken += part.length;
+      if (this.keptBytes > this.limits.maxKeptBytes) throw new TooLarge({ over: "kept", bytes: this.keptBytes, limit: this.limits.maxKeptBytes });
     }
 
+    this.charge(part.length * WEIGHTS.text);
     // a copy: the chunk's buffer is the stream's, and is reused or released after this read
-    this.capture?.parts.push(part.slice());
+    this.slabs.append(part);
+  }
+
+  /**
+   * The part kept so far, parsed. The copies the parse holds at once are charged before it; they and the text held
+   * until now are given back after (what the parsed value holds was charged as it was read).
+   */
+  private parseKept(): JsonValue {
+    const held = this.slabs.length * WEIGHTS.text;
+    const moment = this.slabs.length * WEIGHTS.parse;
+    this.charge(moment);
+    this.flush();
+    const value = parsed(this.slabs.take());
+    this.charge(-moment - held);
+
+    return value;
   }
 
   /**
@@ -639,6 +959,7 @@ class Scanner {
   private valueStarted(at: number, kind: number | null): void {
     if (this.capture) {
       this.node();
+      this.charge(kind === null ? WEIGHTS.value : WEIGHTS.container);
 
       return;
     }
@@ -658,36 +979,51 @@ class Scanner {
         if (key === "versions" && opensObject) {
           // a second `versions` replaces the first, as in JSON.parse
           this.inVersions = true;
-          this.versions = [];
+          this.versions = new Map();
+          this.versionsClass = this.seed;
+          this.docsWeight = 0;
 
           return;
         }
 
-        this.startCapture({ at, into: "top", name: key });
+        if (key === "versions") {
+          this.versionCount = 0;
+          this.versionDocs = 0;
+        }
+
+        this.startCapture({ at, kind, into: "top", name: key });
 
         return;
       }
 
-      case 2:
-        if (!this.inVersions) return;
+      case 2: {
+        const key = this.versionKey;
+
+        if (!this.inVersions || key === null) return;
 
         if (opensObject) {
           this.inVersion = true;
           this.fields = [];
+          this.fieldsClass = this.seed;
+          this.docWeight = 0;
 
           return;
         }
 
-        if (this.profile.otherVersions && this.versionKey !== null) this.startCapture({ at, into: "version", name: this.versionKey });
+        if (this.profile.otherVersions) this.startCapture({ at, kind, into: "version", name: key });
+        // not kept, yet it replaces an earlier entry of the same key, as in JSON.parse
+        else if (this.versions.has(key)) this.versions.set(key, DROPPED);
 
         return;
+      }
+
       case 3: {
         const key = this.fieldKey;
 
         if (!this.inVersion || key === null) return;
         const listed = this.profile.fields.names.has(key);
 
-        if (this.profile.fields.kind === "except" ? !listed : listed) this.startCapture({ at, into: "field", name: key });
+        if (this.profile.fields.kind === "except" ? !listed : listed) this.startCapture({ at, kind, into: "field", name: key });
 
         return;
       }
@@ -696,9 +1032,10 @@ class Scanner {
     }
   }
 
-  private startCapture(input: { at: number; into: "top" | "version" | "field"; name: string }): void {
+  private startCapture(input: { at: number; kind: number | null; into: "top" | "version" | "field"; name: string }): void {
     this.node();
-    this.capture = { depth: this.depth, into: input.into, name: input.name, parts: [], from: input.at };
+    this.charge(input.kind === null ? WEIGHTS.value : WEIGHTS.container);
+    this.capture = { depth: this.depth, into: input.into, name: input.name, from: input.at };
   }
 
   /** A value ended just before `end`, at the current depth: if it was being kept, it is parsed and put in place. */
@@ -708,19 +1045,19 @@ class Scanner {
     if (!c || c.depth !== this.depth || c.into === "key") return;
     this.keep(chunk.subarray(c.from, end));
     this.capture = null;
-    const value = parsed(joined(c.parts));
+    const value = this.parseKept();
 
     switch (c.into) {
       case "top":
-        this.top.push([c.name, value]);
+        this.topEntry(c.name, value);
 
         break;
       case "version":
-        this.versions.push([c.name, value]);
+        this.versionEntry(c.name, value);
 
         break;
       case "field":
-        this.fields.push([c.name, value]);
+        this.fieldEntry(c.name, value);
 
         break;
       default: {
@@ -750,7 +1087,9 @@ export async function readPackument(body: ReadableStream<Uint8Array>, options: R
       scanner.feed(value);
     }
 
-    return { kind: "ok", body: scanner.finish(), bytes: scanner.bytes, keptBytes: scanner.keptBytes, keptNodes: scanner.keptNodes };
+    const kept = scanner.finish();
+
+    return { kind: "ok", body: kept, bytes: scanner.bytes, keptBytes: scanner.keptBytes, keptNodes: scanner.keptNodes, weight: scanner.weight, versionCount: scanner.versionCount, versionDocs: scanner.versionDocs };
   } catch (e) {
     // given back before anything awaits, so reads in flight with this one see the room at once
     options.budget?.give(scanner.taken);

@@ -21,18 +21,41 @@ export function json(body: unknown, status = 200, headers: Readonly<Record<strin
 /** Bytes a streamed answer gathers before it sends them: big enough to keep the stream's overhead small. */
 const STREAM_CHUNK_CHARS = 64 * 1024;
 
+/**
+ * The members of an object in a streamed answer, made only as they are written (streamedJson): a packument's
+ * `versions`, say, so each version's document exists only while it is sent.
+ */
+export class LazyMembers {
+  readonly entries: () => Iterable<readonly [string, unknown]>;
+
+  constructor(entries: () => Iterable<readonly [string, unknown]>) {
+    this.entries = entries;
+  }
+}
+
+/** The members a streamed answer writes one at a time: a LazyMembers, or a plain object named in `spread`. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- the response boundary: a member of the body jsonPieces is writing, whatever JSON.stringify accepts
+function membersOf(value: unknown, spread: boolean): Iterable<readonly [string, unknown]> | null {
+  if (value instanceof LazyMembers) return value.entries();
+
+  // an object (not an array, not null): JSON.stringify would write it as members too
+  if (spread && value instanceof Object && !Array.isArray(value)) return Object.entries(value);
+
+  return null;
+}
+
 /** The JSON text of `body`, an object, in pieces: each member on its own, and the members of `spread` one at a time. */
 function* jsonPieces<T extends object>(body: T, spread: keyof T & string): Generator<string> {
   let first = true;
 
   for (const [key, value] of Object.entries(body)) {
     const head = `${first ? "{" : ","}${JSON.stringify(key)}:`;
+    const members = membersOf(value, key === spread);
 
-    // an object (not an array, not null): JSON.stringify would write it as members too
-    if (key === spread && value instanceof Object && !Array.isArray(value)) {
+    if (members) {
       let inner = true;
 
-      for (const [k, v] of Object.entries(value)) {
+      for (const [k, v] of members) {
         const text = JSON.stringify(v);
 
         // as JSON.stringify does: a member whose value has no JSON form is left out
@@ -57,9 +80,14 @@ function* jsonPieces<T extends object>(body: T, spread: keyof T & string): Gener
 }
 
 /**
- * Like json, for an object with one large member (`spread`, a packument's `versions`): the text is written as it is
- * sent, one member of `spread` at a time, so the answer is never held whole as a string and again as bytes. next's
- * full packument is 30 MB of JSON.
+ * Like json, for an object with large members (`spread`, a packument's `versions`, and any LazyMembers): the text is
+ * written as it is sent, one member of each at a time, so the answer is never held whole as a string and again as
+ * bytes. next's full packument is 30 MB of JSON.
+ *
+ * The status is sent before the body, so a piece that fails to serialize after the first cannot become an error
+ * answer: the stream is errored instead, which ends the response without its last chunk, and a client reads that as
+ * a failed download, never as a complete packument. Callers make what can fail before they call this (apm.ts,
+ * upstreamPackument); this stays the backstop, and logs.
  */
 export function streamedJson<T extends object>(body: T, spread: keyof T & string, headers: Readonly<Record<string, string>> = {}): Response {
   const pieces = jsonPieces(body, spread);
@@ -69,17 +97,24 @@ export function streamedJson<T extends object>(body: T, spread: keyof T & string
     pull(controller) {
       let text = "";
 
-      while (text.length < STREAM_CHUNK_CHARS) {
-        const next = pieces.next();
+      try {
+        while (text.length < STREAM_CHUNK_CHARS) {
+          const next = pieces.next();
 
-        if (next.done) {
-          if (text !== "") controller.enqueue(encoder.encode(text));
-          controller.close();
+          if (next.done) {
+            if (text !== "") controller.enqueue(encoder.encode(text));
+            controller.close();
 
-          return;
+            return;
+          }
+
+          text += next.value;
         }
+      } catch (e) {
+        console.error(JSON.stringify({ level: "error", event: "streamed-json", error: e instanceof Error ? e.message : String(e) }));
+        controller.error(e);
 
-        text += next.value;
+        return;
       }
 
       controller.enqueue(encoder.encode(text));

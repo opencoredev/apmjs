@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { Cause, Effect, Exit } from "effect";
 import { z } from "zod";
-import { MAX_JSON_BODY_BYTES, parseBody, parseOptionalBody } from "../src/http.ts";
+import { LazyMembers, MAX_JSON_BODY_BYTES, parseBody, parseOptionalBody, streamedJson } from "../src/http.ts";
 
 const CHUNK = 1024 * 1024;
 
@@ -75,5 +75,61 @@ describe("request bodies are bounded while they are read", () => {
     expect(ok).toEqual({ a: 1 });
     const empty = await Effect.runPromise(parseOptionalBody(new Request("http://registry.test/", { method: "POST" }), z.object({}).loose()));
     expect(empty).toEqual({});
+  });
+});
+
+// streamedJson writes a packument a member at a time; LazyMembers are made only as they are written
+describe("streamedJson", () => {
+  test("writes what JSON.stringify writes, a spread object's and LazyMembers' members one at a time", async () => {
+    let made = 0;
+
+    function* docs(): Generator<readonly [string, unknown]> {
+      for (let i = 0; i < 3_000; i++) {
+        made++;
+        yield [`1.0.${i}`, { name: "p", version: `1.0.${i}`, skip: undefined, text: "x".repeat(100) }];
+      }
+    }
+
+    const body = { name: "p", gone: undefined, versions: new LazyMembers(docs), time: { "1.0.0": "t" }, empty: new LazyMembers(() => []) };
+    const res = streamedJson(body, "time");
+
+    // nothing is made before the body is read
+    expect(made).toBe(0);
+    const want = { name: "p", versions: Object.fromEntries([...docs()].map(([k, v]) => [k, v])), time: { "1.0.0": "t" }, empty: {} };
+
+    expect(JSON.parse(await res.text())).toEqual(JSON.parse(JSON.stringify(want)));
+  });
+
+  test("a member that fails to serialize after the first chunk errors the stream, never ends it as if complete", async () => {
+    const deep: unknown[] = [];
+    let at: unknown[] = deep;
+
+    // deeper than JSON.stringify's recursion can go
+    for (let i = 0; i < 1_000_000; i++) {
+      const next: unknown[] = [];
+      at.push(next);
+      at = next;
+    }
+
+    function* docs(): Generator<readonly [string, unknown]> {
+      for (let i = 0; i < 2_000; i++) yield [`1.0.${i}`, "y".repeat(100)];
+      yield ["9.9.9", deep];
+    }
+
+    const errors: unknown[] = [];
+    const log = console.error;
+    console.error = (...args: unknown[]) => errors.push(args);
+
+    try {
+      const res = streamedJson({ name: "p", versions: new LazyMembers(docs) }, "versions");
+
+      // the status was sent with the first chunk; the body then fails, so no client reads it as complete
+      expect(res.status).toBe(200);
+      await expect(res.text()).rejects.toThrow();
+    } finally {
+      console.error = log;
+    }
+
+    expect(JSON.stringify(errors)).toContain("streamed-json");
   });
 });

@@ -11,7 +11,7 @@ import { z } from "zod";
 import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_KEPT_BYTES, resolveResponse } from "../src/apm.ts";
+import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_METADATA_WEIGHT, resolveResponse } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
@@ -328,8 +328,9 @@ describe("the resolve walk bounds its database work", () => {
 // Review of 89441a9, finding 3: a walk holds every catalog it read until it answers, read six at a time, and the
 // isolate cache's eviction frees none a request still holds, so one request's package metadata had no bound.
 describe("the resolve walk bounds the package metadata it holds", () => {
-  test("past REQUEST_KEPT_BYTES the rest are unchecked with a warning, reads in flight included", () => {
-    // eight npm dependencies of about 6 MB kept each: 48 MB against a 40 MB budget, six of them read at once
+  test("past REQUEST_METADATA_WEIGHT the rest are unchecked with a warning, reads in flight included", () => {
+    // eight npm dependencies of about 6 MB kept each: 48 MB held once read, against a 56 MB budget that also holds the
+    // text of the reads in flight, six at once, and each parse's moment
     const pad = 6 * 1024 * 1024;
     const deps = Array.from({ length: 8 }, (_, i) => ({ name: `big${i}`, pad }));
     const root = { name: "root", dependencies: Object.fromEntries(deps.map((d) => [d.name, "^1.0.0"])) };
@@ -337,14 +338,15 @@ describe("the resolve walk bounds the package metadata it holds", () => {
 
     return withDatabase({ local: [root], upstream: deps }, async (url) => {
       const r = await resolve({ url, name: "root", npm: npm.url });
-      const fits = Math.floor(REQUEST_KEPT_BYTES / pad);
+      const checked = r.body.tree.packages.length;
 
       report("8 packuments of 6 MB", r);
       expect(r.status).toBe(200);
-      // on 89441a9 all eight were read, held and checked
-      expect(r.body.tree.packages.length).toBe(fits);
-      expect(r.body.tree.unchecked).toBe(deps.length - fits);
-      expect(r.body.tree.uncheckedDeps.map((d) => d.reason)).toEqual(Array.from({ length: deps.length - fits }, () => OVER_BUDGET_TEXT));
+      // on 89441a9 all eight were read, held and checked; what is held stays under the budget
+      expect(checked).toBeGreaterThanOrEqual(2);
+      expect(checked * pad).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
+      expect(r.body.tree.unchecked).toBe(deps.length - checked);
+      expect(r.body.tree.uncheckedDeps.map((d) => d.reason)).toEqual(Array.from({ length: deps.length - checked }, () => OVER_BUDGET_TEXT));
       expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.text)).toEqual([`some dependencies were not checked: ${OVER_BUDGET_TEXT}`]);
       // a walk cut short refuses in strict mode, as at its other limits
       expect((await resolve({ url, name: "root", npm: npm.url, strict: true })).status).not.toBe(200);
