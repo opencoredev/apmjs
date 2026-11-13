@@ -223,7 +223,7 @@ test("upgrading from 0012 with a write to analysis_jobs open does not hold later
     await writer.query("SET statement_timeout = '1s'");
     await writer.query("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('later', '1.0.0', 2)");
     await holder.query("COMMIT");
-    expect(await run).toEqual(["0013_analysis_attempts", "0014_analysis_indexes"]);
+    expect(await run).toEqual(["0013_analysis_attempts", "0014_analysis_indexes", "0015_rescore_runtime_failures"]);
     expect(await validIndexes(writer, ["analysis_jobs_queued", "analysis_outcomes_unswept", "analysis_outcomes_unfinished"])).toEqual({ analysis_jobs_queued: true, analysis_outcomes_unswept: true });
     const cols = (await writer.query<{ name: string }>("SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'analysis_outcomes' AND column_name LIKE 'fetch_%' ORDER BY 1")).rows;
 
@@ -252,7 +252,7 @@ test("upgrading from 0010 with a write to analysis_outcomes open does not hold l
     await writer.query("SET statement_timeout = '1s'");
     await writer.query("INSERT INTO analysis_outcomes (package, version, scorer) VALUES ('later', '1.0.0', 's')");
     await holder.query("COMMIT");
-    expect(await run).toEqual(["0011_unfinished_analyses", "0012_analysis_failures", "0013_analysis_attempts", "0014_analysis_indexes"]);
+    expect(await run).toEqual(["0011_unfinished_analyses", "0012_analysis_failures", "0013_analysis_attempts", "0014_analysis_indexes", "0015_rescore_runtime_failures"]);
   } finally {
     await holder.query("ROLLBACK").catch(() => {});
     await run?.catch(() => {});
@@ -281,11 +281,49 @@ test("0014 gives up at its lock_timeout behind a long write, drops the invalid i
     // the failed concurrent build left an invalid index behind
     expect(await validIndexes(holder, ["analysis_jobs_queued"])).toEqual({ analysis_jobs_queued: false });
     await holder.query("COMMIT");
-    expect(await migrate(db.url)).toEqual(["0014_analysis_indexes"]);
+    expect(await migrate(db.url)).toEqual(["0014_analysis_indexes", "0015_rescore_runtime_failures"]);
     expect(await validIndexes(holder, ["analysis_jobs_queued", "analysis_outcomes_unswept"])).toEqual({ analysis_jobs_queued: true, analysis_outcomes_unswept: true });
     expect(await migrate(db.url)).toEqual([]);
   } finally {
     await holder.end();
+    await db.drop();
+  }
+}, 30_000);
+
+// Staging's queue recorded 54 versions unreadable because workerd refused an inflate held to the trailer's exact size
+// (core/src/tarball.ts, GUNZIP_SLACK_BYTES), and stored the smaller re-run's incomplete score for versions the 30 s CPU
+// limit or a store error stopped (three 0.187.0, vite 8.3.8). 0015 drops those so they are scored again, and only those.
+test("0015 drops the outcomes the runtime caused, and keeps every other outcome", async () => {
+  const db = await migratedBefore("0015");
+  const c = await connect(db.url);
+  const rerun = { signals: [{ id: "incomplete", evidence: ["an earlier analysis of this version was stopped by the platform's CPU limit or failed before it stored anything, so this one read at most 4 MB"] }] };
+  const full = { signals: [{ id: "incomplete", evidence: ["src/huge.js: too large to analyze"] }] };
+
+  try {
+    await c.query(
+      `INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, starts, started_at, failures) VALUES
+         ('react', '19.3.1', 's', 'unreadable', 'the tarball is not one apm can read (not valid gzip: it inflates to more than the 200192 bytes its trailer says)', 1, 1, 0),
+         ('broken', '1.0.0', 's', 'unreadable', 'the tarball is not one apm can read (not valid gzip: incorrect header check)', 1, 1, 0),
+         ('next', '16.4.6', 's', 'too-large', 'the tarball inflates to more than 48 MB', 1, 1, 0),
+         ('limited', '1.0.0', 's', 'analysis-limit', 'two analyses of it were stopped', 3, 1, 0),
+         ('vite', '8.3.8', 's', NULL, NULL, 2, 1, 0),
+         ('three', '0.186.0', 's', NULL, NULL, 1, 1, 0),
+         ('throws', '1.0.0', 's', NULL, NULL, 1, 1, 1),
+         ('hono', '4.13.18', 's', NULL, NULL, 1, 1, 0)`,
+    );
+    await c.query(
+      `INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES
+         ('vite', '8.3.8', 'd1', 's', $1::jsonb, 1), ('hono', '4.13.18', 'd2', 's', $2::jsonb, 1)`,
+      [JSON.stringify(rerun), JSON.stringify(full)],
+    );
+    expect(await migrate(db.url)).toEqual(["0015_rescore_runtime_failures"]);
+    const outcomes = (await c.query<{ package: string }>("SELECT package FROM analysis_outcomes ORDER BY package")).rows.map((r) => r.package);
+    const analyses = (await c.query<{ package: string }>("SELECT package FROM upstream_analysis ORDER BY package")).rows.map((r) => r.package);
+
+    expect(outcomes).toEqual(["broken", "hono", "next", "throws"]);
+    expect(analyses).toEqual(["hono"]);
+  } finally {
+    await c.end();
     await db.drop();
   }
 }, 30_000);

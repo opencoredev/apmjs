@@ -12,9 +12,10 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
+import { StoreError } from "../src/errors.ts";
 import { Upstream, type Probe, type UpstreamPackage } from "../src/upstream.ts";
 
 const T0 = Date.parse("2026-11-12T00:00:00Z");
@@ -196,9 +197,34 @@ async function withRig(fn: (rig: Rig, sql: (q: string, p?: unknown[]) => Promise
   }
 }
 
-function layerFor(input: { url: string; now: number; upstream: Layer.Layer<Upstream>; queue: ReturnType<typeof queueStub>["queue"] | null; stop?: { armed: boolean } }) {
+/**
+ * The real store, except that a result's write fails with a store error the next `lost.writes` times, as Hyperdrive's
+ * "PgConnection: Connection closed" did on staging under vite 8.3.8's finished analysis.
+ */
+function losingStore(lost: { writes: number }) {
+  return Layer.effect(
+    Store,
+    Effect.gen(function* () {
+      const real = yield* Store;
+
+      return Store.of({
+        ...real,
+        // each run of the write decides, as a query sent again on a new connection would
+        setUpstreamAnalysis: (input) =>
+          Effect.suspend(() => {
+            if (lost.writes <= 0) return real.setUpstreamAnalysis(input);
+            lost.writes--;
+
+            return Effect.fail(new StoreError({ operation: "setUpstreamAnalysis", cause: new Error("PgConnection: Connection closed") }));
+          }),
+      });
+    }),
+  );
+}
+
+function layerFor(input: { url: string; now: number; upstream: Layer.Layer<Upstream>; queue: ReturnType<typeof queueStub>["queue"] | null; stop?: { armed: boolean }; lost?: { writes: number } }) {
   const store = Store.postgres(input.url);
-  const wrapped = input.stop ? Layer.provideMerge(stoppingStore(input.stop), store) : store;
+  const wrapped = input.stop ? Layer.provideMerge(stoppingStore(input.stop), store) : input.lost ? Layer.provideMerge(losingStore(input.lost), store) : store;
   const base = Layer.mergeAll(wrapped, input.upstream, Clock.fixed({ now: input.now, wallNow: input.now }));
 
   return Layer.provideMerge(Analysis.layer(input.queue), base);
@@ -628,4 +654,48 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
       expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'prestart'")).length).toBe(1);
     });
   }, 60_000);
+});
+
+// Staging, vite 8.3.8: the run's write of a finished analysis failed with "PgConnection: Connection closed". The run
+// stayed begun, so the queue's retry found it busy for RUN_WINDOW_MS, and the run after that was taken for one the
+// platform stopped and stored a 4 MB re-run's incomplete score (34, F) seven minutes later.
+describe("a run the store fails is the registry's failure, not the package's", () => {
+  const incompleteOf = async (sql: (q: string, p?: unknown[]) => Promise<unknown[]>, name: string) => {
+    const [stored] = Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = $1 AND scorer = $2", [name, SCORER]));
+
+    return stored ? stored.analysis.signals.some((s) => s.id === "incomplete") : null;
+  };
+
+  test("a write that fails once is tried again on a new connection, and the full analysis is stored", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["blip-pkg"]);
+      const lost = { writes: 1 };
+      const outcome = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "blip-pkg", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: null, lost })), Effect.scoped));
+
+      expect(outcome).toBe("stored");
+      expect(lost.writes).toBe(0);
+      expect(await incompleteOf(sql, "blip-pkg")).toBe(false);
+    });
+  }, 120_000);
+
+  test("a run whose writes all fail is handed back at once, and the queue's next delivery runs it in full", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["lost-pkg"]);
+      const job = { name: "lost-pkg", version: "1.0.0" };
+      const lost = { writes: 100 };
+      const first = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: null, lost })), Effect.scoped));
+
+      expect(first).toBe("retry");
+      // the queue's retry, 30 s later and well inside RUN_WINDOW_MS: not busy, and not a re-run
+      const second = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 30_000, upstream: up.layer, queue: null })), Effect.scoped));
+
+      expect(second).toBe("stored");
+      expect(await incompleteOf(sql, "lost-pkg")).toBe(false);
+      expect(z.array(z.object({ starts: z.number(), fetch_failures: z.number() })).parse(await sql("SELECT starts, fetch_failures FROM analysis_outcomes WHERE package = 'lost-pkg'"))).toEqual([{ starts: 2, fetch_failures: 1 }]);
+    });
+  }, 120_000);
+});
+
+test("a begun run is taken for still going only while it could be: the Worker's whole CPU limit and more", () => {
+  expect(RUN_WINDOW_MS).toBeGreaterThan(WORKER_CPU_MS);
 });

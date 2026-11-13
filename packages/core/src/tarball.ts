@@ -58,9 +58,18 @@ function trailerSize(bytes: Uint8Array): number | null {
 const GUNZIP_PASSES = 2;
 
 /**
+ * Room the inflate gets past the trailer's size. workerd's node:zlib grows its output in steps and refuses a step that
+ * would pass maxOutputLength even when the stream itself ends inside it, so a limit of exactly the trailer's size
+ * failed real packages (react 19.3.1 at 200192 bytes, tinyglobby 0.2.17 at 46080) as "not valid gzip" on Cloudflare
+ * while Bun inflated them. Measured in workerd, a stream needed up to 36 KB more; this leaves several times that.
+ */
+export const GUNZIP_SLACK_BYTES = 256 * 1024;
+
+/**
  * Inflates gzip, refusing output larger than `maxBytes`. The trailer says how large the output is, so that much is
- * charged to the meter before anything is inflated and the inflate is held to it: a stream that inflates past what its
- * trailer says is refused as invalid, so the charge always covers the work.
+ * charged to the meter before anything is inflated and the inflate is held to it, plus GUNZIP_SLACK_BYTES the runtime
+ * needs: a stream that inflates past what its trailer says is refused as invalid, so the charge covers the work but
+ * for at most that slack.
  */
 export function gunzipCapped(bytes: Uint8Array, maxBytes: number, meter?: Meter): Uint8Array {
   return metered(meter, () => {
@@ -70,16 +79,21 @@ export function gunzipCapped(bytes: Uint8Array, maxBytes: number, meter?: Meter)
 
     if (size > maxBytes) throw new ArchiveError("too-large", `inflates to more than ${Math.floor(maxBytes / (1024 * 1024))} MB`);
     chargeText("gunzip", Math.max(size, bytes.length), GUNZIP_PASSES);
+    const overrun = (): ArchiveError => new ArchiveError("invalid", `not valid gzip: it inflates to more than the ${size} bytes its trailer says`);
+    let out: Uint8Array;
 
     try {
-      return new Uint8Array(gunzipSync(bytes, { maxOutputLength: Math.max(1, size) }));
+      out = new Uint8Array(gunzipSync(bytes, { maxOutputLength: size + GUNZIP_SLACK_BYTES }));
     } catch (e) {
-      if (e instanceof RangeError || (hasCode(e) && e.code === "ERR_BUFFER_TOO_LARGE")) {
-        throw new ArchiveError("invalid", `not valid gzip: it inflates to more than the ${size} bytes its trailer says`);
-      }
+      if (e instanceof RangeError || (hasCode(e) && e.code === "ERR_BUFFER_TOO_LARGE")) throw overrun();
 
       throw new ArchiveError("invalid", `not valid gzip: ${e instanceof Error ? e.message : String(e)}`);
     }
+
+    // the slack is the runtime's, not the stream's: output past the trailer's size is refused as before
+    if (out.length > size) throw overrun();
+
+    return out;
   });
 }
 

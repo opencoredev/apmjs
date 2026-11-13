@@ -6,8 +6,8 @@
 // and its cron sweep runs it.
 //
 // Every analysis is metered by counted work (the meter in @apm/core), not by time: in a deployed Worker the clock does
-// not move while code runs. The meter is not a proof: work it misses is stopped by the platform's default 30 s CPU
-// limit, and what follows makes every way a run can end store an outcome. A queued run records its start before it does
+// not move while code runs. The meter is not a proof: work it misses is stopped by the Worker's CPU limit
+// (WORKER_CPU_MS, which packages/infra sets), and what follows makes every way a run can end store an outcome. A queued run records its start before it does
 // anything, the upstream included (startAnalysis), and decides whether to stop trying before it downloads anything. The
 // cron sweep (recover) requeues every run that began and never ended, and every job the queue accepted that never began
 // one. After a stopped run the next reads less and is incomplete; the one after it records that the version cannot be
@@ -19,10 +19,11 @@
 import { Context, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
-import { Manifest, Store, type Unscorable, type VersionRecord } from "./db.ts";
+import { Manifest, Store, type AnalysisStart, type Unscorable, type VersionRecord } from "./db.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
 import { digestLabel, tooLargeText, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
+import { WORKER_CPU_MS } from "../scripts/compat.ts";
 
 export type AnalysisJob = { readonly name: string; readonly version: string };
 
@@ -48,17 +49,18 @@ type Stored = { kind: "stored" | "unscorable" | "retry"; v: VersionRecord };
  */
 export const WORKER_MAX_UNPACKED_BYTES = 48 * 1024 * 1024;
 
-/** The CPU limit per invocation: Cloudflare's default, which packages/infra does not raise. One queue message is handled per invocation. */
-export const WORKER_CPU_MS = 30_000;
+/** The CPU limit per invocation, which packages/infra sets on the Worker. One queue message is handled per invocation. */
+export { WORKER_CPU_MS };
 
 /**
- * Work one queued analysis may spend, the unpack included: the whole meter, about 18 s of CPU at the most expensive
- * unit measured (docs/SCORE.md). A run that costs more is stopped by the platform and recovered by the sweep.
+ * Work one queued analysis may spend, the unpack included: the whole meter, about 70 s of a Worker's CPU at the units
+ * measured on staging, inside WORKER_CPU_MS (docs/SCORE.md). A run that costs more is stopped by the platform and
+ * recovered by the sweep.
  */
 export const QUEUE_WORK = MAX_ANALYSIS_WORK;
 
-/** A run begun less than this long ago may still be going: a full meter's CPU, plus the download and the writes. */
-export const RUN_WINDOW_MS = 6 * 60_000;
+/** A run begun less than this long ago may still be going: the Worker's whole CPU limit, plus the download and the writes. */
+export const RUN_WINDOW_MS = WORKER_CPU_MS + 2 * 60_000;
 
 /** At most this many unfinished runs are requeued per sweep; the rest wait for the next one. */
 export const RECOVER_PER_SWEEP = 200;
@@ -78,6 +80,9 @@ export const MAX_FETCH_FAILURES = 10;
 
 export const FETCH_GIVE_UP_MS = 60 * 60_000;
 
+/** Times a result's write is tried again after a store error before the run is handed back. */
+export const STORE_RETRIES = 2;
+
 /** Runs that may fail with an error before the version is stored as incomplete, naming the error's class. */
 export const MAX_FAILED_RUNS = 2;
 
@@ -95,7 +100,7 @@ const RERUN: RunPlan = {
 
 const LIMIT_HIT: Unscorable = { reason: "analysis-limit", detail: "two analyses of it were stopped by the platform before they finished, so the registry stopped trying" };
 
-const FETCH_GAVE_UP: Unscorable = { reason: "unavailable", detail: `the upstream registry could not be asked for it, or would not serve its tarball, in ${MAX_FETCH_FAILURES} or more tries over an hour, so the registry stopped trying` };
+const FETCH_GAVE_UP: Unscorable = { reason: "unavailable", detail: `the upstream registry could not be asked for it, would not serve its tarball, or the registry could not store the result, in ${MAX_FETCH_FAILURES} or more tries over an hour, so the registry stopped trying` };
 
 /** What a queued version the upstream no longer serves is settled as, so the sweep never picks it again. */
 const GONE: Record<"package" | "version" | "tarball", Unscorable> = {
@@ -226,6 +231,12 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
           });
 
         /**
+         * A result's write, tried again on a store error: the pool opens a new connection for each try. On staging a
+         * Hyperdrive connection closed under vite 8.3.8's finished analysis, and without a retry that lost the run.
+         */
+        const durable = <A>(write: Effect.Effect<A, StoreError>): Effect.Effect<A, StoreError> => write.pipe(Effect.retry({ times: STORE_RETRIES }));
+
+        /**
          * Analyzes bytes and stores what it came to. A run that fails with an error keeps its start counted
          * (failAnalysis); after MAX_FAILED_RUNS failed runs the version is stored as incomplete, naming the error's class.
          * A run that fails in a way it cannot report (a store error, a platform stop) leaves its start for the sweep.
@@ -246,7 +257,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                   // nothing of the version is read again, its manifest included: reading it may be what failed
                   const analysis = failedAnalysis({ manifest: {}, files: [], errorClass: result.errorClass, attempts: failures });
 
-                  yield* store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis, at: yield* clock.now });
+                  yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis, at: yield* clock.now }));
                   v.score = analysis;
 
                   return { kind: "stored", v };
@@ -257,7 +268,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
 
               case "scored":
-                yield* store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis: result.analysis, at: yield* clock.now });
+                yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis: result.analysis, at: yield* clock.now }));
                 v.score = result.analysis;
 
                 return { kind: "stored", v };
@@ -304,8 +315,27 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
             }
 
+            // a run the store failed after it began is the registry's failure, not the package's: it is counted like a
+            // fetch failure and handed back, so the queue's retry runs it again in full at once. Left as a begun run, it
+            // read as busy for RUN_WINDOW_MS and then as one the platform stopped, so vite 8.3.8 waited 7 minutes and
+            // stored the re-run's incomplete score. The count is bounded as fetch failures are (MAX_FETCH_FAILURES).
             const now = yield* clock.now;
 
+            return yield* runStarted(job, begun, now).pipe(
+              Effect.catchTag("StoreError", (e) =>
+                Effect.logWarning("analysis run lost its store", { name: job.name, version: job.version, operation: e.operation }).pipe(
+                  Effect.andThen(durable(store.failFetch({ name: job.name, version: job.version, errorClass: `store unavailable (${e.operation})`, now, runMs: RUN_WINDOW_MS }))),
+                  Effect.as<JobOutcome>("retry"),
+                  // the store is gone altogether: the start stays, and the sweep finds it once RUN_WINDOW_MS pass
+                  Effect.catchTag("StoreError", () => Effect.fail(e)),
+                ),
+              ),
+            );
+          });
+
+        /** The rest of a run once its start is recorded: give up, fetch, analyze and store. */
+        const runStarted = (job: AnalysisJob, begun: Extract<AnalysisStart, { kind: "started" }>, now: number): Effect.Effect<JobOutcome, StoreError | BlobError> =>
+          Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError> {
             if (begun.fetchFailures >= MAX_FETCH_FAILURES && begun.fetchFailedSince !== null && now - begun.fetchFailedSince >= FETCH_GIVE_UP_MS) {
               yield* settleGone(job, FETCH_GAVE_UP);
 

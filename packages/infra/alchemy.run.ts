@@ -7,7 +7,7 @@ import * as Alchemy from "alchemy";
 import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../registry/scripts/compat.ts";
+import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS, WORKER_CPU_MS } from "../registry/scripts/compat.ts";
 import { websiteAgentEnv } from "./web-env.ts";
 
 const PRODUCTION = { registry: "registry.apmjs.dev", web: "apmjs.dev", docs: "docs.apmjs.dev" } as const;
@@ -59,6 +59,8 @@ export default Alchemy.Stack(
       main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
       bundle: false,
       compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
+      // the queue consumer's one analysis per invocation needs more than the default 30 s of CPU (compat.ts, WORKER_CPU_MS)
+      limits: { cpuMs: WORKER_CPU_MS },
       env: {
         HYPERDRIVE: postgres,
         BLOBS: blobs,
