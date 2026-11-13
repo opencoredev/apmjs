@@ -12,7 +12,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, INLINE_ANALYSES, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue } from "../src/analysis.ts";
+import { Analysis, INLINE_ANALYSES, MAX_FAILED_RUNS, RECOVER_PER_SWEEP, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { Upstream, type Probe, type UpstreamPackage } from "../src/upstream.ts";
@@ -42,8 +42,10 @@ function tarFile(name: string, text: string): Uint8Array[] {
   return [h, data, new Uint8Array((512 - (data.length % 512)) % 512)];
 }
 
-function tarball(name: string): Uint8Array {
-  const parts = [...tarFile("package/package.json", JSON.stringify({ name, version: "1.0.0", license: "MIT", main: "index.js" })), ...tarFile("package/index.js", "module.exports = require('./lib.js');\n"), ...tarFile("package/lib.js", "module.exports = 2;\n"), new Uint8Array(1024)];
+/** `withManifest: false` leaves package.json out, so the analysis reads the packument's manifest instead. */
+function tarball(name: string, withManifest = true): Uint8Array {
+  const manifest = withManifest ? tarFile("package/package.json", JSON.stringify({ name, version: "1.0.0", license: "MIT", main: "index.js" })) : [];
+  const parts = [...manifest, ...tarFile("package/index.js", "module.exports = require('./lib.js');\n"), ...tarFile("package/lib.js", "module.exports = 2;\n"), new Uint8Array(1024)];
   const tar = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let at = 0;
 
@@ -76,15 +78,36 @@ function versionOf(name: string, bytes: Uint8Array): VersionRecord {
   };
 }
 
-/** The upstream as a recording stub: one version per package, its tarball served from memory, every download counted. */
-function upstreamStub(names: readonly string[]) {
-  const bytes = new Map(names.map((n) => [n, tarball(n)]));
+/**
+ * A packument manifest whose `exports` throws when read, as the analysis overflowing its stack would: what a run that
+ * fails with an error it reports looks like to the registry, whatever the cause.
+ */
+function throwingManifest(name: string): VersionRecord["manifest"] {
+  return Object.defineProperty({ name, version: "1.0.0", main: "index.js" }, "exports", {
+    enumerable: true,
+    get(): never {
+      throw new RangeError("Maximum call stack size exceeded.");
+    },
+  });
+}
+
+/**
+ * The upstream as a recording stub: one version per package, its tarball served from memory, every download counted.
+ * The packages named in `failing` have no package.json in their tarball and a manifest the analysis fails on.
+ */
+function upstreamStub(names: readonly string[], failing: readonly string[] = []) {
+  const bytes = new Map([...names.map((n): [string, Uint8Array] => [n, tarball(n)]), ...failing.map((n): [string, Uint8Array] => [n, tarball(n, false)])]);
   const downloads: string[] = [];
 
   const pkgOf = (name: string): UpstreamPackage | null => {
     const b = bytes.get(name);
 
-    return b ? { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [versionOf(name, b)], tarballs: new Map() } : null;
+    if (!b) return null;
+    const v = versionOf(name, b);
+
+    if (failing.includes(name)) v.manifest = throwingManifest(name);
+
+    return { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map() };
   };
 
   const probeOf = (name: string): Probe => {
@@ -322,6 +345,134 @@ describe("no anonymous inline analysis", () => {
       expect(INLINE_ANALYSES).toBe(2);
       expect(await Effect.runPromise(request(true))).toEqual(["scored", "scored", "queued", "queued"]);
       expect(up.downloads).toEqual(["p1", "p2"]);
+    });
+  }, 120_000);
+});
+
+// Review of d49bf6e, finding 5: a run that failed with an error it reported called abandonAnalysis, which reset its
+// start count and its start time and stored nothing, so the sweep never saw it again and the version looked queued
+// forever. A failed run now keeps its start counted, and after MAX_FAILED_RUNS the version is stored as incomplete.
+describe("a run that fails with an error ends in a stored outcome", () => {
+  const Failures = z.array(z.object({ starts: z.number(), failures: z.number(), last_error: z.string().nullable(), started_at: z.coerce.number().nullable(), outcome: z.string().nullable() }));
+
+  test("queued: the first failure is retried, the second stores incomplete naming the error class", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub([], ["throws-pkg"]);
+      const q = queueStub();
+      const job = { name: "throws-pkg", version: "1.0.0" };
+      const runAt = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(MAX_FAILED_RUNS).toBe(2);
+      // the queue delivers it again; the failure kept its start and made the run count as ended
+      expect(await runAt(T0)).toBe("retry");
+      expect(Failures.parse(await sql("SELECT starts, failures, last_error, started_at, outcome FROM analysis_outcomes WHERE package = 'throws-pkg'"))).toEqual([
+        { starts: 1, failures: 1, last_error: "RangeError", started_at: T0 - RUN_WINDOW_MS, outcome: null },
+      ]);
+      expect(await sql("SELECT 1 FROM upstream_analysis WHERE package = 'throws-pkg'")).toEqual([]);
+
+      // the redelivery, 30 s later, fails too: stored as incomplete, below the floor, naming the class only
+      expect(await runAt(T0 + 30_000)).toBe("stored");
+      const [stored] = Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'throws-pkg' AND scorer = $1", [SCORER]));
+      const incomplete = stored?.analysis.signals.find((s) => s.id === "incomplete")?.evidence.join("\n") ?? "";
+
+      expect(incomplete).toContain("RangeError");
+      expect(incomplete).not.toContain("Maximum call stack");
+
+      // nothing left for the sweep
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(swept).toBe(0);
+    });
+  }, 120_000);
+
+  test("without a queue redelivery the sweep finds the failed run, and the next failure stores incomplete", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub([], ["throws-pkg"]);
+      const q = queueStub();
+      const job = { name: "throws-pkg", version: "1.0.0" };
+
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("retry");
+
+      // a local registry (no queue): the sweep runs the job itself, and that run is the second failure
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 1, upstream: up.layer, queue: null })), Effect.scoped));
+
+      expect(swept).toBe(1);
+      expect(Failures.parse(await sql("SELECT starts, failures, last_error, started_at, outcome FROM analysis_outcomes WHERE package = 'throws-pkg'"))[0]).toMatchObject({ starts: 2, failures: 2 });
+      expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'throws-pkg'")).length).toBe(1);
+    });
+  }, 120_000);
+
+  test("inline: a failed run keeps its start, is queued, and the version stays unscored, never clean", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub([], ["throws-pkg"]);
+      const q = queueStub();
+      const pkg = up.pkgOf("throws-pkg");
+      const v = pkg?.versions[0];
+
+      if (!pkg || !v) throw new Error("no package");
+
+      const got = await Effect.runPromise(
+        Effect.gen(function* () {
+          const a = yield* Analysis;
+
+          yield* a.allowInline(Effect.succeed(true));
+
+          return yield* a.ensure(pkg, v);
+        }).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped),
+      );
+
+      expect(got.score).toBeNull();
+      expect(q.sent).toEqual([{ name: "throws-pkg", version: "1.0.0" }]);
+      expect(Failures.parse(await sql("SELECT starts, failures, last_error, started_at, outcome FROM analysis_outcomes WHERE package = 'throws-pkg'"))[0]).toMatchObject({ starts: 1, failures: 1, last_error: "RangeError" });
+
+      // the queued run is the second failure
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "throws-pkg", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 30_000, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("stored");
+    });
+  }, 120_000);
+});
+
+// Review of d49bf6e, finding 6: the sweep took the oldest 200 unfinished rows, and runJob acknowledged a version the
+// upstream no longer has without settling its row, so 200 removed versions ahead of one stopped live version were
+// picked by every sweep and the live one never was.
+describe("versions the upstream no longer has cannot starve the sweep", () => {
+  const seed = async (sql: (q: string, p?: unknown[]) => Promise<unknown[]>, live: string): Promise<void> => {
+    // 200 removed versions whose runs began first, then the live one, all stopped long ago
+    await sql(
+      `INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at)
+       SELECT 'gone-' || i, '1.0.0', $1, 1, $2::bigint + i FROM generate_series(0, $3::int - 1) AS i`,
+      [SCORER, T0 - 10 * RUN_WINDOW_MS, RECOVER_PER_SWEEP],
+    );
+    await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ($1, '1.0.0', $2, 1, $3)", [live, SCORER, T0 - 5 * RUN_WINDOW_MS]);
+  };
+
+  test("no queue: the first sweep settles the removed versions as unavailable, the second scores the live one", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["live-pkg"]);
+
+      await seed(sql, "live-pkg");
+      const sweep = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: null })), Effect.scoped));
+
+      expect(await sweep(T0)).toBe(RECOVER_PER_SWEEP);
+      expect(await sql("SELECT count(*)::int AS n FROM analysis_outcomes WHERE outcome = 'unavailable'")).toEqual([{ n: RECOVER_PER_SWEEP }]);
+      expect(await sweep(T0 + 1)).toBe(1);
+      expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'live-pkg'")).length).toBe(1);
+      expect(await sweep(T0 + 2)).toBe(0);
+    });
+  }, 120_000);
+
+  test("with a queue: the second sweep sends the live version, whatever the first one's jobs did", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["live-pkg"]);
+      const q = queueStub();
+
+      await seed(sql, "live-pkg");
+      const sweep = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(await sweep(T0)).toBe(RECOVER_PER_SWEEP);
+      expect(q.sent.some((j) => j.name === "live-pkg")).toBe(false);
+      // the jobs were not run yet (a slow queue): the rows the first sweep picked go to the back
+      await sweep(T0 + 1);
+      expect(q.sent.some((j) => j.name === "live-pkg")).toBe(true);
     });
   }, 120_000);
 });

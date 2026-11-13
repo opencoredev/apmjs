@@ -375,14 +375,30 @@ export type StoreApi = {
    * another run began less than `runMs` ago (it may still be running) or the version was decided unscorable.
    */
   readonly startAnalysis: (input: { name: string; version: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
-  /** Takes back the start `startAnalysis` counted, for a run that ended with an error it reported (not a platform stop). */
+  /**
+   * Takes back the start `startAnalysis` counted, for an inline run that gave its work to the queue on purpose (it
+   * spent its share of the meter, or another run had begun). Only for work already queued: a failed run is `failAnalysis`.
+   */
   readonly abandonAnalysis: (name: string, version: string) => Effect.Effect<void, StoreError>;
+  /**
+   * Records that a run failed with an error it reported: its start stays counted, `errorClass` is kept, and the run
+   * counts as ended (started `runMs` before `now`), so the next delivery or the sweep may start it again. Returns how
+   * many runs of it have failed, this one included; null when the version already has an outcome.
+   */
+  readonly failAnalysis: (input: { name: string; version: string; errorClass: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
   /**
    * Runs `startAnalysis` counted that began at or before `before` and never ended: no outcome, and no analysis of the
    * version by the current scorer. The record a run leaves before it starts, so the cron sweep finds what the platform
-   * stopped (analysis.ts, `recover`). Oldest first, at most `limit`.
+   * stopped (analysis.ts, `recover`). At most `limit`, the ones the sweep picked longest ago (or never) first, and each
+   * picked is marked picked at `now`: a row the sweep cannot settle moves to the back instead of being picked forever.
    */
-  readonly unfinishedAnalyses: (input: { before: number; limit: number }) => Effect.Effect<{ name: string; version: string }[], StoreError>;
+  readonly unfinishedAnalyses: (input: { before: number; limit: number; now: number }) => Effect.Effect<{ name: string; version: string }[], StoreError>;
+  /**
+   * Which of these upstream versions the current scorer has decided: an analysis stored, or an outcome. Keyed
+   * `"<name> <version>"`. One read however many are asked for, and nothing of the analyses themselves: what a resolve
+   * waiting for the queue polls.
+   */
+  readonly decidedAnalyses: (versions: readonly { name: string; version: string }[]) => Effect.Effect<Set<string>, StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -974,13 +990,38 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         sql`UPDATE analysis_outcomes SET starts = GREATEST(starts - 1, 0), started_at = NULL WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL`,
         none,
       ),
-    unfinishedAnalyses: ({ before, limit }) =>
+    failAnalysis: ({ name, version, errorClass, now, runMs }) =>
+      run(
+        "failAnalysis",
+        sql`UPDATE analysis_outcomes SET failures = failures + 1, last_error = ${errorClass.slice(0, 200)}, started_at = ${now - runMs}
+            WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL
+            RETURNING failures`,
+        one(z.object({ failures: Int })).transform((row) => row?.failures ?? null),
+      ),
+    decidedAnalyses: (versions) =>
+      versions.length === 0
+        ? Effect.succeed(new Set<string>())
+        : run(
+            "decidedAnalyses",
+            sql`WITH wanted AS (SELECT * FROM unnest(${versions.map((v) => v.name)}::text[], ${versions.map((v) => v.version)}::text[]) AS w(package, version))
+                SELECT w.package, w.version FROM wanted w
+                WHERE EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = w.package AND a.version = w.version AND a.scorer = ${SCORER})
+                   OR EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = w.package AND o.version = w.version AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL)`,
+            all(z.object({ package: z.string(), version: z.string() })),
+          ).pipe(Effect.map((rows) => new Set(rows.map((r) => `${r.package} ${r.version}`)))),
+    unfinishedAnalyses: ({ before, limit, now }) =>
       run(
         "unfinishedAnalyses",
-        sql`SELECT o.package AS name, o.version FROM analysis_outcomes o
-            WHERE o.scorer = ${SCORER} AND o.outcome IS NULL AND o.started_at IS NOT NULL AND o.started_at <= ${before}
-              AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = o.package AND a.version = o.version AND a.scorer = ${SCORER})
-            ORDER BY o.started_at LIMIT ${limit}`,
+        sql`WITH picked AS (
+              SELECT o.package, o.version FROM analysis_outcomes o
+              WHERE o.scorer = ${SCORER} AND o.outcome IS NULL AND o.started_at IS NOT NULL AND o.started_at <= ${before}
+                AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = o.package AND a.version = o.version AND a.scorer = ${SCORER})
+              ORDER BY o.swept_at NULLS FIRST, o.started_at LIMIT ${limit}
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE analysis_outcomes o SET swept_at = ${now} FROM picked
+            WHERE o.package = picked.package AND o.version = picked.version AND o.scorer = ${SCORER}
+            RETURNING o.package AS name, o.version`,
         all(z.object({ name: z.string(), version: z.string() })),
       ),
 
