@@ -2,7 +2,7 @@
 // a version went live, and a package's packument was fetched from upstream. worker.ts provides the listeners
 // (the AI review queue) when they are configured; without it nothing listens.
 import { Context, Effect, Option } from "effect";
-import type { Lease } from "./memory.ts";
+import type { BackgroundLease } from "./memory.ts";
 import type { UpstreamPackage } from "./upstream.ts";
 
 export type Committed = { name: string; version: string; firstPublish: boolean };
@@ -14,9 +14,10 @@ export class ReleaseHooks extends Context.Service<
     readonly afterCommit: (v: Committed) => Effect.Effect<void>;
     /**
      * After an upstream packument is fetched (not on cache hits). `held` is a background lease (memory.ts) that holds
-     * `pkg`: the listener releases it once nothing it started refers to `pkg` any more.
+     * `pkg`: the listener stops when `held.signal` aborts, and releases it once nothing it started refers to `pkg` any
+     * more. Until then `pkg` stays charged, past the deadline too.
      */
-    readonly upstreamFetched: (pkg: UpstreamPackage, held: Lease) => Effect.Effect<void>;
+    readonly upstreamFetched: (pkg: UpstreamPackage, held: BackgroundLease) => Effect.Effect<void>;
   }
 >()("@apm/registry/ReleaseHooks") {}
 

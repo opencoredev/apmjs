@@ -47,9 +47,9 @@ const VIEWED = {
 };
 
 /**
- * `heavy`: 2,000 versions, each with 11.5 KB of a kept field and 340 devDependencies. Alone, each read fits every
- * per-read limit (24 MB weight cached and scored; 45 MB weight, 1.4 million nodes, of devDependencies); together they
- * pass REQUEST_METADATA_WEIGHT.
+ * `heavy`: 2,000 versions, each with 12.2 KB of a kept field and 364 devDependencies. Alone, each read fits every
+ * per-read limit (25 MiB weight cached and scored; 47.8 MiB weight, 1.46 million nodes, of devDependencies); together
+ * they pass REQUEST_METADATA_WEIGHT (72 MiB).
  */
 const HEAVY = JSON.stringify({
   name: "heavy",
@@ -57,7 +57,7 @@ const HEAVY = JSON.stringify({
   versions: Object.fromEntries(
     Array.from({ length: 2_000 }, (_, i) => [
       `1.0.${i}`,
-      { name: "heavy", version: `1.0.${i}`, notes: "n".repeat(11_500), devDependencies: Object.fromEntries(Array.from({ length: 340 }, (_, j) => [`dev${j}`, {}])), dist: dist("heavy", `1.0.${i}`) },
+      { name: "heavy", version: `1.0.${i}`, notes: "n".repeat(12_200), devDependencies: Object.fromEntries(Array.from({ length: 364 }, (_, j) => [`dev${j}`, {}])), dist: dist("heavy", `1.0.${i}`) },
     ]),
   ),
 });
@@ -149,7 +149,7 @@ describe("the npm packument route", () => {
     const body = Served.parse(JSON.parse(full?.text ?? ""));
 
     expect(Object.keys(body.versions)).toHaveLength(2_000);
-    expect(body.versions["1.0.7"]?.notes).toBe("n".repeat(11_500));
+    expect(body.versions["1.0.7"]?.notes).toBe("n".repeat(12_200));
     // on f0e533a the second read had no budget: all of them were read and held beside the packument
     expect(Object.values(body.versions).some((v) => "devDependencies" in v)).toBe(false);
   }, 60_000);

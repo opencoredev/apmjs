@@ -46,7 +46,7 @@ import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
-import { fail, json, LazyMembers, parseBody, streamedJson, streamWeight } from "./http.ts";
+import { fail, json, LazyMembers, longestPiece, parseBody, streamedJson, streamWeight } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
@@ -1020,13 +1020,36 @@ function readmeOf(pkg: { readme: string; readme_version: string | null }, versio
   return { readme: shown.text, readmeVersion: shown.version };
 }
 
+/** What the package answer holds for each version it lists while it is built and sent: its place in the sorted copy. */
+const PAGE_LISTED_WEIGHT = 16;
+
+/** What it holds for each version it shows (at most PAGE_VERSIONS): the row's object, its dates' text. */
+const PAGE_SHOWN_WEIGHT = 1024;
+
+/** The versions a package answer shows, newest first. */
+const PAGE_VERSIONS = 200;
+
+/** The package answer did not fit the request's lease: the same 503 as a packument that did not (upstreamRoute). */
+const pageRefused = (name: string): Response =>
+  json({ error: `The upstream registry could not be read for ${name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+
+/**
+ * GET /-/apm/v1/packages/<name>: the package page's answer. An upstream package's readme and description can be
+ * megabytes, so the answer is streamed (streamedJson), its serialized size is charged to the request's lease before
+ * it is made, and the lease stays open until the last byte is sent or the client cancels (review of 747a032,
+ * finding 4): the answer never exists whole as a string or a buffered body.
+ */
 const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
-    const src = yield* lookup(name, yield* RequestMemory);
+    const lease = yield* RequestMemory;
+    const src = yield* lookup(name, lease);
 
     if (!src) return fail(404, "Not found");
+
+    // the sorted copy of the version list and the rows shown, charged before they are made
+    if (!lease.take(src.versions.length * PAGE_LISTED_WEIGHT + Math.min(PAGE_VERSIONS, src.versions.length) * PAGE_SHOWN_WEIGHT)) return pageRefused(name);
     // the row lookup read, so the answer and the versions come from one read of it
     const local = src.kind === "local" ? src.pkg : null;
     const latest0 = src.versions.find((v) => v.version === src.distTags.latest) ?? null;
@@ -1035,7 +1058,7 @@ const packageResponse = (name: string) =>
     const latestFree = latest && latestReport ? sourceFreeReport(latest, latestReport) : null;
     const text = local ? packageTextShown(local, src.versions) : null;
 
-    return json({
+    const body = {
       name,
       source: src.kind,
       description: text?.description ?? (src.kind === "upstream" ? src.pkg.description : ""),
@@ -1057,7 +1080,7 @@ const packageResponse = (name: string) =>
           : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
-        .slice(0, 200)
+        .slice(0, PAGE_VERSIONS)
         .map((v) => {
           const r = reportFor(v, at);
 
@@ -1074,7 +1097,12 @@ const packageResponse = (name: string) =>
             unscorable: !r && v.unscorable ? notScored(src, v).text : null,
           };
         }),
-    });
+    };
+
+    // what streaming it holds at once, its longest member's text included, charged before a byte of it is written
+    if (!lease.take(streamWeight(longestPiece(body)))) return pageRefused(name);
+
+    return streamedJson(body, null, {}, { onDone: lease.retain() });
   });
 
 /**

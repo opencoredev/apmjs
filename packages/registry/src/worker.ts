@@ -182,11 +182,12 @@ function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<
             }
 
             background(
-              Effect.runPromiseExit(considerUpstream(pkg).pipe(Effect.provide(fresh), Effect.scoped))
+              // interrupted at the lease's deadline: the run settles once its finalizers have, and only then is the
+              // package given back to the isolate's memory pool
+              Effect.runPromiseExit(considerUpstream(pkg).pipe(Effect.provide(fresh), Effect.scoped), { signal: held.signal })
                 .then((exit) => {
                   if (Exit.isFailure(exit)) logFailure("review", { name: pkg.name }, Cause.pretty(exit.cause));
                 })
-                // the package stays charged to the isolate's memory pool until the look at it is over
                 .finally(() => held.release()),
             );
           }),

@@ -7,7 +7,9 @@
 // - finding 2: 5,000,000 bytes of 0x80, which decode to U+FFFD, were charged 4.77 MiB and held 9.61 MiB;
 // - finding 3: a stalled shared-cache write kept 3.6 MiB after the read's charge was given back.
 // And the round's claim (docs/ARCHITECTURE.md): random concurrent mixes of reads, walks, scans, streamed packuments,
-// cache writes and evictions hold no more above the isolate's base than the pool's peak charge and a small overhead.
+// cache writes and evictions, interrupted reads, malformed reads whose cancel takes a moment, and looks at fetched
+// packages that stop at their deadline or ignore it, hold no more above the isolate's base than the pool's peak charge
+// and a small overhead. On 747a032 the interrupts and stalled looks alone held up to 70.6 MiB past the charge.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { z } from "zod";
 import { POOL_WEIGHT } from "../src/memory.ts";
@@ -118,7 +120,7 @@ describe("the pool's charge bounds the isolate's memory under any mix", () => {
   });
 
   for (const seed of [1, 7, 42, 2026, 31337]) {
-    test(`seed ${seed}: reads, walks, scans, streams, cache writes and evictions at once`, async () => {
+    test(`seed ${seed}: reads, walks, scans, streams, cache writes, evictions, interrupts, malformed reads and stalled looks at once`, async () => {
       const got = Mix.parse(await (await heap.dispatch(`/mix?seed=${seed}&ops=150`)).json());
 
       process.stdout.write(

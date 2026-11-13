@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { Cause, Effect, Exit } from "effect";
 import { z } from "zod";
-import { LazyMembers, MAX_JSON_BODY_BYTES, parseBody, parseOptionalBody, streamedJson } from "../src/http.ts";
+import { jsonChars, LazyMembers, longestPiece, MAX_JSON_BODY_BYTES, parseBody, parseOptionalBody, STREAM_OVERHEAD_WEIGHT, streamedJson, streamWeight } from "../src/http.ts";
 
 const CHUNK = 1024 * 1024;
 
@@ -131,5 +131,55 @@ describe("streamedJson", () => {
     }
 
     expect(JSON.stringify(errors)).toContain("streamed-json");
+  });
+});
+
+describe("the size of an answer is counted before it is serialized", () => {
+  // escapes of every kind, a pair split by nothing, lone surrogates, numbers JSON writes as null, members JSON leaves out
+  const SAMPLES: readonly unknown[] = [
+    "",
+    'quote " backslash \\ tab \t newline \n bell \u0007 nul \u0000 del \u007f',
+    "pair 😀 lone high \ud800 x lone low \udc00 y end high \ud83d",
+    "é€ wide",
+    0,
+    -1.5e-7,
+    1e21,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    true,
+    false,
+    null,
+    [],
+    [1, undefined, () => 0, "a", null, [[]]],
+    {},
+    { a: 1, skipped: undefined, fn: () => 0, "k\"ey\n": "v", nested: { deep: [{ x: "y" }] } },
+    { at: new Date(0), boxed: [Object("s"), Object(2), Object(false)] },
+  ];
+
+  test("jsonChars is the length of JSON.stringify, for every kind of value route code answers with", () => {
+    for (const value of SAMPLES) expect(jsonChars(value)).toBe(JSON.stringify(value)?.length);
+    expect(jsonChars(undefined)).toBeUndefined();
+  });
+
+  test("a long string member is streamed in pieces and the text is what JSON.stringify writes", async () => {
+    // a pair across a piece boundary, control characters, lone surrogates and two-byte characters
+    const readme = `${"r".repeat(65_535)}😀${"\u0001\"\\".repeat(30_000)}\ud800${"€".repeat(70_000)}\udc00`;
+    const body = { name: "p", readme, description: "short", list: [1, 2, 3] };
+    const text = await streamedJson(body, null).text();
+
+    expect(text).toBe(JSON.stringify(body));
+    expect(JSON.parse(text)).toEqual(body);
+  });
+
+  test("the longest piece of an answer with a megabytes-long readme is bounded by a chunk, not by the readme", () => {
+    const readme = "x".repeat(8 * 1024 * 1024);
+    const longest = longestPiece({ name: "p", readme, versions: [{ version: "1.0.0", deprecated: "d".repeat(200_000) }] });
+
+    // the versions member is one piece of its own; the readme is written 64 KiB at a time
+    expect(longest).toBeLessThan(500_000);
+    expect(longest).toBeGreaterThan(200_000);
+    expect(streamWeight(longest)).toBeLessThan(STREAM_OVERHEAD_WEIGHT + 2 * 1024 * 1024);
+    // without a long string, the longest piece is its member's JSON exactly: `,"key":` and the text
+    expect(longestPiece({ a: 1, list: ["x".repeat(1000)] })).toBe(`,"list":`.length + JSON.stringify(["x".repeat(1000)]).length);
   });
 });

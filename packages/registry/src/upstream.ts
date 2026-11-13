@@ -466,6 +466,37 @@ export type DevDependencyRead = { readonly byVersion: ReadonlyMap<string, unknow
  */
 const SHARE_TIMEOUT_MS = 20_000;
 
+/**
+ * Like Effect.tryPromise, but an interruption is joined: it aborts the signal `run` was given and waits for the
+ * promise to settle before the interrupted fiber ends. A read (readPackument) stopped this way has canceled its stream
+ * and given its charge back by then, so the scope that releases its lease runs after nothing refers to the read any
+ * more. Effect.tryPromise aborts the signal but does not wait, and a lease released then is closed under a read that
+ * is still running (review of 747a032, finding 1).
+ */
+const joinedPromise = <A>(run: (signal: AbortSignal) => Promise<A>): Effect.Effect<A, unknown> =>
+  Effect.callback<A, unknown>((resume, signal) => {
+    let pending: Promise<A>;
+
+    try {
+      pending = run(signal);
+    } catch (e) {
+      resume(Effect.fail(e));
+
+      return;
+    }
+
+    pending.then(
+      (a) => resume(Effect.succeed(a)),
+      (cause) => resume(Effect.fail(cause)),
+    );
+
+    // run when the fiber is interrupted, after `signal` has aborted: the fiber ends once the promise has settled
+    return Effect.promise(() => pending.then(
+      () => undefined,
+      () => undefined,
+    ));
+  });
+
 export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/registry/Upstream") {
   /**
    * The proxy of `baseUrl` (ending with "/"). `background` finishes work after the response (the shared packument
@@ -602,47 +633,47 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * here: the caller starts one (shareCopy) once converting the read has fit.
          */
         const fetchPackument = (input: { url: string; now: number; profile: KeepProfile; lease: Lease }): Effect.Effect<PackumentAnswer, unknown> =>
-          Effect.tryPromise({
-            try: async (): Promise<PackumentAnswer> => {
-              const { url, now, profile, lease } = input;
-              const key = packumentKey(url, profile);
-              const shared = sharing ? workerCache() : null;
-              const cacheStart = performance.now();
-              const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
-              // a copy with no time (written before copies carried one) or past its TTL is not used
-              const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
+          // an interrupted read (a sibling of a parallel lookup failed, the request ended) cancels its stream and gives
+          // its charge back before the fiber ends, so the lease is never released under it
+          joinedPromise(async (interrupted): Promise<PackumentAnswer> => {
+            const { url, now, profile, lease } = input;
+            const key = packumentKey(url, profile);
+            const shared = sharing ? workerCache() : null;
+            const cacheStart = performance.now();
+            const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
+            // a copy with no time (written before copies carried one) or past its TTL is not used
+            const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
-              if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
-                const read = await readPackument(hit.body, { profile, lease });
-                timing?.add("npm-cache", performance.now() - cacheStart);
+            if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
+              const read = await readPackument(hit.body, { profile, lease, signal: interrupted });
+              timing?.add("npm-cache", performance.now() - cacheStart);
 
-                return answerOf(url, read, sentAt, false);
-              }
+              return answerOf(url, read, sentAt, false);
+            }
 
-              await hit?.body?.cancel();
-              const npmStart = performance.now();
-              const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+            await hit?.body?.cancel();
+            const npmStart = performance.now();
+            const signal = AbortSignal.any([interrupted, AbortSignal.timeout(10_000)]);
+            const res = await fetch(url, { headers: { accept: "application/json" }, signal });
 
-              if (res.status !== 200 || !res.body) {
-                await res.body?.cancel();
-                timing?.add("npm", performance.now() - npmStart);
-
-                return { kind: "status", status: res.status === 200 ? 502 : res.status, fetchedAt: now };
-              }
-
-              const read = await readPackument(res.body, { profile, lease });
+            if (res.status !== 200 || !res.body) {
+              await res.body?.cancel();
               timing?.add("npm", performance.now() - npmStart);
 
-              return answerOf(url, read, now, true);
-            },
-            catch: (cause) => cause,
+              return { kind: "status", status: res.status === 200 ? 502 : res.status, fetchedAt: now };
+            }
+
+            const read = await readPackument(res.body, { profile, lease, signal });
+            timing?.add("npm", performance.now() - npmStart);
+
+            return answerOf(url, read, now, true);
           });
 
         /**
          * Gives the data center's cache a copy of a packument npm just sent, written a version at a time as it is put,
          * so it is never held whole as one string. The write is background work with a lease of its own: it holds
          * `block` (the memory the copy is written from) and what serializing it takes (streamWeight) until the put
-         * settles, is stopped (SHARE_TIMEOUT_MS), or the runtime has stopped it. Nothing is written when that does not
+         * settles or is stopped (SHARE_TIMEOUT_MS, or its lease's deadline). Nothing is written when that does not
          * fit (review of 6862fc7, finding 3).
          */
         const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool }): void => {
@@ -657,7 +688,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
           const done = (): void => work.release();
           const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt) };
-          const signal = AbortSignal.timeout(SHARE_TIMEOUT_MS);
+          // stopped at SHARE_TIMEOUT_MS, or at the lease's deadline: the stream then drops the package, and only that
+          // lets the lease go before the put settles
+          const signal = AbortSignal.any([work.signal, AbortSignal.timeout(SHARE_TIMEOUT_MS)]);
           const copy = streamedJson(input.body, "versions", headers, { signal, onDone: () => (signal.aborted ? done() : undefined) });
 
           background(

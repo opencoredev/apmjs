@@ -38,10 +38,11 @@ export const REQUEST_WEIGHT = 72 * MiB;
 export const CACHE_WEIGHT = 32 * MiB;
 
 /**
- * How long background work may hold its lease. A Worker finishes work it was handed (waitUntil) for at most 30 seconds
- * after the response; past this the runtime has stopped it, so what it held is no longer reachable and is given back.
+ * How long background work may run before it is told to stop: its lease's signal aborts then. The lease is not given
+ * back at the deadline: the work lets go once it has stopped (and dropped what it refers to), and work that does not
+ * stop keeps its charge, so the pool never counts as free memory something still refers to.
  */
-export const BACKGROUND_DEADLINE_MS = 60_000;
+export const BACKGROUND_DEADLINE_MS = 30_000;
 
 /** Memory several holders may refer to at once: counted once in the pool while any of them holds it. */
 export class Block {
@@ -78,16 +79,13 @@ export class Lease {
   private holds = 1;
   private openerGone = false;
   private openFlag = true;
-  /** For background work: when the runtime has stopped it for sure. */
-  readonly deadline: number;
 
   /** @internal made by MemoryPool and Lease.child only */
-  constructor(input: { pool: MemoryPool; kind: LeaseKind; limit: number; parent: Lease | null; deadline: number }) {
+  constructor(input: { pool: MemoryPool; kind: LeaseKind; limit: number; parent: Lease | null }) {
     this.pool = input.pool;
     this.kind = input.kind;
     this.limit = input.limit;
     this.parent = input.parent;
-    this.deadline = input.deadline;
   }
 
   get open(): boolean {
@@ -204,7 +202,7 @@ export class Lease {
   /** A lease that counts against this one (and its parents) with a limit of its own, for part of a request's work. */
   child(limit: number = Number.POSITIVE_INFINITY): Lease {
     this.assertOpen();
-    const made = new Lease({ pool: this.pool, kind: "child", limit, parent: this, deadline: this.deadline });
+    const made = new Lease({ pool: this.pool, kind: "child", limit, parent: this });
     this.children.add(made);
 
     return made;
@@ -237,7 +235,7 @@ export class Lease {
   }
 
   /** Gives everything back: its children's, its blocks (freed when no one else holds them), its own weight. */
-  private close(): void {
+  protected close(): void {
     if (!this.openFlag) return;
 
     // deleting the entry being visited is safe while iterating a Set
@@ -249,10 +247,43 @@ export class Lease {
     this.parent?.children.delete(this);
     this.pool.closed(this);
   }
+}
 
-  /** @internal the pool ends a background lease past its deadline */
-  expire(): void {
-    this.close();
+/**
+ * The lease of work that runs after the response. `signal` aborts at its deadline (BACKGROUND_DEADLINE_MS): the work
+ * stops, lets go of what it refers to, and only then releases the lease. Until it does, what it holds stays charged.
+ */
+export class BackgroundLease extends Lease {
+  /** When the work must stop: it aborts at `deadline`, or when the pool finds it past it. */
+  readonly signal: AbortSignal;
+  /** By the pool's clock. */
+  readonly deadline: number;
+  private readonly stopper = new AbortController();
+  private timer: ReturnType<typeof setTimeout> | null;
+
+  /** @internal made by MemoryPool.backgroundLease only */
+  constructor(input: { pool: MemoryPool; deadline: number; ms: number }) {
+    super({ pool: input.pool, kind: "background", limit: Number.POSITIVE_INFINITY, parent: null });
+    this.deadline = input.deadline;
+    this.signal = this.stopper.signal;
+    this.timer = setTimeout(() => this.stop(), input.ms);
+  }
+
+  /** Tells the work to stop. Nothing is given back here: the work releases the lease once it has stopped. */
+  stop(): void {
+    this.clearTimer();
+
+    if (!this.stopper.signal.aborted) this.stopper.abort(new Error("the background work passed its deadline"));
+  }
+
+  private clearTimer(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  protected override close(): void {
+    this.clearTimer();
+    super.close();
   }
 }
 
@@ -264,7 +295,7 @@ export class MemoryPool {
   private used = 0;
   private peak = 0;
   private readonly reclaimers: Reclaimer[] = [];
-  private readonly background = new Set<Lease>();
+  private readonly background = new Set<BackgroundLease>();
   private cacheLease: Lease | null = null;
   private readonly clock: () => number;
 
@@ -289,22 +320,23 @@ export class MemoryPool {
 
   /** A request's lease: the route handler opens one and every read the request makes takes from it. */
   request(limit: number = REQUEST_WEIGHT): Lease {
-    return new Lease({ pool: this, kind: "request", limit, parent: null, deadline: Number.POSITIVE_INFINITY });
+    return new Lease({ pool: this, kind: "request", limit, parent: null });
   }
 
   /** The isolate cache's lease, one per pool (`limit` counts only when it is first made). */
   cache(limit: number = CACHE_WEIGHT): Lease {
-    this.cacheLease ??= new Lease({ pool: this, kind: "cache", limit, parent: null, deadline: Number.POSITIVE_INFINITY });
+    this.cacheLease ??= new Lease({ pool: this, kind: "cache", limit, parent: null });
 
     return this.cacheLease;
   }
 
   /**
    * A lease for work that runs after the response (a shared-cache write, the review's look at a package), with no
-   * limit but the pool's. It ends at BACKGROUND_DEADLINE_MS at the latest.
+   * limit but the pool's. Its signal tells the work to stop at BACKGROUND_DEADLINE_MS; the lease stays open, and
+   * charged, until the work has stopped and released it.
    */
-  backgroundLease(): Lease {
-    const made = new Lease({ pool: this, kind: "background", limit: Number.POSITIVE_INFINITY, parent: null, deadline: this.clock() + BACKGROUND_DEADLINE_MS });
+  backgroundLease(): BackgroundLease {
+    const made = new BackgroundLease({ pool: this, deadline: this.clock() + BACKGROUND_DEADLINE_MS, ms: BACKGROUND_DEADLINE_MS });
     this.background.add(made);
 
     return made;
@@ -341,13 +373,15 @@ export class MemoryPool {
 
   /** @internal */
   closed(lease: Lease): void {
-    this.background.delete(lease);
+    if (lease instanceof BackgroundLease) this.background.delete(lease);
   }
 
   private makeRoom(need: number): void {
     const now = this.clock();
 
-    for (const l of this.background) if (now >= l.deadline) l.expire();
+    // work past its deadline is told to stop (in case its timer has not fired); what it holds stays charged until it
+    // has, so this take is not given that room
+    for (const l of this.background) if (now >= l.deadline) l.stop();
     const target = this.used - need;
 
     for (const reclaim of this.reclaimers) {

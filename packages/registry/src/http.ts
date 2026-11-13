@@ -44,12 +44,131 @@ function membersOf(value: unknown, spread: boolean): Iterable<readonly [string, 
   return null;
 }
 
-/** The JSON text of `body`, an object, in pieces: each member on its own, and the members of `spread` one at a time. */
-function* jsonPieces<T extends object>(body: T, spread: keyof T & string): Generator<string> {
+const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xdbff;
+
+const isLowSurrogate = (unit: number): boolean => unit >= 0xdc00 && unit <= 0xdfff;
+
+/** The characters JSON.stringify writes for `text` between its quotes, counted without building them. */
+function escapedChars(text: string): number {
+  let n = 0;
+
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+
+    if (unit === 0x22 || unit === 0x5c || unit === 0x08 || unit === 0x09 || unit === 0x0a || unit === 0x0c || unit === 0x0d) n += 2;
+    else if (unit < 0x20) n += 6;
+    else if (isHighSurrogate(unit) && i + 1 < text.length && isLowSurrogate(text.charCodeAt(i + 1))) {
+      n += 2;
+      i++;
+    } else if (isHighSurrogate(unit) || isLowSurrogate(unit)) n += 6;
+    else n += 1;
+  }
+
+  return n;
+}
+
+/**
+ * The length of JSON.stringify(value), counted without building it, or undefined where JSON.stringify gives none: the
+ * size of an answer, charged before it is serialized. Mirrors JSON.stringify for what route code answers with (plain
+ * objects and arrays of strings, numbers, booleans and null, and values with toJSON, such as a Date).
+ */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- the response boundary: whatever JSON.stringify accepts
+export function jsonChars(value: unknown, key = ""): number | undefined {
+  let v = value;
+
+  if (v instanceof Object && "toJSON" in v && v.toJSON instanceof Function) v = v.toJSON(key);
+
+  if (v instanceof Number) v = Number(v);
+  else if (v instanceof String) v = String(v);
+  else if (v instanceof Boolean) v = v.valueOf();
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON.stringify decides what to write by typeof, and so does this count of it
+  switch (typeof v) {
+    case "string":
+      return escapedChars(v) + 2;
+    case "number":
+      return Number.isFinite(v) ? String(v).length : 4;
+    case "boolean":
+      return v ? 4 : 5;
+    case "bigint":
+      throw new TypeError("Do not know how to serialize a BigInt");
+    case "undefined":
+    case "function":
+    case "symbol":
+      return undefined;
+    case "object": {
+      if (v === null) return 4;
+
+      if (Array.isArray(v)) {
+        let n = 2 + Math.max(0, v.length - 1);
+
+        for (let i = 0; i < v.length; i++) n += jsonChars(v[i], String(i)) ?? 4;
+
+        return n;
+      }
+
+      let n = 2;
+      let members = 0;
+
+      for (const [k, member] of Object.entries(v)) {
+        const chars = jsonChars(member, k);
+
+        if (chars === undefined) continue;
+        n += escapedChars(k) + 3 + chars + (members > 0 ? 1 : 0);
+        members++;
+      }
+
+      return n;
+    }
+
+    default:
+      // typeof has no other answer
+      return undefined;
+  }
+}
+
+/** A member streamedJson writes in pieces of it rather than whole: a string longer than a chunk (a readme). */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- the response boundary: a member of the body, whatever JSON.stringify accepts
+function isLongString(value: unknown): value is string {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- JSON.stringify writes a string by its typeof, not by a schema
+  return typeof value === "string" && value.length > STREAM_CHUNK_CHARS;
+}
+
+/**
+ * The JSON text of a long string, after its opening quote and before its closing one, in pieces of at most
+ * STREAM_CHUNK_CHARS characters of the string (a surrogate pair is never split): the text is never built whole.
+ */
+function* stringPieces(text: string): Generator<string> {
+  for (let at = 0; at < text.length; ) {
+    let to = Math.min(text.length, at + STREAM_CHUNK_CHARS);
+
+    if (to < text.length && isHighSurrogate(text.charCodeAt(to - 1)) && isLowSurrogate(text.charCodeAt(to))) to++;
+    yield JSON.stringify(text.slice(at, to)).slice(1, -1);
+    at = to;
+  }
+}
+
+/** The most characters one piece of stringPieces is: each character of a chunk escaped to six. */
+const STRING_PIECE_CHARS = 6 * (STREAM_CHUNK_CHARS + 1);
+
+/**
+ * The JSON text of `body`, an object, in pieces: each member on its own, the members of `spread` one at a time, and a
+ * member that is a string longer than STREAM_CHUNK_CHARS (a readme) in pieces of it.
+ */
+function* jsonPieces<T extends object>(body: T, spread: (keyof T & string) | null): Generator<string> {
   let first = true;
 
   for (const [key, value] of Object.entries(body)) {
     const head = `${first ? "{" : ","}${JSON.stringify(key)}:`;
+
+    if (isLongString(value)) {
+      yield `${head}"`;
+      yield* stringPieces(value);
+      yield '"';
+      first = false;
+      continue;
+    }
+
     const members = membersOf(value, key === spread);
 
     if (members) {
@@ -96,7 +215,22 @@ export const streamWeight = (maxPieceChars: number): number => 4 * maxPieceChars
 /** When a streamed answer ends: `onDone` once it is sent, failed or canceled, or `signal` aborted it. */
 export type StreamOptions = { readonly signal?: AbortSignal; readonly onDone?: () => void };
 
-const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xdbff;
+/**
+ * The longest piece streamedJson(body, null) writes, in characters, counted without building it: the answer's
+ * streamWeight is charged from it before the stream is made. A long string member counts as its largest piece.
+ */
+export function longestPiece<T extends object>(body: T): number {
+  let longest = 1;
+
+  for (const [key, value] of Object.entries(body)) {
+    const head = escapedChars(key) + 4;
+    const chars = isLongString(value) ? STRING_PIECE_CHARS : jsonChars(value, key);
+
+    if (chars !== undefined) longest = Math.max(longest, head + chars);
+  }
+
+  return longest;
+}
 
 /**
  * Like json, for an object with large members (`spread`, a packument's `versions`, and any LazyMembers): the text is
@@ -109,7 +243,7 @@ const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xd
  * a failed download, never as a complete packument. Callers make what can fail before they call this (apm.ts,
  * upstreamPackument); this stays the backstop, and logs.
  */
-export function streamedJson<T extends object>(body: T, spread: keyof T & string, headers: Readonly<Record<string, string>> = {}, options: StreamOptions = {}): Response {
+export function streamedJson<T extends object>(body: T, spread: (keyof T & string) | null, headers: Readonly<Record<string, string>> = {}, options: StreamOptions = {}): Response {
   // dropped when the stream ends: what still refers to the stream (a timer's abort listener, a reader that never lets
   // go of it) then holds none of `body`
   let pieces: Generator<string> | null = jsonPieces(body, spread);

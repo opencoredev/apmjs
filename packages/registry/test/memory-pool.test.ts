@@ -15,7 +15,7 @@ import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Store } from "../src/db.ts";
 import { STREAM_OVERHEAD_WEIGHT } from "../src/http.ts";
-import { CACHE_WEIGHT, MemoryPool, POOL_WEIGHT, REQUEST_WEIGHT, type Lease } from "../src/memory.ts";
+import { BACKGROUND_DEADLINE_MS, CACHE_WEIGHT, MemoryPool, POOL_WEIGHT, REQUEST_WEIGHT, type Lease } from "../src/memory.ts";
 import { READ_OVERHEAD_WEIGHT, readPackument } from "../src/packument-read.ts";
 import { packageMoment, packageWeight, Upstream, type UpstreamApi } from "../src/upstream.ts";
 
@@ -100,15 +100,30 @@ describe("leases of one pool", () => {
     expect(() => request.take(1)).toThrow("used after it was released");
   });
 
-  test("background work past its deadline is given back when the pool needs the room", () => {
+  test("background work past its deadline is told to stop, and keeps its charge until it has", () => {
     let now = 0;
     const pool = new MemoryPool(100, () => now);
     const work = pool.backgroundLease();
     expect(work.take(80)).toBe(true);
 
     expect(pool.request().take(30)).toBe(false);
-    now = 61_000;
+    expect(work.signal.aborted).toBe(false);
+    now = BACKGROUND_DEADLINE_MS;
+    // on 747a032 the pool closed the lease here and gave the room away while the work still referred to it
+    expect(pool.request().take(30)).toBe(false);
+    expect([work.signal.aborted, work.open, pool.charged]).toEqual([true, true, 80]);
+    // the work has stopped and lets go: only now is the room free
+    work.release();
     expect(pool.request().take(30)).toBe(true);
+  });
+
+  test("stopping background work aborts its signal and gives nothing back", () => {
+    const work = new MemoryPool().backgroundLease();
+    expect(work.signal.aborted).toBe(false);
+    work.stop();
+    expect(work.signal.aborted).toBe(true);
+    expect(work.open).toBe(true);
+    work.release();
     expect(work.open).toBe(false);
   });
 });

@@ -10,7 +10,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import cloudflareRolldown from "@alchemy.run/cloudflare-runtime/rolldown";
 import { Miniflare } from "miniflare";
+import { rolldown } from "rolldown";
 import { z } from "zod";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../scripts/compat.ts";
 
@@ -104,9 +106,12 @@ export async function startWorkerdHeap(entry: string): Promise<WorkerdHeap> {
   const entryPath = join(dir, "entry.js");
 
   await Bun.write(entryPath, entry);
-  const built = await Bun.build({ entrypoints: [entryPath], outdir: dir, target: "browser", format: "esm", external: ["node:*"], naming: "worker.js" });
+  // bundled as the deploy bundles the Worker (scripts/build.ts), so an entry can import the routes and their auth and
+  // Postgres modules
+  const bundle = await rolldown({ input: entryPath, external: ["lightningcss", "fsevents"], plugins: [cloudflareRolldown({ compatibilityDate: COMPATIBILITY_DATE, compatibilityFlags: [...COMPATIBILITY_FLAGS] })] });
 
-  if (!built.success) throw new Error(built.logs.map(String).join("\n"));
+  await bundle.write({ dir, format: "esm", entryFileNames: "worker.js", codeSplitting: false, minify: false, sourcemap: false });
+  await bundle.close();
   const port = await freePort();
   let inspector: Inspector | null = null;
   // Miniflare reads workerd's V8 flags from the environment when it starts workerd
@@ -114,8 +119,8 @@ export async function startWorkerdHeap(entry: string): Promise<WorkerdHeap> {
   process.env.MINIFLARE_WORKERD_V8_FLAGS = "--expose-gc";
 
   const mf = new Miniflare({
-    modules: true,
-    script: await Bun.file(join(dir, "worker.js")).text(),
+    modulesRoot: dir,
+    modules: [{ type: "ESModule", path: join(dir, "worker.js"), contents: await Bun.file(join(dir, "worker.js")).text() }],
     compatibilityDate: COMPATIBILITY_DATE,
     compatibilityFlags: [...COMPATIBILITY_FLAGS],
     inspectorPort: port,

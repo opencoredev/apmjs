@@ -1179,15 +1179,31 @@ class Scanner {
   }
 }
 
-export type ReadOptions = { readonly lease: Lease; readonly limits?: PackumentLimits; readonly profile?: KeepProfile };
+export type ReadOptions = {
+  readonly lease: Lease;
+  readonly limits?: PackumentLimits;
+  readonly profile?: KeepProfile;
+  /**
+   * Stops the read: the stream is canceled, that cancel is waited for, and only then is the read's charge given back
+   * and the read rejected with the signal's reason. Whoever stops a read waits for it to settle before it releases
+   * the lease (upstream.ts, joined).
+   */
+  readonly signal?: AbortSignal;
+};
 
 /**
  * Reads a packument's body under `limits`, keeping what `profile` names (TRIMMED by default), and taking what it keeps
- * from `lease`, which must be open. Cancels the stream when it stops early.
+ * from `lease`, which must be open. Cancels the stream when it stops early, and settles only once that cancel has.
  */
 export async function readPackument(body: ReadableStream<Uint8Array>, options: ReadOptions): Promise<PackumentRead> {
   const { lease } = options;
   lease.assertOpen();
+  const signal = options.signal ?? null;
+
+  if (signal?.aborted) {
+    await body.cancel(signal.reason).catch(() => undefined);
+    throw signal.reason;
+  }
 
   if (!lease.take(READ_OVERHEAD_WEIGHT)) {
     await body.cancel().catch(() => undefined);
@@ -1196,19 +1212,32 @@ export async function readPackument(body: ReadableStream<Uint8Array>, options: R
   }
 
   try {
-    return await scan(body, { ...options, limits: options.limits ?? PACKUMENT_LIMITS, profile: options.profile ?? TRIMMED });
+    return await scan(body, { lease, limits: options.limits ?? PACKUMENT_LIMITS, profile: options.profile ?? TRIMMED, signal });
   } finally {
     lease.give(READ_OVERHEAD_WEIGHT);
   }
 }
 
-async function scan(body: ReadableStream<Uint8Array>, options: Required<ReadOptions>): Promise<PackumentRead> {
-  const scanner = new Scanner({ limits: options.limits, profile: options.profile, lease: options.lease });
+type ScanOptions = { readonly lease: Lease; readonly limits: PackumentLimits; readonly profile: KeepProfile; readonly signal: AbortSignal | null };
+
+async function scan(body: ReadableStream<Uint8Array>, options: ScanOptions): Promise<PackumentRead> {
+  // null once the read has failed: what it built is then unreachable while the stream's cancel is waited for
+  let scanner: Scanner | null = new Scanner({ limits: options.limits, profile: options.profile, lease: options.lease });
   const reader = body.getReader();
+  const { signal } = options;
+  // one cancel, whoever starts it: an abort while a read is pending, or a read that failed. Not a Promise.race of each
+  // read against the signal: every race would stay on the signal's promise, and keep its chunk, until the read ends
+  let cancelling: Promise<void> | null = null;
+  const cancel = (): Promise<void> => (cancelling ??= reader.cancel(signal?.aborted ? signal.reason : undefined).catch(() => undefined));
+  const onAbort = (): void => void cancel();
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
+
+      // a pending read the abort canceled ends as done: the read stops, it does not finish
+      if (signal?.aborted) throw signal.reason;
 
       if (done) break;
       scanner.feed(value);
@@ -1228,15 +1257,22 @@ async function scan(body: ReadableStream<Uint8Array>, options: Required<ReadOpti
       maxPieceChars: scanner.maxPieceChars,
     };
   } catch (e) {
-    // given back before anything awaits, so reads in flight with this one see the room at once
-    options.lease.give(scanner.taken);
-    await reader.cancel().catch(() => undefined);
+    // every reference to what the scanner built is dropped first, and its charge is given back only once the cancel
+    // has settled: until then the stream (and whatever its source holds) may still refer to the read's memory
+    const taken = scanner?.taken ?? 0;
+    scanner = null;
+
+    // an error's stack refers to the objects its frames ran on (the scanner, from feed) until it is formatted
+    if (e instanceof Error) void e.stack;
+    await cancel();
+    options.lease.give(taken);
 
     if (e instanceof TooLarge) return { kind: "too-large", over: e.over, bytes: e.bytes, limit: e.limit };
 
     if (e instanceof InvalidPackument) return { kind: "invalid", reason: e.message };
     throw e;
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }

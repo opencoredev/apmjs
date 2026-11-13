@@ -280,17 +280,89 @@ describe("readPackument", () => {
     expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, lease: alone })).kind).toBe("ok");
     expect(alone.taken).toBeLessThan(31_000);
     expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, lease: leaseOf(115_000) })).kind).toBe("too-large");
-    // three in step hold one another's text: the first to parse finds no room, the two after it do
+    // three in step hold one another's text: the first to parse finds no room. A refused read keeps its charge until
+    // its stream's cancel has settled (review of 747a032, finding 2), so in step the others may find none either
     const budget = leaseOf(160_000, 3);
     const reads = await Promise.all([1, 2, 3].map((n) => readPackument(streamOf(one(n), 1_024), { limits: LIMITS, lease: budget })));
 
-    expect(reads.map((r) => r.kind).toSorted()).toEqual(["ok", "ok", "too-large"]);
+    expect(reads.filter((r) => r.kind === "too-large").length).toBeGreaterThanOrEqual(1);
     expect(reads.find((r) => r.kind === "too-large")).toMatchObject({ over: "budget", limit: 160_000 + 3 * READ_OVERHEAD_WEIGHT });
-    // the two that were kept stay taken, at what they weigh now; the refused one's partial take was given back
+    // the ones that were kept stay taken, at what they weigh now; the refused ones' partial takes were given back
     const kept = reads.reduce((n, r) => n + (r.kind === "ok" ? r.weight : 0), 0);
 
     expect(budget.taken).toBe(kept);
     expect(kept).toBeLessThan(2 * 31_000);
+    // one after another, two fit where three in step did not
+    const after = leaseOf(160_000, 2);
+
+    for (const n of [4, 5]) expect((await readPackument(streamOf(one(n), 1_024), { limits: LIMITS, lease: after })).kind).toBe("ok");
+  });
+
+  test("a refused read keeps its charge until its stream's cancel has settled, then gives all of it back", async () => {
+    // review of 747a032, finding 2: the charge was given back before the cancel was awaited, while the scanner still
+    // referred to what it had read
+    const lease = leaseOf(1_000_000);
+    let cancelStarted = (): void => undefined;
+    let finishCancel = (): void => undefined;
+    const started = new Promise<void>((r) => (cancelStarted = r));
+    const stalled = new Promise<void>((r) => (finishCancel = r));
+    let step = 0;
+
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (step++ === 0) c.enqueue(new TextEncoder().encode(`{"name":"p","readme":"${"x".repeat(100_000)}","versions":{}}!`));
+      },
+      cancel() {
+        cancelStarted();
+
+        return stalled;
+      },
+    });
+
+    const pending = readPackument(body, { limits: LIMITS, lease });
+
+    await started;
+    // what the read took is still charged while the cancel runs
+    expect(lease.taken).toBeGreaterThan(100_000 + READ_OVERHEAD_WEIGHT);
+    finishCancel();
+
+    expect((await pending).kind).toBe("invalid");
+    expect(lease.taken).toBe(0);
+  });
+
+  test("an aborted read cancels its stream, waits for that, and gives every charge back before it rejects", async () => {
+    const lease = leaseOf(1_000_000);
+    const abort = new AbortController();
+    let cancelled = false;
+    let reached = (): void => undefined;
+    const parked = new Promise<void>((r) => (reached = r));
+    let step = 0;
+
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        if (step++ === 0) {
+          c.enqueue(new TextEncoder().encode(`{"name":"p","versions":{},"readme":"${"x".repeat(100_000)}`));
+
+          return;
+        }
+
+        reached();
+        await new Promise(() => undefined);
+      },
+      async cancel() {
+        await Bun.sleep(5);
+        cancelled = true;
+      },
+    });
+
+    const pending = readPackument(body, { limits: LIMITS, lease, signal: abort.signal });
+
+    await parked;
+    expect(lease.taken).toBeGreaterThan(100_000);
+    abort.abort(new Error("stopped"));
+
+    await expect(pending).rejects.toThrow("stopped");
+    expect([cancelled, lease.taken]).toEqual([true, 0]);
   });
 
   for (const [what, text] of [
