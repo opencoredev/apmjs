@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -235,6 +235,42 @@ type Resolved = {
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
 
+/**
+ * How long `apm add` and `apm x` keep asking about a version the registry is still analysing: 90 s in all, each ask
+ * itself waiting up to about 20 s at the registry. APM_PENDING_WAIT_MS sets another bound (tests).
+ */
+export const PENDING_WAIT_MS = 90_000;
+
+function pendingWaitMs(): number {
+  const n = Number(process.env.APM_PENDING_WAIT_MS);
+
+  return Number.isFinite(n) && n >= 0 ? n : PENDING_WAIT_MS;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * GET /resolve, asked again while the registry answers 202 (still analysing) until PENDING_WAIT_MS is over, with a
+ * progress line each time. The last answer is returned: a 202 then still means pending, and is refused.
+ */
+async function resolveWaiting(api: Api, name: string, params: URLSearchParams): Promise<{ status: number; body: unknown }> {
+  const started = Date.now();
+  const limit = pendingWaitMs();
+
+  for (;;) {
+    const r = await api.raw(`-/apm/v1/resolve?${params}`);
+    const pending = r.status === 202 ? ResolvePending.safeParse(r.body) : null;
+    const elapsed = Date.now() - started;
+
+    if (!pending?.success || elapsed >= limit) return r;
+    const count = pending.data.pendingCount ?? pending.data.pending.length;
+
+    say(dim(`apm: ${name}: ${count === 1 ? "1 version is" : `${count} versions are`} still being analysed (${pending.data.pending.slice(0, 3).map((p) => `${p.name}@${p.version}`).join(", ")}${count > 3 ? ", …" : ""}); waiting, ${Math.round(elapsed / 1000)}s of ${Math.round(limit / 1000)}s`));
+    // at least a second between asks, whatever the registry says
+    await sleep(Math.min(Math.max(1, pending.data.retryAfter ?? 5) * 1000, Math.max(0, limit - elapsed)));
+  }
+}
+
 async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
@@ -245,7 +281,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   else if (flag(a, "cooldown")) params.set("cooldown", flag(a, "cooldown") ?? "24h");
   if (force) params.set("floor", "0");
   else if (flag(a, "floor")) params.set("floor", flag(a, "floor") ?? "40");
-  const r = await api.raw(`-/apm/v1/resolve?${params}`);
+  const r = await resolveWaiting(api, name, params);
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
@@ -258,6 +294,25 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
 
     return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [] };
+  }
+
+  if (r.status === 202) {
+    // still pending after the wait: no score is not a pass, and --force cannot lift it
+    const p = ResolvePending.parse(r.body);
+    const count = p.pendingCount ?? p.pending.length;
+    const listed = p.pending.slice(0, 5).map((d) => `${d.name}@${d.version}`).join(", ");
+
+    return {
+      name,
+      version: p.version,
+      report: null,
+      skipped: [],
+      blocked: `${name}${p.version ? `@${p.version}` : ""} is still being analysed, try again in a minute (${count === 1 ? "1 version has" : `${count} versions have`} no score yet: ${listed}${count > 5 ? ", …" : ""})`,
+      forceable: false,
+      source: "apm",
+      unchecked: [],
+      tree: [],
+    };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
@@ -294,6 +349,10 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
   }
 
   if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm has not scored or cannot score, unknown names and dangerous dependencies stay blocked.`);
+
+  const analysing = blocked.filter((b) => b.blocked?.includes("still being analysed"));
+
+  if (analysing.length > 0) say(`apm scores a version before anything installs it. Run apm ${verb} ${analysing.map((b) => b.name).join(" ")} again in a minute.`);
 }
 
 const DistSchema = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose() }).loose()) }).loose();

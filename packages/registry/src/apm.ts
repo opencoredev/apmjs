@@ -1,7 +1,7 @@
 // apm extensions on top of the npm protocol: publish guards, scoring, version states,
 // incident response, name search, the ~safe view, server-side resolve, the scan API and
 // the upstream proxy.
-import { Effect, Option } from "effect";
+import { Context, Effect, Option } from "effect";
 import { z } from "zod";
 import {
   analyze,
@@ -1493,7 +1493,13 @@ type UncheckedDep = { dependency: string; reason: string; via: string[] };
  * `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry.
  * `digests`: the tarball digest of each of those, which keys its AI review; not sent.
  */
-type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; packages: { name: string; version: string }[]; digests: (string | null)[] };
+type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; pending: PendingDep[]; packages: { name: string; version: string }[]; digests: (string | null)[] };
+
+/**
+ * A version in the tree with no score yet that the registry will score: an upstream version queued for analysis. Never
+ * read as clean, and never as merely unchecked either: a resolve with one waits for it, then answers that it is pending.
+ */
+type PendingDep = { name: string; version: string; via: string[] };
 
 const MAX_UNCHECKED_LISTED = 50;
 
@@ -1526,6 +1532,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
     const at = yield* now;
     const blocks: TreeBlock[] = [];
     const uncheckedDeps: UncheckedDep[] = [];
+    const pending: PendingDep[] = [];
     const packages: Tree["packages"] = [];
     const digests: Tree["digests"] = [];
     let unchecked = 0;
@@ -1628,9 +1635,11 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       digests.push(digest ? digestLabel(digest) : null);
       let v = picked.v;
 
-      if (!parseAnalysis(v.score) && analyses < limits.maxAnalyses) {
-        analyses++;
-        v = yield* ensureAnalyzed(picked.src, v);
+      if (!parseAnalysis(v.score)) {
+        if (analyses < limits.maxAnalyses) {
+          analyses++;
+          v = yield* ensureAnalyzed(picked.src, v);
+        } else if (picked.src.kind === "upstream" && !v.unscorable) yield* Effect.flatMap(Analysis, (a) => a.enqueue(dep.name, v.version));
       }
 
       const age = at - v.published_at;
@@ -1639,8 +1648,11 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       // the package manager installs this version whatever its age, so a fresh one blocks the tree like a low score
       if (age < policy.cooldownMs) {
         blocks.push({ name: dep.name, version: v.version, reason: `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`, via: item.via });
-      } else if (!r) miss(key, "could not be analyzed", item.via);
-      else if (r.score < policy.floor)
+      } else if (!r) {
+        // queued for analysis is pending, not unchecked: the answer waits for it and never passes it
+        if (picked.src.kind === "upstream" && !v.unscorable) pending.push({ name: dep.name, version: v.version, via: item.via });
+        else miss(key, v.unscorable ? notScored(picked.src, v).text : "could not be analyzed", item.via);
+      } else if (r.score < policy.floor)
         blocks.push({
           name: dep.name,
           version: v.version,
@@ -1656,7 +1668,7 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key], level: item.level + 1 });
     }
 
-    const tree: Tree = { blocks, unchecked, uncheckedDeps, packages, digests };
+    const tree: Tree = { blocks, unchecked, uncheckedDeps, pending, packages, digests };
 
     return tree;
   });
@@ -1709,26 +1721,34 @@ const treeReviews = (tree: Tree) =>
   });
 
 /** The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. */
-const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({ blocks: tree.blocks, unchecked: tree.unchecked, uncheckedDeps: tree.uncheckedDeps, packages: tree.packages, reviews });
+const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({ blocks: tree.blocks, unchecked: tree.unchecked, uncheckedDeps: tree.uncheckedDeps, pending: tree.pending, packages: tree.packages, reviews });
 
-/** GET /-/apm/v1/resolve: the newest version in range that passes the policy, and its dependency walk. */
-export const resolveResponse = (url: URL) =>
+/**
+ * How long a resolve waits for queued analyses to land before it answers that they are pending, and how often it
+ * looks. The wait is the database's (one read per look), not CPU. Tests provide a shorter one.
+ */
+export class ResolveWait extends Context.Service<ResolveWait, { readonly maxMs: number; readonly pollMs: number }>()("@apm/registry/ResolveWait") {}
+
+/** About 20 s: inside the website's 25 s timeout for a resolve, and short of the platform's limits on a request. */
+export const RESOLVE_WAIT = { maxMs: 20_000, pollMs: 1_000 } as const;
+
+/** What a client should wait before it asks again about a resolve that is still pending, in seconds. */
+export const PENDING_RETRY_AFTER_S = 10;
+
+/** One pass of the resolve: a final answer, or the versions it is waiting on (the root, its dependencies or both). */
+type ResolvePass = { kind: "answer"; response: Response } | { kind: "pending"; version: string; pending: PendingDep[]; skipped: { version: string; reason: string; revokeReason: string | null }[] };
+
+/** What policyBlock says of a version with no score that the registry will score: the root of a pending resolve. */
+const NOT_SCORED_YET = "not scored yet";
+
+const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
+
+const waitingOn = (p: Omit<Extract<ResolvePass, { kind: "pending" }>, "kind">): ResolvePass => ({ kind: "pending", ...p });
+
+const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source }) =>
   Effect.gen(function* () {
+    const { name, range, policy, treePolicy, src } = input;
     const at = yield* now;
-    const name = url.searchParams.get("name") ?? "";
-    const range = url.searchParams.get("range") || "latest";
-
-    const parsedPolicy = parsePolicy(url);
-
-    if (parsedPolicy.kind === "invalid") return fail(400, parsedPolicy.error);
-    const policy = parsedPolicy.policy;
-    // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
-    // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
-    const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
-
-    const src = yield* lookup(name);
-
-    if (!src) return fail(404, `No package named ${name}.`);
     const tagged = tagTarget(src.distTags, range);
     // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
     // below it, but a stable tag never falls back to a prerelease.
@@ -1747,20 +1767,29 @@ export const resolveResponse = (url: URL) =>
       const v = analyzedCount < 5 ? yield* ensureAnalyzed(src, v0) : v0;
       analyzedCount++;
       const block = policyBlock(v, policy, at);
+      // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
+      const pendingRoot = block === NOT_SCORED_YET && src.kind === "upstream";
 
-      if (block === null) {
+      if (block === null || pendingRoot) {
         const report = reportFor(v, at);
+        // a pending root's tree is walked too, so its dependencies are queued while it is
         const walked = yield* treeBlocks(v, treePolicy);
         const tree = treeAnswer(walked, yield* treeReviews(walked));
 
         if (walked.blocks.length > 0) {
           const list = walked.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
 
-          return json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report: embeddedReport(v, report) }, tree }, 422);
+          return answered(json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report: embeddedReport(v, report) }, tree }, 422));
+        }
+
+        if (pendingRoot || walked.pending.length > 0) {
+          const pending = [...(pendingRoot ? [{ name, version: v.version, via: [] }] : []), ...walked.pending];
+
+          return waitingOn({ version: v.version, pending, skipped });
         }
 
         // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
-        return json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } }, 200, { "cache-control": "no-store" });
+        return answered(json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } }, 200, { "cache-control": "no-store" }));
       }
 
       skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
@@ -1771,10 +1800,83 @@ export const resolveResponse = (url: URL) =>
     const newest = matches[0];
     const newestReport = newest ? reportFor(newest, at) : null;
 
-    return json(
-      { error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
-      422,
+    return answered(
+      json(
+        { error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
+        422,
+      ),
     );
+  });
+
+/** Whether every pending version now has a stored analysis or a decided outcome: one read for all of them. */
+const landed = (pending: readonly PendingDep[]) =>
+  Effect.gen(function* () {
+    const decided = yield* (yield* Store).decidedAnalyses(pending);
+
+    return pending.every((p) => decided.has(`${p.name} ${p.version}`));
+  });
+
+/**
+ * GET /-/apm/v1/resolve: the newest version in range that passes the policy, and its dependency walk. A version in it
+ * that is queued for analysis (the root or a dependency) is never passed: the registry waits up to RESOLVE_WAIT for
+ * the queue to score it, polling the database, then answers from what landed. Anything still pending is answered with
+ * 202, the list of pending versions and Retry-After, never with 200.
+ */
+export const resolveResponse = (url: URL) =>
+  Effect.gen(function* () {
+    const name = url.searchParams.get("name") ?? "";
+    const range = url.searchParams.get("range") || "latest";
+
+    const parsedPolicy = parsePolicy(url);
+
+    if (parsedPolicy.kind === "invalid") return fail(400, parsedPolicy.error);
+    const policy = parsedPolicy.policy;
+    // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
+    // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
+    const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
+
+    let src = yield* lookup(name);
+    const wait = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
+    const looks = Math.max(0, Math.ceil(wait.maxMs / Math.max(1, wait.pollMs)));
+    let waited = 0;
+
+    for (;;) {
+      if (!src) return fail(404, `No package named ${name}.`);
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, src });
+
+      if (pass.kind === "answer") return pass.response;
+
+      // nothing landed yet: look again until it has or the wait is over, then walk again
+      let ready = false;
+
+      while (!ready && waited < looks) {
+        yield* Effect.sleep(wait.pollMs);
+        waited++;
+        ready = yield* landed(pass.pending);
+      }
+
+      if (!ready) {
+        const listed = pass.pending.slice(0, MAX_UNCHECKED_LISTED);
+
+        return json(
+          {
+            error: `${name}@${pass.version} is still being analysed: ${pass.pending.length === 1 ? "1 version has" : `${pass.pending.length} versions have`} no score yet (${listed.map((p) => `${p.name}@${p.version}`).join(", ")}${pass.pending.length > listed.length ? ", …" : ""}). Nothing was installed as if it passed; try again in a minute.`,
+            name,
+            range,
+            version: pass.version,
+            pending: listed,
+            pendingCount: pass.pending.length,
+            retryAfter: PENDING_RETRY_AFTER_S,
+            skipped: pass.skipped,
+          },
+          202,
+          { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
+        );
+      }
+
+      // read afresh: a version the queue scored meanwhile comes back with its analysis
+      src = yield* lookup(name);
+    }
   });
 
 const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })) });
@@ -1790,7 +1892,10 @@ type ScanAdvisory = { package: string; version: string; level: "fatal" | "warn";
 
 type ScanUnchecked = { package: string; version: string; reason: string };
 
-type ScanOne = { kind: "clean" } | { kind: "advisory"; advisory: ScanAdvisory } | { kind: "unchecked"; unchecked: ScanUnchecked };
+/** A version queued for analysis: not clean and not merely unchecked. The scanner waits for it, then blocks it. */
+type ScanPending = { package: string; version: string };
+
+type ScanOne = { kind: "clean" } | { kind: "advisory"; advisory: ScanAdvisory } | { kind: "unchecked"; unchecked: ScanUnchecked } | { kind: "pending"; unchecked: ScanUnchecked };
 
 const scanOne = (p: { name: string; version: string }, baseUrl: string, at: number) =>
   Effect.gen(function* () {
@@ -1815,7 +1920,11 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
 
-    if (!r) return unchecked(notScored(src, v).text);
+    if (!r) {
+      const why = notScored(src, v);
+
+      return why.kind === "queued" ? ({ kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } } satisfies ScanOne) : unchecked(why.text);
+    }
 
     if (r.score >= SCORE_FLOOR) return { kind: "clean" } satisfies ScanOne;
 
@@ -1856,11 +1965,31 @@ const scanResponse = (req: Request, caller: Caller) =>
     const advisories: ScanAdvisory[] = [];
     // Versions the scan could not judge. Missing from `advisories` is not the same as clean.
     const unchecked: ScanUnchecked[] = [];
+    // queued versions are listed twice: in `unchecked`, so a scanner from before `pending` never reads one as clean,
+    // and in `pending`, which a scanner that knows it waits on and then blocks
+    const pending: ScanPending[] = [];
     const results = yield* Effect.forEach(packages.slice(0, cap), (p) => scanOne(p, baseUrl, at), { concurrency: SCAN_CONCURRENCY });
 
     for (const r of results) {
-      if (r.kind === "advisory") advisories.push(r.advisory);
-      else if (r.kind === "unchecked") unchecked.push(r.unchecked);
+      switch (r.kind) {
+        case "advisory":
+          advisories.push(r.advisory);
+          break;
+        case "unchecked":
+          unchecked.push(r.unchecked);
+          break;
+        case "pending":
+          unchecked.push(r.unchecked);
+          pending.push({ package: r.unchecked.package, version: r.unchecked.version });
+          break;
+        case "clean":
+          break;
+        default: {
+          const _exhaustive: never = r;
+
+          return _exhaustive;
+        }
+      }
     }
 
     const over = signedIn
@@ -1869,7 +1998,7 @@ const scanResponse = (req: Request, caller: Caller) =>
 
     for (const p of packages.slice(cap)) unchecked.push({ package: p.name, version: p.version, reason: over });
 
-    return json({ advisories, unchecked });
+    return json(pending.length > 0 ? { advisories, unchecked, pending, retryAfter: PENDING_RETRY_AFTER_S } : { advisories, unchecked, pending });
   });
 
 const AuditBody = z.record(z.string(), z.array(z.string()));

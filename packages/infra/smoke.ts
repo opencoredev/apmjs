@@ -86,13 +86,17 @@ async function stockClients(): Promise<void> {
   record(npm.code === 0 && installed(n, "is-odd") === "3.0.1" && lock.includes(registry), "npm install of a real npm package through the registry", `exit ${npm.code}, lockfile resolves to the registry: ${lock.includes(registry)}`);
 }
 
+// Anonymous, so the registry analyses nothing inline: a version not scored yet is queued, the registry waits for the
+// queue (about 20 s), and apm add asks again for up to 90 s before it refuses. The detail says how long each took.
 async function apmRefusal(): Promise<void> {
   const dir = project("apm-app");
   const env = { APM_REGISTRY: registry };
+  const t0 = Date.now();
   const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0"], dir, env);
-  record(bad.code !== 0 && installed(dir, "puppeteer") === null && /below 40/.test(bad.out), "apm add refuses a low-score npm package (puppeteer@1.20.0)", `exit ${bad.code}, installed ${installed(dir, "puppeteer")}`);
+  record(bad.code !== 0 && installed(dir, "puppeteer") === null && /below 40/.test(bad.out), "apm add refuses a low-score npm package (puppeteer@1.20.0)", `exit ${bad.code}, installed ${installed(dir, "puppeteer")}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  const t1 = Date.now();
   const good = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "ms"], dir, env);
-  record(good.code === 0 && installed(dir, "ms") !== null, "apm add installs a clean npm package (ms)", `exit ${good.code}`);
+  record(good.code === 0 && installed(dir, "ms") !== null, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
 }
 
 async function bunAudit(): Promise<void> {

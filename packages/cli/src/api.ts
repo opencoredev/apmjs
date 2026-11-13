@@ -48,6 +48,19 @@ export const Tree = z
 
 export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional() });
 export const ResolveFail = z.object({ error: z.string(), name: z.string(), version: z.null(), skipped: Skipped });
+
+/**
+ * A 202 from /resolve: the version, or a version in its tree, is queued for analysis and has no score yet. Nothing in
+ * it is a pass; `apm add` and `apm x` ask again for a while, then refuse.
+ */
+export const ResolvePending = z.object({
+  error: z.string(),
+  name: z.string(),
+  version: z.string().nullable(),
+  pending: z.array(z.object({ name: z.string(), version: z.string() })),
+  pendingCount: z.number().int().min(0).optional(),
+  retryAfter: z.number().min(0).optional(),
+});
 export type ResolveOk = z.infer<typeof ResolveOk>;
 
 export const ScoreResponse = ReportSchema.extend({

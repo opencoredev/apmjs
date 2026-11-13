@@ -1,5 +1,5 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "types": ["@cloudflare/workers-types", "node", "bun"] },
-  "include": ["src/**/*.ts", "test/tree-walk.test.ts", "test/analysis-recovery.test.ts"]
+  "include": ["src/**/*.ts", "test/tree-walk.test.ts", "test/analysis-recovery.test.ts", "test/resolve-pending.test.ts"]
 }

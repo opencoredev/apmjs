@@ -5,6 +5,10 @@
 // host from package data such as a tarball URL, so a lockfile cannot pick who vouches for it or who
 // learns what you install. Every package it could not check gets its own warning, and with
 // APM_SCANNER_STRICT=1 any unchecked package cancels the install.
+//
+// A version the registry has queued for analysis is pending, not unchecked: it has no score yet, so it is never
+// let through as clean. The scanner asks again for up to PENDING_WAIT_MS, then cancels the install for anything
+// still pending, in either mode, saying why and when to try again.
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,15 +19,29 @@ type Env = Record<string, string | undefined>;
 type RegistryUnchecked = { package: string; version: string; reason: string };
 type Unchecked = { id: string; reason: string };
 
+/** A version the registry has queued for analysis and not scored yet. */
+type Pending = { package: string; version: string };
+
 function isScanAdvisory(v: unknown): v is ScanAdvisory {
   if (typeof v !== "object" || v === null) return false;
   return "package" in v && typeof v.package === "string" && "level" in v && (v.level === "fatal" || v.level === "warn") && "description" in v && typeof v.description === "string";
 }
 
-function isUnchecked(v: unknown): v is RegistryUnchecked {
+/** A package and version, as `pending` lists them and every `unchecked` entry starts. */
+function isPending(v: unknown): v is Pending {
   if (typeof v !== "object" || v === null) return false;
-  return "package" in v && typeof v.package === "string" && "version" in v && typeof v.version === "string" && "reason" in v && typeof v.reason === "string";
+  return "package" in v && typeof v.package === "string" && "version" in v && typeof v.version === "string";
 }
+
+function isUnchecked(v: unknown): v is RegistryUnchecked {
+  return isPending(v) && "reason" in v && typeof v.reason === "string";
+}
+
+/** How long the scanner waits for queued versions to be scored before it cancels the install: 60 s. */
+export const PENDING_WAIT_MS = 60_000;
+
+/** How often it asks again while it waits. */
+const PENDING_POLL_MS = 3_000;
 
 /** A registry base URL ending in "/", or null when `value` is not an http(s) URL. */
 function registryUrl(value: string): string | null {
@@ -79,7 +97,7 @@ function originOf(url: string): string | null {
   }
 }
 
-type Answer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[] } | { kind: "unavailable"; reason: string };
+type Answer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[]; pending: Pending[] } | { kind: "unavailable"; reason: string };
 
 async function ask(registry: string, packages: Bun.Security.Package[]): Promise<Answer> {
   try {
@@ -98,8 +116,9 @@ async function ask(registry: string, packages: Bun.Security.Package[]): Promise<
     if (!(body instanceof Object) || !("advisories" in body) || !Array.isArray(body.advisories)) return { kind: "unavailable", reason: `${registry} sent an answer the scanner does not understand` };
 
     const unchecked = "unchecked" in body && Array.isArray(body.unchecked) ? body.unchecked.filter(isUnchecked) : [];
+    const pending = "pending" in body && Array.isArray(body.pending) ? body.pending.filter(isPending) : [];
 
-    return { kind: "advisories", advisories: body.advisories.filter(isScanAdvisory), unchecked };
+    return { kind: "advisories", advisories: body.advisories.filter(isScanAdvisory), unchecked, pending };
   } catch (e) {
     return { kind: "unavailable", reason: `could not reach ${registry} (${e instanceof Error ? e.message : String(e)})` };
   }
@@ -114,14 +133,50 @@ async function askAll(registry: string, packages: Bun.Security.Package[]): Promi
   const answers = await Promise.all(batches.map((b) => ask(registry, b)));
   const advisories: ScanAdvisory[] = [];
   const unchecked: RegistryUnchecked[] = [];
+  const pending: Pending[] = [];
 
   for (const a of answers) {
     if (a.kind === "unavailable") return a;
     advisories.push(...a.advisories);
     unchecked.push(...a.unchecked);
+    pending.push(...a.pending);
   }
 
-  return { kind: "advisories", advisories, unchecked };
+  return { kind: "advisories", advisories, unchecked, pending };
+}
+
+const keyOf = (p: { package: string; version: string }): string => `${p.package}@${p.version}`;
+
+/**
+ * Asks about every package, then asks again about the pending ones until none is pending or `waitMs` is over. What
+ * landed meanwhile replaces its pending entry; what is still pending at the end is returned as pending.
+ */
+async function askUntilScored(input: { registry: string; packages: Bun.Security.Package[]; waitMs: number; pollMs: number; warn: (line: string) => void; sleep: (ms: number) => Promise<void> }): Promise<Answer> {
+  const first = await askAll(input.registry, input.packages);
+
+  if (first.kind === "unavailable" || first.pending.length === 0) return first;
+  const started = Date.now();
+  let answer = first;
+
+  while (answer.pending.length > 0 && Date.now() - started < input.waitMs) {
+    input.warn(`apm scanner: waiting for ${answer.pending.length} package(s) the registry is still analysing (${Math.round((Date.now() - started) / 1000)}s of ${Math.round(input.waitMs / 1000)}s): ${answer.pending.slice(0, 5).map(keyOf).join(", ")}${answer.pending.length > 5 ? ", …" : ""}`);
+    await input.sleep(Math.min(input.pollMs, Math.max(0, input.waitMs - (Date.now() - started))));
+    const waiting = new Set(answer.pending.map(keyOf));
+    const again = await askAll(input.registry, input.packages.filter((p) => waiting.has(`${p.name}@${p.version}`)));
+
+    // the registry could not be asked again: what was pending stays pending, and blocks below
+    if (again.kind === "unavailable") break;
+    const asked = (p: { package: string; version: string }): boolean => waiting.has(keyOf(p));
+
+    answer = {
+      kind: "advisories",
+      advisories: [...answer.advisories, ...again.advisories],
+      unchecked: [...answer.unchecked.filter((u) => !asked(u)), ...again.unchecked],
+      pending: again.pending,
+    };
+  }
+
+  return answer;
 }
 
 /**
@@ -132,8 +187,11 @@ export function isRegistryVersion(version: string): boolean {
   return /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version);
 }
 
-/** The scan itself, with its inputs explicit so tests can drive it. */
-export async function scanPackages(input: { packages: Bun.Security.Package[]; env: Env; cwd: string; warn: (line: string) => void }): Promise<Bun.Security.Advisory[]> {
+/**
+ * The scan itself, with its inputs explicit so tests can drive it. `waitMs` and `sleep` default to PENDING_WAIT_MS
+ * (or APM_SCANNER_WAIT_MS) and a timer.
+ */
+export async function scanPackages(input: { packages: Bun.Security.Package[]; env: Env; cwd: string; warn: (line: string) => void; waitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<Bun.Security.Advisory[]> {
   // git, file and link dependencies are not on a registry: nothing can vouch for them, so each is reported
   const onRegistry = input.packages.filter((p) => isRegistryVersion(p.version));
   const registry = configuredRegistry({ env: input.env, cwd: input.cwd });
@@ -147,14 +205,28 @@ export async function scanPackages(input: { packages: Bun.Security.Package[]; en
   if (!registry) {
     for (const pkg of onRegistry) unchecked.push({ id: `${pkg.name}@${pkg.version}`, reason: "no apm registry configured (set APM_REGISTRY, or [install] registry in bunfig.toml)" });
   } else if (onRegistry.length > 0) {
-    const answer = await askAll(registry, onRegistry);
+    const envWait = Number(input.env.APM_SCANNER_WAIT_MS);
+    const waitMs = input.waitMs ?? (Number.isFinite(envWait) && envWait >= 0 ? envWait : PENDING_WAIT_MS);
+    const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const answer = await askUntilScored({ registry, packages: onRegistry, waitMs, pollMs: input.pollMs ?? PENDING_POLL_MS, warn: input.warn, sleep });
 
     if (answer.kind === "unavailable") {
       for (const pkg of onRegistry) unchecked.push({ id: `${pkg.name}@${pkg.version}`, reason: answer.reason });
     } else {
       for (const a of answer.advisories) out.push({ level: a.level, package: a.package, url: a.url, description: a.description });
+      const stillPending = new Set(answer.pending.map(keyOf));
 
-      for (const u of answer.unchecked) unchecked.push({ id: `${u.package}@${u.version}`, reason: `${registry} could not check it: ${u.reason}` });
+      // no score yet is not a pass: blocked in either mode, with when to try again
+      for (const p of answer.pending) {
+        out.push({
+          level: "fatal",
+          package: p.package,
+          url: null,
+          description: `${keyOf(p)} is still being analysed by ${registry} (waited ${Math.round(waitMs / 1000)}s). apm installs no version before it has a score; try again in a minute.`,
+        });
+      }
+
+      for (const u of answer.unchecked) if (!stillPending.has(keyOf(u))) unchecked.push({ id: `${u.package}@${u.version}`, reason: `${registry} could not check it: ${u.reason}` });
 
       // The verdict is about the registry's copy; bun is fetching this one from another host.
       const origin = new URL(registry).origin;
