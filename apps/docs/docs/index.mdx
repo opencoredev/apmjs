@@ -23,7 +23,7 @@ apm is early. The registry, CLI and score engine work and are tested, and the re
 | A stolen account means rotating tokens and hunting versions by hand. | `apm incident --since <time>` revokes every token and every version published since then. |
 | No safety signal. | Every version gets a score from 0 to 100. Every point lost cites a file and line. Popularity is never an input. |
 | A leaked token can publish. | A version uploaded with a login token waits until a person approves it with a passkey or an authenticator code. |
-| New versions install the minute they appear. | `apm add` and the `~safe` view skip versions under 24 hours old and versions scoring under 40. |
+| New versions install the minute they appear. | `apm add` and the `~safe` view skip versions under 24 hours old. `apm add` warns about a version scoring under 40 and installs it; `apm add --strict` and the `~safe` view skip it. |
 | Unscoped names are first come, first served. | New packages are scoped to your GitHub login. Names one edit from a popular package are refused. |
 
 ## The parts

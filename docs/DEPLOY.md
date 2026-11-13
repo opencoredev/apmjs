@@ -37,7 +37,7 @@ bun packages/infra/deploy.ts deploy --stage staging
 bun packages/infra/smoke.ts --stage staging              # check it with stock clients
 ```
 
-`deploy` prints the stage's URLs. The smoke check runs `bun add` and `npm install` of real npm packages through the registry, `apm add` against a low-score package (it must refuse) and a clean one, a staged `npm publish` approved with a TOTP code and then installed, and `bun audit`. On staging it signs in as a check account (`apm-staging-check`) that it creates in the staging database, because GitHub sign-in needs a person at a browser; everything after sign-in runs the deployed code. It never makes that account on production.
+`deploy` prints the stage's URLs. The smoke check runs `bun add` and `npm install` of real npm packages through the registry, `apm add` against a low-score package (three 0.187.0, which has no dependencies, so no cooldown can refuse it: the default must warn and install it, `--strict` must refuse it; a failed check prints apm's whole output) and a clean one, a staged `npm publish` approved with a TOTP code and then installed, and `bun audit`. On staging it signs in as a check account (`apm-staging-check`) that it creates in the staging database, because GitHub sign-in needs a person at a browser; everything after sign-in runs the deployed code. It never makes that account on production.
 
 ### Order
 
