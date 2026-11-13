@@ -150,9 +150,19 @@ describe("blocker 1: transitive dependencies install only from the registry apm 
     const r = await apm(["add", "root-artifact-demo@1.0.0", "--pm", pm], { cwd: app, env });
 
     expect(readdirSync(marks), r.out).not.toContain("leaf-UNCHECKED");
-    expect(r.code, r.out).not.toBe(0);
-    expect(r.out).toContain("@artifactuser/leaf@1.0.0");
+    expect(r.out).toContain("@artifactuser/leaf");
     expect(filesContaining(join(app, "node_modules"), "UNCHECKED_BYTES"), r.out).toEqual([]);
+
+    // lockfile first: pnpm re-resolves an entry locked to another registry when it computes the add's lockfile with
+    // the scope pinned to the checked one, so the checked bytes install and their script runs; bun and npm keep the
+    // locked entry, whose integrity the check refuses before anything is installed
+    if (pm === "pnpm") {
+      expect(r.code, r.out).toBe(0);
+      expect(readdirSync(marks), r.out).toEqual(["leaf-CHECKED"]);
+    } else {
+      expect(r.code, r.out).not.toBe(0);
+      expect(r.out).toContain("@artifactuser/leaf@1.0.0");
+    }
   }
 
   async function cleanTreeCase(pm: Pm): Promise<void> {

@@ -1,183 +1,60 @@
-// What the package manager actually installed, and the registry's verdict on every package of it. The resolve walk
-// predicts the install graph; lockfile pins, nested peers, overrides and the project's own ranges can make the real one
-// differ (review of 16fc8b5, findings 1 to 3), so apm add, apm x and apm audit check the graph the package manager
-// wrote, at the exact versions, before any install script runs. See docs/ARCHITECTURE.md, "After the install".
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+// The registry's verdict on every package of a lockfile. apm add and apm x have the package manager compute the
+// lockfile in a directory of their own, then check every package of it here, at the exact version and integrity it
+// locks, before anything is installed (see docs/ARCHITECTURE.md, "How `apm add` makes the package manager install what apm checked"). apm audit checks node_modules
+// with the same code.
 import { z } from "zod";
 import { InstallWarning, type Api } from "./api.ts";
-import { installedPackages } from "./audit.ts";
-import { isRegistryVersion, lockedTree, type LockNode, type LockPm } from "./lockfile.ts";
+import type { LockNode, Origin } from "./lockfile.ts";
 
-/** A package as the check asks about it. `platform`: built for one os or cpu, so summed up with its family when printed. */
+/**
+ * A registry package as the check asks about it. `integrity`: the lockfile's, which the registry compares with the bytes
+ * it serves. `platform`: built for one os or cpu, so summed up with its family when printed.
+ */
 export type InstalledPackage = { name: string; version: string; integrity: string | null; platform: boolean };
+
+/** A package from somewhere no registry can check: git, a file, a link, the project's own workspace, a remote tarball. */
+export type LocalPackage = { name: string; version: string; origin: Exclude<Origin, { kind: "registry" }> };
 
 /** `name@version`, the key of everything here. */
 export const idOf = (p: { name: string; version: string }): string => `${p.name}@${p.version}`;
 
 /**
- * What an install left, as apm reads it: from the lockfile the package manager just wrote, or (no lockfile apm can read,
- * yarn's for one) from node_modules. `nodes` are the lockfile's entries (for the integrity check and held scripts).
+ * What a lockfile asks the check about. `packages`: every registry package, one per name@version (a nested leaf@1.0.0
+ * beside a hoisted leaf@2.0.0 is two). `local`: the rest, kept with their origin. `conflicts`: a name@version the
+ * lockfile locks to two different artifacts, refused in every mode. `noIntegrity`: registry entries with no integrity,
+ * whose bytes apm cannot confirm. `bundled`: entries inside their parent's tarball, which the parent's score covers.
  */
-export type InstalledGraph =
-  | { kind: "lockfile"; path: string; nodes: LockNode[]; packages: InstalledPackage[]; notFromRegistry: InstalledPackage[] }
-  | { kind: "node_modules"; packages: InstalledPackage[]; notFromRegistry: InstalledPackage[]; unreadable: { id: string; reason: string }[] }
-  | { kind: "unreadable"; reason: string };
+export type LockGraph = { packages: InstalledPackage[]; local: LocalPackage[]; conflicts: Blocked[]; noIntegrity: InstalledPackage[]; bundled: number };
 
-/** What was installed before an add: every name@version, from the lockfile or node_modules. */
-export type Before = { ids: ReadonlySet<string> };
+/** Every node of a lockfile, as the check takes them. `integrityKnown`: false for yarn, whose checksums are not the registry's. */
+export function lockGraph(nodes: readonly LockNode[], opts: { integrityKnown: boolean }): LockGraph {
+  const byId = new Map<string, InstalledPackage>();
+  const local = new Map<string, LocalPackage>();
+  const conflicts = new Map<string, Blocked>();
+  let bundled = 0;
 
-/** Every name@version installed in `cwd` now: the lockfile's (all of it), else node_modules'. */
-export function installedIds(input: { cwd: string; pm: LockPm | null }): Before {
-  if (input.pm !== null) {
-    const read = lockedTree({ cwd: input.cwd, pm: input.pm, roots: { kind: "all" } });
-
-    if (read.kind === "read") return { ids: new Set(read.nodes.map(idOf)) };
-  }
-
-  const disk = installedPackages(input.cwd);
-
-  return { ids: new Set([...disk.packages].flatMap(([name, versions]) => [...versions].map((version) => idOf({ name, version })))) };
-}
-
-const asPackage = (n: { name: string; version: string; integrity: string | null; platform: boolean }): InstalledPackage => ({ name: n.name, version: n.version, integrity: n.integrity, platform: n.platform });
-
-/** Installed packages: from a registry, and not (git, file and link entries). */
-type Split = { packages: InstalledPackage[]; notFromRegistry: InstalledPackage[] };
-
-/** One entry per name@version (the first integrity seen); git, file and link entries apart. */
-function split(nodes: readonly InstalledPackage[]): Split {
-  const seen = new Map<string, InstalledPackage>();
-
-  for (const n of nodes) if (!seen.has(idOf(n))) seen.set(idOf(n), n);
-  const all = [...seen.values()];
-
-  return { packages: all.filter((p) => isRegistryVersion(p.version)), notFromRegistry: all.filter((p) => !isRegistryVersion(p.version)) };
-}
-
-/**
- * The graph an add brought in: every node under the added packages (whatever version the package manager reused for
- * them, a peer included), and every name@version that is new since `before` anywhere in the project (an override, a
- * re-resolved peer). Nothing is truncated. A package installed before and untouched by the add is not this add's.
- */
-export function addedGraph(input: { cwd: string; pm: LockPm | null; roots: readonly string[]; before: Before }): InstalledGraph {
-  const { cwd, pm, roots, before } = input;
-
-  if (pm !== null) {
-    const all = lockedTree({ cwd, pm, roots: { kind: "all" } });
-    const under = lockedTree({ cwd, pm, roots: { kind: "under", names: [...roots] } });
-
-    if (all.kind === "read" && under.kind === "read") {
-      const missing = roots.filter((r) => !under.nodes.some((n) => n.name === r));
-
-      if (missing.length > 0) return { kind: "unreadable", reason: `${under.path} has no entry for ${missing.join(", ")}` };
-      const keys = new Set(under.nodes.map((n) => n.key));
-      const nodes = [...under.nodes, ...all.nodes.filter((n) => !keys.has(n.key) && !before.ids.has(idOf(n)))];
-
-      return { kind: "lockfile", path: under.path, nodes, ...split(nodes.map(asPackage)) };
-    }
-
-    if (all.kind === "unreadable") return { kind: "unreadable", reason: `${all.path} could not be read (${all.reason})` };
-  }
-
-  // no lockfile apm can read: node_modules, followed the way node resolves a require
-  const disk = nodeModulesGraph({ cwd, roots });
-  const now = installedPackages(cwd);
-  const fresh = [...now.packages].flatMap(([name, versions]) => [...versions].flatMap((version): InstalledPackage[] => (before.ids.has(idOf({ name, version })) ? [] : [{ name, version, integrity: null, platform: false }])));
-
-  return { kind: "node_modules", ...split([...disk.packages, ...fresh]), unreadable: [...disk.unreadable, ...now.unchecked] };
-}
-
-/** Every package in a lockfile (apm x's own install, which is all new) or, without one, in node_modules. */
-export function wholeGraph(input: { cwd: string; pm: LockPm | null }): InstalledGraph {
-  return addedGraph({ cwd: input.cwd, pm: input.pm, roots: [], before: { ids: new Set() } });
-}
-
-// ---------- node_modules ----------
-const OnDisk = z
-  .object({
-    name: z.string(),
-    version: z.string(),
-    dependencies: z.record(z.string(), z.unknown()).optional().catch(undefined),
-    optionalDependencies: z.record(z.string(), z.unknown()).optional().catch(undefined),
-    peerDependencies: z.record(z.string(), z.unknown()).optional().catch(undefined),
-    os: z.unknown().optional(),
-    cpu: z.unknown().optional(),
-  })
-  .loose();
-
-/** Directories a node_modules walk reads at most. */
-const DISK_BUDGET = 50_000;
-
-/**
- * The packages under `roots` as node would load them: each package's dependencies and peers looked up from its real
- * directory upward, `<dir>/node_modules/<name>` at each level, as require() does. A dependency that is not on disk (an
- * optional one for another platform) is not installed, so not followed.
- */
-/** Packages node_modules holds under some roots, and the directories apm could not read. */
-type DiskGraph = { packages: InstalledPackage[]; unreadable: { id: string; reason: string }[] };
-
-function nodeModulesGraph(input: { cwd: string; roots: readonly string[] }): DiskGraph {
-  const packages: InstalledPackage[] = [];
-  const unreadable: { id: string; reason: string }[] = [];
-  const seen = new Set<string>();
-  let budget = DISK_BUDGET;
-
-  const real = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return p;
-    }
-  };
-
-  const find = (from: string, name: string): string | null => {
-    for (let dir = from; ; dir = dirname(dir)) {
-      if (!dir.endsWith(`${sep}node_modules`)) {
-        const candidate = join(dir, "node_modules", name);
-
-        if (existsSync(join(candidate, "package.json"))) return real(candidate);
-      }
-
-      if (dirname(dir) === dir) return null;
-    }
-  };
-
-  const queue = input.roots.flatMap((r) => find(input.cwd, r) ?? []);
-
-  for (let i = 0; i < queue.length && budget-- > 0; i++) {
-    const dir = queue[i];
-
-    if (dir === undefined || seen.has(dir)) continue;
-    seen.add(dir);
-    let m: z.infer<typeof OnDisk>;
-
-    try {
-      const parsed = OnDisk.safeParse(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")));
-
-      if (!parsed.success) {
-        unreadable.push({ id: dir, reason: "package.json has no name or version" });
-        continue;
-      }
-
-      m = parsed.data;
-    } catch {
-      unreadable.push({ id: dir, reason: "unreadable package.json" });
+  for (const n of nodes) {
+    if (n.bundled) {
+      bundled++;
       continue;
     }
 
-    packages.push({ name: m.name, version: m.version, integrity: null, platform: m.os !== undefined || m.cpu !== undefined });
-
-    for (const dep of Object.keys({ ...m.dependencies, ...m.optionalDependencies, ...m.peerDependencies })) {
-      const at = find(dir, dep);
-
-      if (at !== null) queue.push(at);
+    if (n.origin.kind !== "registry") {
+      local.set(`${idOf(n)} ${n.origin.source}`, { name: n.name, version: n.version, origin: n.origin });
+      continue;
     }
+
+    const id = idOf(n);
+    const seen = byId.get(id);
+
+    if (seen === undefined) byId.set(id, { name: n.name, version: n.version, integrity: n.integrity, platform: n.platform });
+    else if (seen.integrity === null) byId.set(id, { ...seen, integrity: n.integrity });
+    else if (n.integrity !== null && n.integrity !== seen.integrity) conflicts.set(id, { name: n.name, version: n.version, reason: `the lockfile locks ${id} to two different artifacts (${seen.integrity} and ${n.integrity})` });
   }
 
-  if (budget < 0) unreadable.push({ id: "node_modules", reason: `more than ${DISK_BUDGET} package directories` });
+  const packages = [...byId.values()];
 
-  return { packages, unreadable };
+  return { packages, local: [...local.values()], conflicts: [...conflicts.values()], noIntegrity: opts.integrityKnown ? packages.filter((p) => p.integrity === null) : [], bundled };
 }
 
 // ---------- the registry's verdict ----------
@@ -264,7 +141,7 @@ async function scanAll(api: Api, packages: readonly InstalledPackage[], policy: 
  * then again about those still being analysed until none is or `waitMs` is over. `progress` says what it waits for.
  * Never strict at the registry: the caller applies the mode to the verdict.
  */
-export async function checkGraph(input: { api: Api; packages: readonly InstalledPackage[]; notFromRegistry: readonly InstalledPackage[]; waitMs: number; progress: (line: string) => void; policy: CheckPolicy }): Promise<GraphVerdict> {
+export async function checkGraph(input: { api: Api; packages: readonly InstalledPackage[]; local: readonly LocalPackage[]; noIntegrity: readonly InstalledPackage[]; waitMs: number; progress: (line: string) => void; policy: CheckPolicy }): Promise<GraphVerdict> {
   const { api, policy } = input;
   const byId = new Map(input.packages.map((p) => [idOf(p), p]));
   const blocked = new Map<string, Blocked>();
@@ -323,7 +200,10 @@ export async function checkGraph(input: { api: Api; packages: readonly Installed
     if (p && !blocked.has(id)) warnings.set(`${id}:unchecked`, ownWarning({ name: p.name, version: p.version, kind: "unchecked", text: `not checked: ${reason}` }));
   }
 
-  for (const p of input.notFromRegistry) warnings.set(`${idOf(p)}:unchecked`, ownWarning({ name: p.name, version: p.version, kind: "unchecked", text: "not from a registry (git, file or link), so no registry can check it" }));
+  // git, file, link and workspace entries keep their origin: no registry can check them (strict refuses each)
+  for (const p of input.local) warnings.set(`${idOf(p)}:unchecked`, ownWarning({ name: p.name, version: p.version, kind: "unchecked", text: `not checked: it comes from ${p.origin.kind === "workspace" ? "your own workspace" : `a ${p.origin.kind}`} (${p.origin.source}), not a registry, so no registry can check it` }));
+
+  for (const p of input.noIntegrity) if (!blocked.has(idOf(p))) warnings.set(`${idOf(p)}:unchecked`, ownWarning({ name: p.name, version: p.version, kind: "unchecked", text: "not checked: the lockfile records no integrity for it, so apm cannot confirm it is the artifact the registry serves" }));
 
   // a blocked version needs no warning on top; --force lifts the floor and the cooldown of the packages it names
   const lifted = (w: InstallWarning): boolean => policy.lifted.has(idOf(w)) && (w.kind === "low-score" || w.kind === "cooldown");

@@ -159,25 +159,20 @@ export async function runCmd(cmd: string[], opts: RunOpts): Promise<{ code: numb
 }
 
 /**
- * What puts node_modules back in step with the project after a refused add, with every install script off: the frozen
- * install of the lockfile apm put back, or, with none to put back, the package manager's own remove of the names the
- * add put in package.json. null when there is nothing it can run (yarn, or an add that only changed versions with no
- * lockfile).
+ * The add that only computes the lockfile: it writes package.json and the lockfile and installs nothing, with every
+ * script off. apm runs it in a directory of its own (see lockfirst.ts). yarn berry's `--mode update-lockfile` is its
+ * own form of it; classic yarn has none.
  */
-export function undoArgs(pm: Pm, input: { hadLockfile: boolean; addedNames: readonly string[] }): string[] | null {
-  if (input.hadLockfile) return frozenInstallArgs(pm);
-
-  if (input.addedNames.length === 0) return null;
-
+export function lockOnlyArgs(pm: Pm, specs: readonly string[], opts: { dev: boolean }): string[] {
   switch (pm) {
     case "npm":
-      return ["npm", "uninstall", "--ignore-scripts", "--no-audit", "--no-fund", ...input.addedNames];
+      return ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", ...(opts.dev ? ["--save-dev"] : []), ...specs];
     case "pnpm":
-      return ["pnpm", "remove", "--ignore-scripts", ...input.addedNames];
+      return ["pnpm", "add", "--lockfile-only", "--ignore-scripts", ...(opts.dev ? ["--save-dev"] : []), ...specs];
     case "bun":
-      return ["bun", "remove", "--ignore-scripts", ...input.addedNames];
+      return ["bun", "add", "--lockfile-only", "--ignore-scripts", ...(opts.dev ? ["--dev"] : []), ...specs];
     case "yarn":
-      return null;
+      return ["yarn", "add", "--mode", "update-lockfile", ...(opts.dev ? ["--dev"] : []), ...specs];
     default: {
       const _exhaustive: never = pm;
 
@@ -186,21 +181,42 @@ export function undoArgs(pm: Pm, input: { hadLockfile: boolean; addedNames: read
   }
 }
 
-/** The install of a lockfile as it stands, every script off; none for yarn, whose flags differ by version. */
-function frozenInstallArgs(pm: Pm): string[] | null {
+/**
+ * The install of exactly the lockfile apm checked, every script off. npm has no frozen install but `ci`, which deletes
+ * node_modules first: apm uses it when there is no node_modules to keep, and otherwise npm install, which keeps what it
+ * need not change (a patch the user made in an untouched package, say); apm then confirms the lockfile is unchanged
+ * byte for byte, which is what frozen means (verify.ts).
+ */
+export function frozenInstallArgs(pm: Exclude<Pm, "yarn">, opts: { keepNodeModules: boolean }): string[] {
   switch (pm) {
     case "npm":
-      return ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"];
+      return opts.keepNodeModules ? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"] : ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"];
     case "pnpm":
       return ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"];
     case "bun":
       return ["bun", "install", "--frozen-lockfile", "--ignore-scripts"];
-    case "yarn":
-      return null;
     default: {
       const _exhaustive: never = pm;
 
       return _exhaustive;
     }
+  }
+}
+
+/** Which yarn runs in a directory: berry (2 and up) has a lockfile-only mode, classic (1) has none. */
+export type YarnLine = { kind: "berry"; version: string } | { kind: "classic"; version: string } | { kind: "unknown"; why: string };
+
+/** `yarn --version` in `cwd` (which runs the project's own yarn release, as yarn itself would). */
+export async function yarnLine(input: { cwd: string; env: Record<string, string | undefined> }): Promise<YarnLine> {
+  try {
+    const r = await runCmd(["yarn", "--version"], { cwd: input.cwd, env: input.env, quiet: true });
+    const version = r.out.trim().split("\n").at(-1)?.trim() ?? "";
+    const major = Number(/^(\d+)\./.exec(version)?.[1]);
+
+    if (r.code !== 0 || !Number.isFinite(major)) return { kind: "unknown", why: `yarn --version exited ${r.code}` };
+
+    return major >= 2 ? { kind: "berry", version } : { kind: "classic", version };
+  } catch (e) {
+    return { kind: "unknown", why: e instanceof Error ? e.message : String(e) };
   }
 }

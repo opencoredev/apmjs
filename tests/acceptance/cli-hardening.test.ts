@@ -102,9 +102,19 @@ async function pinnedLockfileCase(pm: "bun" | "pnpm"): Promise<void> {
   const r = await apm(["add", "@alice/p@1.0.0", "--pm", pm], { cwd: app, env });
   const installed = join(app, "node_modules", "@alice", "p", "index.js");
 
-  expect(r.code, r.out).not.toBe(0);
-  expect(r.out).toContain("lockfile");
   expect(existsSync(installed) ? readFileSync(installed, "utf8") : "").not.toContain("EVIL-UNCHECKED-CONTENT");
+
+  // apm add is lockfile first: pnpm computes the add's lockfile with every scope pinned to the checked registry, and
+  // re-resolves an entry locked to another registry, so the checked bytes are what installs. bun keeps the locked
+  // entry, whose integrity the check refuses before anything is installed.
+  if (pm === "pnpm") {
+    expect(r.code, r.out).toBe(0);
+    expect(readFileSync(installed, "utf8")).toContain("checked");
+    expect(readFileSync(join(app, "pnpm-lock.yaml"), "utf8")).not.toContain(other.url);
+  } else {
+    expect(r.code, r.out).not.toBe(0);
+    expect(r.out).toContain("lockfile");
+  }
 }
 
 async function publishTargetCase(pm: "bun" | "npm"): Promise<void> {
