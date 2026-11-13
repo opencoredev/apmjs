@@ -183,8 +183,15 @@ export type Unscorable = { readonly reason: z.infer<typeof UnscorableReason>; re
 /** A version as stored; an upstream one also carries why it can never be scored, when that is decided. */
 export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: Unscorable };
 
+/**
+ * The runs of a version so far, the one starting included, as Store.startAnalysis finds them. `starts` counts every
+ * run begun; of those, `fetchFailures` ended unable to fetch the version and `failures` ended with an error they
+ * reported. The rest began and never stored anything: the platform ended them, for a reason it does not tell the run.
+ */
+export type RunHistory = { starts: number; fetchFailures: number; fetchFailedSince: number | null; failures: number };
+
 /** What starting a run came to (Store.startAnalysis). */
-export type AnalysisStart = { kind: "started"; starts: number; fetchFailures: number; fetchFailedSince: number | null } | { kind: "running" } | { kind: "decided" };
+export type AnalysisStart = ({ kind: "started" } & RunHistory) | { kind: "running" } | { kind: "decided" };
 
 /** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
 export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, Unscorable> };
@@ -1009,11 +1016,19 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
               ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
               WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
-              RETURNING starts, fetch_failures, fetch_failed_since`,
-          one(z.object({ starts: Int, fetch_failures: Int, fetch_failed_since: z.coerce.number().nullable() })),
+              RETURNING starts, fetch_failures, fetch_failed_since, failures`,
+          one(z.object({ starts: Int, fetch_failures: Int, fetch_failed_since: z.coerce.number().nullable(), failures: Int })),
         );
 
-        if (started) return { kind: "started", starts: started.starts, fetchFailures: started.fetch_failures, fetchFailedSince: started.fetch_failed_since } satisfies AnalysisStart;
+        if (started) {
+          return {
+            kind: "started",
+            starts: started.starts,
+            fetchFailures: started.fetch_failures,
+            fetchFailedSince: started.fetch_failed_since,
+            failures: started.failures,
+          } satisfies AnalysisStart;
+        }
 
         // not started: an outcome decided it, or a run began inside the window
         const decided = yield* run(

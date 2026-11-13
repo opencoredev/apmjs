@@ -51,7 +51,7 @@ describe("versions that can never be scored", () => {
     tarballs.set("no-checksum", { bytes: tgzOf("no-checksum", { "index.js": "module.exports = 1;\n" }), downloads: 0, checksum: false });
 
     // the platform stops a run, then one more: what the next runs do
-    for (const name of ["stopped-once", "stopped-twice", "still-running", "limit-dep"]) {
+    for (const name of ["stopped-once", "stopped-twice", "stopped-thrice", "still-running", "limit-dep"]) {
       tarballs.set(name, { bytes: tgzOf(name, { "index.js": "module.exports = require('./lib.js');\n", "lib.js": "module.exports = 2;\n" }), downloads: 0, checksum: true });
     }
 
@@ -168,24 +168,34 @@ describe("versions that can never be scored", () => {
     await expectUnscorable("no-checksum", "unavailable", "no checksum");
   }, 60_000);
 
-  test("a run the platform stopped is followed by a smaller run that is incomplete, never clean", async () => {
-    // what a stopped run leaves: its start counted, nothing stored, and longer ago than any run can take
+  test("a run the platform stopped is run again in full, and stores a complete score", async () => {
+    // what a stopped run leaves: its start counted, nothing stored, and longer ago than any run can take. Production,
+    // 13 Nov: express 5.3.0's first run shared its isolate with six others, and the memory limit ended them all
     await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-once', '1.0.0', 'apm-score-v10', 1, $1)", [clock - 60 * 60_000]);
     expect(await reg.analysisJob({ name: "stopped-once", version: "1.0.0" })).toBe("ack");
     const score = await getJson(`${reg.url}-/apm/v1/score/stopped-once/1.0.0`);
 
     expect(score.status, JSON.stringify(score.body)).toBe(200);
+    expect(Signals.parse(score.body).signals.find((x) => x.id === "incomplete")).toBeUndefined();
+  }, 60_000);
+
+  test("after two stopped runs the next is a smaller run that is incomplete, never clean, and says why first", async () => {
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-twice', '1.0.0', 'apm-score-v10', 2, $1)", [clock - 60 * 60_000]);
+    expect(await reg.analysisJob({ name: "stopped-twice", version: "1.0.0" })).toBe("ack");
+    const score = await getJson(`${reg.url}-/apm/v1/score/stopped-twice/1.0.0`);
+
+    expect(score.status, JSON.stringify(score.body)).toBe(200);
     const s = Signals.parse(score.body);
 
-    expect(s.signals.find((x) => x.id === "incomplete")?.evidence.join("\n") ?? "").toContain("stopped by the platform's CPU limit");
+    expect(s.signals.find((x) => x.id === "incomplete")?.evidence[0]).toBe("2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB");
     expect(s.score).toBeLessThan(70);
   }, 60_000);
 
-  test("after two stopped runs the third records that the version cannot be scored, without analysing", async () => {
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-twice', '1.0.0', 'apm-score-v10', 2, $1)", [clock - 60 * 60_000]);
-    expect(await reg.analysisJob({ name: "stopped-twice", version: "1.0.0" })).toBe("ack");
-    await expectUnscorable("stopped-twice", "analysis-limit", "were stopped by the platform before they finished");
-    expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'stopped-twice'"))).toEqual([{ starts: 3, outcome: "analysis-limit" }]);
+  test("after three stopped runs the next records that the version cannot be scored, without analysing", async () => {
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-thrice', '1.0.0', 'apm-score-v10', 3, $1)", [clock - 60 * 60_000]);
+    expect(await reg.analysisJob({ name: "stopped-thrice", version: "1.0.0" })).toBe("ack");
+    await expectUnscorable("stopped-thrice", "analysis-limit", "3 analyses of it were stopped by the platform before they finished");
+    expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'stopped-thrice'"))).toEqual([{ starts: 4, outcome: "analysis-limit" }]);
   }, 60_000);
 
   test("a run that began a minute ago may still be going: the job comes back later, and nothing is decided", async () => {

@@ -1073,6 +1073,12 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   if (ambiguous.length > 0) throw new AmbiguousPathsError(ambiguous);
   const found = collector();
   const add = found.add;
+
+  // Why this run read less is added before anything it found: only the first SHOWN_EVIDENCE lines are shown, and a
+  // smaller re-run of a big package also has parser-limit and skipped-file warnings, so the reason added last was cut
+  // (six parser-depth warnings pushed it out). Same rank ("tree") and first in, so first shown.
+  for (const why of input.incompleteBecause ?? []) add("incomplete", why);
+
   const byPath = new Map(files.map((f) => [f.path, f]));
   const hooks = expandHooks(manifest);
 
@@ -1357,8 +1363,6 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
   for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
-
-  for (const why of input.incompleteBecause ?? []) add("incomplete", why);
 
   for (const list of [unanalyzed, v3.unanalyzed]) {
     if (list.length === 0) continue;

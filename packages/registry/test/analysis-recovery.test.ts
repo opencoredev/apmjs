@@ -1,7 +1,8 @@
 // Criterion 1 of apm-score-v10, the registry's half. A run the platform stops mid-analysis always ends in a stored
 // outcome: its record exists before it analyses anything (startAnalysis), the cron sweep (Analysis.recover) requeues
-// it, the next run reads less and is incomplete, and after a second stop the version is recorded as one that cannot be
-// scored. And no request analyses anything, signed in or not: its cache misses are queued, and the queue's run records
+// it, the next run is in full, after two stops the next reads less and is incomplete, and after a third the version is
+// recorded as one that cannot be scored (analysis-stops.test.ts covers the reduced run). And no request analyses
+// anything, signed in or not: its cache misses are queued, and the queue's run records
 // itself before it asks the upstream anything (review of 5b5b492, finding 3). The store is the real Postgres one; the
 // upstream and the queue are recording stubs, and the "platform stop" is a stub that ends the run where it is armed.
 import { describe, expect, test } from "bun:test";
@@ -234,7 +235,7 @@ const Outcome = z.array(z.object({ starts: z.number(), started_at: z.coerce.numb
 const Stored = z.array(z.object({ analysis: z.object({ signals: z.array(z.object({ id: z.string(), evidence: z.array(z.string()) })) }) }));
 
 describe("a run the platform stops always ends in a stored outcome", () => {
-  test("stopped between start and store: the record is there, the sweep requeues it, the rerun is incomplete", async () => {
+  test("stopped between start and store: the record is there, the sweep requeues it, the rerun is in full", async () => {
     await withRig(async (db, sql) => {
       const up = upstreamStub(["stopped-pkg"]);
       const q = queueStub();
@@ -267,14 +268,15 @@ describe("a run the platform stops always ends in a stored outcome", () => {
       expect(swept).toBe(1);
       expect(q.sent).toEqual([{ name: "stopped-pkg", version: "1.0.0" }]);
 
-      // the queue's run reads less and stores an incomplete analysis
+      // the queue's run is in full: one stop is not the package's cost (production, 13 Nov: the memory limit of an
+      // isolate seven runs shared), so it stores a complete analysis
       const outcome = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "stopped-pkg", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + RUN_WINDOW_MS + 2, upstream: up.layer, queue: q.queue })), Effect.scoped));
 
       expect(outcome).toBe("stored");
       const [stored] = Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'stopped-pkg' AND scorer = $1", [SCORER]));
       const incomplete = stored?.analysis.signals.find((s) => s.id === "incomplete");
 
-      expect(incomplete?.evidence.join("\n") ?? "").toContain("stopped by the platform");
+      expect(incomplete).toBeUndefined();
 
       // and the sweep has nothing left to do
       const again = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS, upstream: up.layer, queue: q.queue })), Effect.scoped));
@@ -283,14 +285,14 @@ describe("a run the platform stops always ends in a stored outcome", () => {
     });
   }, 120_000);
 
-  test("stopped twice: the sweep requeues each time, and the third run records that it cannot be scored", async () => {
+  test("stopped three times: the sweep requeues each time, and the fourth run records that it cannot be scored", async () => {
     await withRig(async (db, sql) => {
       const up = upstreamStub(["twice-pkg"]);
       const q = queueStub();
       const job = { name: "twice-pkg", version: "1.0.0" };
       let now = T0;
 
-      for (const round of [1, 2]) {
+      for (const round of [1, 2, 3]) {
         const stop = { armed: true };
         const run = await Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue, stop })), Effect.scoped));
 
@@ -306,8 +308,8 @@ describe("a run the platform stops always ends in a stored outcome", () => {
       const last = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob(job)).pipe(Effect.provide(layerFor({ url: db.url, now: now + 1, upstream: up.layer, queue: q.queue })), Effect.scoped));
 
       expect(last).toBe("unscorable");
-      expect(Outcome.parse(await sql("SELECT starts, started_at, outcome FROM analysis_outcomes WHERE package = 'twice-pkg'"))[0]).toMatchObject({ starts: 3, outcome: "analysis-limit" });
-      expect(q.sent.length).toBe(2);
+      expect(Outcome.parse(await sql("SELECT starts, started_at, outcome FROM analysis_outcomes WHERE package = 'twice-pkg'"))[0]).toMatchObject({ starts: 4, outcome: "analysis-limit" });
+      expect(q.sent.length).toBe(3);
     });
   }, 120_000);
 });
@@ -382,9 +384,12 @@ describe("no request analyses anything", () => {
 
       expect(swept).toBe(1);
       expect(q.sent.length).toBe(2);
-      // the third run, with the upstream back, is the rerun: it reads less and stores incomplete, never clean
-      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "fetch-stop", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS + 1, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("unscorable");
-      expect(Outcome.parse(await sql("SELECT starts, started_at, outcome FROM analysis_outcomes WHERE package = 'fetch-stop'"))[0]).toMatchObject({ starts: 3, outcome: "analysis-limit" });
+      // the third run, with the upstream back, is the rerun: two runs began and stored nothing, so it reads less and
+      // stores incomplete, never clean
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.runJob({ name: "fetch-stop", version: "1.0.0" })).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 3 * RUN_WINDOW_MS + 1, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe("stored");
+      const [stored] = Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'fetch-stop' AND scorer = $1", [SCORER]));
+
+      expect(stored?.analysis.signals.find((s) => s.id === "incomplete")?.evidence.join("\n") ?? "").toContain("2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB");
     });
   }, 120_000);
 
@@ -551,25 +556,26 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
   // the platform stopping the Worker while it downloads or caches the tarball: nothing after it runs
   const dies = () => Effect.die(new PlatformStop());
 
-  test("runs stopped while fetching are counted, and the third run gives up before fetching", async () => {
+  test("runs stopped while fetching are counted, and the fourth run gives up before fetching", async () => {
     await withRig(async (db, sql) => {
       const up = failingUpstream({ tarball: dies });
 
       for (let i = 0; i < 6; i++) await runAt(db.url, T0 + i * RUN_WINDOW_MS, up.layer);
 
-      // on 9913a74: no row at all, and six downloads
-      expect(await rowOf(sql)).toEqual([{ starts: 3, fetch_failures: 0, outcome: "analysis-limit", detail: expect.stringContaining("stopped by the platform") }]);
-      expect(up.calls.tarball).toBe(2);
+      // on 9913a74: no row at all, and six downloads. Two full runs and the smaller one each download, and the
+      // fourth gives up
+      expect(await rowOf(sql)).toEqual([{ starts: 4, fetch_failures: 0, outcome: "analysis-limit", detail: expect.stringContaining("3 analyses of it were stopped by the platform") }]);
+      expect(up.calls.tarball).toBe(3);
     });
   }, 60_000);
 
-  test("a row already at two starts is settled on its next delivery, before any upstream work", async () => {
+  test("a row already at three stops is settled on its next delivery, before any upstream work", async () => {
     await withRig(async (db, sql) => {
-      await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('prestart', '1.0.0', $1, 2, 0)", [SCORER]);
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('prestart', '1.0.0', $1, 3, 0)", [SCORER]);
       const up = failingUpstream({ tarball: dies });
       const exit = await runAt(db.url, T0, up.layer);
 
-      // on 9913a74: the probe and the download ran, and the row stayed at two starts with no outcome
+      // on 9913a74: the probe and the download ran, and the row stayed at its starts with no outcome
       expect(Exit.isSuccess(exit) ? exit.value : null).toBe<JobOutcome>("unscorable");
       expect(up.calls).toEqual({ probe: 0, tarball: 0 });
       expect((await rowOf(sql))[0]?.outcome).toBe("analysis-limit");

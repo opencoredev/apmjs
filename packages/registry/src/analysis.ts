@@ -10,8 +10,13 @@
 // (WORKER_CPU_MS, which packages/infra sets), and what follows makes every way a run can end store an outcome. A queued run records its start before it does
 // anything, the upstream included (startAnalysis), and decides whether to stop trying before it downloads anything. The
 // cron sweep (recover) requeues every run that began and never ended, and every job the queue accepted that never began
-// one. After a stopped run the next reads less and is incomplete; the one after it records that the version cannot be
-// scored. A run that fails with an error (a stack overflow, say) keeps its start counted too, and after MAX_FAILED_RUNS
+// one. Why the platform ended such a run (its CPU limit, its memory limit, a deploy) is not something the run can
+// know, so recovery does not ask: a run that began and stored nothing is run again in full, and only after
+// STOPS_BEFORE_RERUN of them does the next read less and store an incomplete analysis; if that one is stopped too the
+// version is recorded as one that cannot be scored (planFor). On production, 13 Nov, seven runs sharing one isolate
+// were ended by its memory limit, and the next delivery of each was the smaller re-run: five versions that need a
+// second or less of CPU stored 39. The queue consumer now runs one invocation at a time (packages/infra,
+// maxConcurrency 1), so analyses no longer share an isolate's memory. A run that fails with an error (a stack overflow, say) keeps its start counted too, and after MAX_FAILED_RUNS
 // such runs the version is stored as incomplete, naming the error's class. A run that cannot fetch the version keeps
 // its start and counts a fetch failure, and after MAX_FETCH_FAILURES of them the version is settled as unavailable, as
 // is one the upstream no longer lists. A version is never left looking queued forever, and never scored clean on a
@@ -19,7 +24,7 @@
 import { Context, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
-import { Manifest, Store, type AnalysisStart, type Unscorable, type VersionRecord } from "./db.ts";
+import { Manifest, Store, type AnalysisStart, type RunHistory, type Unscorable, type VersionRecord } from "./db.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
 import { digestLabel, tooLargeText, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
@@ -53,9 +58,9 @@ export const WORKER_MAX_UNPACKED_BYTES = 48 * 1024 * 1024;
 export { WORKER_CPU_MS };
 
 /**
- * Work one queued analysis may spend, the unpack included: the whole meter, about 70 s of a Worker's CPU at the units
- * measured on staging, inside WORKER_CPU_MS (docs/SCORE.md). A run that costs more is stopped by the platform and
- * recovered by the sweep.
+ * Work one queued analysis may spend, the unpack included: the whole meter, about 60 to 70 s of a Worker's CPU at the
+ * units measured on staging (prettier 3.9.10: 160 million units, 31 s), past WORKER_CPU_MS (docs/SCORE.md). A run that
+ * costs more is stopped by the platform, and the sweep recovers it.
  */
 export const QUEUE_WORK = MAX_ANALYSIS_WORK;
 
@@ -68,8 +73,13 @@ export const RECOVER_PER_SWEEP = 200;
 /** A re-run after a stopped one reads at most this much, and says so. */
 export const RERUN_SCANNED_BYTES = 4 * 1024 * 1024;
 
-/** The run that records analysis-limit instead of analysing: two analysis runs began and neither stored anything. */
-const GIVE_UP_AT_START = 3;
+/**
+ * Runs of a version that began and stored nothing before the next one reads less: the first run and one full re-run.
+ * A stop is not always the package's cost (a deploy, or before maxConcurrency 1 the memory limit of an isolate it
+ * shared), so one stop alone does not reduce the reading. After this many the next run reads less, and if that one is
+ * stopped too the version is recorded as one that cannot be scored.
+ */
+export const STOPS_BEFORE_RERUN = 2;
 
 /**
  * A version is settled as unavailable once at least MAX_FETCH_FAILURES runs ended unable to fetch it (the upstream
@@ -92,13 +102,30 @@ export const REQUEUE_AFTER_MS = 10 * 60_000;
 /** How one analysis run reads: the whole package under a meter, or a smaller re-run that is marked incomplete. */
 export type RunPlan = { maxWork: number; maxScannedBytes?: number; incompleteBecause?: readonly string[] };
 
-const RERUN: RunPlan = {
-  maxWork: MAX_ANALYSIS_WORK / 4,
-  maxScannedBytes: RERUN_SCANNED_BYTES,
-  incompleteBecause: [`an earlier analysis of this version was stopped by the platform's CPU limit or failed before it stored anything, so this one read at most ${RERUN_SCANNED_BYTES / (1024 * 1024)} MB`],
-};
+const FULL: RunPlan = { maxWork: QUEUE_WORK };
 
-const LIMIT_HIT: Unscorable = { reason: "analysis-limit", detail: "two analyses of it were stopped by the platform before they finished, so the registry stopped trying" };
+const rerun = (because: string): RunPlan => ({ maxWork: MAX_ANALYSIS_WORK / 4, maxScannedBytes: RERUN_SCANNED_BYTES, incompleteBecause: [`${because}, so this one read at most ${RERUN_SCANNED_BYTES / (1024 * 1024)} MB`] });
+
+/** What the next run of a version does, from the runs before it: analyse in full, read less, or record that it cannot be scored. */
+export type NextRun = { kind: "analyse"; plan: RunPlan } | { kind: "give-up"; unscorable: Unscorable };
+
+/**
+ * The next run's plan, from how many runs before it began and stored nothing. A run that could not fetch the version
+ * or failed with an error it reported ended: it is not a stop, and the next run is in full (MAX_FAILED_RUNS and
+ * MAX_FETCH_FAILURES decide what follows those).
+ */
+export function planFor(history: RunHistory): NextRun {
+  // the runs begun before this one that never ended: no result, no reported error, no fetch failure
+  const stopped = Math.max(0, history.starts - 1 - history.fetchFailures - history.failures);
+
+  if (stopped > STOPS_BEFORE_RERUN) {
+    return { kind: "give-up", unscorable: { reason: "analysis-limit", detail: `${stopped} analyses of it were stopped by the platform before they finished, the last one reading at most ${RERUN_SCANNED_BYTES / (1024 * 1024)} MB, so the registry stopped trying` } };
+  }
+
+  if (stopped === STOPS_BEFORE_RERUN) return { kind: "analyse", plan: rerun(`${stopped} earlier analyses of this version were stopped by the platform before they stored anything`) };
+
+  return { kind: "analyse", plan: FULL };
+}
 
 const FETCH_GAVE_UP: Unscorable = { reason: "unavailable", detail: `the upstream registry could not be asked for it, would not serve its tarball, or the registry could not store the result, in ${MAX_FETCH_FAILURES} or more tries over an hour, so the registry stopped trying` };
 
@@ -173,8 +200,8 @@ export type AnalysisApi = {
   readonly ensure: (pkg: UpstreamPackage, v: VersionRecord) => Effect.Effect<VersionRecord, StoreError | BlobError>;
   /**
    * The cron sweep's half: requeues every run that began at least RUN_WINDOW_MS ago and never stored anything (the
-   * platform stopped it). The queue's next run of it reads less and is incomplete, and the one after records the
-   * version as one that cannot be scored. Returns how many it requeued.
+   * platform stopped it). How the queue's next run of it reads depends on how many runs before it stored nothing (planFor). Returns how many
+   * it requeued.
    */
   readonly recover: Effect.Effect<number, StoreError | BlobError>;
   /** Queues a version for analysis unless it is already scored or queued. */
@@ -293,7 +320,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         /**
          * The queue's run of one job. Its start is recorded before anything else, the upstream included, so every
          * delivery leaves a record the sweep finds, and the decision to stop trying comes before any download: after
-         * two analysis runs that stored nothing the version is analysis-limit, and after MAX_FETCH_FAILURES runs that
+         * the stops planFor allows the version is analysis-limit, and after MAX_FETCH_FAILURES runs that
          * could not fetch it over FETCH_GIVE_UP_MS, unavailable. A fetch that fails in a way that may pass keeps its
          * start, counts as a fetch failure and ends the run, so the queue's retry may run it again at once.
          */
@@ -342,11 +369,11 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               return "unscorable";
             }
 
-            // the analysis runs begun, this one included: a run that could not fetch never analysed anything
-            const analyses = begun.starts - begun.fetchFailures;
+            // the runs before this one decide how it reads: two that stored nothing, and this one reads less
+            const next = planFor(begun);
 
-            if (analyses >= GIVE_UP_AT_START) {
-              yield* settleGone(job, LIMIT_HIT);
+            if (next.kind === "give-up") {
+              yield* settleGone(job, next.unscorable);
 
               return "unscorable";
             }
@@ -407,7 +434,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
             }
 
-            const stored = yield* analyzeAndStore(pkg, v, got, analyses === 1 ? { maxWork: QUEUE_WORK } : RERUN);
+            const stored = yield* analyzeAndStore(pkg, v, got, next.plan);
 
             return stored.kind;
           });

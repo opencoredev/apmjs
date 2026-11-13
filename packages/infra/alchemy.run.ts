@@ -54,6 +54,19 @@ export default Alchemy.Stack(
     const debugTokenHash = yield* Config.withDefault(Config.String("DEBUG_TOKEN_HASH"), "");
     const debug = Object.fromEntries(debugTokenHash === "" ? [] : [["APM_DEBUG_TOKEN_HASH", debugTokenHash]]);
 
+    // PENDING REMOVAL, once the owner approves deleting it: the tail Worker an earlier version of fix/first-run created
+    // on staging (apmjs-analysis-tail-staging). It is declared here only so a deploy does not delete it. It is inert:
+    // no registry Worker lists it as a tail consumer, it has no bindings, and its handler (registry/src/tail.ts) does
+    // nothing. Removing this declaration (and tail.ts, its build in scripts/build.ts and deploy.ts) makes the next
+    // deploy of a stage delete it there.
+    yield* Cloudflare.Worker("AnalysisTail", {
+      name: `apmjs-analysis-tail-${stage}`,
+      main: yield* Config.withDefault(Config.String("APM_TAIL_BUNDLE"), resolve(import.meta.dirname, "../registry/dist-tail/tail.js")),
+      bundle: false,
+      compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
+      workersDev: false,
+    });
+
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
       main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
@@ -87,9 +100,12 @@ export default Alchemy.Stack(
     yield* Cloudflare.Queues.Consumer("AnalysisConsumer", {
       queueId: analysis.queueId,
       scriptName: registry.workerName,
-      // one message per invocation, so each analysis has the whole CPU limit and a stopped one takes no other with it;
-      // enough retries for a run the platform stopped, the wait while it may still look busy, and the smaller re-run
-      settings: { batchSize: 1, maxRetries: 5, maxWaitTimeMs: 1000, retryDelay: 30 },
+      // One message per invocation and one invocation at a time: Cloudflare otherwise runs several queue invocations in
+      // one isolate, and they share its 128 MB. On production, 13 Nov, seven analyses in one isolate went past it and the
+      // platform ended all seven. batchSize 1 gives each analysis the whole CPU limit; maxConcurrency 1 keeps two from
+      // ever running at once, so none shares an isolate's memory with another. Enough retries for a run the platform
+      // stopped, the wait while it may still look busy, and the smaller re-run.
+      settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5, maxWaitTimeMs: 1000, retryDelay: 30 },
     });
 
     // The website: Next.js through OpenNext. Its route handlers forward /api/auth/* and /-/apm/v1/* to the registry,
