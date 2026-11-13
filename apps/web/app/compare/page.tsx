@@ -63,7 +63,7 @@ const GROUPS: readonly Group[] = [
       { label: "Granularity", npm: "Third-party scores rate the whole package.", apm: "Every version scored. A new `curl | sh` or risky dependency drops it." },
       { label: "Metadata", npm: "Trusts the publish request, so install scripts can hide.", apm: "Read from the tarball’s package.json. A mismatch is refused." },
       { label: "Install check", npm: "Installs first, audit afterwards.", apm: "`apm add` and `apm x` check the whole tree first." },
-      { label: "Fresh releases", npm: "No cooldown by default.", apm: "24h cooldown. `/~safe/` gives any client the cooldown plus a score floor of 40." },
+      { label: "Fresh releases", npm: "No cooldown by default.", apm: "24h cooldown: `apm add` warns about a version under a day old, `--strict` refuses it, and `/~safe/` leaves it out for any client, with a score floor of 40." },
     ],
   },
   {

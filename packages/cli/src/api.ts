@@ -41,20 +41,24 @@ export const TreeReviews = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
 ]);
 
-/** `packages`: every name@version the registry's walk checked (older registries send none). `unchecked` is the total. */
+/**
+ * `packages`: every name@version the registry's walk checked (older registries send none). `unchecked` is the total.
+ * `platformSkips`: optional packages built for another platform than the one asked for, which do not install here.
+ */
 export const Tree = z
-  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), reviews: TreeReviews.optional() })
+  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), platformSkips: z.number().int().min(0).default(0), reviews: TreeReviews.optional() })
   .loose();
 
 /**
- * Why an install that goes ahead was flagged: a score under the floor, an incomplete analysis, a version apm cannot
- * score or has not scored yet, a dependency the registry could not look up, or a walk cut short (older registries
- * send none, and refused these instead). `score` and `grade` only for a scored version.
+ * Why an install that goes ahead was flagged: a version published inside the cooldown, a score under the floor, an
+ * incomplete analysis, a version apm cannot score or has not scored yet, a dependency the registry could not look up,
+ * or a walk cut short (older registries send none, and refused these instead). `score` and `grade` only for a scored
+ * version.
  */
 export const InstallWarning = z.object({
   name: z.string(),
   version: z.string(),
-  kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]),
+  kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]),
   score: z.number().nullable(),
   grade: z.string().nullable(),
   text: z.string(),
@@ -112,6 +116,14 @@ export const ScanResponse = z.object({
   unchecked: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })).default([]),
 });
 export const AuditResponse = z.object({ advisories: BulkResponse, unavailable: z.array(z.string()) });
+
+/** The platform an install is for, as the registry's resolve and scan read it: node's platform and architecture. */
+export type InstallTarget = { os: string; cpu: string };
+
+/** This machine's platform: the registry skips an optional package built for another, as the package manager does. */
+export function installTarget(): InstallTarget {
+  return { os: process.platform, cpu: process.arch };
+}
 
 export class ApiError extends Error {
   constructor(

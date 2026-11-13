@@ -30,7 +30,7 @@ const Case = z.object({
       unchecked: z.number(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
       // the registry's warnings on the install (resolve's `warnings`): via empty for the version itself
-      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
+      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
       depReviews: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("off") }),
         z.object({ kind: z.literal("unknown") }),
@@ -119,6 +119,8 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
 describe("the CLI against a stand-in registry", () => {
   let server: ReturnType<typeof Bun.serve>;
   let home: string;
+  /** The platform each resolve asked for, by package name. */
+  const targets = new Map<string, { os: string | null; cpu: string | null }>();
 
   beforeAll(() => {
     home = mkdtempSync(join(tmpdir(), "apm-explain-"));
@@ -130,6 +132,8 @@ describe("the CLI against a stand-in registry", () => {
 
         if (url.pathname === "/-/apm/v1/resolve") {
           const name = url.searchParams.get("name");
+
+          if (name) targets.set(name, { os: url.searchParams.get("os"), cpu: url.searchParams.get("cpu") });
 
           const clean: TreeReviewsWire = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
           const ok = (reviews: TreeReviewsWire) => Response.json({ name, range: "latest", source: "local", version: "1.2.3", report: { score: 95, grade: "A", signals: [] }, skipped: [], tree: { unchecked: 0, uncheckedDeps: [], packages: [], reviews } });
@@ -191,6 +195,14 @@ describe("the CLI against a stand-in registry", () => {
 
     return { code, out };
   }
+
+  // review of 2fbf383, finding 5: the resolve walked every platform's optional binaries, since nothing said which
+  test("apm explain asks about the install for this machine's platform", async () => {
+    await apm(["explain", "good"]);
+
+    // on 2fbf383: { os: null, cpu: null }, so the registry judged a win32 binary for a linux install
+    expect(targets.get("good")).toEqual({ os: process.platform, cpu: process.arch });
+  });
 
   // review finding P1: the review answer said the version was being revoked, the CLI dropped the flag and exited 0
   test("apm explain refuses a version the review answer says is being revoked, whatever its review says", async () => {

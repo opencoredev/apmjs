@@ -26,7 +26,7 @@ const Case = z.object({
       unchecked: z.number(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
       // the registry's warnings on the install (resolve's `warnings`): via empty for the version itself
-      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
+      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
       depReviews: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("off") }),
         z.object({ kind: z.literal("unknown") }),

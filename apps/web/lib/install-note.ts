@@ -11,7 +11,7 @@ export type InstallClient = z.infer<typeof InstallClient>;
 
 export const BUN_SCANNER = "@apm/bun-scanner";
 
-const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your config, and warns about a low score (--strict refuses it).";
+const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your config, and warns about a low score or a version published in the last 24 hours (--strict refuses both).";
 
 export type InstallNote =
   /** apm add: the checks run before the package manager does. */

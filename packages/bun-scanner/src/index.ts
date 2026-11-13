@@ -6,9 +6,9 @@
 // learns what you install. Every package it could not check gets its own warning, and with
 // APM_SCANNER_STRICT=1 any unchecked package cancels the install.
 //
-// A score never cancels an install by default (the project owner's policy since 2026-11): a score under 40, an
-// incomplete analysis, a version apm cannot score, one still being analysed after PENDING_WAIT_MS and a package the
-// registry could not look up are each a warning, and the install goes ahead. In a terminal they are `warn`
+// A score never cancels an install by default (the project owner's policy since 2026-11): a version published inside
+// the 24-hour cooldown, a score under 40, an incomplete analysis, a version apm cannot score, one still being analysed
+// after PENDING_WAIT_MS and a package the registry could not look up are each a warning, and the install goes ahead. In a terminal they are `warn`
 // advisories, which bun shows and asks about; anywhere else (CI) bun cancels on a `warn` advisory, so the scanner
 // prints them instead. APM_SCANNER_STRICT=1 makes each of them fatal. A revoked version, and one an apm reviewer
 // confirmed malicious, are fatal in both modes.
@@ -117,7 +117,9 @@ async function ask(registry: string, packages: Bun.Security.Package[], strict: b
     const res = await fetch(`${registry}-/apm/v1/scan`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })), strict }),
+      // the platform this install is for: bun is handed every platform's optional binaries and installs only this
+      // one's, so the registry skips the others a scanned package lists as optional instead of judging them
+      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })), strict, os: process.platform, cpu: process.arch }),
       signal: AbortSignal.timeout(20_000),
     });
 

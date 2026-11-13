@@ -46,7 +46,7 @@ const WarningWire = z
   .object({
     name: z.string(),
     version: z.string(),
-    kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]),
+    kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]),
     text: z.string(),
     // at most three, each a signal's label and the file and line its evidence cites; older registries send none
     reasons: z.array(z.string()).optional(),
@@ -89,8 +89,9 @@ export type DepReviews = z.infer<typeof TreeReviewsWire> | { kind: "unknown" };
 export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[] };
 
 /**
- * GET /-/apm/v1/resolve with a 422: nothing in range passes (revoked, yanked, the cooldown), or the newest that does
- * pulls in a version an apm reviewer confirmed malicious (`confirmed`) or one inside its cooldown.
+ * GET /-/apm/v1/resolve with a 422: nothing in range passes (revoked, yanked, confirmed malicious), or the newest that
+ * does pulls in a version an apm reviewer confirmed malicious (`confirmed`). A version inside its cooldown is a warning
+ * on a 200 (review of 2fbf383, finding 1).
  */
 export const ResolveRefusedWire = z.object({
   error: z.string(),
@@ -100,8 +101,8 @@ export const ResolveRefusedWire = z.object({
 });
 
 /**
- * What the registry's install policy (24-hour cooldown, revokes, confirmed malice, the dependency walk, and the score
- * floor of 40 as a warning) says about a range.
+ * What the registry's install policy (revokes, confirmed malice, the dependency walk, and the 24-hour cooldown and the
+ * score floor of 40 as warnings) says about a range.
  */
 export type ResolveOutcome =
   | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[] } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }

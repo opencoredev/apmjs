@@ -80,7 +80,7 @@ apm asks the registry for the newest version that is at least 24 hours old and n
 
 A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
 
-If a package is refused, apm says why and whether `--force` would help. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
+If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning; `--strict` refuses it. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
 
 ## Next steps
 

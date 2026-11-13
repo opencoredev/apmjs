@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, installTarget, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -222,7 +222,8 @@ type TreePackages = z.infer<typeof Tree>["packages"];
 
 /**
  * `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry.
- * `warnings`: what installs anyway, and why it was flagged (a low or incomplete score, no score, a failed lookup).
+ * `warnings`: what installs anyway, and why it was flagged (published inside the cooldown, a low or incomplete
+ * score, no score, a failed lookup). `platformSkips`: optional packages built for another platform, not installed here.
  */
 type Resolved = {
   name: string;
@@ -235,12 +236,13 @@ type Resolved = {
   unchecked: UncheckedDeps;
   tree: TreePackages;
   warnings: InstallWarning[];
+  platformSkips: number;
 };
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
 
 /**
- * Strict mode: refuse a score under 40, an incomplete analysis, a version apm cannot score or has not scored yet, and
+ * Strict mode: refuse a version inside the 24-hour cooldown, a score under 40, an incomplete analysis, a version apm cannot score or has not scored yet, and
  * a dependency the registry could not look up, as apm did before scores became warnings. --strict or APM_STRICT=1.
  */
 function strictMode(a: Args): boolean {
@@ -287,7 +289,8 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
   const strict = strictMode(a);
-  const params = new URLSearchParams({ name, range: range ?? "latest" });
+  // this machine's platform: the registry skips optional packages built for another, as the package manager does
+  const params = new URLSearchParams({ name, range: range ?? "latest", ...installTarget() });
 
   if (strict) params.set("strict", "1");
   // --force overrides this package's score floor and cooldown; revoked and yanked versions stay blocked,
@@ -300,7 +303,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, platformSkips: ok.tree?.platformSkips ?? 0 };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
@@ -308,7 +311,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [] };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [], platformSkips: 0 };
   }
 
   if (r.status === 503) {
@@ -316,7 +319,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
     const said = z.object({ error: z.string() }).safeParse(r.body);
     const msg = said.success ? said.data.error : `the registry could not check ${name} (HTTP 503)`;
 
-    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [] };
+    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], platformSkips: 0 };
   }
 
   if (r.status === 202) {
@@ -336,12 +339,13 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
       unchecked: [],
       tree: [],
       warnings: [],
+      platformSkips: 0,
     };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [] };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], platformSkips: 0 };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -360,6 +364,8 @@ function printResolved(r: Resolved): void {
   // dependencies apm could not score install unchecked: say which, so nobody reads silence as clean
   for (const u of r.unchecked.slice(0, 10)) say(`  ${yellow("!")} not checked: ${u.dependency} (${u.reason})`);
   if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);
+
+  if (r.platformSkips > 0) say(`  ${dim(`${r.platformSkips === 1 ? "1 optional package" : `${r.platformSkips} optional packages`} built for another platform than ${process.platform}-${process.arch} skipped, as your package manager skips them`)}`);
   printWarnings(r.warnings);
 }
 
@@ -382,7 +388,7 @@ function printWarnings(warnings: readonly InstallWarning[]): void {
   }
 
   if (warnings.length > MAX_PRINTED_WARNINGS) say(yellow(`and ${warnings.length - MAX_PRINTED_WARNINGS} more warnings (apm ... --json lists them all)`));
-  say(yellow("apm installs it anyway: a score informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1)."));
+  say(yellow("apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1)."));
 }
 
 /** What to tell someone whose install was refused: --force only when it would help, and what it does. */
@@ -395,7 +401,7 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean):
     say(dim("  --force lifts the score floor and the cooldown for the named package only; its dependencies are still checked."));
   }
 
-  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm reviewers confirmed malicious, unknown names and dependencies inside their cooldown stay blocked${strict ? "; in strict mode, so do versions apm has not scored or cannot score and dependencies under the floor" : ""}.`);
+  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm reviewers confirmed malicious and unknown names stay blocked${strict ? "; in strict mode, so do versions apm has not scored or cannot score, and dependencies under the floor or inside their cooldown" : ""}.`);
 
   const analysing = blocked.filter((b) => b.blocked?.includes("still being analysed") || b.blocked?.includes("could not be checked"));
 
@@ -727,7 +733,7 @@ async function cmdAudit(): Promise<number> {
   // the registry checks at most 200 packages per scan without a token, so large trees go in batches
   const all = [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version })));
   const batches = Array.from({ length: Math.ceil(all.length / SCAN_BATCH) }, (_, i) => all.slice(i * SCAN_BATCH, (i + 1) * SCAN_BATCH));
-  const parts = await Promise.all(batches.map((packages) => api.post("-/apm/v1/scan", { packages }, ScanResponse)));
+  const parts = await Promise.all(batches.map((packages) => api.post("-/apm/v1/scan", { packages, ...installTarget() }, ScanResponse)));
   const scan = { advisories: parts.flatMap((p) => p.advisories), unchecked: parts.flatMap((p) => p.unchecked) };
   const findings: { id: string; severity: string; text: string }[] = [];
   // checks that could not run: an audit with any of these is not a pass
@@ -1116,7 +1122,7 @@ async function cmdPublish(a: Args): Promise<number> {
 // ---------- help / passthrough ----------
 const HELP = `apm ${VERSION}: checks before you install, run or publish; your package manager does the rest.
 
-  apm add <pkg>[@range]...   resolve with a 24h cooldown, warn on a score under 40, then <pm> add the exact version
+  apm add <pkg>[@range]...   resolve, warn on a version under 24h old or a score under 40, then <pm> add the exact version
   apm x <pkg> [args]         show the risk card and any warning, then run it (bunx / npx)
   apm publish [--bump patch|minor|major] [--dry-run] [--tag t]
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
@@ -1131,8 +1137,9 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --json, --otp <code>, --no-browser
-  --strict (or APM_STRICT=1): refuse a score under 40, an incomplete analysis, no score yet or ever, and a
-  dependency the registry could not look up, instead of warning about them
+  --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
+  under 40, an incomplete analysis, no score yet or ever, and a dependency the registry could not look up, instead
+  of warning about them. --no-cooldown: no cooldown warning (strict: no refusal) for anything in the tree
 Registry: APM_REGISTRY or registry= in .npmrc (default ${DEFAULT_REGISTRY})`;
 
 // Commands that run package install scripts: their env gets no credentials. `apm run` keeps the env, as `bun run` would.

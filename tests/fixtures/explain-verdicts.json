@@ -1,5 +1,5 @@
 {
-  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. Since the warn-not-block policy (2026-11) a score, an incomplete analysis, no score or a flagged dependency is review-first with a summary that says it installs; do-not-install is only for revoked, yanked and confirmed malicious.",
+  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. Since the warn-not-block policy (2026-11) a score, an incomplete analysis, no score, a version published inside the 24-hour cooldown or a flagged dependency is review-first with a summary that says it installs; do-not-install is only for revoked, yanked and confirmed malicious.",
   "cases": [
     {
       "name": "clean, scored, every dependency reviewed clean or not picked: install",
@@ -760,7 +760,7 @@
       }
     },
     {
-      "name": "a cooldown refused the range: review first, not do-not-install, and no command",
+      "name": "strict mode's cooldown refused the range: review first, not do-not-install, and no command",
       "resolve": {
         "kind": "refused",
         "reason": "x@2.0.0: published 3h ago (cooldown 24h)",
@@ -1567,9 +1567,152 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (a score under 40, an incomplete analysis, no score, or a lookup that failed).",
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, or a lookup that failed).",
         "reasons": [
           "apm flagged 2 dependencies: `dep-low@1.0.0: scores 12/100 (F), under the floor of 40`, `dep-down@^1.0.0: could not be checked: registry or upstream unavailable`."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "the version itself was published inside the cooldown: it installs with a warning, so review first with the reason (review of 2fbf383, finding 1)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "cooldown",
+            "text": "published 5 hours ago, inside apm's 24-hour cooldown",
+            "via": []
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it was published inside apm's 24-hour cooldown, so it has had little time to be looked at.",
+        "reasons": [
+          "The registry said: `x@1.0.0: published 5 hours ago, inside apm's 24-hour cooldown`",
+          "The AI review found nothing in the files it read."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "a fresh version still being analysed: its cooldown warning does not hide that it has no score yet",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "cooldown",
+            "text": "published 1 hour ago, inside apm's 24-hour cooldown",
+            "via": []
+          },
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "pending",
+            "text": "This version is not scored yet: its tarball is queued for analysis.",
+            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but x@1.0.0 is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute. No AI review: apm never picked this version for one.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "evidence": [],
+        "url": "https://apmjs.dev/package/x/v/1.0.0"
+      }
+    },
+    {
+      "name": "a dependency published inside the cooldown: it installs with a warning, so review first, naming it (review of 2fbf383, finding 1)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "baseline-browser-mapping",
+            "version": "2.11.37",
+            "kind": "cooldown",
+            "text": "published 3 hours ago, inside apm's 24-hour cooldown",
+            "via": [
+              "x@1.0.0"
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 1 dependency apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, or a lookup that failed).",
+        "reasons": [
+          "apm flagged 1 dependency: `baseline-browser-mapping@2.11.37: published 3 hours ago, inside apm's 24-hour cooldown`."
         ],
         "coverage": {
           "aiReview": "reviewed",

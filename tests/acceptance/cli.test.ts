@@ -151,18 +151,26 @@ describe("apm: install gate", () => {
     expect(installedVersion(app, "evil-dep")).toBe("1.0.0");
   });
 
-  test("apm add skips versions younger than the 24h cooldown unless asked", async () => {
+  // review of 2fbf383, finding 1: a version inside the cooldown is the one npm and bun install, so apm add installs and
+  // checks it with a warning; --strict falls back to the newest older version, as apm add did in every mode before
+  test("apm add installs a version younger than the 24h cooldown with a warning; --strict skips it", async () => {
     await publish("nice-dep", "1.2.0", alice); // brand new
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
     const r = await apm(["add", "nice-dep"], { cwd: app, env: sb.env });
     expect(r.code, r.out).toBe(0);
-    expect(installedVersion(app, "nice-dep")).toBe("1.1.0");
-    expect(r.out).toContain("1.2.0");
+    expect(installedVersion(app, "nice-dep")).toBe("1.2.0");
+    expect(r.out).toContain("inside apm's 24-hour cooldown");
+    const strictApp = bunProject({}, alice);
+    const strict = await apm(["add", "nice-dep", "--strict"], { cwd: strictApp, env: sb.env });
+    expect(strict.code, strict.out).toBe(0);
+    expect(installedVersion(strictApp, "nice-dep")).toBe("1.1.0");
+    expect(strict.out).toContain("skipped 1.2.0");
     const app2 = bunProject({}, alice);
     const r2 = await apm(["add", "nice-dep", "--no-cooldown"], { cwd: app2, env: sb.env });
     expect(r2.code, r2.out).toBe(0);
     expect(installedVersion(app2, "nice-dep")).toBe("1.2.0");
+    expect(r2.out).not.toContain("inside apm's 24-hour cooldown");
   });
 });
 

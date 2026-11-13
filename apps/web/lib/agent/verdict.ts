@@ -287,7 +287,8 @@ function pageUrl(raw: string | undefined): string | null {
 function evidenceOf(resolve: { name: string; range: string | null; resolve: ResolveOutcome; review: ReviewInput }["resolve"]): Pick<Verdict, "evidence" | "url"> {
   if (resolve.kind !== "ok") return { evidence: [], url: null };
 
-  const own = resolve.deps.warnings.find((w) => w.via.length === 0);
+  // the version's own score warning, not its cooldown one: the evidence is the score's
+  const own = resolve.deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
 
   const fromSignals = (resolve.report?.signals ?? [])
     .filter((s) => s.points < 0)
@@ -325,7 +326,8 @@ function decide(input: { name: string; range: string | null; resolve: ResolveOut
 
       if (refusedAsPulled(resolve.skipped)) return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
 
-      // held back for another reason (a cooldown): not a sign of malice, so a look first, and no command to run now
+      // held back for another reason (strict mode's cooldown or score floor): not a sign of malice, so a look first,
+      // and no command to run now
       return { ...base, verdict: "review-first", version: resolve.newest, score: null, summary: `Review ${asked} before installing: apm's install policy holds it back for now, and nothing in its answer says it is malicious. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
     }
 
@@ -391,6 +393,10 @@ function decide(input: { name: string; range: string | null; resolve: ResolveOut
   const own = reviewHold(review);
 
   if (own) holds.push({ why: own, reason: reviewReason(review) });
+  // a version published inside apm's cooldown installs with a warning (strict mode refuses it): a look first
+  const fresh = deps.warnings.find((w) => w.via.length === 0 && w.kind === "cooldown");
+
+  if (fresh) holds.push({ why: "it was published inside apm's 24-hour cooldown, so it has had little time to be looked at", reason: `The registry said: ${quoted(`${name}@${version}: ${fresh.text}`)}` });
   const depReviews: DepReviews = deps.reviews;
 
   if (depReviews.kind === "on") {
@@ -408,7 +414,7 @@ function decide(input: { name: string; range: string | null; resolve: ResolveOut
 
   if (flaggedDeps.length > 0) {
     holds.push({
-      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (a score under ${SCORE_FLOOR}, an incomplete analysis, no score, or a lookup that failed)`,
+      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (published inside the cooldown, a score under ${SCORE_FLOOR}, an incomplete analysis, no score, or a lookup that failed)`,
       reason: `apm flagged ${plural(flaggedDeps.length, "dependency", "dependencies")}: ${flaggedDeps
         .slice(0, SHOWN)
         .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))
@@ -439,7 +445,7 @@ function decide(input: { name: string; range: string | null; resolve: ResolveOut
   const commands = commandsFor(name, version);
   const note = noReviewNote(aiReview);
 
-  const ownWarning = deps.warnings.find((w) => w.via.length === 0);
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
 
   // the version itself has no score: it installs, and nothing has read its code
   if (report === null) {

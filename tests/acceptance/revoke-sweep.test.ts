@@ -469,7 +469,7 @@ function probes(): Probe[] {
   const v1 = (rest: string, route: GetRouteName, status: Probe["status"]): Probe => ({ path: `-/apm/v1/${rest}`, route, status });
   // after the revokes; `latest` then points at the clean version, as the revoke moves tags off a withheld one
   const withheld = (v: string): boolean => v === PENDING || v === REVOKED;
-  // REVOKED was published an hour ago: inside the 24-hour cooldown, so /~safe/ and a plain resolve leave it out
+  // REVOKED was published an hour ago: inside the 24-hour cooldown, so /~safe/ leaves it out (a plain resolve warns)
   const cooling = (v: string): boolean => v === REVOKED;
 
   /**
@@ -532,7 +532,9 @@ function probes(): Probe[] {
     // the package whose score skipped a marked file: it scores under the floor, and resolve embeds its report
     v1(`score/${SKIPPED_PKG}/${CLEAN}`, "score", 200),
     v1(`packages/${SKIPPED_PKG}`, "package", 200),
-    v1(`resolve?name=${SKIPPED_PKG}&range=${CLEAN}`, "resolve", 422),
+    // inside its cooldown and under the floor: both warn, so it installs until it is revoked (review of 2fbf383,
+    // finding 1; before, the cooldown refused it in every mode)
+    v1(`resolve?name=${SKIPPED_PKG}&range=${CLEAN}`, "resolve", (a) => (a.phase === "after" ? 422 : 200)),
     v1(`resolve?name=${SKIPPED_PKG}&range=${CLEAN}&floor=0&cooldown=0`, "resolve", (a) => (a.phase === "after" ? 422 : 200)),
     v1("me", "me", (a) => (a.caller === "maintainer" ? 200 : 401)),
     v1(`score/${NAME}`, "score", 200),
@@ -542,8 +544,9 @@ function probes(): Probe[] {
     ...VERSIONS.map((v) => v1(`packages/${NAME}/versions/${v}`, "versions", 200)),
     v1(`popular-scores?names=${NAME},${DEPENDENT}`, "popular-scores", 200),
     v1("recent-packages?limit=50", "recent-packages", 200),
-    // the dependency walk and the AI review standings of what it walked (tree.reviews); DEPENDENT is inside its cooldown
-    v1(`resolve?name=${DEPENDENT}`, "resolve", 422),
+    // the dependency walk and the AI review standings of what it walked (tree.reviews); DEPENDENT is inside its
+    // cooldown, which warns (review of 2fbf383, finding 1): its tree decides, as with the cooldown lifted below
+    v1(`resolve?name=${DEPENDENT}`, "resolve", (a) => (a.phase === "after" ? 200 : 422)),
     // before the revoke, the dependency's newest version is REVOKED, confirmed malicious: refused in every mode
     v1(`resolve?name=${DEPENDENT}&floor=0&cooldown=0`, "resolve", (a) => (a.phase === "after" ? 200 : 422)),
     // files and readmes (files.ts)

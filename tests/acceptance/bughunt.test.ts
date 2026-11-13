@@ -79,13 +79,23 @@ describe("the dependency tree is checked the way npm installs it", () => {
     expect(dig(warned.body, "warnings", 0, "version")).toBe("2.0.0-beta.1");
   });
 
-  test("a dependency published inside the cooldown blocks the tree", async () => {
+  // review of 2fbf383, finding 1: the package manager installs the fresh dependency whatever its age, so it is checked
+  // and warned about; strict mode refuses it, as every mode did before
+  test("a dependency published inside the cooldown is a warning, and strict mode refuses it", async () => {
     const r = await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app`);
-    expect(r.status, JSON.stringify(r.body)).toBe(422);
-    const blocks = JSON.stringify(dig(r.body, "tree", "blocks"));
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    const warnings = JSON.stringify(dig(r.body, "warnings"));
+    expect(warnings).toContain('"name":"hot-dep","version":"1.0.0"');
+    expect(warnings).toContain("inside apm's 24-hour cooldown");
+    expect(JSON.stringify(dig(r.body, "tree", "packages"))).toContain('"name":"hot-dep"');
+    const strict = await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app&strict=1`);
+    expect(strict.status, JSON.stringify(strict.body)).toBe(422);
+    const blocks = JSON.stringify(dig(strict.body, "tree", "blocks"));
     expect(blocks).toContain('"name":"hot-dep","version":"1.0.0"');
     expect(blocks).toMatch(/cooldown/);
-    expect((await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app&cooldown=0`)).status).toBe(200);
+    const lifted = await getJson(`${reg.url}-/apm/v1/resolve?name=cool-app&cooldown=0`);
+    expect(lifted.status).toBe(200);
+    expect(JSON.stringify(dig(lifted.body, "warnings"))).not.toContain("cooldown");
   });
 
   test("a floor or cooldown that is not a number of zero or more is a 400, not a pass", async () => {

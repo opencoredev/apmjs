@@ -208,12 +208,17 @@ describe("upstream proxy", () => {
     expect(dig(body, "versions", "9.0.0")).toBeUndefined();
   });
 
-  test("apm add gates upstream packages by cooldown, and by score in strict mode", async () => {
+  test("apm add warns about an upstream version inside the cooldown, and strict mode skips it and refuses a low score", async () => {
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
     const ok = await apm(["add", "up-pkg"], { cwd: app, env: sb.env });
     expect(ok.code, ok.out).toBe(0);
-    expect(installedVersion(app, "up-pkg")).toBe("1.1.0");
+    expect(installedVersion(app, "up-pkg")).toBe("1.2.0");
+    expect(ok.out).toContain("inside apm's 24-hour cooldown");
+    const strictPkg = writeConsumer(work, reg, alice, {});
+    const older = await apm(["add", "up-pkg", "--strict"], { cwd: strictPkg, env: sb.env });
+    expect(older.code, older.out).toBe(0);
+    expect(installedVersion(strictPkg, "up-pkg")).toBe("1.1.0");
     // a low score warns and installs by default; --strict refuses it
     const strictApp = writeConsumer(work, reg, alice, {});
     const bad = await apm(["add", "up-evil", "--strict"], { cwd: strictApp, env: sb.env });

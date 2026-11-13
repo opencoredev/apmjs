@@ -118,8 +118,9 @@ function transcript(ok: boolean, out: string): void {
  * The low-score package the warn path installs: three 0.187.0. Its analysis is incomplete (its largest files are past
  * what apm reads), so it scores under 40 on every run; it has no dependencies and no install scripts, and it was
  * published weeks ago. puppeteer 1.20.0, the check's first target, brings in a tree of dependencies, so whenever one of them
- * publishes (ws 6.2.7 did, 7 hours before a run) the 24-hour cooldown refuses the install in every mode, and the check
- * failed on the cooldown instead of testing the warning. Its install script also downloads Chromium.
+ * publishes (ws 6.2.7 did, 7 hours before a run) its warnings include the cooldown's, beside the score's (before the
+ * review of 2fbf383 the cooldown refused the install in every mode, and the check failed on it). Its install script
+ * also downloads Chromium.
  */
 const LOW_SCORE = { name: "three", version: "0.187.0" } as const;
 

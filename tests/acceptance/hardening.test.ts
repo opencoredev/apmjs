@@ -256,16 +256,21 @@ describe("council round 2: Kimi findings", () => {
     await reg?.stop();
   });
 
-  test("--force also overrides the cooldown for a package that only has fresh versions, but never a revoked one", async () => {
+  test("a package that only has fresh versions installs with a warning; strict refuses it unless forced, and a revoked one never", async () => {
     const { apm, installedVersion } = await import("./harness");
     expect((await publish(reg, alice, { name: "brand-new-thing", version: "1.0.0" })).code).toBe(0);
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
-    const blocked = await apm(["add", "brand-new-thing"], { cwd: app, env: sb.env });
-    expect(blocked.code).not.toBe(0);
-    const forced = await apm(["add", "brand-new-thing", "--force"], { cwd: app, env: sb.env });
-    expect(forced.code, forced.out).toBe(0);
+    const warned = await apm(["add", "brand-new-thing"], { cwd: app, env: sb.env });
+    expect(warned.code, warned.out).toBe(0);
+    expect(warned.out).toContain("inside apm's 24-hour cooldown");
     expect(installedVersion(app, "brand-new-thing")).toBe("1.0.0");
+    const strictApp = writeConsumer(work, reg, alice, {});
+    const blocked = await apm(["add", "brand-new-thing", "--strict"], { cwd: strictApp, env: sb.env });
+    expect(blocked.code).not.toBe(0);
+    const forced = await apm(["add", "brand-new-thing", "--strict", "--force"], { cwd: strictApp, env: sb.env });
+    expect(forced.code, forced.out).toBe(0);
+    expect(installedVersion(strictApp, "brand-new-thing")).toBe("1.0.0");
     expect((await publish(reg, alice, { name: "gone-for-good", version: "1.0.0" })).code).toBe(0);
     const rv = await getJson(`${reg.url}-/apm/v1/revoke`, {
       method: "POST",

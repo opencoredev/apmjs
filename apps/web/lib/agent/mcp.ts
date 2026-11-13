@@ -175,7 +175,7 @@ const checkName: Tool<typeof CheckNameInput> = {
 const explain: Tool<typeof ExplainInput> = {
   name: "explain_install",
   title: "Should I install this?",
-  description: "Before adding a dependency: runs apm's install policy (24-hour cooldown, revokes, confirmed malice, the dependency tree, and the score floor of 40 as a warning) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons and the command to run.",
+  description: "Before adding a dependency: runs apm's install policy (revokes, confirmed malice, the dependency tree, and the 24-hour cooldown and the score floor of 40 as warnings) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons and the command to run.",
   input: ExplainInput,
   async run({ name, version }, source) {
     const verdict = await explainFor({ name, range: version ?? null, source });

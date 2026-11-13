@@ -1,7 +1,7 @@
 // `apm explain` and `apm search`, the commands agents lean on. main.ts hands in its output functions, so with
 // --json each prints one document on stdout and everything else goes to stderr, like every apm command.
 import { z } from "zod";
-import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, type RawAnswer } from "./api.ts";
+import { Api, ResolveFail, ResolveOk, encodeName, installTarget, parseSpec, type RawAnswer } from "./api.ts";
 import { EXIT, explain, type ResolvedInput, type ReviewInput } from "./explain.ts";
 
 type Paint = (s: string) => string;
@@ -81,7 +81,7 @@ async function resolvedFor(api: Api, name: string, range: string | null): Promis
   let r: { status: number; body: unknown };
 
   try {
-    r = await api.raw(`-/apm/v1/resolve?${new URLSearchParams({ name, range: range ?? "latest" })}`);
+    r = await api.raw(`-/apm/v1/resolve?${new URLSearchParams({ name, range: range ?? "latest", ...installTarget() })}`);
   } catch (e) {
     return { kind: "unavailable", reason: e instanceof Error ? e.message : "the registry did not answer" };
   }

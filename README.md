@@ -14,7 +14,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 | Publishing is a chore and leaks secrets | `apm publish` packs with your PM, lists files, blocks secrets and missing `main`/`types`/`bin`, previews the score, `--bump patch`. The registry repeats the checks server-side |
 | Manifest confusion | Metadata is served from the tarball's package.json; a publish whose request hides install scripts is refused |
 | Typosquats, no name check | Domain-search-style name check; new names one edit from popular packages are refused |
-| No cooldown by default | `apm add` skips versions under 24h; `https://<registry>/~safe/` gives any client the same filter |
+| No cooldown by default | `apm add` warns about a version under 24h old, in the package or its tree (`--strict` refuses it); `https://<registry>/~safe/` leaves such versions out for any client |
 | A score that blocks, or one that is ignored | A score informs, it does not block: `apm add`, `apm x`, the registry's resolve and scan answers and the Bun scanner warn about a score under 40, an incomplete analysis, a version apm cannot score or has not scored yet, and a dependency the registry could not look up, with the score, the top reasons (file and line) and a link, then install. `--strict` (or `APM_STRICT=1`, `APM_SCANNER_STRICT=1`, the `~safe/` view) refuses them instead. Revoked and yanked versions, and ones an apm reviewer confirmed malicious, are refused in every mode |
 | Coverage | Proxies the public registry: every npm package gets scored on demand; names that exist upstream can't be published here |
 
