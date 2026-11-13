@@ -13,7 +13,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_ACCEPTED_SHARE, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { StoreError } from "../src/errors.ts";
@@ -726,3 +726,61 @@ test("an analysis whose evidence quotes a NUL or an unpaired surrogate is stored
     expect(stored[0]?.evidence).toEqual(["db/000741.ldb:23400: \u0001ce\uFFFDunctual", "lone \uFFFD half", "a backslash then u0000: \\u0000 stays", "a pair \ud83d\ude00 stays"]);
   });
 }, 120_000);
+
+// Review of 89441a9, finding 6: the sweep took unfinished runs first and accepted jobs only with the room they left, so
+// 200 or more unfinished runs left an accepted job that never began a run waiting through every sweep.
+describe("accepted jobs that never began cannot starve behind unfinished runs", () => {
+  test("600 unfinished runs and 150 accepted jobs: each sweep keeps room for both, and every job is sent by the second", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub([]);
+      const runs = 600;
+      const waiting = 150;
+
+      await sql(
+        `INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at)
+         SELECT 'run-' || i, '1.0.0', $1, 1, $2::bigint + i FROM generate_series(0, $3::int - 1) AS i`,
+        [SCORER, T0 - 10 * RUN_WINDOW_MS, runs],
+      );
+      await sql(`INSERT INTO analysis_jobs (package, version, queued_at) SELECT 'job-' || i, '1.0.0', $1::bigint - i FROM generate_series(0, $2::int - 1) AS i`, [T0, waiting]);
+      const q = queueStub();
+      const sweep = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
+      const per: { runs: number; jobs: number }[] = [];
+
+      for (let i = 1; i <= 3; i++) {
+        const before = q.sent.length;
+
+        expect(await sweep(T0 + i * REQUEUE_AFTER_MS)).toBe(RECOVER_PER_SWEEP);
+        const sent = q.sent.slice(before);
+
+        per.push({ runs: sent.filter((j) => j.name.startsWith("run-")).length, jobs: sent.filter((j) => j.name.startsWith("job-")).length });
+      }
+
+      // on 89441a9: [{runs: 200, jobs: 0}] three times, and no accepted job was ever sent
+      expect(per[0]).toEqual({ runs: RECOVER_PER_SWEEP - RECOVER_ACCEPTED_SHARE, jobs: RECOVER_ACCEPTED_SHARE });
+      expect(per.every((p) => p.runs >= RECOVER_PER_SWEEP - RECOVER_ACCEPTED_SHARE && p.jobs > 0)).toBe(true);
+      const jobsSent = new Set(q.sent.filter((j) => j.name.startsWith("job-")).map((j) => j.name));
+      const firstTwo = new Set(q.sent.slice(0, 2 * RECOVER_PER_SWEEP).filter((j) => j.name.startsWith("job-")).map((j) => j.name));
+
+      expect(firstTwo.size).toBe(waiting);
+      expect(jobsSent.size).toBe(waiting);
+      // and the unfinished runs still all go out in turn: 600 over the three sweeps less what the jobs took
+      expect(new Set(q.sent.filter((j) => j.name.startsWith("run-")).map((j) => j.name)).size).toBe(per.reduce((n, p) => n + p.runs, 0));
+    });
+  }, 120_000);
+
+  test("with no accepted jobs waiting, unfinished runs take the whole sweep", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub([]);
+
+      await sql(
+        `INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at)
+         SELECT 'run-' || i, '1.0.0', $1, 1, $2::bigint + i FROM generate_series(0, $3::int - 1) AS i`,
+        [SCORER, T0 - 10 * RUN_WINDOW_MS, 300],
+      );
+      const q = queueStub();
+
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe(RECOVER_PER_SWEEP);
+      expect(q.sent.length).toBe(RECOVER_PER_SWEEP);
+    });
+  }, 60_000);
+});

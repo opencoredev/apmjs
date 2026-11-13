@@ -187,8 +187,10 @@ export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: Unscorab
  * The runs of a version so far, the one starting included, as Store.startAnalysis finds them. `starts` counts every
  * run begun; of those, `fetchFailures` ended unable to fetch the version and `failures` ended with an error they
  * reported. The rest began and never stored anything: the platform ended them, for a reason it does not tell the run.
+ * `reportedStart` is the start number of the latest run that reported how it ended (a failure or a fetch failure),
+ * null when none has (migration 0017).
  */
-export type RunHistory = { starts: number; fetchFailures: number; fetchFailedSince: number | null; failures: number };
+export type RunHistory = { starts: number; fetchFailures: number; fetchFailedSince: number | null; failures: number; reportedStart: number | null };
 
 /** What starting a run came to (Store.startAnalysis). */
 export type AnalysisStart = ({ kind: "started" } & RunHistory) | { kind: "running" } | { kind: "decided" };
@@ -1016,8 +1018,8 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
               ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
               WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
-              RETURNING starts, fetch_failures, fetch_failed_since, failures`,
-          one(z.object({ starts: Int, fetch_failures: Int, fetch_failed_since: z.coerce.number().nullable(), failures: Int })),
+              RETURNING starts, fetch_failures, fetch_failed_since, failures, reported_start`,
+          one(z.object({ starts: Int, fetch_failures: Int, fetch_failed_since: z.coerce.number().nullable(), failures: Int, reported_start: Int.nullable() })),
         );
 
         if (started) {
@@ -1027,6 +1029,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             fetchFailures: started.fetch_failures,
             fetchFailedSince: started.fetch_failed_since,
             failures: started.failures,
+            reportedStart: started.reported_start,
           } satisfies AnalysisStart;
         }
 
@@ -1043,7 +1046,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       run(
         "failFetch",
         sql`UPDATE analysis_outcomes SET fetch_failures = fetch_failures + 1, last_error = ${errorClass.slice(0, 200)}, started_at = ${now - runMs},
-              fetch_failed_since = COALESCE(fetch_failed_since, ${now})
+              fetch_failed_since = COALESCE(fetch_failed_since, ${now}), reported_start = starts
             WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL
             RETURNING fetch_failures`,
         one(z.object({ fetch_failures: Int })).transform((row) => row?.fetch_failures ?? null),
@@ -1051,7 +1054,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
     failAnalysis: ({ name, version, errorClass, now, runMs }) =>
       run(
         "failAnalysis",
-        sql`UPDATE analysis_outcomes SET failures = failures + 1, last_error = ${errorClass.slice(0, 200)}, started_at = ${now - runMs}
+        sql`UPDATE analysis_outcomes SET failures = failures + 1, last_error = ${errorClass.slice(0, 200)}, started_at = ${now - runMs}, reported_start = starts
             WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL
             RETURNING failures`,
         one(z.object({ failures: Int })).transform((row) => row?.failures ?? null),

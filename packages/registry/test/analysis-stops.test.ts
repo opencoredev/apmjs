@@ -19,7 +19,7 @@ import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis, MAX_FAILED_RUNS, planFor, RUN_WINDOW_MS, STOPS_BEFORE_RERUN, type AnalysisJob } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type RunHistory, type VersionRecord } from "../src/db.ts";
-import { Upstream, type UpstreamPackage } from "../src/upstream.ts";
+import { Upstream, type UpstreamApi, type UpstreamPackage } from "../src/upstream.ts";
 
 const T0 = Date.parse("2026-11-13T05:49:20Z");
 const JOB: AnalysisJob = { name: "express-like", version: "1.0.0" };
@@ -89,9 +89,7 @@ function pkg(): UpstreamPackage {
   return { name: JOB.name, distTags: { latest: JOB.version }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map() };
 }
 
-const upstream = Layer.succeed(
-  Upstream,
-  Upstream.of({
+const STUB: UpstreamApi = {
     baseUrl: "http://upstream.invalid/",
     scopeExists: () => Effect.succeed("unknown"),
     search: () => Effect.succeed({ kind: "unavailable" }),
@@ -103,8 +101,9 @@ const upstream = Layer.succeed(
     get: () => Effect.succeed(pkg()),
     tarball: () => Effect.succeed({ kind: "ok", bytes: BYTES, digest: { algo: "sha512", hex: createHash("sha512").update(BYTES).digest("hex") } }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
-  }),
-);
+};
+
+const upstream = Layer.succeed(Upstream, Upstream.of(STUB));
 
 /** The platform ending the invocation: nothing the run would do after it happens, and nothing it can report. */
 class PlatformStop extends Error {}
@@ -147,6 +146,22 @@ async function withDb(fn: (url: string, sql: (q: string, p?: unknown[]) => Promi
 function deliver(url: string, now: number, stopped: boolean) {
   return Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob(JOB)).pipe(Effect.provide(layerFor(url, now, { armed: stopped })), Effect.scoped));
 }
+
+/** An upstream whose tarball cannot be fetched right now: the run counts a fetch failure and ends. */
+const unreachableTarball = Layer.succeed(
+  Upstream,
+  Upstream.of({ ...STUB, tarball: () => Effect.succeed({ kind: "unavailable", reason: "the tarball download failed", retryable: true }) }),
+);
+
+/** One delivery at `now` against another upstream; it stores nothing it would not store anyway. */
+async function deliverWith(url: string, now: number, up: Layer.Layer<Upstream>): Promise<string | null> {
+  const base = Layer.mergeAll(Store.postgres(url), up, Clock.fixed({ now, wallNow: now }));
+  const exit = await Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob(JOB)).pipe(Effect.provide(Layer.provideMerge(Analysis.layer(null), base)), Effect.scoped));
+
+  return Exit.isSuccess(exit) ? exit.value : null;
+}
+
+const Row2 = z.array(z.object({ starts: z.number(), fetch_failures: z.number(), reported_start: z.number().nullable() }));
 
 /** A delivery the platform ends before it stores anything. */
 async function stoppedAt(url: string, now: number): Promise<void> {
@@ -215,7 +230,7 @@ describe("a run that began and stored nothing: full, full, reduced, then analysi
 });
 
 describe("planFor", () => {
-  const history = (h: Partial<RunHistory>): RunHistory => ({ starts: 1, fetchFailures: 0, fetchFailedSince: null, failures: 0, ...h });
+  const history = (h: Partial<RunHistory>): RunHistory => ({ starts: 1, fetchFailures: 0, fetchFailedSince: null, failures: 0, reportedStart: null, ...h });
 
   const kindOf = (h: Partial<RunHistory>): string => {
     const next = planFor(history(h));
@@ -233,6 +248,53 @@ describe("planFor", () => {
     expect(kindOf({ starts: 2, failures: 1 })).toBe("full");
     expect(kindOf({ starts: MAX_FAILED_RUNS + 1, failures: MAX_FAILED_RUNS })).toBe("full");
     expect(kindOf({ starts: 3, fetchFailures: 1, failures: 1 })).toBe("full");
-    expect(kindOf({ starts: 4, fetchFailures: 1 })).toBe("reduced");
+    // the fetch failure came first (start 1), then two stops: the third start reads less
+    expect(kindOf({ starts: 4, fetchFailures: 1, reportedStart: 1 })).toBe("reduced");
   });
+
+  // Review of 89441a9, finding 5: the counts alone cannot say which run came last, so two stops and then a reported
+  // failure still picked the smaller re-run (on 89441a9 each of these was "reduced")
+  test("the run just after one that reported how it ended runs in full, whatever stopped before it", () => {
+    // stop, stop, a failure it reported: the review's {starts: 4, failures: 1, fetchFailures: 0}
+    expect(kindOf({ starts: 4, failures: 1, reportedStart: 3 })).toBe("full");
+    // stop, stop, a fetch failure
+    expect(kindOf({ starts: 4, fetchFailures: 1, reportedStart: 3 })).toBe("full");
+    // stop, a failure, stop: the last run was a stop, and two runs have stopped
+    expect(kindOf({ starts: 4, failures: 1, reportedStart: 2 })).toBe("reduced");
+    // stop, stop, a fetch failure, a failure
+    expect(kindOf({ starts: 5, fetchFailures: 1, failures: 1, reportedStart: 4 })).toBe("full");
+  });
+
+  test("the stop bound holds across mixed histories: past STOPS_BEFORE_RERUN stops in all, give up", () => {
+    // stop, stop, a failure, stop: three stops, whatever came between
+    expect(kindOf({ starts: 5, failures: 1, reportedStart: 3 })).toBe("give-up");
+    // a reported run last does not lift it
+    expect(kindOf({ starts: 6, failures: 1, fetchFailures: 1, reportedStart: 5 })).toBe("give-up");
+    // stops between fetch failures count up: fetch failure, stop, fetch failure, stop, fetch failure, stop
+    expect(kindOf({ starts: 7, fetchFailures: 3, reportedStart: 5 })).toBe("give-up");
+  });
+});
+
+describe("reported_start, written by the store", () => {
+  test("stop, stop, a fetch failure: the next delivery runs in full and stores a complete analysis", async () => {
+    await withDb(async (url, sql) => {
+      for (let i = 0; i < STOPS_BEFORE_RERUN; i++) await stoppedAt(url, T0 + i * STEP);
+      // the third delivery cannot fetch the tarball, says so, and ends
+      expect(await deliverWith(url, T0 + STOPS_BEFORE_RERUN * STEP, unreachableTarball)).toBe("retry");
+      expect(Row2.parse(await sql("SELECT starts, fetch_failures, reported_start FROM analysis_outcomes WHERE package = $1", [JOB.name]))[0]).toEqual({ starts: 3, fetch_failures: 1, reported_start: 3 });
+
+      expect(await storedAt(url, T0 + (STOPS_BEFORE_RERUN + 1) * STEP)).toBe("stored");
+      // on 89441a9 this was the smaller re-run's incomplete analysis
+      expect(await incompleteEvidence(sql)).toBeNull();
+    });
+  }, 60_000);
+
+  test("failAnalysis records the start that failed", async () => {
+    await withDb(async (url, sql) => {
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ($1, $2, $3, 3, $4)", [JOB.name, JOB.version, SCORER, T0]);
+      await Effect.runPromise(Effect.flatMap(Store, (s) => s.failAnalysis({ name: JOB.name, version: JOB.version, errorClass: "RangeError", now: T0, runMs: 1 })).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+
+      expect(Row2.parse(await sql("SELECT starts, fetch_failures, reported_start FROM analysis_outcomes WHERE package = $1", [JOB.name]))[0]).toEqual({ starts: 3, fetch_failures: 0, reported_start: 3 });
+    });
+  }, 60_000);
 });

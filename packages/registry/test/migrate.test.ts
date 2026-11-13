@@ -36,6 +36,9 @@ test("concurrent migration runs apply each migration once and both succeed", asy
 
 const RECENT_INDEX = "0009_upstream_analysis_recent";
 
+/** Every migration from `first` on, in order: what an upgrade from just before it applies. */
+const idsFrom = (first: string): string[] => migrationFiles().map((m) => m.id).filter((id) => id >= first);
+
 async function connect(url: string): Promise<Client> {
   const c = new Client({ connectionString: url });
   await c.connect();
@@ -223,7 +226,7 @@ test("upgrading from 0012 with a write to analysis_jobs open does not hold later
     await writer.query("SET statement_timeout = '1s'");
     await writer.query("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('later', '1.0.0', 2)");
     await holder.query("COMMIT");
-    expect(await run).toEqual(["0013_analysis_attempts", "0014_analysis_indexes", "0015_rescore_runtime_failures", "0016_release_rescore_reservations"]);
+    expect(await run).toEqual(idsFrom("0013"));
     expect(await validIndexes(writer, ["analysis_jobs_queued", "analysis_outcomes_unswept", "analysis_outcomes_unfinished"])).toEqual({ analysis_jobs_queued: true, analysis_outcomes_unswept: true });
     const cols = (await writer.query<{ name: string }>("SELECT column_name AS name FROM information_schema.columns WHERE table_name = 'analysis_outcomes' AND column_name LIKE 'fetch_%' ORDER BY 1")).rows;
 
@@ -252,7 +255,7 @@ test("upgrading from 0010 with a write to analysis_outcomes open does not hold l
     await writer.query("SET statement_timeout = '1s'");
     await writer.query("INSERT INTO analysis_outcomes (package, version, scorer) VALUES ('later', '1.0.0', 's')");
     await holder.query("COMMIT");
-    expect(await run).toEqual(["0011_unfinished_analyses", "0012_analysis_failures", "0013_analysis_attempts", "0014_analysis_indexes", "0015_rescore_runtime_failures", "0016_release_rescore_reservations"]);
+    expect(await run).toEqual(idsFrom("0011"));
   } finally {
     await holder.query("ROLLBACK").catch(() => {});
     await run?.catch(() => {});
@@ -281,7 +284,7 @@ test("0014 gives up at its lock_timeout behind a long write, drops the invalid i
     // the failed concurrent build left an invalid index behind
     expect(await validIndexes(holder, ["analysis_jobs_queued"])).toEqual({ analysis_jobs_queued: false });
     await holder.query("COMMIT");
-    expect(await migrate(db.url)).toEqual(["0014_analysis_indexes", "0015_rescore_runtime_failures", "0016_release_rescore_reservations"]);
+    expect(await migrate(db.url)).toEqual(idsFrom("0014"));
     expect(await validIndexes(holder, ["analysis_jobs_queued", "analysis_outcomes_unswept"])).toEqual({ analysis_jobs_queued: true, analysis_outcomes_unswept: true });
     expect(await migrate(db.url)).toEqual([]);
   } finally {
@@ -318,7 +321,7 @@ test("0015 and 0016 drop the outcomes the runtime caused and their reservations,
     );
     // reservations: vite's (its re-run is dropped), hono's (stored), next's (an outcome), and one never started
     await c.query(`INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('vite', '8.3.8', 1), ('hono', '4.13.18', 1), ('next', '16.4.6', 1), ('three', '0.187.0', 1)`);
-    expect(await migrate(db.url)).toEqual(["0015_rescore_runtime_failures", "0016_release_rescore_reservations"]);
+    expect(await migrate(db.url)).toEqual(idsFrom("0015"));
     const outcomes = (await c.query<{ package: string }>("SELECT package FROM analysis_outcomes ORDER BY package")).rows.map((r) => r.package);
     const analyses = (await c.query<{ package: string }>("SELECT package FROM upstream_analysis ORDER BY package")).rows.map((r) => r.package);
 

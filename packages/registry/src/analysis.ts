@@ -67,10 +67,16 @@ export const QUEUE_WORK = MAX_ANALYSIS_WORK;
 /** A run begun less than this long ago may still be going: the Worker's whole CPU limit, plus the download and the writes. */
 export const RUN_WINDOW_MS = WORKER_CPU_MS + 2 * 60_000;
 
-/** At most this many unfinished runs are requeued per sweep; the rest wait for the next one. */
+/** At most this many jobs are requeued per sweep, unfinished runs and accepted jobs together; the rest wait for the next one. */
 export const RECOVER_PER_SWEEP = 200;
 
-/** A re-run after a stopped one reads at most this much, and says so. */
+/**
+ * Of a sweep's RECOVER_PER_SWEEP, the room kept for accepted jobs that never began a run; the rest is for runs that
+ * began and never ended. Either kind takes what the other leaves unused.
+ */
+export const RECOVER_ACCEPTED_SHARE = RECOVER_PER_SWEEP / 2;
+
+/** The smaller re-run, after STOPS_BEFORE_RERUN stopped runs, reads at most this much, and says so. */
 export const RERUN_SCANNED_BYTES = 4 * 1024 * 1024;
 
 /**
@@ -110,17 +116,22 @@ const rerun = (because: string): RunPlan => ({ maxWork: MAX_ANALYSIS_WORK / 4, m
 export type NextRun = { kind: "analyse"; plan: RunPlan } | { kind: "give-up"; unscorable: Unscorable };
 
 /**
- * The next run's plan, from how many runs before it began and stored nothing. A run that could not fetch the version
- * or failed with an error it reported ended: it is not a stop, and the next run is in full (MAX_FAILED_RUNS and
- * MAX_FETCH_FAILURES decide what follows those).
+ * The next run's plan, from the runs before it. A run that could not fetch the version or failed with an error it
+ * reported ended: it is not a stop. So the run just after one that reported runs in full, whatever stopped the runs
+ * before that (MAX_FAILED_RUNS and MAX_FETCH_FAILURES decide what follows those). After a stop, the next runs in full
+ * until STOPS_BEFORE_RERUN runs have stopped, then reads less; and past that many stops in all the version is
+ * recorded as one that cannot be scored, which bounds the stops whatever came between them.
  */
 export function planFor(history: RunHistory): NextRun {
   // the runs begun before this one that never ended: no result, no reported error, no fetch failure
   const stopped = Math.max(0, history.starts - 1 - history.fetchFailures - history.failures);
 
   if (stopped > STOPS_BEFORE_RERUN) {
-    return { kind: "give-up", unscorable: { reason: "analysis-limit", detail: `${stopped} analyses of it were stopped by the platform before they finished, the last one reading at most ${RERUN_SCANNED_BYTES / (1024 * 1024)} MB, so the registry stopped trying` } };
+    return { kind: "give-up", unscorable: { reason: "analysis-limit", detail: `${stopped} analyses of it were stopped by the platform before they finished, so the registry stopped trying` } };
   }
+
+  // the run just before this one reported how it ended (review of 89441a9, finding 5)
+  if (history.reportedStart !== null && history.reportedStart === history.starts - 1) return { kind: "analyse", plan: FULL };
 
   if (stopped === STOPS_BEFORE_RERUN) return { kind: "analyse", plan: rerun(`${stopped} earlier analyses of this version were stopped by the platform before they stored anything`) };
 
@@ -442,10 +453,14 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         const api: AnalysisApi = {
           recover: Effect.gen(function* () {
             const now = yield* clock.now;
-            const runs = yield* store.unfinishedAnalyses({ before: now - RUN_WINDOW_MS, limit: RECOVER_PER_SWEEP, now });
-            // and jobs the queue accepted that never began a run (it gave up on them first, or never delivered them):
-            // past the time a requeue may claim them again, so each is sent once more
-            const accepted = runs.length < RECOVER_PER_SWEEP ? yield* store.acceptedAnalyses({ before: now - REQUEUE_AFTER_MS, limit: RECOVER_PER_SWEEP - runs.length }) : [];
+            // jobs the queue accepted that never began a run (it gave up on them first, or never delivered them), past
+            // the time a requeue may claim them again, so each is sent once more. Read first, and only read: each kind
+            // has RECOVER_ACCEPTED_SHARE of the sweep, and what one leaves unused the other may take. Before this (review
+            // of 89441a9, finding 6) unfinished runs were taken first, so 200 of them left no room for the others.
+            const waiting = yield* store.acceptedAnalyses({ before: now - REQUEUE_AFTER_MS, limit: RECOVER_PER_SWEEP });
+            // runs that began and never ended: picking them marks them swept, so only as many as there is room for
+            const runs = yield* store.unfinishedAnalyses({ before: now - RUN_WINDOW_MS, limit: RECOVER_PER_SWEEP - Math.min(waiting.length, RECOVER_ACCEPTED_SHARE), now });
+            const accepted = waiting.slice(0, RECOVER_PER_SWEEP - runs.length);
 
             // with no queue (a local registry), the sweep runs the job itself, under the same meter
             for (const r of [...runs, ...accepted]) {
