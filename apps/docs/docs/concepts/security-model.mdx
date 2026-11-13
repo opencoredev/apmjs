@@ -50,9 +50,9 @@ A check means nothing if the package manager then installs other bytes, or if ch
 
 1. It pins every scope it checks to the checked registry, and refuses if an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere.
 2. In a temporary directory, from a copy of only your `package.json`, lockfile and package-manager configuration (and, in a workspace, each member's `package.json`), the package manager computes the add's lockfile and installs nothing (`npm install --package-lock-only`, `pnpm add --lockfile-only`, `bun add --lockfile-only`, every script off).
-3. apm asks the registry about every package in that lockfile at its exact version and integrity: nested copies, overrides, peers and the versions your lockfile already pinned. A revoked, yanked or confirmed malicious version, or one whose integrity is not the registry's, is refused in every mode; a fresh, low-scoring or unscored one, and a git, file, link or workspace entry, is a warning, and `--strict` refuses it.
+3. apm asks the registry about every package in that lockfile at its exact version and integrity: nested copies, overrides, peers and the versions your lockfile already pinned. A revoked, yanked or confirmed malicious version, or one whose integrity is not the registry's, is refused in every mode; a fresh, low-scoring or unscored one, one whose integrity the registry cannot compare, and a git, file, link or remote-tarball entry, is a warning, and `--strict` refuses it. Your workspace's own members, matched to their folders, names and versions, are your source and are not asked about.
 4. A refusal ends here. Your project was never touched, so there is nothing to undo.
-5. Otherwise apm writes the checked `package.json` and lockfile over yours (those two files only, each in one rename, and only if neither changed meanwhile), installs exactly that lockfile with every script held back, confirms that what installed is that lockfile, and only then runs install scripts.
+5. Otherwise apm writes the checked `package.json` and lockfile over yours (those two files only, each in one rename, and only if neither changed meanwhile), installs exactly that lockfile with every script held back, confirms that what installed is that lockfile (every dependency resolves, the way Node loads it, to the locked version, and nothing else is in `node_modules`), and only then runs install scripts, for the packages this install put in place.
 
 If the install does not match the checked lockfile, apm runs no script, leaves `node_modules` as it is (apm never undoes an install) and prints the commands that put your `package.json` and lockfile back.
 
@@ -61,7 +61,7 @@ If the install does not match the checked lockfile, apm runs no script, leaves `
 Limits:
 
 - yarn runs install scripts while it installs, before apm can check what it installed. `apm add --strict` refuses yarn adds before anything runs. Otherwise apm warns first; with yarn 2 and later it checks the lockfile yarn computes in a copy (`--mode update-lockfile`) before yarn installs, and with yarn 1, which has no such mode, it can only check `node_modules` after yarn installed and ran scripts, and says so.
-- A bundled dependency ships inside its parent's tarball: the parent's score covers it, and it is not asked about on its own.
+- A bundled dependency ships inside its parent's tarball: the parent's score covers its code. apm asks only whether that version was revoked, yanked or confirmed malicious, and refuses it if so.
 
 ## What apm does not protect against
 
