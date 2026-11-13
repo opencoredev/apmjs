@@ -11,29 +11,87 @@ export class StreamedTarballError extends Error {
   override readonly name = "StreamedTarballError";
 }
 
+/** How long a streamed tarball may take in all, and how long it may go without a chunk passing through. */
+export const STREAM_LIMITS = { totalMs: 10 * 60_000, idleMs: 60_000 } as const;
+
 /**
- * `source`'s bytes, unchanged and unbuffered: each chunk is hashed and passed on when the next one arrives. At the end
- * the held chunk is sent only when every byte matches `digest`, and their count matches `length` when it is known;
- * otherwise the stream errors. Holds one chunk of the network's at a time, whatever the tarball's size.
+ * `source`'s bytes, unchanged and unbuffered: each nonempty chunk is hashed and passed on when the next nonempty one
+ * arrives, so the last one with bytes is always held back. At the end it is sent only when every byte matches `digest`
+ * and their count matches `length` when it is known; otherwise the stream errors. An empty chunk is ignored (passing
+ * the held chunk on for it would let every byte out before the check: review of 23453ab, finding 1). A chunk that
+ * would take the count past `length` is refused before the held one goes out. The whole transfer has `limits.totalMs`,
+ * and `limits.idleMs` between chunks, whether the upstream or a slow client is the one stalling; past either the
+ * stream errors and the upstream is cancelled. Holds one chunk of the network's at a time, whatever the size.
  */
-export function verifiedStream({ source, digest, length, url }: { source: ReadableStream<Uint8Array>; digest: Digest; length: number | null; url: string }): ReadableStream<Uint8Array> {
+export function verifiedStream({
+  source,
+  digest,
+  length,
+  url,
+  limits = STREAM_LIMITS,
+}: {
+  source: ReadableStream<Uint8Array>;
+  digest: Digest;
+  length: number | null;
+  url: string;
+  limits?: { totalMs: number; idleMs: number };
+}): ReadableStream<Uint8Array> {
   const hash = createHash(digest.algo);
   let held: Uint8Array | null = null;
   let seen = 0;
+  let done = false;
+  let total: ReturnType<typeof setTimeout> | null = null;
+  let idle: ReturnType<typeof setTimeout> | null = null;
+
+  const stopTimers = (): void => {
+    if (total !== null) clearTimeout(total);
+
+    if (idle !== null) clearTimeout(idle);
+
+    total = null;
+    idle = null;
+  };
 
   const refuse = (controller: TransformStreamDefaultController<Uint8Array>, error: string): void => {
+    if (done) return;
+    done = true;
+    stopTimers();
+    held = null;
     console.error(JSON.stringify({ level: "error", event: "upstream-tarball-stream", error, url, bytes: seen, declared: length }));
     controller.error(new StreamedTarballError(error));
   };
 
+  const armIdle = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (idle !== null) clearTimeout(idle);
+    idle = setTimeout(() => refuse(controller, "stalled"), limits.idleMs);
+  };
+
   const checker = new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      total = setTimeout(() => refuse(controller, "too-slow"), limits.totalMs);
+      armIdle(controller);
+    },
     transform(chunk, controller) {
+      if (done) return;
+      armIdle(controller);
+
+      if (chunk.byteLength === 0) return;
+
+      if (length !== null && seen + chunk.byteLength > length) {
+        refuse(controller, "length-overrun");
+
+        return;
+      }
+
       if (held !== null) controller.enqueue(held);
       hash.update(chunk);
       seen += chunk.byteLength;
       held = chunk;
     },
     flush(controller) {
+      if (done) return;
+      stopTimers();
+
       if (length !== null && seen !== length) {
         refuse(controller, "length-mismatch");
 
@@ -46,7 +104,10 @@ export function verifiedStream({ source, digest, length, url }: { source: Readab
         return;
       }
 
+      done = true;
+
       if (held !== null) controller.enqueue(held);
+      held = null;
     },
   });
 

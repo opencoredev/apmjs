@@ -186,14 +186,23 @@ describe("upstream tarballs over the analysis cap", () => {
 
     // headers go out before the checksum can be known; on 1627c5e this was a 502 for the size
     expect(res.status).toBe(200);
+    // every byte that reached the client is counted, whether or not the body then errors (review of 23453ab, finding 3)
+    const reader = res.body?.getReader();
     let received = 0;
+    let errored = false;
 
     try {
-      received = (await res.arrayBuffer()).byteLength;
+      for (;;) {
+        const chunk = await reader?.read();
+
+        if (chunk === undefined || chunk.done) break;
+        received += chunk.value.byteLength;
+      }
     } catch {
-      // the stream errored: the client saw a broken body
+      errored = true;
     }
 
+    expect(errored).toBe(true);
     expect(received).toBeLessThan(want.length);
   }, 120_000);
 
