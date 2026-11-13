@@ -108,27 +108,49 @@ function matchOf(list: readonly (readonly [string, RegExp])[], out: string): str
   return list.find(([, re]) => re.test(out))?.[0] ?? null;
 }
 
+/** A failed check's whole CLI output, indented under its FAIL line, so a failure says what apm printed. */
+function transcript(ok: boolean, out: string): void {
+  if (ok) return;
+  process.stdout.write(`${out.trimEnd().split("\n").map((l) => `    | ${l}`).join("\n")}\n`);
+}
+
+/**
+ * The low-score package the warn path installs: three 0.187.0. Its analysis is incomplete (its largest files are past
+ * what apm reads), so it scores under 40 on every run; it has no dependencies and no install scripts, and it was
+ * published weeks ago. puppeteer 1.20.0, the check's first target, brings in a tree of dependencies, so whenever one of them
+ * publishes (ws 6.2.7 did, 7 hours before a run) the 24-hour cooldown refuses the install in every mode, and the check
+ * failed on the cooldown instead of testing the warning. Its install script also downloads Chromium.
+ */
+const LOW_SCORE = { name: "three", version: "0.187.0" } as const;
+
 // Anonymous: a version not scored yet is queued, and the registry waits for the queue (about 20 s) before it answers.
 // A cold analysis can take longer than that, or end in an outcome that is not a score, so any of the warnings (and,
-// with --strict, any of the refusals) passes, and the detail says which, and how long each took. puppeteer's own
-// postinstall would download Chromium once the install goes ahead; the smoke check does not need it.
+// with --strict, any of the refusals) passes, and the detail says which, and how long each took.
 async function apmWarning(): Promise<void> {
-  const env = { APM_REGISTRY: registry, PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1", PUPPETEER_SKIP_DOWNLOAD: "1" };
+  const env = { APM_REGISTRY: registry };
+  const spec = `${LOW_SCORE.name}@${LOW_SCORE.version}`;
   const dir = project("apm-app");
   const t0 = Date.now();
-  const warned = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0"], dir, env);
+  const warned = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", spec], dir, env);
   const warning = /WARNING/.test(warned.out) ? matchOf(WARNINGS, warned.out) : null;
+  const warnedOk = warned.code === 0 && installed(dir, LOW_SCORE.name) === LOW_SCORE.version && warning !== null;
 
-  record(warned.code === 0 && installed(dir, "puppeteer") === "1.20.0" && warning !== null, "apm add warns about a low-score npm package (puppeteer@1.20.0) and installs it", `exit ${warned.code}, installed ${installed(dir, "puppeteer")}, warned as ${warning ?? "nothing apm says"}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  record(warnedOk, `apm add warns about a low-score npm package (${spec}) and installs it`, `exit ${warned.code}, installed ${installed(dir, LOW_SCORE.name)}, warned as ${warning ?? "nothing apm says"}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  transcript(warnedOk, warned.out);
   const strictDir = project("apm-strict-app");
   const t1 = Date.now();
-  const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0", "--strict"], strictDir, env);
+  const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", spec, "--strict"], strictDir, env);
   const refusal = matchOf(REFUSALS, bad.out);
+  const refusedOk = bad.code !== 0 && installed(strictDir, LOW_SCORE.name) === null && refusal !== null;
 
-  record(bad.code !== 0 && installed(strictDir, "puppeteer") === null && refusal !== null, "apm add --strict refuses it", `exit ${bad.code}, installed ${installed(strictDir, "puppeteer")}, refused as ${refusal ?? "nothing apm says"}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+  record(refusedOk, "apm add --strict refuses it", `exit ${bad.code}, installed ${installed(strictDir, LOW_SCORE.name)}, refused as ${refusal ?? "nothing apm says"}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+  transcript(refusedOk, bad.out);
   const t2 = Date.now();
   const good = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "ms"], dir, env);
-  record(good.code === 0 && installed(dir, "ms") !== null, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t2) / 1000).toFixed(1)} s`);
+  const goodOk = good.code === 0 && installed(dir, "ms") !== null;
+
+  record(goodOk, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t2) / 1000).toFixed(1)} s`);
+  transcript(goodOk, good.out);
 }
 
 async function bunAudit(): Promise<void> {
