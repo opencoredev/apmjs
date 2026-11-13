@@ -1198,6 +1198,73 @@
       }
     },
     {
+      "name": "a version revoked after a resolve that carried evidence shows none of it (review of b725ce9, finding 2)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 30,
+        "lost": [
+          {
+            "label": "Runs code built at runtime",
+            "points": -40,
+            "evidence": [
+              "index.js:7: eval(body)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "low-score",
+            "text": "scores 30/100 (C), under the floor of 40",
+            "reasons": [
+              "Runs code built at runtime: index.js:7: eval(body)"
+            ],
+            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "answer",
+        "status": 200,
+        "body": {
+          "name": "x",
+          "version": "1.0.0",
+          "status": "not-reviewed",
+          "job": null,
+          "review": null,
+          "viewer": "public",
+          "private": null,
+          "canRequest": false,
+          "versionStatus": "revoked",
+          "redacted": true
+        }
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it was revoked. The registry said so after its install policy picked this version, so apm's checks of it no longer count.",
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
+        },
+        "evidence": [],
+        "url": null
+      }
+    },
+    {
       "name": "a version yanked after the resolve read: do-not-install, as the policy would now refuse it",
       "resolve": {
         "kind": "ok",

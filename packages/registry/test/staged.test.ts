@@ -62,6 +62,18 @@ describe("staged uploads", () => {
       expect((await run((s) => s.pendingStagedLoad({ user: "u", name: "@u/p", now }))).byPackage).toBe(2);
     }));
 
+  // review of b725ce9, finding 1: Postgres refuses NUL in jsonb, so a staged score quoting one failed the quota check
+  // and the insert with a 500 while a direct publish of the same bytes succeeded
+  test("a staged score whose evidence quotes a NUL or an unpaired surrogate is stored", () =>
+    withStore(async (_url, run) => {
+      const s0 = staged({ id: "nul", version: "4.0.0", readme: "" });
+      const withNul: NewStaged = { ...s0, score: { signals: [{ id: "x", evidence: ["bin/a.node:1: a\u0000b \ud800"] }] } };
+      const r = await run((s) => s.insertStagedWithin(withNul, { perUser: 20, perPackage: 5, bytesPerUser: 1024 * 1024 }));
+
+      expect(r.kind).toBe("staged");
+      expect(JSON.stringify((await run((s) => s.getStaged("nul")))?.score)).toContain("a\uFFFDb \uFFFD");
+    }));
+
   test("the byte quota counts metadata", () =>
     withStore(async (_url, run) => {
       const r = await run((s) => s.insertStagedWithin(staged({ id: "big", version: "2.0.0", readme: "r".repeat(2000) }), { perUser: 20, perPackage: 5, bytesPerUser: 1500 }));

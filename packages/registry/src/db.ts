@@ -240,7 +240,8 @@ export type Reservation = { kind: "locked" } | { kind: "reserved"; id: number };
 export type TwoFactorRecord = { secret: string; backupCodes: string; verified: boolean };
 
 /** A staged score as the jsonb text the row stores, or null. */
-const scoreJson = ({ score }: Pick<NewStaged, "score">): string | null => (score === null || score === undefined ? null : JSON.stringify(score));
+/** A staged upload's score as jsonb text, with NUL and lone surrogates made storable like every other score (storableJson). */
+const scoreJson = ({ score }: Pick<NewStaged, "score">): string | null => (score === null || score === undefined ? null : storableJson(JSON.stringify(score)));
 
 const hashOf = (secret: string): string => createHash("sha256").update(secret).digest("hex");
 

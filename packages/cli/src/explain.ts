@@ -330,7 +330,11 @@ export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean
  * `index.js:7: eval(body)` and a version page came back as review-first with only the score and the signal's label.
  */
 export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
-  return { ...decide(input), ...evidenceOf(input.resolved) };
+  // a review read that says the version is pulled (revoked, yanked or withheld) came after the resolve: the resolve's
+  // evidence lines quote the package's source, which a withheld version no longer shows (review of b725ce9, finding 2)
+  const shown = input.review.kind === "pulled" ? { evidence: [], url: null } : evidenceOf(input.resolved);
+
+  return { ...decide(input), ...shown };
 }
 
 /** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
