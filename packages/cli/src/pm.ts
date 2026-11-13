@@ -157,3 +157,50 @@ export async function runCmd(cmd: string[], opts: RunOpts): Promise<{ code: numb
   const code = await proc.exited;
   return { code, out };
 }
+
+/**
+ * What puts node_modules back in step with the project after a refused add, with every install script off: the frozen
+ * install of the lockfile apm put back, or, with none to put back, the package manager's own remove of the names the
+ * add put in package.json. null when there is nothing it can run (yarn, or an add that only changed versions with no
+ * lockfile).
+ */
+export function undoArgs(pm: Pm, input: { hadLockfile: boolean; addedNames: readonly string[] }): string[] | null {
+  if (input.hadLockfile) return frozenInstallArgs(pm);
+
+  if (input.addedNames.length === 0) return null;
+
+  switch (pm) {
+    case "npm":
+      return ["npm", "uninstall", "--ignore-scripts", "--no-audit", "--no-fund", ...input.addedNames];
+    case "pnpm":
+      return ["pnpm", "remove", "--ignore-scripts", ...input.addedNames];
+    case "bun":
+      return ["bun", "remove", "--ignore-scripts", ...input.addedNames];
+    case "yarn":
+      return null;
+    default: {
+      const _exhaustive: never = pm;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** The install of a lockfile as it stands, every script off; none for yarn, whose flags differ by version. */
+function frozenInstallArgs(pm: Pm): string[] | null {
+  switch (pm) {
+    case "npm":
+      return ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"];
+    case "pnpm":
+      return ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"];
+    case "bun":
+      return ["bun", "install", "--frozen-lockfile", "--ignore-scripts"];
+    case "yarn":
+      return null;
+    default: {
+      const _exhaustive: never = pm;
+
+      return _exhaustive;
+    }
+  }
+}

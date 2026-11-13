@@ -53,7 +53,7 @@ import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
-import { Store, type PackageRecord, type Unscorable, type VersionHead, type VersionRecord } from "./db.ts";
+import { Store, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, LazyMembers, longestPiece, parseBody, streamedJson, streamWeight } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
@@ -82,7 +82,7 @@ import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
-import { jsonBound, keptSummary, keptVersion, summaryVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
+import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -281,53 +281,114 @@ function rowWeights(v: VersionRecord): RowWeights {
   return { manifest: jsonBound(v.manifest).weight, score: isRecord(v.score) ? jsonBound(v.score).weight : 0 };
 }
 
+/** How often a read of picked rows measures them again when one grew between its measuring and its read. */
+const ROW_READ_TRIES = 2;
+
+/** A package and which of its versions to keep, if it is local: a root's candidates, or the versions a walk's ranges pick. */
+type LocalRead = { name: string; select: Select };
+
 /**
- * The versions `select` picks of a local package, summarized under `lease`. Every version is read first as a head
- * (number, age, state), then only the picked ones whole: on 93274c8 a resolve of a package with 230 versions read 2,300
- * whole rows over ten pages and charged none of them (finding 5). The picked rows' sizes are read first, and what
- * reading them whole holds is reserved from those before any of them is sent; once they are here, the reservation is
- * settled to what they weigh. On 1924692 the rows were read, then charged, so a one-byte pool still got a whole row
- * (review of 1924692, finding 4). null when they did not fit.
+ * The versions each `select` picks of local packages, summarized under `lease`, in a fixed number of statements however
+ * many packages there are. Every version is read first as a head (number, age, state), then only the picked ones whole:
+ * on 93274c8 a resolve of a package with 230 versions read 2,300 whole rows over ten pages and charged none of them
+ * (finding 5), and on 16fc8b5 a walk read every version of each local dependency whole and charged none of it (review
+ * of 16fc8b5, finding 4). The picked rows' sizes are read first, and what reading them whole holds is reserved package
+ * by package before any of them is sent; a package that does not fit is null (over budget). The read sends a row only
+ * while it still measures no more than that (Store.versionsWithin), so a row that grew in between is never read past
+ * its reservation (review of 16fc8b5, finding 5): its package is measured again, and after ROW_READ_TRIES it is null.
+ * What stays taken from `lease` is each summary, scores included. On 1924692 the rows were read, then charged, so a
+ * one-byte pool still got a whole row (review of 1924692, finding 4).
  */
-const localWithin = (pkg: PackageRecord, lease: Lease, select: Select) =>
+const localsWithin = (reads: readonly LocalRead[], lease: Lease) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
-    const heads = (yield* store.versionHeads(pkg.name)).map((h) => atTime(h, at));
-    const picked = select({ distTags: pkg.distTags, versions: heads }).map((h) => h.version);
-    const reserved = (yield* store.versionSizes(pkg.name, picked)).reduce((n, s) => n + textReadWeight(s.manifest) + textReadWeight(s.score), 0);
+    const out = new Map<string, Catalog | null>();
 
-    if (!lease.take(reserved)) return null;
-    const got = yield* store.versionsIn(pkg.name, picked).pipe(Effect.onError(() => Effect.sync(() => lease.give(reserved))));
-    const rows = new Map(got.map((v) => [v.version, atTime(v, at)]));
-    // in the order `select` wants them (a root's candidates, newest first)
-    const versions = picked.flatMap((version) => rows.get(version) ?? []);
-    const weights = versions.map(rowWeights);
-    const read = weights.reduce((n, w) => n + w.manifest + w.score, 0);
+    if (reads.length === 0) return out;
+    const local = yield* store.localHeadsOf(reads.map((r) => r.name));
 
-    // settled to what the rows weigh: a bound the sizes missed (a row changed between the reads, a number's longest
-    // text) is taken on top, or the read gives up
-    if (read > reserved && !lease.take(read - reserved)) {
-      lease.give(reserved);
+    let pending = reads.flatMap((r) => {
+      const l = local.get(r.name);
 
-      return null;
+      return l === undefined ? [] : [{ pkg: l.pkg, picked: r.select({ distTags: l.pkg.distTags, versions: l.heads.map((h) => atTime(h, at)) }).map((h) => h.version) }];
+    });
+
+    for (let attempt = 0; attempt < ROW_READ_TRIES && pending.length > 0; attempt++) {
+      const sizes = yield* store.versionSizes(pending.flatMap((p) => p.picked.map((version) => ({ package: p.pkg.name, version }))));
+      const fits: { pkg: PackageTags; picked: string[]; sizes: VersionSize[]; reserved: number }[] = [];
+
+      for (const p of pending) {
+        const mine = sizes.filter((x) => x.package === p.pkg.name);
+        const reserved = mine.reduce((n, x) => n + textReadWeight(x.manifest) + textReadWeight(x.score), 0);
+
+        if (lease.take(reserved)) fits.push({ ...p, sizes: mine, reserved });
+        else out.set(p.pkg.name, null);
+      }
+
+      const total = fits.reduce((n, f) => n + f.reserved, 0);
+      const got = fits.length === 0 ? [] : yield* store.versionsWithin(fits.flatMap((f) => f.sizes)).pipe(Effect.onError(() => Effect.sync(() => lease.give(total))));
+      const rowsOf = new Map<string, VersionRecord[]>();
+
+      for (const v of got) rowsOf.set(v.package, [...(rowsOf.get(v.package) ?? []), v]);
+      pending = [];
+
+      for (const f of fits) {
+        const rows = rowsOf.get(f.pkg.name) ?? [];
+
+        // a row measured but not sent grew after it was measured: give the reservation back and measure it again
+        if (rows.length < f.sizes.length) {
+          lease.give(f.reserved);
+          pending.push({ pkg: f.pkg, picked: f.picked });
+          continue;
+        }
+
+        out.set(f.pkg.name, settleLocal({ pkg: f.pkg, picked: f.picked, rows, reserved: f.reserved, at, lease }));
+      }
     }
 
-    if (read < reserved) lease.give(reserved - read);
-    const kept = keptSummary({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions }, lease);
-    // the whole manifests are given back once cut down; the scores stay, kept with the summary
-    const scores = weights.reduce((n, w) => n + w.score, 0);
+    for (const p of pending) out.set(p.pkg.name, null);
 
-    if (kept === null) {
-      lease.give(read);
-
-      return null;
-    }
-
-    lease.give(read - scores);
-
-    return kept.summary;
+    return out;
   });
+
+/**
+ * One local package's picked rows, read under a reservation of `reserved`: settled to what they weigh (a bound the
+ * sizes missed, a number's longest text, is taken on top, or the read gives up), summarized, and only the summary, its
+ * scores included, left taken. null, with the reservation given back, when they did not fit.
+ */
+function settleLocal(input: { pkg: PackageTags; picked: readonly string[]; rows: readonly VersionRecord[]; reserved: number; at: number; lease: Lease }): Catalog | null {
+  const { pkg, lease, reserved } = input;
+  const byVersion = new Map(input.rows.map((v) => [v.version, atTime(v, input.at)]));
+  // in the order `select` wants them (a root's candidates, newest first)
+  const versions = input.picked.flatMap((version) => byVersion.get(version) ?? []);
+  const weights = versions.map(rowWeights);
+  const read = weights.reduce((n, w) => n + w.manifest + w.score, 0);
+
+  if (read > reserved && !lease.take(read - reserved)) {
+    lease.give(reserved);
+
+    return null;
+  }
+
+  if (read < reserved) lease.give(reserved - read);
+  const kept = keptSummary({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions }, lease);
+  // the whole manifests are given back once cut down; the scores stay, kept with the summary
+  const scores = weights.reduce((n, w) => n + w.score, 0);
+
+  if (kept === null) {
+    lease.give(read);
+
+    return null;
+  }
+
+  lease.give(read - scores);
+
+  return kept.summary;
+}
+
+/** localsWithin for one package: null when it did not fit, or is not (or no longer) this registry's. */
+const localWithin = (pkg: PackageTags, lease: Lease, select: Select) => Effect.map(localsWithin([{ name: pkg.name, select }], lease), (m) => m.get(pkg.name) ?? null);
 
 /**
  * A package summarized (walk-catalog.ts), keeping only the versions `select` picks from it: its packument is held
@@ -440,27 +501,26 @@ const found = (src: Catalog, v: VersionRecord): Picked => ({ kind: "found", src,
  */
 type Lookup = Catalog | null | "unknown" | "over-budget";
 
+/** What the walk's `keep` reads of a version to decide whether it may install: its package, number and state. */
+type Keepable = Pick<VersionRecord, "package" | "version" | "status">;
+
 /** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
-const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
+const pickDependency = (dep: RegistryDependency, keep: (v: Keepable) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
 
-/** pickDependency on a catalog already read. */
-function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Picked {
-  if (src === "unknown") return { kind: "unavailable", reason: UNAVAILABLE_TEXT };
-
-  if (src === "over-budget") return { kind: "over-budget", reason: OVER_BUDGET_TEXT };
-
-  if (src === null) return missing("not on this registry or upstream");
-  let inRange: VersionRecord[];
+/** The version of `versions` (heads or whole rows) a dependency picks: the newest in its range or tag that `keep` allows. */
+function pickVersion<V extends Pick<VersionRecord, "version" | "status">>(input: { distTags: Record<string, string>; versions: readonly V[]; dep: RegistryDependency; keep: (v: V) => boolean }): V | undefined {
+  const { dep } = input;
+  let inRange: V[];
 
   switch (dep.kind) {
     case "tag": {
-      const tagged = tagTarget(src.distTags, dep.tag);
-      inRange = tagged ? src.versions.filter((v) => v.version === tagged) : [];
+      const tagged = tagTarget(input.distTags, dep.tag);
+      inRange = tagged ? input.versions.filter((v) => v.version === tagged) : [];
       break;
     }
 
     case "registry":
-      inRange = src.versions.filter((v) => satisfies(v.version, dep.range));
+      inRange = input.versions.filter((v) => satisfies(v.version, dep.range));
       break;
     default: {
       const _exhaustive: never = dep;
@@ -469,7 +529,17 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord)
     }
   }
 
-  const best = inRange.filter(keep).sort((a, b) => newestFirst(a.version, b.version))[0];
+  return inRange.filter(input.keep).sort((a, b) => newestFirst(a.version, b.version))[0];
+}
+
+/** pickDependency on a catalog already read. */
+function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: Keepable) => boolean): Picked {
+  if (src === "unknown") return { kind: "unavailable", reason: UNAVAILABLE_TEXT };
+
+  if (src === "over-budget") return { kind: "over-budget", reason: OVER_BUDGET_TEXT };
+
+  if (src === null) return missing("not on this registry or upstream");
+  const best = pickVersion({ distTags: src.distTags, versions: src.versions, dep, keep });
 
   return best ? found(src, best) : missing(`no installable version matches ${describeDependency(dep)}`);
 }
@@ -502,19 +572,36 @@ const pickKey = (dep: RegistryDependency): string => `${dep.name}\u0000${dep.kin
 const keptPick = (full: Catalog, v: VersionRecord): Picked => found({ kind: full.kind, name: full.name, distTags: {}, versions: [v] }, v);
 
 /**
- * Each pick of `deps` (all of one package) from a local catalog, keeping of it only the version each picks. Its
- * versions come from the database and are not charged, as they never were.
+ * Each pick of each local package's `deps` from this registry's own: every version read as a head, and only the versions
+ * the deps pick read whole, reserved from `lease` before they are read and kept summarized under it for the rest of the
+ * walk (localsWithin). On 16fc8b5 every version of a local dependency was read whole and none of it charged (review of
+ * 16fc8b5, finding 4). A package that did not fit is over budget.
  */
-function localPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean): Map<string, Picked> {
-  const picks = new Map<string, Picked>();
+const localPicks = (input: { byName: ReadonlyMap<string, readonly RegistryDependency[]>; keep: (v: Keepable) => boolean; lease: Lease }) =>
+  Effect.gen(function* () {
+    const { keep } = input;
+    const reads = [...input.byName].map(([name, deps]): LocalRead => ({ name, select: (full) => [...new Set(deps.flatMap((dep) => pickVersion({ distTags: full.distTags, versions: full.versions, dep, keep: (h) => keep({ package: name, version: h.version, status: h.status }) }) ?? []))] }));
+    const summaries = yield* localsWithin(reads, input.lease);
+    const picks = new Map<string, Picked>();
 
-  for (const dep of deps) {
-    const p = pickFrom(full, dep, keep);
-    picks.set(pickKey(dep), p.kind === "found" ? keptPick(full, summaryVersion(p.v).summary) : p);
-  }
+    // a name this registry does not have is not in `summaries`: npm's, picked by the caller
+    for (const [name, deps] of input.byName) {
+      if (!summaries.has(name)) continue;
+      const summary = summaries.get(name) ?? null;
 
-  return picks;
-}
+      for (const dep of deps) {
+        if (summary === null) {
+          picks.set(pickKey(dep), { kind: "over-budget", reason: OVER_BUDGET_TEXT });
+          continue;
+        }
+
+        const p = pickFrom(summary, dep, keep);
+        picks.set(pickKey(dep), p.kind === "found" ? keptPick(summary, p.v) : p);
+      }
+    }
+
+    return picks;
+  });
 
 /**
  * Each pick of `deps` (all of one package) from npm's catalog, keeping of it only the version each picks: none of it
@@ -522,7 +609,7 @@ function localPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v
  * it is cut down (walk-catalog.ts, keptVersion), and what stays taken is the summary's weight. null, with nothing
  * taken, when they do not fit.
  */
-function upstreamPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean, reserve: Reserve): Summary<Map<string, Picked>> | null {
+function upstreamPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: Keepable) => boolean, reserve: Reserve): Summary<Map<string, Picked>> | null {
   const picks = new Map<string, Picked>();
   let weight = 0;
 
@@ -550,12 +637,12 @@ function upstreamPicks(full: Catalog, deps: readonly RegistryDependency[], keep:
 }
 
 /**
- * The picks one walk makes, each package and range once. `load` reads the packages a batch of dependencies needs in a
- * fixed number of statements (this registry's packages, versions and dismissals, then npm's analyses and packuments)
- * and keeps of each only the versions its ranges pick (localPicks, upstreamPicks): what stays taken from `lease` is those, and a
- * packument is held only while it is read and picked from. `pick` loads a dependency no batch had.
+ * The picks one walk makes, each package and range once. `load` reads the packages a batch of dependencies needs (this
+ * registry's dist-tags in one statement, then each local package's heads and picked rows, then npm's analyses and
+ * packuments) and keeps of each only the versions its ranges pick (localPicks, upstreamPicks): what stays taken from
+ * `lease` is those, and a packument is held only while it is read and picked from. `pick` loads a dependency no batch had.
  */
-function pickMemo(lease: Lease, keep: (v: VersionRecord) => boolean) {
+function pickMemo(lease: Lease, keep: (v: Keepable) => boolean) {
   const known = new Map<string, Picked>();
 
   const load = (deps: readonly RegistryDependency[]) =>
@@ -571,14 +658,10 @@ function pickMemo(lease: Lease, keep: (v: VersionRecord) => boolean) {
       }
 
       if (byName.size === 0) return;
-      const at = yield* now;
-      const local = yield* (yield* Store).catalogsOf([...byName.keys()]);
+      const picks = yield* localPicks({ byName, keep, lease });
 
-      for (const [name, c] of local) {
-        const picks = localPicks(localSource(c.pkg, c.versions.map((v) => atTime(v, at))), byName.get(name) ?? [], keep);
-
-        for (const [k, p] of picks) known.set(k, p);
-      }
+      for (const [k, p] of picks) known.set(k, p);
+      const local = new Set([...byName].flatMap(([name, deps]) => (deps.some((d) => picks.has(pickKey(d))) ? [name] : [])));
 
       const rest = [...byName.keys()].filter((n) => !local.has(n));
       const upstream = yield* upstreamOrNull;
@@ -2811,7 +2894,14 @@ export const resolveResponse = (url: URL) =>
  * scanner exactly what it installs, so nothing is skipped for its platform (review of 93274c8, finding 1). An `os` or
  * `cpu` an older scanner sends is ignored.
  */
-const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })), strict: z.boolean().optional() });
+const ScanBody = z.object({
+  packages: z.array(z.object({ name: z.string(), version: z.string(), integrity: z.string().max(1024).optional() })),
+  strict: z.boolean().optional(),
+  // apm add's --cooldown and --floor, as resolve takes them: the cooldown is the one asked for, the floor never under
+  // the default (resolve lowers it for the named package only, which apm add applies itself)
+  cooldown: z.string().max(32).optional(),
+  floor: z.number().min(0).max(100).optional(),
+});
 
 /** Packages one scan checks: signed in, and without a token. Each may mean an upstream packument and tarball. */
 export const MAX_SCAN = 2000;
@@ -2828,20 +2918,55 @@ type ScanUnchecked = { package: string; version: string; reason: string };
 type ScanPending = { package: string; version: string };
 
 /**
+ * A version apm add, apm x and apm audit refuse in every mode: revoked or revoke-pending, yanked, confirmed malicious by
+ * an apm reviewer, or not the bytes the registry serves (`integrity`: the caller's lockfile holds another hash). The
+ * Bun scanner reads `advisories` instead, where a yanked version is not one: bun installs it from a lockfile, as npm
+ * would, and apm add refuses it only because the add makes the project depend on it anew.
+ */
+type ScanBlocked = { package: string; version: string; kind: "revoked" | "yanked" | "confirmed" | "integrity"; reason: string };
+
+/**
  * One finding of a package's scan. `flagged`: what the default mode installs with a warning and strict mode refuses,
  * as an advisory at the level the mode gives it, with the warning itself and which list it also goes in.
  */
 type ScanOne =
   | { kind: "clean" }
   | { kind: "advisory"; advisory: ScanAdvisory }
+  | { kind: "blocked"; blocked: ScanBlocked }
   | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "cooldown" | "unscorable" | "unavailable" }
   | { kind: "unchecked"; unchecked: ScanUnchecked }
   | { kind: "pending"; unchecked: ScanUnchecked };
 
 /** One package's findings. Whatever its os and cpu, it is checked: the package manager is about to install it. */
-const scanOne = (input: { p: { name: string; version: string }; strict: boolean; at: number; lease: Lease }) =>
+/**
+ * Whether the integrity a caller's lockfile holds names other bytes than `stored`: only when both name the same hash
+ * algorithm, since a lockfile may hold sha1 where the registry keeps sha512. An SRI string may list several hashes.
+ */
+export function integrityDiffers(sent: string | undefined, stored: string): boolean {
+  if (sent === undefined || stored === "") return false;
+
+  const hashes = (sri: string): Map<string, string> =>
+    new Map(
+      sri
+        .trim()
+        .split(/\s+/)
+        .flatMap((h) => {
+          const dash = h.indexOf("-");
+
+          return dash > 0 ? [[h.slice(0, dash), h.slice(dash + 1)] as const] : [];
+        }),
+    );
+
+  const ours = hashes(stored);
+  const theirs = hashes(sent);
+  const shared = [...theirs.keys()].filter((alg) => ours.has(alg));
+
+  return shared.length > 0 && shared.every((alg) => ours.get(alg) !== theirs.get(alg));
+}
+
+const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy }) =>
   Effect.gen(function* () {
-    const { p, strict, at, lease } = input;
+    const { p, strict, at, lease, policy } = input;
     const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne[] => [{ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } }];
     const url = versionUrl(webUrl, p.name, p.version);
@@ -2868,20 +2993,34 @@ const scanOne = (input: { p: { name: string; version: string }; strict: boolean;
 
     if (!v0) return unchecked("no such version");
 
-    if (v0.status === "revoked" || v0.status === "revoke-pending") {
-      const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url };
+    const blocked = (kind: ScanBlocked["kind"], reason: string): ScanOne => ({ kind: "blocked", blocked: { package: p.name, version: p.version, kind, reason } });
 
-      return [{ kind: "advisory", advisory }] satisfies ScanOne[];
+    if (v0.status === "revoked" || v0.status === "revoke-pending") {
+      const description = `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`;
+      const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description, url };
+
+      return [{ kind: "advisory", advisory }, blocked("revoked", description)] satisfies ScanOne[];
+    }
+
+    // another artifact than the one this registry serves under that name and version
+    if (integrityDiffers(p.integrity, v0.integrity)) {
+      const description = `${p.name}@${p.version}: the lockfile's integrity ${p.integrity ?? ""} is not the ${v0.integrity} this registry serves, so it is not the version apm checked.`;
+
+      return [{ kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description, url } }, blocked("integrity", description)] satisfies ScanOne[];
     }
 
     // confirmed malicious by an apm reviewer: refused in every mode
     if (yield* reviewerConfirmed(v0)) {
-      return [{ kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version}: apm reviewers confirmed this version is malicious.`, url } }] satisfies ScanOne[];
+      const description = `${p.name}@${p.version}: apm reviewers confirmed this version is malicious.`;
+
+      return [{ kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description, url } }, blocked("confirmed", description)] satisfies ScanOne[];
     }
 
+    // yanked: no advisory, so a lockfile keeps installing it through the Bun scanner, but apm add refuses it
+    const yanked: ScanOne[] = v0.status === "yanked" ? [blocked("yanked", `${p.name}@${p.version} was yanked by its maintainer${v0.status_reason ? `: ${v0.status_reason}` : ""}`)] : [];
     // inside the cooldown: a warning (strict: refused), and the version is still checked
-    const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: DEFAULT_POLICY.cooldownMs, url, via: [] });
-    const findings: ScanOne[] = fresh ? [flagged(fresh, "cooldown")] : [];
+    const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
+    const findings: ScanOne[] = [...yanked, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
     // a stored analysis of these exact bytes is reused; a version never analyzed is queued
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
@@ -2895,7 +3034,7 @@ const scanOne = (input: { p: { name: string; version: string }; strict: boolean;
       return [...findings, flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [] }), "unscorable")] satisfies ScanOne[];
     }
 
-    const w = scoreWarning({ name: p.name, version: p.version, report: r, floor: SCORE_FLOOR, url, via: [] });
+    const w = scoreWarning({ name: p.name, version: p.version, report: r, floor: policy.floor, url, via: [] });
 
     return [...findings, w ? flagged(w, "scored") : { kind: "clean" }] satisfies ScanOne[];
   });
@@ -2907,13 +3046,20 @@ const scanOne = (input: { p: { name: string; version: string }; strict: boolean;
  * `fatal`), each with its warning in `warnings`; `unscorable` and `unavailable` list the last two apart. A queued
  * version is in `pending` (and in `unchecked`, for scanners from before `pending`): the scanner asks again, then warns
  * (strict: blocks). Every package is checked whatever its os and cpu: the scan is asked about exactly what the package
- * manager installs, so a guess about which are optional must not hide one (review of 93274c8, finding 1).
+ * manager installs, so a guess about which are optional must not hide one (review of 93274c8, finding 1). `blocked`
+ * lists what apm add, apm x and apm audit refuse in every mode (ScanBlocked), a yanked version and one whose
+ * `integrity`, when the caller sends it, names other bytes included. apm add asks about the exact graph the package
+ * manager installed this way, before any install script runs (review of 16fc8b5, findings 1 to 3).
  */
 export const scanResponse = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
     const at = yield* now;
     const body = yield* parseBody(req, ScanBody);
     const strict = body.strict === true || strictParam(new URL(req.url).searchParams.get("strict"));
+    const cooldownMs = body.cooldown === undefined ? DEFAULT_POLICY.cooldownMs : parseDuration(body.cooldown);
+
+    if (cooldownMs === null) return fail(400, `cooldown must be a duration of 0 or more, like 24h, 90m or 2d (got "${body.cooldown ?? ""}")`);
+    const policy: Policy = { cooldownMs, floor: Math.max(body.floor ?? DEFAULT_POLICY.floor, DEFAULT_POLICY.floor) };
     const signedIn = caller.kind === "user";
     const cap = signedIn ? MAX_SCAN : MAX_SCAN_ANONYMOUS;
     const seen = new Set<string>();
@@ -2928,6 +3074,7 @@ export const scanResponse = (req: Request, caller: Caller) =>
     });
 
     const advisories: ScanAdvisory[] = [];
+    const blocked: ScanBlocked[] = [];
     const warnings: InstallWarning[] = [];
     const unscorable: ScanUnchecked[] = [];
     const unavailable: ScanPending[] = [];
@@ -2939,13 +3086,16 @@ export const scanResponse = (req: Request, caller: Caller) =>
     const checked = packages.slice(0, cap);
     // the packuments of the packages being checked at once share the request's lease, each under a child of it given
     // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
-    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease })), { concurrency: SCAN_CONCURRENCY });
+    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy })), { concurrency: SCAN_CONCURRENCY });
     const results = reads.flat();
 
     for (const r of results) {
       switch (r.kind) {
         case "advisory":
           advisories.push(r.advisory);
+          break;
+        case "blocked":
+          blocked.push(r.blocked);
           break;
         case "flagged":
           advisories.push(r.advisory);
@@ -2977,7 +3127,7 @@ export const scanResponse = (req: Request, caller: Caller) =>
       : `a scan without a token checks at most ${MAX_SCAN_ANONYMOUS} packages; sign in (apm login) to check up to ${MAX_SCAN}, or send the rest in another request`;
 
     for (const p of packages.slice(cap)) unchecked.push({ package: p.name, version: p.version, reason: over });
-    const answer = { advisories, warnings, unchecked, pending, unscorable, unavailable, strict };
+    const answer = { advisories, blocked, warnings, unchecked, pending, unscorable, unavailable, strict };
 
     return json(pending.length > 0 ? { ...answer, retryAfter: PENDING_RETRY_AFTER_S } : answer);
   });

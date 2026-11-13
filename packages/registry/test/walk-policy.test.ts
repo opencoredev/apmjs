@@ -41,12 +41,17 @@ type V = {
   peerDependenciesMeta?: Record<string, { optional: boolean }>;
   os?: string[];
   cpu?: string[];
+  /** Filler in the manifest, to make a row big. */
+  pad?: string;
 };
 
 type P = { name: string; latest?: string; versions: V[] };
 
-/** Whole version rows a resolve read, what its pool had charged as each versionsIn read began, and that pool. */
-type WholeReads = { rows: number; chargedAtRead: number[]; pool: MemoryPool | null };
+/**
+ * Whole version rows a resolve read, what its pool had charged as each versionsWithin read began, and that pool.
+ * `afterSizes`: run once, right after the next size read answers (a row that changes between its measuring and its read).
+ */
+type WholeReads = { rows: number; chargedAtRead: number[]; pool: MemoryPool | null; afterSizes: (() => Promise<void>) | null };
 
 /** A version published ten days ago with no dependencies. */
 const v = (version: string, extra: Omit<V, "version"> = {}): V => ({ version, ...extra });
@@ -116,6 +121,7 @@ const ResolveBody = z.object({
 
 const ScanBody = z.object({
   advisories: z.array(z.object({ package: z.string(), version: z.string(), level: z.string(), description: z.string() })),
+  blocked: z.array(z.object({ package: z.string(), version: z.string(), kind: z.string(), reason: z.string() })).default([]),
   warnings: z.array(Warning),
   unchecked: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })),
 });
@@ -156,6 +162,10 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     { name: "many-yanked", versions: [v("1.0.0"), ...Array.from({ length: 25 }, (_, i) => v(`2.0.${i}`, { status: "yanked", statusReason: "bad build" }))] },
     { name: "many-fresh", versions: [v("1.0.0"), ...Array.from({ length: 45 }, (_, i) => v(`2.0.${i}`, { ageMs: HOUR }))] },
     { name: "all-fresh", versions: Array.from({ length: MAX_ROOT_CANDIDATES + 30 }, (_, i) => v(`3.0.${i}`, { ageMs: HOUR })) },
+    // review of 16fc8b5, findings 4 and 5: a local dependency with five big rows, and a root whose row grows
+    { name: "big-dep", versions: ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.0.4"].map((x) => v(x, { pad: "x".repeat(30_000) })) },
+    pkg("big-parent", { dependencies: { "big-dep": "^1.0.0" } }),
+    pkg("grow-root"),
     // 5. platforms
     pkg("win-helper"),
     pkg("bin-win", { os: ["win32"], cpu: ["x64"], ageMs: HOUR, dependencies: { "win-helper": "^1.0.0", "no-such-win-dep": "^1.0.0" } }),
@@ -189,9 +199,9 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
 
   /**
    * Whole version rows (manifest and score) the store has read since the counter was reset, by any read, and what the
-   * request's pool had charged when each versionsIn read began.
+   * request's pool had charged when each versionsWithin read began.
    */
-  const whole: WholeReads = { rows: 0, chargedAtRead: [], pool: null };
+  const whole: WholeReads = { rows: 0, chargedAtRead: [], pool: null, afterSizes: null };
 
   /** The real store, counting every whole version row it reads. */
   const countingStore = () =>
@@ -210,14 +220,25 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
           return Store.of({
             ...real,
             listVersions: (n) => Effect.map(real.listVersions(n), counted),
-            versionsIn: (n, vs) =>
+            getVersion: (n, v) => Effect.map(real.getVersion(n, v), (row) => (row === null ? null : (counted([row])[0] ?? null))),
+            versionSizes: (vs) =>
+              Effect.flatMap(real.versionSizes(vs), (sizes) =>
+                Effect.promise(async () => {
+                  const hook = whole.afterSizes;
+
+                  whole.afterSizes = null;
+
+                  if (hook) await hook();
+
+                  return sizes;
+                }),
+              ),
+            versionsWithin: (sizes) =>
               Effect.suspend(() => {
                 whole.chargedAtRead.push(whole.pool?.charged ?? -1);
 
-                return Effect.map(real.versionsIn(n, vs), counted);
+                return Effect.map(real.versionsWithin(sizes), counted);
               }),
-            getVersion: (n, v) => Effect.map(real.getVersion(n, v), (row) => (row === null ? null : (counted([row])[0] ?? null))),
-            catalogsOf: (ns) => Effect.map(real.catalogsOf(ns), (m) => (counted([...m.values()].flatMap((c) => c.versions)), m)),
             activeVersionsOf: (ns) => Effect.map(real.activeVersionsOf(ns), counted),
           });
         }),
@@ -236,7 +257,7 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     return { status: out.status, body: ResolveBody.parse(JSON.parse(out.raw)), raw: out.raw };
   };
 
-  const scan = async (body: { packages: { name: string; version: string }[]; strict?: boolean; os?: string; cpu?: string }) => {
+  const scan = async (body: { packages: { name: string; version: string; integrity?: string }[]; strict?: boolean; os?: string; cpu?: string; cooldown?: string; floor?: number }) => {
     const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const program = Effect.flatMap(scanResponse(req, { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
     const out = await Effect.runPromise(program.pipe(Effect.provide(layers()), Effect.scoped));
@@ -492,6 +513,131 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(whole.chargedAtRead.length).toBeGreaterThan(0);
       expect(whole.chargedAtRead.every((c) => c > 0)).toBe(true);
       expect(roomy.charged).toBe(0);
+    });
+  });
+
+  describe("review of 16fc8b5, findings 4 and 5: every local row a walk reads is reserved before it comes", () => {
+    test("a local dependency's versions are read as heads, and only the one it picks whole, charged before the read", async () => {
+      whole.rows = 0;
+      whole.chargedAtRead = [];
+      const pool = new MemoryPool();
+      const r = await resolve("big-parent", {}, pool);
+
+      expect(r.status).toBe(200);
+      expect(names(r)).toEqual(["big-dep@1.0.4"]);
+      // the root's one version and big-dep's pick; on 16fc8b5 all five 30 KB rows of big-dep were read, uncharged
+      expect(whole.rows).toBe(2);
+      expect(whole.chargedAtRead.every((c) => c > 0)).toBe(true);
+      // a 30 KB row was charged while it was read; on 16fc8b5 the request's peak stayed under 10 KB
+      expect(pool.peakCharged).toBeGreaterThan(60_000);
+      expect(pool.charged).toBe(0);
+    });
+
+    test("a local dependency's pick that does not fit is unchecked, never read", async () => {
+      whole.rows = 0;
+      const pool = new MemoryPool(60_000);
+      const r = await resolve("big-parent", {}, pool);
+
+      expect(r.status).toBe(200);
+      expect(r.body.tree?.uncheckedDeps.map((d) => d.dependency)).toEqual(["big-dep@^1.0.0"]);
+      // only the root's row: on 16fc8b5 big-dep's five rows were read whatever the pool held
+      expect(whole.rows).toBe(1);
+    });
+
+    const grow = (): Promise<void> =>
+      (async () => {
+        const c = new Client({ connectionString: db.url });
+
+        await c.connect();
+
+        try {
+          await c.query(`UPDATE versions SET manifest = manifest || jsonb_build_object('pad', repeat('x', 200000)) WHERE package = 'grow-root'`);
+        } finally {
+          await c.end();
+        }
+      })();
+
+    const shrink = async (): Promise<void> => {
+      const c = new Client({ connectionString: db.url });
+
+      await c.connect();
+
+      try {
+        await c.query(`UPDATE versions SET manifest = manifest - 'pad' WHERE package = 'grow-root'`);
+      } finally {
+        await c.end();
+      }
+    };
+
+    test("a row that grows after it was measured is not read past its reservation: measured again, then refused", async () => {
+      whole.rows = 0;
+      whole.chargedAtRead = [];
+      whole.afterSizes = grow;
+      const tight = new MemoryPool(100_000);
+
+      try {
+        const r = await resolve("grow-root", {}, tight);
+
+        // on 16fc8b5: 503 as well, but after the grown 200 KB row was read under a 7 KB reservation
+        expect(r.status).toBe(503);
+        expect(whole.rows).toBe(0);
+        expect(tight.charged).toBe(0);
+      } finally {
+        await shrink();
+      }
+    });
+
+    test("with room, the grown row is measured again and read under its new size", async () => {
+      whole.rows = 0;
+      whole.chargedAtRead = [];
+      whole.afterSizes = grow;
+      const roomy = new MemoryPool();
+
+      try {
+        const r = await resolve("grow-root", {}, roomy);
+
+        expect(r.status).toBe(200);
+        // the first read sent nothing (the row had grown), the second sent it, reserved at its new size
+        expect(whole.rows).toBe(1);
+        expect(whole.chargedAtRead.length).toBe(2);
+        expect(whole.chargedAtRead.at(-1) ?? 0).toBeGreaterThan(400_000);
+        expect(roomy.charged).toBe(0);
+      } finally {
+        await shrink();
+      }
+    });
+  });
+
+  describe("review of 16fc8b5: the scan apm add asks after the install", () => {
+    test("revoked and yanked versions are listed as blocked; a yanked one is no advisory, so the Bun scanner lets a lockfile keep it", async () => {
+      const r = await scan({ packages: [{ name: "host-p", version: "1.0.1" }, { name: "many-yanked", version: "2.0.3" }, { name: "peer-a", version: "1.0.0" }] });
+
+      expect(r.status).toBe(200);
+      expect(r.body?.blocked.map((b) => `${b.package}@${b.version}:${b.kind}`)).toEqual(["host-p@1.0.1:revoked", "many-yanked@2.0.3:yanked"]);
+      expect(r.body?.advisories.map((a) => `${a.package}@${a.version}:${a.level}`)).toEqual(["host-p@1.0.1:fatal"]);
+    });
+
+    test("an integrity that names other bytes is blocked; one of another hash algorithm is not compared", async () => {
+      const other = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha1-y" }] });
+      const algorithm = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha512-abc" }] });
+      const same = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha1-x" }] });
+
+      expect(other.body?.blocked.map((b) => b.kind)).toEqual(["integrity"]);
+      expect(other.body?.advisories.map((a) => a.level)).toEqual(["fatal"]);
+      expect(algorithm.body?.blocked).toEqual([]);
+      expect(same.body?.blocked).toEqual([]);
+    });
+
+    test("the cooldown apm add asks for applies: 0 turns it off; a floor under the default is raised to it", async () => {
+      const asked = await scan({ packages: [{ name: "fresh-dep", version: "1.0.0" }] });
+      const off = await scan({ packages: [{ name: "fresh-dep", version: "1.0.0" }], cooldown: "0" });
+      const low = await scan({ packages: [{ name: "fresh-dep", version: "1.0.0" }], cooldown: "0", floor: 0 });
+      const bad = await scan({ packages: [{ name: "fresh-dep", version: "1.0.0" }], cooldown: "soon" });
+
+      expect(asked.body?.warnings.map((w) => w.kind)).toEqual(["cooldown"]);
+      expect(off.body?.warnings).toEqual([]);
+      expect(low.body?.warnings).toEqual([]);
+      expect(bad.status).toBe(400);
     });
   });
 

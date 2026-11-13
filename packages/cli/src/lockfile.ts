@@ -7,8 +7,16 @@ import type { Pm } from "./pm.ts";
 
 export type Locked = { integrity: string | null; resolved: string | null };
 
-/** One installed package as the lockfile records it. `key` is the lockfile's own id for it. */
-export type LockNode = { key: string; name: string; version: string; integrity: string | null; resolved: string | null; hasInstallScript: boolean };
+/**
+ * One installed package as the lockfile records it. `key` is the lockfile's own id for it. `platform`: the entry names
+ * the os or cpu it is built for (a platform binary, which the lockfile keeps for every platform).
+ */
+export type LockNode = { key: string; name: string; version: string; integrity: string | null; resolved: string | null; hasInstallScript: boolean; platform: boolean };
+
+/** An os or cpu field: a list, or (bun) one name. */
+const Platforms = z.union([z.array(z.string()), z.string()]).optional().catch(undefined);
+
+const hasPlatform = (e: { os?: string[] | string | undefined; cpu?: string[] | string | undefined }): boolean => e.os !== undefined || e.cpu !== undefined;
 
 /** The nodes under the added packages, or why apm could not read them. */
 export type LockRead = { kind: "read"; path: string; nodes: LockNode[] } | { kind: "missing" } | { kind: "unreadable"; path: string; reason: string };
@@ -98,6 +106,8 @@ const NpmEntry = z
     dependencies: DepMap.optional(),
     optionalDependencies: DepMap.optional(),
     peerDependencies: DepMap.optional(),
+    os: Platforms,
+    cpu: Platforms,
   })
   .loose();
 
@@ -145,14 +155,14 @@ function npmNode(packages: z.infer<typeof NpmLock>["packages"], key: string | nu
 
   if (!e || e.link || e.version === undefined) return [];
 
-  return [{ key, name: e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length), version: e.version, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true }];
+  return [{ key, name: e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length), version: e.version, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true, platform: hasPlatform(e) }];
 }
 
 /** A top-level entry of a package-lock.json asked for as `name`: a link (a workspace package) is a node too, never a registry version. */
 function npmTop(packages: z.infer<typeof NpmLock>["packages"], name: string, key: string | null): LockNode[] {
   const e = key === null ? undefined : packages[key];
 
-  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false }];
+  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false, platform: false }];
 
   return npmNode(packages, key).map((node) => ({ ...node, key: name }));
 }
@@ -162,7 +172,7 @@ function npmTop(packages: z.infer<typeof NpmLock>["packages"], name: string, key
 const BunLock = z.object({ packages: z.record(z.string(), z.array(z.unknown())) }).loose();
 
 const BunMeta = z
-  .object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional(), peerDependencies: DepMap.optional(), hasInstallScript: z.boolean().optional() })
+  .object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional(), peerDependencies: DepMap.optional(), hasInstallScript: z.boolean().optional(), os: Platforms, cpu: Platforms })
   .loose();
 
 /** "a/@s/b/c" -> ["a", "@s/b", "c"]: a bun.lock key is the install path's package names. */
@@ -242,7 +252,7 @@ function bunGraph(text: string, roots: Roots): LockNode[] {
 
     if (!e) return [];
 
-    return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true }];
+    return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true, platform: hasPlatform(e.meta) }];
   };
 
   if (roots.kind === "top") return roots.names.flatMap((n) => node(resolve([], n) ?? "").map((x) => ({ ...x, key: n })));
@@ -259,7 +269,7 @@ const PnpmImporter = z
   .loose();
 
 const PnpmSnapshot = z.object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional() }).loose();
-const PnpmPackage = PnpmSnapshot.extend({ resolution: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose().optional(), requiresBuild: z.boolean().optional() });
+const PnpmPackage = PnpmSnapshot.extend({ resolution: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose().optional(), requiresBuild: z.boolean().optional(), os: Platforms, cpu: Platforms });
 
 const PnpmLock = z
   .object({
@@ -305,7 +315,7 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
 
     if (!id || !p) return [];
 
-    return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true }];
+    return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true, platform: hasPlatform(p) }];
   };
 
   if (roots.kind === "top") {
@@ -316,7 +326,7 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
       if (v === undefined) return [];
       const key = topKey(n);
 
-      return key === null ? [{ key: n, name: n, version: v, integrity: null, resolved: null, hasInstallScript: false }] : node(key).map((x) => ({ ...x, key: n }));
+      return key === null ? [{ key: n, name: n, version: v, integrity: null, resolved: null, hasInstallScript: false, platform: false }] : node(key).map((x) => ({ ...x, key: n }));
     });
   }
 

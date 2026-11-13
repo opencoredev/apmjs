@@ -1,18 +1,20 @@
 // After `apm add` installs with install scripts held back: is every package under the ones apm added the
 // artifact the checked registry serves? Only then do the held-back scripts run. See docs/ARCHITECTURE.md.
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { encodeName, type Api } from "./api.ts";
-import { findLockfile, isRegistryVersion, LOCKFILES, lockedTree, type LockNode, type LockPm } from "./lockfile.ts";
+import { installedPackages } from "./audit.ts";
+import { findLockfile, isRegistryVersion, LOCKFILES, type LockNode } from "./lockfile.ts";
+import type { Pm } from "./pm.ts";
 
-/** A node whose bytes are not what the checked registry serves, and why. */
-export type Mismatch = { node: LockNode; why: string };
+/**
+ * A node whose bytes are not what the checked registry serves, and why. `served`: the registry lists that version, with
+ * other bytes; false when it does not list it at all (gone from it, or revoked or yanked there).
+ */
+export type Mismatch = { node: LockNode; why: string; served: boolean };
 
-export type TreeCheck =
-  | { kind: "verified"; nodes: LockNode[]; notFromRegistry: LockNode[] }
-  | { kind: "mismatch"; nodes: LockNode[]; bad: Mismatch[] }
-  | { kind: "unreadable"; reason: string };
+export type TreeCheck = { kind: "verified"; nodes: LockNode[]; notFromRegistry: LockNode[] } | { kind: "mismatch"; nodes: LockNode[]; bad: Mismatch[] };
 
 const Dists = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional() }).loose() }).loose()) }).loose();
 
@@ -35,30 +37,11 @@ async function pool<T, R>(items: readonly T[], limit: number, fn: (item: T) => P
 }
 
 /**
- * Reads the lockfile the install just wrote and compares each node under `roots` with the integrity
- * `api`'s registry serves for that name@version. Git, file and link nodes are not on a registry: they
- * come back in `notFromRegistry` (the resolve tree already listed them as not checked).
+ * Compares each lockfile node with the integrity `api`'s registry serves for that name@version. Git, file and link
+ * nodes are not on a registry: they come back in `notFromRegistry` (the post-install check warns about each).
  */
-export async function verifyTree(input: { api: Api; cwd: string; pm: LockPm; roots: string[] }): Promise<TreeCheck> {
-  const read = lockedTree({ cwd: input.cwd, pm: input.pm, roots: { kind: "under", names: input.roots } });
-
-  switch (read.kind) {
-    case "missing":
-      return { kind: "unreadable", reason: `there is no ${LOCKFILES[input.pm].join(" or ")} to read` };
-    case "unreadable":
-      return { kind: "unreadable", reason: `${read.path} could not be read (${read.reason})` };
-    case "read":
-      break;
-    default: {
-      const _exhaustive: never = read;
-
-      return _exhaustive;
-    }
-  }
-
-  const missingRoots = input.roots.filter((r) => !read.nodes.some((n) => n.name === r));
-
-  if (missingRoots.length > 0) return { kind: "unreadable", reason: `${read.path} has no entry for ${missingRoots.join(", ")}` };
+export async function verifyNodes(input: { api: Api; nodes: readonly LockNode[] }): Promise<TreeCheck> {
+  const read = { nodes: [...input.nodes] };
   const fromRegistry = read.nodes.filter((n) => isRegistryVersion(n.version));
   const names = [...new Set(fromRegistry.map((n) => n.name))];
   const served = new Map<string, Map<string, string>>();
@@ -82,9 +65,9 @@ export async function verifyTree(input: { api: Api; cwd: string; pm: LockPm; roo
   const bad: Mismatch[] = fromRegistry.flatMap((node): Mismatch[] => {
     const expected = served.get(node.name)?.get(node.version);
 
-    if (expected === undefined) return [{ node, why: `${registry} does not serve ${node.name}@${node.version}` }];
+    if (expected === undefined) return [{ node, why: `${registry} does not serve ${node.name}@${node.version}`, served: false }];
 
-    if (node.integrity !== expected) return [{ node, why: `the lockfile has ${node.integrity ?? "no integrity"}${node.resolved ? ` from ${node.resolved}` : ""}, but ${registry} serves ${expected}` }];
+    if (node.integrity !== expected) return [{ node, why: `the lockfile has ${node.integrity ?? "no integrity"}${node.resolved ? ` from ${node.resolved}` : ""}, but ${registry} serves ${expected}`, served: true }];
 
     return [];
   });
@@ -95,14 +78,43 @@ export async function verifyTree(input: { api: Api; cwd: string; pm: LockPm; roo
 }
 
 // ---------- undoing a refused install ----------
-/** The bytes of package.json and the lockfile before an install, so a refused one can be put back. */
-export type Snapshot = { files: { path: string; bytes: Uint8Array | null }[] };
+/**
+ * The bytes of package.json and the lockfile before an install, so a refused one can be put back, and whether the
+ * project had a node_modules then.
+ */
+export type Snapshot = { files: { path: string; bytes: Uint8Array | null }[]; hadNodeModules: boolean };
 
-export function snapshot(input: { cwd: string; pm: LockPm }): Snapshot {
-  const lock = findLockfile(input.cwd, input.pm) ?? join(input.cwd, LOCKFILES[input.pm][0] ?? "");
-  const files = [join(input.cwd, "package.json"), lock].map((path) => ({ path, bytes: existsSync(path) ? new Uint8Array(readFileSync(path)) : null }));
+/** The nearest yarn.lock from `cwd` upward, else where yarn would write one. */
+function yarnLock(cwd: string): string {
+  let dir = cwd;
 
-  return { files };
+  for (let i = 0; i < 20; i++) {
+    if (existsSync(join(dir, "yarn.lock"))) return join(dir, "yarn.lock");
+    const parent = dirname(dir);
+
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return join(cwd, "yarn.lock");
+}
+
+/** The lockfile `pm` reads and writes for `cwd`: the nearest one, else where it would write one. */
+export function lockfileOf(input: { cwd: string; pm: Pm }): string {
+  if (input.pm === "yarn") return yarnLock(input.cwd);
+
+  return findLockfile(input.cwd, input.pm) ?? join(input.cwd, LOCKFILES[input.pm][0] ?? "");
+}
+
+export function snapshot(input: { cwd: string; pm: Pm }): Snapshot {
+  const files = [join(input.cwd, "package.json"), lockfileOf(input)].map((path) => ({ path, bytes: existsSync(path) ? new Uint8Array(readFileSync(path)) : null }));
+
+  return { files, hadNodeModules: existsSync(join(input.cwd, "node_modules")) };
+}
+
+/** Whether the snapshot held a lockfile (its second file). */
+export function hadLockfile(s: Snapshot): boolean {
+  return (s.files[1]?.bytes ?? null) !== null;
 }
 
 export function restore(s: Snapshot): void {
@@ -177,4 +189,40 @@ export function removeInstalled(input: { cwd: string; nodes: readonly { name: st
 /** Where bun installed a bun.lock key: "a/@s/b" is node_modules/a/node_modules/@s/b. */
 export function bunInstallDir(cwd: string, names: string[]): string {
   return join(cwd, ...names.flatMap((n) => ["node_modules", ...n.split("/")]));
+}
+
+/** Whether each of `ids` (name@version) is still somewhere in `cwd`'s node_modules. */
+export function stillInstalled(input: { cwd: string; ids: readonly string[] }): string[] {
+  const disk = installedPackages(input.cwd);
+
+  return input.ids.filter((id) => {
+    const at = id.lastIndexOf("@");
+
+    return at > 0 && disk.packages.get(id.slice(0, at))?.has(id.slice(at + 1)) === true;
+  });
+}
+
+/**
+ * Undoes a refused add: package.json and the lockfile go back to their bytes from before it, `reinstall` (the package
+ * manager's own frozen install or remove, with scripts off) puts node_modules back in step, then the bytes are put back
+ * again (a remove writes both), and every directory of a name@version the add brought in (`added`, never one installed
+ * before) that is still there is removed. Returns which of `watch` are still on disk, and the command's exit code.
+ */
+export async function undoAdd(input: { cwd: string; before: Snapshot; reinstall: string[] | null; run: (cmd: string[]) => Promise<number>; added: readonly { name: string; version: string }[]; watch: readonly string[] }): Promise<{ code: number | null; left: string[] }> {
+  restore(input.before);
+  const modules = join(input.cwd, "node_modules");
+
+  // the add made node_modules: removing it is the whole undo, and nothing is installed again
+  if (!input.before.hadNodeModules) {
+    rmSync(modules, { recursive: true, force: true });
+
+    return { code: null, left: stillInstalled({ cwd: input.cwd, ids: input.watch }) };
+  }
+
+  const code = input.reinstall === null ? null : await input.run(input.reinstall);
+
+  restore(input.before);
+  removeInstalled({ cwd: input.cwd, nodes: input.added });
+
+  return { code, left: stillInstalled({ cwd: input.cwd, ids: input.watch }) };
 }

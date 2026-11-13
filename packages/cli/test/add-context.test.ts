@@ -117,7 +117,8 @@ describe("apm add's question to the registry", () => {
     const r = await add({ cwd, pm: "npm", pkg: "plugin-b", json: false });
 
     expect(asked.get("plugin-b")?.installed).toBe("host");
-    expect(r.text).toContain("peer host@^1.0.0: your package.json lists it with no lockfile entry, so your package manager installs the newest in range, 1.1.0, which apm checked");
+    // review of 16fc8b5, finding 2: the newest in range is a guess, not what the package manager installs
+    expect(r.text).toContain("peer host@^1.0.0: your package.json lists it with no lockfile entry; apm checked the newest in range, 1.1.0, and checks the version your package manager picks once it is installed");
   });
 
   test("with a lockfile apm cannot read (yarn's) it sends the name as unknown", async () => {

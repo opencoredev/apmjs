@@ -6,15 +6,17 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
-import { bunKeyNames, findLockfile, isLockPm, lockedEntry, projectPins, type LockNode, type LockPm } from "./lockfile.ts";
-import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
-import { bunInstallDir, removeInstalled, restore, snapshot, verifyTree } from "./verify.ts";
+import { bunKeyNames, findLockfile, isLockPm, isRegistryVersion, lockedEntry, projectPins, type LockNode, type LockPm } from "./lockfile.ts";
+import type { Mismatch } from "./verify.ts";
+import { addArgs, detectPm, packArgs, publishArgs, runCmd, undoArgs, type Detection, type Pm } from "./pm.ts";
+import { addedGraph, checkGraph, DEFAULT_CHECK, idOf, installedIds, wholeGraph, type Before, type CheckPolicy, type GraphVerdict, type InstalledGraph } from "./installed.ts";
+import { bunInstallDir, hadLockfile, removeInstalled, restore, snapshot, undoAdd, verifyNodes, type Snapshot } from "./verify.ts";
 
 const VERSION = "0.1.0";
 const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
@@ -287,15 +289,22 @@ async function resolveWaiting(api: Api, name: string, params: URLSearchParams): 
 
 /**
  * What a resolve is asked for besides the package: the project's direct dependencies, each `name`, `name@version` (the
- * version its lockfile pins) or `name@?` (a lockfile apm cannot read, or an entry it cannot pin), so a peer the project
- * provides is checked at the version that installs (review of 1924692, finding 1). No os or cpu: the registry then
- * checks every platform's optional packages, so no config, hook or flag can make the package manager install one apm
- * did not check (review of 1924692, findings 2 and 3).
+ * version its lockfile pins) or `name@?` (a lockfile apm cannot read, or an entry it cannot pin), so the early answer
+ * checks a peer the project provides at the version its lockfile pins (review of 1924692, finding 1). It is advisory:
+ * the check after the install reads what the package manager really installed (review of 16fc8b5, findings 1 to 3).
+ * No os or cpu: the registry then checks every platform's optional packages (review of 1924692, findings 2 and 3).
+ * `left out`: why a project's context was not sent whole (too many names for one request); it is never cut short.
  */
-type ResolveContext = { installed: readonly string[] };
+type ResolveContext = { installed: readonly string[]; leftOut: string | null };
 
 /** The names the registry takes in one resolve's `installed` (MAX_INSTALLED_NAMES there). */
 const MAX_INSTALLED_NAMES = 500;
+
+/**
+ * The bytes `installed` may take in a resolve's URL: well under what an edge takes in a request line (an HTTP 414 at
+ * about 16 KB on Cloudflare), so a project with long scoped names is told so rather than refused by the edge.
+ */
+const MAX_INSTALLED_BYTES = 8_000;
 
 const ProjectManifest = z.object({
   dependencies: z.record(z.string(), z.unknown()).optional().catch(undefined),
@@ -318,7 +327,7 @@ function projectNames(cwd: string): string[] {
         if (!m.success) return [];
         const names = new Set([m.data.dependencies, m.data.devDependencies, m.data.optionalDependencies, m.data.peerDependencies].flatMap((d) => Object.keys(d ?? {})));
 
-        return [...names].filter((n) => isValidPackageName(n)).slice(0, MAX_INSTALLED_NAMES);
+        return [...names].filter((n) => isValidPackageName(n));
       } catch {
         return [];
       }
@@ -335,8 +344,11 @@ function projectNames(cwd: string): string[] {
 
 /** The context of a resolve for the package manager `pm` runs from `cwd`; `installed` only where apm add adds to a project. */
 function resolveContext(input: { pm: Detection["pm"]; cwd: string; project: boolean }): ResolveContext {
-  if (!input.project) return { installed: [] };
+  if (!input.project) return { installed: [], leftOut: null };
   const names = projectNames(input.cwd);
+
+  // never a part of it: the early answer goes without, and the check after the install reads every installed package
+  if (names.length > MAX_INSTALLED_NAMES) return { installed: [], leftOut: `your package.json lists ${names.length} dependencies, more than the ${MAX_INSTALLED_NAMES} the registry's early check takes` };
   const pins = projectPins({ cwd: input.cwd, pm: input.pm, names });
 
   const installed = names.map((n) => {
@@ -357,7 +369,11 @@ function resolveContext(input: { pm: Detection["pm"]; cwd: string; project: bool
     }
   });
 
-  return { installed };
+  const bytes = encodeURIComponent(installed.join(",")).length;
+
+  if (bytes > MAX_INSTALLED_BYTES) return { installed: [], leftOut: `your package.json's ${names.length} dependencies take ${bytes} bytes, more than the ${MAX_INSTALLED_BYTES} the registry's early check takes in one request` };
+
+  return { installed, leftOut: null };
 }
 
 async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext): Promise<Resolved> {
@@ -424,6 +440,9 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
 
     return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [] };
   }
+  if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
+
+  if (r.status === 400) throw new ApiError(r.status, `resolve failed for ${name}: ${errorOf(r.body, r.status)}`, r.body);
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
 
@@ -450,10 +469,10 @@ function printResolved(r: Resolved): void {
   // a peer the project provides: which of its versions apm checked. One it could not tell is a warning of its own
   for (const p of r.projectPeers.slice(0, 10)) {
     if (p.kind === "lockfile") say(`  ${dim(`peer ${p.dependency}: your project provides it; apm checked ${p.version ?? "?"}, the version your lockfile pins`)}`);
-    else if (p.kind === "newest" || p.kind === undefined) say(`  ${dim(`peer ${p.dependency}: your package.json lists it with no lockfile entry, so your package manager installs the newest in range${p.version ? `, ${p.version},` : ""} which apm checked`)}`);
+    else if (p.kind === "newest" || p.kind === undefined) say(`  ${dim(`peer ${p.dependency}: your package.json lists it with no lockfile entry; apm checked the newest in range${p.version ? `, ${p.version}` : ""}, and checks the version your package manager picks once it is installed`)}`);
   }
 
-  printWarnings(r.warnings, r.tree);
+  printWarnings({ warnings: r.warnings, binaries: r.tree.filter((p) => p.platform !== undefined), allFamilies: true, closing: EARLY_CLOSING });
 }
 
 /**
@@ -502,17 +521,16 @@ function reasonCounts(warnings: readonly InstallWarning[]): string {
 }
 
 /**
- * The platform binaries the walk checked, one line a family: every platform's are checked, since the package manager
- * may install any of them, so they are summed up rather than listed (`--json` lists each warning). Returns the
- * warnings left to print one by one.
+ * The platform binaries among `binaries`, one line a family: every platform's are checked, since the package manager
+ * may install any of them, so they are summed up rather than listed (`--json` lists each warning). `all`: a line for a
+ * family with no warning too. Returns the warnings left to print one by one.
  */
-function printPlatformFamilies(warnings: readonly InstallWarning[], tree: TreePackages): InstallWarning[] {
+function printPlatformFamilies(warnings: readonly InstallWarning[], binaries: readonly { name: string; version: string }[], opts: { all: boolean }): InstallWarning[] {
   const families = new Map<string, Set<string>>();
 
-  for (const p of tree) {
-    if (p.platform === undefined) continue;
+  for (const p of binaries) {
     const members = families.get(platformFamily(p.name)) ?? new Set<string>();
-    members.add(`${p.name}@${p.version}`);
+    members.add(idOf(p));
     families.set(platformFamily(p.name), members);
   }
 
@@ -522,15 +540,17 @@ function printPlatformFamilies(warnings: readonly InstallWarning[], tree: TreePa
   const grouped = new Map<string, InstallWarning[]>();
 
   for (const w of warnings) {
-    const f = w.via.length > 0 ? familyOf.get(`${w.name}@${w.version}`) : undefined;
+    const f = familyOf.get(idOf(w));
 
     if (f === undefined) rest.push(w);
     else grouped.set(f, [...(grouped.get(f) ?? []), w]);
   }
 
-  say();
+  const shown = [...families].filter(([f]) => opts.all || grouped.has(f));
 
-  for (const [family, members] of families) {
+  if (shown.length > 0) say();
+
+  for (const [family, members] of shown) {
     const flagged = grouped.get(family) ?? [];
     const head = `${members.size} platform ${members.size === 1 ? "binary" : "binaries"} (${family})`;
 
@@ -543,12 +563,16 @@ function printPlatformFamilies(warnings: readonly InstallWarning[], tree: TreePa
 /** At most this many warnings are printed per package; --json has them all. */
 const MAX_PRINTED_WARNINGS = 10;
 
+const EARLY_CLOSING = "apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).";
+
 /**
  * Each warning on an install that goes ahead, as a block: what, why (up to three reasons, each with its file and
  * line) and where to read more. A score never refuses by default; this is how the person installing is told.
+ * `closing`: the line after them, if any.
  */
-function printWarnings(all: readonly InstallWarning[], tree: TreePackages): void {
-  const warnings = printPlatformFamilies(all, tree);
+function printWarnings(input: { warnings: readonly InstallWarning[]; binaries: readonly { name: string; version: string }[]; allFamilies: boolean; closing: string | null }): void {
+  const all = input.warnings;
+  const warnings = printPlatformFamilies(all, input.binaries, { all: input.allFamilies });
 
   if (all.length === 0) return;
   say();
@@ -557,11 +581,13 @@ function printWarnings(all: readonly InstallWarning[], tree: TreePackages): void
     say(`${yellow(bold("WARNING"))} ${bold(`${w.name}@${w.version}`)} ${w.text}${w.via.length > 0 ? dim(` (via ${w.via.join(" > ")})`) : ""}`);
 
     for (const reason of w.reasons) say(`  - ${reason}`);
-    say(`  ${dim(w.url)}`);
+
+    if (w.url) say(`  ${dim(w.url)}`);
   }
 
   if (warnings.length > MAX_PRINTED_WARNINGS) say(yellow(`and ${warnings.length - MAX_PRINTED_WARNINGS} more warnings (apm ... --json lists them all)`));
-  say(yellow("apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1)."));
+
+  if (input.closing !== null) say(yellow(input.closing));
 }
 
 /** What to tell someone whose install was refused: --force only when it would help, and what it does. */
@@ -619,15 +645,123 @@ function treeScopes(results: Resolved[]): string[] {
 }
 
 /**
+ * What the check after an install found, for the --json result. `source`: where apm read the installed graph.
+ * `refused`: apm refused it, so no install script ran. `restored`: what apm did to undo a refused add, and which of the
+ * refused or added versions are still on disk.
+ */
+type InstalledReport = {
+  source: "lockfile" | "node_modules";
+  checked: number;
+  blocked: { name: string; version: string; reason: string }[];
+  warnings: InstallWarning[];
+  refused: boolean;
+  restored: { command: string | null; code: number | null; left: string[] } | null;
+};
+
+/**
+ * The policy the check after an install applies, as resolveSpec asks the registry for it: --force and --no-cooldown
+ * turn the cooldown off (resolve's cooldown is the whole tree's), --cooldown and --floor set them, and --force lifts the
+ * score floor and the cooldown of the named packages only.
+ */
+function checkPolicy(a: Args, results: readonly Resolved[]): CheckPolicy {
+  const force = has(a, "force");
+  const floor = Number(flag(a, "floor"));
+
+  return {
+    cooldown: has(a, "no-cooldown") || force ? "0" : flag(a, "cooldown"),
+    floor: !force && flag(a, "floor") !== null && Number.isFinite(floor) ? floor : null,
+    lifted: new Set(force ? results.flatMap((r) => (r.version === null ? [] : [idOf({ name: r.name, version: r.version })])) : []),
+  };
+}
+
+/** The early answer's warnings, as `name@version:kind`, so the check after the install prints each once. */
+function earlyKeys(results: readonly Resolved[]): Set<string> {
+  return new Set(results.flatMap((r) => r.warnings.map((w) => `${idOf(w)}:${w.kind}`)));
+}
+
+/** The check after an install: what apm could not read, a lockfile entry that is not the checked artifact, or the verdict. */
+type PostCheck =
+  | { kind: "unreadable"; reason: string }
+  | { kind: "mismatch"; bad: Mismatch[] }
+  | { kind: "checked"; graph: Extract<InstalledGraph, { kind: "lockfile" | "node_modules" }>; verdict: GraphVerdict; refused: boolean };
+
+/**
+ * Checks what the package manager installed, at the exact versions it wrote, before any install script runs: each
+ * lockfile entry must be the artifact the registry serves, then every package is asked about in one pass (scan). A
+ * revoked, yanked or confirmed malicious version refuses in every mode; strict mode refuses every warning too. Prints
+ * the verdict: the warnings of the real graph, without those the early answer printed already, and where the package
+ * manager installed another version than the early answer checked.
+ */
+async function checkInstalled(input: { api: Api; graph: InstalledGraph; pm: Pm; strict: boolean; results: readonly Resolved[]; installed: string; policy: CheckPolicy }): Promise<PostCheck> {
+  const { api, graph, strict } = input;
+
+  if (graph.kind === "unreadable") return { kind: "unreadable", reason: graph.reason };
+  const verdict = await checkGraph({ api, packages: graph.packages, notFromRegistry: graph.notFromRegistry, waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: input.policy });
+
+  if (graph.kind === "lockfile") {
+    // a version the registry does not list may be one it revoked or yanked: the verdict says so, with its reason
+    const blocked = new Set(verdict.blocked.map(idOf));
+    const integrity = await verifyNodes({ api, nodes: graph.nodes });
+    const bad = integrity.kind === "mismatch" ? integrity.bad.filter((b) => b.served || !blocked.has(idOf(b.node))) : [];
+
+    if (bad.length > 0) return { kind: "mismatch", bad };
+  }
+
+  const refused = verdict.blocked.length > 0 || (strict && verdict.warnings.length > 0);
+  const total = graph.packages.length + graph.notFromRegistry.length;
+
+  say();
+  say(dim(`apm: checked the ${total} package${total === 1 ? "" : "s"} ${input.installed} at the versions ${input.pm} installed (${graph.kind === "lockfile" ? graph.path.split("/").at(-1) ?? "its lockfile" : "node_modules"}), before any install script`));
+
+  if (graph.kind === "node_modules") for (const u of graph.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
+
+  // the early answer checked a version the package manager did not install: say which one it installed instead
+  const installedIds = new Set(graph.packages.map(idOf));
+  const swapped = input.results.flatMap((r) => r.tree.filter((p) => !installedIds.has(idOf(p))).flatMap((p) => {
+    const instead = graph.packages.filter((g) => g.name === p.name).map((g) => g.version);
+
+    return instead.length > 0 ? [`${p.name}: the early check read ${p.version}, ${input.pm} installed ${instead.join(" and ")}`] : [];
+  }));
+
+  for (const line of [...new Set(swapped)].slice(0, 5)) say(dim(`  ${line}; that is the version checked here`));
+
+  for (const b of verdict.blocked) fail(`refused: ${b.name}@${b.version}: ${b.reason}`);
+  const binaries = graph.packages.filter((p) => p.platform);
+
+  if (strict) {
+    printWarnings({ warnings: verdict.warnings, binaries, allFamilies: false, closing: null });
+
+    if (verdict.warnings.length > 0) fail(`refused: strict mode refuses ${verdict.warnings.length === 1 ? "this warning" : `these ${verdict.warnings.length} warnings`} (${[...new Set(verdict.warnings.map(idOf))].slice(0, 5).join(", ")}${verdict.warnings.length > 5 ? ", …" : ""})`);
+  } else {
+    const early = earlyKeys(input.results);
+    const fresh = verdict.warnings.filter((w) => !early.has(`${idOf(w)}:${w.kind}`));
+    const seen = verdict.warnings.length - fresh.length;
+
+    printWarnings({ warnings: fresh, binaries, allFamilies: false, closing: fresh.length > 0 && !refused ? "apm installed them anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1)." : null });
+
+    if (seen > 0) say(dim(`apm: ${seen} warning${seen === 1 ? " is" : "s are"} the early check's, shown above`));
+  }
+
+  if (!refused && verdict.warnings.length === 0) say(dim("apm: no warnings"));
+
+  return { kind: "checked", graph, verdict, refused };
+}
+
+/** The report of a check, for --json. */
+function reportOf(post: Extract<PostCheck, { kind: "checked" }>, restored: InstalledReport["restored"]): InstalledReport {
+  return { source: post.graph.kind, checked: post.graph.packages.length + post.graph.notFromRegistry.length, blocked: post.verdict.blocked, warnings: post.verdict.warnings, refused: post.refused, restored };
+}
+
+/**
  * Runs the install scripts `apm add` held back, now that the tree is verified: npm rebuilds the packages
  * that have them, pnpm builds what it recorded as pending, and bun reinstalls them from its verified
  * lockfile (bun only runs scripts while installing a package, and only for trusted ones).
  */
-async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[]; registry: string; scopes: string[] }): Promise<number> {
+async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[]; registry: string; scopes: string[]; quiet: boolean }): Promise<number> {
   const { pm, cwd } = input;
   const withScripts = input.nodes.filter((n) => n.hasInstallScript);
   const env = pmEnv(input.registry, input.scopes);
-  const opts = { cwd, env, stdoutToStderr: jsonMode };
+  const opts = { cwd, env, stdoutToStderr: jsonMode || input.quiet };
 
   switch (pm) {
     case "npm": {
@@ -657,47 +791,36 @@ async function runHeldScripts(input: { pm: LockPm; cwd: string; nodes: LockNode[
 }
 
 /**
- * After an install with scripts held back: every package under the added ones must be the artifact the
- * checked registry serves. A refused install is undone (package.json and the lockfile put back, the
- * unverified packages removed) and its scripts never run. Returns the exit code.
+ * Undoes an add apm refused after the install: package.json and the lockfile go back to their bytes from before it,
+ * the package manager puts node_modules back in step with scripts off (undoArgs), and what the add brought in that is
+ * still there is removed. Says exactly what is left on disk. Returns what it did, for --json.
  */
-async function verifyAndRunScripts(input: { api: Api; cwd: string; pm: LockPm; results: Resolved[]; scopes: string[]; before: ReturnType<typeof snapshot> }): Promise<number> {
-  const { api, cwd, pm } = input;
-  const check = await verifyTree({ api, cwd, pm, roots: input.results.map((r) => r.name) });
+async function undoRefusedAdd(input: { cwd: string; pm: Pm; before: Snapshot; beforeIds: Before; beforeNames: ReadonlySet<string>; results: readonly Resolved[]; post: Extract<PostCheck, { kind: "checked" }>; registry: string; scopes: string[] }): Promise<InstalledReport["restored"]> {
+  const { cwd, pm, before, post } = input;
+  const addedNames = input.results.map((r) => r.name).filter((n) => !input.beforeNames.has(n));
+  const reinstall = undoArgs(pm, { hadLockfile: hadLockfile(before), addedNames });
+  const cmd = reinstall === null ? null : [...reinstall, ...registryArgs(pm, input.registry, input.scopes)];
+  const refusedIds = [...post.verdict.blocked.map(idOf), ...(post.refused ? post.verdict.warnings.map(idOf) : [])];
+  const added = post.graph.packages.filter((p) => !input.beforeIds.ids.has(idOf(p)));
+  const watch = [...new Set([...refusedIds, ...added.map(idOf)])];
 
-  switch (check.kind) {
-    case "unreadable":
-      fail(`refused: apm could not confirm what ${pm} installed: ${check.reason}`);
-      say("Install scripts were not run. Turn the lockfile back on (apm compares it with the registry it checked), then run apm add again.");
+  if (cmd !== null) say(dim(`→ ${cmd.join(" ")}  (putting the project back)`));
+  const undone = await undoAdd({ cwd, before, reinstall: cmd, added, watch, run: async (c) => (await runCmd(c, { cwd, env: { ...pmEnv(input.registry, input.scopes), npm_config_ignore_scripts: "true" }, stdoutToStderr: true })).code });
+  const files = before.files.map((f) => f.path.split("/").at(-1) ?? f.path).join(" and ");
+  const scripts = pm === "yarn" ? "yarn ran install scripts while it installed (apm cannot hold them back under yarn); apm runs none of its own" : "No install script ran";
 
-      return 1;
-    case "mismatch": {
-      for (const b of check.bad) fail(`refused: ${b.node.name}@${b.node.version} is not the checked artifact: ${b.why}`);
-      restore(input.before);
-      const removed = removeInstalled({ cwd, nodes: check.bad.map((b) => b.node) });
+  say();
+  say(`${scripts}. apm put ${files} back as they were before apm add${cmd === null ? "" : `, then ran ${cmd.slice(0, 3).join(" ")} … (exit ${undone.code ?? "?"}) to put node_modules back`}.`);
+  const blockedIds = new Set(post.verdict.blocked.map(idOf));
+  const stayed = undone.left.filter((id) => input.beforeIds.ids.has(id) && blockedIds.has(id));
+  const leftover = undone.left.filter((id) => !input.beforeIds.ids.has(id));
 
-      say(`Install scripts were not run. apm put package.json and the lockfile back${removed.length > 0 ? ` and removed ${removed.length} unverified package director${removed.length === 1 ? "y" : "ies"}` : ""}.`);
-      say("Check the lockfile and .npmrc for another registry, delete the stale lockfile entries, then run apm add again.");
+  if (leftover.length > 0) say(yellow(`Still in node_modules, never run by apm: ${leftover.slice(0, 10).join(", ")}${leftover.length > 10 ? `, and ${leftover.length - 10} more` : ""}. Delete node_modules and reinstall to be sure.`));
+  else say("Nothing this add installed is left in node_modules.");
 
-      return 1;
-    }
+  if (stayed.length > 0) say(yellow(`Your project installed ${stayed.join(", ")} before this add, and still does: run apm audit.`));
 
-    case "verified": {
-      for (const n of check.notFromRegistry) say(`  ${yellow("!")} not from a registry, not checked: ${n.name}@${n.version}`);
-      say(dim(`apm: ${check.nodes.length} installed package${check.nodes.length === 1 ? "" : "s"} match ${api.cfg.registry}; running install scripts`));
-      const code = await runHeldScripts({ pm, cwd, nodes: check.nodes, registry: api.cfg.registry, scopes: input.scopes });
-
-      if (code !== 0) fail(`apm: the install scripts failed (exit ${code})`);
-
-      return code;
-    }
-
-    default: {
-      const _exhaustive: never = check;
-
-      return _exhaustive;
-    }
-  }
+  return { command: cmd === null ? null : cmd.join(" "), code: undone.code, left: undone.left };
 }
 
 async function cmdAdd(a: Args): Promise<number> {
@@ -706,6 +829,8 @@ async function cmdAdd(a: Args): Promise<number> {
   const api = new Api(cfg);
   const det = pmFor(a, cwd);
   const specs = a.positional;
+  const strict = strictMode(a);
+
   if (specs.length === 0) {
     say(dim(`apm: no packages given, running ${det.pm} install`));
     const code = (await runCmd([det.pm, "install"], { cwd, env: withoutSecrets(process.env), stdoutToStderr: jsonMode })).code;
@@ -713,16 +838,20 @@ async function cmdAdd(a: Args): Promise<number> {
 
     return code;
   }
+
   const results: Resolved[] = [];
   const ctx = resolveContext({ pm: det.pm, cwd, project: true });
+
+  if (ctx.leftOut !== null) say(dim(`apm: ${ctx.leftOut}, so it goes without them; the check after the install reads every installed package`));
   for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
   for (const r of results) printResolved(r);
   const blocked = results.filter((r) => r.blocked !== null || r.version === null);
+
   if (blocked.length > 0) {
     say();
     for (const b of blocked) say(red(`refused: ${b.blocked ?? `${b.name}: nothing to install`}`));
-    refusalAdvice(blocked, "add", strictMode(a));
-    emitJson(false, det, results);
+    refusalAdvice(blocked, "add", strict);
+    emitJson({ ok: false, det, results });
 
     return 1;
   }
@@ -730,7 +859,7 @@ async function cmdAdd(a: Args): Promise<number> {
   const scopes = treeScopes(results);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "install")) {
-    emitJson(false, det, results, lastError);
+    emitJson({ ok: false, det, results, error: lastError });
 
     return 1;
   }
@@ -741,42 +870,89 @@ async function cmdAdd(a: Args): Promise<number> {
 
   if (pinnedElsewhere.length > 0) {
     say(`Delete ${pinnedElsewhere.length === 1 ? "that entry" : "those entries"} from the lockfile, then run apm add again.`);
-    emitJson(false, det, results, lastError);
+    emitJson({ ok: false, det, results, error: lastError });
     return 1;
   }
+
   const pinned = results.map((r) => `${r.name}@${r.version}`);
   const lockPm = isLockPm(det.pm) ? det.pm : null;
-  // bun, npm and pnpm install with every script held back; they run once the whole tree is verified
-  const before = lockPm ? snapshot({ cwd, pm: lockPm }) : null;
+  // what the project held before, so a refused add can be undone and only what it brought in is its own
+  const before = snapshot({ cwd, pm: det.pm });
+  const beforeIds = installedIds({ cwd, pm: lockPm });
+  const beforeNames = new Set(projectNames(cwd));
+  // bun, npm and pnpm install with every script held back; they run once the installed graph is checked
   const cmd = [...addArgs(det.pm, pinned, { dev: has(a, "dev"), ignoreScripts: lockPm !== null }), ...registryArgs(det.pm, cfg.registry, scopes)];
   say(dim(`→ ${cmd.join(" ")}  (${det.pm}: ${det.why})`));
   const run = await runCmd(cmd, { cwd, env: pmEnv(cfg.registry, scopes), stdoutToStderr: jsonMode });
 
   if (run.code !== 0) {
-    emitJson(false, det, results);
+    emitJson({ ok: false, det, results });
 
     return run.code;
   }
 
-  if (lockPm && before) {
-    const code = await verifyAndRunScripts({ api, cwd, pm: lockPm, results, scopes, before });
+  const graph = addedGraph({ cwd, pm: lockPm, roots: results.map((r) => r.name), before: beforeIds });
+  const post = await checkInstalled({ api, graph, pm: det.pm, strict, results, installed: "this add installed", policy: checkPolicy(a, results) });
 
-    emitJson(code === 0, det, results, code === 0 ? null : lastError);
+  switch (post.kind) {
+    case "unreadable":
+      fail(`refused: apm could not confirm what ${det.pm} installed: ${post.reason}`);
+      say("Install scripts were not run. Turn the lockfile back on (apm compares it with the registry it checked), then run apm add again.");
+      emitJson({ ok: false, det, results, error: lastError });
+
+      return 1;
+    case "mismatch": {
+      for (const b of post.bad) fail(`refused: ${b.node.name}@${b.node.version} is not the checked artifact: ${b.why}`);
+      restore(before);
+      const removed = removeInstalled({ cwd, nodes: post.bad.map((b) => b.node) });
+
+      say(`Install scripts were not run. apm put package.json and the lockfile back${removed.length > 0 ? ` and removed ${removed.length} unverified package director${removed.length === 1 ? "y" : "ies"}` : ""}.`);
+      say("Check the lockfile and .npmrc for another registry, delete the stale lockfile entries, then run apm add again.");
+      emitJson({ ok: false, det, results, error: lastError });
+
+      return 1;
+    }
+
+    case "checked":
+      break;
+    default: {
+      const _exhaustive: never = post;
+
+      return _exhaustive;
+    }
+  }
+
+  if (post.refused) {
+    const error = lastError;
+    const restored = await undoRefusedAdd({ cwd, pm: det.pm, before, beforeIds, beforeNames, results, post, registry: cfg.registry, scopes });
+
+    if (post.verdict.blocked.length === 0) say(`Run apm add ${results.map((r) => r.name).join(" ")} without --strict to install with these warnings.`);
+    emitJson({ ok: false, det, results, error, installed: reportOf(post, restored) });
+
+    return 1;
+  }
+
+  if (lockPm !== null && post.graph.kind === "lockfile") {
+    say(dim(`apm: ${post.graph.nodes.length} installed package${post.graph.nodes.length === 1 ? "" : "s"} match ${api.cfg.registry}; running install scripts`));
+    const code = await runHeldScripts({ pm: lockPm, cwd, nodes: post.graph.nodes, registry: api.cfg.registry, scopes, quiet: false });
+
+    if (code !== 0) fail(`apm: the install scripts failed (exit ${code})`);
+    emitJson({ ok: code === 0, det, results, error: code === 0 ? null : lastError, installed: reportOf(post, null) });
 
     return code;
   }
 
-  emitJson(true, det, results);
+  emitJson({ ok: true, det, results, installed: reportOf(post, null) });
 
   return 0;
 }
 
-function emitJson(ok: boolean, det: Detection, results: Resolved[], error: string | null = null): void {
+function emitJson(input: { ok: boolean; det: Detection; results: Resolved[]; error?: string | null; installed?: InstalledReport }): void {
   emit({
-    ok,
-    pm: det.pm,
-    error,
-    packages: results.map((r) => ({
+    ok: input.ok,
+    pm: input.det.pm,
+    error: input.error ?? null,
+    packages: input.results.map((r) => ({
       name: r.name,
       version: r.version,
       score: r.report?.score ?? null,
@@ -791,9 +967,39 @@ function emitJson(ok: boolean, det: Detection, results: Resolved[], error: strin
       reason: r.blocked,
       forceable: r.forceable,
     })),
+    // review of 16fc8b5: the check of what the package manager really installed (null when nothing was installed)
+    installed: input.installed ?? null,
   });
 }
 
+/** A package's `bin`: one binary named like the package (`null`), or each binary's name. */
+const BinField = z.object({ bin: z.union([z.string().transform(() => null), z.record(z.string(), z.string()).transform((r) => Object.keys(r))]).optional() }).loose();
+
+/** The binary `apm x <name>` runs, as npx picks it: the only one, else the one named like the package. */
+function binOf(dir: string, name: string): { kind: "found"; bin: string; path: string } | { kind: "none"; why: string } {
+  const unscoped = name.split("/").at(-1) ?? name;
+  let field: z.infer<typeof BinField>["bin"];
+
+  try {
+    field = BinField.parse(JSON.parse(readFileSync(join(dir, "node_modules", name, "package.json"), "utf8"))).bin;
+  } catch {
+    return { kind: "none", why: `apm could not read ${name}'s package.json` };
+  }
+
+  const names = field === undefined ? [] : field === null ? [unscoped] : field;
+  const bin = names.length === 1 ? names[0] : names.find((n) => n === unscoped);
+
+  if (bin === undefined) return { kind: "none", why: names.length === 0 ? `${name} has no binary to run` : `${name} has several binaries (${names.join(", ")}) and none is named ${unscoped}` };
+  const path = join(dir, "node_modules", ".bin", bin);
+
+  return existsSync(path) ? { kind: "found", bin, path } : { kind: "none", why: `${name}'s binary ${bin} was not installed` };
+}
+
+/**
+ * apm x: the package is installed into a directory of its own with every script held back, the graph the package
+ * manager installed is checked as apm add checks it, and only then do its install scripts and its binary run. The
+ * directory is removed afterwards.
+ */
 async function cmdX(a: Args): Promise<number> {
   const cwd = process.cwd();
   const [spec, ...rest] = a.positional;
@@ -805,22 +1011,82 @@ async function cmdX(a: Args): Promise<number> {
   const cfg = config(cwd);
   const api = new Api(cfg);
   const det = pmFor(a, cwd);
+  const strict = strictMode(a);
   const r = await resolveSpec(api, spec, a, resolveContext({ pm: det.pm, cwd, project: false }));
   printResolved(r);
   if (r.blocked !== null || r.version === null) {
     say(red(`refused to run ${r.name}: ${r.blocked ?? "no version"}`));
-    refusalAdvice([r], "x", strictMode(a));
+    refusalAdvice([r], "x", strict);
     return 1;
   }
 
   const scopes = treeScopes([r]);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "run")) return 1;
-  const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown", "--strict"].includes(x));
-  const cmd = execArgs(det.pm, `${r.name}@${r.version}`, rest.length > 0 ? passArgs : []);
-  say(dim(`→ ${cmd.join(" ")}`));
+  // yarn's own runner gives no lockfile to read; npm's install does the same job
+  const xpm: LockPm = isLockPm(det.pm) ? det.pm : "npm";
+  const dir = mkdtempSync(join(tmpdir(), "apm-x-"));
 
-  return (await runCmd(cmd, { cwd, env: pmEnv(cfg.registry, scopes) })).code;
+  try {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "apm-x", version: "0.0.0", private: true }));
+    const install = [...addArgs(xpm, [`${r.name}@${r.version}`], { dev: false, ignoreScripts: true }), ...registryArgs(xpm, cfg.registry, scopes)];
+
+    say(dim(`→ ${install.join(" ")}  (in a directory of its own, checked before anything runs)`));
+    const installed = await runCmd(install, { cwd: dir, env: pmEnv(cfg.registry, scopes), stdoutToStderr: true });
+
+    if (installed.code !== 0) {
+      fail(`apm x: ${xpm} could not install ${r.name}@${r.version} (exit ${installed.code})`);
+
+      return installed.code;
+    }
+
+    const post = await checkInstalled({ api, graph: wholeGraph({ cwd: dir, pm: xpm }), pm: xpm, strict, results: [r], installed: `apm x installed for ${r.name}`, policy: checkPolicy(a, [r]) });
+
+    if (post.kind === "unreadable") {
+      fail(`refused to run ${r.name}: apm could not confirm what ${xpm} installed: ${post.reason}`);
+
+      return 1;
+    }
+
+    if (post.kind === "mismatch") {
+      for (const b of post.bad) fail(`refused to run ${r.name}: ${b.node.name}@${b.node.version} is not the checked artifact: ${b.why}`);
+
+      return 1;
+    }
+
+    if (post.refused) {
+      say(`apm ran nothing: no install script and no binary, and the directory it installed into is removed.${post.verdict.blocked.length === 0 ? ` Run apm x ${r.name} without --strict to run it with these warnings.` : ""}`);
+
+      return 1;
+    }
+
+    if (post.graph.kind === "lockfile") {
+      const code = await runHeldScripts({ pm: xpm, cwd: dir, nodes: post.graph.nodes, registry: cfg.registry, scopes, quiet: true });
+
+      if (code !== 0) {
+        fail(`apm x: the install scripts failed (exit ${code})`);
+
+        return code;
+      }
+    }
+
+    const bin = binOf(dir, r.name);
+
+    if (bin.kind === "none") {
+      fail(`apm x: ${bin.why}`);
+
+      return 1;
+    }
+
+    const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown", "--strict"].includes(x));
+    const args = rest.length > 0 ? passArgs : [];
+
+    say(dim(`→ ${bin.bin}${args.length > 0 ? ` ${args.join(" ")}` : ""}`));
+
+    return (await runCmd([bin.path, ...args], { cwd, env: pmEnv(cfg.registry, scopes) })).code;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---------- score / name ----------
@@ -893,9 +1159,12 @@ async function cmdSearch(a: Args): Promise<number> {
 }
 
 // ---------- audit ----------
-/** Packages per scan request: what the registry checks without a token. */
-const SCAN_BATCH = 200;
-
+/**
+ * apm audit: every package in node_modules at its exact version, checked by the code apm add uses after an install
+ * (installed.ts), plus the advisories the upstream registry has for them. A revoked, yanked or confirmed malicious
+ * version is a critical finding; a warning (a fresh version, a low or incomplete score, one apm cannot score) is a
+ * finding too; what could not be checked or is still being analysed is unchecked. Any of them fails the audit.
+ */
 async function cmdAudit(): Promise<number> {
   const cwd = process.cwd();
   const api = new Api(config(cwd));
@@ -909,18 +1178,20 @@ async function cmdAudit(): Promise<number> {
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
   const audit = installed.size > 0 ? await api.post("-/apm/v1/audit", query, AuditResponse) : { advisories: {}, unavailable: [] };
-  // the registry checks at most 200 packages per scan without a token, so large trees go in batches
-  const all = [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version })));
-  const batches = Array.from({ length: Math.ceil(all.length / SCAN_BATCH) }, (_, i) => all.slice(i * SCAN_BATCH, (i + 1) * SCAN_BATCH));
-  const parts = await Promise.all(batches.map((packages) => api.post("-/apm/v1/scan", { packages }, ScanResponse)));
-  const scan = { advisories: parts.flatMap((p) => p.advisories), unchecked: parts.flatMap((p) => p.unchecked) };
-  const findings: { id: string; severity: string; text: string }[] = [];
+  const all = [...installed].flatMap(([name, vs]) => [...vs].map((version) => ({ name, version, integrity: null, platform: false })));
+  const verdict = await checkGraph({ api, packages: all.filter((p) => isRegistryVersion(p.version)), notFromRegistry: all.filter((p) => !isRegistryVersion(p.version)), waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: DEFAULT_CHECK });
+  const findings: { id: string; severity: string; text: string }[] = verdict.blocked.map((b) => ({ id: idOf(b), severity: "critical", text: b.reason }));
   // checks that could not run: an audit with any of these is not a pass
   const unchecked: { id: string; reason: string }[] = [
     ...unreadable,
     ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: "advisories could not be fetched from the upstream registry" }))),
-    ...scan.unchecked.map((u) => ({ id: `${u.package}@${u.version}`, reason: u.reason })),
   ];
+
+  for (const w of verdict.warnings) {
+    if (w.kind === "unchecked" || w.kind === "pending") unchecked.push({ id: idOf(w), reason: w.text });
+    else findings.push({ id: idOf(w), severity: "warning", text: w.text });
+  }
+
   for (const [name, advisories] of Object.entries(audit.advisories)) {
     for (const adv of advisories) {
       // Bun.semver.satisfies matches every version against a malformed range; such an advisory is unchecked, not a hit
@@ -929,12 +1200,9 @@ async function cmdAudit(): Promise<number> {
         continue;
       }
       for (const v of installed.get(name) ?? []) {
-        if (Bun.semver.satisfies(v, adv.vulnerable_versions)) findings.push({ id: `${name}@${v}`, severity: adv.severity, text: adv.title });
+        if (Bun.semver.satisfies(v, adv.vulnerable_versions) && !findings.some((f) => f.id === `${name}@${v}` && f.text === adv.title)) findings.push({ id: `${name}@${v}`, severity: adv.severity, text: adv.title });
       }
     }
-  }
-  for (const s of scan.advisories) {
-    if (!findings.some((f) => f.id === `${s.package}@${s.version}`)) findings.push({ id: `${s.package}@${s.version}`, severity: "critical", text: s.description });
   }
   const ok = findings.length === 0 && unchecked.length === 0;
 
@@ -946,7 +1214,7 @@ async function cmdAudit(): Promise<number> {
     say(green(`✓ ${installed.size} packages checked, no revoked or dangerous versions found`));
     return 0;
   }
-  for (const f of findings) say(`${red(f.severity.padEnd(8))} ${bold(f.id)}  ${f.text}`);
+  for (const f of findings) say(`${(f.severity === "warning" ? yellow : red)(f.severity.padEnd(8))} ${bold(f.id)}  ${f.text}`);
 
   for (const u of unchecked.slice(0, 20)) say(`${yellow("unchecked".padEnd(8))} ${bold(u.id)}  ${u.reason}`);
 

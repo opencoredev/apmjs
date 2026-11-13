@@ -199,3 +199,30 @@ describe("@apm/bun-scanner trusts only the configured registry", () => {
     expect(readme).toMatch(/APM_SCANNER_STRICT=1 bun install/);
   });
 });
+
+// Review of 16fc8b5, finding 1, for the scanner: bun hands it the install set, so a version the lockfile already pins
+// and a new package reuses is asked about too. The walk would predict sleaf@1.1.0 (old, clean); bun keeps the
+// project's sleaf@1.0.0, published an hour ago, which strict mode refuses.
+describe("@apm/bun-scanner is asked about exactly what bun installs", () => {
+  test("a fresh version the lockfile pins, reused by a new package, is scanned: strict cancels the add", async () => {
+    await publish("sleaf", "1.1.0", alice);
+    await publish("sroot", "1.0.0", alice, { dependencies: { sleaf: "^1.0.0" } });
+    clock += 10 * DAY;
+    await publish("sleaf", "1.0.0", alice);
+    await publish("sexisting", "1.0.0", alice, { dependencies: { sleaf: "1.0.0" } });
+    clock += 60 * 60 * 1000;
+    const sb = makeSandbox(reg, alice);
+    const app = scannedApp();
+
+    expect((await run(["bun", "add", "-d", "@apm/bun-scanner"], { cwd: app, env: sb.env })).code).toBe(0);
+    const first = await run(["bun", "add", "sexisting"], { cwd: app, env: sb.env });
+
+    expect(first.code, first.out).toBe(0);
+    expect(readFileSync(join(app, "bun.lock"), "utf8")).toContain('"sleaf@1.0.0"');
+    const r = await run(["bun", "add", "sroot"], { cwd: app, env: { ...sb.env, APM_SCANNER_STRICT: "1" } });
+
+    expect(r.out).toContain("sleaf@1.0.0");
+    expect(r.code, r.out).not.toBe(0);
+    expect(installedVersion(app, "sroot")).toBeNull();
+  });
+});

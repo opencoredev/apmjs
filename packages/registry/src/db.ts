@@ -98,6 +98,7 @@ export type TextSize = z.infer<typeof TextSize>;
 
 const VersionSizeRow = z
   .object({
+    package: z.string(),
     version: z.string(),
     manifest_octets: z.number().int().min(0),
     manifest_separators: z.number().int().min(0),
@@ -107,6 +108,7 @@ const VersionSizeRow = z
     score_objects: z.number().int().min(0),
   })
   .transform((r) => ({
+    package: r.package,
     version: r.version,
     manifest: TextSize.parse({ octets: r.manifest_octets, separators: r.manifest_separators, objects: r.manifest_objects }),
     score: TextSize.parse({ octets: r.score_octets, separators: r.score_separators, objects: r.score_objects }),
@@ -114,6 +116,24 @@ const VersionSizeRow = z
 
 /** The size of a version row's manifest and score, as versionSizes reads them: what reading the row whole holds. */
 export type VersionSize = z.output<typeof VersionSizeRow>;
+
+/** A package as choosing among its versions needs it: its name and dist-tags. */
+export type PackageTags = { name: string; distTags: Record<string, string> };
+
+/** A local package's dist-tags and its versions as heads (localHeadsOf). */
+export type LocalHeads = { pkg: PackageTags; heads: VersionHead[] };
+
+/** One row of localHeadsOf: a package, and one of its versions as a head (none for a package with no versions). */
+const LocalHeadRow = z.object({
+  name: z.string(),
+  dist_tags: z.record(z.string(), z.string()),
+  version: z.string().nullable(),
+  published_at: Int.nullable(),
+  seq: Int.nullable(),
+  status: VersionRow.shape.status.nullable(),
+  status_reason: z.string().nullable(),
+  status_at: IntOrNull,
+});
 
 /** A version as far as the package text it wrote goes (withheld.ts): its description and keywords, unparsed. */
 const TextSourceRow = VersionRow.pick({ package: true, status: true, status_at: true, published_at: true, seq: true })
@@ -375,20 +395,22 @@ export type StoreApi = {
   readonly removeOwner: (name: string, user: string) => Effect.Effect<"removed" | "not-owner" | "last-owner", StoreError>;
 
   readonly listVersions: (name: string) => Effect.Effect<VersionRecord[], StoreError>;
-  /** Every version of a package as a head (number, age, order, state), in publish order: no manifest, no score. */
-  readonly versionHeads: (name: string) => Effect.Effect<VersionHead[], StoreError>;
-  /** The given versions of a package, whole, in publish order; one it does not have is left out. */
-  readonly versionsIn: (name: string, versions: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
+  /**
+   * Each name this registry has, with its dist-tags and every version as a head (number, age, order, state), in publish
+   * order: what choosing among its versions needs, in one statement, without its readme, manifests or scores.
+   */
+  readonly localHeadsOf: (names: readonly string[]) => Effect.Effect<Map<string, LocalHeads>, StoreError>;
   /**
    * The size of each given version's manifest and score, counted in the database, so a reader can reserve memory for
-   * the rows before versionsIn sends them. One it does not have is left out.
+   * the rows before versionsWithin sends them. One it does not have is left out.
    */
-  readonly versionSizes: (name: string, versions: readonly string[]) => Effect.Effect<VersionSize[], StoreError>;
+  readonly versionSizes: (versions: readonly { package: string; version: string }[]) => Effect.Effect<VersionSize[], StoreError>;
   /**
-   * Several packages' catalogs in a fixed number of statements (packages, versions, dismissals): each name this
-   * registry has, with its dist-tags and its versions as listVersions gives them. Names it does not have are left out.
+   * The versions `sizes` names, whole, in publish order, each only while its manifest and score still measure no more
+   * than `sizes` says: a row that grew after it was measured is left out, so it is never read past what was reserved
+   * for it (review of 16fc8b5, finding 5). One statement, so each row is measured as it is sent.
    */
-  readonly catalogsOf: (names: readonly string[]) => Effect.Effect<Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>, StoreError>;
+  readonly versionsWithin: (sizes: readonly VersionSize[]) => Effect.Effect<VersionRecord[], StoreError>;
   readonly activeVersionsOf: (names: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
   /**
    * Every version of each package that has a revoked or revoke-pending version, with only what packageTextShown reads
@@ -835,49 +857,64 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "removeOwner", cause })))),
 
     listVersions: (name) => Effect.flatMap(run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
-    versionHeads: (name) =>
-      run("versionHeads", sql`SELECT version, published_at, seq, status, status_reason, status_at FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionHeadRow)),
-    versionsIn: (name, versions) =>
-      versions.length === 0
-        ? Effect.succeed([])
-        : Effect.flatMap(run("versionsIn", sql`SELECT * FROM versions WHERE package = ${name} AND version = ANY(${[...versions]}) ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
-    versionSizes: (name, versions) =>
+    localHeadsOf: (names) =>
+      names.length === 0
+        ? Effect.succeed(new Map<string, LocalHeads>())
+        : run(
+            "localHeadsOf",
+            sql`SELECT p.name, p.dist_tags, v.version, v.published_at, v.seq, v.status, v.status_reason, v.status_at
+                FROM packages p LEFT JOIN versions v ON v.package = p.name
+                WHERE p.name = ANY(${[...new Set(names)]})
+                ORDER BY p.name, v.published_at, v.seq`,
+            all(LocalHeadRow).transform((rows) => {
+              const out = new Map<string, LocalHeads>();
+
+              for (const r of rows) {
+                const at = out.get(r.name) ?? { pkg: { name: r.name, distTags: r.dist_tags }, heads: [] };
+
+                if (r.version !== null && r.published_at !== null && r.seq !== null && r.status !== null) at.heads.push({ version: r.version, published_at: r.published_at, seq: r.seq, status: r.status, status_reason: r.status_reason, status_at: r.status_at });
+                out.set(r.name, at);
+              }
+
+              return out;
+            }),
+          ),
+    versionSizes: (versions) =>
       versions.length === 0
         ? Effect.succeed([])
         : run(
             "versionSizes",
-            sql`SELECT version,
+            sql`SELECT package, version,
                        octet_length(m)::int AS manifest_octets,
                        (octet_length(m) - octet_length(translate(m, ':,[', '')))::int AS manifest_separators,
                        (octet_length(m) - octet_length(replace(m, '{', '')))::int AS manifest_objects,
                        octet_length(s)::int AS score_octets,
                        (octet_length(s) - octet_length(translate(s, ':,[', '')))::int AS score_separators,
                        (octet_length(s) - octet_length(replace(s, '{', '')))::int AS score_objects
-                FROM (SELECT version, manifest::text AS m, coalesce(score::text, '') AS s FROM versions WHERE package = ${name} AND version = ANY(${[...versions]})) AS t`,
+                FROM (SELECT v.package, v.version, v.manifest::text AS m, coalesce(v.score::text, '') AS s
+                      FROM versions v JOIN unnest(${versions.map((x) => x.package)}::text[], ${versions.map((x) => x.version)}::text[]) AS w(package, version)
+                        ON w.package = v.package AND w.version = v.version) AS t`,
             all(VersionSizeRow),
           ),
-    catalogsOf: (names) =>
-      Effect.gen(function* () {
-        const out = new Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>();
-
-        if (names.length === 0) return out;
-        const wanted = [...new Set(names)];
-        const pkgs = yield* run("catalogsOf: packages", sql`SELECT * FROM packages WHERE name = ANY(${wanted})`, all(PackageOut));
-
-        if (pkgs.length === 0) return out;
-
-        const rows = yield* run(
-          "catalogsOf: versions",
-          sql`SELECT * FROM versions WHERE package = ANY(${pkgs.map((p) => p.name)}) ORDER BY package, published_at, seq`,
-          all(VersionRow),
-        ).pipe(Effect.flatMap(withDismissals));
-
-        for (const p of pkgs) out.set(p.name, { pkg: p, versions: [] });
-
-        for (const v of rows) out.get(v.package)?.versions.push(v);
-
-        return out;
-      }),
+    versionsWithin: (sizes) =>
+      sizes.length === 0
+        ? Effect.succeed([])
+        : Effect.flatMap(
+            run(
+              "versionsWithin",
+              sql`SELECT v.* FROM versions v
+                  JOIN unnest(${sizes.map((x) => x.package)}::text[], ${sizes.map((x) => x.version)}::text[],
+                              ${sizes.map((x) => x.manifest.octets)}::int[], ${sizes.map((x) => x.manifest.separators)}::int[], ${sizes.map((x) => x.manifest.objects)}::int[],
+                              ${sizes.map((x) => x.score.octets)}::int[], ${sizes.map((x) => x.score.separators)}::int[], ${sizes.map((x) => x.score.objects)}::int[])
+                       AS s(package, version, mo, ms, mb, so, ss, sb) ON s.package = v.package AND s.version = v.version
+                  CROSS JOIN LATERAL (SELECT v.manifest::text AS m, coalesce(v.score::text, '') AS t) AS c
+                  WHERE octet_length(c.m) <= s.mo AND octet_length(c.m) - octet_length(translate(c.m, ':,[', '')) <= s.ms AND octet_length(c.m) - octet_length(replace(c.m, '{', '')) <= s.mb
+                    AND octet_length(c.t) <= s.so AND octet_length(c.t) - octet_length(translate(c.t, ':,[', '')) <= s.ss AND octet_length(c.t) - octet_length(replace(c.t, '{', '')) <= s.sb
+                  ORDER BY v.package, v.published_at, v.seq`,
+              all(VersionRow),
+            ),
+            withDismissals,
+          ),
     activeVersionsOf: (names) =>
       names.length === 0
         ? Effect.succeed([])

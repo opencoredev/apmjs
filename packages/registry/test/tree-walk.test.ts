@@ -209,8 +209,10 @@ describe("the resolve walk bounds its database work", () => {
         expect(r.body.tree.unchecked).toBe(0);
         // the root (package, version heads, its picked versions' sizes, its picked versions, dismissals) and the leaf's
         // catalog, once each; AI review is off. The root reads heads first and only its candidates whole (review of
-        // 93274c8, finding 5), reserved from their sizes before they are read (review of 1924692, finding 4)
-        expect(r.queries).toBeLessThanOrEqual(8);
+        // 93274c8, finding 5), reserved from their sizes before they are read (review of 1924692, finding 4). The leaf
+        // is read the same way, in four statements (its dist-tags and heads, its picked version's size, that version,
+        // dismissals), so it is reserved before it is read too (review of 16fc8b5, finding 4)
+        expect(r.queries).toBeLessThanOrEqual(9);
       },
     ));
 
@@ -227,8 +229,8 @@ describe("the resolve walk bounds its database work", () => {
       expect(r.status).toBe(200);
       expect(r.body.tree.packages.length).toBe(300);
       expect(r.body.tree.unchecked).toBe(0);
-      // the root, then one batch per level (mids, leaves): a handful of statements, not three per package
-      expect(r.queries).toBeLessThanOrEqual(12);
+      // the root, then one batch of four statements per level (mids, leaves): a handful, not four per package
+      expect(r.queries).toBeLessThanOrEqual(14);
     });
   });
 
@@ -269,8 +271,9 @@ describe("the resolve walk bounds its database work", () => {
       expect(r.body.tree.packages.length).toBe(MAX_WALK_LEVELS);
       expect(r.body.tree.unchecked).toBe(1);
       expect(r.body.tree.uncheckedDeps[0]?.reason).toBe(`the check stops after ${MAX_WALK_LEVELS} levels of dependencies`);
-      // three statements per level read, plus the root's
-      expect(r.queries).toBeLessThanOrEqual(3 * MAX_WALK_LEVELS + 6);
+      // four statements per level read (heads, the picked rows' sizes, the rows, dismissals: review of 16fc8b5,
+      // finding 4), plus the root's
+      expect(r.queries).toBeLessThanOrEqual(4 * MAX_WALK_LEVELS + 6);
       // a walk cut short at its limits installs with a warning that says so (at 5b5b492: 200 and no warning), and
       // strict mode refuses it
       expect(r.body.warnings?.map((w) => [w.name, w.kind])).toEqual([["c0", "unchecked"]]);
