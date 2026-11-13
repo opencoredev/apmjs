@@ -12,10 +12,11 @@ import { z } from "zod";
 import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { resolveResponse, ResolveWait } from "../src/apm.ts";
+import { resolveResponse, ResolveWait, scanResponse } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
-import { Store } from "../src/db.ts";
+import { RegistryConfig } from "../src/config.ts";
+import { Store, UnscorableReason } from "../src/db.ts";
 import { Upstream } from "../src/upstream.ts";
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
@@ -69,6 +70,7 @@ const Body = z.object({
   pending: z.array(z.object({ name: z.string(), version: z.string() })).optional(),
   retryAfter: z.number().optional(),
   tree: z.object({ blocks: z.array(z.object({ name: z.string(), reason: z.string() })) }).loose().optional(),
+  skipped: z.array(z.object({ version: z.string(), reason: z.string() })).optional(),
 });
 
 async function resolve(input: { url: string; npm: string; name: string; wait: { maxMs: number; pollMs: number } }) {
@@ -163,5 +165,73 @@ describe("a queued dependency is pending, never clean", () => {
       expect(r.status).toBe(202);
       expect(r.body.version).toBe("1.0.0");
       expect(r.body.pending).toEqual([{ name: "cold-root", version: "1.0.0" }]);
+    }));
+});
+
+/** POST /-/apm/v1/scan, anonymous, as the Bun scanner asks it. */
+async function scan(input: { url: string; npm: string; packages: { name: string; version: string }[] }) {
+  const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: input.npm, legacyAuth: false, namePolicy: "open", admins: [] } as const;
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
+  const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
+  const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: input.packages }) });
+  const ScanBody = z.object({ advisories: z.array(z.object({ package: z.string(), level: z.string(), description: z.string() })), unchecked: z.array(z.object({ package: z.string() })), pending: z.array(z.object({ package: z.string() })) });
+  const program = Effect.flatMap(scanResponse(req, { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res.status, body: ScanBody.parse(await res.json()) })));
+
+  return Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+}
+
+/** What the queue's run records for a version it can never score. */
+const storeOutcome = (sql: Sql, name: string, reason: string): Promise<void> =>
+  sql(`INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ($1, '1.0.0', $2, $3, 'stand-in detail', 0)`, [name, SCORER, reason]);
+
+// Review of 9913a74, finding 2: once a pending dependency reached a terminal outcome (analysis-limit) the same resolve
+// answered 200 with no blocks and it only "unchecked", and the scan listed it as unchecked, which the default scanner
+// only warns about. A version that will never be scored blocks the tree and is a fatal advisory, like a low score.
+describe("a version apm will never score blocks, never installs unchecked", () => {
+  for (const reason of UnscorableReason.options) {
+    test(`a dependency decided ${reason}: 202 while pending, then 422 naming why`, () =>
+      withRig(async ({ url, npm, sql }) => {
+        const before = await resolve({ url, npm, name: "root", wait: { maxMs: 0, pollMs: 1 } });
+
+        expect(before.status).toBe(202);
+        await storeOutcome(sql, "cold-evil", reason);
+        const after = await resolve({ url, npm, name: "root", wait: { maxMs: 0, pollMs: 1 } });
+
+        // on 9913a74: 200, tree.blocks [], tree.unchecked 1
+        expect(after.status).toBe(422);
+        expect(after.body.tree?.blocks.map((b) => b.name)).toEqual(["cold-evil"]);
+        expect(after.body.tree?.blocks[0]?.reason).toStartWith("apm cannot score this version:");
+        expect(after.body.error).toContain("cold-evil@1.0.0 apm cannot score this version");
+      }));
+
+    test(`the scan answers a version decided ${reason} with a fatal advisory`, () =>
+      withRig(async ({ url, npm, sql }) => {
+        await storeOutcome(sql, "cold-evil", reason);
+        const r = await scan({ url, npm, packages: [{ name: "cold-evil", version: "1.0.0" }] });
+
+        // on 9913a74: no advisory, only an unchecked entry
+        expect(r.status).toBe(200);
+        expect(r.body.advisories.map((a) => [a.package, a.level])).toEqual([["cold-evil", "fatal"]]);
+        expect(r.body.advisories[0]?.description).toContain("apm cannot score this version");
+        expect(r.body.pending).toEqual([]);
+        expect(r.body.unchecked).toEqual([]);
+      }));
+  }
+
+  test("a root decided unscorable is refused, naming why", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await storeOutcome(sql, "cold-root", "analysis-limit");
+      const r = await resolve({ url, npm, name: "cold-root", wait: { maxMs: 0, pollMs: 1 } });
+
+      expect(r.status).toBe(422);
+      expect(r.body.skipped?.[0]?.reason).toStartWith("apm cannot score this version: its analysis runs past the registry's limits");
+    }));
+
+  test("a scan of a pending version still lists it as pending, not as an advisory", () =>
+    withRig(async ({ url, npm }) => {
+      const r = await scan({ url, npm, packages: [{ name: "cold-evil", version: "1.0.0" }] });
+
+      expect(r.body.pending.map((p) => p.package)).toEqual(["cold-evil"]);
+      expect(r.body.advisories).toEqual([]);
     }));
 });

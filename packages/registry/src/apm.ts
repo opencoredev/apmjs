@@ -402,7 +402,7 @@ const checkDependencies = (manifest: Record<string, unknown>) =>
       const analyzed = yield* ensureAnalyzed(picked.src, picked.v);
       const r = reportFor(analyzed, at, { ignoreRecent: true });
 
-      if (!r) unchecked.push(`${dep.name}@${picked.v.version}: could not be analyzed`);
+      if (!r) unchecked.push(`${dep.name}@${picked.v.version}: ${notScored(picked.src, analyzed).text}`);
       else if (r.score < SCORE_FLOOR) risky.push({ name: dep.name, version: picked.v.version, score: r.score });
     }
 
@@ -1649,9 +1649,13 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       if (age < policy.cooldownMs) {
         blocks.push({ name: dep.name, version: v.version, reason: `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`, via: item.via });
       } else if (!r) {
-        // queued for analysis is pending, not unchecked: the answer waits for it and never passes it
-        if (picked.src.kind === "upstream" && !v.unscorable) pending.push({ name: dep.name, version: v.version, via: item.via });
-        else miss(key, v.unscorable ? notScored(picked.src, v).text : "could not be analyzed", item.via);
+        const why = notScored(picked.src, v);
+
+        // queued for analysis is pending: the answer waits for it and never passes it. A version decided unscorable
+        // (too large, unavailable, unreadable, past the analysis limits) or one with no score for any other reason
+        // never gets one: it blocks the tree as a low score does, since the package manager would install it
+        if (why.kind === "queued") pending.push({ name: dep.name, version: v.version, via: item.via });
+        else blocks.push({ name: dep.name, version: v.version, reason: why.text, via: item.via });
       } else if (r.score < policy.floor)
         blocks.push({
           name: dep.name,
@@ -1923,7 +1927,13 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
     if (!r) {
       const why = notScored(src, v);
 
-      return why.kind === "queued" ? ({ kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } } satisfies ScanOne) : unchecked(why.text);
+      if (why.kind === "queued") return { kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } } satisfies ScanOne;
+
+      // decided, not waiting: no score will come, and a version with no score is never installed as if it passed,
+      // whatever mode the scanner runs in
+      const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} has no apm score and will not get one: ${why.text}. apm installs no version without a score.`, url };
+
+      return { kind: "advisory", advisory } satisfies ScanOne;
     }
 
     if (r.score >= SCORE_FLOOR) return { kind: "clean" } satisfies ScanOne;
@@ -1944,7 +1954,7 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
     return { kind: "advisory", advisory } satisfies ScanOne;
   });
 
-const scanResponse = (req: Request, caller: Caller) =>
+export const scanResponse = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
     const { baseUrl } = yield* RegistryConfig;
     const at = yield* now;

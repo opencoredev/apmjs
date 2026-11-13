@@ -11,7 +11,7 @@ type Stub = { url: string; asked: string[][]; stop: () => void };
 const ScanBody = z.object({ packages: z.array(z.object({ name: z.string() })) });
 
 /** A scan API that answers `pending` for the versions in `pendingFor` until it has been asked `rounds` times. */
-function stubRegistry(input: { pendingFor: string[]; rounds: number; thenAdvisory?: boolean }): Stub {
+function stubRegistry(input: { pendingFor: string[]; rounds: number; thenAdvisory?: boolean; thenDescription?: (name: string) => string }): Stub {
   const asked: string[][] = [];
 
   const server = Bun.serve({
@@ -27,7 +27,7 @@ function stubRegistry(input: { pendingFor: string[]; rounds: number; thenAdvisor
 
       const advisories =
         !stillPending && input.thenAdvisory
-          ? names.filter((n) => input.pendingFor.includes(n)).map((n) => ({ package: n, version: "1.0.0", level: "fatal", description: `${n}@1.0.0 has apm score 10/100`, url: null }))
+          ? names.filter((n) => input.pendingFor.includes(n)).map((n) => ({ package: n, version: "1.0.0", level: "fatal", description: input.thenDescription?.(n) ?? `${n}@1.0.0 has apm score 10/100`, url: null }))
           : [];
 
       return Response.json({ advisories, unchecked: pending.map((p) => ({ ...p, reason: "not scored yet: queued for analysis" })), pending });
@@ -104,4 +104,20 @@ describe("a queued version is pending, and the scanner never lets it through", (
 
     expect(r).toMatchObject({ kind: "advisories", out: [] });
   });
+
+  // review of 9913a74, finding 2: a version that went from pending to a terminal outcome (analysis-limit) came back as
+  // only unchecked, which the default mode lets through; the registry now answers it with a fatal advisory
+  for (const strict of [false, true]) {
+    test(`decided unscorable while the scanner waits: blocked in ${strict ? "strict" : "default"} mode, naming why`, async () => {
+      const why = (n: string): string => `${n}@1.0.0 has no apm score and will not get one: apm cannot score this version: its analysis runs past the registry's limits (stand-in). apm installs no version without a score.`;
+
+      stub = stubRegistry({ pendingFor: ["cold"], rounds: 1, thenAdvisory: true, thenDescription: why });
+      const r = await scan({ strict, waitMs: 5_000, names: ["cold"] });
+
+      expect(r.kind).toBe("advisories");
+
+      if (r.kind !== "advisories") return;
+      expect(r.out).toEqual([{ level: "fatal", package: "cold", url: null, description: why("cold") }]);
+    });
+  }
 });
