@@ -258,7 +258,7 @@ A version is therefore never left looking queued forever, and never scored clean
 
 Some versions can never be scored, and the registry records why, per scorer:
 
-- `too-large`: the tarball is over the 32 MiB download cap or the 48 MiB unpack cap. next 16.x is 43 MB and 192 MB.
+- `too-large`: the tarball is over the 32 MiB download cap or the 48 MiB unpack cap. next 16.x is 43 MB and 192 MB. The cap is for analysis only: the registry still serves the tarball (streamed, checked against its checksum on the way), and installs warn that the version cannot be scored.
 - `unavailable`: the upstream lists no checksum, serves the tarball from a host apm will not fetch, or no longer has the package, the version or its tarball.
 - `unreadable`: not a gzip tar apm can read, or a path appears twice or escapes the package folder.
 - `analysis-limit`: the platform stopped its analysis twice before it finished.

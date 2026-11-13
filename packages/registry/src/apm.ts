@@ -72,7 +72,7 @@ import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
-import { tooLargeText, Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
+import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
 import { summarize, summaryVersion, type Catalog, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
@@ -2646,16 +2646,26 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
 
       // confirmed malicious by an apm reviewer: gone like a revoked version, before anything is downloaded
       if ((yield* confirmedVersions(src.name, src.versions.filter((x) => x.version === version))).has(version)) return fail(410, confirmedText(src.name, version), { confirmed: true });
-      const got = yield* upstream.tarball(src.pkg, version);
+      const v = src.versions.find((x) => x.version === version);
+
+      if (viaSafe) {
+        // the view serves only what passes its policy, the tarball route included, and decides before any byte is sent
+        const analyzed = v ? yield* ensureAnalyzed(src, v) : null;
+        const block = analyzed ? policyBlock(analyzed, DEFAULT_POLICY, at) : "not listed upstream";
+
+        if (block !== null) return fail(404, `${src.name}@${version} is not in this view: ${block}.`);
+      }
+
+      // a tarball over the analysis cap is streamed, not held: the client checks its integrity, and so does the stream
+      const got = yield* upstream.serve(src.pkg, version);
 
       switch (got.kind) {
         case "absent":
           return fail(404, `${src.name}@${version} is not published upstream.`);
         case "unavailable":
           return fail(502, `Upstream tarball unavailable: ${got.reason}.`);
-        case "too-large":
-          return fail(502, `Upstream tarball unavailable: ${tooLargeText(got.bytes)}.`);
         case "ok":
+        case "stream":
           break;
         default: {
           const _exhaustive: never = got;
@@ -2664,20 +2674,25 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
         }
       }
 
-      const v = src.versions.find((x) => x.version === version);
+      // Scoring a download happens off the request path: the queue consumer analyzes it (one over the cap is recorded
+      // too large, once).
+      if (!viaSafe && v && !parseAnalysis(v.score)) yield* (yield* Analysis).enqueue(src.name, version);
 
-      if (viaSafe) {
-        // the view serves only what passes its policy, the tarball route included
-        const analyzed = v ? yield* ensureAnalyzed(src, v) : null;
-        const block = analyzed ? policyBlock(analyzed, DEFAULT_POLICY, at) : "not listed upstream";
-
-        if (block !== null) return fail(404, `${src.name}@${version} is not in this view: ${block}.`);
-      } else if (v && !parseAnalysis(v.score)) {
-        // Scoring a download happens off the request path: the queue consumer analyzes it.
-        yield* (yield* Analysis).enqueue(src.name, version);
+      if (got.kind === "ok") {
+        return new Response(req.method === "HEAD" ? null : got.bytes, { headers: { "content-type": "application/octet-stream", "content-length": String(got.bytes.length) } });
       }
 
-      return new Response(req.method === "HEAD" ? null : got.bytes, { headers: { "content-type": "application/octet-stream", "content-length": String(got.bytes.length) } });
+      const headers = new Headers({ "content-type": "application/octet-stream" });
+
+      if (got.length !== null) headers.set("content-length", String(got.length));
+
+      if (req.method === "HEAD") {
+        yield* Effect.promise(() => got.body.cancel());
+
+        return new Response(null, { headers });
+      }
+
+      return new Response(got.body, { headers });
     }
 
     if (sp.rest.length > 0) return null;

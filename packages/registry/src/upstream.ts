@@ -11,6 +11,7 @@ import { readCapped, streamedJson, streamWeight } from "./http.ts";
 import { CACHE_WEIGHT, type Block, type Lease, type MemoryPool } from "./memory.ts";
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
+import { verifiedStream } from "./verified-stream.ts";
 import { reviewSummary, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
@@ -118,6 +119,33 @@ export type UpstreamTarball =
 /** "a 43.7 MB tarball" or "a tarball", for a refusal that names the size when it is known. */
 export function tooLargeText(bytes: number | null): string {
   return `the tarball${bytes === null ? "" : ` (${(bytes / 1_000_000).toFixed(1)} MB)`} is larger than the ${MAX_UPSTREAM_TARBALL_BYTES / (1024 * 1024)} MiB apm downloads`;
+}
+
+/**
+ * A tarball being served: "ok" holds its verified bytes (any tarball up to MAX_UPSTREAM_TARBALL_BYTES, also kept in
+ * the blob store); "stream" is a larger one passed through as it arrives, checked on the way (verifiedStream) and
+ * never held, cached or charged to the memory pool. `length` is what the upstream declared, null when it declared none.
+ */
+export type ServedTarball =
+  | Extract<UpstreamTarball, { kind: "ok" | "absent" | "unavailable" }>
+  | { kind: "stream"; body: ReadableStream<Uint8Array>; length: number | null; digest: Digest };
+
+/** How long a tarball download may take, and how long a streamed one may take to start. */
+const TARBALL_TIMEOUT_MS = 30_000;
+
+/** The Content-Length an answer declares, or null when it declares none (or one that is not a byte count). */
+function declaredLength(res: Response): number | null {
+  const raw = res.headers.get("content-length");
+
+  if (raw === null || !/^\d+$/.test(raw)) return null;
+
+  return Number(raw);
+}
+
+function streamed(res: Response, digest: Digest, length: number | null): ServedTarball {
+  const body = res.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+
+  return { kind: "stream", body: verifiedStream({ source: body, digest, length, url: res.url }), length, digest };
 }
 
 /** Upstream answers that may succeed when asked again. */
@@ -467,6 +495,11 @@ export type UpstreamApi = {
    * are never served.
    */
   readonly tarball: (pkg: UpstreamPackage, version: string) => Effect.Effect<UpstreamTarball, BlobError>;
+  /**
+   * The tarball for a client: like `tarball` up to MAX_UPSTREAM_TARBALL_BYTES, and past it a stream of the upstream's
+   * answer, checked against the published checksum on the way (verifiedStream). Never "too-large".
+   */
+  readonly serve: (pkg: UpstreamPackage, version: string) => Effect.Effect<ServedTarball, BlobError>;
   /** Forwards an advisory bulk request. A failure is "unavailable", never an empty (clean) answer. */
   readonly advisories: (body: unknown) => Effect.Effect<UpstreamAdvisories>;
 };
@@ -529,8 +562,12 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         /** The only origins tarballs are fetched from, on every redirect hop. */
         const origins: ReadonlySet<string> = new Set([new URL(baseUrl).origin, NPM_ORIGIN]);
 
-        /** GET from the upstream's own origin (or npm's) only; each redirect hop is checked before it is followed. */
-        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | Extract<UpstreamTarball, { kind: "unavailable" | "too-large" }>> => {
+        /**
+         * GET from the upstream's own origin (or npm's) only; each redirect hop is checked before it is followed. The 200
+         * answer, its body not read yet. TARBALL_TIMEOUT_MS runs from the request until `release` is called: a download
+         * calls it once the body is read, a stream as soon as the answer has come, since a client may take longer.
+         */
+        const open = async (raw: string): Promise<{ kind: "ok"; res: Response; release: () => void } | Extract<UpstreamTarball, { kind: "unavailable" }>> => {
           let current: URL;
 
           try {
@@ -541,16 +578,22 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
           for (let hop = 0; hop <= MAX_HOPS; hop++) {
             if (!origins.has(current.origin)) return { kind: "unavailable", reason: `refusing to fetch a tarball from ${current.origin}, which is not the upstream registry`, retryable: false };
+            const deadline = new AbortController();
+            const timer = setTimeout(() => deadline.abort(new Error("the tarball download timed out")), TARBALL_TIMEOUT_MS);
+            const release = (): void => clearTimeout(timer);
             let res: Response;
 
             try {
-              res = await fetch(current, { redirect: "manual", signal: AbortSignal.timeout(30_000) });
+              res = await fetch(current, { redirect: "manual", signal: deadline.signal });
             } catch {
+              release();
+
               return { kind: "unavailable", reason: "the tarball download failed", retryable: true };
             }
 
             if (REDIRECTS.has(res.status)) {
               await res.body?.cancel();
+              release();
               const location = res.headers.get("location");
 
               if (!location) return { kind: "unavailable", reason: "a redirect without a location", retryable: false };
@@ -566,27 +609,82 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (res.status !== 200) {
               await res.body?.cancel();
+              release();
 
               return { kind: "unavailable", reason: `the upstream answered ${res.status}`, retryable: isTransientStatus(res.status) };
             }
 
-            const declared = Number(res.headers.get("content-length") ?? 0);
-
-            if (declared > MAX_UPSTREAM_TARBALL_BYTES) {
-              await res.body?.cancel();
-
-              return { kind: "too-large", bytes: declared };
-            }
-
-            const bytes = await readCapped(res, MAX_UPSTREAM_TARBALL_BYTES);
-
-            if (!bytes) return { kind: "too-large", bytes: null };
-
-            return { kind: "ok", bytes };
+            return { kind: "ok", res, release };
           }
 
           return { kind: "unavailable", reason: "too many redirects", retryable: false };
         };
+
+        /** The whole body of an open answer, within MAX_UPSTREAM_TARBALL_BYTES; null when it is larger. */
+        const gather = async (opened: { res: Response; release: () => void }): Promise<Uint8Array | null> => {
+          try {
+            return await readCapped(opened.res, MAX_UPSTREAM_TARBALL_BYTES);
+          } finally {
+            opened.release();
+          }
+        };
+
+        /** A tarball's bytes, for analysis: never more than MAX_UPSTREAM_TARBALL_BYTES of them. */
+        const download = async (raw: string): Promise<{ kind: "ok"; bytes: Uint8Array } | Extract<UpstreamTarball, { kind: "unavailable" | "too-large" }>> => {
+          const opened = await open(raw);
+
+          if (opened.kind !== "ok") return opened;
+          const declared = declaredLength(opened.res);
+
+          if (declared !== null && declared > MAX_UPSTREAM_TARBALL_BYTES) {
+            await opened.res.body?.cancel();
+            opened.release();
+
+            return { kind: "too-large", bytes: declared };
+          }
+
+          const bytes = await gather(opened);
+
+          if (!bytes) return { kind: "too-large", bytes: null };
+
+          return { kind: "ok", bytes };
+        };
+
+        /** Where a listed version's tarball is, and the checksum it must match; "absent" or "unavailable" when apm has neither. */
+        const locate = (pkg: UpstreamPackage, version: string): { kind: "found"; url: string; digest: Digest } | Extract<UpstreamTarball, { kind: "absent" | "unavailable" }> => {
+          const url = pkg.tarballs.get(version);
+          const rec = pkg.versions.find((v) => v.version === version);
+
+          if (!url || !rec) return { kind: "absent" };
+          const digest = digestOf(rec);
+
+          if (!digest) return { kind: "unavailable", reason: "the upstream publishes no checksum for this version", retryable: false };
+
+          return { kind: "found", url, digest };
+        };
+
+        /** The verified copy in the blob store, if there is one; a copy that fails its checksum is removed. */
+        const cachedCopy = (digest: Digest) =>
+          Effect.gen(function* () {
+            const key = upstreamBlobKey(digest);
+            const cached = yield* blobs.bytes(key);
+
+            if (Option.isNone(cached)) return null;
+
+            if (matches(cached.value, digest)) return cached.value;
+            yield* blobs.remove(key);
+
+            return null;
+          });
+
+        /** Bytes that passed their checksum are kept in the blob store; others are "unavailable". */
+        const verified = (bytes: Uint8Array, digest: Digest) =>
+          Effect.gen(function* () {
+            if (!matches(bytes, digest)) return { kind: "unavailable", reason: "the upstream tarball failed its integrity check", retryable: true } as const;
+            yield* blobs.put(upstreamBlobKey(digest), bytes);
+
+            return { kind: "ok", bytes, digest } as const;
+          });
 
         const now = Effect.sync(() => Date.now());
 
@@ -997,29 +1095,48 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           get: (name, lease) => Effect.map(probe(name, lease), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {
-              const url = pkg.tarballs.get(version);
-              const rec = pkg.versions.find((v) => v.version === version);
+              const at = locate(pkg, version);
 
-              if (!url || !rec) return { kind: "absent" } as const;
-              const digest = digestOf(rec);
+              if (at.kind !== "found") return at;
+              const cached = yield* cachedCopy(at.digest);
 
-              if (!digest) return { kind: "unavailable", reason: "the upstream publishes no checksum for this version", retryable: false } as const;
-              const key = upstreamBlobKey(digest);
-              const cached = yield* blobs.bytes(key);
-
-              if (Option.isSome(cached)) {
-                if (matches(cached.value, digest)) return { kind: "ok", bytes: cached.value, digest } as const;
-                yield* blobs.remove(key);
-              }
-
-              const got = yield* Effect.promise(() => download(url));
+              if (cached) return { kind: "ok", bytes: cached, digest: at.digest } as const;
+              const got = yield* Effect.promise(() => download(at.url));
 
               if (got.kind !== "ok") return got;
 
-              if (!matches(got.bytes, digest)) return { kind: "unavailable", reason: "the upstream tarball failed its integrity check", retryable: true } as const;
-              yield* blobs.put(key, got.bytes);
+              return yield* verified(got.bytes, at.digest);
+            }),
+          serve: (pkg, version) =>
+            Effect.gen(function* () {
+              const at = locate(pkg, version);
 
-              return { kind: "ok", bytes: got.bytes, digest } as const;
+              if (at.kind !== "found") return at;
+              const cached = yield* cachedCopy(at.digest);
+
+              if (cached) return { kind: "ok", bytes: cached, digest: at.digest } as const;
+              const opened = yield* Effect.promise(() => open(at.url));
+
+              if (opened.kind !== "ok") return opened;
+              const declared = declaredLength(opened.res);
+
+              // small enough to analyze: held, checked and cached as the analysis would, so its bytes are fetched once
+              if (declared === null || declared <= MAX_UPSTREAM_TARBALL_BYTES) {
+                const bytes = yield* Effect.promise(() => gather(opened));
+
+                if (bytes) return yield* verified(bytes, at.digest);
+                // no length declared and more than the cap sent: asked again, to stream from the start
+                const again = yield* Effect.promise(() => open(at.url));
+
+                if (again.kind !== "ok") return again;
+                again.release();
+
+                return streamed(again.res, at.digest, declaredLength(again.res));
+              }
+
+              opened.release();
+
+              return streamed(opened.res, at.digest, declared);
             }),
           advisories: (body) =>
             fetchJson(`${baseUrl}-/npm/v1/security/advisories/bulk`, 10_000, {

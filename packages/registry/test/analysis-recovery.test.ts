@@ -148,6 +148,8 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
 
           return b ? { kind: "ok", bytes: b, digest: { algo: "sha512", hex: createHash("sha512").update(b).digest("hex") } } : { kind: "absent" };
         }),
+      // no tarball route runs in this file
+      serve: () => Effect.succeed({ kind: "absent" }),
       advisories: () => Effect.succeed({ kind: "unavailable" }),
     }),
   );

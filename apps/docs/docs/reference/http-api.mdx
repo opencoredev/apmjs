@@ -29,7 +29,7 @@ Prefix any path with `/~safe` to read through the safe view: `https://registry.a
 | `GET /-/ping` | none | `{}` |
 | `GET /<package>` | none | The package document (packument). Supports the abbreviated form (`Accept: application/vnd.npm.install-v1+json`) and `ETag`. Each version carries apm's score as `_apmScore`. |
 | `GET /<package>/<version or tag>` | none | One version's document. Revoked versions answer `404`. |
-| `GET /<package>/-/<file>.tgz` | none | The tarball, checked against its published sha512 before it is sent. A revoked version answers `410` with `{ error, revoked: true, revokeReason }`; `error` is the line npm prints, so it ends with the owner's reason too. |
+| `GET /<package>/-/<file>.tgz` | none | The tarball, checked against its published sha512 before it is sent. An npm tarball over 32 MiB is streamed instead and checked as it passes: one that fails ends before its last bytes, and the client's own integrity check refuses it. A revoked version answers `410` with `{ error, revoked: true, revokeReason }`; `error` is the line npm prints, so it ends with the owner's reason too. |
 | `PUT /<package>` | token | Publish one version. With a login token it is staged and answers `202` with `approvalUrl`, `expiresAt` and an `npm-notice` header holding the link. `npm deprecate` uses this route too; with a login token it needs a code in `npm-otp`. |
 | `GET /-/package/<package>/dist-tags` | none | The dist-tags. |
 | `PUT /-/package/<package>/dist-tags/<tag>` | token, factor | Move a tag. A login token needs a code (npm sends it as `npm-otp`). |
