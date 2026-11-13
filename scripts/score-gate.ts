@@ -7,14 +7,17 @@
 // A focused test (.only) runs part of the suite by design, so any makes the score at least 1 (review of 2b7767f,
 // finding 8). The inventory reads each file's syntax with TypeScript's parser, so a test declared or focused through an
 // alias (`import { test as check }`, `check.only.each(...)`) counts like any other (review of efef668, finding 4), and
-// scripts/score.ts also runs bun with .only turned into an error (score-preload.ts).
+// scripts/score.ts also runs bun with .only turned into an error (score-preload.ts). A name is resolved by its lexical
+// binding, not its spelling, so `check` can be test in one scope and describe in another, and each binding is resolved
+// once, so the inventory always finishes (review of a24c6aa, finding 4). A `.only` call the inventory cannot resolve
+// (`rows(test).only(...)`, through a helper) counts as focused (review of a24c6aa, finding 3).
 import ts from "typescript";
 
 /** A modifier that keeps a test function a test function: `test.skip`, `test.only`, `describe.concurrent`. */
 const STATIC_MODIFIERS = new Set(["skip", "todo", "only", "failing", "serial", "concurrent"]);
 
 /** A modifier that is called with its configuration first: `test.each([...])(...)`, `test.if(cond)(...)`. */
-const CALLED_MODIFIERS = new Set(["each", "if", "skipIf", "todoIf", "failingIf", "runIf"]);
+const CALLED_MODIFIERS = new Set(["each", "if", "skipIf", "todoIf", "failingIf", "runIf", "concurrentIf", "serialIf"]);
 
 /** bun:test's exports that declare a test or a suite (x...: skipped). */
 const EXPORTS = new Map<string, "test" | "describe">([
@@ -60,18 +63,24 @@ function memberName(node: ts.Node): { object: ts.Expression; name: string } | nu
 
 const isBunTest = (node: ts.Node): boolean => ts.isStringLiteralLike(node) && node.text === "bun:test";
 
-/** What `expr` is, through aliases, member accesses, configuration calls, parentheses and type assertions. */
-function resolve(expr: ts.Expression, bindings: ReadonlyMap<string, Ref>): Ref | null {
-  if (ts.isParenthesizedExpression(expr) || ts.isNonNullExpression(expr) || ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isTypeAssertionExpression(expr)) return resolve(expr.expression, bindings);
+/** A lexical binding: the symbol TypeScript's binder gives a declared name, or a global's name. */
+type BindingKey = ts.Symbol | `global:${string}`;
 
-  if (ts.isIdentifier(expr)) return bindings.get(expr.text) ?? null;
+/** What each binding of one file stands for, looked up by the binding an identifier refers to. */
+type Scope = { keyOf: (id: ts.Identifier) => BindingKey; refs: Map<BindingKey, Ref> };
+
+/** What `expr` is, through aliases, member accesses, configuration calls, parentheses and type assertions. */
+function resolve(expr: ts.Expression, scope: Scope): Ref | null {
+  if (ts.isParenthesizedExpression(expr) || ts.isNonNullExpression(expr) || ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isTypeAssertionExpression(expr)) return resolve(expr.expression, scope);
+
+  if (ts.isIdentifier(expr)) return scope.refs.get(scope.keyOf(expr)) ?? null;
   const m = memberName(expr);
 
-  if (m !== null) return member(resolve(m.object, bindings), m.name);
+  if (m !== null) return member(resolve(m.object, scope), m.name);
 
   if (ts.isCallExpression(expr)) {
     if (ts.isIdentifier(expr.expression) && expr.expression.text === "require" && expr.arguments[0] !== undefined && isBunTest(expr.arguments[0])) return { kind: "module" };
-    const callee = resolve(expr.expression, bindings);
+    const callee = resolve(expr.expression, scope);
 
     // a configuration call (`test.each([...])`) gives back a function that declares; a declaration gives back nothing
     return callee?.kind === "fn" && callee.pending ? { ...callee, pending: false } : null;
@@ -80,17 +89,41 @@ function resolve(expr: ts.Expression, bindings: ReadonlyMap<string, Ref>): Ref |
   return null;
 }
 
+/** The binder's view of one file: which declaration each identifier refers to. No lib and no imports are read. */
+function keysOf(file: ts.SourceFile): (id: ts.Identifier) => BindingKey {
+  const host: ts.CompilerHost = {
+    getSourceFile: (name) => (name === file.fileName ? file : undefined),
+    getDefaultLibFileName: () => "/lib.d.ts",
+    writeFile: () => undefined,
+    getCurrentDirectory: () => "/",
+    getCanonicalFileName: (name) => name,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => "\n",
+    fileExists: (name) => name === file.fileName,
+    readFile: () => undefined,
+  };
+
+  const checker = ts.createProgram({ rootNames: [file.fileName], options: { noLib: true, noResolve: true, types: [] }, host }).getTypeChecker();
+
+  return (id) => checker.getSymbolAtLocation(id) ?? `global:${id.text}`;
+}
+
 /**
- * Every name that stands for bun:test or one of its test functions: the globals test, it and describe, imports from
- * bun:test (renamed, namespace or default), and variables bound to any of those (`const check = test`, `const fit =
- * test.only`, `const { test: t } = bt`, `require("bun:test")`), in any order.
+ * Every binding that stands for bun:test or one of its test functions: the globals test, it and describe, imports
+ * from bun:test (renamed, namespace or default), and variables bound to any of those (`const check = test`, `const
+ * fit = test.only`, `const { test: t } = bt`, `require("bun:test")`), in any order. Each binding is resolved once:
+ * a pass that resolves no new one ends the search, so it ends after at most one pass per variable.
  */
-function bindingsOf(file: ts.SourceFile): Map<string, Ref> {
-  const bindings = new Map<string, Ref>([
-    ["test", { kind: "fn", fn: "test", focused: false, pending: false }],
-    ["it", { kind: "fn", fn: "test", focused: false, pending: false }],
-    ["describe", { kind: "fn", fn: "describe", focused: false, pending: false }],
+function scopeOf(file: ts.SourceFile): Scope {
+  const keyOf = keysOf(file);
+
+  const bindings = new Map<BindingKey, Ref>([
+    ["global:test", { kind: "fn", fn: "test", focused: false, pending: false }],
+    ["global:it", { kind: "fn", fn: "test", focused: false, pending: false }],
+    ["global:describe", { kind: "fn", fn: "describe", focused: false, pending: false }],
   ]);
+
+  const scope: Scope = { keyOf, refs: bindings };
 
   const aliases: { name: ts.BindingName; init: ts.Expression }[] = [];
 
@@ -98,16 +131,16 @@ function bindingsOf(file: ts.SourceFile): Map<string, Ref> {
     if (ts.isImportDeclaration(node) && isBunTest(node.moduleSpecifier) && node.importClause !== undefined) {
       const clause = node.importClause;
 
-      if (clause.name !== undefined) bindings.set(clause.name.text, { kind: "module" });
+      if (clause.name !== undefined) bindings.set(keyOf(clause.name), { kind: "module" });
       const named = clause.namedBindings;
 
-      if (named !== undefined && ts.isNamespaceImport(named)) bindings.set(named.name.text, { kind: "module" });
+      if (named !== undefined && ts.isNamespaceImport(named)) bindings.set(keyOf(named.name), { kind: "module" });
 
       if (named !== undefined && ts.isNamedImports(named)) {
         for (const spec of named.elements) {
           const r = member({ kind: "module" }, (spec.propertyName ?? spec.name).text);
 
-          if (r !== null) bindings.set(spec.name.text, r);
+          if (r !== null) bindings.set(keyOf(spec.name), r);
         }
       }
     }
@@ -118,33 +151,52 @@ function bindingsOf(file: ts.SourceFile): Map<string, Ref> {
 
   visit(file);
 
-  // an alias of an alias may come before it: repeat until nothing new is bound
+  // an alias of an alias may come before it: repeat while a pass binds something new. A binding, once resolved, is
+  // never resolved again, so each pass binds at least one of finitely many or is the last.
   for (let changed = true; changed; ) {
     changed = false;
 
     for (const a of aliases) {
-      const r = resolve(a.init, bindings);
+      const r = resolve(a.init, scope);
 
       if (r === null) continue;
 
-      const bind = (name: string, ref: Ref | null): void => {
-        if (ref === null || JSON.stringify(bindings.get(name)) === JSON.stringify(ref)) return;
-        bindings.set(name, ref);
+      const bind = (id: ts.Identifier, ref: Ref | null): void => {
+        const key = keyOf(id);
+
+        if (ref === null || bindings.has(key)) return;
+        bindings.set(key, ref);
         changed = true;
       };
 
-      if (ts.isIdentifier(a.name)) bind(a.name.text, r);
+      if (ts.isIdentifier(a.name)) bind(a.name, r);
       else if (ts.isObjectBindingPattern(a.name)) {
         for (const el of a.name.elements) {
           const prop = el.propertyName ?? el.name;
 
-          if (ts.isIdentifier(el.name) && (ts.isIdentifier(prop) || ts.isStringLiteralLike(prop))) bind(el.name.text, member(r, prop.text));
+          if (ts.isIdentifier(el.name) && (ts.isIdentifier(prop) || ts.isStringLiteralLike(prop))) bind(el.name, member(r, prop.text));
         }
       }
     }
   }
 
-  return bindings;
+  return scope;
+}
+
+/**
+ * Whether an `.only` access is called, directly or through more modifiers: `x.only(...)`, `x.only.each(rows)(...)`.
+ * One the inventory cannot resolve is counted as focused: a helper can hand back a test function it cannot see.
+ */
+function isCalled(only: ts.Expression): boolean {
+  for (let cur: ts.Node = only; ; ) {
+    const parent = cur.parent;
+
+    if (ts.isCallExpression(parent) && parent.expression === cur) return true;
+    const m = memberName(parent);
+
+    if (m === null || m.object !== cur || !(STATIC_MODIFIERS.has(m.name) || CALLED_MODIFIERS.has(m.name))) return false;
+    cur = parent;
+  }
 }
 
 /** One file's declared tests' lines, and the lines that focus its run. */
@@ -156,8 +208,8 @@ export type FileInventory = { declared: readonly number[]; focused: readonly num
  * it); and each place a `.only` focuses a test or a suite, through any alias or modifier chain (`check.only.each`).
  */
 export function inventoryOf(source: string): FileInventory {
-  const file = ts.createSourceFile("test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const bindings = bindingsOf(file);
+  const file = ts.createSourceFile("/test.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const scope = scopeOf(file);
   const declared: number[] = [];
   const focused = new Set<number>();
   const lineOf = (pos: number): number => file.getLineAndCharacterOfPosition(pos).line + 1;
@@ -166,13 +218,13 @@ export function inventoryOf(source: string): FileInventory {
     const m = memberName(node);
 
     if (m !== null && m.name === "only" && ts.isExpression(node)) {
-      const r = resolve(node, bindings);
+      const r = resolve(node, scope);
 
-      if (r?.kind === "fn" && r.focused) focused.add(lineOf(node.getStart(file)));
+      if ((r?.kind === "fn" && r.focused) || (r === null && isCalled(node))) focused.add(lineOf(node.getStart(file)));
     }
 
     if (ts.isCallExpression(node)) {
-      const r = resolve(node.expression, bindings);
+      const r = resolve(node.expression, scope);
 
       if (r?.kind === "fn" && !r.pending) {
         if (r.fn === "test") declared.push(lineOf(node.arguments[0]?.getStart(file) ?? node.expression.getEnd()));

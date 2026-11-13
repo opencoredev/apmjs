@@ -97,6 +97,58 @@ describe("scripts/score.ts", () => {
     expect(r.code).toBe(1);
   });
 
+  // review of a24c6aa, finding 3: the reviewer's fixture scored 0 with exit 0 while a failing test was skipped
+  test("a focus through a helper's test.each result fails the run, and the ordinary test runs (on a24c6aa: 0, exit 0)", async () => {
+    const derived = "import { test } from 'bun:test';\nconst rows = (t: typeof test) => t.each([1, 2, 3]);\nconst ordinary = (t: typeof test) => t('must run', () => { throw new Error('failed'); });\nrows(test).only('focused %d', () => {});\nordinary(test);\n";
+    const r = await score({ "derived.test.ts": derived });
+
+    expect(r.out).toContain("(focused) acceptance/derived.test.ts:4");
+    expect(Number(r.score), r.out).toBeGreaterThanOrEqual(1);
+    expect(r.code).toBe(1);
+  });
+
+  test("a focus no source reading can see is refused when it runs: .only of test.each, test.if, describe.each and skipIf results, chained too, by computed name", async () => {
+    // no other test is declared, so a focus that is not refused leaves nothing unrun for the inventory to count; the same
+    // file with the key "concurrent" is the control: it scores 0, so the refusal is the only thing that fails
+    const pick = (expr: string, key: string) => `import { describe, test } from 'bun:test';\nconst key = [${JSON.stringify(key.slice(0, 2))}, ${JSON.stringify(key.slice(2))}].join('');\n(${expr} as any)[key]('focused %s', () => {});\n`;
+
+    for (const expr of ["test.each([1, 2])", "test.if(true)", "describe.each([1])", "test.skipIf(false)", "test.if(true).each([1])"]) {
+      const focused = await score({ "computed.test.ts": pick(expr, "only") });
+      const control = await score({ "computed.test.ts": pick(expr, "concurrent") });
+
+      expect([focused.code, control.code, control.score], `${expr}\n${focused.out}\n${control.out}`).toEqual([1, 0, "0"]);
+    }
+  }, 60_000);
+
+  // review of a24c6aa, finding 4: one alias name bound to test at file scope and to describe in a suite
+  test("an alias name reused in another scope: the inventory finishes and counts each by its own binding (on a24c6aa: never finished)", async () => {
+    const shadow = 'import { test, describe } from "bun:test";\nconst check = test;\ncheck("top", () => {});\ndescribe("inner", () => {\n  const check = describe;\n  check("group", () => {\n    test("nested", () => {});\n  });\n});\n';
+    const r = await score({ "shadow.test.ts": shadow });
+
+    expect(r.score, r.out).toBe("0");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("declared=2 ran=2 pass=2");
+  }, 30_000);
+
+  // review of a24c6aa, finding 6: reading .only must not throw, only calling it
+  test("helpers that copy a test function's properties run as without the preload (on a24c6aa: 1)", async () => {
+    const byValue = "import { test } from 'bun:test';\nfunction wrap(fn: any) {\n  const check: any = (...args: any[]) => fn(...args);\n  for (const name of Object.getOwnPropertyNames(fn)) {\n    if (['name', 'length', 'prototype', 'caller', 'arguments'].includes(name)) continue;\n    Object.defineProperty(check, name, { value: fn[name], configurable: true });\n  }\n  return check;\n}\nconst check = wrap(test);\ncheck('ordinary passing helper', () => {});\n";
+    const byDescriptor = "import { test } from 'bun:test';\nconst copy = (fn: any) => {\n  const check: any = (...args: any[]) => fn(...args);\n  for (const name of Object.getOwnPropertyNames(fn)) Object.defineProperty(check, name, Object.getOwnPropertyDescriptor(fn, name)!);\n  return check;\n};\nconst check = copy(test);\ncheck('ordinary', () => {});\ncheck.each([1, 2])('rows %d', () => {});\n";
+    const r = await score({ "value.test.ts": byValue, "descriptor.test.ts": byDescriptor });
+
+    expect(r.score, r.out).toBe("0");
+    expect(r.code).toBe(0);
+  });
+
+  test("calling .only copied onto a helper is still refused", async () => {
+    const copied = (key: string) =>
+      `import { test } from 'bun:test';\nconst copy = (fn: any) => {\n  const check: any = (...args: any[]) => fn(...args);\n  for (const name of Object.getOwnPropertyNames(fn)) Object.defineProperty(check, name, Object.getOwnPropertyDescriptor(fn, name)!);\n  return check;\n};\nconst key = [${JSON.stringify(key.slice(0, 2))}, ${JSON.stringify(key.slice(2))}].join('');\ncopy(test)[key]('focused', () => {});\ntest('ordinary', () => {});\n`;
+
+    const [focused, control] = [await score({ "copied.test.ts": copied("only") }), await score({ "copied.test.ts": copied("concurrent") })];
+
+    expect([focused.code, control.code, control.score], `${focused.out}\n${control.out}`).toEqual([1, 0, "0"]);
+  });
+
   test("everything passing, describe.each included: 0, exit 0", async () => {
     const r = await score({ "pass.test.ts": each.replace("not.toBe(2)", "toBeGreaterThan(0)") });
 
@@ -169,6 +221,20 @@ describe("gateScore", () => {
 
     expect(inv.declared).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 19]);
     expect(inv.focused).toEqual([4, 10, 13, 15]);
+  });
+
+  test("review of a24c6aa, finding 4: each binding of a reused name resolves on its own, and cycles end", () => {
+    const shadow = 'import { test, describe } from "bun:test";\nconst check = test;\ncheck("top", () => {});\ndescribe("inner", () => {\n  const check = describe;\n  check("group", () => test("nested", () => {}));\n});\ncheck.only("f", () => {});\n';
+
+    expect(inventoryOf(shadow)).toEqual({ declared: [3, 6, 8], focused: [8] });
+    expect(inventoryOf("const a = b;\nconst b = a;\nconst c = c;\ntest('x', () => {});\n")).toEqual({ declared: [4], focused: [] });
+    expect(inventoryOf("function f(test: any) {\n  test('not bun', () => {});\n}\n").declared).toEqual([]);
+  });
+
+  test("review of a24c6aa, finding 3: a .only call the inventory cannot resolve counts as focused; reading one does not", () => {
+    const src = "import { test } from 'bun:test';\nconst rows = (t: typeof test) => t.each([1]);\nrows(test).only('a %d', f);\nhelper().only.each([1])('b', f);\nconst opts = { only: false };\nif (opts.only) {}\nconst n = options.only.length;\n";
+
+    expect(inventoryOf(src).focused).toEqual([3, 4]);
   });
 
   test("a renamed import declares tests under its new name", () => {
