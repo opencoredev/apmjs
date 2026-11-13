@@ -70,7 +70,7 @@ apm uses the package manager your project already uses: it reads the lockfile, t
 apm add zod
 ```
 
-apm asks the registry for the newest version that is at least 24 hours old and not revoked, yanked or confirmed malicious, prints its score card, and checks every package under it. Then it runs your package manager with the exact version and holds back install scripts. It reads what the package manager really installed, every package at its exact version, compares each with what the registry served and checks it, and runs the scripts last. A revoked or yanked version anywhere in that graph undoes the install.
+apm asks the registry for the newest version that is at least 24 hours old and not revoked, yanked or confirmed malicious, prints its score card, and checks every package under it. Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package in it at its exact version. Only a lockfile that passes is written to your project and installed, with install scripts held back until apm has confirmed the install matches it. A revoked or yanked version anywhere in that lockfile refuses the add before anything in your project changes.
 
 ```text
 ✓ zod@4.6.7  score 90/100 (A)

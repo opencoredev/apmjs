@@ -36,7 +36,7 @@ Every npm package is scored the first time apm sees it. When a client asks the v
 
 Use `~safe` when you want the checks with stock tools and no CLI. Compared with `apm add`:
 
-- `apm add` also checks every package under the one you add, verifies what your package manager installed against what the registry served, and runs install scripts only after that.
+- `apm add` also checks every package of the lockfile your package manager computes for the add, before anything is installed, verifies the install matches it, and runs install scripts only after that.
 - `~safe` filters each version on its own. A package that depends on a hidden version fails to install, with the reason in the error.
 
 The view cannot be tuned. To install one version it hides, use the plain registry for that install, or `apm add <package> --force`, which lifts the floor and cooldown for that package only.

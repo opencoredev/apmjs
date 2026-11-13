@@ -46,18 +46,22 @@ Codes and passkeys protect every action that changes what people install or how 
 
 ## How `apm add` installs what it checked
 
-A check means nothing if the package manager then installs other bytes. `apm add`:
+A check means nothing if the package manager then installs other bytes, or if checking means installing first. `apm add` is lockfile first:
 
-1. pins every scope in the checked dependency tree to the checked registry, and refuses if an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere;
-2. refuses if the lockfile already pins an added package to a different tarball;
-3. installs with every install script held back (`--ignore-scripts`);
-4. reads the graph the package manager installed from the lockfile it wrote (or `node_modules`), every package at its exact version, including versions the lockfile already pinned, nested peers and overrides, and compares each package's integrity with what the checked registry serves;
-5. asks the registry about every one of those packages. A revoked, yanked or confirmed malicious version is refused in every mode; a fresh, low-scoring or unscored one is a warning, and `--strict` refuses it;
-6. runs the held-back scripts only when the check passes. Otherwise no script runs: apm restores `package.json` and the lockfile, puts `node_modules` back with the package manager (scripts off), names the refused versions, says what is left on disk and exits non-zero.
+1. It pins every scope it checks to the checked registry, and refuses if an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere.
+2. In a temporary directory, from a copy of only your `package.json`, lockfile and package-manager configuration (and, in a workspace, each member's `package.json`), the package manager computes the add's lockfile and installs nothing (`npm install --package-lock-only`, `pnpm add --lockfile-only`, `bun add --lockfile-only`, every script off).
+3. apm asks the registry about every package in that lockfile at its exact version and integrity: nested copies, overrides, peers and the versions your lockfile already pinned. A revoked, yanked or confirmed malicious version, or one whose integrity is not the registry's, is refused in every mode; a fresh, low-scoring or unscored one, and a git, file, link or workspace entry, is a warning, and `--strict` refuses it.
+4. A refusal ends here. Your project was never touched, so there is nothing to undo.
+5. Otherwise apm writes the checked `package.json` and lockfile over yours (those two files only, each in one rename, and only if neither changed meanwhile), installs exactly that lockfile with every script held back, confirms that what installed is that lockfile, and only then runs install scripts.
 
-`apm x` installs the package into a directory of its own the same way and checks it before any script or the binary runs. `apm audit` uses the same check on everything in `node_modules`.
+If the install does not match the checked lockfile, apm runs no script, leaves `node_modules` as it is (apm never undoes an install) and prints the commands that put your `package.json` and lockfile back.
 
-Limits: with yarn, apm reads `node_modules` after yarn installs, and yarn has already run install scripts by then. The bytes of a refused install sit in `node_modules`, never run, until apm removes them.
+`apm x` does the same in a directory of its own, and runs the binary with that directory's `node_modules/.bin` first on `PATH`. `apm audit` uses the same check on everything in `node_modules`.
+
+Limits:
+
+- yarn runs install scripts while it installs, before apm can check what it installed. `apm add --strict` refuses yarn adds before anything runs. Otherwise apm warns first; with yarn 2 and later it checks the lockfile yarn computes in a copy (`--mode update-lockfile`) before yarn installs, and with yarn 1, which has no such mode, it can only check `node_modules` after yarn installed and ran scripts, and says so.
+- A bundled dependency ships inside its parent's tarball: the parent's score covers it, and it is not asked about on its own.
 
 ## What apm does not protect against
 

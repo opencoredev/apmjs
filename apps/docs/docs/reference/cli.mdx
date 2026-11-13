@@ -27,7 +27,7 @@ Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A passed-throug
 apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D]
 ```
 
-Resolves each package to the newest version that is not revoked, yanked or confirmed malicious, checks its whole dependency tree, including every platform's optional binaries (see [Platform](#platform)), installs the exact version with install scripts held back, then checks the graph the package manager really installed (see [After the install](#after-the-install)), then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
+Resolves each package to the newest version that is not revoked, yanked or confirmed malicious and checks its whole dependency tree, including every platform's optional binaries (see [Platform](#platform)). Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package of that lockfile (see [Lockfile first](#lockfile-first)). Only a lockfile that passes is written to your project and installed, with install scripts held back until apm confirms the install matches it. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
 
 A score informs; it does not block. When the package or a dependency was published inside the 24-hour cooldown ("published 5 hours ago, inside apm's 24-hour cooldown"), scores under 40, has an incomplete analysis, can never be scored, is still being analysed after the wait, or could not be looked up because the registry or npm did not answer, `apm add` prints a warning block for each, then installs:
 
@@ -49,29 +49,41 @@ With `--strict` (or `APM_STRICT=1`), each of those refuses instead, as apm did b
 | `--no-cooldown` | Same as `--cooldown 0`. |
 | `--strict` | Refuse instead of warning: a version inside the cooldown, a score under the floor, an incomplete analysis, no score yet or ever, a dependency the registry could not look up, any dependency it could not check (a git, URL or file spec, a missing package, a peer it cannot pick a version for), and a dependency walk cut short at its limits. `APM_STRICT=1` does the same, and `apm explain` honours both. |
 | `--floor <n>` | Warn about (with `--strict`, refuse) versions scoring below `n`. Default `40`. Dependencies are always checked at 40 or the stricter floor you ask for. |
-| `--force` | Lift the cooldown for the named packages only, and in strict mode their floor. Revoked and yanked versions, versions apm reviewers confirmed malicious and unknown names stay blocked, and so, in strict mode, do versions apm has not scored or cannot score and dangerous dependencies. |
+| `--force` | Lift the cooldown and the score floor of the exact versions you name, and nothing else: every other package in the lockfile keeps the cooldown and the floor you asked for (a stricter `--floor` included). Revoked and yanked versions, versions apm reviewers confirmed malicious and unknown names stay blocked, and so, in strict mode, do versions apm has not scored or cannot score. |
 | `-D`, `--dev` | Add as a dev dependency. |
 
-### After the install
+### Lockfile first
 
-The registry's answer before the install is a prediction: the package manager can reuse a version your lockfile already pins, meet a peer with a version below the top level, follow your `overrides`, `pnpm.overrides` or `resolutions`, or take the version your `package.json` pins. So after the install, with scripts still held back, `apm add` reads the lockfile the package manager wrote (or `node_modules` when it cannot read one, as with yarn): every package under the ones you added, at the exact version installed, and every version new to the project. It compares each with what the registry serves and asks the registry about each, 200 at a time, with nothing left out:
+The registry's first answer is a prediction: the package manager can reuse a version your lockfile already pins, meet a peer with a version below the top level, follow your `overrides`, `pnpm.overrides` or `resolutions`, or take the version your `package.json` pins. So `apm add` has the package manager answer instead, before anything is installed:
+
+1. It copies your `package.json`, the lockfile (`npm-shrinkwrap.json` before `package-lock.json`, as npm reads them), `.npmrc`, `pnpm-workspace.yaml`, `.pnpmfile.cjs`, `bunfig.toml`, `.yarnrc.yml` and, in a workspace, each member's `package.json`, into a new temporary directory, and nothing else.
+2. There the package manager computes the add's lockfile with every script off: `npm install --package-lock-only`, `pnpm add --lockfile-only` or `bun add --lockfile-only`.
+3. apm asks the registry about every package of that lockfile at its exact version and integrity, 200 at a time, with nothing left out:
 
 ```text
-apm: checked the 2 packages this add installed at the versions npm installed (package-lock.json), before any install script
-  leaf: the early check read 1.1.0, npm installed 1.0.0; that is the version checked here
+apm: checked the 3 packages in the package-lock.json npm computed for this add, at the exact versions and integrity it locks, before installing anything
+  leaf: the early check read 1.1.0, the lockfile holds 1.0.0; that is the version checked here
 
 WARNING leaf@1.0.0 published 1 hour ago, inside apm's 24-hour cooldown
 ```
 
-A revoked or yanked version, or one apm reviewers confirmed malicious, refuses the add in every mode; `--strict` refuses every warning too. Warnings already printed before the install are not printed twice. A refused add runs no install script and puts the project back: `package.json` and the lockfile as they were, `node_modules` brought back in step by your package manager with scripts off (or removed, when the add created it). apm names the refused versions and says what, if anything, is left on disk.
+A revoked or yanked version, one apm reviewers confirmed malicious, or one whose integrity is not what the registry serves refuses the add in every mode; `--strict` refuses every warning too. A git, file, link or workspace entry cannot be checked by a registry: it is a warning, which `--strict` refuses (your workspace's own packages included). A bundled dependency ships inside its parent's tarball, so the parent's score covers it. Warnings already printed by the first answer are not printed twice.
+
+A refused add exits 1 and names what it refused. Your project was never touched: `package.json`, the lockfile and `node_modules` are byte for byte as they were.
+
+When the check passes, apm writes the checked `package.json` and lockfile over yours (those two files only, and only if neither changed while it checked), installs exactly that lockfile with scripts held back (`npm ci --ignore-scripts`, or `npm install --ignore-scripts` when there is a `node_modules` to keep; `pnpm install --frozen-lockfile --ignore-scripts`; `bun install --frozen-lockfile --ignore-scripts`), confirms that what installed is that lockfile, and then runs the install scripts of the packages it installed with the package manager's own rebuild. apm does not run your project's own `postinstall` or `prepare` scripts, and says so.
+
+If what installed is not the checked lockfile, no script runs and apm leaves the files as installed: it never undoes an install. It prints the commands that put your `package.json` and lockfile back (it keeps a copy of both until the add finishes), and the `git checkout` alternative.
+
+With yarn, which runs install scripts while it installs, `--strict` refuses before anything runs: "apm cannot check yarn installs before yarn runs their scripts." Without it, apm warns first. Yarn 2 and later compute the lockfile in a copy (`yarn add --mode update-lockfile`), which apm checks before yarn installs; yarn 1 has no such mode, so apm checks `node_modules` after yarn installed it and ran its scripts, and says so.
 
 With `--json`:
 
 ```json
-{ "ok": true, "pm": "bun", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 90, "grade": "A", "signals": [{ "id": "eval", "points": -10 }], "skipped": [], "unchecked": [], "warnings": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "restored": null } }
+{ "ok": true, "pm": "bun", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 90, "grade": "A", "signals": [{ "id": "eval", "points": -10 }], "skipped": [], "unchecked": [], "warnings": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "touched": true, "stage": "done", "recovery": null } }
 ```
 
-`installed` is the check after the install (null when nothing was installed): `blocked` lists `{ name, version, reason }` refused in every mode, `warnings` the real graph's warnings, and `restored` what a refused add did to put the project back (`command`, its exit `code`, and the versions `left` on disk).
+`installed` is the check of the computed lockfile (null when apm stopped before it): `checked` counts its packages, `blocked` lists `{ name, version, reason }` refused in every mode, `warnings` its warnings, `touched` whether apm wrote to your project (never before the check passes), `stage` where the add stopped (`check`, `install`, `verify`, `scripts` or `done`), and `recovery` the commands that put the project back when it stopped after apm wrote the checked files. `source` is `node_modules` only under yarn 1.
 
 Each entry in `warnings` is `{ name, version, kind, score, grade, text, reasons, url, via }`: `kind` is `cooldown`, `low-score`, `incomplete`, `unscorable`, `pending`, `unavailable` (the registry or npm did not answer) or `unchecked` (a dependency apm could not check, or the walk stopped at its limits); `score` and `grade` are set for `low-score` and `incomplete`; `reasons` holds up to three, each with its file and line; `via` is the dependency path, empty for the package itself. `projectPeers` lists the peers your project provides (see [Peers your project already has](#peers-your-project-already-has)) as `{ dependency, via, kind, version }`.
 
@@ -93,7 +105,7 @@ WARNING 8 platform binaries (@next/swc-*): 8 too large to analyze
 The registry walks each required peer at the version its range picks, unless something in the tree installs the peer's own package under the peer's name at a version in range (a package installed under an alias does not count). A peer nothing in the tree installs but your `package.json` lists (`dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`) is your project's, and the package manager uses your version. `apm add` reads which one from your lockfile (`package-lock.json`, `pnpm-lock.yaml` or `bun.lock`) and sends each name with the version the lockfile pins:
 
 - Pinned: the registry checks that exact version, under the usual policy (a warning by default, refused with `--strict`). A pinned version that was revoked or yanked is refused in every mode.
-- No lockfile, or no entry for that name: the registry checks the newest version in range and `apm add` prints a note saying so. Your `package.json` may pin an older one; the check after the install reads the version that really installed.
+- No lockfile, or no entry for that name: the registry checks the newest version in range and `apm add` prints a note saying so. Your `package.json` may pin an older one; the check of the computed lockfile reads the version the package manager really picked.
 - A lockfile apm cannot read (`yarn.lock`), or an entry it cannot pin to a registry version (an alias, a git, file or workspace entry): the peer is reported as not checked, a warning that `--strict` refuses.
 
 ## apm x
@@ -102,7 +114,7 @@ The registry walks each required peer at the version its range picks, unless som
 apm x <package>[@version] [args...]
 ```
 
-Shows the package's score card, installs it into a directory of its own with your package manager (npm for yarn projects) with install scripts held back, checks what installed as `apm add` does, then runs the install scripts and the package's binary (the only one, or the one named like the package) in your directory. The directory is removed afterwards. Aliases: `apm exec`, `apm dlx`. Takes the same `--strict`, `--force`, `--no-cooldown`, `--cooldown` and `--floor` flags as `add`, warns the same way, and waits for a version still being analysed the same way. Put apm's own flags before the package: what follows the package goes to its binary.
+Shows the package's score card, then in a temporary project of its own has your package manager (npm for yarn projects) compute the lockfile, checks every package of it as `apm add` does, and only then installs it with install scripts held back, confirms the install matches it, runs the install scripts and runs the package's binary (the only one, or the one named like the package) in your directory. The binary runs with the temporary project's `node_modules/.bin` first on `PATH`, so a helper binary it calls is one apm checked. The directory is removed afterwards. Aliases: `apm exec`, `apm dlx`. Takes the same `--strict`, `--force`, `--no-cooldown`, `--cooldown` and `--floor` flags as `add`, warns the same way, and waits for a version still being analysed the same way. Put apm's own flags before the package: what follows the package goes to its binary.
 
 ## apm score
 
