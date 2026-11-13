@@ -9,6 +9,7 @@ import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CA
 import type { Analysis } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
+import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { RegistryConfig, type NamePolicy } from "./config.ts";
 import { Store, type PackageRecord, type StagedLoad, type StoredScope, type VersionRecord } from "./db.ts";
 import { refuse, type BlobError, type HttpFailure, type InfraError, type StoreError } from "./errors.ts";
@@ -274,7 +275,9 @@ export const packument = (pkg: PackageRecord, abbreviated: boolean, ext: Extensi
     const base = `${(yield* RegistryConfig).baseUrl}${view?.prefix ?? ""}`;
     const now = yield* (yield* Clock).now;
     const all = yield* versionsOf(pkg.name);
-    const served = servedVersions(all);
+    // a version an apm reviewer confirmed malicious is not offered, in any view (confirmed.ts)
+    const confirmed = yield* confirmedVersions(pkg.name, all);
+    const served = servedVersions(all).filter((v) => !confirmed.has(v.version));
     const live = view ? served.filter(view.keep) : served;
     const versions: Record<string, unknown> = {};
     const time: Record<string, string> = { created: iso(pkg.created_at), modified: iso(pkg.modified_at) };
@@ -295,7 +298,7 @@ export const packument = (pkg: PackageRecord, abbreviated: boolean, ext: Extensi
       time[v.version] = iso(v.published_at);
     }
 
-    const distTags = view ? retag(pkg.distTags, live.map((v) => v.version)) : { ...pkg.distTags };
+    const distTags = view || confirmed.size > 0 ? retag(pkg.distTags, live.map((v) => v.version)) : { ...pkg.distTags };
 
     if (abbreviated) {
       return { name: pkg.name, modified: iso(pkg.modified_at), "dist-tags": distTags, versions };
@@ -1065,6 +1068,9 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
         return fail(410, `${name}@${v.version} was revoked by its owner: ${reason}`, { revoked: true, revokeReason: reason });
       }
 
+      // confirmed malicious by an apm reviewer: gone like a revoked version, for existing lockfiles too (confirmed.ts)
+      if ((yield* confirmedVersions(name, [v])).has(v.version)) return fail(410, confirmedText(name, v.version), { confirmed: true });
+
       if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
       const blobs = yield* Blobs;
 
@@ -1116,15 +1122,18 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
     // GET /:name/:versionOrTag
     const spec = rest[0] ?? "";
     // in a view, tags point at what the view serves (latest moves back to the newest kept version)
-    const tags = view ? retag(pkg.distTags, servedVersions(yield* versionsOf(name)).filter(view.keep).map((x) => x.version)) : pkg.distTags;
+    const every = yield* versionsOf(name);
+    const confirmed = yield* confirmedVersions(name, every);
+    const offered = servedVersions(every).filter((x) => !confirmed.has(x.version));
+    const tags = view ? retag(pkg.distTags, offered.filter(view.keep).map((x) => x.version)) : confirmed.size > 0 ? retag(pkg.distTags, offered.map((x) => x.version)) : pkg.distTags;
     const resolved = tagTarget(tags, spec) ?? spec;
 
     if (!isValidVersion(resolved)) return fail(404, "Version not found");
     const v = yield* versionOf(name, resolved);
 
     // a revoke-pending version's manifest (its scripts, its dependency specs) is withheld like a revoked one's; only
-    // its tarball stays, for existing lockfiles
-    if (!v || isWithheld(v.status)) return fail(404, "Version not found");
+    // its tarball stays, for existing lockfiles. One confirmed malicious is withheld the same way (confirmed.ts).
+    if (!v || isWithheld(v.status) || confirmed.has(v.version)) return fail(404, "Version not found");
 
     if (view && !view.keep(v)) return fail(404, `${name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
     const base = `${(yield* RegistryConfig).baseUrl}${view?.prefix ?? ""}`;

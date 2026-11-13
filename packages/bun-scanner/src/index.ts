@@ -100,9 +100,19 @@ function originOf(url: string): string | null {
   }
 }
 
-type Answer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[]; pending: Pending[] } | { kind: "unavailable"; reason: string };
+/** A package in a scan request that failed: the registry was never asked about it, so it is unchecked, nothing more. */
+type Failed = { id: string; reason: string };
 
-async function ask(registry: string, packages: Bun.Security.Package[], strict: boolean): Promise<Answer> {
+/**
+ * What the registry said. `failed` lists the packages of the batches that could not be asked when others could: their
+ * answer is unknown, and every other batch's advisories still count.
+ */
+type Answer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[]; pending: Pending[]; failed: Failed[] } | { kind: "unavailable"; reason: string };
+
+/** One request's answer, before batches are merged. */
+type BatchAnswer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[]; pending: Pending[] } | { kind: "unavailable"; reason: string };
+
+async function ask(registry: string, packages: Bun.Security.Package[], strict: boolean): Promise<BatchAnswer> {
   try {
     const res = await fetch(`${registry}-/apm/v1/scan`, {
       method: "POST",
@@ -130,22 +140,37 @@ async function ask(registry: string, packages: Bun.Security.Package[], strict: b
 /** Packages per scan request: the registry checks at most this many without a token. */
 const BATCH = 200;
 
-/** Asks about every package, BATCH at a time in parallel. Unavailable when any batch could not be asked. */
+/**
+ * Asks about every package, BATCH at a time in parallel. Unavailable only when no batch could be asked. A batch that
+ * failed while others answered leaves its packages unchecked and keeps every other batch's advisories: before this
+ * (review of a76b9fc, finding 2), a 503 on batch 2 of 201 packages dropped batch 1's fatal advisory, and the scan
+ * returned nothing but "unchecked" warnings.
+ */
 async function askAll(registry: string, packages: Bun.Security.Package[], strict: boolean): Promise<Answer> {
   const batches = Array.from({ length: Math.ceil(packages.length / BATCH) }, (_, i) => packages.slice(i * BATCH, (i + 1) * BATCH));
   const answers = await Promise.all(batches.map((b) => ask(registry, b, strict)));
   const advisories: ScanAdvisory[] = [];
   const unchecked: RegistryUnchecked[] = [];
   const pending: Pending[] = [];
+  const failed: Failed[] = [];
+  let reason: string | null = null;
 
-  for (const a of answers) {
-    if (a.kind === "unavailable") return a;
+  for (const [i, a] of answers.entries()) {
+    if (a.kind === "unavailable") {
+      reason ??= a.reason;
+
+      for (const p of batches[i] ?? []) failed.push({ id: `${p.name}@${p.version}`, reason: a.reason });
+      continue;
+    }
+
     advisories.push(...a.advisories);
     unchecked.push(...a.unchecked);
     pending.push(...a.pending);
   }
 
-  return { kind: "advisories", advisories, unchecked, pending };
+  if (reason !== null && failed.length === packages.length) return { kind: "unavailable", reason };
+
+  return { kind: "advisories", advisories, unchecked, pending, failed };
 }
 
 const keyOf = (p: { package: string; version: string }): string => `${p.package}@${p.version}`;
@@ -169,13 +194,16 @@ async function askUntilScored(input: { registry: string; packages: Bun.Security.
 
     // the registry could not be asked again: what was pending stays pending, and is warned about (strict: blocked) below
     if (again.kind === "unavailable") break;
-    const asked = (p: { package: string; version: string }): boolean => waiting.has(keyOf(p));
+    // a batch of the asking again that failed: its packages are still pending, not answered
+    const unanswered = new Set(again.failed.map((f) => f.id));
+    const asked = (p: { package: string; version: string }): boolean => waiting.has(keyOf(p)) && !unanswered.has(keyOf(p));
 
     answer = {
       kind: "advisories",
       advisories: [...answer.advisories, ...again.advisories],
       unchecked: [...answer.unchecked.filter((u) => !asked(u)), ...again.unchecked],
-      pending: again.pending,
+      pending: [...again.pending, ...answer.pending.filter((p) => unanswered.has(keyOf(p)))],
+      failed: answer.failed,
     };
   }
 
@@ -252,6 +280,9 @@ export async function scanPackages(input: { packages: Bun.Security.Package[]; en
       }
 
       for (const u of answer.unchecked) if (!stillPending.has(keyOf(u))) unchecked.push({ id: `${u.package}@${u.version}`, reason: `${registry} could not check it: ${u.reason}` });
+
+      // the packages of a batch the registry could not be asked about: unchecked, and nothing else is lost
+      for (const f of answer.failed) unchecked.push({ id: f.id, reason: f.reason });
 
       // The verdict is about the registry's copy; bun is fetching this one from another host.
       const origin = new URL(registry).origin;

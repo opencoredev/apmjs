@@ -255,6 +255,38 @@ async function review(name: string, version: string, token?: string): Promise<{ 
   return getJson(`${reg.url}-/apm/v1/review/${encodeURIComponent(name)}/${version}`, token ? { headers: { authorization: `Bearer ${token}` } } : undefined);
 }
 
+const Packument = z.object({ versions: z.record(z.string(), z.unknown()), "dist-tags": z.record(z.string(), z.string()) });
+
+type Served = { listed: boolean; abbreviated: boolean; tagged: boolean; safeListed: boolean; manifest: number; tarball: number; safeTarball: number };
+
+/** What every route a package manager uses says about one version: listed in the packuments and tags, and its files. */
+async function served(name: string, version: string): Promise<Served> {
+  const versions = async (url: string, accept?: string) => {
+    const res = await fetch(url, accept ? { headers: { accept } } : undefined);
+    const body = Packument.parse(await res.json());
+
+    return { listed: version in body.versions, tagged: Object.values(body["dist-tags"]).includes(version) };
+  };
+
+  const plain = await versions(`${reg.url}${name}`);
+  const abbreviated = await versions(`${reg.url}${name}`, "application/vnd.npm.install-v1+json");
+  const safe = await versions(`${reg.url}~safe/${name}`);
+  const status = async (url: string) => (await fetch(url)).status;
+
+  return {
+    listed: plain.listed,
+    abbreviated: abbreviated.listed,
+    tagged: plain.tagged,
+    safeListed: safe.listed,
+    manifest: await status(`${reg.url}${name}/${version}`),
+    tarball: await status(`${reg.url}${name}/-/${name}-${version}.tgz`),
+    safeTarball: await status(`${reg.url}~safe/${name}/-/${name}-${version}.tgz`),
+  };
+}
+
+const SERVED: Served = { listed: true, abbreviated: true, tagged: true, safeListed: true, manifest: 200, tarball: 200, safeTarball: 200 };
+const WITHHELD: Served = { listed: false, abbreviated: false, tagged: false, safeListed: false, manifest: 404, tarball: 410, safeTarball: 410 };
+
 async function until(check: () => Promise<boolean>, ms = 3000): Promise<boolean> {
   const end = Date.now() + ms;
 
@@ -894,9 +926,29 @@ describe("AI review standings for install decisions", () => {
 
     expect(Array.isArray(advisories) ? advisories.map((a) => [dig(a, "level"), String(dig(a, "description"))]) : []).toEqual([["fatal", `${DEP}@1.0.0: apm reviewers confirmed this version is malicious.`]]);
 
+    // review of a76b9fc, finding 1: resolve and scan refused it, but every route a package manager uses still served it
+    expect(await served(DEP, "1.0.0")).toEqual(WITHHELD);
+
     await reg.query("UPDATE reviews SET human_state = 'dismissed', human_at = $1 WHERE package = ANY($2)", [clock, [DEP, MUTE]]);
     expect(dig((await review(DEP, "1.0.0")).body, "review", "state")).toBe("cleared");
     expect(dig((await resolve()).body, "tree", "reviews")).toEqual(empty);
+    // a reviewer who clears the flag makes it served again, on the next request
+    expect(await served(DEP, "1.0.0")).toEqual(SERVED);
+  });
+
+  test("an upstream version confirmed malicious is not served either, plain or ~safe, and comes back once cleared", async () => {
+    // quiet-lib 1.0.1 was reviewed (found nothing) in the Request AI review test
+    expect(dig((await review("quiet-lib", "1.0.1")).body, "review", "state")).toBe("found-nothing");
+    // an upstream version has no manifest route of its own, and 1.0.1 is no dist-tag's target
+    const upstreamServed = { ...SERVED, manifest: 404, tagged: false };
+
+    expect(await served("quiet-lib", "1.0.1")).toEqual(upstreamServed);
+    await reg.query("UPDATE reviews SET human_state = 'confirmed', human_at = $1 WHERE package = 'quiet-lib' AND version = '1.0.1'", [clock]);
+    expect(await served("quiet-lib", "1.0.1")).toEqual(WITHHELD);
+    // the other versions are untouched
+    expect((await fetch(`${reg.url}quiet-lib/-/quiet-lib-1.0.2.tgz`)).status).toBe(200);
+    await reg.query("UPDATE reviews SET human_state = 'dismissed', human_at = $1 WHERE package = 'quiet-lib' AND version = '1.0.1'", [clock]);
+    expect(await served("quiet-lib", "1.0.1")).toEqual(upstreamServed);
   });
 
   // re-review finding 1: the walk stopped enqueueing past depth 12 and did not count what it left out, so a dependency

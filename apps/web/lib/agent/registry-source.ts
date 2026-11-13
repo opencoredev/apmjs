@@ -8,15 +8,17 @@ import { registryFetch } from "../registry-transport";
 import { REGISTRY } from "../registry-url";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
 import { parseJson } from "./json";
+import { EXPLAIN_RESOLVE_WAIT_MS, RESOLVE_TIMEOUT_MS } from "./resolve-budget";
 import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome } from "./source";
 
 const NameReportWire = ExactPart.extend(LookalikePart.omit({ query: true, valid: true }).shape).extend(AlternativesPart.omit({ query: true, valid: true }).shape);
 
-/** /resolve walks the dependency tree and may score a tarball first, so it gets longer than a plain read. */
-const RESOLVE_TIMEOUT_MS = 25_000;
-
+/**
+ * /resolve walks the dependency tree and waits for analyses still queued, so it gets longer than a plain read; explain
+ * asks for a short wait so it answers inside that (resolve-budget.ts).
+ */
 async function resolve(input: { name: string; range: string }): Promise<ResolveOutcome> {
-  const path = `-/apm/v1/resolve?${new URLSearchParams({ name: input.name, range: input.range })}`;
+  const path = `-/apm/v1/resolve?${new URLSearchParams({ name: input.name, range: input.range, wait: String(EXPLAIN_RESOLVE_WAIT_MS) })}`;
 
   try {
     const res = await registryFetch(`${REGISTRY}${path}`, { cache: "no-store", headers: { accept: "application/json" }, signal: withTimeout(RESOLVE_TIMEOUT_MS) });

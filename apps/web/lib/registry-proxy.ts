@@ -10,8 +10,9 @@ export function isRegistryPath(pathname: string): boolean {
   return REGISTRY_PREFIXES.some((prefix) => pathname.startsWith(prefix));
 }
 
-// What the old rewrite allowed: long enough for a slow OAuth exchange, short enough to free the socket.
-const FORWARD_TIMEOUT_MS = 30_000;
+// Long enough for a slow OAuth exchange and for a resolve that waits the registry's whole 20 s for queued analyses
+// and walks its tree twice (agent/resolve-budget.test.ts), short enough to free the socket.
+export const FORWARD_TIMEOUT_MS = 40_000;
 
 // Per-hop headers: they describe one connection, never the message.
 const HOP_BY_HOP = ["connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authenticate", "proxy-authorization"];

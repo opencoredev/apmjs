@@ -43,6 +43,7 @@ import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { digestLabel, digestOf } from "./digest.ts";
+import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, parseBody } from "./http.ts";
@@ -68,6 +69,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
+import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { tooLargeText, Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
 import {
@@ -1795,8 +1797,7 @@ const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({
  */
 export class ResolveWait extends Context.Service<ResolveWait, { readonly maxMs: number; readonly pollMs: number }>()("@apm/registry/ResolveWait") {}
 
-/** About 20 s: inside the website's 25 s timeout for a resolve, and short of the platform's limits on a request. */
-export const RESOLVE_WAIT = { maxMs: 20_000, pollMs: 1_000 } as const;
+export { RESOLVE_WAIT };
 
 /** What a client should wait before it asks again about a resolve that is still pending, in seconds. */
 export const PENDING_RETRY_AFTER_S = 10;
@@ -1902,7 +1903,8 @@ const resolvePass = (input: { name: string; range: string; policy: Policy; treeP
         // judged as the floor judges it: a fresh publish's own signal is the cooldown's business, not the score's
         const judged = reportFor(v, at, { ignoreRecent: true });
         const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [] }) : null;
-        const stillPending = [...(pendingRoot ? [] : walked.pending)].map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
+        // every dependency still pending warns, the root's own pending included (review of a76b9fc, finding 3)
+        const stillPending = walked.pending.map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
         const warnings = [...(own ? [own] : []), ...walked.warnings, ...stillPending];
 
         // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
@@ -1952,6 +1954,10 @@ export const resolveResponse = (url: URL) =>
     const parsedPolicy = parsePolicy(url);
 
     if (parsedPolicy.kind === "invalid") return fail(400, parsedPolicy.error);
+    // a caller with its own deadline (the website's explain) asks to wait less, so it is answered before it gives up
+    const asked = parseWait(url.searchParams.get(WAIT_PARAM));
+
+    if (asked.kind === "invalid") return fail(400, asked.error);
     const policy = parsedPolicy.policy;
     // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
     // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
@@ -1965,7 +1971,8 @@ export const resolveResponse = (url: URL) =>
     }
 
     let src = first;
-    const wait = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
+    const configured = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
+    const wait = { maxMs: Math.min(configured.maxMs, asked.maxMs), pollMs: configured.pollMs };
     const looks = Math.max(0, Math.ceil(wait.maxMs / Math.max(1, wait.pollMs)));
     let waited = 0;
 
@@ -2268,8 +2275,11 @@ const ABBREV = [
   "deprecated",
 ];
 
-function upstreamPackument(base: string, src: Extract<Source, { kind: "upstream" }>, abbreviated: boolean, view: PackumentView | null, at: number): Record<string, unknown> {
-  const kept = view ? src.versions.filter(view.keep) : src.versions;
+function upstreamPackument(input: { base: string; src: Extract<Source, { kind: "upstream" }>; abbreviated: boolean; view: PackumentView | null; at: number; confirmed: ReadonlySet<string> }): Record<string, unknown> {
+  const { base, src, abbreviated, view, at, confirmed } = input;
+  // a version an apm reviewer confirmed malicious is not offered, in any view (confirmed.ts)
+  const offered = src.versions.filter((v) => !confirmed.has(v.version));
+  const kept = view ? offered.filter(view.keep) : offered;
   const versions: Record<string, unknown> = {};
   const time: Record<string, string> = {};
 
@@ -2297,7 +2307,7 @@ function upstreamPackument(base: string, src: Extract<Source, { kind: "upstream"
 
   let distTags = { ...src.distTags };
 
-  if (view) {
+  if (view || confirmed.size > 0) {
     const keptIds = kept.map((v) => v.version);
     const tags: Record<string, string> = {};
 
@@ -2350,6 +2360,9 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       const version = m?.[2];
 
       if (!version) return fail(404, "Not found");
+
+      // confirmed malicious by an apm reviewer: gone like a revoked version, before anything is downloaded
+      if ((yield* confirmedVersions(src.name, src.versions.filter((x) => x.version === version))).has(version)) return fail(410, confirmedText(src.name, version), { confirmed: true });
       const got = yield* upstream.tarball(src.pkg, version);
 
       switch (got.kind) {
@@ -2397,7 +2410,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       for (const v of cooled) yield* ensureAnalyzed(src, v);
     }
 
-    const body = upstreamPackument(baseUrl, src, abbreviated, viaSafe ? safeView(at) : null, at);
+    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions) });
 
     return json(body, 200, { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });
   });

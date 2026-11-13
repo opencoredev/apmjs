@@ -411,6 +411,8 @@ export type StoreApi = {
    * waiting for the queue polls.
    */
   readonly decidedAnalyses: (versions: readonly { name: string; version: string }[]) => Effect.Effect<Set<string>, StoreError>;
+  /** The tarballs of `name` an apm reviewer confirmed malicious, each as its version and digest label (confirmed.ts). */
+  readonly confirmedReviews: (name: string) => Effect.Effect<{ version: string; digest: string }[], StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -1026,6 +1028,8 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             RETURNING failures`,
         one(z.object({ failures: Int })).transform((row) => row?.failures ?? null),
       ),
+    confirmedReviews: (name) =>
+      run("confirmedReviews", sql`SELECT version, digest FROM reviews WHERE package = ${name} AND human_state = 'confirmed'`, all(z.object({ version: z.string(), digest: z.string() }))),
     decidedAnalyses: (versions) =>
       versions.length === 0
         ? Effect.succeed(new Set<string>())
