@@ -41,13 +41,23 @@ export const TreeReviews = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
 ]);
 
+/** A package the walk checked; `platform`, the os and cpu a platform binary is built for (older registries send none). */
+const CheckedPackage = DepRef.extend({ platform: z.object({ os: z.array(z.string()), cpu: z.array(z.string()) }).optional() });
+
+/**
+ * A required peer nothing in the tree installs whose name the project's package.json lists. `kind`: `lockfile`, the
+ * registry checked `version`, the one the project's lockfile pins; `newest`, no lockfile entry, so the newest in range,
+ * `version`, which is what the package manager installs; `unknown`, apm could not tell, so it is unchecked. Older
+ * registries send neither field.
+ */
+export const ProjectPeer = z.object({ dependency: z.string(), via: z.array(z.string()), kind: z.enum(["lockfile", "newest", "unknown"]).optional(), version: z.string().nullish() });
+
 /**
  * `packages`: every name@version the registry's walk checked (older registries send none). `unchecked` is the total.
- * `platformSkips`: optional packages built for another platform than the one asked for, which do not install here.
- * `projectPeers`: required peers nothing in the tree installs whose names the project's package.json lists.
+ * `projectPeers`: required peers the project provides (ProjectPeer).
  */
 export const Tree = z
-  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), platformSkips: z.number().int().min(0).default(0), projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })).default([]), reviews: TreeReviews.optional() })
+  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(CheckedPackage).default([]), projectPeers: z.array(ProjectPeer).default([]), reviews: TreeReviews.optional() })
   .loose();
 
 /**

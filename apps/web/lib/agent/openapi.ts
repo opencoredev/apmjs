@@ -61,7 +61,10 @@ const ResolveAnswer = z.object({
     unchecked: z.number(),
     uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) })),
     skippedForPlatform: z.array(z.object({ dependency: z.string(), version: z.string(), reason: z.string(), via: z.array(z.string()) })).optional().describe("Optional packages built for another platform than os and cpu: not installed there, so not checked"),
-    projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })).optional().describe("Required peers nothing in the tree installs whose names the installed parameter lists: the project's own version is used if it fits, and the walk checked the version the range picks instead"),
+    projectPeers: z
+      .array(z.object({ dependency: z.string(), via: z.array(z.string()), kind: z.enum(["lockfile", "newest", "unknown"]), version: z.string().nullable() }))
+      .optional()
+      .describe("Required peers nothing in the tree installs whose names the installed parameter lists: the project's own version is used. kind lockfile: the version the project's lockfile pins was checked; newest: no pin was sent, so the newest in range was checked; unknown: not checked (an unchecked warning)"),
   }),
   policy: z.object({ cooldownHours: z.number(), floor: z.number(), strict: z.boolean().optional(), os: z.string().optional(), cpu: z.string().optional() }),
 });
@@ -246,9 +249,9 @@ export function openApiDocument() {
           { name: "range", in: "query", required: false, schema: { type: "string", default: "latest" }, example: "^4" },
           { name: "cooldown", in: "query", required: false, description: 'A duration such as 24h, 90m or 0 (default 24h).', schema: { type: "string" } },
           { name: "floor", in: "query", required: false, description: "Lowest passing score (default 40).", schema: { type: "integer", minimum: 0, maximum: 100 } },
-          { name: "os", in: "query", required: false, description: 'The install\'s platform as node names it (linux, darwin, win32); optional packages built for another are skipped. Default "any".', schema: { type: "string" } },
+          { name: "os", in: "query", required: false, description: 'The install\'s platform as node names it (linux, darwin, win32); optional packages built for another are skipped, and the caller is responsible for that being the platform that installs (no force flag, os/cpu setting or supportedArchitectures). Default "any": every platform is checked, as the apm CLI asks.', schema: { type: "string" } },
           { name: "cpu", in: "query", required: false, description: 'The install\'s architecture as node names it (x64, arm64). Default "any".', schema: { type: "string" } },
-          { name: "installed", in: "query", required: false, description: "The names the project's package.json already lists, comma-separated (at most 500): a peer nothing in the tree installs but the project lists is named in tree.projectPeers.", schema: { type: "string" } },
+          { name: "installed", in: "query", required: false, description: "The project's direct dependencies, comma-separated (at most 500): name, name@version (the version the project's lockfile pins) or name@? (a version the caller cannot tell). A peer nothing in the tree installs but the project lists is checked at the pinned version, the newest in range for a bare name, or reported unchecked for name@?, and named in tree.projectPeers.", schema: { type: "string" } },
         ],
         responses: { 200: json("ResolveAnswer", "A version passes"), 404: err("No such package"), 422: err("No version in range passes, or the newest that does pulls in a dangerous dependency; skipped says why") },
       }),

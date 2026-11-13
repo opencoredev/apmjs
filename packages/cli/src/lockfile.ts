@@ -64,8 +64,11 @@ export function isRegistryVersion(v: string): boolean {
 
 const DepMap = z.record(z.string(), z.string());
 
-/** Which nodes to read: those under the named top-level packages, or every node in the lockfile. */
-export type Roots = { kind: "under"; names: string[] } | { kind: "all" };
+/**
+ * Which nodes to read: those under the named top-level packages, only the named top-level packages themselves (`top`,
+ * where each node's key is the name it was asked for, so an alias maps back to it), or every node in the lockfile.
+ */
+export type Roots = { kind: "under"; names: string[] } | { kind: "top"; names: string[] } | { kind: "all" };
 
 /** Breadth-first walk from the roots over `edges`, each key visited once. */
 function walk(input: { roots: string[]; edges: (key: string) => string[] }): string[] {
@@ -127,15 +130,31 @@ function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
     return Object.keys({ ...e.dependencies, ...e.optionalDependencies, ...e.peerDependencies }).flatMap((d) => resolve(key, d) ?? []);
   };
 
-  const keys = roots.kind === "all" ? Object.keys(packages).filter((k) => k !== "") : walk({ roots: roots.names.flatMap((r) => resolve(from, r) ?? []), edges });
+  const tops = (names: string[]): string[] => names.flatMap((r) => resolve(from, r) ?? []);
 
-  return keys.flatMap((key): LockNode[] => {
-    const e = packages[key];
+  if (roots.kind === "top") return roots.names.flatMap((n) => npmTop(packages, n, resolve(from, n)));
+  const keys = roots.kind === "all" ? Object.keys(packages).filter((k) => k !== "") : walk({ roots: tops(roots.names), edges });
 
-    if (!e || e.link || e.version === undefined) return [];
+  return keys.flatMap((key) => npmNode(packages, key));
+}
 
-    return [{ key, name: e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length), version: e.version, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true }];
-  });
+/** The node at `key` of a package-lock.json, or none for a link or an entry without a version. */
+function npmNode(packages: z.infer<typeof NpmLock>["packages"], key: string | null): LockNode[] {
+  if (key === null) return [];
+  const e = packages[key];
+
+  if (!e || e.link || e.version === undefined) return [];
+
+  return [{ key, name: e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length), version: e.version, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true }];
+}
+
+/** A top-level entry of a package-lock.json asked for as `name`: a link (a workspace package) is a node too, never a registry version. */
+function npmTop(packages: z.infer<typeof NpmLock>["packages"], name: string, key: string | null): LockNode[] {
+  const e = key === null ? undefined : packages[key];
+
+  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false }];
+
+  return npmNode(packages, key).map((node) => ({ ...node, key: name }));
 }
 
 // ---------- bun: bun.lock ----------
@@ -216,15 +235,20 @@ function bunGraph(text: string, roots: Roots): LockNode[] {
     return m ? Object.keys({ ...m.dependencies, ...m.optionalDependencies, ...m.peerDependencies }).flatMap((d) => resolve(bunKeyNames(key), d) ?? []) : [];
   };
 
-  const keys = roots.kind === "all" ? [...entries.keys()] : walk({ roots: roots.names.flatMap((r) => resolve([], r) ?? []), edges });
+  const tops = (names: string[]): string[] => names.flatMap((r) => resolve([], r) ?? []);
 
-  return keys.flatMap((key): LockNode[] => {
+  const node = (key: string): LockNode[] => {
     const e = entries.get(key);
 
     if (!e) return [];
 
     return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true }];
-  });
+  };
+
+  if (roots.kind === "top") return roots.names.flatMap((n) => node(resolve([], n) ?? "").map((x) => ({ ...x, key: n })));
+  const keys = roots.kind === "all" ? [...entries.keys()] : walk({ roots: tops(roots.names), edges });
+
+  return keys.flatMap(node);
 }
 
 // ---------- pnpm: pnpm-lock.yaml v9 (and v6, where snapshots live under packages) ----------
@@ -261,14 +285,13 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
   const top = lock.importers?.[importer] ?? lock.importers?.["."];
   const topDeps = { ...top?.dependencies, ...top?.devDependencies, ...top?.optionalDependencies };
 
-  const rootKeys =
-    roots.kind === "all"
-      ? Object.keys(snapshots ?? packages).map((k) => k.replace(/^\//, ""))
-      : roots.names.flatMap((r) => {
-          const v = topDeps[r];
+  const topKey = (r: string): string | null => {
+    const v = topDeps[r];
 
-          return v === undefined ? [] : (pnpmKey(r, v) ?? []);
-        });
+    return v === undefined ? null : pnpmKey(r, v);
+  };
+
+  const rootKeys = roots.kind === "all" ? Object.keys(snapshots ?? packages).map((k) => k.replace(/^\//, "")) : roots.names.flatMap((r) => topKey(r) ?? []);
 
   const edges = (key: string): string[] => {
     const s = snapOf(key);
@@ -276,14 +299,28 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
     return Object.entries({ ...s?.dependencies, ...s?.optionalDependencies }).flatMap(([n, v]) => pnpmKey(n, v) ?? []);
   };
 
-  return walk({ roots: rootKeys, edges }).flatMap((key): LockNode[] => {
+  const node = (key: string): LockNode[] => {
     const id = splitId(key.replace(/\(.*$/, ""));
     const p = pkgOf(key);
 
     if (!id || !p) return [];
 
     return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true }];
-  });
+  };
+
+  if (roots.kind === "top") {
+    // a link:, file: or workspace: entry has no node: it is not a registry version, which projectPins says
+    return roots.names.flatMap((n): LockNode[] => {
+      const v = topDeps[n];
+
+      if (v === undefined) return [];
+      const key = topKey(n);
+
+      return key === null ? [{ key: n, name: n, version: v, integrity: null, resolved: null, hasInstallScript: false }] : node(key).map((x) => ({ ...x, key: n }));
+    });
+  }
+
+  return walk({ roots: rootKeys, edges }).flatMap(node);
 }
 
 function graphOf(input: { pm: LockPm; path: string; lockDir: string; cwd: string; roots: Roots }): LockNode[] {
@@ -332,4 +369,74 @@ export function lockedEntry(input: { cwd: string; pm: Pm; name: string; version:
   const hit = read.nodes.find((n) => n.name === input.name && n.version === input.version);
 
   return hit ? { integrity: hit.integrity, resolved: hit.resolved } : null;
+}
+
+/**
+ * What the project already installs under a name its package.json lists, as its lockfile says: `pinned`, a registry
+ * version; `unknown`, a lockfile apm cannot read (yarn's, or one it fails to parse) or an entry it cannot pin to a
+ * registry version (an alias, a git, file or link entry). A name with no lockfile, or none for it, is not in the map:
+ * the package manager installs the newest version in range.
+ */
+export type ProjectPin = { kind: "pinned"; version: string } | { kind: "unknown"; why: string };
+
+/** The nearest yarn.lock from `cwd` upward, or null. */
+function findYarnLock(cwd: string): string | null {
+  let dir = cwd;
+
+  for (let i = 0; i < 20; i++) {
+    if (existsSync(join(dir, "yarn.lock"))) return join(dir, "yarn.lock");
+    const parent = dirname(dir);
+
+    if (parent === dir) return null;
+    dir = parent;
+  }
+
+  return null;
+}
+
+/** The version the project's lockfile pins for each of `names` (its direct dependencies), as ProjectPin says. */
+export function projectPins(input: { cwd: string; pm: Pm; names: readonly string[] }): Map<string, ProjectPin> {
+  const out = new Map<string, ProjectPin>();
+  const { pm, cwd, names } = input;
+
+  if (!isLockPm(pm)) {
+    const yarn = findYarnLock(cwd);
+
+    if (yarn !== null) for (const n of names) out.set(n, { kind: "unknown", why: `apm cannot read ${yarn}` });
+
+    return out;
+  }
+
+  const read = lockedTree({ cwd, pm, roots: { kind: "top", names: [...names] } });
+
+  switch (read.kind) {
+    case "missing":
+      return out;
+    case "unreadable":
+      for (const n of names) out.set(n, { kind: "unknown", why: `apm could not read ${read.path}: ${read.reason}` });
+
+      return out;
+    case "read":
+      break;
+    default: {
+      const _exhaustive: never = read;
+
+      return _exhaustive;
+    }
+  }
+
+  const byName = new Map(read.nodes.map((x) => [x.key, x]));
+
+  for (const n of names) {
+    const node = byName.get(n);
+
+    if (node === undefined) continue;
+
+    if (node.name !== n) out.set(n, { kind: "unknown", why: `${n} installs ${node.name}, an alias` });
+    // a git, file or remote tarball entry carries the version its package.json says, not a registry's
+    else if (!isRegistryVersion(node.version) || (node.resolved !== null && !/^https?:\/\//.test(node.resolved))) out.set(n, { kind: "unknown", why: `${n} is not installed from a registry (${node.resolved ?? node.version})` });
+    else out.set(n, { kind: "pinned", version: node.version });
+  }
+
+  return out;
 }

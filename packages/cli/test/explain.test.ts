@@ -196,12 +196,13 @@ describe("the CLI against a stand-in registry", () => {
     return { code, out };
   }
 
-  // review of 2fbf383, finding 5: the resolve walked every platform's optional binaries, since nothing said which
-  test("apm explain asks about the install for this machine's platform", async () => {
+  // review of 1924692, findings 2 and 3: a config or hook apm did not read could make the package manager install a
+  // binary for another platform than the one asked about, so apm asks about every platform
+  test("apm explain asks about every platform, as apm add does", async () => {
     await apm(["explain", "good"]);
 
-    // on 2fbf383: { os: null, cpu: null }, so the registry judged a win32 binary for a linux install
-    expect(targets.get("good")).toEqual({ os: process.platform, cpu: process.arch });
+    // on 1924692: { os: process.platform, cpu: process.arch }
+    expect(targets.get("good")).toEqual({ os: null, cpu: null });
   });
 
   // review finding P1: the review answer said the version was being revoked, the CLI dropped the flag and exited 0

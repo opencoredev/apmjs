@@ -5,15 +5,14 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
-import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, type FileLike } from "@apm/core";
+import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
-import { installTarget, type TargetChoice } from "./target.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
-import { bunKeyNames, findLockfile, isLockPm, lockedEntry, type LockNode, type LockPm } from "./lockfile.ts";
+import { bunKeyNames, findLockfile, isLockPm, lockedEntry, projectPins, type LockNode, type LockPm } from "./lockfile.ts";
 import { addArgs, detectPm, execArgs, packArgs, publishArgs, runCmd, type Detection, type Pm } from "./pm.ts";
 import { bunInstallDir, removeInstalled, restore, snapshot, verifyTree } from "./verify.ts";
 
@@ -224,7 +223,7 @@ type TreePackages = z.infer<typeof Tree>["packages"];
 /**
  * `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry.
  * `warnings`: what installs anyway, and why it was flagged (published inside the cooldown, a low or incomplete
- * score, no score, a failed lookup). `platformSkips`: optional packages built for another platform, not installed here.
+ * score, no score, a failed lookup). `projectPeers`: required peers the project provides, and the version checked for each.
  */
 type Resolved = {
   name: string;
@@ -237,9 +236,7 @@ type Resolved = {
   unchecked: UncheckedDeps;
   tree: TreePackages;
   warnings: InstallWarning[];
-  platformSkips: number;
   projectPeers: z.infer<typeof Tree>["projectPeers"];
-  target: TargetChoice;
 };
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
@@ -289,11 +286,13 @@ async function resolveWaiting(api: Api, name: string, params: URLSearchParams): 
 }
 
 /**
- * What a resolve is asked for besides the package: the platform the package manager will install for (TargetChoice),
- * and the names the project's package.json already lists, so the answer can say which peers the project's own version
- * meets.
+ * What a resolve is asked for besides the package: the project's direct dependencies, each `name`, `name@version` (the
+ * version its lockfile pins) or `name@?` (a lockfile apm cannot read, or an entry it cannot pin), so a peer the project
+ * provides is checked at the version that installs (review of 1924692, finding 1). No os or cpu: the registry then
+ * checks every platform's optional packages, so no config, hook or flag can make the package manager install one apm
+ * did not check (review of 1924692, findings 2 and 3).
  */
-type ResolveContext = { target: TargetChoice; installed: readonly string[] };
+type ResolveContext = { installed: readonly string[] };
 
 /** The names the registry takes in one resolve's `installed` (MAX_INSTALLED_NAMES there). */
 const MAX_INSTALLED_NAMES = 500;
@@ -336,21 +335,37 @@ function projectNames(cwd: string): string[] {
 
 /** The context of a resolve for the package manager `pm` runs from `cwd`; `installed` only where apm add adds to a project. */
 function resolveContext(input: { pm: Detection["pm"]; cwd: string; project: boolean }): ResolveContext {
-  const target = installTarget({ pm: input.pm, cwd: input.cwd, env: env() });
+  if (!input.project) return { installed: [] };
+  const names = projectNames(input.cwd);
+  const pins = projectPins({ cwd: input.cwd, pm: input.pm, names });
 
-  // the walk checks every platform's optional packages then: say why, so a longer list of warnings is explained
-  if (target.kind === "any") say(dim(`apm: checking optional packages for every platform, since ${input.pm} may install them: ${target.why}`));
+  const installed = names.map((n) => {
+    const pin = pins.get(n);
 
-  return { target, installed: input.project ? projectNames(input.cwd) : [] };
+    if (pin === undefined) return n;
+
+    switch (pin.kind) {
+      case "pinned":
+        return `${n}@${pin.version}`;
+      case "unknown":
+        return `${n}@?`;
+      default: {
+        const _exhaustive: never = pin;
+
+        return _exhaustive;
+      }
+    }
+  });
+
+  return { installed };
 }
 
 async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
   const strict = strictMode(a);
-  // the platform the package manager installs for: this machine's, or "any" when a force flag or an os/cpu override
-  // is in effect for it (review of 93274c8, finding 2)
-  const params = new URLSearchParams({ name, range: range ?? "latest", ...ctx.target.target });
+  // no os or cpu: every platform's optional packages are checked (ResolveContext)
+  const params = new URLSearchParams({ name, range: range ?? "latest" });
 
   if (ctx.installed.length > 0) params.set("installed", ctx.installed.join(","));
 
@@ -365,7 +380,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, platformSkips: ok.tree?.platformSkips ?? 0, projectPeers: ok.tree?.projectPeers ?? [], target: ctx.target };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, projectPeers: ok.tree?.projectPeers ?? [] };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
@@ -373,7 +388,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [], platformSkips: 0, projectPeers: [], target: ctx.target };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [] };
   }
 
   if (r.status === 503) {
@@ -381,7 +396,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const said = z.object({ error: z.string() }).safeParse(r.body);
     const msg = said.success ? said.data.error : `the registry could not check ${name} (HTTP 503)`;
 
-    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], platformSkips: 0, projectPeers: [], target: ctx.target };
+    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [] };
   }
 
   if (r.status === 202) {
@@ -401,15 +416,13 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
       unchecked: [],
       tree: [],
       warnings: [],
-      platformSkips: 0,
       projectPeers: [],
-      target: ctx.target,
     };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], platformSkips: 0, projectPeers: [], target: ctx.target };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [] };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -434,11 +447,97 @@ function printResolved(r: Resolved): void {
     if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);
   }
 
-  if (r.platformSkips > 0 && r.target.kind === "host") say(`  ${dim(`${r.platformSkips === 1 ? "1 optional package" : `${r.platformSkips} optional packages`} built for another platform than ${r.target.target.os}-${r.target.target.cpu} skipped, as your package manager skips them`)}`);
+  // a peer the project provides: which of its versions apm checked. One it could not tell is a warning of its own
+  for (const p of r.projectPeers.slice(0, 10)) {
+    if (p.kind === "lockfile") say(`  ${dim(`peer ${p.dependency}: your project provides it; apm checked ${p.version ?? "?"}, the version your lockfile pins`)}`);
+    else if (p.kind === "newest" || p.kind === undefined) say(`  ${dim(`peer ${p.dependency}: your package.json lists it with no lockfile entry, so your package manager installs the newest in range${p.version ? `, ${p.version},` : ""} which apm checked`)}`);
+  }
 
-  // a peer the project's own version meets: apm checked the version the range picks, and cannot see the project's
-  for (const p of r.projectPeers.slice(0, 10)) say(`  ${yellow("!")} peer ${p.dependency}: your package.json lists it, so your project's own version is used if it fits; apm checked the newest in range, not yours (apm audit checks what is installed)`);
-  printWarnings(r.warnings);
+  printWarnings(r.warnings, r.tree);
+}
+
+/**
+ * The family a platform binary belongs to, for grouping: its scope and the first part of its name, as
+ * `@next/swc-*` for @next/swc-linux-x64-gnu or `@img/sharp-*` for @img/sharp-libvips-darwin-arm64.
+ */
+function platformFamily(name: string): string {
+  const slash = name.startsWith("@") ? name.indexOf("/") + 1 : 0;
+  const dash = name.indexOf("-", slash);
+
+  return dash < 0 ? name : `${name.slice(0, dash + 1)}*`;
+}
+
+/** A warning in a few words, for a family's summary line. */
+function shortReason(w: InstallWarning): string {
+  switch (w.kind) {
+    case "cooldown":
+      return "inside the 24-hour cooldown";
+    case "low-score":
+      return `scored under ${SCORE_FLOOR}`;
+    case "incomplete":
+      return "analysis incomplete";
+    case "unscorable":
+      return /too large/.test(w.text) ? "too large to analyze" : "cannot be scored";
+    case "pending":
+      return "not scored yet";
+    case "unavailable":
+      return "could not be looked up";
+    case "unchecked":
+      return "not checked";
+    default: {
+      const _exhaustive: never = w.kind;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** "2 too large to analyze, 1 inside the 24-hour cooldown": how many of `warnings` say each thing. */
+function reasonCounts(warnings: readonly InstallWarning[]): string {
+  const counts = new Map<string, number>();
+
+  for (const w of warnings) counts.set(shortReason(w), (counts.get(shortReason(w)) ?? 0) + 1);
+
+  return [...counts].map(([why, n]) => `${n} ${why}`).join(", ");
+}
+
+/**
+ * The platform binaries the walk checked, one line a family: every platform's are checked, since the package manager
+ * may install any of them, so they are summed up rather than listed (`--json` lists each warning). Returns the
+ * warnings left to print one by one.
+ */
+function printPlatformFamilies(warnings: readonly InstallWarning[], tree: TreePackages): InstallWarning[] {
+  const families = new Map<string, Set<string>>();
+
+  for (const p of tree) {
+    if (p.platform === undefined) continue;
+    const members = families.get(platformFamily(p.name)) ?? new Set<string>();
+    members.add(`${p.name}@${p.version}`);
+    families.set(platformFamily(p.name), members);
+  }
+
+  if (families.size === 0) return [...warnings];
+  const familyOf = new Map([...families].flatMap(([f, members]) => [...members].map((m): [string, string] => [m, f])));
+  const rest: InstallWarning[] = [];
+  const grouped = new Map<string, InstallWarning[]>();
+
+  for (const w of warnings) {
+    const f = w.via.length > 0 ? familyOf.get(`${w.name}@${w.version}`) : undefined;
+
+    if (f === undefined) rest.push(w);
+    else grouped.set(f, [...(grouped.get(f) ?? []), w]);
+  }
+
+  say();
+
+  for (const [family, members] of families) {
+    const flagged = grouped.get(family) ?? [];
+    const head = `${members.size} platform ${members.size === 1 ? "binary" : "binaries"} (${family})`;
+
+    say(flagged.length > 0 ? `${yellow(bold("WARNING"))} ${head}: ${reasonCounts(flagged)}` : dim(`${head}: no warnings`));
+  }
+
+  return rest;
 }
 
 /** At most this many warnings are printed per package; --json has them all. */
@@ -448,8 +547,10 @@ const MAX_PRINTED_WARNINGS = 10;
  * Each warning on an install that goes ahead, as a block: what, why (up to three reasons, each with its file and
  * line) and where to read more. A score never refuses by default; this is how the person installing is told.
  */
-function printWarnings(warnings: readonly InstallWarning[]): void {
-  if (warnings.length === 0) return;
+function printWarnings(all: readonly InstallWarning[], tree: TreePackages): void {
+  const warnings = printPlatformFamilies(all, tree);
+
+  if (all.length === 0) return;
   say();
 
   for (const w of warnings.slice(0, MAX_PRINTED_WARNINGS)) {
@@ -684,6 +785,8 @@ function emitJson(ok: boolean, det: Detection, results: Resolved[], error: strin
       skipped: r.skipped,
       unchecked: r.unchecked,
       warnings: r.warnings,
+      // review of 1924692, finding 1: the peers the project provides, and the version checked for each
+      projectPeers: r.projectPeers,
       blocked: r.blocked !== null,
       reason: r.blocked,
       forceable: r.forceable,
@@ -780,10 +883,9 @@ function io(): AgentIo {
 
 async function cmdExplain(a: Args): Promise<number> {
   const cwd = process.cwd();
-  // the mode and the platform apm add would ask about here (review of 93274c8, finding 6: --strict was ignored)
-  const target = installTarget({ pm: pmFor(a, cwd).pm, cwd, env: env() });
 
-  return explainCommand({ api: new Api(config(cwd)), spec: a.positional[0], io: io(), strict: strictMode(a), target: target.target });
+  // the mode apm add would run in here (review of 93274c8, finding 6: --strict was ignored)
+  return explainCommand({ api: new Api(config(cwd)), spec: a.positional[0], io: io(), strict: strictMode(a) });
 }
 
 async function cmdSearch(a: Args): Promise<number> {
