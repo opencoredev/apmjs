@@ -117,9 +117,8 @@ async function ask(registry: string, packages: Bun.Security.Package[], strict: b
     const res = await fetch(`${registry}-/apm/v1/scan`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      // the platform this install is for: bun is handed every platform's optional binaries and installs only this
-      // one's, so the registry skips the others a scanned package lists as optional instead of judging them
-      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })), strict, os: process.platform, cpu: process.arch }),
+      // no platform: bun hands the scanner exactly what it installs, so the registry checks every one of them
+      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })), strict }),
       signal: AbortSignal.timeout(20_000),
     });
 

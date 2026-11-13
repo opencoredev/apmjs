@@ -1,7 +1,8 @@
 // `apm explain` and `apm search`, the commands agents lean on. main.ts hands in its output functions, so with
 // --json each prints one document on stdout and everything else goes to stderr, like every apm command.
 import { z } from "zod";
-import { Api, ResolveFail, ResolveOk, encodeName, installTarget, parseSpec, type RawAnswer } from "./api.ts";
+import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, type RawAnswer } from "./api.ts";
+import type { InstallTarget } from "./target.ts";
 import { EXIT, explain, type ResolvedInput, type ReviewInput } from "./explain.ts";
 
 type Paint = (s: string) => string;
@@ -76,12 +77,20 @@ async function reviewOf(api: Api, name: string, version: string): Promise<Review
   }
 }
 
-/** The registry's install policy for name@range at its defaults: what apm add would pick, or why it would refuse. */
-async function resolvedFor(api: Api, name: string, range: string | null): Promise<ResolvedInput> {
+/**
+ * The registry's install policy for name@range: what apm add would pick, or why it would refuse, in the mode apm add
+ * would run in (`strict`, from --strict or APM_STRICT=1) and for the platform it would ask about.
+ */
+async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; target: InstallTarget }): Promise<ResolvedInput> {
+  const { api, name, range } = input;
   let r: { status: number; body: unknown };
+  const params = new URLSearchParams({ name, range: range ?? "latest", ...input.target });
+
+  // review of 93274c8, finding 6: apm explain --strict asked in the default mode
+  if (input.strict) params.set("strict", "1");
 
   try {
-    r = await api.raw(`-/apm/v1/resolve?${new URLSearchParams({ name, range: range ?? "latest", ...installTarget() })}`);
+    r = await api.raw(`-/apm/v1/resolve?${params}`);
   } catch (e) {
     return { kind: "unavailable", reason: e instanceof Error ? e.message : "the registry did not answer" };
   }
@@ -117,7 +126,7 @@ async function resolvedFor(api: Api, name: string, range: string | null): Promis
 }
 
 /** apm explain <pkg>[@range]: exit 0 install, 3 review-first, 1 do-not-install or not-found, 4 unknown, 2 usage. */
-export async function explainCommand(input: { api: Api; spec: string | undefined; io: AgentIo }): Promise<number> {
+export async function explainCommand(input: { api: Api; spec: string | undefined; io: AgentIo; strict: boolean; target: InstallTarget }): Promise<number> {
   const { api, spec, io } = input;
 
   if (!spec) {
@@ -127,7 +136,7 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
   }
 
   const { name, range } = parseSpec(spec);
-  const resolved = await resolvedFor(api, name, range);
+  const resolved = await resolvedFor({ api, name, range, strict: input.strict, target: input.target });
   // only an "ok" resolve reads the review; the other verdicts never look at it
   const unread: ReviewInput = { kind: "unreadable" };
   const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version) : unread;

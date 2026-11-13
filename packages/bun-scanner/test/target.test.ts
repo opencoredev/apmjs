@@ -1,7 +1,7 @@
-// Review of 2fbf383, finding 5: bun hands the scanner every platform's optional binaries (all 26 of @esbuild/* for
-// esbuild) and installs only this machine's, so a scan of the others could cancel an install that never fetches them.
-// The scanner now sends the install's platform, and the registry skips the binaries a scanned package lists as
-// optional for another. The registry is a stub that records what it is asked.
+// Review of 93274c8, finding 1: the registry decided from package names which scanned packages were optional for
+// another platform, so a parent asking optionally for scan-bin@1.0.0 hid a revoked scan-bin@2.0.0 that bun was about
+// to install. Bun hands the scanner exactly what it installs, so the scanner sends no platform and the registry checks
+// every package. The registry is a stub that records what it is asked.
 import { afterEach, expect, test } from "bun:test";
 import { z } from "zod";
 import { scanPackages } from "../src/index.ts";
@@ -15,7 +15,7 @@ afterEach(() => {
   server = null;
 });
 
-test("every scan request names the platform the install is for", async () => {
+test("every scan request asks about every package it was handed, and names no platform to skip by", async () => {
   const asked: z.infer<typeof ScanBody>[] = [];
 
   server = Bun.serve({
@@ -24,7 +24,7 @@ test("every scan request names the platform the install is for", async () => {
     async fetch(req): Promise<Response> {
       asked.push(ScanBody.parse(await req.json()));
 
-      return Response.json({ advisories: [], unchecked: [], pending: [], skippedForPlatform: [] });
+      return Response.json({ advisories: [], unchecked: [], pending: [] });
     },
   });
   const registry = server.url.href;
@@ -32,6 +32,7 @@ test("every scan request names the platform the install is for", async () => {
 
   await scanPackages({ packages, env: { APM_REGISTRY: registry }, cwd: "/nonexistent", warn: () => {}, waitMs: 0, interactive: false });
 
-  // on 2fbf383: { packages, strict } only, so the registry judged the win32 binary for a linux install
-  expect(asked.map((a) => [a.os, a.cpu])).toEqual([[process.platform, process.arch]]);
+  // on 93274c8: os and cpu were sent, and the registry skipped @esbuild/win32-x64 by name
+  expect(asked.map((a) => [a.os, a.cpu])).toEqual([[undefined, undefined]]);
+  expect(asked.flatMap((a) => a.packages.map((p) => p.name))).toEqual(["esbuild", "@esbuild/linux-x64", "@esbuild/win32-x64"]);
 });

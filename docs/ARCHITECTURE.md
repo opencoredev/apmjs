@@ -142,6 +142,11 @@ Limits:
 - yarn gets steps 1 and 2 only. apm does not read `yarn.lock`, so yarn installs run their scripts as usual.
 - `apm x` (bunx, npx, pnpm dlx) gets step 1 only. Those tools install into their own cache with no project lockfile to verify.
 - The tree walk stops after 300 packages, 400 dependency lookups (failed ones included) or 32 levels, whichever comes first; anything past that is listed as not checked, and only the lockfile verification in step 4 covers it. Each name and range is picked once per walk, and a level's packages are read in one batch; a range a later level asks of a package read earlier reads it again, usually from the isolate cache.
+- The walk predicts the tree; it does not read it. It has no project state, so it cannot see the versions the project's `package.json` or lockfile already pins, and where its prediction and the real install differ it errs toward checking more: an optional package is skipped for another platform only when the CLI is sure of the platform (no force flag, no os/cpu override), a peer counts as met only by its own package under its own name, and the Bun scanner and `apm audit` check every package they are handed, platform or not.
+
+### Future work: check the resolved graph, not a prediction
+
+`apm add` should resolve the lockfile first and check the exact graph the package manager resolved, so there is no prediction left to diverge: run `npm install --package-lock-only`, `pnpm install --lockfile-only` or `bun install --lockfile-only` (with scripts off and the registry pinned, as step 1 does), read the lockfile it writes with the readers step 4 already uses, and send that list of name@version pairs to the registry to check before anything is fetched into `node_modules`. Platform, peers, aliases, overrides, `supportedArchitectures` and the project's own pins would then all be the package manager's answer, not apm's guess. Not built yet: it needs a scan-style check over a lockfile's packages with the resolve answer's warnings and strict refusals, and a way to put the lockfile back when the check refuses.
 
 ## Tests
 

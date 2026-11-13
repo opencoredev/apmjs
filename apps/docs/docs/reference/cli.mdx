@@ -27,7 +27,7 @@ Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A passed-throug
 apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D]
 ```
 
-Resolves each package to the newest version that is not revoked, yanked or confirmed malicious, checks its dependency tree for this machine's platform (optional packages built for another, such as `@next/swc-win32-*` on Linux, are skipped as your package manager skips them), installs the exact version with install scripts held back, verifies every installed package against the registry, then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
+Resolves each package to the newest version that is not revoked, yanked or confirmed malicious, checks its dependency tree for the platform your package manager will install for (optional packages built for another, such as `@next/swc-win32-*` on Linux, are skipped as your package manager skips them; see [Platform](#platform)), installs the exact version with install scripts held back, verifies every installed package against the registry, then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
 
 A score informs; it does not block. When the package or a dependency was published inside the 24-hour cooldown ("published 5 hours ago, inside apm's 24-hour cooldown"), scores under 40, has an incomplete analysis, can never be scored, is still being analysed after the wait, or could not be looked up because the registry or npm did not answer, `apm add` prints a warning block for each, then installs:
 
@@ -47,7 +47,7 @@ With `--strict` (or `APM_STRICT=1`), each of those refuses instead, as apm did b
 | --- | --- |
 | `--cooldown <duration>` | Warn about (with `--strict`, skip or refuse) versions younger than this, in the package and its tree. `24h` (default), `90m`, `2d`, `0`. A bare number is hours. |
 | `--no-cooldown` | Same as `--cooldown 0`. |
-| `--strict` | Refuse instead of warning: a version inside the cooldown, a score under the floor, an incomplete analysis, no score yet or ever, a dependency the registry could not look up, and a dependency walk cut short at its limits. `APM_STRICT=1` does the same. |
+| `--strict` | Refuse instead of warning: a version inside the cooldown, a score under the floor, an incomplete analysis, no score yet or ever, a dependency the registry could not look up, any dependency it could not check (a git, URL or file spec, a missing package, a peer it cannot pick a version for), and a dependency walk cut short at its limits. `APM_STRICT=1` does the same, and `apm explain` honours both. |
 | `--floor <n>` | Warn about (with `--strict`, refuse) versions scoring below `n`. Default `40`. Dependencies are always checked at 40 or the stricter floor you ask for. |
 | `--force` | Lift the cooldown for the named packages only, and in strict mode their floor. Revoked and yanked versions, versions apm reviewers confirmed malicious and unknown names stay blocked, and so, in strict mode, do versions apm has not scored or cannot score and dangerous dependencies. |
 | `-D`, `--dev` | Add as a dev dependency. |
@@ -59,6 +59,19 @@ With `--json`:
 ```
 
 Each entry in `warnings` is `{ name, version, kind, score, grade, text, reasons, url, via }`: `kind` is `low-score`, `incomplete`, `unscorable`, `pending`, `unavailable` (the registry or npm did not answer) or `unchecked` (the walk stopped at its limits); `score` and `grade` are set for the first two; `reasons` holds up to three, each with its file and line; `via` is the dependency path, empty for the package itself.
+
+### Platform
+
+apm sends the registry this machine's `os` and `cpu` only when nothing in effect for the package manager it runs can make it install packages built for another platform. Otherwise it sends `any`, says why on stderr, and the registry checks every optional package. It counts as overridden when:
+
+- npm, pnpm or bun: `npm_config_force`, `npm_config_os` or `npm_config_cpu` is set in the environment (in any case; `force=false` does not count), or `force`, `os` or `cpu` is in a project `.npmrc`, the user `.npmrc` or the `.npmrc` that `npm_config_globalconfig` names.
+- pnpm also: `pnpm_config_*` for those keys, `supported-architectures` in an `.npmrc`, `pnpm.supportedArchitectures` in `package.json`, and `supportedArchitectures` or `force` in `pnpm-workspace.yaml`.
+- bun also: `[install]` `os`, `cpu` or `force` in `bunfig.toml` or the user's `.bunfig.toml`.
+- yarn: always, since apm does not read yarn's `supportedArchitectures`.
+
+### Peers your project already has
+
+The registry walks each required peer at the version its range picks, unless something in the tree installs the peer's own package under the peer's name at a version in range (a package installed under an alias does not count). `apm add` sends the names your `package.json` lists (`dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`); for a peer nothing in the tree installs but your project lists, it prints that your project's own version is used if it fits. apm checked the newest version in range, not yours: the registry does not see your lockfile, so `apm audit` is what checks the version you have installed.
 
 ## apm x
 
@@ -90,7 +103,7 @@ Says whether a name is free, taken, or free but refused (with the reason), plus 
 apm audit [--json]
 ```
 
-Checks every installed version against apm's revocations and the upstream advisories. Exits `1` on any finding and also when anything could not be checked.
+Checks every installed version against apm's revocations and the upstream advisories, whatever platform each is built for: nothing installed is skipped. Exits `1` on any finding and also when anything could not be checked.
 
 ```json
 { "ok": false, "checked": 412, "findings": [{ "id": "some-package@1.0.3", "severity": "critical", "text": "..." }], "unchecked": [] }
@@ -172,6 +185,6 @@ Prints the user the current token belongs to, and the registry.
 | `npm_config_userconfig` | Path of the user `.npmrc`. Default `~/.npmrc`. |
 | `NO_COLOR` | Turn off colors. |
 | `APM_PENDING_WAIT_MS` | How long `apm add --strict` and `apm x --strict` keep asking about versions still being analysed. Default `90000`. |
-| `APM_STRICT` | `1` makes `apm add` and `apm x` strict, as `--strict` does. |
+| `APM_STRICT` | `1` makes `apm add`, `apm x` and `apm explain` strict, as `--strict` does. |
 
 Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.

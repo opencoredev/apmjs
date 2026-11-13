@@ -44,9 +44,10 @@ export const TreeReviews = z.discriminatedUnion("kind", [
 /**
  * `packages`: every name@version the registry's walk checked (older registries send none). `unchecked` is the total.
  * `platformSkips`: optional packages built for another platform than the one asked for, which do not install here.
+ * `projectPeers`: required peers nothing in the tree installs whose names the project's package.json lists.
  */
 export const Tree = z
-  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), platformSkips: z.number().int().min(0).default(0), reviews: TreeReviews.optional() })
+  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), platformSkips: z.number().int().min(0).default(0), projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })).default([]), reviews: TreeReviews.optional() })
   .loose();
 
 /**
@@ -116,14 +117,6 @@ export const ScanResponse = z.object({
   unchecked: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })).default([]),
 });
 export const AuditResponse = z.object({ advisories: BulkResponse, unavailable: z.array(z.string()) });
-
-/** The platform an install is for, as the registry's resolve and scan read it: node's platform and architecture. */
-export type InstallTarget = { os: string; cpu: string };
-
-/** This machine's platform: the registry skips an optional package built for another, as the package manager does. */
-export function installTarget(): InstallTarget {
-  return { os: process.platform, cpu: process.arch };
-}
 
 export class ApiError extends Error {
   constructor(
