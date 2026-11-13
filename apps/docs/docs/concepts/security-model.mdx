@@ -51,10 +51,13 @@ A check means nothing if the package manager then installs other bytes. `apm add
 1. pins every scope in the checked dependency tree to the checked registry, and refuses if an `.npmrc`, `bunfig.toml` or `.yarnrc.yml` sends one of those scopes elsewhere;
 2. refuses if the lockfile already pins an added package to a different tarball;
 3. installs with every install script held back (`--ignore-scripts`);
-4. reads the lockfile the install wrote and compares every package's integrity with what the checked registry serves;
-5. runs the held-back scripts only when everything matches. Otherwise it restores `package.json` and the lockfile, removes the unverified packages and exits non-zero.
+4. reads the graph the package manager installed from the lockfile it wrote (or `node_modules`), every package at its exact version, including versions the lockfile already pinned, nested peers and overrides, and compares each package's integrity with what the checked registry serves;
+5. asks the registry about every one of those packages. A revoked, yanked or confirmed malicious version is refused in every mode; a fresh, low-scoring or unscored one is a warning, and `--strict` refuses it;
+6. runs the held-back scripts only when the check passes. Otherwise no script runs: apm restores `package.json` and the lockfile, puts `node_modules` back with the package manager (scripts off), names the refused versions, says what is left on disk and exits non-zero.
 
-Limits: with yarn, apm does steps 1 and 2 only. `apm x` does step 1 only, because `bunx` and `npx` install into their own cache. The tree walk stops at 300 packages, 400 dependency lookups or 32 levels, whichever comes first; the rest is listed as not checked.
+`apm x` installs the package into a directory of its own the same way and checks it before any script or the binary runs. `apm audit` uses the same check on everything in `node_modules`.
+
+Limits: with yarn, apm reads `node_modules` after yarn installs, and yarn has already run install scripts by then. The bytes of a refused install sit in `node_modules`, never run, until apm removes them.
 
 ## What apm does not protect against
 
