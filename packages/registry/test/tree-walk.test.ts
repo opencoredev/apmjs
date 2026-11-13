@@ -11,12 +11,17 @@ import { z } from "zod";
 import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_METADATA_WEIGHT, resolveResponse } from "../src/apm.ts";
+import { Auth } from "../src/auth.ts";
+import { apmRoute, MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_METADATA_WEIGHT, resolveResponse } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
 import { Upstream } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DAY = 86_400_000;
@@ -160,7 +165,7 @@ async function resolve(input: { url: string; name: string; npm?: string; strict?
   const u = new URL(`http://registry.test/-/apm/v1/resolve?${params}`);
   const store = Store.postgres(input.url);
   const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: input.npm ?? null, legacyAuth: false, namePolicy: "open", admins: [] } as const;
-  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
+  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   const layers = input.npm === undefined ? base : Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
 
   const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, body: ResolveBody.parse(await res.json()) })));
@@ -350,6 +355,112 @@ describe("the resolve walk bounds the package metadata it holds", () => {
       expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.text)).toEqual([`some dependencies were not checked: ${OVER_BUDGET_TEXT}`]);
       // a walk cut short refuses in strict mode, as at its other limits
       expect((await resolve({ url, name: "root", npm: npm.url, strict: true })).status).not.toBe(200);
+    }).finally(() => npm.stop());
+  });
+});
+
+/** One read of npm's package metadata a request made: which method, and the lease it was made under. */
+type LeasedRead = { readonly method: string; readonly lease: Lease };
+
+/** The real Upstream layer, with every packument read noted with its lease. */
+function recording(npm: string, reads: LeasedRead[]) {
+  return Layer.effect(
+    Upstream,
+    Effect.gen(function* () {
+      const u = yield* Upstream;
+
+      const note = (method: string, lease: Lease): void => {
+        reads.push({ method, lease });
+      };
+
+      return Upstream.of({
+        ...u,
+        probe: (n, lease) => Effect.suspend(() => (note("probe", lease), u.probe(n, lease))),
+        probeWithin: (n, lease) => Effect.suspend(() => (note("probeWithin", lease), u.probeWithin(n, lease))),
+        probeMany: (ns, lease) => Effect.suspend(() => (note("probeMany", lease), u.probeMany(ns, lease))),
+        listing: (n, lease) => Effect.suspend(() => (note("listing", lease), u.listing(n, lease))),
+        get: (n, lease) => Effect.suspend(() => (note("get", lease), u.get(n, lease))),
+        devDependencies: (n, lease) => Effect.suspend(() => (note("devDependencies", lease), u.devDependencies(n, lease))),
+      });
+    }),
+  ).pipe(Layer.provide(Upstream.layer(npm, 60_000, null)));
+}
+
+/** GET `path` through the apm routes in a pool of its own, noting every packument read and the request's lease. */
+async function leasedGet(input: { url: string; npm: string; path: string }): Promise<{ status: number; reads: LeasedRead[]; request: Lease; pool: MemoryPool }> {
+  const pool = new MemoryPool();
+  const reads: LeasedRead[] = [];
+  const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: input.npm, legacyAuth: false, namePolicy: "open", admins: [] } as const;
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
+  // Better Auth is built on first use only, and these routes never sign anyone in
+  const auth = Auth.layer({ databaseUrl: input.url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+  const layers = Layer.provideMerge(Layer.mergeAll(recording(input.npm, reads), auth), base);
+  const request = pool.request();
+  const req = new Request(`http://registry.test${input.path}`);
+  const program = Effect.flatMap(input.path.includes("/resolve") ? resolveResponse(new URL(req.url)) : apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+  const out = await Effect.runPromise(program.pipe(Effect.provideService(RequestMemory, request), Effect.provide(layers), Effect.scoped));
+
+  return { status: out.status, reads, request, pool };
+}
+
+// Review of 6862fc7, finding 4: resolve read its root, and read it again after waiting, outside the walk's budget, and
+// popular-scores read four packages at once with no budget at all. Every read a handler makes is now under the one lease
+// it opened, or a child of it.
+describe("every packument a request reads is under the request's lease", () => {
+  test("resolve: the root, its reloads and the walk share one lease, so the root counts against the walk", () => {
+    // two npm roots, one with 10 MiB kept and one with nothing, each over 32 npm dependencies of 2 MiB of its own: 64
+    // MiB of them, more than the request holds, so each walk checks as many as fit beside its root
+    const pad = 2 * 1024 * 1024;
+    const rootPad = 10 * 1024 * 1024;
+    const depsOf = (p: string) => Array.from({ length: 32 }, (_, i) => ({ name: `${p}-dep${i}`, pad }));
+    const rootOf = (name: string, deps: readonly Pkg[], padding: number) => ({ name, dependencies: Object.fromEntries(deps.map((d) => [d.name, "^1.0.0"])), pad: padding });
+    const [bigDeps, smallDeps] = [depsOf("big"), depsOf("small")];
+    const [big, small] = [rootOf("big-root", bigDeps, rootPad), rootOf("small-root", smallDeps, 0)];
+    const all = [big, small, ...bigDeps, ...smallDeps];
+    const npm = fakeNpm(all);
+
+    return withDatabase({ local: [], upstream: all }, async (url) => {
+      // each walk reads its own dependencies from npm, none from the isolate cache
+      const withBig = await resolve({ url, name: "big-root", npm: npm.url });
+      const withSmall = await resolve({ url, name: "small-root", npm: npm.url });
+      const leased = await leasedGet({ url, npm: npm.url, path: "/-/apm/v1/resolve?name=big-root&range=latest&wait=0" });
+      const [bigChecked, smallChecked] = [withBig.body.tree.packages.length, withSmall.body.tree.packages.length];
+
+      report("an npm root of 10 MiB over 32 of 2 MiB", withBig);
+      report("an npm root of 0 MiB over 32 of 2 MiB", withSmall);
+      expect(leased.status).toBe(200);
+      // on 6862fc7 the root was read with probe() and get() under no budget
+      expect(leased.reads.length).toBeGreaterThan(1);
+      expect(leased.reads.every((x) => x.lease.root === leased.request)).toBe(true);
+      expect(leased.reads.map((x) => x.method)).toContain("probeMany");
+      expect(leased.request.peakTaken).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
+      // the big root's 10 MiB leaves the walk room for about five fewer; on 6862fc7 both walks checked as many
+      expect(bigChecked).toBeGreaterThanOrEqual(1);
+      expect(bigChecked).toBeLessThanOrEqual(smallChecked - 3);
+      expect(rootPad + bigChecked * pad).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
+      expect(withBig.body.tree.uncheckedDeps.map((d) => d.reason)).toEqual(Array.from({ length: bigDeps.length - bigChecked }, () => OVER_BUDGET_TEXT));
+    }).finally(() => npm.stop());
+  });
+
+  test("popular-scores: each name is read under a child of the request's lease, and together they stay within it", () => {
+    // six names of 10 MiB, read four at once: 40 MiB each while it is parsed
+    const pad = 10 * 1024 * 1024;
+    const names = Array.from({ length: 6 }, (_, i) => ({ name: `popular${i}`, pad }));
+    const npm = fakeNpm(names);
+
+    return withDatabase({ local: [], upstream: names }, async (url) => {
+      const r = await leasedGet({ url, npm: npm.url, path: `/-/apm/v1/popular-scores?names=${names.map((n) => n.name).join(",")}` });
+
+      process.stdout.write(`[popular-scores] 6 names of 10 MiB: ${r.reads.length} reads, the request held ${(r.request.peakTaken / (1024 * 1024)).toFixed(1)} MiB at most, the pool ${(r.pool.peakCharged / (1024 * 1024)).toFixed(1)} MiB with the cache\n`);
+      expect(r.status).toBe(200);
+      expect(r.reads.length).toBe(names.length);
+      // on 6862fc7: get() four at once, each under no budget
+      expect(r.reads.every((x) => x.lease.root === r.request && x.lease !== r.request)).toBe(true);
+      expect(new Set(r.reads.map((x) => x.lease)).size).toBe(names.length);
+      expect(r.request.peakTaken).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
+      expect(r.pool.peakCharged).toBeLessThanOrEqual(r.pool.limit);
+      // each child gave back what it held once its name was answered: only the isolate cache's entries are left
+      expect(r.request.taken).toBe(0);
     }).finally(() => npm.stop());
   });
 });

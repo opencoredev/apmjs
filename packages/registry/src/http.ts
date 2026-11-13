@@ -80,44 +80,111 @@ function* jsonPieces<T extends object>(body: T, spread: keyof T & string): Gener
 }
 
 /**
+ * What a streamed answer (streamedJson) holds at once beside the member it is writing, in bytes: the chunk being put
+ * together and its encoded copy (STREAM_CHUNK_CHARS characters, two bytes each, and three bytes each encoded), and two
+ * chunks the reader of the stream may not have let go yet.
+ */
+export const STREAM_OVERHEAD_WEIGHT = 1024 * 1024;
+
+/**
+ * The memory a streamed answer may hold while it is written, as weight (packument-read.ts, WEIGHTS), for an answer
+ * whose longest member is `maxPieceChars` characters of JSON: that member's text as JSON.stringify builds and returns
+ * it (two bytes a character, twice), and STREAM_OVERHEAD_WEIGHT. Charged to a lease before the stream is made.
+ */
+export const streamWeight = (maxPieceChars: number): number => 4 * maxPieceChars + STREAM_OVERHEAD_WEIGHT;
+
+/** When a streamed answer ends: `onDone` once it is sent, failed or canceled, or `signal` aborted it. */
+export type StreamOptions = { readonly signal?: AbortSignal; readonly onDone?: () => void };
+
+const isHighSurrogate = (unit: number): boolean => unit >= 0xd800 && unit <= 0xdbff;
+
+/**
  * Like json, for an object with large members (`spread`, a packument's `versions`, and any LazyMembers): the text is
  * written as it is sent, one member of each at a time, so the answer is never held whole as a string and again as
- * bytes. next's full packument is 30 MB of JSON.
+ * bytes. next's full packument is 30 MB of JSON. A member longer than a chunk is sent in chunks of it, so what is
+ * encoded at once stays STREAM_CHUNK_CHARS (streamWeight).
  *
  * The status is sent before the body, so a piece that fails to serialize after the first cannot become an error
  * answer: the stream is errored instead, which ends the response without its last chunk, and a client reads that as
  * a failed download, never as a complete packument. Callers make what can fail before they call this (apm.ts,
  * upstreamPackument); this stays the backstop, and logs.
  */
-export function streamedJson<T extends object>(body: T, spread: keyof T & string, headers: Readonly<Record<string, string>> = {}): Response {
-  const pieces = jsonPieces(body, spread);
+export function streamedJson<T extends object>(body: T, spread: keyof T & string, headers: Readonly<Record<string, string>> = {}, options: StreamOptions = {}): Response {
+  // dropped when the stream ends: what still refers to the stream (a timer's abort listener, a reader that never lets
+  // go of it) then holds none of `body`
+  let pieces: Generator<string> | null = jsonPieces(body, spread);
   const encoder = new TextEncoder();
+  // the member being written, and how much of it is sent
+  let piece = "";
+  let at = 0;
+  let onAbort: (() => void) | null = null;
+
+  const end = (): void => {
+    if (pieces === null) return;
+    pieces = null;
+    piece = "";
+
+    if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+    onAbort = null;
+    options.onDone?.();
+  };
 
   const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const signal = options.signal;
+
+      if (!signal) return;
+
+      onAbort = () => {
+        if (pieces === null) return;
+        controller.error(signal.reason ?? new Error("the streamed answer was aborted"));
+        end();
+      };
+
+      signal.addEventListener("abort", onAbort, { once: true });
+    },
     pull(controller) {
       let text = "";
 
       try {
         while (text.length < STREAM_CHUNK_CHARS) {
-          const next = pieces.next();
+          if (pieces === null) return;
 
-          if (next.done) {
-            if (text !== "") controller.enqueue(encoder.encode(text));
-            controller.close();
+          if (at >= piece.length) {
+            piece = "";
+            const next = pieces.next();
 
-            return;
+            if (next.done) {
+              if (text !== "") controller.enqueue(encoder.encode(text));
+              controller.close();
+              end();
+
+              return;
+            }
+
+            piece = next.value;
+            at = 0;
           }
 
-          text += next.value;
+          let to = Math.min(piece.length, at + STREAM_CHUNK_CHARS - text.length);
+
+          // each chunk is encoded on its own, so a surrogate pair is never split between two
+          if (to < piece.length && isHighSurrogate(piece.charCodeAt(to - 1))) to++;
+          text += at === 0 && to === piece.length ? piece : piece.slice(at, to);
+          at = to;
         }
       } catch (e) {
         console.error(JSON.stringify({ level: "error", event: "streamed-json", error: e instanceof Error ? e.message : String(e) }));
         controller.error(e);
+        end();
 
         return;
       }
 
       controller.enqueue(encoder.encode(text));
+    },
+    cancel() {
+      end();
     },
   });
 

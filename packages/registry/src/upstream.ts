@@ -6,10 +6,10 @@ import { Blobs } from "./blobs.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
-import { notify } from "./hooks.ts";
-import { readCapped } from "./http.ts";
-import { streamedJson } from "./http.ts";
-import { DEV_DEPENDENCIES, KeptBudget, MAX_PACKUMENT_WEIGHT, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
+import { ReleaseHooks } from "./hooks.ts";
+import { readCapped, streamedJson, streamWeight } from "./http.ts";
+import { CACHE_WEIGHT, type Block, type Lease, type MemoryPool } from "./memory.ts";
+import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { createHash } from "node:crypto";
 
@@ -38,6 +38,12 @@ const DevDependencies = z.object({ versions: z.record(z.string(), z.unknown()).d
 
 const DevDocument = z.object({ devDependencies: z.unknown().optional() });
 
+/**
+ * What serving a package read from npm holds beside it, from the read (PackumentRead): `versionDocs`, what a shallow
+ * copy of every version document weighs; `maxPieceChars`, the longest member of its packument as JSON.
+ */
+export type ServeCost = { readonly versionDocs: number; readonly maxPieceChars: number };
+
 export type UpstreamPackage = {
   name: string;
   distTags: Record<string, string>;
@@ -47,14 +53,16 @@ export type UpstreamPackage = {
   versions: VersionRecord[];
   /** original tarball URL per version */
   tarballs: Map<string, string>;
+  serveCost: ServeCost;
 };
 
 /** "unknown" means the upstream could not be asked; it is never treated as "absent". */
 export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" } | { kind: "unknown" };
 
 /**
- * A probe made under a request's KeptBudget: "over-budget" when the request already holds as much package metadata
- * as it may, so this one was not read (or not kept). Not the same as "unknown": npm may well have answered.
+ * A probe made under a request's lease (memory.ts): "over-budget" when the request already holds as much package
+ * metadata as it may, or the isolate does, so this one was not read (or not kept). Not the same as "unknown": npm may
+ * well have answered.
  */
 export type BudgetedProbe = Probe | { kind: "over-budget" };
 
@@ -132,7 +140,7 @@ export type UpstreamListing = CachedProbe | { kind: "unknown" };
  * The package apm caches, read from the packument readPackument kept: each version npm lists with a valid document,
  * in publish order. Null when the packument is not one.
  */
-export function cachedPackage(name: string, body: KeptPackument): CachedPackage | null {
+export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost): CachedPackage | null {
   const parsed = UpPackument.safeParse(body);
 
   if (!parsed.success) return null;
@@ -180,6 +188,7 @@ export function cachedPackage(name: string, body: KeptPackument): CachedPackage 
     maintainers: (raw.maintainers ?? []).map((m) => m.name),
     versions: ordered,
     tarballs,
+    serveCost,
   };
 }
 
@@ -211,10 +220,11 @@ const PROBE_CONCURRENCY = 6;
 const MAX_ENTRIES = 500;
 
 /**
- * The most package metadata the isolate keeps, as weight (packageWeight): an upper bound on its heap, which an isolate
- * has 128 MB of for every request it runs. next weighs 26 MiB cached (14 MiB of heap in workerd). Oldest go first.
+ * The most package metadata the isolate cache keeps, as weight (packageWeight): an upper bound on its heap, taken from
+ * the isolate's memory pool (memory.ts, CACHE_WEIGHT). next weighs 26 MiB cached (14 MiB of heap in workerd). Oldest
+ * go first, and the pool takes back entries only the cache holds when a read needs the room.
  */
-export const PROBE_CACHE_WEIGHT = 32 * 1024 * 1024;
+export const PROBE_CACHE_WEIGHT = CACHE_WEIGHT;
 
 /**
  * What a cached package holds for each version beside the packument it was read from (cachedPackage: the version's
@@ -242,23 +252,26 @@ export const packageMoment = (read: { readonly versionCount: number; readonly ve
  * Answers from the public registry, kept for a minute per Worker isolate. Only public data lives here, never
  * anything about a request or a person, so sharing it between requests is safe. Promises are never shared:
  * a Worker may not finish I/O that another request started.
+ *
+ * With a lease (the pool's cache lease, memory.ts), an entry's memory is a Block the cache holds beside whoever else
+ * does: the cache keeps no more than its lease's limit (oldest go first), and when the pool needs room it takes back
+ * entries only the cache holds, oldest first. Evicting one a request still holds frees nothing until that request ends.
  */
 export class IsolateCache<V> {
-  private readonly entries = new Map<string, { at: number; value: V; weight: number }>();
-  private weight = 0;
+  private readonly entries = new Map<string, { at: number; value: V; block: Block | null }>();
   private readonly ttlMs: number;
-  /** The most total weight kept; an entry heavier than this is not kept at all. */
-  private readonly budget: number;
+  private readonly lease: Lease | null;
 
-  constructor(ttlMs: number, budget = Number.POSITIVE_INFINITY) {
+  constructor(ttlMs: number, lease: Lease | null = null) {
     this.ttlMs = ttlMs;
-    this.budget = budget;
+    this.lease = lease;
+    lease?.pool.onPressure((need) => this.reclaim(need));
   }
   get(key: string, now: number): V | undefined {
     return this.entry(key, now)?.value;
   }
-  /** The value under `key` and the weight it was kept with, while it is fresh. */
-  entry(key: string, now: number): { readonly value: V; readonly weight: number } | undefined {
+  /** The value under `key` and the block it was kept with, while it is fresh. */
+  entry(key: string, now: number): { readonly value: V; readonly block: Block | null } | undefined {
     const hit = this.entries.get(key);
 
     if (!hit) return undefined;
@@ -271,32 +284,68 @@ export class IsolateCache<V> {
 
     return hit;
   }
-  /** Keeps `value` under `key`; `weight` counts toward the budget, and older entries leave to make room. */
-  set(key: string, value: V, now: number, weight = 0): void {
+  /**
+   * Keeps `value` under `key`; with a lease, the cache holds `block` too, and older entries leave to make room for it.
+   * False when it was not kept: heavier than the cache may hold.
+   */
+  set(key: string, value: V, now: number, block: Block | null = null): boolean {
     this.delete(key);
+    const lease = this.lease;
+    const held = block !== null && lease !== null ? block : null;
 
-    if (weight > this.budget) return;
-    this.entries.set(key, { at: now, value, weight });
-    this.weight += weight;
+    if (held !== null && lease !== null) {
+      if (held.weight > lease.limit) return false;
 
-    while (this.entries.size > MAX_ENTRIES || this.weight > this.budget) {
-      const oldest = this.entries.keys().next();
+      while (lease.taken + held.weight > lease.limit) if (!this.evictOldest()) break;
 
-      if (oldest.done) break;
-      this.delete(oldest.value);
+      if (!lease.hold(held)) return false;
     }
+
+    this.entries.set(key, { at: now, value, block: held });
+
+    while (this.entries.size > MAX_ENTRIES) if (!this.evictOldest()) break;
+
+    return true;
   }
   delete(key: string): void {
     const gone = this.entries.get(key);
 
     if (!gone) return;
-    this.weight -= gone.weight;
     this.entries.delete(key);
+
+    if (gone.block) this.lease?.drop(gone.block);
+  }
+  /** Weight the cache holds, its share of blocks others hold too included. */
+  get weight(): number {
+    return this.lease?.taken ?? 0;
+  }
+  private evictOldest(): boolean {
+    const oldest = this.entries.keys().next();
+
+    if (oldest.done) return false;
+    this.delete(oldest.value);
+
+    return true;
+  }
+  /** The pool needs `need` more: entries only the cache holds leave, oldest first, until that much is freed. */
+  private reclaim(need: number): void {
+    const lease = this.lease;
+
+    if (!lease) return;
+    let freed = 0;
+
+    for (const [key, e] of this.entries) {
+      if (freed >= need) return;
+
+      if (e.block && lease.soleHolder(e.block)) {
+        freed += e.block.weight;
+        this.delete(key);
+      }
+    }
   }
 }
 
 type Caches = {
-  probes: IsolateCache<CachedProbe>;
   searches: IsolateCache<Extract<UpstreamSearch, { kind: "ok" }>>;
   scopes: IsolateCache<"found" | "absent">;
 };
@@ -308,8 +357,24 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   const known = isolateCaches.get(key);
 
   if (known) return known;
-  const made: Caches = { probes: new IsolateCache(ttlMs, PROBE_CACHE_WEIGHT), searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
+  const made: Caches = { searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
   isolateCaches.set(key, made);
+
+  return made;
+}
+
+/** The packument cache of each pool (the isolate's, or a test's), by upstream and TTL: its entries are the pool's blocks. */
+const probeCaches = new WeakMap<MemoryPool, Map<string, IsolateCache<CachedProbe>>>();
+
+function probeCacheFor(pool: MemoryPool, baseUrl: string, ttlMs: number): IsolateCache<CachedProbe> {
+  const byKey = probeCaches.get(pool) ?? new Map<string, IsolateCache<CachedProbe>>();
+  probeCaches.set(pool, byKey);
+  const key = `${ttlMs} ${baseUrl}`;
+  const known = byKey.get(key);
+
+  if (known) return known;
+  const made = new IsolateCache<CachedProbe>(ttlMs, pool.cache());
+  byKey.set(key, made);
 
   return made;
 }
@@ -339,12 +404,13 @@ export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Reque
 
 /**
  * What asking for a packument came to. "ok": what readPackument kept, and what it weighs (`read`), taken from the
- * budget it was read under. "status": npm answered something other than a 200 with a body. "refused": npm answered,
- * but readPackument refused it (too large, not JSON), so it is an answer apm cannot use. "over-budget": the request's
- * KeptBudget had no room for it.
+ * lease it was read under; `fresh` when npm sent it now, so the data center's cache may be given a copy (shareCopy)
+ * once the caller has made room for converting it. "status": npm answered something other than a 200 with a body.
+ * "refused": npm answered, but readPackument refused it (too large, not JSON), so it is an answer apm cannot use.
+ * "over-budget": the lease had no room for it.
  */
 type PackumentAnswer =
-  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }> }
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean }
   | { kind: "status"; status: number; fetchedAt: number }
   | { kind: "refused"; fetchedAt: number }
   | { kind: "over-budget" };
@@ -359,24 +425,28 @@ export type UpstreamApi = {
   readonly search: (text: string, size: number) => Effect.Effect<UpstreamSearch>;
   /** Whether `@scope` has packages upstream. */
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
-  readonly probe: (name: string) => Effect.Effect<Probe, StoreError>;
-  /** probe under a request's budget for the package metadata it holds (scan: one lease per package). */
-  readonly probeWithin: (name: string, budget: KeptBudget) => Effect.Effect<BudgetedProbe, StoreError>;
-  /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
-  readonly listing: (name: string) => Effect.Effect<UpstreamListing>;
   /**
-   * probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. With
-   * a budget, every packument kept counts against it, cached ones included, and a name past it is "over-budget".
+   * The package with its analyses, read under `lease` (memory.ts): what it holds stays taken from the lease until the
+   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here.
    */
-  readonly probeMany: (names: readonly string[], budget?: KeptBudget) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
+  readonly probe: (name: string, lease: Lease) => Effect.Effect<Probe, StoreError>;
+  /** probe, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
+  readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
+  /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
+  readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
+  /**
+   * probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. Every
+   * packument kept counts against `lease`, cached ones included, and a name past it is "over-budget".
+   */
+  readonly probeMany: (names: readonly string[], lease: Lease) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
-   * `budget` (the request's, beside the packument it holds); what it weighs stays taken from `budget`.
+   * `lease` (the request's, beside the packument it holds); what it weighs stays taken from `lease`.
    */
-  readonly devDependencies: (name: string, budget?: KeptBudget) => Effect.Effect<ReadonlyMap<string, unknown> | null>;
-  /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
-  readonly get: (name: string) => Effect.Effect<UpstreamPackage | null, StoreError>;
+  readonly devDependencies: (name: string, lease: Lease) => Effect.Effect<DevDependencyRead | null>;
+  /** The package when upstream has it; null when it is absent, upstream cannot be asked, or it does not fit `lease`. */
+  readonly get: (name: string, lease: Lease) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
    * The tarball of a version the upstream lists right now, verified against its published checksum. Cached in
    * the blob store by that checksum and verified again on every read, so a removed version or tampered bytes
@@ -386,6 +456,15 @@ export type UpstreamApi = {
   /** Forwards an advisory bulk request. A failure is "unavailable", never an empty (clean) answer. */
   readonly advisories: (body: unknown) => Effect.Effect<UpstreamAdvisories>;
 };
+
+/** Each version's devDependencies (DEV_DEPENDENCIES), and the longest version document of that read as JSON. */
+export type DevDependencyRead = { readonly byVersion: ReadonlyMap<string, unknown>; readonly maxPieceChars: number };
+
+/**
+ * How long a copy written to the data center's cache may take. Past it the write is stopped (its stream errors, so no
+ * partial copy is kept) and what it held is given back.
+ */
+const SHARE_TIMEOUT_MS = 20_000;
 
 export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/registry/Upstream") {
   /**
@@ -400,6 +479,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         const blobs = yield* Blobs;
         const timing = yield* timingOrNull;
         const caches = cachesFor(baseUrl, ttlMs);
+        // `background` is set only inside a Worker request, where `caches` always exists
+        const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
         /** The only origins tarballs are fetched from, on every redirect hop. */
         const origins: ReadonlySet<string> = new Set([new URL(baseUrl).origin, NPM_ORIGIN]);
 
@@ -502,12 +583,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             Effect.orElseSucceed((): UpstreamSearch => ({ kind: "unavailable" })),
           );
 
-        // `background` is set only inside a Worker request, where `caches` always exists
-        const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
-
-        /** A packument read as an answer. One it refused is logged; one past the request's budget is not an error. */
-        const answerOf = (url: string, read: PackumentRead, fetchedAt: number): PackumentAnswer => {
-          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read };
+        /** A packument read as an answer. One it refused is logged; one past the request's lease is not an error. */
+        const answerOf = (url: string, read: PackumentRead, fetchedAt: number, fresh: boolean): PackumentAnswer => {
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh };
 
           if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
@@ -520,13 +598,13 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         /**
          * npm's packument as `profile` keeps it, from the shared cache when another isolate fetched it within the TTL.
          * `fetchedAt` is when npm sent it: `now` for a fresh fetch, the copy's own time for a shared one. The body is
-         * streamed through readPackument, never held whole, and only what it keeps is shared: vite's 39 MB packument
-         * is 2.8 MB kept. What it keeps is taken from `budget`, when there is one.
+         * streamed through readPackument, never held whole, and what it keeps is taken from `lease`. No copy is shared
+         * here: the caller starts one (shareCopy) once converting the read has fit.
          */
-        const fetchPackument = (input: { url: string; now: number; profile: KeepProfile; budget: KeptBudget | null }): Effect.Effect<PackumentAnswer, unknown> =>
+        const fetchPackument = (input: { url: string; now: number; profile: KeepProfile; lease: Lease }): Effect.Effect<PackumentAnswer, unknown> =>
           Effect.tryPromise({
             try: async (): Promise<PackumentAnswer> => {
-              const { url, now, profile, budget } = input;
+              const { url, now, profile, lease } = input;
               const key = packumentKey(url, profile);
               const shared = sharing ? workerCache() : null;
               const cacheStart = performance.now();
@@ -535,10 +613,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
               if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
-                const read = await readPackument(hit.body, { profile, budget });
+                const read = await readPackument(hit.body, { profile, lease });
                 timing?.add("npm-cache", performance.now() - cacheStart);
 
-                return answerOf(url, read, sentAt);
+                return answerOf(url, read, sentAt, false);
               }
 
               await hit?.body?.cancel();
@@ -552,114 +630,161 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                 return { kind: "status", status: res.status === 200 ? 502 : res.status, fetchedAt: now };
               }
 
-              const read = await readPackument(res.body, { profile, budget });
+              const read = await readPackument(res.body, { profile, lease });
               timing?.add("npm", performance.now() - npmStart);
 
-              if (shared && background && read.kind === "ok") {
-                const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(now) };
-                // written a version at a time, as it is put, so the copy is never held whole as one string
-                background(shared.put(key, streamedJson(read.body, "versions", headers)).catch(() => undefined));
-              }
-
-              return answerOf(url, read, now);
+              return answerOf(url, read, now, true);
             },
             catch: (cause) => cause,
           });
+
+        /**
+         * Gives the data center's cache a copy of a packument npm just sent, written a version at a time as it is put,
+         * so it is never held whole as one string. The write is background work with a lease of its own: it holds
+         * `block` (the memory the copy is written from) and what serializing it takes (streamWeight) until the put
+         * settles, is stopped (SHARE_TIMEOUT_MS), or the runtime has stopped it. Nothing is written when that does not
+         * fit (review of 6862fc7, finding 3).
+         */
+        const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool }): void => {
+          if (!sharing || background === null) return;
+          const work = input.pool.backgroundLease();
+
+          if (!work.hold(input.block) || !work.take(streamWeight(input.maxPieceChars))) {
+            work.release();
+
+            return;
+          }
+
+          const done = (): void => work.release();
+          const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt) };
+          const signal = AbortSignal.timeout(SHARE_TIMEOUT_MS);
+          const copy = streamedJson(input.body, "versions", headers, { signal, onDone: () => (signal.aborted ? done() : undefined) });
+
+          background(
+            workerCache()
+              .put(packumentKey(input.url, input.profile), copy)
+              .catch(() => undefined)
+              .finally(done),
+          );
+        };
 
         /** An answer that is not a packument: absent when npm said 404, unknown otherwise. */
         const packageOf = (answer: Extract<PackumentAnswer, { kind: "status" | "refused" }>): CachedProbe | { kind: "unknown" } =>
           answer.kind === "status" && answer.status === 404 ? { kind: "absent" } : { kind: "unknown" };
 
         /**
-         * The packument as npm lists it, from the isolate cache or npm, without its analyses. With a budget, what this
-         * request now holds is taken from it: a package's weight (packageWeight) and its scored copy (SCORED_WEIGHT),
-         * for a cached one and a fresh one alike. Without one, a fresh read is held to MAX_PACKUMENT_WEIGHT on its own.
+         * The review's look at a package npm just sent runs after the response: it gets a lease of its own that holds
+         * the package and the copy it is given, released when it is done (worker.ts). Not looked at when that does not
+         * fit; the next fetch of the package looks again.
          */
-        const listed = (name: string, budget: KeptBudget | null): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
+        const fetched = (pkg: CachedPackage, block: Block, pool: MemoryPool) =>
+          Effect.gen(function* () {
+            const hooks = yield* Effect.serviceOption(ReleaseHooks);
+
+            if (Option.isNone(hooks)) return;
+            const held = pool.backgroundLease();
+
+            if (!held.hold(block) || !held.take(pkg.versions.length * SCORED_WEIGHT)) {
+              held.release();
+
+              return;
+            }
+
+            yield* hooks.value.upstreamFetched({ ...pkg, versions: pkg.versions.map((v) => ({ ...v, score: null })) }, held);
+          });
+
+        /**
+         * The packument as npm lists it, from the isolate cache or npm, without its analyses. What this request now
+         * holds is taken from `lease`: a cached package's block (held, not copied) and its scored copy (SCORED_WEIGHT),
+         * or a fresh read, the moment converting it takes (packageMoment), and its scored copy. A fresh package becomes
+         * a block the lease holds, which the isolate cache and a shared-cache write may hold too.
+         */
+        const listed = (name: string, lease: Lease): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
           Effect.gen(function* () {
             const t = yield* now;
-            const cached = caches.probes.entry(name, t);
+            const probes = probeCacheFor(lease.pool, baseUrl, ttlMs);
+            const cached = probes.entry(name, t);
 
             if (cached !== undefined) {
-              const held = cached.weight + (cached.value.kind === "found" ? cached.value.pkg.versions.length * SCORED_WEIGHT : 0);
+              if (cached.value.kind !== "found") return cached.value;
+              const scored = cached.value.pkg.versions.length * SCORED_WEIGHT;
 
-              return budget && !budget.take(held) ? { kind: "over-budget" as const } : cached.value;
+              if ((cached.block !== null && !lease.hold(cached.block)) || !lease.take(scored)) return { kind: "over-budget" as const };
+
+              return cached.value;
             }
 
             // nothing more fits: npm is not asked at all
-            if (budget?.exhausted) return { kind: "over-budget" as const };
-            const within = budget ?? new KeptBudget(MAX_PACKUMENT_WEIGHT);
+            if (lease.exhausted) return { kind: "over-budget" as const };
+            const url = `${baseUrl}${encodeName(name)}`;
 
-            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: TRIMMED, budget: within }).pipe(
-              Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })),
-            );
+            const answer = yield* fetchPackument({ url, now: t, profile: TRIMMED, lease }).pipe(Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })));
 
-            if (answer.kind === "over-budget") return budget ? answer : { kind: "unknown" as const };
-            let fresh: CachedProbe | { kind: "unknown" };
-            let weight = 0;
+            if (answer.kind === "over-budget") return answer;
 
-            if (answer.kind === "ok") {
-              const { read } = answer;
-              const held = packageWeight(read) - read.weight + read.versionCount * SCORED_WEIGHT;
-              const moment = packageMoment(read);
+            if (answer.kind !== "ok") {
+              const gone = packageOf(answer);
 
-              if (!within.take(held + moment)) {
-                within.give(read.weight);
+              if (gone.kind === "absent") probes.set(name, gone, answer.fetchedAt);
 
-                if (budget) return { kind: "over-budget" as const };
-                console.error(JSON.stringify({ level: "error", event: "upstream-packument", error: "packument-too-large", url: `${baseUrl}${encodeName(name)}`, over: "weight", bytes: within.taken + held + moment, limit: within.limit }));
+              return gone;
+            }
 
-                return { kind: "unknown" as const };
-              }
+            const { read } = answer;
+            const held = packageWeight(read) - read.weight + read.versionCount * SCORED_WEIGHT;
+            const moment = packageMoment(read);
 
-              const pkg = cachedPackage(name, answer.body);
-              within.give(moment);
-              fresh = pkg ? { kind: "found", pkg } : { kind: "unknown" };
-              weight = packageWeight(read);
+            // converting it must fit before anything is built from it, a shared copy included
+            if (!lease.take(held + moment)) {
+              lease.give(read.weight);
 
+              return { kind: "over-budget" as const };
+            }
+
+            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars });
+            lease.give(moment);
+
+            if (!pkg) {
               // nothing of it is held
-              if (!pkg) within.give(read.weight + held);
-            } else fresh = packageOf(answer);
+              lease.give(read.weight + held);
 
-            if (fresh.kind === "unknown") return fresh;
+              return { kind: "unknown" as const };
+            }
 
+            const block = lease.seal(packageWeight(read));
+
+            if (answer.fresh) shareCopy({ url, profile: TRIMMED, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool });
+            const fresh: CachedProbe = { kind: "found", pkg };
             // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
             // takes room from older ones (PROBE_CACHE_WEIGHT)
-            caches.probes.set(name, fresh, answer.fetchedAt, weight);
-
-            if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
+            probes.set(name, fresh, answer.fetchedAt, block);
+            yield* fetched(pkg, block, lease.pool);
 
             return fresh;
           });
 
         /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
-        const listing = (name: string): Effect.Effect<UpstreamListing> =>
-          // with no budget there is nothing to be over
-          Effect.map(listed(name, null), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
+        const listing = (name: string, lease: Lease): Effect.Effect<UpstreamListing> =>
+          // a package that did not fit the lease could not be read: the caller asks again later
+          Effect.map(listed(name, lease), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        const probe = (name: string): Effect.Effect<Probe, StoreError> =>
+        const probeWithin = (name: string, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
           Effect.gen(function* () {
-            const listed = yield* listing(name);
-
-            if (listed.kind !== "found") return listed;
-
-            return scoredPackage(listed.pkg, yield* store.upstreamAnalyses(name));
-          });
-
-        const probeWithin = (name: string, budget: KeptBudget): Effect.Effect<BudgetedProbe, StoreError> =>
-          Effect.gen(function* () {
-            const l = yield* listed(name, budget);
+            const l = yield* listed(name, lease);
 
             if (l.kind !== "found") return l;
 
             return scoredPackage(l.pkg, yield* store.upstreamAnalyses(name));
           });
 
-        const probeMany = (names: readonly string[], budget?: KeptBudget): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
+        const probe = (name: string, lease: Lease): Effect.Effect<Probe, StoreError> =>
+          Effect.map(probeWithin(name, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+
+        const probeMany = (names: readonly string[], lease: Lease): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
             const wanted = [...new Set(names)];
-            // a few at once: the reads in flight share the budget, so together they keep no more than it allows
-            const got = yield* Effect.forEach(wanted, (name) => Effect.map(listed(name, budget ?? null), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
+            // a few at once: the reads in flight share the lease, so together they keep no more than it allows
+            const got = yield* Effect.forEach(wanted, (name) => Effect.map(listed(name, lease), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
             const found = got.flatMap(([name, l]) => (l.kind === "found" ? [name] : []));
             const scores = yield* store.upstreamAnalysesOf(found);
             const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
@@ -667,31 +792,49 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scoredPackage(l.pkg, scores.get(name) ?? none) : l]));
           });
 
-        /** Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate. */
-        const devDependencies = (name: string, budget?: KeptBudget): Effect.Effect<ReadonlyMap<string, unknown> | null> =>
+        /**
+         * Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate.
+         * Converting them is charged (packageMoment) before it is done, and stays charged with the read while the
+         * request holds the answer.
+         */
+        const devDependencies = (name: string, lease: Lease): Effect.Effect<DevDependencyRead | null> =>
           Effect.gen(function* () {
             const t = yield* now;
-            const within = budget ?? new KeptBudget(MAX_PACKUMENT_WEIGHT);
-            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: DEV_DEPENDENCIES, budget: within }).pipe(Effect.orElseSucceed(() => null));
+            const url = `${baseUrl}${encodeName(name)}`;
+            const answer = yield* fetchPackument({ url, now: t, profile: DEV_DEPENDENCIES, lease }).pipe(Effect.orElseSucceed(() => null));
 
             if (answer?.kind !== "ok") return null;
-            const parsed = DevDependencies.safeParse(answer.body);
+            const { read } = answer;
+            const moment = packageMoment(read);
 
-            if (!parsed.success) {
-              within.give(answer.read.weight);
+            if (!lease.take(moment)) {
+              lease.give(read.weight);
 
               return null;
             }
 
-            const out = new Map<string, unknown>();
+            const parsed = DevDependencies.safeParse(answer.body);
+
+            if (!parsed.success) {
+              lease.give(read.weight + moment);
+
+              return null;
+            }
+
+            const byVersion = new Map<string, unknown>();
 
             for (const [version, doc] of Object.entries(parsed.data.versions)) {
               const one = DevDocument.safeParse(doc);
 
-              if (one.success && one.data.devDependencies !== undefined) out.set(version, one.data.devDependencies);
+              if (one.success && one.data.devDependencies !== undefined) byVersion.set(version, one.data.devDependencies);
             }
 
-            return out;
+            if (answer.fresh) {
+              const block = lease.seal(read.weight + moment);
+              shareCopy({ url, profile: DEV_DEPENDENCIES, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool });
+            }
+
+            return { byVersion, maxPieceChars: read.maxPieceChars };
           });
 
         const api: UpstreamApi = {
@@ -739,7 +882,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           listing,
           probeMany,
           devDependencies,
-          get: (name) => Effect.map(probe(name), (p) => (p.kind === "found" ? p.pkg : null)),
+          get: (name, lease) => Effect.map(probe(name, lease), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {
               const url = pkg.tarballs.get(version);

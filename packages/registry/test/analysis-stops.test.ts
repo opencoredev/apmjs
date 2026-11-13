@@ -20,6 +20,10 @@ import { Analysis, MAX_FAILED_RUNS, planFor, RUN_WINDOW_MS, STOPS_BEFORE_RERUN, 
 import { Clock } from "../src/clock.ts";
 import { Store, type RunHistory, type VersionRecord } from "../src/db.ts";
 import { Upstream, type UpstreamApi, type UpstreamPackage } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const T0 = Date.parse("2026-11-13T05:49:20Z");
 const JOB: AnalysisJob = { name: "express-like", version: "1.0.0" };
@@ -86,7 +90,7 @@ function pkg(): UpstreamPackage {
     score: null,
   };
 
-  return { name: JOB.name, distTags: { latest: JOB.version }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map() };
+  return { name: JOB.name, distTags: { latest: JOB.version }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
 }
 
 const STUB: UpstreamApi = {
@@ -121,7 +125,7 @@ function stoppingStore(stop: { armed: boolean }) {
 }
 
 function layerFor(url: string, now: number, stop: { armed: boolean }) {
-  const base = Layer.mergeAll(Layer.provideMerge(stoppingStore(stop), Store.postgres(url)), upstream, Clock.fixed({ now, wallNow: now }));
+  const base = Layer.mergeAll(Layer.provideMerge(stoppingStore(stop), Store.postgres(url)), upstream, Clock.fixed({ now, wallNow: now }), RequestMemory.layer(POOL));
 
   return Layer.provideMerge(Analysis.layer(null), base);
 }
@@ -155,7 +159,7 @@ const unreachableTarball = Layer.succeed(
 
 /** One delivery at `now` against another upstream; it stores nothing it would not store anyway. */
 async function deliverWith(url: string, now: number, up: Layer.Layer<Upstream>): Promise<string | null> {
-  const base = Layer.mergeAll(Store.postgres(url), up, Clock.fixed({ now, wallNow: now }));
+  const base = Layer.mergeAll(Store.postgres(url), up, Clock.fixed({ now, wallNow: now }), RequestMemory.layer(POOL));
   const exit = await Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob(JOB)).pipe(Effect.provide(Layer.provideMerge(Analysis.layer(null), base)), Effect.scoped));
 
   return Exit.isSuccess(exit) ? exit.value : null;

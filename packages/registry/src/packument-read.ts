@@ -18,12 +18,14 @@
 //   heap an array, and objects whose keys come in ever new orders cost V8 a new hidden class each.
 // - maxDepth: open containers anywhere, discarded ones included. Each costs nine bytes of stacks that grow to at most
 //   this; nothing else is allocated for a container it discards.
-// - budget (optional): weight shared with every other read of one request (KeptBudget), so a walk that reads several
-//   packuments at once holds no more than it allows in all.
+// - lease: weight taken from the isolate's memory pool (memory.ts) through the request's lease, so a walk that reads
+//   several packuments at once, and every request beside it, hold no more than the pool allows in all. Required: no
+//   read happens outside a lease.
 // A packument past any of them is refused as too-large, never held. The text it keeps is copied into fixed-size slabs
 // (SLAB_BYTES), so what it allocates for a kept part depends on the part's length, never on how many pieces the
 // stream delivered it in.
 import { z } from "zod";
+import type { Lease } from "./memory.ts";
 
 /** Top-level packument fields the registry reads (upstream.ts, UpPackument); everything else is skipped. */
 const TOP_FIELDS: ReadonlySet<string> = new Set(["name", "dist-tags", "versions", "time", "description", "readme", "maintainers"]);
@@ -57,6 +59,12 @@ export const TRIMMED: KeepProfile = { top: TOP_FIELDS, fields: { kind: "except",
 
 /** Only each version's devDependencies: what the full packument adds back to TRIMMED. */
 export const DEV_DEPENDENCIES: KeepProfile = { top: new Set(["versions"]), fields: { kind: "only", names: new Set(["devDependencies"]) }, otherVersions: false };
+
+/**
+ * What JSON.stringify writes for a number, at most ("-1.7976931348623157e+308"): what a number of one digit may grow to
+ * when the kept value is serialized again.
+ */
+const NUMBER_CHARS = 24;
 
 /** The most of a packument read before it is refused: reading costs CPU, not memory, so this is well past any real one. */
 export const MAX_PACKUMENT_BYTES = 160 * 1024 * 1024;
@@ -133,54 +141,11 @@ function memberWeight(count: number): number {
 export const SLAB_BYTES = 64 * 1024;
 
 /**
- * Weight (WEIGHTS) several reads share: one request's walk, say, that reads packuments a few at once and holds every one
- * until it answers. Each read takes from it as it keeps, gives back what it took if it is refused, and leaves what it
- * took taken when it succeeds (the caller holds that packument now). Single-threaded, so reads in flight together
- * see each other's takes. A lease (`lease()`) takes through its parent and gives all it took back at once, for a
- * caller that holds a packument only for a while (one package of a scan).
+ * What a read holds while it runs whatever it keeps, taken from its lease for as long as it runs: its slabs (the one
+ * being filled and a spare), the network chunk it is reading, its stacks and the stream around it. Measured in
+ * workerd through the Upstream layer: 144 KiB a read in flight (memory-pool.workerd.test.ts).
  */
-export class KeptBudget {
-  private used = 0;
-  readonly limit: number;
-  private readonly parent: KeptBudget | null;
-
-  constructor(limit: number, parent: KeptBudget | null = null) {
-    this.limit = limit;
-    this.parent = parent;
-  }
-
-  /** Takes `n`, or nothing and false when that would pass this budget's limit or its parent's. */
-  take(n: number): boolean {
-    if (this.used + n > this.limit) return false;
-
-    if (this.parent && !this.parent.take(n)) return false;
-    this.used += n;
-
-    return true;
-  }
-
-  give(n: number): void {
-    const back = Math.min(n, this.used);
-    this.used -= back;
-    this.parent?.give(back);
-  }
-
-  /** A budget that takes from this one, with no limit of its own; release() gives back everything it took. */
-  lease(): KeptBudget & { release: () => void } {
-    const leased = new KeptBudget(Number.POSITIVE_INFINITY, this);
-
-    return Object.assign(leased, { release: () => leased.give(leased.taken) });
-  }
-
-  get taken(): number {
-    return this.used;
-  }
-
-  /** Nothing more fits: a read would be refused at its first kept byte. */
-  get exhausted(): boolean {
-    return this.used >= this.limit || (this.parent?.exhausted ?? false);
-  }
-}
+export const READ_OVERHEAD_WEIGHT = 192 * 1024;
 
 /** Which bound a refused packument passed. */
 export type TooLargeOver = "read" | "kept" | "nodes" | "weight" | "depth" | "budget";
@@ -189,11 +154,13 @@ export type TooLargeOver = "read" | "kept" | "nodes" | "weight" | "depth" | "bud
  * What reading a packument came to. "ok": the kept fields, as one object, and what it weighs (WEIGHTS; what it holds
  * now, the parses' moments left out). `versionCount`: the entries of its `versions`; `versionDocs`: the part of the
  * weight that is the version documents' own objects and members, what a shallow copy of each would weigh.
+ * `maxPieceChars`: the most characters JSON.stringify writes for one member of the kept packument (a top-level field
+ * with its key, or one `versions` entry with its key): what serializing it a member at a time holds at once.
  * "too-large": it passed a bound (`over`) at `bytes` (or nodes, or levels, or weight) of `limit`. "invalid": not JSON,
  * or JSON that is not an object.
  */
 export type PackumentRead =
-  | { kind: "ok"; body: KeptPackument; bytes: number; keptBytes: number; keptNodes: number; weight: number; versionCount: number; versionDocs: number }
+  | { kind: "ok"; body: KeptPackument; bytes: number; keptBytes: number; keptNodes: number; weight: number; versionCount: number; versionDocs: number; maxPieceChars: number }
   | { kind: "too-large"; over: TooLargeOver; bytes: number; limit: number }
   | { kind: "invalid"; reason: string };
 
@@ -260,8 +227,22 @@ const isDigit = (b: number): boolean => b >= ZERO && b <= NINE;
 
 const isSpace = (b: number): boolean => b === 0x20 || b === 0x0a || b === 0x0d || b === 0x09;
 
-/** A value being kept: where it goes once it ends, and the depth it started at. Its bytes so far are in the slabs. */
-type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "key"; readonly name: string; from: number };
+/**
+ * A value being kept: where it goes once it ends, and the depth it started at. Its bytes so far are in the slabs;
+ * `bytes` and `numbers` count its text and the numbers in it, which bound what JSON.stringify writes for it.
+ */
+type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "key"; readonly name: string; from: number; bytes: number; numbers: number };
+
+/**
+ * The key of a member the reader decides about, once read: its text, or IGNORED when it is longer than any name the
+ * profile keeps there, so it was never built as a string.
+ */
+const IGNORED: unique symbol = Symbol("ignored");
+
+type DecisionKey = string | typeof IGNORED | null;
+
+/** The most bytes a key naming one of `names` can take as JSON text: each character a six-byte \u escape, and quotes. */
+const rawKeyMax = (names: ReadonlySet<string>): number => 2 + 6 * Math.max(0, ...[...names].map((n) => n.length));
 
 class InvalidPackument extends Error {}
 
@@ -314,6 +295,15 @@ class Slabs {
     }
 
     this.length += part.length;
+  }
+
+  /** Lets the bytes appended since the last take() go without decoding them. */
+  discard(): void {
+    if (this.current) this.spare = this.current;
+    this.full = [];
+    this.current = null;
+    this.used = 0;
+    this.length = 0;
   }
 
   /** The bytes appended since the last call, as text. */
@@ -415,10 +405,31 @@ class Scanner {
   private topClass: number;
   private versionsClass: number;
   private fieldsClass: number;
-  /** The key of the member being read at the root, in `versions`, and in a version document. */
-  private rootKey: string | null = null;
+  /**
+   * The key of the member being read at the root, in `versions`, and in a version document, as long as the reader holds
+   * it: each is charged (heldKeys, by depth) from when it is built until the next key at its depth replaces it. Its
+   * text's length is kept (keyBytes) for maxPieceChars.
+   */
+  private rootKey: DecisionKey = null;
   private versionKey: string | null = null;
-  private fieldKey: string | null = null;
+  private fieldKey: DecisionKey = null;
+  private readonly heldKeys = [0, 0, 0, 0];
+  /**
+   * The charge of keys put in what the reader builds (adoptKey): the root's members until the read ends, `versions`'
+   * until it closes (its Map, then the object made from it), and a version document's until it closes.
+   */
+  private topKeys = 0;
+  private versionKeys = 0;
+  private docKeys = 0;
+  private readonly keyBytes = [0, 0, 0, 0];
+  /** The decision key being read: the most bytes it may take before it is known to name nothing kept, and whether it did. */
+  private keyLimit = Number.POSITIVE_INFINITY;
+  private keyOverlong = false;
+  private readonly topKeyMax: number;
+  private readonly fieldKeyMax: number;
+  /** What JSON.stringify writes for the version document being read, at most; and for any one member, at most. */
+  private docChars = 0;
+  maxPieceChars = 0;
   /** Whether the container at depth 2 is the `versions` object, and the one at depth 3 a version document read into. */
   private inVersions = false;
   private inVersion = false;
@@ -436,17 +447,19 @@ class Scanner {
   private docWeight = 0;
   /** Weight charged and not yet taken from the shared budget. */
   private pending = 0;
-  /** What this read took from the shared budget, given back if it is refused. */
+  /** What this read took from its lease, given back if it is refused. */
   taken = 0;
 
   private readonly limits: PackumentLimits;
   private readonly profile: KeepProfile;
-  private readonly budget: KeptBudget | null;
+  private readonly lease: Lease;
 
-  constructor(input: { limits: PackumentLimits; profile: KeepProfile; budget: KeptBudget | null }) {
+  constructor(input: { limits: PackumentLimits; profile: KeepProfile; lease: Lease }) {
     this.limits = input.limits;
     this.profile = input.profile;
-    this.budget = input.budget;
+    this.lease = input.lease;
+    this.topKeyMax = rawKeyMax(input.profile.top);
+    this.fieldKeyMax = input.profile.fields.kind === "only" ? rawKeyMax(input.profile.fields.names) : Number.POSITIVE_INFINITY;
     this.seed = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0x811c9dc5;
     this.topClass = this.seed;
     this.versionsClass = this.seed;
@@ -474,9 +487,11 @@ class Scanner {
               b = chunk[i] ?? 0;
             }
           } else {
-            // kept: a lead byte from 0xc4 starts a character past U+00FF; a key's bytes are hashed for its hidden class
+            // kept: any byte past ASCII may make the string two bytes a character, so it is charged so. A lead byte
+            // from 0xc4 starts a character past U+00FF, and a byte that is not valid UTF-8 decodes to U+FFFD, which is
+            // too (review of 6862fc7, finding 2). A key's bytes are hashed for its hidden class.
             while (b !== QUOTE && b !== BACKSLASH && b >= 0x20) {
-              if (b >= 0xc4) this.wide = true;
+              if (b >= 0x80) this.wide = true;
 
               if (this.hashing) this.keyHash = Math.imul(this.keyHash ^ b, FNV_PRIME);
               i++;
@@ -599,9 +614,16 @@ class Scanner {
     if (this.state === S_BOM && this.bytes === 0) throw new InvalidPackument("the packument is empty");
 
     if (this.state !== S_DONE) throw new InvalidPackument("the packument ends early");
+
+    const kept = Object.fromEntries(this.top);
+
+    // the keys the reader held go with it
+    for (let d = 1; d < this.heldKeys.length; d++) this.holdKey(d, 0);
+    this.charge(-this.topKeys);
+    this.topKeys = 0;
     this.flush();
 
-    return Object.fromEntries(this.top);
+    return kept;
   }
 
   private hashByte(b: number): void {
@@ -629,6 +651,8 @@ class Scanner {
       this.open(kind);
     } else if (b === MINUS || isDigit(b)) {
       this.valueStarted(at, null);
+
+      if (this.capture) this.capture.numbers++;
       this.numberState = b === MINUS ? N_MINUS : b === ZERO ? N_ZERO : N_INT;
       this.state = S_NUMBER;
     } else if (b === TRUE[0] || b === FALSE[0] || b === NULL[0]) {
@@ -658,9 +682,13 @@ class Scanner {
       return;
     }
 
-    // keys matter only where the reader decides what to keep
+    // keys matter only where the reader decides what to keep. At the root, and in a version document a profile keeps
+    // only some fields of, a key is only compared with the names kept there: one longer than any of them can be is
+    // not built at all (review of 6862fc7, finding 1)
     if (this.depth === 1 || (this.depth === 2 && this.inVersions) || (this.depth === 3 && this.inVersion)) {
-      this.capture = { depth: this.depth, into: "key", name: "", from: at };
+      this.keyLimit = this.keyLimitAt(this.depth);
+      this.keyOverlong = false;
+      this.capture = { depth: this.depth, into: "key", name: "", from: at, bytes: 0, numbers: 0 };
     }
   }
 
@@ -742,7 +770,7 @@ class Scanner {
 
   private stringEnded(chunk: Uint8Array, quoteAt: number): void {
     const c = this.capture;
-    // a string inside a kept part, as V8 will hold it: its content, two bytes a character when wide
+    // a string inside a kept part, as V8 will hold it: its content, two bytes an input byte when wide
     const content = c && c.into !== "key" ? (this.base + quoteAt - 1 - this.stringStart) * (this.wide ? 2 : 1) * WEIGHTS.text : 0;
 
     if (this.stringIsKey) {
@@ -758,9 +786,26 @@ class Scanner {
       if (!c || c.into !== "key" || c.depth !== this.depth) return;
       this.keep(chunk.subarray(c.from, quoteAt + 1));
       this.capture = null;
+      const raw = this.base + quoteAt + 1 - this.stringStart;
+      this.keyBytes[this.depth] = raw;
+
+      if (this.keyOverlong) {
+        // longer than any name kept here: skipped without ever being a string
+        this.keyOverlong = false;
+        this.holdKey(this.depth, 0);
+
+        if (this.depth === 1) this.rootKey = IGNORED;
+        else this.fieldKey = IGNORED;
+
+        return;
+      }
+
+      const wide = this.wide;
       const key = z.string().safeParse(this.parseKept());
 
       if (!key.success) throw new InvalidPackument("a key that is not a string");
+      // held until the next key at this depth replaces it: as V8 holds it, at most two bytes an input byte
+      this.holdKey(this.depth, raw * (wide ? 2 : 1) * WEIGHTS.text);
 
       if (this.depth === 1) this.rootKey = key.data;
       else if (this.depth === 2) this.versionKey = key.data;
@@ -772,6 +817,41 @@ class Scanner {
     this.charge(content);
     this.state = S_AFTER;
     this.valueEnded(chunk, quoteAt + 1);
+  }
+
+  /** The most bytes a decision key at `depth` may take before it is known to name nothing the profile keeps there. */
+  private keyLimitAt(depth: number): number {
+    if (depth === 1) return this.topKeyMax;
+
+    if (depth === 3) return this.fieldKeyMax;
+
+    // a version's key is always kept
+    return Number.POSITIVE_INFINITY;
+  }
+
+  /** The key held at `depth` now weighs `weight`: what the one it replaces was charged is given back. */
+  private holdKey(depth: number, weight: number): void {
+    const was = this.heldKeys[depth] ?? 0;
+    this.heldKeys[depth] = weight;
+    this.charge(weight - was);
+  }
+
+  /** The key held at `depth` is put in something the reader builds: its charge moves with it (topKeys and the rest). */
+  private adoptKey(depth: number): number {
+    const weight = this.heldKeys[depth] ?? 0;
+    this.heldKeys[depth] = 0;
+
+    return weight;
+  }
+
+  /** One member of the kept packument writes at most `chars` characters as JSON (maxPieceChars). */
+  private piece(chars: number): void {
+    if (chars > this.maxPieceChars) this.maxPieceChars = chars;
+  }
+
+  /** What JSON.stringify writes for a kept value at most: its text, and every number in it at its longest. */
+  private static valueChars(c: Capture): number {
+    return c.bytes + NUMBER_CHARS * c.numbers;
   }
 
   /** The object at `level` of the stack has one more key, hashed `keyHash`: whether that makes a new hidden class. */
@@ -838,8 +918,13 @@ class Scanner {
       this.node();
       this.charge(WEIGHTS.container);
       this.docsWeight += this.docWeight + WEIGHTS.container;
+      // `"key":{` and `}`, and a comma before it
+      this.piece((this.keyBytes[2] ?? 0) + this.docChars + 3);
       this.versionEntry(key, Object.fromEntries(this.fields));
       this.fields = [];
+      // the document's own keys are held by it now (charged as its members), the ones read for it are gone
+      this.charge(-this.docKeys);
+      this.docKeys = 0;
 
       return;
     }
@@ -852,6 +937,8 @@ class Scanner {
       this.versionCount = this.versions.size;
       this.versionDocs = this.docsWeight;
       this.versions = new Map();
+      this.charge(-this.versionKeys);
+      this.versionKeys = 0;
 
       return;
     }
@@ -866,7 +953,7 @@ class Scanner {
     if (this.keptNodes > this.limits.maxKeptNodes) throw new TooLarge({ over: "nodes", bytes: this.keptNodes, limit: this.limits.maxKeptNodes });
   }
 
-  /** Weight charged (or given back, when negative), checked against maxWeight and taken from the budget in steps. */
+  /** Weight charged (or given back, when negative), checked against maxWeight and taken from the lease in steps. */
   private charge(n: number): void {
     this.weight += n;
 
@@ -876,21 +963,21 @@ class Scanner {
     if (this.pending >= FLUSH_WEIGHT || this.pending < 0) this.flush();
   }
 
-  /** What was charged since the last flush, taken from the budget (or given back). */
+  /** What was charged since the last flush, taken from the lease (or given back). */
   private flush(): void {
     const n = this.pending;
     this.pending = 0;
 
-    if (!this.budget || n === 0) return;
+    if (n === 0) return;
 
     if (n < 0) {
-      this.budget.give(-n);
+      this.lease.give(-n);
       this.taken += n;
 
       return;
     }
 
-    if (!this.budget.take(n)) throw new TooLarge({ over: "budget", bytes: this.budget.taken + n, limit: this.budget.limit });
+    if (!this.lease.take(n)) throw new TooLarge({ over: "budget", bytes: this.lease.taken + n, limit: this.lease.limit });
     this.taken += n;
   }
 
@@ -905,18 +992,21 @@ class Scanner {
   }
 
   private topEntry(key: string, value: JsonValue): void {
+    this.topKeys += this.adoptKey(1);
     this.topClass = hashString(this.topClass, key);
     this.member(key, this.topClass, this.top.length + 1);
     this.top.push([key, value]);
   }
 
   private versionEntry(key: string, value: JsonValue): void {
+    this.versionKeys += this.adoptKey(2);
     this.versionsClass = hashString(this.versionsClass, key);
     this.member(key, this.versionsClass, this.versions.size + 1);
     this.versions.set(key, value);
   }
 
   private fieldEntry(key: string, value: JsonValue): void {
+    this.docKeys += this.adoptKey(3);
     this.fieldsClass = hashString(this.fieldsClass, key);
     this.docWeight += memberWeight(this.fields.length + 1);
     this.member(key, this.fieldsClass, this.fields.length + 1);
@@ -925,8 +1015,21 @@ class Scanner {
 
   private keep(part: Uint8Array): void {
     if (part.length === 0) return;
+    const c = this.capture;
 
-    if (this.capture?.into !== "key") {
+    if (c?.into === "key") {
+      if (this.keyOverlong) return;
+
+      // a key that cannot name anything kept here: what was copied of it goes, and nothing more is
+      if (this.slabs.length + part.length > this.keyLimit) {
+        this.keyOverlong = true;
+        this.charge(-this.slabs.length * WEIGHTS.text);
+        this.slabs.discard();
+
+        return;
+      }
+    } else {
+      if (c) c.bytes += part.length;
       this.keptBytes += part.length;
 
       if (this.keptBytes > this.limits.maxKeptBytes) throw new TooLarge({ over: "kept", bytes: this.keptBytes, limit: this.limits.maxKeptBytes });
@@ -974,7 +1077,7 @@ class Scanner {
       case 1: {
         const key = this.rootKey;
 
-        if (key === null || !this.profile.top.has(key)) return;
+        if (key === null || key === IGNORED || !this.profile.top.has(key)) return;
 
         if (key === "versions" && opensObject) {
           // a second `versions` replaces the first, as in JSON.parse
@@ -1006,6 +1109,7 @@ class Scanner {
           this.fields = [];
           this.fieldsClass = this.seed;
           this.docWeight = 0;
+          this.docChars = 0;
 
           return;
         }
@@ -1020,7 +1124,7 @@ class Scanner {
       case 3: {
         const key = this.fieldKey;
 
-        if (!this.inVersion || key === null) return;
+        if (!this.inVersion || key === null || key === IGNORED) return;
         const listed = this.profile.fields.names.has(key);
 
         if (this.profile.fields.kind === "except" ? !listed : listed) this.startCapture({ at, kind, into: "field", name: key });
@@ -1035,7 +1139,7 @@ class Scanner {
   private startCapture(input: { at: number; kind: number | null; into: "top" | "version" | "field"; name: string }): void {
     this.node();
     this.charge(input.kind === null ? WEIGHTS.value : WEIGHTS.container);
-    this.capture = { depth: this.depth, into: input.into, name: input.name, from: input.at };
+    this.capture = { depth: this.depth, into: input.into, name: input.name, from: input.at, bytes: 0, numbers: 0 };
   }
 
   /** A value ended just before `end`, at the current depth: if it was being kept, it is parsed and put in place. */
@@ -1047,16 +1151,22 @@ class Scanner {
     this.capture = null;
     const value = this.parseKept();
 
+    // a member written as `,"key":value`, with the key's text as it was read
+    const chars = Scanner.valueChars(c) + 2;
+
     switch (c.into) {
       case "top":
+        this.piece((this.keyBytes[1] ?? 0) + chars);
         this.topEntry(c.name, value);
 
         break;
       case "version":
+        this.piece((this.keyBytes[2] ?? 0) + chars);
         this.versionEntry(c.name, value);
 
         break;
       case "field":
+        this.docChars += (this.keyBytes[3] ?? 0) + chars;
         this.fieldEntry(c.name, value);
 
         break;
@@ -1069,14 +1179,31 @@ class Scanner {
   }
 }
 
-export type ReadOptions = { readonly limits?: PackumentLimits; readonly profile?: KeepProfile; readonly budget?: KeptBudget | null };
+export type ReadOptions = { readonly lease: Lease; readonly limits?: PackumentLimits; readonly profile?: KeepProfile };
 
 /**
  * Reads a packument's body under `limits`, keeping what `profile` names (TRIMMED by default), and taking what it keeps
- * from `budget` when one is given. Cancels the stream when it stops early.
+ * from `lease`, which must be open. Cancels the stream when it stops early.
  */
-export async function readPackument(body: ReadableStream<Uint8Array>, options: ReadOptions = {}): Promise<PackumentRead> {
-  const scanner = new Scanner({ limits: options.limits ?? PACKUMENT_LIMITS, profile: options.profile ?? TRIMMED, budget: options.budget ?? null });
+export async function readPackument(body: ReadableStream<Uint8Array>, options: ReadOptions): Promise<PackumentRead> {
+  const { lease } = options;
+  lease.assertOpen();
+
+  if (!lease.take(READ_OVERHEAD_WEIGHT)) {
+    await body.cancel().catch(() => undefined);
+
+    return { kind: "too-large", over: "budget", bytes: lease.taken + READ_OVERHEAD_WEIGHT, limit: lease.limit };
+  }
+
+  try {
+    return await scan(body, { ...options, limits: options.limits ?? PACKUMENT_LIMITS, profile: options.profile ?? TRIMMED });
+  } finally {
+    lease.give(READ_OVERHEAD_WEIGHT);
+  }
+}
+
+async function scan(body: ReadableStream<Uint8Array>, options: Required<ReadOptions>): Promise<PackumentRead> {
+  const scanner = new Scanner({ limits: options.limits, profile: options.profile, lease: options.lease });
   const reader = body.getReader();
 
   try {
@@ -1089,10 +1216,20 @@ export async function readPackument(body: ReadableStream<Uint8Array>, options: R
 
     const kept = scanner.finish();
 
-    return { kind: "ok", body: kept, bytes: scanner.bytes, keptBytes: scanner.keptBytes, keptNodes: scanner.keptNodes, weight: scanner.weight, versionCount: scanner.versionCount, versionDocs: scanner.versionDocs };
+    return {
+      kind: "ok",
+      body: kept,
+      bytes: scanner.bytes,
+      keptBytes: scanner.keptBytes,
+      keptNodes: scanner.keptNodes,
+      weight: scanner.weight,
+      versionCount: scanner.versionCount,
+      versionDocs: scanner.versionDocs,
+      maxPieceChars: scanner.maxPieceChars,
+    };
   } catch (e) {
     // given back before anything awaits, so reads in flight with this one see the room at once
-    options.budget?.give(scanner.taken);
+    options.lease.give(scanner.taken);
     await reader.cancel().catch(() => undefined);
 
     if (e instanceof TooLarge) return { kind: "too-large", over: e.over, bytes: e.bytes, limit: e.limit };

@@ -5,6 +5,7 @@
 // the file and the line. The score is recomputed without it wherever it is read (db.ts applies dismissals as versions
 // load). The dismissal and its undo each go into the package's public log in the same transaction, both with a
 // reason, and nothing carries over to other bytes, versions or scorers.
+import type { RequestMemory } from "./memory.ts";
 import { Effect } from "effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { DISMISSABLE, evidenceAt, parseAnalysis } from "@apm/core";
@@ -177,7 +178,7 @@ export const evidenceRoute = (
   req: Request,
   url: URL,
   caller: Caller,
-): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth> =>
+): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth | RequestMemory> =>
   Effect.gen(function* () {
     const p = url.pathname;
 

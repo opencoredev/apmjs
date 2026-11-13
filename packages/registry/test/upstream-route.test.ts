@@ -20,6 +20,10 @@ import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
 import { DEV_DEPENDENCIES, readPackument } from "../src/packument-read.ts";
 import { Upstream } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 
@@ -98,7 +102,7 @@ afterAll(async () => {
 /** One request through upstreamRoute; null when the route does not answer it (the protocol route then says 404). */
 async function get(path: string, accept = "application/json"): Promise<{ status: number; headers: Headers; text: string } | null> {
   const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url, legacyAuth: false, namePolicy: "open", admins: [] } as const;
-  const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
+  const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   // a TTL under a second, so each request asks the stand-in again
   const layers = Layer.provideMerge(Upstream.layer(npm.url, 1, null), base);
   const req = new Request(`http://registry.test${path}`, { headers: { accept } });
@@ -135,7 +139,7 @@ describe("the npm packument route", () => {
 
   test("devDependencies that do not fit beside the packument in the request's budget are left out, not held", async () => {
     // each read on its own is within every limit
-    for (const profile of [undefined, DEV_DEPENDENCIES]) expect((await readPackument(new Blob([HEAVY]).stream(), { profile })).kind).toBe("ok");
+    for (const profile of [undefined, DEV_DEPENDENCIES]) expect((await readPackument(new Blob([HEAVY]).stream(), { profile, lease: new MemoryPool().request() })).kind).toBe("ok");
     const full = await get("/heavy");
 
     expect(full?.status).toBe(200);

@@ -46,7 +46,7 @@ import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
-import { fail, json, LazyMembers, parseBody, streamedJson } from "./http.ts";
+import { fail, json, LazyMembers, parseBody, streamedJson, streamWeight } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
@@ -71,7 +71,7 @@ import {
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
-import { KeptBudget } from "./packument-read.ts";
+import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import { tooLargeText, Upstream, type BudgetedProbe, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
@@ -186,7 +186,8 @@ type Source =
 const localSource = (pkg: PackageRecord, versions: VersionRecord[]): Source => ({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions, pkg });
 const upstreamSource = (pkg: UpstreamPackage): Source => ({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions, pkg });
 
-const lookup = (name: string) =>
+/** A package's catalog, here or upstream; an upstream one is read under `lease` (memory.ts) and held until it closes. */
+const lookup = (name: string, lease: Lease) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -194,7 +195,7 @@ const lookup = (name: string) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const up = yield* upstream.get(name);
+    const up = yield* upstream.get(name, lease);
 
     if (!up) return null;
 
@@ -204,18 +205,29 @@ const lookup = (name: string) =>
 /**
  * The package metadata one request holds at most (a resolve walk, a scan, or the packument route's two reads), as
  * weight: an upper bound on its heap (packument-read.ts, WEIGHTS), every read in flight and each parse's moment
- * included. A walk holds every catalog it read until it answers, and the isolate cache's eviction frees none a request
- * still holds, so without this a tree of big packuments could take a Worker's 128 MB with the requests beside it.
- * Cached with its records and scored, in MiB: next 26.6, @types/node 20.8, typescript 20.6, react 13.6, so next, react
- * and typescript fit together. A dependency past it is reported unchecked, with a warning, never passed.
+ * included. Every handler reads under one lease of the isolate's memory pool (memory.ts, RequestMemory) with this
+ * limit, which the pool's own (POOL_WEIGHT, shared by every request and the isolate cache) bounds in turn. Cached with
+ * its records and scored, in MiB: next 26.6, @types/node 20.8, typescript 20.6, react 13.6, so next, react and
+ * typescript fit together. A dependency past it is reported unchecked, with a warning, never passed.
  */
-export const REQUEST_METADATA_WEIGHT = 64 * 1024 * 1024;
+export const REQUEST_METADATA_WEIGHT = REQUEST_WEIGHT;
 
-/** Why a dependency past REQUEST_METADATA_WEIGHT was not checked. */
-export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_METADATA_WEIGHT / (1024 * 1024)} MB of package metadata in one request, and this package's did not fit`;
+/** Why a dependency past REQUEST_METADATA_WEIGHT, or past what the isolate had room for, was not checked. */
+export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_METADATA_WEIGHT / (1024 * 1024)} MB of package metadata in one request, and less while the registry holds others, and this package's did not fit`;
 
-/** Like lookupOrUnknown, under a request's budget for the package metadata it holds (scan: one lease per package). */
-const lookupWithin = (name: string, budget: KeptBudget) =>
+/**
+ * Runs `use` with a child of the request's lease, released when it ends: for package metadata read only for a while
+ * (one name of popular-scores, one package of a scan), so what it held is given back for the next.
+ */
+const briefly = <A, E, R>(use: (lease: Lease) => Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const child = (yield* RequestMemory).child();
+
+    return yield* use(child).pipe(Effect.ensuring(Effect.sync(() => child.release())));
+  });
+
+/** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
+const lookupWithin = (name: string, lease: Lease) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -224,11 +236,11 @@ const lookupWithin = (name: string, budget: KeptBudget) =>
 
     if (!upstream) return null;
 
-    return lookupOf(yield* upstream.probeWithin(name, budget));
+    return lookupOf(yield* upstream.probeWithin(name, lease));
   });
 
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
-const lookupOrUnknown = (name: string) =>
+const lookupOrUnknown = (name: string, lease: Lease) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -236,7 +248,7 @@ const lookupOrUnknown = (name: string) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* upstream.probe(name);
+    const probe = yield* upstream.probe(name, lease);
 
     if (probe.kind === "unknown") return "unknown" as const;
 
@@ -315,7 +327,7 @@ const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, 
 type Lookup = Source | null | "unknown" | "over-budget";
 
 /** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
-const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean) => Effect.map(lookupOrUnknown(dep.name), (src) => pickFrom(src, dep, keep));
+const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
 
 /** pickDependency on a catalog already read. */
 function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Picked {
@@ -374,7 +386,7 @@ function lookupOf(p: BudgetedProbe | undefined): Lookup {
  * (this registry's packages, versions and dismissals, then npm's packuments and their analyses); `get` reads a name
  * no batch has.
  */
-function catalogMemo(budget: KeptBudget) {
+function catalogMemo(lease: Lease) {
   const known = new Map<string, Lookup>();
 
   const load = (names: readonly string[]) =>
@@ -400,7 +412,7 @@ function catalogMemo(budget: KeptBudget) {
         return;
       }
 
-      const probes = yield* upstream.probeMany(rest, budget);
+      const probes = yield* upstream.probeMany(rest, lease);
 
       for (const n of rest) known.set(n, lookupOf(probes.get(n)));
     });
@@ -434,18 +446,23 @@ const checkDependencies = (manifest: Record<string, unknown>) =>
         continue;
       }
 
-      const picked = yield* pickDependency(dep, (v) => v.status !== "revoked");
+      // each dependency's catalog is held only while it is checked
+      const checked = yield* briefly((lease) =>
+        Effect.gen(function* () {
+          const picked = yield* pickDependency(dep, (v) => v.status !== "revoked", lease);
 
-      if (picked.kind !== "found") {
-        unchecked.push(`${describeDependency(dep)}: ${picked.reason}`);
-        continue;
-      }
+          if (picked.kind !== "found") return { kind: "unchecked" as const, text: `${describeDependency(dep)}: ${picked.reason}` };
+          const analyzed = yield* ensureAnalyzed(picked.src, picked.v);
+          const r = reportFor(analyzed, at, { ignoreRecent: true });
 
-      const analyzed = yield* ensureAnalyzed(picked.src, picked.v);
-      const r = reportFor(analyzed, at, { ignoreRecent: true });
+          if (!r) return { kind: "unchecked" as const, text: `${dep.name}@${picked.v.version}: ${notScored(picked.src, analyzed).text}` };
 
-      if (!r) unchecked.push(`${dep.name}@${picked.v.version}: ${notScored(picked.src, analyzed).text}`);
-      else if (r.score < SCORE_FLOOR) risky.push({ name: dep.name, version: picked.v.version, score: r.score });
+          return { kind: "scored" as const, version: picked.v.version, score: r.score };
+        }),
+      );
+
+      if (checked.kind === "unchecked") unchecked.push(checked.text);
+      else if (checked.score < SCORE_FLOOR) risky.push({ name: dep.name, version: checked.version, score: checked.score });
     }
 
     if (specs.length > MAX_PUBLISH_DEPS) unchecked.push(`${specs.length - MAX_PUBLISH_DEPS} more dependencies: apm checks the first ${MAX_PUBLISH_DEPS} at publish`);
@@ -550,9 +567,10 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
       const upstream = yield* upstreamOrNull;
 
       if (upstream) {
-        const probe = yield* upstream.probe(name);
+        // only whether npm has the name is kept, so its catalog is given back at once
+        const probe = yield* briefly((lease) => Effect.map(upstream.probe(name, lease), (p) => p.kind));
 
-        if (probe.kind === "found") {
+        if (probe === "found") {
           return {
             ok: false,
             status: 403,
@@ -561,7 +579,7 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
         }
 
         // scoped names too: during an outage nobody can tell whose @scope/name this is on npm
-        if (probe.kind === "unknown") {
+        if (probe === "unknown") {
           return {
             ok: false,
             status: 503,
@@ -1006,7 +1024,7 @@ const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
-    const src = yield* lookup(name);
+    const src = yield* lookup(name, yield* RequestMemory);
 
     if (!src) return fail(404, "Not found");
     // the row lookup read, so the answer and the versions come from one read of it
@@ -1075,7 +1093,7 @@ const packageExists = (path: string) =>
 
     if (!upstream) return new Response(null, { status: 404 });
     // the listing alone: whether npm has the name needs neither apm's scores nor its dismissals
-    const listed = yield* upstream.listing(sp.name);
+    const listed = yield* upstream.listing(sp.name, yield* RequestMemory);
 
     if (listed.kind === "unknown") return new Response(null, { status: 503 });
 
@@ -1090,7 +1108,7 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = yield* lookup(name);
+    const src = yield* lookup(name, yield* RequestMemory);
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
@@ -1137,22 +1155,26 @@ const popularScoresResponse = (url: URL) =>
 
     if (names.length === 0 || names.length > MAX_POPULAR_NAMES) return fail(400, `names must list 1 to ${MAX_POPULAR_NAMES} package names, comma-separated`);
 
+    // the names read at once share the request's lease, each under a child of it given back once its score is read
+    // (review of 6862fc7, finding 4)
     const packages = yield* Effect.forEach(
       names,
       (name) =>
-        Effect.gen(function* () {
-          const none = { name, version: null, score: null, grade: null };
-          const store = yield* Store;
+        briefly((lease) =>
+          Effect.gen(function* () {
+            const none = { name, version: null, score: null, grade: null };
+            const store = yield* Store;
 
-          // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
-          if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).scores.size === 0) return none;
-          const src = yield* lookup(name);
-          const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
-          // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
-          const r = latest ? reportFor(latest, at) : null;
+            // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
+            if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).scores.size === 0) return none;
+            const src = yield* lookup(name, lease);
+            const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
+            // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
+            const r = latest ? reportFor(latest, at) : null;
 
-          return latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
-        }),
+            return latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
+          }),
+        ),
       { concurrency: 4 },
     );
 
@@ -1215,7 +1237,7 @@ const exactPart = (query: string, valid: boolean) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
-    const found = valid ? yield* lookupOrUnknown(query) : null;
+    const found = valid ? yield* lookupOrUnknown(query, yield* RequestMemory) : null;
     // When npm can't be asked, the name is neither taken nor available: say so instead of "available".
     const unknown = found === "unknown";
     const src = found === "unknown" ? null : found;
@@ -1260,12 +1282,14 @@ const alternativesPart = (query: string, user: string | null) =>
     const stems = [bare, `${bare}-js`, `${bare}js`, `use-${bare}`, `${bare}-kit`, `${bare}-core`];
 
     const check = (name: string) =>
-      Effect.map(lookupOrUnknown(name), (hit): Suggestion => {
-        const taken = hit !== null && hit !== "unknown";
-        const cc = taken ? [] : typoConflicts(name);
+      briefly((lease) =>
+        Effect.map(lookupOrUnknown(name, lease), (hit): Suggestion => {
+          const taken = hit !== null && hit !== "unknown";
+          const cc = taken ? [] : typoConflicts(name);
 
-        return { name, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown", checked: true };
-      });
+          return { name, available: hit === null && cc.length === 0, taken, unknown: hit === "unknown", checked: true };
+        }),
+      );
 
     if (namePolicy === "scoped" && user === null) {
       const suggestions = stems.flatMap((s): Suggestion[] => {
@@ -1597,7 +1621,7 @@ const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, m
  * `maxAnalyses` tarball analyses. Each name's catalog is read once per walk, a level's names in one batch, and each
  * name and range is resolved once. Everything it could not score is counted and listed, never dropped.
  */
-const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WALK_LIMITS) =>
+const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: WalkLimits = WALK_LIMITS) =>
   Effect.gen(function* () {
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
@@ -1619,8 +1643,9 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
     };
 
     const seen = new Set<string>();
-    // every catalog the walk reads, it holds until it answers: together they stay under maxWeight
-    const catalogs = catalogMemo(new KeptBudget(limits.maxWeight));
+    // every catalog the walk reads, it holds until it answers: together they stay under maxWeight, inside the
+    // request's lease, so the root and its reloads count beside them (review of 6862fc7, finding 4)
+    const catalogs = catalogMemo(lease.child(limits.maxWeight));
     let overBudget = false;
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
@@ -1875,9 +1900,20 @@ const waitingOn = (p: Omit<Extract<ResolvePass, { kind: "pending" }>, "kind">): 
  */
 type ResolveMode = { strict: boolean; final: boolean };
 
-const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode }) =>
+/**
+ * One pass of resolve over `src`. Its walk holds what it reads under a child of `lease`, given back when the pass has
+ * its answer: what it returns refers to no catalog.
+ */
+const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode; lease: Lease }) =>
+  Effect.suspend(() => {
+    const walk = input.lease.child();
+
+    return resolveWalk({ ...input, lease: walk }).pipe(Effect.ensuring(Effect.sync(() => walk.release())));
+  });
+
+const resolveWalk = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode; lease: Lease }) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, src, mode } = input;
+    const { name, range, policy, treePolicy, src, mode, lease } = input;
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
     const tagged = tagTarget(src.distTags, range);
@@ -1908,7 +1944,7 @@ const resolvePass = (input: { name: string; range: string; policy: Policy; treeP
 
       if (block === null || pendingRoot) {
         // a pending root's tree is walked too, so its dependencies are queued while it is
-        const walked = yield* treeBlocks(v, treePolicy);
+        const walked = yield* treeBlocks(v, treePolicy, lease);
         const tree = treeAnswer(walked, yield* treeReviews(walked));
         const newest = { version: v.version, report: embeddedReport(v, report) };
 
@@ -2015,14 +2051,28 @@ export const resolveResponse = (url: URL) =>
     // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
     const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
 
-    const first = yield* lookupOrUnknown(name);
+    // the root is read under the request's lease, each read of it under a child given back when a newer read replaces
+    // it, beside the walks (review of 6862fc7, finding 4)
+    const lease = yield* RequestMemory;
+    let rootLease = lease.child();
+    // one variable holds the root, so a catalog its lease gave back is never still reachable
+    let src = yield* lookupOrUnknown(name, rootLease);
+
+    /** The root read afresh: the catalog it replaces is given back. */
+    const reload = Effect.gen(function* () {
+      const next = lease.child();
+      const got = yield* lookup(name, next);
+      rootLease.release();
+      rootLease = next;
+
+      return got;
+    });
 
     // the package itself could not be looked up: there is no version to install, and a retry may find one
-    if (first === "unknown") {
+    if (src === "unknown") {
       return json({ error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) });
     }
 
-    let src = first;
     const configured = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
     const wait = { maxMs: Math.min(configured.maxMs, asked.maxMs), pollMs: configured.pollMs };
     const looks = Math.max(0, Math.ceil(wait.maxMs / Math.max(1, wait.pollMs)));
@@ -2030,7 +2080,7 @@ export const resolveResponse = (url: URL) =>
 
     for (;;) {
       if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: false } });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: false }, lease });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -2045,10 +2095,10 @@ export const resolveResponse = (url: URL) =>
 
       if (!ready && !strict) {
         // the wait is over: what landed is read afresh, and what is still pending is a warning
-        const latest = yield* lookup(name);
+        src = yield* reload;
 
-        if (!latest) return fail(404, `No package named ${name}.`);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, src: latest, mode: { strict, final: true } });
+        if (!src) return fail(404, `No package named ${name}.`);
+        const last = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: true }, lease });
 
         if (last.kind === "answer") return last.response;
       }
@@ -2073,7 +2123,7 @@ export const resolveResponse = (url: URL) =>
       }
 
       // read afresh: a version the queue scored meanwhile comes back with its analysis
-      src = yield* lookup(name);
+      src = yield* reload;
     }
   });
 
@@ -2104,7 +2154,7 @@ type ScanOne =
   | { kind: "unchecked"; unchecked: ScanUnchecked }
   | { kind: "pending"; unchecked: ScanUnchecked };
 
-const scanOne = (p: { name: string; version: string }, strict: boolean, at: number, budget: KeptBudget) =>
+const scanOne = (p: { name: string; version: string }, strict: boolean, at: number, lease: Lease) =>
   Effect.gen(function* () {
     const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne => ({ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } });
@@ -2119,7 +2169,7 @@ const scanOne = (p: { name: string; version: string }, strict: boolean, at: numb
       advisory: { package: p.name, version: p.version, level, description: `${warningLines(warning).slice(0, -1).join("\n")}${strict ? "" : "\napm lets it install; APM_SCANNER_STRICT=1 refuses it."}`, url: warning.url },
     });
 
-    const src = yield* lookupWithin(p.name, budget);
+    const src = yield* lookupWithin(p.name, lease);
 
     if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 
@@ -2194,18 +2244,9 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // queued versions are listed twice: in `unchecked`, so a scanner from before `pending` never reads one as clean,
     // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
-    // the packuments of the packages being checked at once share one budget; each gives its share back when it is done
-    const budget = new KeptBudget(REQUEST_METADATA_WEIGHT);
-
-    const results = yield* Effect.forEach(
-      packages.slice(0, cap),
-      (p) => {
-        const lease = budget.lease();
-
-        return scanOne(p, strict, at, lease).pipe(Effect.ensuring(Effect.sync(() => lease.release())));
-      },
-      { concurrency: SCAN_CONCURRENCY },
-    );
+    // the packuments of the packages being checked at once share the request's lease, each under a child of it given
+    // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
+    const results = yield* Effect.forEach(packages.slice(0, cap), (p) => briefly((lease) => scanOne(p, strict, at, lease)), { concurrency: SCAN_CONCURRENCY });
 
     for (const r of results) {
       switch (r.kind) {
@@ -2432,6 +2473,15 @@ function upstreamPackument(input: {
   };
 }
 
+/**
+ * What a served version document has beyond the packument's own (upstreamPackument): its `dist` with the tarball URL
+ * apm serves, its compact score, and the field that says what servableManifest left out, as JSON characters at most.
+ */
+const SERVED_EXTRA_CHARS = 16 * 1024;
+
+/** What the served answer holds for each version while it is sent: its places in the filtered lists, its manifest's. */
+const SERVED_VERSION_WEIGHT = 64;
+
 /** How long a client should wait before it asks again for a packument the upstream could not give, in seconds. */
 export const UPSTREAM_RETRY_AFTER_S = 30;
 
@@ -2447,9 +2497,10 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const sp = splitPath(p);
 
     if (!sp || (yield* (yield* Store).getPackage(sp.name))) return null;
-    // the packument and the devDependencies the full one adds back are held together until the answer is sent
-    const budget = new KeptBudget(REQUEST_METADATA_WEIGHT);
-    const src = yield* lookupWithin(sp.name, budget);
+    // the packument and the devDependencies the full one adds back are held together under the request's lease until
+    // the answer is sent
+    const lease = yield* RequestMemory;
+    const src = yield* lookupWithin(sp.name, lease);
 
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
     // client retries, never "Not found", which npm reports as a package that does not exist
@@ -2514,12 +2565,26 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       for (const v of cooled) yield* ensureAnalyzed(src, v);
     }
 
-    // the full packument (npm view, yarn 1) adds back each version's devDependencies, read apart so the registry's own
-    // reads stay small; a HEAD sends no body, so it reads none
-    const devDependencies = abbreviated || req.method === "HEAD" ? null : yield* upstream.devDependencies(src.name, budget);
-    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions), devDependencies });
+    const headers = { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" };
 
-    return streamedJson(body, "versions", { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });
+    // a HEAD sends no body, so nothing is read or written for one
+    if (req.method === "HEAD") return new Response(null, { status: 200, headers });
+    // the full packument (npm view, yarn 1) adds back each version's devDependencies, read apart so the registry's own
+    // reads stay small
+    const dev = abbreviated ? null : yield* upstream.devDependencies(src.name, lease);
+    // what the answer holds while it is sent, charged before it is made: its manifests array (a shallow copy of each
+    // version document when devDependencies are added back) and what streaming its longest member holds
+    const { serveCost } = src.pkg;
+    const longest = serveCost.maxPieceChars + (dev?.maxPieceChars ?? 0) + SERVED_EXTRA_CHARS;
+
+    if (!lease.take(serveCost.versionDocs + src.versions.length * SERVED_VERSION_WEIGHT + streamWeight(longest))) {
+      return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    }
+
+    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions), devDependencies: dev?.byVersion ?? null });
+
+    // the request's lease stays open until the last byte is sent: the stream refers to the package until then
+    return streamedJson(body, "versions", headers, { onDone: lease.retain() });
   });
 
 // ---------- router ----------
@@ -2577,7 +2642,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(`/${rest.slice("score/".length)}`);
 
       if (!sp) return fail(404, "Not found");
-      const src = yield* lookup(sp.name);
+      const src = yield* lookup(sp.name, yield* RequestMemory);
 
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];

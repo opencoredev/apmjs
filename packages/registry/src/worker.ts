@@ -15,6 +15,7 @@ import { Store, type StoreFault } from "./db.ts";
 import type { HttpFailure, InfraError } from "./errors.ts";
 import { fail, failureResponse, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
 import { route } from "./router.ts";
+import { ISOLATE_POOL, RequestMemory } from "./memory.ts";
 import { legacyAuthRefusal } from "./startup.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { considerUpstream, REVIEW_DEFAULTS, ReviewConfig, reviewLocalCommit, type ReviewSettings } from "./review.ts";
@@ -172,13 +173,21 @@ function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<
             Effect.provide(context),
             Effect.catch((e) => Effect.sync(() => logFailure("review", { name: v.name, version: v.version }, String(e.cause)))),
           ),
-        upstreamFetched: (pkg) =>
+        upstreamFetched: (pkg, held) =>
           Effect.sync(() => {
-            if (background === null) return;
+            if (background === null) {
+              held.release();
+
+              return;
+            }
+
             background(
-              Effect.runPromiseExit(considerUpstream(pkg).pipe(Effect.provide(fresh), Effect.scoped)).then((exit) => {
-                if (Exit.isFailure(exit)) logFailure("review", { name: pkg.name }, Cause.pretty(exit.cause));
-              }),
+              Effect.runPromiseExit(considerUpstream(pkg).pipe(Effect.provide(fresh), Effect.scoped))
+                .then((exit) => {
+                  if (Exit.isFailure(exit)) logFailure("review", { name: pkg.name }, Cause.pretty(exit.cause));
+                })
+                // the package stays charged to the isolate's memory pool until the look at it is over
+                .finally(() => held.release()),
             );
           }),
       });
@@ -188,7 +197,10 @@ function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<
 
 export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis | Auth;
 
-/** Every service a request uses, over this Worker's bindings. The Postgres connection lives as long as the request. */
+/**
+ * Every service a request uses, over this Worker's bindings. The Postgres connection and the request's memory lease
+ * (memory.ts) live as long as the request.
+ */
 export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, faults: ReadonlySet<StoreFault> = new Set()) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
@@ -201,7 +213,9 @@ export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: L
       ? Layer.provideMerge(Analysis.none, base)
       : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), base));
 
-  return Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl }), withScoring);
+  // one lease of the isolate's memory pool for the run (a request, a queue job, the sweep): every read of npm's
+  // package metadata it makes takes from it, and a streamed answer keeps it until the last byte is sent
+  return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl }), withScoring), RequestMemory.layer(ISOLATE_POOL));
 }
 
 type LogFields = Readonly<Record<string, string | number | boolean | null>>;

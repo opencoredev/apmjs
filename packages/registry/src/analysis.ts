@@ -21,6 +21,7 @@
 // its start and counts a fetch failure, and after MAX_FETCH_FAILURES of them the version is settled as unavailable, as
 // is one the upstream no longer lists. A version is never left looking queued forever, and never scored clean on a
 // reading that stopped short.
+import { RequestMemory } from "./memory.ts";
 import { Context, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
@@ -214,11 +215,14 @@ export type AnalysisApi = {
    * platform stopped it). How the queue's next run of it reads depends on how many runs before it stored nothing (planFor). Returns how many
    * it requeued.
    */
-  readonly recover: Effect.Effect<number, StoreError | BlobError>;
+  readonly recover: Effect.Effect<number, StoreError | BlobError, RequestMemory>;
   /** Queues a version for analysis unless it is already scored or queued. */
   readonly enqueue: (name: string, version: string) => Effect.Effect<void, StoreError>;
-  /** The consumer's work: fetch, verify, analyze and store one version, or record why it cannot be. */
-  readonly runJob: (job: AnalysisJob) => Effect.Effect<JobOutcome, StoreError | BlobError>;
+  /**
+   * The consumer's work: fetch, verify, analyze and store one version, or record why it cannot be. The packument is
+   * read under the run's lease (RequestMemory).
+   */
+  readonly runJob: (job: AnalysisJob) => Effect.Effect<JobOutcome, StoreError | BlobError, RequestMemory>;
 };
 
 export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/registry/Analysis") {
@@ -335,8 +339,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
          * could not fetch it over FETCH_GIVE_UP_MS, unavailable. A fetch that fails in a way that may pass keeps its
          * start, counts as a fetch failure and ends the run, so the queue's retry may run it again at once.
          */
-        const runJob = (job: AnalysisJob): Effect.Effect<JobOutcome, StoreError | BlobError> =>
-          Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError> {
+        const runJob = (job: AnalysisJob): Effect.Effect<JobOutcome, StoreError | BlobError, RequestMemory> =>
+          Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError, RequestMemory> {
             const begun = yield* store.startAnalysis({ name: job.name, version: job.version, now: yield* clock.now, runMs: RUN_WINDOW_MS });
 
             switch (begun.kind) {
@@ -372,8 +376,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
           });
 
         /** The rest of a run once its start is recorded: give up, fetch, analyze and store. */
-        const runStarted = (job: AnalysisJob, begun: Extract<AnalysisStart, { kind: "started" }>, now: number): Effect.Effect<JobOutcome, StoreError | BlobError> =>
-          Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError> {
+        const runStarted = (job: AnalysisJob, begun: Extract<AnalysisStart, { kind: "started" }>, now: number): Effect.Effect<JobOutcome, StoreError | BlobError, RequestMemory> =>
+          Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError | BlobError, RequestMemory> {
             if (begun.fetchFailures >= MAX_FETCH_FAILURES && begun.fetchFailedSince !== null && now - begun.fetchFailedSince >= FETCH_GIVE_UP_MS) {
               yield* settleGone(job, FETCH_GAVE_UP);
 
@@ -390,7 +394,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             }
 
             const fetchFailed = (errorClass: string): Effect.Effect<JobOutcome, StoreError> => store.failFetch({ name: job.name, version: job.version, errorClass, now, runMs: RUN_WINDOW_MS }).pipe(Effect.as("retry"));
-            const probe = yield* upstream.probe(job.name);
+            // the job's own lease (worker.ts opens one per queue message, and one for the sweep that runs jobs itself)
+            const probe = yield* upstream.probe(job.name, yield* RequestMemory);
 
             switch (probe.kind) {
               case "unknown":
@@ -464,7 +469,11 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
 
             // with no queue (a local registry), the sweep runs the job itself, under the same meter
             for (const r of [...runs, ...accepted]) {
-              if (queue === null) yield* runJob(r);
+              if (queue === null) {
+                // each job's packument under a child of the sweep's lease, given back when the job ends
+                const child = (yield* RequestMemory).child();
+                yield* runJob(r).pipe(Effect.provideService(RequestMemory, child), Effect.ensuring(Effect.sync(() => child.release())));
+              }
               else yield* enqueue(r.name, r.version);
             }
 

@@ -10,16 +10,28 @@ import { z } from "zod";
 import {
   DEV_DEPENDENCIES,
   DROPPED_VERSION_FIELDS,
-  KeptBudget,
   MAX_KEPT_PACKUMENT_NODES,
   MAX_PACKUMENT_DEPTH,
   MAX_PACKUMENT_WEIGHT,
-  readPackument,
+  READ_OVERHEAD_WEIGHT,
+  readPackument as readUnder,
   SLAB_BYTES,
   type JsonValue,
   type KeptPackument,
   type PackumentLimits,
+  type PackumentRead,
+  type ReadOptions,
 } from "../src/packument-read.ts";
+import { MemoryPool, type Lease } from "../src/memory.ts";
+
+/** A lease with no limit, in a pool of its own: for a read that tests the reader's own bounds. */
+const unlimited = (): Lease => new MemoryPool(Number.POSITIVE_INFINITY).request(Number.POSITIVE_INFINITY);
+
+/** readPackument under `options.lease`, or an unlimited one. */
+const readPackument = (body: ReadableStream<Uint8Array>, options: Partial<ReadOptions> = {}): Promise<PackumentRead> => readUnder(body, { ...options, lease: options.lease ?? unlimited() });
+
+/** A request lease of `limit` for what reads keep, beside what each of `reads` holds while it runs, in a pool that has room. */
+const leaseOf = (limit: number, reads = 1): Lease => new MemoryPool(Number.POSITIVE_INFINITY).request(limit + reads * READ_OVERHEAD_WEIGHT);
 
 const LIMITS: PackumentLimits = { maxBytes: 10_000_000, maxKeptBytes: 1_000_000, maxKeptNodes: 100_000, maxWeight: 100_000_000, maxDepth: 1_000 };
 
@@ -263,17 +275,17 @@ describe("readPackument", () => {
     const one = (n: number): string => JSON.stringify({ name: `p${n}`, description: "D".repeat(30_000), versions: {} });
     // alone, one read holds its 30 KB description as text and as the string it is parsed into, and twice more while it
     // is parsed: 120 KB at that moment, and what it holds after, 30 KB, is all it keeps taken
-    const alone = new KeptBudget(125_000);
+    const alone = leaseOf(125_000);
 
-    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, budget: alone })).kind).toBe("ok");
+    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, lease: alone })).kind).toBe("ok");
     expect(alone.taken).toBeLessThan(31_000);
-    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, budget: new KeptBudget(115_000) })).kind).toBe("too-large");
+    expect((await readPackument(streamOf(one(0), 1_024), { limits: LIMITS, lease: leaseOf(115_000) })).kind).toBe("too-large");
     // three in step hold one another's text: the first to parse finds no room, the two after it do
-    const budget = new KeptBudget(160_000);
-    const reads = await Promise.all([1, 2, 3].map((n) => readPackument(streamOf(one(n), 1_024), { limits: LIMITS, budget })));
+    const budget = leaseOf(160_000, 3);
+    const reads = await Promise.all([1, 2, 3].map((n) => readPackument(streamOf(one(n), 1_024), { limits: LIMITS, lease: budget })));
 
     expect(reads.map((r) => r.kind).toSorted()).toEqual(["ok", "ok", "too-large"]);
-    expect(reads.find((r) => r.kind === "too-large")).toMatchObject({ over: "budget", limit: 160_000 });
+    expect(reads.find((r) => r.kind === "too-large")).toMatchObject({ over: "budget", limit: 160_000 + 3 * READ_OVERHEAD_WEIGHT });
     // the two that were kept stay taken, at what they weigh now; the refused one's partial take was given back
     const kept = reads.reduce((n, r) => n + (r.kind === "ok" ? r.weight : 0), 0);
 
@@ -438,6 +450,22 @@ function packumentLike(next: () => number): string {
   return `{"name":"p","users":${generate(next, 1)},"readme":${generate(next, 1)},"versions":{${versions}}${extra},"${KEYS[Math.floor(next() * KEYS.length)]}":${generate(next, 1)}}`;
 }
 
+/**
+ * The longest member streamedJson writes for a kept packument at once, in characters: a top-level field with its key,
+ * or one entry of `versions` with its key when it is an object. What maxPieceChars must be at least.
+ */
+function longestPiece(body: KeptPackument): number {
+  let most = 0;
+
+  for (const [k, v] of Object.entries(body)) {
+    if (k === "versions" && isJsonObject(v)) {
+      for (const [version, doc] of Object.entries(v)) most = Math.max(most, JSON.stringify(version).length + 1 + JSON.stringify(doc).length);
+    } else most = Math.max(most, JSON.stringify(k).length + 1 + JSON.stringify(v).length);
+  }
+
+  return most;
+}
+
 /** One mutation of valid text: a byte removed, inserted or replaced with one that matters to the grammar. */
 function mutate(next: () => number, text: string): string {
   const at = Math.floor(next() * text.length);
@@ -450,6 +478,26 @@ function mutate(next: () => number, text: string): string {
 
   return text.slice(0, at) + glyph + text.slice(at + 1);
 }
+
+describe("the longest member a stream writes (maxPieceChars)", () => {
+  test("is at least what JSON.stringify writes, for numbers that grow, escapes that shrink and keys of every length", async () => {
+    const docs = [
+      `{"name":"p","versions":{"1.0.0":{"n":[1e20,1E20,-1e-7,0.1e1,5e-324,1.7976931348623157e308,${"1e20,".repeat(500)}1]}}}`,
+      `{"name":"p","readme":"\\u0041\\/\\n\\u0001\\ud800\\u20ac\\"","versions":{"\\u0031.0.0":{"\\u006eame":"p","x":"\\t"}}}`,
+      `{"name":"p","versions":{"1.0.0":{"${"k".repeat(5000)}":1}},"time":{"1.0.0":"2020-01-01"}}`,
+      `{"name":"p","versions":{"1.0.0":"not an object","2.0.0":{"dependencies":{"a":"1"}}}}`,
+      `{"name":"p","versions":[1e20,2e20]}`,
+      `{"name":"€","description":"${"€".repeat(1000)}","versions":{}}`,
+    ];
+
+    for (const text of docs) {
+      const r = await readPackument(streamOf(text, 7), { limits: LIMITS });
+
+      if (r.kind !== "ok") throw new Error(`not read: ${text.slice(0, 80)}`);
+      expect({ text: text.slice(0, 60), ok: r.maxPieceChars >= longestPiece(r.body) }).toEqual({ text: text.slice(0, 60), ok: true });
+    }
+  });
+});
 
 describe("readPackument against JSON.parse, on a fuzz corpus", () => {
   test("6,000 valid and invalid documents: the same verdict, and when valid the same value minus what it drops", async () => {
@@ -469,7 +517,10 @@ describe("readPackument against JSON.parse, on a fuzz corpus", () => {
         valid++;
         expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "ok" });
 
-        if (got.kind === "ok") expect({ i, body: got.body }).toEqual({ i, body: expected(want.value) });
+        if (got.kind === "ok") {
+          expect({ i, body: got.body }).toEqual({ i, body: expected(want.value) });
+          expect({ i, longest: longestPiece(got.body) <= got.maxPieceChars }).toEqual({ i, longest: true });
+        }
       } else {
         invalid++;
         expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "invalid" });
@@ -496,7 +547,10 @@ describe("readPackument against JSON.parse, on a fuzz corpus", () => {
         valid++;
         expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "ok" });
 
-        if (got.kind === "ok") expect({ i, body: got.body }).toEqual({ i, body: expectedDev(want.value) });
+        if (got.kind === "ok") {
+          expect({ i, body: got.body }).toEqual({ i, body: expectedDev(want.value) });
+          expect({ i, longest: longestPiece(got.body) <= got.maxPieceChars }).toEqual({ i, longest: true });
+        }
       } else expect({ i, text, kind: got.kind }).toEqual({ i, text, kind: "invalid" });
     }
 
@@ -519,6 +573,9 @@ describe.skipIf(!existsSync(REAL))("readPackument against JSON.parse, on real pa
 
       expect(trimmed).toMatchObject({ kind: "ok", body: expected(want.value) });
       expect(dev).toMatchObject({ kind: "ok", body: expectedDev(want.value) });
+
+      // what serializing it a member at a time holds is charged from this bound (http.ts, streamWeight)
+      for (const r of [trimmed, dev]) if (r.kind === "ok") expect(r.maxPieceChars).toBeGreaterThanOrEqual(longestPiece(r.body));
     }, 120_000);
   }
 });

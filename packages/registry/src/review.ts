@@ -2,6 +2,7 @@
 // results, the public and maintainer views, "Request AI review", and the owner-only queue where a
 // person confirms or dismisses a flag. The model never runs here: a separate reviewer process
 // (apps/reviewer) leases jobs over HTTP and posts results back. See docs/AI-REVIEW.md.
+import { RequestMemory } from "./memory.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Context, Effect, Option } from "effect";
 import type { SqlError } from "effect/sql/SqlError";
@@ -367,7 +368,7 @@ const catalog = (name: string) =>
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog;
 
-    return upstreamCatalog(yield* upstream.value.probe(name));
+    return upstreamCatalog(yield* upstream.value.probe(name, yield* RequestMemory));
   });
 
 /**
@@ -384,7 +385,7 @@ const catalogListing = (name: string) =>
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog<Listed>;
 
-    return upstreamCatalog(yield* upstream.value.listing(name));
+    return upstreamCatalog(yield* upstream.value.listing(name, yield* RequestMemory));
   });
 
 type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string };
@@ -1021,7 +1022,7 @@ export const reviewRoute = (
   req: Request,
   url: URL,
   caller: Caller,
-): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth> =>
+): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth | RequestMemory> =>
   Effect.gen(function* () {
     const p = url.pathname;
     const isReviewPath = p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/") || p.startsWith("/-/apm/v1/review-admin/") || p.startsWith("/-/apm/v1/review/");

@@ -18,6 +18,10 @@ import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { StoreError } from "../src/errors.ts";
 import { Upstream, type Probe, type UpstreamPackage } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const T0 = Date.parse("2026-11-12T00:00:00Z");
 
@@ -109,7 +113,7 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
 
     if (failing.includes(name)) v.manifest = throwingManifest(name);
 
-    return { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map() };
+    return { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
   };
 
   const probeOf = (name: string): Probe => {
@@ -228,7 +232,7 @@ function losingStore(lost: { writes: number }) {
 function layerFor(input: { url: string; now: number; upstream: Layer.Layer<Upstream>; queue: ReturnType<typeof queueStub>["queue"] | null; stop?: { armed: boolean }; lost?: { writes: number } }) {
   const store = Store.postgres(input.url);
   const wrapped = input.stop ? Layer.provideMerge(stoppingStore(input.stop), store) : input.lost ? Layer.provideMerge(losingStore(input.lost), store) : store;
-  const base = Layer.mergeAll(wrapped, input.upstream, Clock.fixed({ now: input.now, wallNow: input.now }));
+  const base = Layer.mergeAll(wrapped, input.upstream, Clock.fixed({ now: input.now, wallNow: input.now }), RequestMemory.layer(POOL));
 
   return Layer.provideMerge(Analysis.layer(input.queue), base);
 }
@@ -531,10 +535,10 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
 
         return Upstream.of({
           ...u,
-          probe: (name) => Effect.suspend(() => {
+          probe: (name, lease) => Effect.suspend(() => {
             calls.probe++;
 
-            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probe(name);
+            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probe(name, lease);
           }),
           tarball: (pkg, version) => Effect.suspend(() => {
             calls.tarball++;

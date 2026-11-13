@@ -25,10 +25,13 @@ const HEAP_CEILING = 64 * MB;
 const NOISE = 256 * 1024;
 
 const ENTRY = `
-import { DEV_DEPENDENCIES, KeptBudget, readPackument, TRIMMED } from ${JSON.stringify(join(SRC, "packument-read.ts"))};
+import { DEV_DEPENDENCIES, readPackument, TRIMMED } from ${JSON.stringify(join(SRC, "packument-read.ts"))};
+import { MemoryPool } from ${JSON.stringify(join(SRC, "memory.ts"))};
 import { cachedPackage, packageMoment, packageWeight, scoredPackage } from ${JSON.stringify(join(SRC, "upstream.ts"))};
 ${MEASURE}
 const encoder = new TextEncoder();
+/** A lease with no limit, in a pool of its own: for a read that measures the reader alone. */
+const free = () => new MemoryPool(Infinity).request(Infinity);
 
 /** A packument whose version 1.0.0 keeps a field "x": an array of \`count\` copies of \`item\`, streamed about \`chunk\` bytes at a time. */
 function repeated({ name, item, count, chunk }) {
@@ -88,17 +91,17 @@ export default {
 
     if (url.pathname === "/arrays") {
       // the walk's shape: four packuments read at once under one budget, held until it answers
-      const budget = new KeptBudget(Number(q("budget")));
+      const budget = new MemoryPool(Infinity).request(Number(q("budget")));
       let peak = 0;
       const sample = async () => { peak = Math.max(peak, await measure(env)); };
       const reads = await Promise.all([0, 1, 2, 3].map((i) => {
         const body = repeated({ name: "a" + i, item: "[]", count: Number(q("count")), chunk: 65536 });
         // the first stream stops every 16 chunks to have the heap measured while all four are in flight
-        if (i !== 0) return readPackument(body, { budget });
+        if (i !== 0) return readPackument(body, { lease: budget });
         const reader = body.getReader();
         let n = 0;
         const sampled = new ReadableStream({ async pull(c) { if (++n % 16 === 0) await sample(); const r = await reader.read(); if (r.done) c.close(); else c.enqueue(r.value); } });
-        return readPackument(sampled, { budget });
+        return readPackument(sampled, { lease: budget });
       }));
       const held = await measure(env);
       peak = Math.max(peak, held);
@@ -120,12 +123,12 @@ export default {
           at++;
         },
       });
-      const r = await readPackument(body);
+      const r = await readPackument(body, { lease: free() });
       return Response.json({ read: ok(r), length: r.kind === "ok" ? r.body.description.length : -1, beforeEnd: before_end - before, base: before });
     }
 
     if (url.pathname === "/fixture") {
-      const r = await readPackument(generated(FIXTURES[q("fixture")](Number(q("n"))), 65536), { limits: { maxBytes: 1e9, maxKeptBytes: 1e9, maxKeptNodes: 1e9, maxWeight: 1e10, maxDepth: 1000 } });
+      const r = await readPackument(generated(FIXTURES[q("fixture")](Number(q("n"))), 65536), { limits: { maxBytes: 1e9, maxKeptBytes: 1e9, maxKeptNodes: 1e9, maxWeight: 1e10, maxDepth: 1000 }, lease: free() });
       const held = await measure(env);
       globalThis.keep = r; globalThis.keep = null;
       return Response.json({ read: ok(r), held: held - before });
@@ -138,9 +141,9 @@ export default {
         yield '{"name":"p","versions":{';
         for (let i = 0; i < count; i++) yield (i ? "," : "") + '"1.0.' + i + '":{"name":"p","version":"1.0.' + i + '","dist":{"tarball":"https://registry.npmjs.org/p/-/p-1.0.' + i + '.tgz","integrity":"sha512-' + "A".repeat(86) + '=="},"f' + (i % 50) + '":' + i + "}";
         yield '},"time":{' + Array.from({ length: count }, (_, i) => '"1.0.' + i + '":"2020-01-01T00:00:00.000Z"').join(",") + "}}";
-      }, 65536));
+      }, 65536), { lease: free() });
       const body = await measure(env);
-      let pkg = cachedPackage("p", r.body);
+      let pkg = cachedPackage("p", r.body, { versionDocs: r.versionDocs, maxPieceChars: r.maxPieceChars });
       const both = await measure(env);
       const read = { weight: r.weight, versionCount: r.versionCount, versionDocs: r.versionDocs };
       r = null;
@@ -153,7 +156,7 @@ export default {
 
     if (url.pathname === "/real") {
       const profile = q("profile") === "dev" ? DEV_DEPENDENCIES : TRIMMED;
-      const r = await readPackument(req.body, { profile });
+      const r = await readPackument(req.body, { profile, lease: free() });
       const held = await measure(env);
       globalThis.keep = r; globalThis.keep = null;
       return Response.json({ read: ok(r), held: held - before });

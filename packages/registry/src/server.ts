@@ -1,5 +1,6 @@
 // The npm wire protocol: tokens, packuments, tarballs, publish, dist-tags, adduser and search.
 // apm's own routes live in apm.ts and account.ts; router.ts puts them together.
+import type { RequestMemory } from "./memory.ts";
 import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
@@ -348,7 +349,7 @@ export type PublishHook = (input: {
 }) => Effect.Effect<PublishVerdict, InfraError, PublishServices>;
 
 /** Every service a publish may touch, the guard included. */
-export type PublishServices = Blobs | AccessServices | Analysis;
+export type PublishServices = Blobs | AccessServices | Analysis | RequestMemory;
 
 export const approvalUrl = (id: string): Effect.Effect<string, never, RegistryConfig> => Effect.map(RegistryConfig, (c) => `${c.webUrl}approve/${id}`);
 

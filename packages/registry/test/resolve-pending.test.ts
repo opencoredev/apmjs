@@ -23,6 +23,10 @@ import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { Store, UnscorableReason } from "../src/db.ts";
 import { Upstream } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DAY = 86_400_000;
@@ -100,7 +104,7 @@ async function resolve(input: { url: string; npm: string; name: string; wait: { 
 
   if (input.askedWaitMs !== undefined) params.set("wait", String(input.askedWaitMs));
   const u = new URL(`http://registry.test/-/apm/v1/resolve?${params}`);
-  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, input.wait), Layer.succeed(RegistryConfig, SETTINGS(input.npm)));
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, input.wait), Layer.succeed(RegistryConfig, SETTINGS(input.npm)), RequestMemory.layer(POOL));
   const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
   const t0 = performance.now();
   const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, retryAfter: res.headers.get("retry-after"), body: Body.parse(await res.json()) })));
@@ -195,7 +199,7 @@ describe("strict: a queued dependency is pending, never clean", () => {
 
 /** POST /-/apm/v1/scan, anonymous, as the Bun scanner asks it (APM_SCANNER_STRICT=1 sends `strict: true`). */
 async function scan(input: { url: string; npm: string; packages: { name: string; version: string }[]; strict?: boolean }) {
-  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, SETTINGS(input.npm)));
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, SETTINGS(input.npm)), RequestMemory.layer(POOL));
   const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
   const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: input.packages, strict: input.strict === true }) });
 

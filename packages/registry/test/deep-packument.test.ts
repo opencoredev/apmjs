@@ -15,6 +15,10 @@ import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
 import { Upstream } from "../src/upstream.ts";
+import { MemoryPool, RequestMemory } from "../src/memory.ts";
+
+/** This file's memory pool: every request it runs takes a lease of it, as a Worker isolate's do. */
+const POOL = new MemoryPool();
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DEPTH = 50_000;
@@ -50,7 +54,7 @@ describe("a packument with a manifest past the limits apm reads", () => {
 
     try {
       const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url, legacyAuth: false, namePolicy: "open", admins: [] } as const;
-      const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
+      const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
       const layers = Layer.provideMerge(Upstream.layer(npm.url, 60_000, null), base);
       const req = new Request("http://registry.test/deep-review");
       const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), false), (res) => Effect.promise(async () => ({ status: res?.status, text: (await res?.text()) ?? "" })));
