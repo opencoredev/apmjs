@@ -8,6 +8,7 @@ import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
 import { readCapped } from "./http.ts";
+import { readPackument, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { createHash } from "node:crypto";
 
@@ -123,37 +124,60 @@ const PROBE_CONCURRENCY = 6;
 const MAX_ENTRIES = 500;
 
 /**
+ * The most packument the isolate keeps, counted as the JSON readPackument kept: parsed, it is held at about one and a
+ * half times that (next: 15 MB kept, 22 MB held), and an isolate has 128 MB for every request it runs. Oldest go first.
+ */
+export const PROBE_CACHE_BYTES = 16 * 1024 * 1024;
+
+/**
  * Answers from the public registry, kept for a minute per Worker isolate. Only public data lives here, never
  * anything about a request or a person, so sharing it between requests is safe. Promises are never shared:
  * a Worker may not finish I/O that another request started.
  */
-class IsolateCache<V> {
-  private readonly entries = new Map<string, { at: number; value: V }>();
-  constructor(private readonly ttlMs: number) {}
+export class IsolateCache<V> {
+  private readonly entries = new Map<string, { at: number; value: V; weight: number }>();
+  private weight = 0;
+  private readonly ttlMs: number;
+  /** The most total weight kept; an entry heavier than this is not kept at all. */
+  private readonly budget: number;
+
+  constructor(ttlMs: number, budget = Number.POSITIVE_INFINITY) {
+    this.ttlMs = ttlMs;
+    this.budget = budget;
+  }
   get(key: string, now: number): V | undefined {
     const hit = this.entries.get(key);
 
     if (!hit) return undefined;
 
     if (now - hit.at >= this.ttlMs) {
-      this.entries.delete(key);
+      this.delete(key);
 
       return undefined;
     }
 
     return hit.value;
   }
-  set(key: string, value: V, now: number): void {
-    this.entries.delete(key);
-    this.entries.set(key, { at: now, value });
+  /** Keeps `value` under `key`; `weight` counts toward the budget, and older entries leave to make room. */
+  set(key: string, value: V, now: number, weight = 0): void {
+    this.delete(key);
 
-    if (this.entries.size > MAX_ENTRIES) {
+    if (weight > this.budget) return;
+    this.entries.set(key, { at: now, value, weight });
+    this.weight += weight;
+
+    while (this.entries.size > MAX_ENTRIES || this.weight > this.budget) {
       const oldest = this.entries.keys().next();
 
-      if (!oldest.done) this.entries.delete(oldest.value);
+      if (oldest.done) break;
+      this.delete(oldest.value);
     }
   }
   delete(key: string): void {
+    const gone = this.entries.get(key);
+
+    if (!gone) return;
+    this.weight -= gone.weight;
     this.entries.delete(key);
   }
 }
@@ -171,7 +195,7 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   const known = isolateCaches.get(key);
 
   if (known) return known;
-  const made: Caches = { probes: new IsolateCache(ttlMs), searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
+  const made: Caches = { probes: new IsolateCache(ttlMs, PROBE_CACHE_BYTES), searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
   isolateCaches.set(key, made);
 
   return made;
@@ -194,7 +218,7 @@ export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 const workerCache = (): Cache => caches.default;
 
 /** The Cache API key of a packument. This host is never fetched; it only names the entry. */
-export const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v1/${encodeURIComponent(url)}`);
+export const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v2/${encodeURIComponent(url)}`);
 
 function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
@@ -341,13 +365,24 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         // `background` is set only inside a Worker request, where `caches` always exists
         const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
 
+        /** A packument body read by readPackument; one it refused is logged, and reads as an answer apm cannot use. */
+        const keptOf = (url: string, read: PackumentRead): KeptPackument | null => {
+          if (read.kind === "ok") return read.body;
+          const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
+
+          console.error(JSON.stringify({ level: "error", event: "upstream-packument", error: read.kind === "too-large" ? "packument-too-large" : "packument-invalid", url, ...detail }));
+
+          return null;
+        };
+
         /**
          * npm's packument, from the shared cache when another isolate fetched it within the TTL. `fetchedAt` is when npm
-         * sent it: `now` for a fresh fetch, the copy's own time for a shared one.
+         * sent it: `now` for a fresh fetch, the copy's own time for a shared one. The body is streamed through
+         * readPackument, never held whole, and only what it keeps is shared: vite's 39 MB packument is 3.9 MB kept.
          */
-        const fetchPackument = (url: string, now: number): Effect.Effect<{ status: number; body: unknown; fetchedAt: number }, unknown> =>
+        const fetchPackument = (url: string, now: number): Effect.Effect<{ status: number; body: unknown; fetchedAt: number; kept: number }, unknown> =>
           Effect.tryPromise({
-            try: async (): Promise<{ status: number; body: unknown; fetchedAt: number }> => {
+            try: async (): Promise<{ status: number; body: unknown; fetchedAt: number; kept: number }> => {
               const key = packumentKey(url);
               const shared = sharing ? workerCache() : null;
               const cacheStart = performance.now();
@@ -355,34 +390,34 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               // a copy with no time (written before copies carried one) or past its TTL is not used
               const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
-              if (hit && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
-                const body: unknown = JSON.parse(await hit.text());
+              if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
+                const read = await readPackument(hit.body);
                 timing?.add("npm-cache", performance.now() - cacheStart);
 
-                return { status: 200, body, fetchedAt: sentAt };
+                return { status: 200, body: keptOf(url, read), fetchedAt: sentAt, kept: read.kind === "ok" ? read.keptBytes : 0 };
               }
 
               await hit?.body?.cancel();
               const npmStart = performance.now();
               const res = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
 
-              if (res.status !== 200) {
+              if (res.status !== 200 || !res.body) {
                 await res.body?.cancel();
                 timing?.add("npm", performance.now() - npmStart);
 
-                return { status: res.status, body: null, fetchedAt: now };
+                return { status: res.status === 200 ? 502 : res.status, body: null, fetchedAt: now, kept: 0 };
               }
 
-              const text = await res.text();
-              const body: unknown = JSON.parse(text);
+              const read = await readPackument(res.body);
+              const body = keptOf(url, read);
               timing?.add("npm", performance.now() - npmStart);
 
-              if (shared && background) {
+              if (shared && background && read.kind === "ok") {
                 const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(now) };
-                background(shared.put(key, new Response(text, { headers })).catch(() => undefined));
+                background(shared.put(key, new Response(JSON.stringify(read.body), { headers })).catch(() => undefined));
               }
 
-              return { status: 200, body, fetchedAt: now };
+              return { status: 200, body, fetchedAt: now, kept: read.kind === "ok" ? read.keptBytes : 0 };
             },
             catch: (cause) => cause,
           });
@@ -448,10 +483,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         };
 
         /** The package as npm lists it, and when npm said so. */
-        const fetchPackage = (name: string, now: number): Effect.Effect<{ probe: CachedProbe | { kind: "unknown" }; fetchedAt: number }> =>
+        const fetchPackage = (name: string, now: number): Effect.Effect<{ probe: CachedProbe | { kind: "unknown" }; fetchedAt: number; kept: number }> =>
           fetchPackument(`${baseUrl}${encodeName(name)}`, now).pipe(
-            Effect.map(({ status, body, fetchedAt }) => ({ probe: packageOf({ name, status, body }), fetchedAt })),
-            Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now })),
+            Effect.map(({ status, body, fetchedAt, kept }) => ({ probe: packageOf({ name, status, body }), fetchedAt, kept })),
+            Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now, kept: 0 })),
           );
 
         /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
@@ -461,11 +496,12 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const cached = caches.probes.get(name, t);
 
             if (cached !== undefined) return cached;
-            const { probe: fresh, fetchedAt } = yield* fetchPackage(name, t);
+            const { probe: fresh, fetchedAt, kept } = yield* fetchPackage(name, t);
 
             if (fresh.kind === "unknown") return fresh;
-            // the TTL counts from when npm answered, which for a shared copy is before this request
-            caches.probes.set(name, fresh, fetchedAt);
+            // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
+            // takes room from older ones (PROBE_CACHE_BYTES)
+            caches.probes.set(name, fresh, fetchedAt, kept);
 
             if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
 
