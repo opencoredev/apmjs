@@ -29,6 +29,8 @@ apm add <package>[@range]... [--force] [--no-cooldown] [--cooldown <duration>] [
 
 Resolves each package to the newest version that passes the policy, checks its dependency tree, installs the exact version with install scripts held back, verifies every installed package against the registry, then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
 
+A version nobody has scored yet, the package or one of its dependencies, is queued for analysis. The registry waits up to about 20 s for the score, and `apm add` keeps asking for up to 90 s in all, printing what it is waiting for. A cold package usually installs after a few seconds. If anything is still pending after 90 s, `apm add` refuses with `still being analysed, try again in a minute`. It never installs a version as if it passed, and `--force` does not lift this.
+
 | Flag | Meaning |
 | --- | --- |
 | `--cooldown <duration>` | Skip versions younger than this. `24h` (default), `90m`, `2d`, `0`. A bare number is hours. |
@@ -49,7 +51,7 @@ With `--json`:
 apm x <package>[@version] [args...]
 ```
 
-Shows the package's score card, then runs it with `bunx` (bun), `pnpm dlx` (pnpm) or `npx --yes` (npm and yarn). Aliases: `apm exec`, `apm dlx`. Takes the same `--force`, `--no-cooldown`, `--cooldown` and `--floor` flags as `add`. Scopes are pinned to the checked registry, but the tool's own cache is not verified afterwards.
+Shows the package's score card, then runs it with `bunx` (bun), `pnpm dlx` (pnpm) or `npx --yes` (npm and yarn). Aliases: `apm exec`, `apm dlx`. Takes the same `--force`, `--no-cooldown`, `--cooldown` and `--floor` flags as `add`, and waits for a version still being analysed the same way. Scopes are pinned to the checked registry, but the tool's own cache is not verified afterwards.
 
 ## apm score
 
@@ -154,5 +156,6 @@ Prints the user the current token belongs to, and the registry.
 | `npm_config_registry` | Used when `APM_REGISTRY` is not set. |
 | `npm_config_userconfig` | Path of the user `.npmrc`. Default `~/.npmrc`. |
 | `NO_COLOR` | Turn off colors. |
+| `APM_PENDING_WAIT_MS` | How long `apm add` and `apm x` wait for versions still being analysed. Default `90000`. |
 
 Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.

@@ -77,12 +77,6 @@ export default Alchemy.Stack(
       // Writes down pending revokes past 24h and expired staged versions (reads already treat them as final), and
       // requeues analyses the platform stopped before they stored anything.
       crons: ["*/10 * * * *"],
-      // 5 minutes of CPU per invocation, the paid plan's most (the default is 30 s). Nothing depends on it: every analysis
-      // is bounded by its work meter (@apm/core meter.ts), whose full allowance is under 25 s of CPU, so a run fits the
-      // default limit too; an anonymous request analyses nothing, and a signed-in one at most two versions, each under
-      // a quarter of the meter. Only CPU used is billed. A run the platform stops anyway is requeued by the cron's sweep
-      // (packages/registry/src/analysis.ts).
-      limits: { cpuMs: 300_000 },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
       // staging has no custom domain: undefined leaves workers.dev as the only address
       domain: production ? PRODUCTION.registry : undefined,

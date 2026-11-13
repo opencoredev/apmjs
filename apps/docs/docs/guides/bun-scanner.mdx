@@ -6,7 +6,8 @@ description: Make stock bun install and bun add ask apm about every package, and
 `@apm/bun-scanner` plugs into Bun's security scanner hook. Before `bun install` or `bun add` installs anything, Bun hands the scanner the package list, the scanner asks the apm registry about each package, and Bun cancels the install when a version is:
 
 - revoked, or waiting to be revoked;
-- scored below 40.
+- scored below 40;
+- still being analysed after the scanner has waited 60 s for it.
 
 You keep using plain `bun`. No wrapper, no alias.
 
@@ -43,6 +44,19 @@ The scanner asks exactly one registry:
 2. otherwise `[install] registry` from `bunfig.toml`, the project's first, then your global one.
 
 It never takes a registry from package data, so a tarball URL in a lockfile cannot choose who checks it or who sees your package list.
+
+## Versions still being analysed
+
+A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package usually gets its score in a few seconds, and the install then goes ahead or is cancelled on that score. Anything still pending after 60 s cancels the install, in default mode and in strict mode:
+
+```text
+apm scanner: waiting for 1 package(s) the registry is still analysing (0s of 60s): left-pad@1.3.0
+error: left-pad@1.3.0 is still being analysed by https://registry.apmjs.dev/ (waited 60s). apm installs no version before it has a score; try again in a minute.
+```
+
+Run the install again a minute later. Set `APM_SCANNER_WAIT_MS` to wait longer or shorter.
+
+The scanner blocks every pending version, not only ones new to the registry: it cannot tell a long-published package nobody has installed through apm from one published a minute ago, and both have no score.
 
 ## What it cannot check
 

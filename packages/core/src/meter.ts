@@ -2,8 +2,10 @@
 // resolution, decoders, code read from text and scoring all charge it before they do work that grows with the input.
 //
 // A deployed Cloudflare Worker's clock does not move while synchronous code runs, so a time limit bounds nothing
-// there. Counted work does: every charged unit is a step of bounded cost (measured, docs/SCORE.md "Bounded, and how"),
-// so a meter of MAX_ANALYSIS_WORK units bounds the CPU one analysis can use, whatever the package holds.
+// there. Counted work does, for the work it counts: each charged unit is a step whose cost was measured (docs/SCORE.md,
+// "Bounded, and how"). The meter is not a proof that every path is charged; reviews keep finding ones that were not.
+// Work it misses is stopped by the platform's CPU limit, and the registry's recovery stores an outcome for any run that
+// ends without one, so an undercounted input costs CPU but never yields a clean score.
 //
 // When the meter runs out it throws MeterExhausted, which unwinds the whole analysis: no phase can carry on past it.
 // It stays exhausted, so a later charge throws again even if some caller swallowed the first throw, and `analyze`
@@ -38,9 +40,9 @@ export const PHASE_NAMES: Record<Phase, string> = {
 
 /**
  * Units one analysis may spend: 320 million. The slowest package of the 70-package corpus under the registry's caps
- * (three 0.187.0, 20 MB unpacked) spends 168 million (6.3 s of CPU in V8); the most expensive unit measured across the
- * adversarial suite costs 53 ns, so the whole meter is about 17 s of CPU, under the 25 s this must stay within to
- * finish inside a Worker's default 30 s limit (docs/SCORE.md, "Bounded, and how").
+ * (three 0.187.0, 20 MB unpacked) spends 168 million (6.3 s of CPU in V8). At the most expensive unit measured across
+ * the adversarial suite a full meter is about 18 s of CPU, inside a Worker's default 30 s limit; an input that costs
+ * more per unit is stopped by that limit and recovered (docs/SCORE.md, "Bounded, and how").
  */
 export const MAX_ANALYSIS_WORK = 320_000_000;
 
