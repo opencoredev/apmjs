@@ -510,13 +510,15 @@ function probes(): Probe[] {
     { path: `-/package/${NAME}/dist-tags`, route: "dist-tags", status: 200 },
     { path: NAME, route: "packument", status: 200 },
     { path: NAME, route: "packument", status: 200, headers: { accept: "application/vnd.npm.install-v1+json" } },
-    ...specs.map((s): Probe => ({ path: `${NAME}/${s}`, route: "version", status: (a) => ((a.phase === "after" && withheld(s)) || (a.safe && cooling(s)) ? 404 : 200) })),
-    // a revoked tarball is 410; a pending one stays for lockfiles, outside /~safe/, which serves only what passes
+    // REVOKED's flag is confirmed before the revoke, so its manifest is withheld in both phases (confirmed.ts)
+    ...specs.map((s): Probe => ({ path: `${NAME}/${s}`, route: "version", status: (a) => ((a.phase === "after" && withheld(s)) || s === REVOKED || (a.safe && cooling(s)) ? 404 : 200) })),
+    // a revoked tarball is 410, and so is a confirmed malicious one, in /~safe/ too; a pending one stays for lockfiles,
+    // outside /~safe/, which serves only what passes
     ...VERSIONS.map(
       (v): Probe => ({
         path: `${NAME}/-/${NAME}-${v}.tgz`,
         route: "tarball",
-        status: (a) => (a.phase === "after" && v === REVOKED ? 410 : a.safe && (cooling(v) || (a.phase === "after" && withheld(v))) ? 404 : 200),
+        status: (a) => (v === REVOKED ? 410 : a.safe && (cooling(v) || (a.phase === "after" && withheld(v))) ? 404 : 200),
       }),
     ),
     // apm's API (apm.ts)

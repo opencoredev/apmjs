@@ -13,7 +13,7 @@ import { ReviewDecision } from "./actions.ts";
 import { Auth, type SignedIn } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
-import { Store, type User, type VersionRecord } from "./db.ts";
+import { Store, storableJson, type User, type VersionRecord } from "./db.ts";
 import { refuse, StoreError, type AuthError, type HttpFailure } from "./errors.ts";
 import { randomId } from "./hash.ts";
 import { fail, json, parseBody } from "./http.ts";
@@ -909,7 +909,7 @@ const resultResponse = (req: Request, id: string) =>
         yield* query(
           "result: store",
           sql`INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state, human_by, human_at, human_note)
-              VALUES (${job.package}, ${job.version}, ${job.digest}, ${r.outcome}, ${JSON.stringify(r)}::jsonb, ${at}, ${human}, NULL, NULL, NULL)
+              VALUES (${job.package}, ${job.version}, ${job.digest}, ${r.outcome}, ${storableJson(JSON.stringify(r))}::jsonb, ${at}, ${human}, NULL, NULL, NULL)
               ON CONFLICT (package, version, digest) DO UPDATE SET outcome = EXCLUDED.outcome, result = EXCLUDED.result, reviewed_at = EXCLUDED.reviewed_at,
                 human_state = EXCLUDED.human_state, human_by = NULL, human_at = NULL, human_note = NULL`,
           none,

@@ -503,6 +503,18 @@ export class Store extends Context.Service<Store, StoreApi>()("@apm/registry/Sto
 }
 
 const one = <S extends z.ZodType>(row: S) => z.array(row).transform((rows) => rows[0] ?? null);
+
+/**
+ * JSON text for a jsonb column whose strings quote a package (an analysis's evidence, a review's findings). Postgres
+ * refuses U+0000 and unpaired surrogates in jsonb text, so a quote of a binary file made the whole write fail: on
+ * staging, ac 1.0.2's evidence quoted db/000741.ldb and every run of it lost its store. JSON.stringify writes exactly
+ * those two as \u escapes (a paired surrogate stays a character), so each such escape, and no escaped backslash
+ * before a "u", becomes U+FFFD.
+ */
+export function storableJson(json: string): string {
+  return json.replace(/(?<!\\)((?:\\\\)*)\\u(?:0000|d[89a-f][0-9a-f]{2})/gi, "$1\\ufffd");
+}
+
 const all = <S extends z.ZodType>(row: S) => z.array(row);
 const none = z.array(z.unknown()).transform(() => undefined);
 const changed = z.array(z.unknown()).transform((rows) => rows.length > 0);
@@ -825,7 +837,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         "insertVersion",
         sql`INSERT INTO versions (package, version, manifest, shasum, integrity, size, tarball_key, published_at, published_by, score)
             VALUES (${v.package}, ${v.version}, ${JSON.stringify(v.manifest)}::jsonb, ${v.shasum}, ${v.integrity}, ${v.size}, ${v.tarball_key},
-                    ${v.published_at}, ${v.published_by}, ${v.score === null || v.score === undefined ? null : JSON.stringify(v.score)}::jsonb)
+                    ${v.published_at}, ${v.published_by}, ${v.score === null || v.score === undefined ? null : storableJson(JSON.stringify(v.score))}::jsonb)
             ON CONFLICT (package, version) DO NOTHING RETURNING version`,
         changed,
       ),
@@ -965,7 +977,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       run(
         "setUpstreamAnalysis",
         sql`INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at)
-            VALUES (${input.name}, ${input.version}, ${input.digest}, ${SCORER}, ${JSON.stringify(input.analysis)}::jsonb, ${input.at})
+            VALUES (${input.name}, ${input.version}, ${input.digest}, ${SCORER}, ${storableJson(JSON.stringify(input.analysis))}::jsonb, ${input.at})
             ON CONFLICT (package, version, digest, scorer) DO UPDATE SET analysis = EXCLUDED.analysis, analyzed_at = EXCLUDED.analyzed_at`,
         none,
       ),

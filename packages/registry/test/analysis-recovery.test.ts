@@ -699,3 +699,19 @@ describe("a run the store fails is the registry's failure, not the package's", (
 test("a begun run is taken for still going only while it could be: the Worker's whole CPU limit and more", () => {
   expect(RUN_WINDOW_MS).toBeGreaterThan(WORKER_CPU_MS);
 });
+
+// Staging, ac 1.0.2: its evidence quoted a binary file (db/000741.ldb) with U+0000 in it, Postgres refused the jsonb,
+// and every run of it lost its store. A quote's NUL and unpaired surrogates are stored as U+FFFD.
+test("an analysis whose evidence quotes a NUL or an unpaired surrogate is stored", async () => {
+  await withRig(async (db, sql) => {
+    const evidence = ["db/000741.ldb:23400: \u0001ce\u0000unctual", "lone \ud800 half", "a backslash then u0000: \\u0000 stays", "a pair 😀 stays"];
+    const analysis = { scorer: SCORER, signals: [{ id: "x", evidence }] };
+    // SAFETY: the store writes the analysis as JSON and reads nothing in it; only its strings matter to this check
+    const write = Effect.flatMap(Store, (s) => s.setUpstreamAnalysis({ name: "nul-pkg", version: "1.0.0", digest: "sha512-00", analysis: analysis as never, at: T0 }));
+
+    await Effect.runPromise(write.pipe(Effect.provide(Store.postgres(db.url)), Effect.scoped));
+    const stored = z.array(z.object({ evidence: z.array(z.string()) })).parse(await sql("SELECT analysis->'signals'->0->'evidence' AS evidence FROM upstream_analysis WHERE package = 'nul-pkg'"));
+
+    expect(stored[0]?.evidence).toEqual(["db/000741.ldb:23400: \u0001ce\uFFFDunctual", "lone \uFFFD half", "a backslash then u0000: \\u0000 stays", "a pair \ud83d\ude00 stays"]);
+  });
+}, 120_000);
