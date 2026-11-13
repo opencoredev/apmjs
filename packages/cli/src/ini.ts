@@ -1,6 +1,10 @@
 // .npmrc files as npm reads them (review of efef668, finding 3): npm parses them with its `ini` package, so a quoted
 // value loses its quotes, an unquoted one ends at the first unescaped ; or #, `key[]=` lines make a list, a bare `key`
 // is true, and a key under a [section] is not a top-level setting. `${VAR}` in a value is the environment's VAR.
+//
+// What starts a section depends on the ini version (review of a24c6aa, finding 1): before ini 4.1.0 the line must end
+// at its `]`; from 4.1.0 whitespace may follow it. A `[section] ` line is a section to npm 11 (ini 6) and to upstream
+// npm 9.6 and later, and the bare key `[section] ` to Debian's npm 9.2 (ini 3.0.1) and to pnpm 10 (checked on 10.18.3).
 import { z } from "zod";
 
 /** One value a line sets: text, or the literal true, false or null (`key=true`, a bare `key`, `key=null`). */
@@ -62,14 +66,22 @@ function literal(v: string): IniScalar {
   }
 }
 
-/** The top-level settings of an .npmrc, as npm's ini decodes them. A later plain line for a key replaces an earlier one. */
-export function decodeIni(source: string): Map<string, IniValue> {
+/** How a section header may end: `exact` at its `]` (ini before 4.1.0), or `spaced`, with whitespace after it (4.1.0 on). */
+export type SectionSyntax = "exact" | "spaced";
+
+const LINE: Record<SectionSyntax, RegExp> = {
+  exact: /^\[([^\]]*)\]$|^([^=]+)(=(.*))?$/,
+  spaced: /^\[([^\]]*)\]\s*$|^([^=]+)(=(.*))?$/,
+};
+
+/** The top-level settings of an .npmrc, as ini decodes them. A later plain line for a key replaces an earlier one. */
+export function decodeIni(source: string, sections: SectionSyntax): Map<string, IniValue> {
   const out = new Map<string, IniValue>();
   let inSection = false;
 
   for (const line of source.split(/[\r\n]+/)) {
     if (line === "" || /^\s*[;#]/.test(line)) continue;
-    const m = /^\[([^\]]*)\]$|^([^=]+)(=(.*))?$/.exec(line);
+    const m = LINE[sections].exec(line);
 
     if (m === null) continue;
 

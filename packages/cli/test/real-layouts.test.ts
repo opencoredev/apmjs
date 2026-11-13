@@ -232,6 +232,42 @@ describe("finding 3 of efef668: real npm and pnpm leave devDependencies out exac
   }
 });
 
+// Review of a24c6aa, finding 1: a [section] header with whitespace after it is a section to npm 11 (ini 6) and a key to
+// Debian's npm 9.2 (ini 3), so no table answer holds for every npm. Each case is installed with the npm on PATH and
+// apm must agree with what it did; pnpm 10 reads the header as a key. Run once with npm 11 first on PATH as well.
+describe("finding 1 of a24c6aa: section headers followed by whitespace, as the npm on PATH and pnpm read them", () => {
+  const cases = [
+    { npmrc: "[section] \nproduction=true\n", pnpm: "omit" },
+    { npmrc: "omit=dev\n[section] \nproduction=false\n", pnpm: "include" },
+    { npmrc: "[section]\t\nonly=prod\n", pnpm: "omit" },
+  ] as const;
+
+  for (const pm of ["npm", "pnpm"] as const) {
+    test(`${pm}: apm reads each as the install did`, async () => {
+      const wrong: string[] = [];
+
+      for (const [i, c] of cases.entries()) {
+        const root = join(base, `sections-${pm}-${i}`, "project");
+        const caseHome = join(base, `sections-${pm}-${i}`, "home");
+
+        mkdirSync(root, { recursive: true });
+        mkdirSync(caseHome, { recursive: true });
+        writeFileSync(join(root, "package.json"), JSON.stringify({ name: "p", version: "1.0.0", private: true, dependencies: { a: tgz.a }, devDependencies: { devonly: tgz.devonly } }));
+        writeFileSync(join(root, ".npmrc"), c.npmrc);
+        const env = { npm_config_globalconfig: join(caseHome, "global-npmrc"), HOME: caseHome };
+
+        await sh(pm === "npm" ? ["npm", "install", "--ignore-scripts", "--offline"] : [PNPM, "install", "--ignore-scripts", "--offline"], root, env);
+        const did = existsSync(join(root, "node_modules", "devonly")) ? "include" : "omit";
+        const apm = devGroup({ pm, root, env: shEnv(env), production: false }).kind;
+
+        if (apm !== did || (pm === "pnpm" && did !== c.pnpm)) wrong.push(`${JSON.stringify(c.npmrc)}: ${pm} ${did}d, apm says ${apm}`);
+      }
+
+      expect(wrong).toEqual([]);
+    }, 120_000);
+  }
+});
+
 // Review of efef668, finding 1: after a production install with scripts held, the command that runs tool's script
 // (bun installs the removed tool again; pnpm and npm rebuild it) is told the omission too. Without it, bun's second
 // install put devscript back and ran its install script.

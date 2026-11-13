@@ -66,4 +66,16 @@ export const OMISSION_CASES: readonly OmissionCase[] = [
   { name: "the user's production=true", user: "production=true\n", npm: "omit", pnpm: "omit" },
   { name: "a global config's omit=dev and production=true", global: "omit=dev\nproduction=true\n", npm: "omit", pnpm: "omit" },
   { name: "pnpm_config_production=true (pnpm 10 reads npm_config_ only)", env: { pnpm_config_production: "true" }, npm: "include", pnpm: "include" },
+  // review of a24c6aa, finding 2: `key[]=` lists of settings that are not lists (npm 9 and 11 agree on each)
+  { name: "production[]=false, production[]=true", npmrc: "production[]=false\nproduction[]=true\n", npm: "omit", pnpm: "omit" },
+  { name: "production[]=false (a list is true)", npmrc: "production[]=false\n", npm: "omit", pnpm: "omit" },
+  { name: "production=true, then production[]=false", npmrc: "production=true\nproduction[]=false\n", npm: "omit", pnpm: "omit" },
+  { name: "only[]=prod", npmrc: "only[]=prod\n", npm: "omit", pnpm: "include" },
+  { name: "only[]=prod twice (read as prod,prod)", npmrc: "only[]=prod\nonly[]=prod\n", npm: "include", pnpm: "include" },
+  { name: "only[]=prod, only[]=bogus (bogus dropped)", npmrc: "only[]=prod\nonly[]=bogus\n", npm: "omit", pnpm: "include" },
+  { name: "only[]=prod, only[]=false (false kept as null)", npmrc: "only[]=prod\nonly[]=false\n", npm: "include", pnpm: "include" },
+  { name: "dev[]=false and production=true (a list is true)", npmrc: "dev[]=false\nproduction=true\n", npm: "include", pnpm: "omit" },
+  { name: "also[]=dev and production=true", npmrc: "also[]=dev\nproduction=true\n", npm: "include", pnpm: "omit" },
+  { name: "also[]=null, also[]=dev and production=true", npmrc: "also[]=null\nalso[]=dev\nproduction=true\n", npm: "omit", pnpm: "omit" },
+  { name: "omit=dev and optional[]=false", npmrc: "omit=dev\noptional[]=false\n", npm: "omit", pnpm: "include" },
 ];

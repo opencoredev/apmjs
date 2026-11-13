@@ -2,7 +2,7 @@
 // read the way it reads them. The table in fixtures/omission-cases.ts is what real npm 9 and pnpm 10 do with each
 // setting (real-layouts.test.ts installs every case with them); here apm's reading is held to it.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
@@ -59,12 +59,81 @@ describe("each setting, as real npm and pnpm read it", () => {
 
 describe("the .npmrc reader", () => {
   test("decodes quotes, comments, lists, bare keys and sections the way npm's ini does", () => {
-    const ini = decodeIni(['a="x y"', "b='z'", "c=v ; note", "d=v \\; kept", "e[]=1", "e[]=2", "f", "g=true", 'h="null"', "  i = spaced  ", "[sec]", "j=hidden"].join("\n"));
+    const ini = decodeIni(['a="x y"', "b='z'", "c=v ; note", "d=v \\; kept", "e[]=1", "e[]=2", "f", "g=true", 'h="null"', "  i = spaced  ", "[sec]", "j=hidden"].join("\n"), "exact");
 
     const one = (t: string) => ({ kind: "one", item: text(t) }) satisfies IniValue;
     const lit = (value: boolean | null) => ({ kind: "one", item: { kind: "literal", value } }) satisfies IniValue;
 
     expect(Object.fromEntries(ini)).toEqual({ a: one("x y"), b: one("z"), c: one("v"), d: one("v ; kept"), e: { kind: "list", items: [text("1"), text("2")] }, f: lit(true), g: lit(true), h: lit(null), i: one("spaced") });
+  });
+});
+
+// Review of a24c6aa, finding 1: a section header followed by whitespace is a section to ini 4.1.0 and later (npm 11,
+// upstream npm 9.6 on), and a bare key to ini 3 (Debian's npm 9.2) and to pnpm 10. apm reads the files with the
+// grammar of the ini the npm on PATH uses, and when it cannot find that ini, omits only when both readings do.
+describe("finding 1 of a24c6aa: section headers read with the grammar of npm's own ini", () => {
+  /** An npm on PATH whose ini is `iniVersion`: bundled in npm's node_modules, or (debian) beside npm. */
+  function npmOnPath(input: { iniVersion: string; layout: "bundled" | "debian" }): string {
+    const top = join(base, `npm${++n}`);
+    const npmRoot = input.layout === "bundled" ? join(top, "lib", "node_modules", "npm") : join(top, "share", "nodejs", "npm");
+    const iniDir = input.layout === "bundled" ? join(npmRoot, "node_modules", "ini") : join(top, "share", "nodejs", "ini");
+    const bin = join(top, "bin");
+
+    mkdirSync(join(npmRoot, "bin"), { recursive: true });
+    mkdirSync(iniDir, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(npmRoot, "bin", "npm-cli.js"), "");
+    writeFileSync(join(iniDir, "package.json"), JSON.stringify({ name: "ini", version: input.iniVersion }));
+    symlinkSync(join(npmRoot, "bin", "npm-cli.js"), join(bin, "npm"));
+
+    return bin;
+  }
+
+  const npmWith = (npmrc: string, path: string | undefined) => {
+    const p = project({ npmrc });
+
+    return devGroup({ pm: "npm", root: p.root, env: path === undefined ? p.env : { ...p.env, PATH: path }, production: false }).kind;
+  };
+
+  test("[section] then a space: npm 11's ini 6 opens a section, ini 3 reads a key (on a24c6aa: omit for ini 6, the install includes)", () => {
+    const ini6 = npmOnPath({ iniVersion: "6.0.0", layout: "bundled" });
+    const ini41 = npmOnPath({ iniVersion: "4.1.0", layout: "bundled" });
+    const ini40 = npmOnPath({ iniVersion: "4.0.0", layout: "bundled" });
+    const debian = npmOnPath({ iniVersion: "3.0.1", layout: "debian" });
+
+    expect(npmWith("[section] \nproduction=true\n", ini6)).toBe("include");
+    expect(npmWith("[section]\t\nonly=prod\n", ini6)).toBe("include");
+    expect(npmWith("[section] \nproduction=true\n", ini41)).toBe("include");
+    expect(npmWith("[section] \nproduction=true\n", ini40)).toBe("omit");
+    expect(npmWith("[section] \nproduction=true\n", debian)).toBe("omit");
+    expect(npmWith("[section]\t\nonly=prod\n", debian)).toBe("omit");
+  });
+
+  test("the inverse: omit=dev before [section] and production=false omits with ini 6 (on a24c6aa: include, a false refusal)", () => {
+    const ini6 = npmOnPath({ iniVersion: "6.0.0", layout: "bundled" });
+    const debian = npmOnPath({ iniVersion: "3.0.1", layout: "debian" });
+
+    expect(npmWith("omit=dev\n[section] \nproduction=false\n", ini6)).toBe("omit");
+    expect(npmWith("omit=dev\n[section] \nproduction=false\n", debian)).toBe("include");
+  });
+
+  test("no npm ini to read: omit only when both grammars omit", () => {
+    expect(npmWith("[section] \nproduction=true\n", undefined)).toBe("include");
+    expect(npmWith("omit=dev\n[section] \nproduction=false\n", undefined)).toBe("include");
+    expect(npmWith("production=true\n[section] \nomit=optional\n", undefined)).toBe("omit");
+  });
+
+  test("pnpm 10 reads [section] then a space as a key, so production=true after it is top-level", () => {
+    const p = project({ npmrc: "[section] \nproduction=true\n" });
+
+    expect(devGroup({ pm: "pnpm", root: p.root, env: p.env, production: false }).kind).toBe("omit");
+  });
+
+  test("the reader: exact and spaced section syntax", () => {
+    const src = "[sec] \nj=x\n";
+
+    expect(Object.fromEntries(decodeIni(src, "spaced"))).toEqual({});
+    expect([...decodeIni(src, "exact").keys()]).toEqual(["[sec]", "j"]);
   });
 });
 
