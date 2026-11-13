@@ -9,9 +9,10 @@ export const COMPATIBILITY_FLAGS: readonly string[] = ["nodejs_compat"];
  * a Worker spends about 4.7 times the CPU this repository's benchmark machine does per unit (vite 8.3.8: 5.2 s against
  * 1.1 s), so a full meter is about 70 s there, and three 0.187.0 (168 million units) was stopped at the default 30 s
  * every time and only ever stored the smaller re-run's incomplete score. Five minutes, the most Cloudflare allows,
- * would leave the full meter four times that. Until the operator approves that billing change, the limit stays at
- * Cloudflare's default 30 s: a version that needs more is stopped, recovery stores the smaller re-run's result
- * (incomplete), and installs warn about it. Raising it is this one constant. Requests are bounded by their own
- * work and never analyse anything.
+ * would leave the full meter four times that. The operator approved 60 s: measured on staging, every package
+ * analysed in under 5 s except prettier, which needs 28-35 s and was stopped at 30 s on 7 of 10 versions, so 60 s
+ * covers everything measured with about twice the headroom. A version that needs more is stopped, recovery stores the
+ * smaller re-run's result (incomplete), and installs warn about it. Requests are bounded by their own work and never
+ * analyse anything.
  */
-export const WORKER_CPU_MS = 30_000;
+export const WORKER_CPU_MS = 60_000;

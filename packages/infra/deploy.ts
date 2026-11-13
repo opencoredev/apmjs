@@ -20,7 +20,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { buildWorker, TAIL_DIR } from "../registry/scripts/build.ts";
+import { buildWorker } from "../registry/scripts/build.ts";
 import { authSecret, prepareDatabase, type DatabaseReport } from "./stage.ts";
 
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
@@ -144,13 +144,9 @@ if (secret.kind === "missing") process.stdout.write(`auth secret: missing; deplo
 
 // plan must not change the working tree: it bundles into a throwaway folder that is removed afterwards
 const planDir = args.action === "plan" ? mkdtempSync(join(tmpdir(), "apm-plan-bundle-")) : null;
-const planTailDir = args.action === "plan" ? mkdtempSync(join(tmpdir(), "apm-plan-tail-")) : null;
 const bundle = planDir === null ? await buildWorker("worker") : await buildWorker("worker", planDir);
 
-// in a folder of its own: a bundle: false upload takes every module in its entry's folder and below
-const tailBundle = await buildWorker("tail", planTailDir ?? TAIL_DIR);
-
-process.stdout.write(`registry bundle: ${bundle}\ntail bundle: ${tailBundle}\n`);
+process.stdout.write(`registry bundle: ${bundle}\n`);
 
 const subdomain = await workersSubdomain(token, accountId);
 const alchemyFlags: string[] = [];
@@ -176,7 +172,6 @@ const child = Bun.spawn(
       NEON_URL: neonUrl,
       APM_DATABASE: database,
       APM_REGISTRY_BUNDLE: bundle,
-      APM_TAIL_BUNDLE: tailBundle,
       AUTH_SECRET: secret.kind === "missing" ? "plan-only-stand-in-for-the-auth-secret-deploy-creates" : secret.value,
       GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
       GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
@@ -193,6 +188,6 @@ const child = Bun.spawn(
 
 const exitCode = await child.exited;
 
-for (const dir of [planDir, planTailDir]) if (dir !== null) rmSync(dir, { recursive: true, force: true });
+if (planDir !== null) rmSync(planDir, { recursive: true, force: true });
 
 process.exit(exitCode);

@@ -12,7 +12,6 @@ apps/web/.next
 
 # registry Worker bundles
 packages/registry/dist
-packages/registry/dist-tail
 .alchemy
 .open-next
 .wrangler

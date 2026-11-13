@@ -54,19 +54,6 @@ export default Alchemy.Stack(
     const debugTokenHash = yield* Config.withDefault(Config.String("DEBUG_TOKEN_HASH"), "");
     const debug = Object.fromEntries(debugTokenHash === "" ? [] : [["APM_DEBUG_TOKEN_HASH", debugTokenHash]]);
 
-    // PENDING REMOVAL, once the owner approves deleting it: the tail Worker an earlier version of fix/first-run created
-    // on staging (apmjs-analysis-tail-staging). It is declared here only so a deploy does not delete it. It is inert:
-    // no registry Worker lists it as a tail consumer, it has no bindings, and its handler (registry/src/tail.ts) does
-    // nothing. Removing this declaration (and tail.ts, its build in scripts/build.ts and deploy.ts) makes the next
-    // deploy of a stage delete it there. Only staging ever had it, so production never creates one.
-    if (!production) yield* Cloudflare.Worker("AnalysisTail", {
-      name: `apmjs-analysis-tail-${stage}`,
-      main: yield* Config.withDefault(Config.String("APM_TAIL_BUNDLE"), resolve(import.meta.dirname, "../registry/dist-tail/tail.js")),
-      bundle: false,
-      compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
-      workersDev: false,
-    });
-
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
       main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
