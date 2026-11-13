@@ -257,7 +257,7 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     return { status: out.status, body: ResolveBody.parse(JSON.parse(out.raw)), raw: out.raw };
   };
 
-  const scan = async (body: { packages: { name: string; version: string; integrity?: string }[]; strict?: boolean; os?: string; cpu?: string; cooldown?: string; floor?: number }) => {
+  const scan = async (body: { packages: { name: string; version: string; integrity?: string; bundled?: boolean }[]; strict?: boolean; os?: string; cpu?: string; cooldown?: string; floor?: number }) => {
     const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     const program = Effect.flatMap(scanResponse(req, { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
     const out = await Effect.runPromise(program.pipe(Effect.provide(layers()), Effect.scoped));
@@ -638,6 +638,51 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(off.body?.warnings).toEqual([]);
       expect(low.body?.warnings).toEqual([]);
       expect(bad.status).toBe(400);
+    });
+  });
+
+  describe("review of 2a098b1: integrity apm cannot compare, and bundled versions", () => {
+    test("finding 1: an integrity of an algorithm the registry does not know is unverified: a warning, fatal in strict mode, never clean", async () => {
+      const loose = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha256-p6A28Td4tQL4GfvBkRK5iXJm/j9ByYvriNEepD83m8k=" }], cooldown: "0", floor: 0 });
+      const strict = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha256-p6A28Td4tQL4GfvBkRK5iXJm/j9ByYvriNEepD83m8k=" }], cooldown: "0", floor: 0, strict: true });
+
+      // on 2a098b1: 200 with no blocked entries, no warnings and nothing unchecked, even in strict mode
+      expect(loose.body?.blocked).toEqual([]);
+      expect(loose.body?.warnings.map((w) => `${w.kind}: ${w.text.slice(0, 22)}`)).toEqual(["unchecked: integrity not verified"]);
+      expect(strict.body?.advisories.map((a) => `${a.package}@${a.version}:${a.level}`)).toEqual(["peer-a@1.0.0:fatal"]);
+    });
+
+    test("finding 1: a matching weak hash does not vouch for a strongest hash the registry does not know, and a mismatching one in a shared algorithm refuses", async () => {
+      const weak = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha1-x sha512-ZZZZ" }], cooldown: "0", floor: 0 });
+      const extra = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha1-x sha1-y" }], cooldown: "0", floor: 0 });
+
+      // on 2a098b1: both passed as clean
+      expect(weak.body?.blocked).toEqual([]);
+      expect(weak.body?.warnings.map((w) => w.kind)).toEqual(["unchecked"]);
+      expect(extra.body?.blocked.map((b) => b.kind)).toEqual(["integrity"]);
+    });
+
+    test("finding 1: two integrities a lockfile holds for one version are each compared", async () => {
+      const r = await scan({ packages: [{ name: "peer-a", version: "1.0.0", integrity: "sha1-x" }, { name: "peer-a", version: "1.0.0", integrity: "sha1-y" }], cooldown: "0", floor: 0 });
+
+      // on 2a098b1: the second was dropped as a duplicate of peer-a@1.0.0
+      expect(r.body?.blocked.map((b) => `${b.package}@${b.version}:${b.kind}`)).toEqual(["peer-a@1.0.0:integrity"]);
+    });
+
+    test("finding 2: a bundled version is refused when revoked or yanked, and is asked for no score, cooldown or integrity", async () => {
+      const r = await scan({
+        packages: [
+          { name: "host-p", version: "1.0.1", bundled: true },
+          { name: "many-yanked", version: "2.0.3", bundled: true },
+          { name: "fresh-dep", version: "1.0.0", bundled: true, integrity: "sha512-other" },
+          { name: "no-such-bundled", version: "1.0.0", bundled: true },
+        ],
+      });
+
+      expect(r.body?.blocked.map((b) => `${b.package}@${b.version}:${b.kind}`)).toEqual(["host-p@1.0.1:revoked", "many-yanked@2.0.3:yanked"]);
+      // fresh-dep is an hour old and has no matching integrity: neither counts for code that ships in its parent
+      expect(r.body?.warnings).toEqual([]);
+      expect(r.body?.unchecked).toEqual([]);
     });
   });
 

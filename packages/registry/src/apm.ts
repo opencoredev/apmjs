@@ -43,6 +43,9 @@ import {
   type SecretScan,
   type TarEntry,
   servableManifest,
+  compareIntegrity,
+  sha1FromShasum,
+  type IntegrityMatch,
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
@@ -2895,7 +2898,9 @@ export const resolveResponse = (url: URL) =>
  * `cpu` an older scanner sends is ignored.
  */
 const ScanBody = z.object({
-  packages: z.array(z.object({ name: z.string(), version: z.string(), integrity: z.string().max(1024).optional() })),
+  // `bundled`: the version ships inside another package's tarball, so only its state (revoked, yanked, confirmed
+  // malicious) is asked about, never a score, a cooldown or an integrity
+  packages: z.array(z.object({ name: z.string(), version: z.string(), integrity: z.string().max(1024).optional(), bundled: z.boolean().optional() })),
   strict: z.boolean().optional(),
   // apm add's --cooldown and --floor, as resolve takes them: the cooldown is the one asked for, the floor never under
   // the default (resolve lowers it for the named package only, which apm add applies itself)
@@ -2933,38 +2938,24 @@ type ScanOne =
   | { kind: "clean" }
   | { kind: "advisory"; advisory: ScanAdvisory }
   | { kind: "blocked"; blocked: ScanBlocked }
-  | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "cooldown" | "unscorable" | "unavailable" }
+  | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "cooldown" | "unscorable" | "unavailable" | "integrity" }
   | { kind: "unchecked"; unchecked: ScanUnchecked }
   | { kind: "pending"; unchecked: ScanUnchecked };
 
-/** One package's findings. Whatever its os and cpu, it is checked: the package manager is about to install it. */
 /**
- * Whether the integrity a caller's lockfile holds names other bytes than `stored`: only when both name the same hash
- * algorithm, since a lockfile may hold sha1 where the registry keeps sha512. An SRI string may list several hashes.
+ * What the integrity a caller's lockfile holds says about the bytes this registry serves (review of 2a098b1, finding 1):
+ * `matched`, `mismatched` (other bytes, refused in every mode) or `unverified` (the two cannot be compared: a warning,
+ * refused in strict mode), never matched by default. The registry knows its integrity and, from its shasum, a sha1.
  */
-export function integrityDiffers(sent: string | undefined, stored: string): boolean {
-  if (sent === undefined || stored === "") return false;
+export function scanIntegrity(sent: string | undefined, stored: { integrity: string; shasum: string }): IntegrityMatch | null {
+  if (sent === undefined) return null;
+  const sha1 = sha1FromShasum(stored.shasum);
 
-  const hashes = (sri: string): Map<string, string> =>
-    new Map(
-      sri
-        .trim()
-        .split(/\s+/)
-        .flatMap((h) => {
-          const dash = h.indexOf("-");
-
-          return dash > 0 ? [[h.slice(0, dash), h.slice(dash + 1)] as const] : [];
-        }),
-    );
-
-  const ours = hashes(stored);
-  const theirs = hashes(sent);
-  const shared = [...theirs.keys()].filter((alg) => ours.has(alg));
-
-  return shared.length > 0 && shared.every((alg) => ours.get(alg) !== theirs.get(alg));
+  return compareIntegrity({ sent, known: [stored.integrity, ...(sha1 === null ? [] : [sha1])].join(" ") });
 }
 
-const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy }) =>
+/** One package's findings. Whatever its os and cpu, it is checked: the package manager is about to install it. */
+const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined; bundled?: boolean | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy }) =>
   Effect.gen(function* () {
     const { p, strict, at, lease, policy } = input;
     const { webUrl } = yield* RegistryConfig;
@@ -2988,10 +2979,14 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
     if (src === "unknown") return [flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")] satisfies ScanOne[];
 
-    if (src === null) return unchecked("not on this registry or upstream");
+    // a bundled version ships inside its parent's tarball, which the parent's score covers: only its version state is
+    // asked about here, and a version no registry knows is the parent's to vouch for (review of 2a098b1, finding 2)
+    const parentVouches: ScanOne[] = [{ kind: "clean" }];
+
+    if (src === null) return p.bundled === true ? parentVouches : unchecked("not on this registry or upstream");
     const v0 = src.versions.find((x) => x.version === p.version);
 
-    if (!v0) return unchecked("no such version");
+    if (!v0) return p.bundled === true ? parentVouches : unchecked("no such version");
 
     const blocked = (kind: ScanBlocked["kind"], reason: string): ScanOne => ({ kind: "blocked", blocked: { package: p.name, version: p.version, kind, reason } });
 
@@ -3002,12 +2997,17 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
       return [{ kind: "advisory", advisory }, blocked("revoked", description)] satisfies ScanOne[];
     }
 
-    // another artifact than the one this registry serves under that name and version
-    if (integrityDiffers(p.integrity, v0.integrity)) {
-      const description = `${p.name}@${p.version}: the lockfile's integrity ${p.integrity ?? ""} is not the ${v0.integrity} this registry serves, so it is not the version apm checked.`;
+    // another artifact than the one this registry serves under that name and version: refused in every mode. One the
+    // registry cannot compare is not called a match: a warning, refused in strict mode
+    const integrity = p.bundled === true ? null : scanIntegrity(p.integrity, v0);
+
+    if (integrity?.kind === "mismatched") {
+      const description = `${p.name}@${p.version}: the lockfile's integrity ${p.integrity ?? ""} is not the ${v0.integrity} this registry serves (its ${integrity.algorithm} differs), so it is not the version apm checked.`;
 
       return [{ kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description, url } }, blocked("integrity", description)] satisfies ScanOne[];
     }
+
+    const unverified: ScanOne[] = integrity?.kind === "unverified" ? [flagged(stateWarning({ kind: "unchecked", name: p.name, version: p.version, text: `integrity not verified: the lockfile's ${p.integrity ?? ""}: ${integrity.reason}, so apm cannot tell it is the artifact the registry serves`, url, via: [] }), "integrity")] : [];
 
     // confirmed malicious by an apm reviewer: refused in every mode
     if (yield* reviewerConfirmed(v0)) {
@@ -3018,9 +3018,12 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
 
     // yanked: no advisory, so a lockfile keeps installing it through the Bun scanner, but apm add refuses it
     const yanked: ScanOne[] = v0.status === "yanked" ? [blocked("yanked", `${p.name}@${p.version} was yanked by its maintainer${v0.status_reason ? `: ${v0.status_reason}` : ""}`)] : [];
+
+    // bundled: no cooldown, score or analysis of its own (its parent's covers the bytes); its state is all that counts
+    if (p.bundled === true) return yanked.length > 0 ? yanked : parentVouches;
     // inside the cooldown: a warning (strict: refused), and the version is still checked
     const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
-    const findings: ScanOne[] = [...yanked, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
+    const findings: ScanOne[] = [...yanked, ...unverified, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
     // a stored analysis of these exact bytes is reused; a version never analyzed is queued
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
@@ -3064,8 +3067,9 @@ export const scanResponse = (req: Request, caller: Caller) =>
     const cap = signedIn ? MAX_SCAN : MAX_SCAN_ANONYMOUS;
     const seen = new Set<string>();
 
+    // one entry per version and artifact: two integrities a lockfile holds for one version are each compared
     const packages = body.packages.filter((p) => {
-      const key = `${p.name}@${p.version}`;
+      const key = `${p.name}@${p.version} ${p.integrity ?? ""} ${p.bundled === true ? "bundled" : ""}`;
 
       if (seen.has(key)) return false;
       seen.add(key);
