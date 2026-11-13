@@ -41,6 +41,9 @@ describe("apm add's question to the registry", () => {
         const name = url.searchParams.get("name") ?? "";
         const installed = url.searchParams.get("installed");
 
+        // an edge that refuses a long request line answers 414 with no JSON
+        if (name === "too-long") return new Response("Request-URI Too Large", { status: 414 });
+
         asked.set(name, { os: url.searchParams.get("os"), cpu: url.searchParams.get("cpu"), installed });
         // the registry's answer for the peer host: the version the project pins, or the newest in range
         const pin = (installed ?? "").split(",").find((e) => e.startsWith("host"));
@@ -151,5 +154,15 @@ describe("apm add's question to the registry", () => {
     expect(r.text).toContain("WARNING 8 platform binaries (@next/swc-*): 2 too large to analyze");
     expect(r.text).toContain("WARNING plain-dep@1.0.0 apm cannot score this version");
     expect(r.text).not.toContain("WARNING @next/swc-linux-x64-gnu");
+  });
+
+  // review of 16fc8b5, finding 6: a 414 said only "HTTP 414"
+  test("an HTTP 414 says the request was too long and that nothing was installed", async () => {
+    const cwd = project("long", {});
+    const r = await add({ cwd, pm: "npm", pkg: "too-long", json: false });
+
+    expect(r.code).not.toBe(0);
+    expect(r.text).toContain("the request was too long for");
+    expect(r.text).toContain("nothing was installed");
   });
 });
