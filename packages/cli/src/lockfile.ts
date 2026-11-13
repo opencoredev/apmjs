@@ -1,5 +1,6 @@
-// What the package manager locked: the entry for one name@version (checked before an install), and every
-// node an install put under the packages apm added (checked after it, before any install script runs).
+// What a package manager locked: every node of a lockfile, each with where it comes from (a registry, git, a file, a
+// link or the project's own workspace). apm add and apm x check the lockfile the package manager computes, in a
+// directory of its own, before anything is installed (see docs/ARCHITECTURE.md, "How `apm add` makes the package manager install what apm checked").
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
@@ -8,28 +9,40 @@ import type { Pm } from "./pm.ts";
 export type Locked = { integrity: string | null; resolved: string | null };
 
 /**
- * One installed package as the lockfile records it. `key` is the lockfile's own id for it. `platform`: the entry names
- * the os or cpu it is built for (a platform binary, which the lockfile keeps for every platform).
+ * Where a lockfile entry's bytes come from. `registry`: a registry tarball, which the scan checks by name, version and
+ * integrity. The others keep what the lockfile says (`source`): no registry can check them, so they warn and strict
+ * mode refuses them.
  */
-export type LockNode = { key: string; name: string; version: string; integrity: string | null; resolved: string | null; hasInstallScript: boolean; platform: boolean };
+export type Origin = { kind: "registry" } | { kind: "git" | "file" | "link" | "workspace" | "tarball"; source: string };
+
+/**
+ * One installed package as the lockfile records it. `key` is the lockfile's own id for it (npm and bun: its install
+ * path). `platform`: the entry names the os or cpu it is built for. `bundled`: it ships inside its parent's tarball
+ * (npm's inBundle), so the parent's score covers it and it has no artifact of its own.
+ */
+export type LockNode = { key: string; name: string; version: string; integrity: string | null; resolved: string | null; hasInstallScript: boolean; platform: boolean; origin: Origin; bundled: boolean };
 
 /** An os or cpu field: a list, or (bun) one name. */
 const Platforms = z.union([z.array(z.string()), z.string()]).optional().catch(undefined);
 
 const hasPlatform = (e: { os?: string[] | string | undefined; cpu?: string[] | string | undefined }): boolean => e.os !== undefined || e.cpu !== undefined;
 
-/** The nodes under the added packages, or why apm could not read them. */
+/** The nodes of a lockfile, or why apm could not read them. */
 export type LockRead = { kind: "read"; path: string; nodes: LockNode[] } | { kind: "missing" } | { kind: "unreadable"; path: string; reason: string };
 
 export type LockPm = Exclude<Pm, "yarn">;
 
-export const LOCKFILES: Record<LockPm, string[]> = {
+/**
+ * The lockfiles each package manager reads, in its order of precedence: npm uses npm-shrinkwrap.json over
+ * package-lock.json when both are there (review of a2227d1, finding 2).
+ */
+export const LOCKFILES: Record<LockPm, readonly [string, ...string[]]> = {
   bun: ["bun.lock"],
-  npm: ["package-lock.json", "npm-shrinkwrap.json"],
+  npm: ["npm-shrinkwrap.json", "package-lock.json"],
   pnpm: ["pnpm-lock.yaml"],
 };
 
-// What each package manager keeps in node_modules when the project lockfile is turned off.
+// What each package manager keeps in node_modules when the project lockfile is turned off (read for projectPins only).
 const HIDDEN_LOCKFILES: Record<LockPm, string[]> = {
   bun: [],
   npm: [join("node_modules", ".package-lock.json")],
@@ -40,13 +53,21 @@ export function isLockPm(pm: Pm): pm is LockPm {
   return pm !== "yarn";
 }
 
+/** The lockfile `pm` reads in `dir` itself, by precedence, or null. */
+export function lockfileIn(dir: string, pm: LockPm): string | null {
+  for (const f of LOCKFILES[pm]) if (existsSync(join(dir, f))) return join(dir, f);
+
+  return null;
+}
+
 /** The nearest lockfile for `pm` from `cwd` upward, or null. */
 export function findLockfile(cwd: string, pm: LockPm): string | null {
   let dir = cwd;
 
   for (let i = 0; i < 20; i++) {
-    for (const f of LOCKFILES[pm]) if (existsSync(join(dir, f))) return join(dir, f);
+    const hit = lockfileIn(dir, pm);
 
+    if (hit !== null) return hit;
     const parent = dirname(dir);
 
     if (parent === dir) return null;
@@ -68,6 +89,27 @@ function splitId(id: string): { name: string; spec: string } | null {
 /** A plain semver version (what a registry serves), not a git, file, link or workspace spec. */
 export function isRegistryVersion(v: string): boolean {
   return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(v);
+}
+
+/** A registry tarball URL: `<registry>/<name>/-/<file>.tgz`. A tarball anywhere else is not a registry's. */
+const REGISTRY_TARBALL = /^https?:\/\/[^\s]+\/-\/[^/\s]+\.tgz$/;
+
+const GIT = /^(?:git\+|git:|github:|gitlab:|bitbucket:|gist:)/;
+
+/** The origin of a spec or resolved location that is not a plain registry version. */
+function originOf(source: string): Origin {
+  if (GIT.test(source) || /^https?:\/\/codeload\.github\.com\//.test(source)) return { kind: "git", source };
+
+  if (source.startsWith("workspace:")) return { kind: "workspace", source };
+
+  if (source.startsWith("link:") || source.startsWith("portal:")) return { kind: "link", source };
+
+  if (source.startsWith("file:")) return { kind: "file", source };
+
+  if (/^https?:\/\//.test(source)) return { kind: "tarball", source };
+
+  // a path, as npm records a link's target
+  return { kind: "link", source };
 }
 
 const DepMap = z.record(z.string(), z.string());
@@ -94,7 +136,7 @@ function walk(input: { roots: string[]; edges: (key: string) => string[] }): str
   return [...seen];
 }
 
-// ---------- npm: package-lock.json v2/v3 ----------
+// ---------- npm: package-lock.json and npm-shrinkwrap.json v2/v3 ----------
 const NpmEntry = z
   .object({
     name: z.string().optional(),
@@ -102,6 +144,7 @@ const NpmEntry = z
     resolved: z.string().optional(),
     integrity: z.string().optional(),
     link: z.boolean().optional(),
+    inBundle: z.boolean().optional(),
     hasInstallScript: z.boolean().optional(),
     dependencies: DepMap.optional(),
     optionalDependencies: DepMap.optional(),
@@ -111,7 +154,26 @@ const NpmEntry = z
   })
   .loose();
 
-const NpmLock = z.object({ packages: z.record(z.string(), NpmEntry) }).loose();
+type NpmPackages = Record<string, z.infer<typeof NpmEntry>>;
+
+const NpmLock = z.object({ lockfileVersion: z.number().min(2, "lockfileVersion 1 has no packages section; run npm install once to upgrade it"), packages: z.record(z.string(), NpmEntry) }).loose();
+
+/** An entry under node_modules (an installed package), not a folder of the project (a workspace or a link's target). */
+const isInstallPath = (key: string): boolean => key.startsWith("node_modules/") || key.includes("/node_modules/");
+
+/** Where an npm entry's bytes come from: its `resolved`, not its version (review of a2227d1, finding 4). */
+function npmOrigin(key: string, e: z.infer<typeof NpmEntry>): Origin {
+  if (!isInstallPath(key)) return { kind: "workspace", source: key };
+
+  if (e.link === true) return originOf(`link:${e.resolved ?? ""}`);
+  const resolved = e.resolved;
+
+  if (resolved !== undefined && !REGISTRY_TARBALL.test(resolved)) return originOf(resolved);
+
+  if (e.version === undefined || !isRegistryVersion(e.version)) return originOf(resolved ?? e.version ?? key);
+
+  return { kind: "registry" };
+}
 
 function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
   const { packages } = NpmLock.parse(JSON.parse(text));
@@ -135,7 +197,10 @@ function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
   const edges = (key: string): string[] => {
     const e = packages[key];
 
-    if (!e || e.link) return [];
+    if (!e) return [];
+
+    // a link's dependencies are its target's
+    if (e.link === true) return e.resolved !== undefined && packages[e.resolved] ? [e.resolved] : [];
 
     return Object.keys({ ...e.dependencies, ...e.optionalDependencies, ...e.peerDependencies }).flatMap((d) => resolve(key, d) ?? []);
   };
@@ -148,21 +213,31 @@ function npmGraph(text: string, from: string, roots: Roots): LockNode[] {
   return keys.flatMap((key) => npmNode(packages, key));
 }
 
-/** The node at `key` of a package-lock.json, or none for a link or an entry without a version. */
-function npmNode(packages: z.infer<typeof NpmLock>["packages"], key: string | null): LockNode[] {
+/** The node at `key` of a package-lock.json. A link whose target the lockfile holds is that target's node, so none here. */
+function npmNode(packages: NpmPackages, key: string | null): LockNode[] {
   if (key === null) return [];
   const e = packages[key];
 
-  if (!e || e.link || e.version === undefined) return [];
+  if (!e) return [];
+  const name = e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length);
 
-  return [{ key, name: e.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length), version: e.version, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true, platform: hasPlatform(e) }];
+  if (e.link === true) {
+    if (e.resolved !== undefined && packages[e.resolved]) return [];
+
+    return [{ key, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: e.resolved ?? null, hasInstallScript: false, platform: false, origin: npmOrigin(key, e), bundled: false }];
+  }
+
+  // a workspace folder or a link's target: named by its own package.json
+  const folderName = isInstallPath(key) ? name : (e.name ?? key.split("/").at(-1) ?? key);
+
+  return [{ key, name: folderName, version: e.version ?? "0.0.0", integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true, platform: hasPlatform(e), origin: npmOrigin(key, e), bundled: e.inBundle === true }];
 }
 
 /** A top-level entry of a package-lock.json asked for as `name`: a link (a workspace package) is a node too, never a registry version. */
-function npmTop(packages: z.infer<typeof NpmLock>["packages"], name: string, key: string | null): LockNode[] {
+function npmTop(packages: NpmPackages, name: string, key: string | null): LockNode[] {
   const e = key === null ? undefined : packages[key];
 
-  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false, platform: false }];
+  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin: originOf(`link:${e.resolved ?? ""}`), bundled: false }];
 
   return npmNode(packages, key).map((node) => ({ ...node, key: name }));
 }
@@ -251,8 +326,9 @@ function bunGraph(text: string, roots: Roots): LockNode[] {
     const e = entries.get(key);
 
     if (!e) return [];
+    const origin: Origin = isRegistryVersion(e.id.spec) ? { kind: "registry" } : originOf(e.id.spec);
 
-    return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true, platform: hasPlatform(e.meta) }];
+    return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true, platform: hasPlatform(e.meta), origin, bundled: false }];
   };
 
   if (roots.kind === "top") return roots.names.flatMap((n) => node(resolve([], n) ?? "").map((x) => ({ ...x, key: n })));
@@ -269,7 +345,8 @@ const PnpmImporter = z
   .loose();
 
 const PnpmSnapshot = z.object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional() }).loose();
-const PnpmPackage = PnpmSnapshot.extend({ resolution: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose().optional(), requiresBuild: z.boolean().optional(), os: Platforms, cpu: Platforms });
+const PnpmResolution = z.object({ integrity: z.string().optional(), tarball: z.string().optional(), type: z.string().optional(), repo: z.string().optional(), commit: z.string().optional(), directory: z.string().optional() }).loose();
+const PnpmPackage = PnpmSnapshot.extend({ resolution: PnpmResolution.optional(), requiresBuild: z.boolean().optional(), os: Platforms, cpu: Platforms });
 
 const PnpmLock = z
   .object({
@@ -286,6 +363,20 @@ function pnpmKey(name: string, version: string): string | null {
   return /^@?[^@(]+@/.test(version) && !/^\d/.test(version) ? version : `${name}@${version}`;
 }
 
+/** Where a pnpm package's bytes come from: its resolution. */
+function pnpmOrigin(spec: string, resolution: z.infer<typeof PnpmResolution> | undefined): Origin {
+  if (resolution?.type === "git") return { kind: "git", source: `${resolution.repo ?? ""}#${resolution.commit ?? ""}` };
+
+  if (resolution?.type === "directory") return { kind: "link", source: resolution.directory ?? spec };
+  const tarball = resolution?.tarball;
+
+  if (tarball !== undefined && !REGISTRY_TARBALL.test(tarball)) return originOf(tarball);
+
+  if (!isRegistryVersion(spec)) return originOf(spec);
+
+  return { kind: "registry" };
+}
+
 function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
   const lock = PnpmLock.parse(Bun.YAML.parse(text));
   const packages = lock.packages ?? {};
@@ -293,7 +384,8 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
   const pkgOf = (key: string): z.infer<typeof PnpmPackage> | undefined => packages[key.replace(/\(.*$/, "")] ?? packages[`/${key}`] ?? packages[`/${key.replace(/\(.*$/, "")}`];
   const snapOf = (key: string): z.infer<typeof PnpmSnapshot> | undefined => (snapshots ? snapshots[key] : packages[key] ?? packages[`/${key}`]);
   const top = lock.importers?.[importer] ?? lock.importers?.["."];
-  const topDeps = { ...top?.dependencies, ...top?.devDependencies, ...top?.optionalDependencies };
+  const depsOf = (imp: z.infer<typeof PnpmImporter> | undefined) => ({ ...imp?.dependencies, ...imp?.devDependencies, ...imp?.optionalDependencies });
+  const topDeps = depsOf(top);
 
   const topKey = (r: string): string | null => {
     const v = topDeps[r];
@@ -315,8 +407,11 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
 
     if (!id || !p) return [];
 
-    return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true, platform: hasPlatform(p) }];
+    return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true, platform: hasPlatform(p), origin: pnpmOrigin(id.spec, p.resolution), bundled: false }];
   };
+
+  /** A link:, file: or workspace: dependency: no package entry, kept with its origin. */
+  const local = (name: string, spec: string): LockNode => ({ key: `${name}@${spec}`, name, version: spec, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin: originOf(spec), bundled: false });
 
   if (roots.kind === "top") {
     // a link:, file: or workspace: entry has no node: it is not a registry version, which projectPins says
@@ -326,11 +421,59 @@ function pnpmGraph(text: string, importer: string, roots: Roots): LockNode[] {
       if (v === undefined) return [];
       const key = topKey(n);
 
-      return key === null ? [{ key: n, name: n, version: v, integrity: null, resolved: null, hasInstallScript: false, platform: false }] : node(key).map((x) => ({ ...x, key: n }));
+      return key === null ? [{ ...local(n, v), key: n }] : node(key).map((x) => ({ ...x, key: n }));
     });
   }
 
-  return walk({ roots: rootKeys, edges }).flatMap(node);
+  const nodes = walk({ roots: rootKeys, edges }).flatMap(node);
+
+  if (roots.kind !== "all") return nodes;
+  // every importer's local dependencies (a workspace member, a link): each kept, with its origin (review of a2227d1, finding 4)
+  const locals = new Map<string, LockNode>();
+
+  // the workspace's own packages: each importer but the root, named by its directory (projectLayout knows its name)
+  for (const dir of Object.keys(lock.importers ?? {})) if (dir !== ".") locals.set(`workspace:${dir}`, { ...local(dir, `workspace:${dir}`), key: `workspace:${dir}` });
+
+  for (const imp of Object.values(lock.importers ?? {})) {
+    for (const [n, v] of Object.entries(depsOf(imp))) if (pnpmKey(n, v) === null) locals.set(`${n}@${v}`, local(n, v));
+  }
+
+  return [...nodes, ...locals.values()];
+}
+
+// ---------- yarn berry: yarn.lock (YAML, version 4 and up) ----------
+const YarnBerryEntry = z.object({ version: z.string(), resolution: z.string(), checksum: z.string().optional(), dependencies: DepMap.optional(), linkType: z.string().optional() }).loose();
+
+/**
+ * A yarn berry lockfile's packages. Its checksums hash yarn's own archives, not the registry tarball, so apm sends no
+ * integrity for them. The project's own workspace root is not a package.
+ */
+export function yarnBerryNodes(text: string): LockNode[] {
+  const doc = z.record(z.string(), z.unknown()).parse(Bun.YAML.parse(text));
+  const out: LockNode[] = [];
+
+  for (const [key, raw] of Object.entries(doc)) {
+    if (key === "__metadata") continue;
+    const e = YarnBerryEntry.safeParse(raw);
+
+    if (!e.success) throw new Error(`yarn.lock entry ${key} has no version or resolution`);
+    const id = splitId(e.data.resolution);
+
+    if (id === null) throw new Error(`yarn.lock entry ${key} has a resolution apm cannot read (${e.data.resolution})`);
+
+    if (id.spec === "workspace:.") continue;
+    const npm = /^npm:(.+)$/.exec(id.spec)?.[1];
+    const origin: Origin = npm !== undefined && isRegistryVersion(npm) ? { kind: "registry" } : originOf(id.spec.replace(/^patch:/, "file:patch:"));
+
+    out.push({ key, name: id.name, version: npm ?? id.spec, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin, bundled: false });
+  }
+
+  return out;
+}
+
+/** Whether `text` is a yarn berry lockfile (classic yarn.lock has no __metadata). */
+export function isYarnBerryLock(text: string): boolean {
+  return /^__metadata:/m.test(text);
 }
 
 function graphOf(input: { pm: LockPm; path: string; lockDir: string; cwd: string; roots: Roots }): LockNode[] {
@@ -353,6 +496,15 @@ function graphOf(input: { pm: LockPm; path: string; lockDir: string; cwd: string
   }
 }
 
+/** Every node of the lockfile at `path` (the one apm had the package manager compute), or why it could not be read. */
+export function readLock(input: { pm: LockPm; path: string; cwd: string }): LockRead {
+  try {
+    return { kind: "read", path: input.path, nodes: graphOf({ pm: input.pm, path: input.path, lockDir: dirname(input.path), cwd: input.cwd, roots: { kind: "all" } }) };
+  } catch (e) {
+    return { kind: "unreadable", path: input.path, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /** Every node the lockfile puts under the packages named in `roots`, the roots included (or every node). */
 export function lockedTree(input: { cwd: string; pm: LockPm; roots: Roots }): LockRead {
   const found = findLockfile(input.cwd, input.pm);
@@ -367,18 +519,6 @@ export function lockedTree(input: { cwd: string; pm: LockPm; roots: Roots }): Lo
   } catch (e) {
     return { kind: "unreadable", path: at.path, reason: e instanceof Error ? e.message : String(e) };
   }
-}
-
-/** The lockfile entry for name@version, or null when there is no lockfile or no entry apm can read (yarn's included). */
-export function lockedEntry(input: { cwd: string; pm: Pm; name: string; version: string }): Locked | null {
-  if (!isLockPm(input.pm)) return null;
-
-  const read = lockedTree({ cwd: input.cwd, pm: input.pm, roots: { kind: "all" } });
-
-  if (read.kind !== "read") return null;
-  const hit = read.nodes.find((n) => n.name === input.name && n.version === input.version);
-
-  return hit ? { integrity: hit.integrity, resolved: hit.resolved } : null;
 }
 
 /**
@@ -444,7 +584,7 @@ export function projectPins(input: { cwd: string; pm: Pm; names: readonly string
 
     if (node.name !== n) out.set(n, { kind: "unknown", why: `${n} installs ${node.name}, an alias` });
     // a git, file or remote tarball entry carries the version its package.json says, not a registry's
-    else if (!isRegistryVersion(node.version) || (node.resolved !== null && !/^https?:\/\//.test(node.resolved))) out.set(n, { kind: "unknown", why: `${n} is not installed from a registry (${node.resolved ?? node.version})` });
+    else if (node.origin.kind !== "registry" || (node.resolved !== null && !/^https?:\/\//.test(node.resolved))) out.set(n, { kind: "unknown", why: `${n} is not installed from a registry (${node.resolved ?? node.version})` });
     else out.set(n, { kind: "pinned", version: node.version });
   }
 

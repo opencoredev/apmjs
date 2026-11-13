@@ -3,7 +3,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bunKeyNames, lockedTree, projectPins, type LockPm } from "../src/lockfile.ts";
+import { bunKeyNames, isYarnBerryLock, lockedTree, projectPins, readLock, yarnBerryNodes, type LockPm } from "../src/lockfile.ts";
 
 const dirs: string[] = [];
 
@@ -184,5 +184,122 @@ snapshots:
     const broken = project("package-lock.json", "{ not json");
 
     expect(pins({ pm: "npm", cwd: broken, names: ["host"] }).host?.kind).toBe("unknown");
+  });
+});
+
+// review of a2227d1, findings 2, 3 and 4: every node of a lockfile, each with where it comes from
+describe("readLock: every node, with its origin", () => {
+  const nodes = (pm: LockPm, file: string, text: string) => {
+    const dir = project(file, text);
+    const r = readLock({ pm, path: join(dir, file), cwd: dir });
+
+    if (r.kind !== "read") throw new Error(`not read: ${r.kind === "unreadable" ? r.reason : r.kind}`);
+
+    return r.nodes.map((n) => `${n.name}@${n.version} ${n.origin.kind}${n.bundled ? " bundled" : ""}`).sort();
+  };
+
+  test("npm: a file tarball with a plain version is a file, a git entry git, a link and its workspace folder one workspace node, inBundle bundled", () => {
+    const lock = {
+      lockfileVersion: 3,
+      packages: {
+        "": { workspaces: ["packages/*"] },
+        "node_modules/reg": { version: "1.0.0", resolved: "https://registry.example/reg/-/reg-1.0.0.tgz", integrity: "sha512-reg" },
+        "node_modules/reg/node_modules/inner": { version: "2.0.0", inBundle: true },
+        "node_modules/local-leaf": { version: "1.0.0", resolved: "file:../local-leaf-1.0.0.tgz", integrity: "sha512-same-bytes" },
+        "node_modules/gitdep": { version: "2.0.0", resolved: "git+ssh://git@github.com/x/y.git#abc" },
+        "node_modules/elsewhere": { version: "3.0.0", resolved: "https://example.com/elsewhere.tgz", integrity: "sha512-x" },
+        "node_modules/member": { resolved: "packages/member", link: true },
+        "packages/member": { name: "member", version: "0.1.0" },
+      },
+    };
+
+    expect(nodes("npm", "package-lock.json", JSON.stringify(lock))).toEqual(["elsewhere@3.0.0 tarball", "gitdep@2.0.0 git", "inner@2.0.0 registry bundled", "local-leaf@1.0.0 file", "member@0.1.0 workspace", "reg@1.0.0 registry"]);
+  });
+
+  test("npm: lockfileVersion 1 has no packages section and is not read", () => {
+    const dir = project("package-lock.json", JSON.stringify({ lockfileVersion: 1, dependencies: { a: { version: "1.0.0" } } }));
+
+    expect(readLock({ pm: "npm", path: join(dir, "package-lock.json"), cwd: dir }).kind).toBe("unreadable");
+  });
+
+  test("bun: workspace, file and link entries keep their origin", () => {
+    const lock = `{
+      "lockfileVersion": 1,
+      "workspaces": { "": {} },
+      "packages": {
+        "reg": ["reg@1.0.0", "", {}, "sha512-reg"],
+        "member": ["member@workspace:packages/member"],
+        "local": ["local@file:../local", {}],
+        "linked": ["linked@link:linked"],
+      },
+    }`;
+
+    expect(nodes("bun", "bun.lock", lock)).toEqual(["linked@link:linked link", "local@file:../local file", "member@workspace:packages/member workspace", "reg@1.0.0 registry"]);
+  });
+
+  test("pnpm: git and directory resolutions, link: dependencies and the workspace's members", () => {
+    const lock = `lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      reg:
+        specifier: 1.0.0
+        version: 1.0.0
+      linked:
+        specifier: link:../linked
+        version: link:../linked
+  packages/member: {}
+packages:
+  reg@1.0.0:
+    resolution: {integrity: sha512-reg}
+  gitdep@https://codeload.github.com/x/y/tar.gz/abc:
+    resolution: {tarball: https://codeload.github.com/x/y/tar.gz/abc}
+  dirdep@file:../dir:
+    resolution: {directory: ../dir, type: directory}
+snapshots:
+  reg@1.0.0:
+    dependencies:
+      gitdep: https://codeload.github.com/x/y/tar.gz/abc
+      dirdep: file:../dir
+  gitdep@https://codeload.github.com/x/y/tar.gz/abc: {}
+  dirdep@file:../dir: {}
+`;
+
+    expect(nodes("pnpm", "pnpm-lock.yaml", lock)).toEqual(["dirdep@file:../dir link", "gitdep@https://codeload.github.com/x/y/tar.gz/abc git", "linked@link:../linked link", "packages/member@workspace:packages/member workspace", "reg@1.0.0 registry"]);
+  });
+
+  test("yarn berry: npm resolutions are registry versions, the root workspace is not a package, a patch is local", () => {
+    const lock = `__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"project@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "project@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"leaf@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "leaf@npm:1.0.0"
+  checksum: 10c0/abc
+  languageName: node
+  linkType: hard
+
+"member@workspace:packages/member":
+  version: 0.0.0-use.local
+  resolution: "member@workspace:packages/member"
+  languageName: unknown
+  linkType: soft
+
+"fixed@patch:fixed@npm%3A1.0.0#./p.patch::version=1.0.0":
+  version: 1.0.0
+  resolution: "fixed@patch:fixed@npm%3A1.0.0#./p.patch::version=1.0.0"
+  languageName: node
+  linkType: hard
+`;
+
+    expect(isYarnBerryLock(lock)).toBe(true);
+    expect(yarnBerryNodes(lock).map((n) => `${n.name}@${n.version} ${n.origin.kind}`).sort()).toEqual(["fixed@patch:fixed@npm%3A1.0.0#./p.patch::version=1.0.0 file", "leaf@1.0.0 registry", "member@workspace:packages/member workspace"]);
   });
 });
