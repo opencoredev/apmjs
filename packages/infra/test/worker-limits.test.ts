@@ -24,8 +24,8 @@ describe("the registry Worker's CPU limit", () => {
     expect(resource("Registry")).toMatch(/limits: \{ cpuMs: WORKER_CPU_MS \}/);
   });
 
-  test("it is above Cloudflare's default and within its maximum", () => {
-    expect(WORKER_CPU_MS).toBeGreaterThan(30_000);
+  test("it is at least Cloudflare's default and within its maximum", () => {
+    expect(WORKER_CPU_MS).toBeGreaterThanOrEqual(30_000);
     expect(WORKER_CPU_MS).toBeLessThanOrEqual(300_000);
   });
 });

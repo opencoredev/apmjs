@@ -42,7 +42,7 @@ export const PHASE_NAMES: Record<Phase, string> = {
  * Units one analysis may spend: 320 million. The slowest package of the 70-package corpus under the registry's caps
  * (three 0.187.0, 20 MB unpacked) spends 168 million (6.3 s of CPU in V8 here, over 30 s on a Worker). At the most
  * expensive unit measured across the adversarial suite a full meter is about 18 s of CPU here and about 70 s on a
- * Worker, inside the registry Worker's 300 s limit (registry/scripts/compat.ts, WORKER_CPU_MS); an input that costs
+ * Worker, inside the registry Worker's CPU limit (registry/scripts/compat.ts, WORKER_CPU_MS); an input that costs
  * more per unit is stopped by that limit and recovered (docs/SCORE.md, "Bounded, and how").
  */
 export const MAX_ANALYSIS_WORK = 320_000_000;

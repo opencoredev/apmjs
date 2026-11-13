@@ -12,7 +12,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { StoreError } from "../src/errors.ts";
@@ -582,8 +582,11 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
         const up = failingUpstream(kind === "probe" ? { probe: "unknown" } : { tarball: () => Effect.succeed({ kind: "unavailable", reason: "the upstream answered 503", retryable: true }) });
         const outcomes: unknown[] = [];
 
+        // deliveries far enough apart that the failures span the hour the give-up also needs, whatever the CPU limit
+        const step = Math.max(RUN_WINDOW_MS, Math.ceil(FETCH_GIVE_UP_MS / MAX_FETCH_FAILURES));
+
         for (let i = 0; i <= MAX_FETCH_FAILURES; i++) {
-          const exit = await runAt(db.url, T0 + i * RUN_WINDOW_MS, up.layer);
+          const exit = await runAt(db.url, T0 + i * step, up.layer);
 
           outcomes.push(Exit.isSuccess(exit) ? exit.value : "failed");
         }

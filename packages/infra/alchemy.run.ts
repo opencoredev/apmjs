@@ -59,7 +59,7 @@ export default Alchemy.Stack(
       main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
       bundle: false,
       compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
-      // the queue consumer's one analysis per invocation needs more than the default 30 s of CPU (compat.ts, WORKER_CPU_MS)
+      // the queue consumer's CPU limit per analysis (compat.ts, WORKER_CPU_MS): the default 30 s until a raise is approved
       limits: { cpuMs: WORKER_CPU_MS },
       env: {
         HYPERDRIVE: postgres,
