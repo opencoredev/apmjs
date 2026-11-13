@@ -45,6 +45,9 @@ type V = {
 
 type P = { name: string; latest?: string; versions: V[] };
 
+/** Whole version rows a resolve read, what its pool had charged as each versionsIn read began, and that pool. */
+type WholeReads = { rows: number; chargedAtRead: number[]; pool: MemoryPool | null };
+
 /** A version published ten days ago with no dependencies. */
 const v = (version: string, extra: Omit<V, "version"> = {}): V => ({ version, ...extra });
 
@@ -147,7 +150,8 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     { name: "foo", versions: [v("1.0.0", { dependencies: { plugin: "1.0.0" } }), v("1.1.0", { ageMs: HOUR })] },
     pkg("plugin", { peerDependencies: { foo: "^1.0.0" } }),
     pkg("project-plugin", { peerDependencies: { "host-p": "^1.0.0" } }),
-    { name: "host-p", versions: [v("1.0.0", { ageMs: HOUR }), v("1.1.0")] },
+    // review of 1924692, finding 1: the project pins host-p@1.0.0, inside the cooldown, and the newest in range is 1.1.0
+    { name: "host-p", versions: [v("1.0.0", { ageMs: HOUR }), v("1.0.1", { status: "revoked", statusReason: "malware" }), v("1.1.0")] },
     // 4. the root's candidates
     { name: "many-yanked", versions: [v("1.0.0"), ...Array.from({ length: 25 }, (_, i) => v(`2.0.${i}`, { status: "yanked", statusReason: "bad build" }))] },
     { name: "many-fresh", versions: [v("1.0.0"), ...Array.from({ length: 45 }, (_, i) => v(`2.0.${i}`, { ageMs: HOUR }))] },
@@ -187,7 +191,7 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
    * Whole version rows (manifest and score) the store has read since the counter was reset, by any read, and what the
    * request's pool had charged when each versionsIn read began.
    */
-  const whole: { rows: number; chargedAtRead: number[]; pool: MemoryPool | null } = { rows: 0, chargedAtRead: [], pool: null };
+  const whole: WholeReads = { rows: 0, chargedAtRead: [], pool: null };
 
   /** The real store, counting every whole version row it reads. */
   const countingStore = () =>
@@ -351,16 +355,54 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(strict.body.tree?.blocks.map((b) => `${b.name}@${b.version}`)).toEqual(["foo@1.1.0"]);
     });
 
-    test("a peer nothing in the walk installs is named as the project's when apm add says the project lists it", async () => {
-      const told = await resolve("project-plugin", { installed: "host-p,left-pad" });
-      const Peers = z.object({ tree: z.object({ projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })) }) });
+    const Peers = z.object({ tree: z.object({ projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()), kind: z.string(), version: z.string().nullable() })) }) });
 
-      // on 93274c8: no way to say so; the walk still checks the version the range picks, as it did
-      expect(Peers.parse(JSON.parse(told.raw)).tree.projectPeers).toEqual([{ dependency: "host-p@^1.0.0", via: ["project-plugin@1.0.0"] }]);
+    test("a peer the project lists with no lockfile entry is checked at the newest in range, and named as the project's", async () => {
+      const told = await resolve("project-plugin", { installed: "host-p,left-pad" });
+
+      expect(Peers.parse(JSON.parse(told.raw)).tree.projectPeers).toEqual([{ dependency: "host-p@^1.0.0", via: ["project-plugin@1.0.0"], kind: "newest", version: "1.1.0" }]);
       expect(names(told)).toEqual(["host-p@1.1.0"]);
       expect(Peers.parse(JSON.parse((await resolve("project-plugin")).raw)).tree.projectPeers).toEqual([]);
       expect((await resolve("project-plugin", { installed: "Not A Name" })).status).toBe(400);
+      expect((await resolve("project-plugin", { installed: "host-p@^1.0.0" })).status).toBe(400);
       expect((await resolve("project-plugin", { installed: Array.from({ length: 501 }, (_, i) => `p${i}`).join(",") })).status).toBe(400);
+    });
+
+    // review of 1924692, finding 1: npm uses the project's pinned host@1.0.0, and the walk checked host@1.1.0, so strict
+    // mode installed a version inside the cooldown with no warning
+    test("a peer the project's lockfile pins is checked at that version: a warning, and strict mode refuses it", async () => {
+      const r = await resolve("project-plugin", { installed: "host-p@1.0.0" });
+
+      // on 1924692: host-p@1.1.0 checked, no warning
+      expect(r.status).toBe(200);
+      expect(names(r)).toEqual(["host-p@1.0.0"]);
+      expect(r.body.warnings.map((w) => [w.kind, `${w.name}@${w.version}`])).toEqual([["cooldown", "host-p@1.0.0"]]);
+      expect(Peers.parse(JSON.parse(r.raw)).tree.projectPeers).toEqual([{ dependency: "host-p@^1.0.0", via: ["project-plugin@1.0.0"], kind: "lockfile", version: "1.0.0" }]);
+
+      const strict = await resolve("project-plugin", { installed: "host-p@1.0.0", strict: "1" });
+
+      // on 1924692: 200
+      expect(strict.status).toBe(422);
+      expect(strict.body.tree?.blocks.map((b) => `${b.name}@${b.version}`)).toEqual(["host-p@1.0.0"]);
+    });
+
+    test("a pinned version that was revoked is refused in every mode", async () => {
+      const r = await resolve("project-plugin", { installed: "host-p@1.0.1" });
+
+      // on 1924692: 200, host-p@1.1.0 checked
+      expect(r.status).toBe(422);
+      expect(r.body.tree?.blocks.map((b) => [`${b.name}@${b.version}`, b.reason])).toEqual([["host-p@1.0.1", "revoked by its owner"]]);
+    });
+
+    test("a peer whose project version apm cannot tell is unchecked: a warning, and strict mode refuses it", async () => {
+      const r = await resolve("project-plugin", { installed: "host-p@?" });
+
+      expect(r.status).toBe(200);
+      expect(names(r)).toEqual([]);
+      expect(r.body.tree?.unchecked).toBe(1);
+      expect(r.body.warnings.map((w) => [w.kind, w.name])).toEqual([["unchecked", "host-p"]]);
+      expect(Peers.parse(JSON.parse(r.raw)).tree.projectPeers.map((p) => [p.kind, p.version])).toEqual([["unknown", null]]);
+      expect((await resolve("project-plugin", { installed: "host-p@?", strict: "1" })).status).toBe(422);
     });
   });
 
@@ -471,6 +513,15 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
 
       expect(names(any)).toEqual(["bin-linux@1.0.0", "bin-mac@1.0.0", "bin-not-win@1.0.0", "bin-win@1.0.0", "win-helper@1.0.0"]);
       expect(any.body.tree?.skippedForPlatform).toEqual([]);
+    });
+
+    // review of 1924692, findings 2 and 3: the CLI asks about every platform, and groups the binaries it gets back
+    test("each package built for particular platforms is marked with them, so a client can group them", async () => {
+      const any = await resolve("native-app");
+      const Marked = z.object({ tree: z.object({ packages: z.array(z.object({ name: z.string(), platform: z.object({ os: z.array(z.string()), cpu: z.array(z.string()) }).optional() })) }) });
+      const marked = Object.fromEntries(Marked.parse(JSON.parse(any.raw)).tree.packages.map((p) => [p.name, p.platform ?? null]));
+
+      expect(marked).toEqual({ "bin-linux": { os: ["linux"], cpu: ["x64"] }, "bin-mac": { os: ["darwin"], cpu: ["arm64"] }, "bin-not-win": { os: ["!win32"], cpu: [] }, "bin-win": { os: ["win32"], cpu: ["x64"] }, "win-helper": null });
     });
 
     test("a required dependency built for another platform is still walked", async () => {

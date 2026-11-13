@@ -207,9 +207,10 @@ describe("the resolve walk bounds its database work", () => {
         expect(r.status).toBe(200);
         expect(r.body.tree.packages).toEqual([{ name: "leaf", version: "1.0.0" }]);
         expect(r.body.tree.unchecked).toBe(0);
-        // the root (package, version heads, its picked versions, dismissals) and the leaf's catalog, once each; AI
-        // review is off. The root reads heads first and only its candidates whole (review of 93274c8, finding 5)
-        expect(r.queries).toBeLessThanOrEqual(7);
+        // the root (package, version heads, its picked versions' sizes, its picked versions, dismissals) and the leaf's
+        // catalog, once each; AI review is off. The root reads heads first and only its candidates whole (review of
+        // 93274c8, finding 5), reserved from their sizes before they are read (review of 1924692, finding 4)
+        expect(r.queries).toBeLessThanOrEqual(8);
       },
     ));
 
@@ -305,8 +306,9 @@ describe("the resolve walk bounds its database work", () => {
         expect(r.body.tree.packages.length).toBe(100);
         expect(r.body.tree.unchecked).toBe(0);
         expect(asked).toBe(100);
-        // the root's catalog, then per level: this registry's packages (none here) and npm's analyses with dismissals
-        expect(r.queries).toBeLessThanOrEqual(12);
+        // the root's catalog (its sizes read first), then per level: this registry's packages (none here) and npm's
+        // analyses with dismissals
+        expect(r.queries).toBeLessThanOrEqual(13);
       }));
 
     test("a dependency npm answers 404 for is reported as not existing, not as npm being unreachable", () =>

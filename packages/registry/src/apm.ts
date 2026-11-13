@@ -11,6 +11,7 @@ import {
   installEdges,
   isTargetValue,
   platformMismatch,
+  platformOf,
   type DependencyEdge,
   type DependencySpec,
   type InstallManifest,
@@ -29,6 +30,7 @@ import {
   typoConflicts,
   editDistance,
   isValidPackageName,
+  isValidVersion,
   dependencyNames,
   missingEntries,
   COOLDOWN_MS,
@@ -1799,25 +1801,57 @@ function parseTarget(input: { os: string | null | undefined; cpu: string | null 
   return { kind: "ok", target: { os, cpu } };
 }
 
-/** The names resolve's `installed` may list at most: a project's direct dependencies, comma-separated. */
+/** The entries resolve's `installed` may list at most: a project's direct dependencies, comma-separated. */
 export const MAX_INSTALLED_NAMES = 500;
 
-type InstalledParse = { kind: "ok"; names: ReadonlySet<string> } | { kind: "invalid"; error: string };
+/**
+ * What the project already installs under a name its package.json lists, as apm add read it from the lockfile:
+ * `pinned`, the version the lockfile pins; `newest`, a name with no lockfile, or none for it, which the package manager
+ * installs at the newest version in range; `unknown`, a lockfile apm cannot read (yarn's), or an entry it cannot pin
+ * (an alias, a git or file dependency).
+ */
+export type ProjectDep = { kind: "pinned"; version: string } | { kind: "newest" } | { kind: "unknown" };
+
+/** The project's direct dependencies, by the name each installs under. */
+export type ProjectDeps = ReadonlyMap<string, ProjectDep>;
+
+type InstalledParse = { kind: "ok"; deps: ProjectDeps } | { kind: "invalid"; error: string };
+
+/** One entry of `installed`: `name`, `name@version` (the lockfile's pin) or `name@?` (a version apm cannot tell). */
+function installedEntry(entry: string): { name: string; dep: ProjectDep } | null {
+  const at = entry.lastIndexOf("@");
+
+  if (at <= 0) return isValidPackageName(entry) ? { name: entry, dep: { kind: "newest" } } : null;
+  const name = entry.slice(0, at);
+  const version = entry.slice(at + 1);
+
+  if (!isValidPackageName(name)) return null;
+
+  if (version === "?") return { name, dep: { kind: "unknown" } };
+
+  return isValidVersion(version) ? { name, dep: { kind: "pinned", version } } : null;
+}
 
 /**
- * The names a resolve's `installed` lists: the project's direct dependencies, read from its package.json by apm add.
- * None when it is left out. A name apm cannot read, or more than MAX_INSTALLED_NAMES, is an error, never "none".
+ * The project's direct dependencies a resolve's `installed` lists (apm add reads them from the project's package.json
+ * and lockfile): each `name`, `name@version` or `name@?` (installedEntry). None when it is left out. An entry apm
+ * cannot read, or more than MAX_INSTALLED_NAMES, is an error, never "none".
  */
 function parseInstalled(raw: string | null): InstalledParse {
-  if (raw === null || raw.trim() === "") return { kind: "ok", names: new Set() };
-  const names = raw.split(",").map((n) => n.trim());
+  if (raw === null || raw.trim() === "") return { kind: "ok", deps: new Map() };
+  const entries = raw.split(",").map((n) => n.trim());
 
-  if (names.length > MAX_INSTALLED_NAMES) return { kind: "invalid", error: `installed lists at most ${MAX_INSTALLED_NAMES} names (got ${names.length})` };
-  const bad = names.find((n) => !isValidPackageName(n));
+  if (entries.length > MAX_INSTALLED_NAMES) return { kind: "invalid", error: `installed lists at most ${MAX_INSTALLED_NAMES} names (got ${entries.length})` };
+  const deps = new Map<string, ProjectDep>();
 
-  if (bad !== undefined) return { kind: "invalid", error: `installed must list package names separated by commas (got "${bad}")` };
+  for (const e of entries) {
+    const parsed = installedEntry(e);
 
-  return { kind: "ok", names: new Set(names) };
+    if (parsed === null) return { kind: "invalid", error: `installed must list package names, each alone, as name@version or as name@?, separated by commas (got "${e}")` };
+    deps.set(parsed.name, parsed.dep);
+  }
+
+  return { kind: "ok", deps };
 }
 
 type TreeBlock = { name: string; version: string; reason: string; via: string[] };
@@ -1838,8 +1872,9 @@ type PlatformSkip = { dependency: string; version: string; reason: string; via: 
  * the walk stopped at one of its limits. `skippedForPlatform`: optional dependencies the install's platform does not
  * take (at most MAX_UNCHECKED_LISTED listed, `platformSkips` counts them all). `packages`: every name@version the walk
  * checked, so the CLI can pin each scope in the tree to this registry. `projectPeers`: required peers nothing in the
- * walk installs whose names the project's package.json lists (resolve's `installed`). `digests`: the tarball digest of each of those,
- * which keys its AI review; not sent.
+ * walk installs whose names the project's package.json lists (resolve's `installed`), with the version checked for
+ * each. `withdrawn`: versions the project's lockfile pins that are revoked or yanked, refused in every mode. `digests`:
+ * the tarball digest of each of those, which keys its AI review; not sent.
  */
 type Tree = {
   warnings: InstallWarning[];
@@ -1852,9 +1887,16 @@ type Tree = {
   skippedForPlatform: PlatformSkip[];
   platformSkips: number;
   projectPeers: ProjectPeer[];
-  packages: { name: string; version: string }[];
+  withdrawn: TreeBlock[];
+  packages: CheckedPackage[];
   digests: (string | null)[];
 };
+
+/**
+ * A package the walk checked. `platform`: the os and cpu it is built for, when its manifest lists any (a platform
+ * binary, which installs only there), so a client can group them.
+ */
+type CheckedPackage = { name: string; version: string; platform?: { os: string[]; cpu: string[] } };
 
 /**
  * A version in the tree with no score yet that the registry will score: an upstream version queued for analysis. Never
@@ -1932,10 +1974,12 @@ type WalkItem = { dep: DependencySpec; edge: DependencyEdge; via: string[]; inst
 
 /**
  * A required peer the walk left to the project: nothing in the walk installs it, and the project's own package.json
- * lists that name, so the package manager uses the project's version when it fits. The walk still checked the version
- * the range picks; the project's own is not known to it.
+ * lists that name, so the package manager uses the project's version. `lockfile`: the walk checked the version the
+ * project's lockfile pins (review of 1924692, finding 1). `newest`: the project has no lockfile entry for it, so the
+ * package manager installs the newest in range, and the walk checked that one. `unknown`: apm could not tell the
+ * project's version, so the peer is unchecked (a warning; strict mode refuses it). `version`: the version checked.
  */
-type ProjectPeer = { dependency: string; via: string[] };
+type ProjectPeer = { dependency: string; via: string[]; kind: "lockfile" | "newest" | "unknown"; version: string | null };
 
 /**
  * Walks the dependency tree the package manager would install (newest active version matching each range, npm:
@@ -1950,11 +1994,12 @@ type ProjectPeer = { dependency: string; via: string[] };
  * one batch, and each name and range is resolved once. Everything it could not score is counted and listed, never
  * dropped.
  */
-const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; projectNames?: ReadonlySet<string>; limits?: WalkLimits }) =>
+const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; project?: ProjectDeps; limits?: WalkLimits }) =>
   Effect.gen(function* () {
     const { root, policy, target, lease } = input;
-    const projectNames = input.projectNames ?? new Set<string>();
+    const project: ProjectDeps = input.project ?? new Map();
     const projectPeers: ProjectPeer[] = [];
+    const withdrawn: TreeBlock[] = [];
     const projectPeerSeen = new Set<string>();
     const limits = input.limits ?? WALK_LIMITS;
     const at = yield* now;
@@ -1997,7 +2042,10 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
     const seen = new Set<string>();
     // every catalog the walk reads, it holds (summarized) until it answers: together they stay under maxWeight, inside
     // the request's lease, so the root and its reloads count beside them (review of 6862fc7, finding 4)
-    const catalogs = pickMemo(lease.child(limits.maxWeight), (v) => v.status === "active");
+    // a version the project's lockfile pins is what installs, so it is found whatever its state, and refused below
+    // when it is withdrawn; the package manager would never pick any other withdrawn version
+    const pins = new Set([...project].flatMap(([n, d]) => (d.kind === "pinned" ? [`${n}@${d.version}`] : [])));
+    const catalogs = pickMemo(lease.child(limits.maxWeight), (v) => v.status === "active" || pins.has(`${v.package}@${v.version}`));
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
     const lookupKey = pickKey;
@@ -2083,32 +2131,49 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         break;
       }
 
-      const dep = item.dep;
+      const asked = item.dep;
 
-      if (!isRegistryDependency(dep)) {
+      if (!isRegistryDependency(asked)) {
         // a peer the walk cannot pick a version for is listed as one, never left out
-        miss(dep, item.edge === "peer" ? `peer dependency: ${uncheckableReason(dep)}` : uncheckableReason(dep), item.via);
+        miss(asked, item.edge === "peer" ? `peer dependency: ${uncheckableReason(asked)}` : uncheckableReason(asked), item.via);
         continue;
       }
 
-      if (item.edge === "peer" && dep.kind === "registry") {
+      let dep: RegistryDependency = asked;
+      // the project's own entry, when this is a required peer nothing in the walk installs and its package.json lists it
+      let provided: ProjectPeer | null = null;
+
+      if (item.edge === "peer" && asked.kind === "registry") {
         // met only by the peer's own package, installed under the peer's name, at a version in its range: nothing more
         // is installed for it
-        const there = installedPeer(dep, item);
+        const there = installedPeer(asked, item);
 
-        if (there !== null && there.name === dep.name && satisfies(there.version, dep.range)) continue;
+        if (there !== null && there.name === asked.name && satisfies(there.version, asked.range)) continue;
+        const own = there === null ? project.get(asked.key) : undefined;
 
-        // nothing in the walk installs it: the project's own, when its package.json lists the name, is what the
-        // package manager uses if it fits. The walk cannot see that version, so it checks the one the range picks and
-        // says the project's is not checked
-        if (there === null && projectNames.has(dep.key) && !projectPeerSeen.has(dep.key)) {
-          projectPeerSeen.add(dep.key);
+        // nothing in the walk installs it, and the project lists it: the package manager uses the project's version.
+        // The version the lockfile pins is the one checked; with no lockfile entry, the newest in range, which is what
+        // the package manager installs then; a version apm cannot tell is unchecked (review of 1924692, finding 1)
+        if (own !== undefined) {
+          if (projectPeerSeen.has(asked.key)) continue;
+          projectPeerSeen.add(asked.key);
+          provided = { dependency: describeDependency(asked), via: item.via, kind: own.kind === "pinned" ? "lockfile" : own.kind, version: own.kind === "pinned" ? own.version : null };
 
-          if (projectPeers.length < MAX_UNCHECKED_LISTED) projectPeers.push({ dependency: describeDependency(dep), via: item.via });
+          if (projectPeers.length < MAX_UNCHECKED_LISTED) projectPeers.push(provided);
+
+          if (own.kind === "unknown") {
+            miss(asked, `peer dependency: your project provides ${asked.key}, and apm could not read which version its lockfile installs`, item.via);
+            continue;
+          }
+
+          // the project's own package, under the name it installs as, at the version its lockfile pins
+          if (own.kind === "pinned") dep = { kind: "registry", key: asked.key, name: asked.key, range: own.version, aliased: false };
+          // at the top of node_modules, beside everything: a peer anywhere below finds it there
+          children.get(TOP)?.set(dep.key, dep);
         }
       }
 
-      if (item.edge === "peer") {
+      if (item.edge === "peer" && provided === null) {
         // added beside the package that wants it: a peer of a package beside it, or below it, is met by this one
         const beside = children.get(item.via.length >= 2 ? (item.via[item.via.length - 2] ?? TOP) : TOP);
 
@@ -2155,6 +2220,16 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
 
       const key = `${dep.name}@${picked.v.version}`;
 
+      if (provided !== null && provided.kind === "newest") provided.version = picked.v.version;
+      // a version the lockfile pins that its owner revoked or yanked: the package manager would install it, so the
+      // install is refused in every mode
+      const gone = withheldBlock(picked.v);
+
+      if (gone !== null) {
+        if (!withdrawn.some((w) => `${w.name}@${w.version}` === key)) withdrawn.push({ name: dep.name, version: picked.v.version, reason: gone, via: item.via });
+        continue;
+      }
+
       if (item.edge === "optional") {
         // the package manager skips an optional dependency built for another platform: it is not checked, and nothing
         // it depends on is walked, so it cannot change what the install is told
@@ -2173,7 +2248,9 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
 
       if (seen.has(key)) continue;
       seen.add(key);
-      packages.push({ name: dep.name, version: picked.v.version });
+      const platform = platformOf(picked.v.manifest);
+
+      packages.push(platform === null ? { name: dep.name, version: picked.v.version } : { name: dep.name, version: picked.v.version, platform });
       const digest = digestOf(picked.v);
       digests.push(digest ? digestLabel(digest) : null);
       let v = picked.v;
@@ -2220,7 +2297,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${unlisted} more ${unlisted === 1 ? "dependency was" : "dependencies were"} not checked (git or URL specs, missing packages or the walk's limits)`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     }
 
-    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, packages, digests };
+    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, withdrawn, packages, digests };
 
     return tree;
   });
@@ -2342,7 +2419,7 @@ type ResolveMode = { strict: boolean; final: boolean };
 /** A later page of a resolve's root, read under `lease` (rootPage): the catalog, or why it could not be read. */
 type PageRead = (offset: number, lease: Lease) => ReturnType<typeof catalogWithin>;
 
-type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; projectNames: ReadonlySet<string>; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead };
+type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead };
 
 const resolvePass = (input: PassInput) =>
   Effect.suspend(() => {
@@ -2431,7 +2508,7 @@ type Skipped = { version: string; reason: string; revokeReason: string | null };
  */
 const resolveWalk = (input: PassInput) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, target, projectNames, src, mode, lease } = input;
+    const { name, range, policy, treePolicy, target, project, src, mode, lease } = input;
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
     const skipped: Skipped[] = [];
@@ -2477,7 +2554,7 @@ const resolveWalk = (input: PassInput) =>
         // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
         const pendingRoot = (block === null || block === NOT_SCORED_YET) && unscored?.kind === "queued";
 
-        if (block === null || pendingRoot) return yield* rootAnswer({ name, range, policy, treePolicy, target, projectNames, mode, lease, src: page, v, report, unscored, pendingRoot, skipped, at, webUrl });
+        if (block === null || pendingRoot) return yield* rootAnswer({ name, range, policy, treePolicy, target, project, mode, lease, src: page, v, report, unscored, pendingRoot, skipped, at, webUrl });
         skip({ version: v.version, reason: block, revokeReason: null });
       }
 
@@ -2518,7 +2595,7 @@ const rootAnswer = (input: {
   policy: Policy;
   treePolicy: Policy;
   target: InstallTarget;
-  projectNames: ReadonlySet<string>;
+  project: ProjectDeps;
   mode: ResolveMode;
   lease: Lease;
   src: Catalog;
@@ -2531,15 +2608,21 @@ const rootAnswer = (input: {
   webUrl: string;
 }) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, target, projectNames, mode, lease, src, v, report, unscored, pendingRoot, skipped, at, webUrl } = input;
+    const { name, range, policy, treePolicy, target, project, mode, lease, src, v, report, unscored, pendingRoot, skipped, at, webUrl } = input;
     // a pending root's tree is walked too, so its dependencies are queued while it is
-    const walked = yield* walkTree({ root: v, policy: treePolicy, target, lease, projectNames });
+    const walked = yield* walkTree({ root: v, policy: treePolicy, target, lease, project });
     const tree = treeAnswer(walked, yield* treeReviews(walked));
     const newest = { version: v.version, report: embeddedReport(v, report) };
 
     // a dependency confirmed malicious by an apm reviewer: refused in every mode, since the package manager would
     // install it (the version itself was skipped above)
     const confirmed = tree.reviews.kind === "on" ? tree.reviews.confirmed : [];
+
+    // a version the project's lockfile pins that its owner revoked or yanked: refused in every mode, as the package
+    // manager would install it (review of 1924692, finding 1)
+    if (walked.withdrawn.length > 0) {
+      return answered(json({ error: `${name}@${v.version} would use ${walked.withdrawn.map((w) => `${w.name}@${w.version} (${w.reason})`).join(", ")}, which your project's lockfile pins.`, name, range, version: null, skipped, newest, tree: { ...tree, blocks: walked.withdrawn } }, 422));
+    }
 
     if (confirmed.length > 0) {
       return answered(json({ error: `${name}@${v.version} would install ${confirmed.map((c) => `${c.name}@${c.version}`).join(", ")}, which apm reviewers confirmed ${confirmed.length === 1 ? "is" : "are"} malicious.`, name, range, version: null, skipped, newest, tree, confirmed }, 422));
@@ -2630,12 +2713,12 @@ export const resolveResponse = (url: URL) =>
 
     if (parsedTarget.kind === "invalid") return fail(400, parsedTarget.error);
     const target = parsedTarget.target;
-    // the names the project's package.json already lists (apm add sends them): a peer nothing in the walk installs is
-    // the project's, and the answer says so (review of 93274c8, finding 3)
+    // the project's direct dependencies, each with the version its lockfile pins when apm add could read one: a peer
+    // nothing in the walk installs is the project's, and that version is the one checked (review of 1924692, finding 1)
     const parsedInstalled = parseInstalled(url.searchParams.get("installed"));
 
     if (parsedInstalled.kind === "invalid") return fail(400, parsedInstalled.error);
-    const projectNames = parsedInstalled.names;
+    const project = parsedInstalled.deps;
     const policy = parsedPolicy.policy;
     // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
     // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
@@ -2676,7 +2759,7 @@ export const resolveResponse = (url: URL) =>
 
     for (;;) {
       if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, projectNames, src, page, mode: { strict, final: false }, lease });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -2694,7 +2777,7 @@ export const resolveResponse = (url: URL) =>
         src = yield* reload;
 
         if (!src) return fail(404, `No package named ${name}.`);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, target, projectNames, src, page, mode: { strict, final: true }, lease });
+        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease });
 
         if (last.kind === "answer") return last.response;
       }

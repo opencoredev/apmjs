@@ -240,6 +240,16 @@ function allows(values: readonly string[], value: string): boolean {
 }
 
 /**
+ * The platforms `manifest` is built for, as its os and cpu fields list them (npm's shape), or null when it lists none:
+ * a platform binary, such as @next/swc-linux-x64-gnu, which installs only where they allow.
+ */
+export function platformOf(manifest: InstallManifest): { os: string[]; cpu: string[] } | null {
+  const { os, cpu } = InstallFields.parse(manifest);
+
+  return os.length === 0 && cpu.length === 0 ? null : { os, cpu };
+}
+
+/**
  * Why `manifest`'s os or cpu field rules `target` out, or null when it installs there (npm's rule: a listed value
  * allows, a `!`-prefixed one forbids). A target of "any" is ruled out by nothing.
  */
