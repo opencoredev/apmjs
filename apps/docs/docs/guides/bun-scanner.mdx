@@ -58,6 +58,8 @@ Run the install again a minute later. Set `APM_SCANNER_WAIT_MS` to wait longer o
 
 The scanner blocks every pending version, not only ones new to the registry: it cannot tell a long-published package nobody has installed through apm from one published a minute ago, and both have no score.
 
+Some versions never get a score: a tarball too large to download or unpack, one the upstream serves in no form apm can check, one apm cannot read, or one whose analysis keeps running past the registry's limits. The registry answers each with a `fatal` advisory naming the reason, so the install is cancelled in default mode and in strict mode, including when the version was pending at first and its analysis ended that way while the scanner waited.
+
 ## What it cannot check
 
 The scanner prints one warning per package it could not check:

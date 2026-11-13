@@ -50,7 +50,7 @@ Packages that are not on apm are fetched from `https://registry.npmjs.org/`, che
 
 What `apm add` installs. Query: `name`, `range` (default `latest`), `cooldown` (`24h`, `90m`, `2d`, `0`; a bare number is hours; default 24h), `floor` (default `40`). A lower floor applies to the named package only; its dependencies are checked at 40 or the stricter floor.
 
-- `200`: `{ name, version, report, skipped, source, tree }`. `tree.packages` lists every package the registry walked; `tree.uncheckedDeps` lists those it could not score (git and URL specs, missing packages, past the 300-package walk limit). A `200` never has a version without a score in it.
+- `200`: `{ name, version, report, skipped, source, tree }`. `tree.packages` lists every package the registry walked; `tree.uncheckedDeps` lists those it could not look up (git and URL specs, missing packages, past the 300-package walk limit). A `200` never has a version without a score in it: a dependency the registry decided it can never score is in `tree.blocks` with the reason, and the answer is a `422`.
 - `202`: the version, or a version in its tree, is queued for analysis and has no score yet. The registry waited up to about 20 s for it first. `{ error, name, range, version, pending: [{ name, version, via }], pendingCount, retryAfter, skipped }`, with a `Retry-After` header. Ask again later; nothing in it is a pass.
 - `422`: no version passes. `{ error, name, version: null, skipped, newest, tree }`, where `skipped` gives each version's `reason`, and for a revoked or revoke-pending version the owner's words in `revokeReason`. When `newest` is revoked or pending revocation, its `report` is the score answer's withheld form (`redacted: true`, no evidence lines, each skipped file named `file <n>`).
 - `404`: no such package.
@@ -79,7 +79,7 @@ Name check, as `apm name` shows it: `{ query, valid, taken, available, owners, l
 
 The Bun scanner's check. Body: `{ "packages": [{ "name": "zod", "version": "4.6.7" }] }`. At most 200 packages without a token, 2,000 with one; the rest come back as unchecked.
 
-- `200`: `{ advisories: [{ package, version, level, description, url }], unchecked: [{ package, version, reason }], pending: [{ package, version }], retryAfter? }`. A revoked version (or one pending revocation), or one scoring under 40, comes back with `level: "fatal"`, which makes Bun cancel the install. A version queued for analysis is listed in `pending`, and in `unchecked` too so older scanners never read it as clean.
+- `200`: `{ advisories: [{ package, version, level, description, url }], unchecked: [{ package, version, reason }], pending: [{ package, version }], retryAfter? }`. A revoked version (or one pending revocation), or one scoring under 40, comes back with `level: "fatal"`, which makes Bun cancel the install. A version queued for analysis is listed in `pending`, and in `unchecked` too so older scanners never read it as clean. A version the registry decided it can never score (too large, unavailable, unreadable, past the analysis limits) comes back as a `fatal` advisory with the reason.
 
 ### `POST /-/apm/v1/audit`
 

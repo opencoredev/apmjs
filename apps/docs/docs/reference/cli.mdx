@@ -29,7 +29,7 @@ apm add <package>[@range]... [--force] [--no-cooldown] [--cooldown <duration>] [
 
 Resolves each package to the newest version that passes the policy, checks its dependency tree, installs the exact version with install scripts held back, verifies every installed package against the registry, then runs the scripts. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
 
-A version nobody has scored yet, the package or one of its dependencies, is queued for analysis. The registry waits up to about 20 s for the score, and `apm add` keeps asking for up to 90 s in all, printing what it is waiting for. A cold package usually installs after a few seconds. If anything is still pending after 90 s, `apm add` refuses with `still being analysed, try again in a minute`. It never installs a version as if it passed, and `--force` does not lift this.
+A version nobody has scored yet, the package or one of its dependencies, is queued for analysis. The registry waits up to about 20 s for the score, and `apm add` keeps asking for up to 90 s in all, printing what it is waiting for. A cold package usually installs after a few seconds. If anything is still pending after 90 s, `apm add` refuses with `still being analysed, try again in a minute`. A version the registry has decided it can never score, the package or one of its dependencies, is refused with the reason (`apm cannot score this version: …`). It never installs a version as if it passed, and `--force` does not lift either.
 
 | Flag | Meaning |
 | --- | --- |
