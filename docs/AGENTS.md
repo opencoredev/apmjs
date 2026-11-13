@@ -62,7 +62,7 @@ Before adding a dependency, call the apm MCP tool explain_install for it and fol
 
 ## HTTP, without MCP
 
-- `GET https://apmjs.dev/api/explain?package=<name>[@range]`: the install verdict as JSON (`verdict`, `summary`, `reasons`, `commands`, and `coverage`: `aiReview` is `reviewed`, `in-progress`, `no-answer`, `not-selected`, `disabled`, `unreadable` or `not-read`; `dependencies` is `complete`, `incomplete` or `not-read`). Text the registry passes on from a publisher (a yank reason, a dependency spec) is quoted in code spans in `reasons`; `summary` is apm's own words.
+- `GET https://apmjs.dev/api/explain?package=<name>[@range]`: the install verdict as JSON (`verdict`, `summary`, `reasons`, `commands`, `evidence` (what the version lost points for, at most three lines, each with the file and line it cites, quoted), `url` (the version's page, or null), and `coverage`: `aiReview` is `reviewed`, `in-progress`, `no-answer`, `not-selected`, `disabled`, `unreadable` or `not-read`; `dependencies` is `complete`, `incomplete` or `not-read`). Text the registry passes on from a publisher (a yank reason, a dependency spec) is quoted in code spans in `reasons`; `summary` is apm's own words.
 - The package Markdown view and the MCP answers are never cached (`no-store`). A revoked version's view names the files and lines apm found and the revoke's reason, never a line of its source.
 - `GET https://apmjs.dev/package/<name>.md` (or `/package/<name>?format=md`, and `?v=<version>` for an older version): the package page as Markdown. A scoped name is two segments: `/package/@scope/name.md`.
 - `GET https://apmjs.dev/openapi.json`: OpenAPI 3.1 for the registry's JSON API (score, name check, search, AI review, file excerpts, install policy) and these agent routes.

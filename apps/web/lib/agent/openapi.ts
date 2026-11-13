@@ -76,6 +76,8 @@ const Verdict = z.object({
       dependencies: z.enum(DEPENDENCY_COVERAGE).describe("Whether apm scored every dependency the install brings in"),
     })
     .describe("What the verdict rests on"),
+  evidence: z.array(z.string()).describe("What the version lost points for, at most three, each with the file and line it cites; publisher text, quoted in code spans"),
+  url: z.string().nullable().describe("The version's page on the website, when the registry gave one"),
 });
 
 const RecentAnswer = z.object({

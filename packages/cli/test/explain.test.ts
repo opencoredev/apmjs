@@ -30,7 +30,7 @@ const Case = z.object({
       unchecked: z.number(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
       // the registry's warnings on the install (resolve's `warnings`): via empty for the version itself
-      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), via: z.array(z.string()) })).default([]),
+      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
       depReviews: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("off") }),
         z.object({ kind: z.literal("unknown") }),
@@ -53,6 +53,9 @@ const Case = z.object({
     summary: z.string(),
     reasons: z.array(z.string()).optional(),
     coverage: z.object({ aiReview: z.enum(AI_REVIEW_COVERAGE), dependencies: z.enum(DEPENDENCY_COVERAGE) }),
+    // the verdict's evidence lines and page link, exactly; a case that leaves them out does not check them
+    evidence: z.array(z.string()).optional(),
+    url: z.string().nullable().optional(),
   }),
 });
 
@@ -101,6 +104,10 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       expect(v.coverage).toEqual(c.expect.coverage);
 
       for (const r of c.expect.reasons ?? []) expect(v.reasons).toContain(r);
+
+      if (c.expect.evidence !== undefined) expect(v.evidence).toEqual(c.expect.evidence);
+
+      if (c.expect.url !== undefined) expect(v.url).toBe(c.expect.url);
     });
   }
 

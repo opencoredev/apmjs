@@ -32,7 +32,17 @@ export type DepReviews = { kind: "off" } | { kind: "unknown" } | { kind: "on"; c
  * One of the registry's warnings on an install that goes ahead (resolve's `warnings`): `via` empty for the version
  * itself, the dependency path for one it brings in. Older registries send none.
  */
-export type WarningInput = { name: string; version: string; kind: "low-score" | "incomplete" | "unscorable" | "pending" | "unavailable" | "unchecked"; text: string; via: string[] };
+export type WarningInput = {
+  name: string;
+  version: string;
+  kind: "low-score" | "incomplete" | "unscorable" | "pending" | "unavailable" | "unchecked";
+  text: string;
+  /** At most three, each a signal's label and the file and line its evidence cites; older registries send none. */
+  reasons?: string[];
+  /** The package's or the version's page on the website. */
+  url?: string;
+  via: string[];
+};
 
 /**
  * The dependency walk: what apm could not score (the registry's total, and up to 50 named), the AI reviews, and the
@@ -98,6 +108,13 @@ export type Verdict = {
   reasons: string[];
   commands: { apm: string; bun: string; npm: string; pnpm: string } | null;
   coverage: Coverage;
+  /**
+   * What the version lost points for, with the file and line each cites: the registry's warning reasons (at most
+   * three), else the heaviest signals' first evidence. Publisher text, so each is quoted as a code span.
+   */
+  evidence: string[];
+  /** The version's page (or the package's) on the website, from the registry's warning; null when it sent none. */
+  url: string | null;
 };
 
 const SHOWN = 3;
@@ -306,7 +323,49 @@ export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean
   return skipped.length > 0 && skipped.every((s) => PULLED_REASON.test(s.reason));
 }
 
+/**
+ * The verdict, with the evidence behind it and the version's page: what the version lost points for (the registry's
+ * warning reasons, at most three, else its heaviest signals' first evidence, each with its file and line) and the
+ * link the registry's warning gives. Before this (review of a76b9fc, finding 4) a score of 30 with
+ * `index.js:7: eval(body)` and a version page came back as review-first with only the score and the signal's label.
+ */
 export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
+  return { ...decide(input), ...evidenceOf(input.resolved) };
+}
+
+/** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
+function pageUrl(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+
+  try {
+    const u = new URL(raw);
+
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function evidenceOf(resolve: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }["resolved"]): Pick<Verdict, "evidence" | "url"> {
+  if (resolve.kind !== "ok") return { evidence: [], url: null };
+
+  const own = resolve.deps.warnings.find((w) => w.via.length === 0);
+
+  const fromSignals = (resolve.report?.signals ?? [])
+    .filter((s) => s.points < 0)
+    .toSorted((a, b) => a.points - b.points)
+    .slice(0, SHOWN)
+    .flatMap((s) => (s.evidence[0] === undefined ? [] : [`${s.label}: ${s.evidence[0]}`]));
+
+  const lines = own?.reasons !== undefined && own.reasons.length > 0 ? own.reasons.slice(0, SHOWN) : fromSignals;
+
+  return { evidence: lines.map((l) => quoted(l)), url: pageUrl(own?.url) };
+}
+
+/** A verdict before its evidence and link are added (explainInstall). */
+type Decided = Omit<Verdict, "evidence" | "url">;
+
+function decide(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Decided {
   const { name, resolved, review } = input;
   const range = input.range ?? "latest";
   const asked = range === "latest" ? name : `${name}@${plain(range)}`;
@@ -447,7 +506,7 @@ export function explain(input: { name: string; range: string | null; resolved: R
   if (report === null) {
     if (ownWarning?.kind === "unscorable") reasons.unshift(`The registry said: ${quoted(ownWarning.text)}`);
 
-    return { ...known, verdict: "review-first", summary: `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands: run };
+    return { ...known, verdict: "review-first", summary: ownWarning?.kind === "pending" ? `Installs, but ${id} is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute.${note}` : `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands: run };
   }
 
   const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;

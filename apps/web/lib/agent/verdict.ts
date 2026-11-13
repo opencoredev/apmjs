@@ -88,6 +88,13 @@ export type Verdict = {
   /** What to run, by client; null when nothing should be installed yet. */
   commands: Record<InstallClient, string> | null;
   coverage: Coverage;
+  /**
+   * What the version lost points for, with the file and line each cites: the registry's warning reasons (at most
+   * three), else the heaviest signals' first evidence. Publisher text, so each is quoted as a code span.
+   */
+  evidence: string[];
+  /** The version's page (or the package's) on the website, from the registry's warning; null when it sent none. */
+  url: string | null;
 };
 
 const SHOWN = 3;
@@ -250,7 +257,49 @@ function reviewHold(review: ReviewInput): string | null {
 }
 
 /** The verdict for `name@range`, from the registry's resolve answer and the AI review of the version it picked. */
+/**
+ * The verdict, with the evidence behind it and the version's page: what the version lost points for (the registry's
+ * warning reasons, at most three, else its heaviest signals' first evidence, each with its file and line) and the
+ * link the registry's warning gives. Before this (review of a76b9fc, finding 4) a score of 30 with
+ * `index.js:7: eval(body)` and a version page came back as review-first with only the score and the signal's label.
+ */
 export function explainInstall(input: { name: string; range: string | null; resolve: ResolveOutcome; review: ReviewInput }): Verdict {
+  return { ...decide(input), ...evidenceOf(input.resolve) };
+}
+
+/** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
+function pageUrl(raw: string | undefined): string | null {
+  if (raw === undefined) return null;
+
+  try {
+    const u = new URL(raw);
+
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function evidenceOf(resolve: { name: string; range: string | null; resolve: ResolveOutcome; review: ReviewInput }["resolve"]): Pick<Verdict, "evidence" | "url"> {
+  if (resolve.kind !== "ok") return { evidence: [], url: null };
+
+  const own = resolve.deps.warnings.find((w) => w.via.length === 0);
+
+  const fromSignals = (resolve.report?.signals ?? [])
+    .filter((s) => s.points < 0)
+    .toSorted((a, b) => a.points - b.points)
+    .slice(0, SHOWN)
+    .flatMap((s) => (s.evidence[0] === undefined ? [] : [`${s.label}: ${s.evidence[0]}`]));
+
+  const lines = own?.reasons !== undefined && own.reasons.length > 0 ? own.reasons.slice(0, SHOWN) : fromSignals;
+
+  return { evidence: lines.map((l) => quoted(l)), url: pageUrl(own?.url) };
+}
+
+/** A verdict before its evidence and link are added (explainInstall). */
+type Decided = Omit<Verdict, "evidence" | "url">;
+
+function decide(input: { name: string; range: string | null; resolve: ResolveOutcome; review: ReviewInput }): Decided {
   const { name, resolve, review } = input;
   const range = input.range ?? "latest";
   const asked = range === "latest" ? name : `${name}@${plain(range)}`;
@@ -392,7 +441,7 @@ export function explainInstall(input: { name: string; range: string | null; reso
   if (report === null) {
     if (ownWarning?.kind === "unscorable") reasons.unshift(`The registry said: ${quoted(ownWarning.text)}`);
 
-    return { ...known, verdict: "review-first", summary: `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands };
+    return { ...known, verdict: "review-first", summary: ownWarning?.kind === "pending" ? `Installs, but ${id} is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute.${note}` : `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands };
   }
 
   const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
@@ -487,7 +536,13 @@ export function reviewInput(answer: Fetched<Pick<ReviewAnswer, "status" | "revie
 export function verdictText(v: Verdict): string {
   const lines = [`Verdict: ${v.verdict}`, v.summary, `AI review: ${v.coverage.aiReview}. Dependencies scored: ${v.coverage.dependencies}.`];
 
-  if (v.reasons.length > 0) lines.push("", "Reasons:", ...v.reasons.map((r) => `- ${r}`), "", UNTRUSTED_NOTE);
+  if (v.reasons.length > 0) lines.push("", "Reasons:", ...v.reasons.map((r) => `- ${r}`));
+
+  if (v.evidence.length > 0) lines.push("", "Evidence:", ...v.evidence.map((e) => `- ${e}`));
+
+  if (v.reasons.length > 0 || v.evidence.length > 0) lines.push("", UNTRUSTED_NOTE);
+
+  if (v.url) lines.push("", `Details: ${v.url}`);
 
   if (v.commands) {
     lines.push("", `Run: ${v.commands.apm}`, `(or ${v.commands.bun}, ${v.commands.npm}, ${v.commands.pnpm}; plain bun, npm and pnpm only get apm's checks when their registry is set to apm)`);

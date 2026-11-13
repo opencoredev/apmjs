@@ -1536,6 +1536,159 @@
           "dependencies": "not-read"
         }
       }
+    },
+    {
+      "name": "a score under the floor names its evidence and the version's page (review of a76b9fc, finding 4)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 30,
+        "lost": [
+          {
+            "label": "Runs code built at runtime",
+            "points": -40,
+            "evidence": [
+              "index.js:7: eval(body)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "low-score",
+            "text": "scores 30/100 (C), under the floor of 40",
+            "reasons": [
+              "Runs code built at runtime: index.js:7: eval(body)"
+            ],
+            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Runs code built at runtime. Review it before installing. No AI review: apm never picked this version for one.",
+        "reasons": [
+          "Runs code built at runtime (-40 points)."
+        ],
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "evidence": [
+          "`Runs code built at runtime: index.js:7: eval(body)`"
+        ],
+        "url": "https://apmjs.dev/package/x/v/1.0.0"
+      }
+    },
+    {
+      "name": "no warning from an older registry: the evidence comes from the heaviest signals, and there is no link",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 30,
+        "lost": [
+          {
+            "label": "Uses the network",
+            "points": -10,
+            "evidence": [
+              "lib/a.js:3: fetch(u)"
+            ]
+          },
+          {
+            "label": "Runs code built at runtime",
+            "points": -40,
+            "evidence": [
+              "index.js:7: eval(body)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Runs code built at runtime. Review it before installing. No AI review: apm never picked this version for one.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "evidence": [
+          "`Runs code built at runtime: index.js:7: eval(body)`",
+          "`Uses the network: lib/a.js:3: fetch(u)`"
+        ],
+        "url": null
+      }
+    },
+    {
+      "name": "a version still being analysed after the registry's wait says so: review first, not unknown",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "pending",
+            "text": "This version is not scored yet: its tarball is queued for analysis.",
+            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but x@1.0.0 is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute. No AI review: apm never picked this version for one.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "evidence": [],
+        "url": "https://apmjs.dev/package/x/v/1.0.0"
+      }
     }
   ]
 }

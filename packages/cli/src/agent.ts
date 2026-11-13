@@ -147,6 +147,12 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
 
   for (const r of v.reasons) io.say(dim(`  - ${r}`));
 
+  if (v.evidence.length > 0) io.say(dim("  evidence:"));
+
+  for (const e of v.evidence) io.say(dim(`    ${e}`));
+
+  if (v.url) io.say(`  details: ${v.url}`);
+
   if (v.commands) io.say(`  run: ${v.commands.apm}`);
 
   return code;

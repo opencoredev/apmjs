@@ -42,9 +42,21 @@ const TreeReviewsWire = z.discriminatedUnion("kind", [
  * One of resolve's warnings on an install that goes ahead: a low or incomplete score, no score, a dependency the
  * registry could not look up, a walk cut short. `via` is empty for the version itself. Older registries send none.
  */
-const WarningWire = z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), via: z.array(z.string()) }).loose();
+const WarningWire = z
+  .object({
+    name: z.string(),
+    version: z.string(),
+    kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]),
+    text: z.string(),
+    // at most three, each a signal's label and the file and line its evidence cites; older registries send none
+    reasons: z.array(z.string()).optional(),
+    // the package's or the version's page on the website
+    url: z.string().optional(),
+    via: z.array(z.string()),
+  })
+  .loose();
 
-export type WarningInput = Pick<z.infer<typeof WarningWire>, "name" | "version" | "kind" | "text" | "via">;
+export type WarningInput = Pick<z.infer<typeof WarningWire>, "name" | "version" | "kind" | "text" | "reasons" | "url" | "via">;
 
 /** GET /-/apm/v1/resolve with a 200: the newest version in range that passes the policy, and its dependency walk. */
 export const ResolveOkWire = z.object({
