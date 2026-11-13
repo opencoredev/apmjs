@@ -220,7 +220,9 @@ export function inventoryOf(source: string): FileInventory {
     if (m !== null && m.name === "only" && ts.isExpression(node)) {
       const r = resolve(node, scope);
 
-      if ((r?.kind === "fn" && r.focused) || (r === null && isCalled(node))) focused.add(lineOf(node.getStart(file)));
+      // only where it is called: `const saved = test.only` alone focuses nothing, and a call through `saved` is a
+      // call of a focused function, found below (review of 137141c)
+      if (isCalled(node) && ((r?.kind === "fn" && r.focused) || r === null)) focused.add(lineOf(node.getStart(file)));
     }
 
     if (ts.isCallExpression(node)) {

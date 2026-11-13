@@ -63,4 +63,8 @@ function guard(fn: unknown): unknown {
   return fn;
 }
 
-for (const fn of [bun.test, bun.it, bun.describe, Reflect.get(globalThis, "test"), Reflect.get(globalThis, "it"), Reflect.get(globalThis, "describe")]) guard(fn);
+// every test and suite function bun:test exports or puts on globalThis (xdescribe, xit, xtest and any later ones too:
+// review of 137141c), told apart by the prototype they share
+const exported = [...Object.values(bun), ...["test", "it", "describe", "xtest", "xit", "xdescribe"].map((name) => Reflect.get(globalThis, name))];
+
+for (const fn of exported) if (typeof fn === "function" && Object.getPrototypeOf(fn) === shared) guard(fn);

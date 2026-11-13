@@ -7,7 +7,7 @@
 //
 // When apm cannot tell, it answers "include": the install then gets no flag, and a devDependency the package manager
 // leaves out anyway makes the check refuse. It never answers "omit" for an install that would put them in place.
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
@@ -55,7 +55,12 @@ function onPath(env: Env, name: string): string | null {
     const p = join(dir, name);
 
     try {
-      if (statSync(p).isFile()) return realpathSync(p);
+      // as a spawn finds it: a file this user may execute, so the npm read here is the npm that will run (review of 137141c)
+      if (statSync(p).isFile()) {
+        accessSync(p, constants.X_OK);
+
+        return realpathSync(p);
+      }
     } catch {
       // not here
     }
@@ -255,9 +260,13 @@ function npmBool(v: IniValue | undefined, input: { nullable: boolean; env: Env; 
     case "literal":
       return f.value === null ? (input.nullable ? null : false) : f.value;
     case "text":
-      if (input.reading === "raw") return true;
+      // raw, npm 9.3 and later test the text itself: empty, as `production=${P}` with P empty gives, is false
+      if (input.reading === "raw") return f.text !== "";
 
-      return f.text !== "" && !Number.isNaN(Number(f.text)) ? Number(f.text) !== 0 : f.text !== "false" && f.text !== "null";
+      // typed, an empty value is false as well (review of 137141c)
+      if (f.text === "") return false;
+
+      return !Number.isNaN(Number(f.text)) ? Number(f.text) !== 0 : f.text !== "false" && f.text !== "null";
     default: {
       const _exhaustive: never = f;
 

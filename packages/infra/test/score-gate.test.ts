@@ -120,6 +120,15 @@ describe("scripts/score.ts", () => {
     }
   }, 60_000);
 
+  test("review of 137141c: a computed .only on xdescribe is refused too, so the failing test it would hide fails the run (on 137141c: 0)", async () => {
+    // the reviewer's fixture: through the namespace and helpers, so the inventory declares nothing and only the runtime guard can refuse
+    const src = "import * as bt from 'bun:test';\nconst key = ['on', 'ly'].join('');\nconst take = (f: any) => f[key];\nconst ordinary = (f: any) => f('ordinary', () => { throw Error('must run'); });\ntake(bt.xdescribe)('focus', () => {});\nordinary(bt.test);\n";
+    const r = await score({ "x.test.ts": src });
+
+    expect(r.code, r.out).toBe(1);
+    expect(r.score).not.toBe("0");
+  }, 60_000);
+
   // review of a24c6aa, finding 4: one alias name bound to test at file scope and to describe in a suite
   test("an alias name reused in another scope: the inventory finishes and counts each by its own binding (on a24c6aa: never finished)", async () => {
     const shadow = 'import { test, describe } from "bun:test";\nconst check = test;\ncheck("top", () => {});\ndescribe("inner", () => {\n  const check = describe;\n  check("group", () => {\n    test("nested", () => {});\n  });\n});\n';
@@ -191,6 +200,11 @@ describe("gateScore", () => {
     expect(focusedLines('test.only("a", f);\nit.only("b", f);\ndescribe.only("c", f);\ndescribe.each([1]).only("d", f);\n// test.only is refused\ntest("e", f);\n')).toEqual([1, 2, 3, 4]);
   });
 
+  test("review of 137141c: reading .only without calling it focuses nothing; calling it through the saved name does", () => {
+    expect(focusedLines('import { test } from "bun:test";\nconst saved = test.only;\ntest("a", f);\n')).toEqual([]);
+    expect(focusedLines('import { test } from "bun:test";\nconst saved = test.only;\nsaved("a", f);\n')).toEqual([3]);
+  });
+
   test("review of efef668, finding 4: tests and focus found through renamed imports, namespaces, require and aliases", () => {
     const src = [
       "import { test as check, it as spec, describe as group } from 'bun:test';",
@@ -220,7 +234,8 @@ describe("gateScore", () => {
     const inv = inventoryOf(src);
 
     expect(inv.declared).toEqual([8, 9, 10, 11, 12, 13, 14, 15, 19]);
-    expect(inv.focused).toEqual([4, 10, 13, 15]);
+    // line 4 only reads check.only (review of 137141c): the focus is where it is called, through fit on line 13
+    expect(inv.focused).toEqual([10, 13, 15]);
   });
 
   test("review of a24c6aa, finding 4: each binding of a reused name resolves on its own, and cycles end", () => {

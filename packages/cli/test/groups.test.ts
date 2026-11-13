@@ -2,7 +2,7 @@
 // read the way it reads them. The table in fixtures/omission-cases.ts is what real npm 9 and pnpm 10 do with each
 // setting (real-layouts.test.ts installs every case with them); here apm's reading is held to it.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
@@ -39,7 +39,7 @@ function project(c: Pick<OmissionCase, "npmrc" | "user" | "global" | "env">) {
  * A PATH with an npm on it of `npmVersion` whose ini is `iniVersion`: bundled in npm's node_modules, or (debian) in
  * the shared directory beside npm. apm reads only their package.json files.
  */
-function npmOnPath(input: { npmVersion: string; iniVersion: string; layout: "bundled" | "debian" }): string {
+function npmOnPath(input: { npmVersion: string; iniVersion: string; layout: "bundled" | "debian"; executable?: boolean }): string {
   const top = join(base, `npm${++n}`);
   const npmRoot = input.layout === "bundled" ? join(top, "lib", "node_modules", "npm") : join(top, "share", "nodejs", "npm");
   const iniDir = input.layout === "bundled" ? join(npmRoot, "node_modules", "ini") : join(top, "share", "nodejs", "ini");
@@ -50,6 +50,8 @@ function npmOnPath(input: { npmVersion: string; iniVersion: string; layout: "bun
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(npmRoot, "package.json"), JSON.stringify({ name: "npm", version: input.npmVersion }));
   writeFileSync(join(npmRoot, "bin", "npm-cli.js"), "");
+  // as a real npm-cli.js is; a spawn of `npm` passes over one it may not execute
+  chmodSync(join(npmRoot, "bin", "npm-cli.js"), input.executable === false ? 0o644 : 0o755);
   writeFileSync(join(iniDir, "package.json"), JSON.stringify({ name: "ini", version: input.iniVersion }));
   symlinkSync(join(npmRoot, "bin", "npm-cli.js"), join(bin, "npm"));
 
@@ -134,6 +136,21 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
     expect(npmWith("[section] \nproduction=true\n", undefined)).toBe("include");
     expect(npmWith("omit=dev\n[section] \nproduction=false\n", undefined)).toBe("include");
     expect(npmWith("production=true\n[section] \nomit=optional\n", undefined)).toBe("omit");
+  });
+
+  test("the npm read is the npm a spawn runs: one on PATH it may not execute is passed over (review of 137141c)", () => {
+    const stale = npmOnPath({ npmVersion: "11.16.0", iniVersion: "6.0.0", layout: "bundled", executable: false });
+
+    // on 137141c the non-executable npm 11 first on PATH was read (include) while the spawn ran Debian's 9.2 (omit)
+    expect(npmWith("[section] \nproduction=true\n", `${stale}:${NPM92_DEBIAN}`)).toBe("omit");
+  });
+
+  test("production=${P} with P empty: npm 9.3 and later read the empty text as false and install devDependencies (review of 137141c)", () => {
+    const p = project({ npmrc: "production=${P}\n" });
+
+    expect(devGroup({ pm: "npm", root: p.root, env: { ...p.env, P: "", PATH: NPM11 }, production: false }).kind).toBe("include");
+    // npm 9.2 types the value first, and an empty one is false there too
+    expect(devGroup({ pm: "npm", root: p.root, env: { ...p.env, P: "", PATH: NPM92_DEBIAN }, production: false }).kind).toBe("include");
   });
 
   test("pnpm 10 reads [section] then a space as a key, so production=true after it is top-level", () => {
