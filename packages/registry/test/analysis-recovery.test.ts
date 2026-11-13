@@ -12,7 +12,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, INLINE_ANALYSES, MAX_FAILED_RUNS, RECOVER_PER_SWEEP, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue } from "../src/analysis.ts";
+import { Analysis, INLINE_ANALYSES, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { Upstream, type Probe, type UpstreamPackage } from "../src/upstream.ts";
@@ -475,4 +475,154 @@ describe("versions the upstream no longer has cannot starve the sweep", () => {
       expect(q.sent.some((j) => j.name === "live-pkg")).toBe(true);
     });
   }, 120_000);
+});
+
+// Review of 9913a74, finding 3: runJob probed the upstream and fetched, verified and cached the tarball before it
+// recorded its start or checked whether to give up. Six failures there left no record and the sweep found nothing; a
+// row already at two starts stayed at two through six more. Now the start is recorded before any upstream work, the
+// decision to stop trying comes before any download, a fetch that may pass later counts as a fetch failure, and the
+// sweep also requeues jobs the queue accepted that never began a run.
+describe("every delivery of a job is recorded before it asks the upstream anything", () => {
+  /** The stub upstream, with `tarball` and `probe` replaced, and every call to either counted. */
+  function failingUpstream(input: { tarball?: () => Effect.Effect<never> | Effect.Effect<{ kind: "unavailable"; reason: string; retryable: boolean }>; probe?: "unknown" }) {
+    const real = upstreamStub(["prestart"]);
+    const calls = { probe: 0, tarball: 0 };
+
+    const layer = Layer.effect(
+      Upstream,
+      Effect.gen(function* () {
+        const u = yield* Upstream;
+
+        return Upstream.of({
+          ...u,
+          probe: (name) => Effect.suspend(() => {
+            calls.probe++;
+
+            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probe(name);
+          }),
+          tarball: (pkg, version) => Effect.suspend(() => {
+            calls.tarball++;
+
+            return input.tarball ? input.tarball() : u.tarball(pkg, version);
+          }),
+        });
+      }),
+    ).pipe(Layer.provide(real.layer));
+
+    return { layer, calls };
+  }
+
+  const JOB: AnalysisJob = { name: "prestart", version: "1.0.0" };
+  const Row = z.array(z.object({ starts: z.number(), fetch_failures: z.number(), outcome: z.string().nullable(), detail: z.string().nullable() }));
+  const rowOf = async (sql: (q: string, p?: unknown[]) => Promise<unknown[]>) => Row.parse(await sql("SELECT starts, fetch_failures, outcome, detail FROM analysis_outcomes WHERE package = 'prestart'"));
+
+  const runAt = (url: string, now: number, upstream: Layer.Layer<Upstream>) =>
+    Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.runJob(JOB)).pipe(Effect.provide(layerFor({ url, now, upstream, queue: queueStub().queue })), Effect.scoped));
+
+  // the platform stopping the Worker while it downloads or caches the tarball: nothing after it runs
+  const dies = () => Effect.die(new PlatformStop());
+
+  test("runs stopped while fetching are counted, and the third run gives up before fetching", async () => {
+    await withRig(async (db, sql) => {
+      const up = failingUpstream({ tarball: dies });
+
+      for (let i = 0; i < 6; i++) await runAt(db.url, T0 + i * RUN_WINDOW_MS, up.layer);
+
+      // on 9913a74: no row at all, and six downloads
+      expect(await rowOf(sql)).toEqual([{ starts: 3, fetch_failures: 0, outcome: "analysis-limit", detail: expect.stringContaining("stopped by the platform") }]);
+      expect(up.calls.tarball).toBe(2);
+    });
+  }, 60_000);
+
+  test("a row already at two starts is settled on its next delivery, before any upstream work", async () => {
+    await withRig(async (db, sql) => {
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('prestart', '1.0.0', $1, 2, 0)", [SCORER]);
+      const up = failingUpstream({ tarball: dies });
+      const exit = await runAt(db.url, T0, up.layer);
+
+      // on 9913a74: the probe and the download ran, and the row stayed at two starts with no outcome
+      expect(Exit.isSuccess(exit) ? exit.value : null).toBe<JobOutcome>("unscorable");
+      expect(up.calls).toEqual({ probe: 0, tarball: 0 });
+      expect((await rowOf(sql))[0]?.outcome).toBe("analysis-limit");
+    });
+  }, 60_000);
+
+  for (const kind of ["tarball", "probe"] as const) {
+    test(`a ${kind} fetch that may pass later is a counted fetch failure, and after ${MAX_FETCH_FAILURES} the version is unavailable`, async () => {
+      await withRig(async (db, sql) => {
+        const up = failingUpstream(kind === "probe" ? { probe: "unknown" } : { tarball: () => Effect.succeed({ kind: "unavailable", reason: "the upstream answered 503", retryable: true }) });
+        const outcomes: unknown[] = [];
+
+        for (let i = 0; i <= MAX_FETCH_FAILURES; i++) {
+          const exit = await runAt(db.url, T0 + i * RUN_WINDOW_MS, up.layer);
+
+          outcomes.push(Exit.isSuccess(exit) ? exit.value : "failed");
+        }
+
+        // on 9913a74: "retry" every time, and no row
+        expect(outcomes).toEqual([...Array.from({ length: MAX_FETCH_FAILURES }, () => "retry"), "unscorable"]);
+        expect(await rowOf(sql)).toEqual([{ starts: MAX_FETCH_FAILURES + 1, fetch_failures: MAX_FETCH_FAILURES, outcome: "unavailable", detail: expect.stringContaining(`in ${MAX_FETCH_FAILURES} or more tries over an hour`) }]);
+        // the last delivery decided without asking
+        expect(kind === "probe" ? up.calls.probe : up.calls.tarball).toBe(MAX_FETCH_FAILURES);
+      });
+    }, 60_000);
+  }
+
+  test("a fetch failure ends the run: the queue's quick retry runs it again, and the sweep finds it if the retries run out", async () => {
+    await withRig(async (db, sql) => {
+      const up = failingUpstream({ tarball: () => Effect.succeed({ kind: "unavailable", reason: "the upstream answered 503", retryable: true }) });
+      const first = await runAt(db.url, T0, up.layer);
+      const again = await runAt(db.url, T0 + 30_000, up.layer);
+
+      expect([first, again].map((e) => (Exit.isSuccess(e) ? e.value : "failed"))).toEqual(["retry", "retry"]);
+      expect((await rowOf(sql))[0]).toMatchObject({ starts: 2, fetch_failures: 2, outcome: null });
+      const q = queueStub();
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + 60_000, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(swept).toBe(1);
+      expect(q.sent).toEqual([JOB]);
+    });
+  }, 60_000);
+
+  test("a burst of quick fetch failures does not settle the version: an outage under an hour never does", async () => {
+    await withRig(async (db, sql) => {
+      const up = failingUpstream({ probe: "unknown" });
+
+      for (let i = 0; i < 3 * MAX_FETCH_FAILURES; i++) await runAt(db.url, T0 + i * 30_000, up.layer);
+
+      expect((await rowOf(sql))[0]).toMatchObject({ fetch_failures: 3 * MAX_FETCH_FAILURES, outcome: null });
+    });
+  }, 60_000);
+
+  test("a job the queue accepted and never ran is requeued by the sweep, once it may be claimed again", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["prestart", "scored", "decided"]);
+
+      // three accepted jobs: one never ran, one was scored, one was decided
+      for (const name of ["prestart", "scored", "decided"]) await sql("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ($1, '1.0.0', $2)", [name, T0]);
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('scored', '1.0.0', 'd', $1, '{}'::jsonb, 0)", [SCORER]);
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ('decided', '1.0.0', $1, 'too-large', 'x', 0)", [SCORER]);
+      const q = queueStub();
+      const sweep = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
+
+      expect(await sweep(T0 + REQUEUE_AFTER_MS - 1)).toBe(0);
+      // on 9913a74: 0, and nothing sent
+      expect(await sweep(T0 + REQUEUE_AFTER_MS)).toBe(1);
+      expect(q.sent).toEqual([JOB]);
+      // sent again, the job is claimed anew: the next sweep leaves it alone until it may be claimed once more
+      expect(await sweep(T0 + REQUEUE_AFTER_MS + 1)).toBe(0);
+    });
+  }, 60_000);
+
+  test("without a queue, the sweep runs an accepted job itself, which records it and scores it", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["prestart"]);
+
+      await sql("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('prestart', '1.0.0', $1)", [T0]);
+      const swept = await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0 + REQUEUE_AFTER_MS, upstream: up.layer, queue: null })), Effect.scoped));
+
+      expect(swept).toBe(1);
+      expect(Stored.parse(await sql("SELECT analysis FROM upstream_analysis WHERE package = 'prestart'")).length).toBe(1);
+    });
+  }, 60_000);
 });

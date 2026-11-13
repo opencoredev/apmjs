@@ -183,6 +183,9 @@ export type Unscorable = { readonly reason: z.infer<typeof UnscorableReason>; re
 /** A version as stored; an upstream one also carries why it can never be scored, when that is decided. */
 export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: Unscorable };
 
+/** What starting a run came to (Store.startAnalysis). */
+export type AnalysisStart = { kind: "started"; starts: number; fetchFailures: number; fetchFailedSince: number | null } | { kind: "running" } | { kind: "decided" };
+
 /** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
 export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, Unscorable> };
 
@@ -371,10 +374,18 @@ export type StoreApi = {
   /** Records that the current scorer will never score this version, and why. */
   readonly setUnscorable: (input: { name: string; version: string; unscorable: Unscorable; at: number }) => Effect.Effect<void, StoreError>;
   /**
-   * Counts an analysis run of this version as begun and returns how many have begun, this one included. Null when
-   * another run began less than `runMs` ago (it may still be running) or the version was decided unscorable.
+   * Counts a run of this version as begun, before it does anything, and says how many have begun (this one included)
+   * and how many of those ended unable to fetch the version (`fetchFailures`). "running" when another run began less
+   * than `runMs` ago and may still be going; "decided" when the version already has an outcome.
    */
-  readonly startAnalysis: (input: { name: string; version: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
+  readonly startAnalysis: (input: { name: string; version: string; now: number; runMs: number }) => Effect.Effect<AnalysisStart, StoreError>;
+  /**
+   * Records that a run ended because the upstream could not be asked or would not serve the tarball yet: its start
+   * stays counted, `fetch_failures` goes up, `errorClass` is kept, the first such failure's time is kept, and the run
+   * counts as ended (started `runMs` before `now`), so the queue's next delivery or the sweep may start it again.
+   * Returns the fetch failures so far; null when already decided.
+   */
+  readonly failFetch: (input: { name: string; version: string; errorClass: string; now: number; runMs: number }) => Effect.Effect<number | null, StoreError>;
   /**
    * Takes back the start `startAnalysis` counted, for an inline run that gave its work to the queue on purpose (it
    * spent its share of the meter, or another run had begun). Only for work already queued: a failed run is `failAnalysis`.
@@ -393,6 +404,12 @@ export type StoreApi = {
    * picked is marked picked at `now`: a row the sweep cannot settle moves to the back instead of being picked forever.
    */
   readonly unfinishedAnalyses: (input: { before: number; limit: number; now: number }) => Effect.Effect<{ name: string; version: string }[], StoreError>;
+  /**
+   * Jobs the queue accepted at or before `before` (analysis_jobs) that never began a run: no analysis by the current
+   * scorer, no outcome, and no run begun. A job the queue gave up on before its first run left only this behind. At
+   * most `limit`, longest queued first; requeueing one claims it again, which moves it to the back.
+   */
+  readonly acceptedAnalyses: (input: { before: number; limit: number }) => Effect.Effect<{ name: string; version: string }[], StoreError>;
   /**
    * Which of these upstream versions the current scorer has decided: an analysis stored, or an outcome. Keyed
    * `"<name> <version>"`. One read however many are asked for, and nothing of the analyses themselves: what a resolve
@@ -976,13 +993,35 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         none,
       ),
     startAnalysis: ({ name, version, now, runMs }) =>
+      Effect.gen(function* () {
+        const started = yield* run(
+          "startAnalysis",
+          sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
+              ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
+              WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
+              RETURNING starts, fetch_failures, fetch_failed_since`,
+          one(z.object({ starts: Int, fetch_failures: Int, fetch_failed_since: z.coerce.number().nullable() })),
+        );
+
+        if (started) return { kind: "started", starts: started.starts, fetchFailures: started.fetch_failures, fetchFailedSince: started.fetch_failed_since } satisfies AnalysisStart;
+
+        // not started: an outcome decided it, or a run began inside the window
+        const decided = yield* run(
+          "startAnalysisOutcome",
+          sql`SELECT 1 AS decided FROM analysis_outcomes WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NOT NULL`,
+          one(z.object({ decided: Int })),
+        );
+
+        return decided ? ({ kind: "decided" } satisfies AnalysisStart) : ({ kind: "running" } satisfies AnalysisStart);
+      }),
+    failFetch: ({ name, version, errorClass, now, runMs }) =>
       run(
-        "startAnalysis",
-        sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
-            ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
-            WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
-            RETURNING starts`,
-        one(z.object({ starts: Int })).transform((row) => row?.starts ?? null),
+        "failFetch",
+        sql`UPDATE analysis_outcomes SET fetch_failures = fetch_failures + 1, last_error = ${errorClass.slice(0, 200)}, started_at = ${now - runMs},
+              fetch_failed_since = COALESCE(fetch_failed_since, ${now})
+            WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NULL
+            RETURNING fetch_failures`,
+        one(z.object({ fetch_failures: Int })).transform((row) => row?.fetch_failures ?? null),
       ),
     abandonAnalysis: (name, version) =>
       run(
@@ -1022,6 +1061,18 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             UPDATE analysis_outcomes o SET swept_at = ${now} FROM picked
             WHERE o.package = picked.package AND o.version = picked.version AND o.scorer = ${SCORER}
             RETURNING o.package AS name, o.version`,
+        all(z.object({ name: z.string(), version: z.string() })),
+      ),
+
+    acceptedAnalyses: ({ before, limit }) =>
+      run(
+        "acceptedAnalyses",
+        sql`SELECT j.package AS name, j.version FROM analysis_jobs j
+            WHERE j.queued_at <= ${before}
+              AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = j.package AND a.version = j.version AND a.scorer = ${SCORER})
+              AND NOT EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = j.package AND o.version = j.version AND o.scorer = ${SCORER}
+                                AND (o.outcome IS NOT NULL OR o.started_at IS NOT NULL))
+            ORDER BY j.queued_at LIMIT ${limit}`,
         all(z.object({ name: z.string(), version: z.string() })),
       ),
 
