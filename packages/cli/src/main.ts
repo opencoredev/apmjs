@@ -15,13 +15,14 @@ import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { addArgs, detectPm, frozenInstallArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
-import { removeInstalled, verifyInstall, type Placed } from "./verify.ts";
+import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Placed } from "./verify.ts";
+import { devGroup, omitArgs } from "./groups.ts";
 import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 
 const VERSION = "0.1.0";
-const VALUE_FLAGS = new Set(["pm", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
+const VALUE_FLAGS = new Set(["pm", "omit", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
 
 type Args = { cmd: string; positional: string[]; flags: Map<string, string | true>; raw: string[] };
 
@@ -723,8 +724,12 @@ function reportOf(check: LockCheck, rest: { source?: InstalledReport["source"]; 
 /** `path name@version` of a package directory, to tell what an install put in place from what was there before. */
 const placeKey = (p: { path: string; name: string; version: string }): string => `${p.path} ${idOf(p)}`;
 
-/** What the check of an install decided: refused before any script (it said why), or the packages whose scripts run. */
-type Held = { kind: "refused" } | { kind: "held"; fresh: Placed[] };
+/**
+ * What the check of an install decided: refused before any script (it said why), or the packages whose scripts run
+ * (`fresh`) and every package directory the install holds (`installed`: placed, and left from before), which tells a
+ * fresh copy from an old one of the same version.
+ */
+type Held = { kind: "refused" } | { kind: "held"; fresh: Placed[]; installed: { path: string; name: string; version: string }[] };
 
 /**
  * The check after a frozen install, before any install script (review of 2a098b1, findings 2 to 4 and 8): the install
@@ -733,9 +738,9 @@ type Held = { kind: "refused" } | { kind: "held"; fresh: Placed[] };
  * found inside a bundling package's tarball is asked about for its state, and a revoked, yanked or confirmed malicious
  * one refuses in every mode. `fresh`: the packages this install put in place that run an install script, by location.
  */
-async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[]; strict: boolean; refuse: (line: string) => void }): Promise<Held> {
+async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[]; omitted: Omitted; strict: boolean; refuse: (line: string) => void }): Promise<Held> {
   const { pm, strict, refuse } = input;
-  const verified = verifyInstall({ pm, root: input.root, lockfile: input.lockfile, checked: input.checked, nodes: input.nodes, importers: input.importers, members: input.members, before: input.before });
+  const verified = verifyInstall({ pm, root: input.root, lockfile: input.lockfile, checked: input.checked, nodes: input.nodes, importers: input.importers, members: input.members, before: input.before, omitted: input.omitted });
 
   for (const u of verified.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
 
@@ -788,7 +793,7 @@ async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfil
   const before = new Set(input.before.map(placeKey));
   const fresh = new Map(verified.placed.filter((p) => p.scripts && !before.has(placeKey(p))).map((p) => [p.path, p]));
 
-  return { kind: "held", fresh: [...fresh.values()] };
+  return { kind: "held", fresh: [...fresh.values()], installed: [...verified.placed, ...verified.extraneous] };
 }
 
 /** What releasing install scripts did: the exit code, whether bun installed packages again, and scripts apm could not run. */
@@ -804,7 +809,7 @@ type Released = { code: number; reinstalled: boolean; notRun: string[] };
  * project's own: apm runs none of its scripts and says so. A rebuild fetches nothing: the registry is pinned in its
  * environment, as for every package manager apm runs.
  */
-async function releaseScripts(input: { pm: LockPm; root: string; members: readonly string[]; fresh: readonly Placed[]; registry: string; scopes: string[]; quiet: boolean }): Promise<Released> {
+async function releaseScripts(input: { pm: LockPm; root: string; members: readonly string[]; fresh: readonly Placed[]; installed: readonly { path: string; name: string; version: string }[]; registry: string; scopes: string[]; quiet: boolean }): Promise<Released> {
   const { pm, root } = input;
   const env = pmEnv(input.registry, input.scopes);
   const opts = { cwd: root, env, stdoutToStderr: jsonMode || input.quiet };
@@ -826,8 +831,11 @@ async function releaseScripts(input: { pm: LockPm; root: string; members: readon
     case "pnpm": {
       // a pnpm workspace builds a member's packages only when asked recursively
       const recursive = existsSync(join(root, "pnpm-workspace.yaml")) ? ["--recursive"] : [];
-      const specs = [...new Set(inModules.map((p) => (isRegistryVersion(p.version) ? idOf(p) : p.name)))];
+      const { specs, held } = pnpmRebuildable({ fresh: inModules, installed: input.installed });
 
+      for (const spec of held) notRun.push(`pnpm cannot run ${spec}'s install script for only the new copy; run \`pnpm rebuild ${spec}\` yourself if you want it`);
+
+      if (specs.length === 0) return { code: 0, reinstalled: false, notRun };
       say(dim(`→ pnpm rebuild ${[...specs, ...recursive].join(" ")}`));
 
       return { code: (await runCmd(["pnpm", "rebuild", ...specs, ...recursive], opts)).code, reinstalled: false, notRun };
@@ -876,10 +884,10 @@ function ownInstallScripts(root: string): string[] {
  * install script may have run: `scripts` is "none" before apm released them, "maybe" from then on. Returns those
  * commands, for --json.
  */
-function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scripts: "none" | "maybe" }): string[] {
+function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scripts: "none" | "maybe"; omit?: readonly string[] }): string[] {
   const t = targets(input.layout);
   const restore = restoreCommands({ layout: input.layout, backup: input.backup });
-  const reinstall = input.pm === "yarn" ? "yarn install" : frozenInstallArgs(input.pm, { keepNodeModules: true }).join(" ");
+  const reinstall = input.pm === "yarn" ? "yarn install" : [...frozenInstallArgs(input.pm, { keepNodeModules: true }), ...(input.omit ?? [])].join(" ");
   const commands = [...restore, `cd '${input.layout.root.replaceAll("'", "'\\''")}' && ${reinstall}`];
   const scripts = input.scripts === "none" ? "No install script ran." : `Install scripts may have run: ${input.pm === "yarn" ? "yarn ran them as it installed" : "apm had started them"}.`;
 
@@ -908,7 +916,26 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
   const registry = api.cfg.registry;
   const pinned = results.map((r) => `${r.name}@${r.version}`);
   const t = targets(layout);
+  // a production install leaves devDependencies out: the whole lockfile is still checked, the install is told so, and
+  // the check of what was installed lets them be missing (review of 2b7767f, finding 3)
+  const group = devGroup({ pm, root: layout.root, env: env(), production: flag(a, "omit") === "dev" || has(a, "prod") || has(a, "production") });
+  const omit = omitArgs(pm, group);
   const copy = copyProject(layout);
+
+  /** Removes the copy the lockfile was computed in: null, or why it could not, so no failure to clean up hides a result. */
+  const dropCopy = (): string | null => {
+    try {
+      removeTemp(copy.dir);
+
+      return null;
+    } catch (e) {
+      return `apm could not remove its copy of your project at ${copy.dir} (${e instanceof Error ? e.message : String(e)}); remove it yourself: it may hold your .npmrc`;
+    }
+  };
+
+  // until the checked files are written, this function's own finally removes the copy; from the write on, the
+  // transaction below does, inside the boundary that reports how to put the project back (review of 2b7767f, finding 7)
+  let copyHere = true;
   let checked: Checked;
 
   try {
@@ -974,9 +1001,14 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
 
         return 1;
       case "failed": {
+        copyHere = false;
+        const left = dropCopy();
+
         fail(`apm add: writing the checked files failed: ${applied.reason}`);
+
+        if (left !== null) warn(left);
         const error = lastError;
-        const recovery = afterApplyFailure({ layout, backup: applied.backup, pm, scripts: "none" });
+        const recovery = afterApplyFailure({ layout, backup: applied.backup, pm, scripts: "none", omit });
 
         emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage: "install", recovery, refused: true }) });
 
@@ -992,9 +1024,14 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       }
     }
 
+    copyHere = false;
     checked = { check, nodes: read.nodes, importers: read.importers, computed, backup: applied.backup, scopes };
   } finally {
-    removeTemp(copy.dir);
+    if (copyHere) {
+      const left = dropCopy();
+
+      if (left !== null) warn(left);
+    }
   }
 
   const { check, nodes, importers, computed, backup, scopes } = checked;
@@ -1004,7 +1041,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
 
   const failed = (at: InstalledReport["stage"]): number => {
     const error = lastError;
-    const recovery = afterApplyFailure({ layout, backup, pm, scripts });
+    const recovery = afterApplyFailure({ layout, backup, pm, scripts, omit });
 
     emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage: at, recovery, refused: true }) });
 
@@ -1014,15 +1051,26 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
   const memberDirs = layout.members.map((m) => m.dir);
   const refuse = (line: string): void => fail(`refused: ${line}`);
 
-  // review of 2a098b1, finding 12: whatever throws after the write (a package manager that cannot start, a filesystem
-  // error) still reports the stage and the commands that put the project back
+  // review of 2a098b1, finding 12, and of 2b7767f, finding 7: whatever fails after the write (removing the copy, a
+  // package manager that cannot start, a filesystem error) still reports the stage and the commands that put the
+  // project back
   try {
+    const left = dropCopy();
+
+    if (left !== null) {
+      fail(`apm add: ${left}`);
+
+      return failed("install");
+    }
+
     // read before the install: what it puts in place is what gets its install scripts run
     const before = installedPackages(layout.root, memberDirs).found;
     const keep = existsSync(join(layout.root, "node_modules"));
-    const install = [...frozenInstallArgs(pm, { keepNodeModules: keep }), ...registryArgs(pm, registry, scopes)];
+    const install = [...frozenInstallArgs(pm, { keepNodeModules: keep }), ...omit, ...registryArgs(pm, registry, scopes)];
 
     say();
+
+    if (group.kind === "omit") say(dim(`apm: ${group.why}: ${pm} leaves devDependencies out of this install; apm checked them all the same`));
     say(dim(`→ ${install.join(" ")}  (wrote the checked ${t.manifest} and ${t.lockfile}; installing exactly that, every install script held back)`));
     const installed = await runCmd(install, { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode });
 
@@ -1033,14 +1081,18 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     }
 
     stage = "verify";
-    const held = await checkInstall({ api, pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before, strict, refuse });
+    const omitted = { dev: group.kind === "omit" };
+    const held = await checkInstall({ api, pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before, omitted, strict, refuse });
 
     if (held.kind === "refused") return failed("verify");
 
     stage = "scripts";
     scripts = "maybe";
     say(dim(`apm: node_modules is the checked ${t.lockfile}; running install scripts`));
-    const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, registry, scopes, quiet: false });
+    // bun installs packages again to run their scripts: what node_modules held just before is the baseline the second
+    // check holds it to, so nothing new beside it passes as left from before (review of 2b7767f, finding 6)
+    const beforeRelease = pm === "bun" ? installedPackages(layout.root, memberDirs).found : [];
+    const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, installed: held.installed, registry, scopes, quiet: false });
 
     for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 
@@ -1051,15 +1103,10 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       return released.code;
     }
 
-    // bun installed packages again: the result must still be the checked lockfile, with nothing new beside it
     if (released.reinstalled) {
-      const again = verifyInstall({ pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before: installedPackages(layout.root, memberDirs).found });
+      const again = await checkInstall({ api, pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before: beforeRelease, omitted, strict, refuse: (line) => refuse(`after bun installed packages again to run their scripts: ${line}`) });
 
-      if (again.kind === "mismatch") {
-        for (const p of again.problems) refuse(`what bun installed again is not the checked lockfile: ${p}`);
-
-        return failed("scripts");
-      }
+      if (again.kind === "refused") return failed("scripts");
     }
 
     removeTemp(backup.dir);
@@ -1471,7 +1518,8 @@ async function cmdX(a: Args): Promise<number> {
       return installed.code;
     }
 
-    const held = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: [], strict, refuse: (line) => fail(`refused to run ${r.name}: ${line}`) });
+    const omitted = { dev: false };
+    const held = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: [], omitted, strict, refuse: (line) => fail(`refused to run ${r.name}: ${line}`) });
 
     if (held.kind === "refused") {
       say("apm ran no install script and no binary; the directory it installed into is removed.");
@@ -1479,7 +1527,11 @@ async function cmdX(a: Args): Promise<number> {
       return 1;
     }
 
-    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, registry: cfg.registry, scopes, quiet: true });
+    // bun installs packages again to run their scripts: the second check holds node_modules to what it held just before
+    const beforeRelease = xpm === "bun" ? installedPackages(dir, []).found : [];
+    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, installed: held.installed, registry: cfg.registry, scopes, quiet: true });
+
+    for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 
     if (released.code !== 0) {
       fail(`apm x: the install scripts failed (exit ${released.code})`);
@@ -1487,10 +1539,10 @@ async function cmdX(a: Args): Promise<number> {
       return released.code;
     }
 
-    if (released.reinstalled && verifyInstall({ pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: [] }).kind === "mismatch") {
-      fail(`refused to run ${r.name}: what ${xpm} installed again is not the checked lockfile`);
+    if (released.reinstalled) {
+      const again = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: beforeRelease, omitted, strict, refuse: (line) => fail(`refused to run ${r.name}: after ${xpm} installed packages again to run their scripts: ${line}`) });
 
-      return 1;
+      if (again.kind === "refused") return 1;
     }
 
     const bin = binOf(dir, r.name);

@@ -5,16 +5,18 @@
 // What was installed is checked the way Node will load it (review of 2a098b1, findings 3, 4 and 8): from each folder the
 // lockfile installs for, every dependency edge it locks is looked up as Node looks it up, and must reach a package of
 // the locked name and version (a workspace member: the member's own folder); from there, each of that package's own
-// edges, and so on. npm's lockfile keys are install paths, so each one must also hold its locked version, with the
-// integrity npm recorded for it. Every other package found in node_modules is accounted for: inside the tarball of a
-// package that bundles it, there before the install (reported; strict refuses it), or else not the checked lockfile.
+// edges, and so on, wherever the package lives: a store outside the project (pnpm's virtual-store-dir) is walked like
+// one inside it (review of 2b7767f, finding 1). What apm may remove is a separate question (removeInstalled). npm's
+// lockfile keys are install paths, so each one must also hold its locked version, with the integrity npm recorded for
+// it. Every other package found in node_modules is accounted for: inside the tarball of a package that bundles it,
+// there before the install (reported; strict refuses it), or else not the checked lockfile.
 import { existsSync, lstatSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { dirname, join, parse, sep } from "node:path";
 import { z } from "zod";
 import { integritiesConflict } from "@apm/core";
 import { installedPackages, relPath, type Found } from "./audit.ts";
 import { idOf, type Member } from "./installed.ts";
-import { bunKeyNames, type LockDep, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
+import { bunKeyNames, isRegistryVersion, supportsHost, type LockDep, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 
 const Manifest = z
   .object({
@@ -61,13 +63,18 @@ function realOrNull(p: string): string | null {
   }
 }
 
-const isInside = (p: string, root: string): boolean => p === root || p.startsWith(`${root}${sep}`);
+const isInside = (p: string, root: string): boolean => p === root || p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 
 /**
- * The directory Node loads `name` from when a module in `from` (a real path inside `root`) requires it: from's own
- * node_modules, then each parent's (never a node_modules/node_modules), stopping at `root`. Its real path, or null.
+ * The directory Node loads `name` from when a module in `from` (a real path) requires it: from's own node_modules,
+ * then each parent's (never a node_modules/node_modules), stopping at `root` when `from` is inside it, else at the
+ * filesystem's root, as Node does for a package in a store outside the project. Its real path, or null.
  */
 export function resolveFrom(input: { root: string; from: string; name: string }): string | null {
+  return resolveWithin({ ...input, root: isInside(input.from, input.root) ? input.root : parse(input.from).root });
+}
+
+function resolveWithin(input: { root: string; from: string; name: string }): string | null {
   let dir = input.from;
 
   for (;;) {
@@ -84,6 +91,9 @@ export function resolveFrom(input: { root: string; from: string; name: string })
     dir = parent;
   }
 }
+
+/** A node as the lockfile locks it: name@version, with the version its package.json must hold when that is not its locator. */
+const lockedId = (n: LockNode): string => (n.installedVersion !== null && n.installedVersion !== n.version ? `${idOf(n)} (version ${n.installedVersion})` : idOf(n));
 
 /** A package installed at a place the lockfile puts it: the node, its real path from the root's, and its package.json identity. */
 export type Placed = { key: string; path: string; name: string; version: string; scripts: boolean };
@@ -132,7 +142,13 @@ function hiddenIntegrities(root: string): Map<string, string> {
  * there, and nothing else is in node_modules but what was there before or ships inside a bundling package. `before`:
  * the packages node_modules held before the install (installedPackages(...).found).
  */
-export function verifyInstall(input: { pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[] }): Verified {
+/** What the install was told to leave out: `dev`, the folders' devDependencies (a production install; see groups.ts). */
+export type Omitted = { dev: boolean };
+
+/** This machine's os and cpu, as Node and the lockfiles name them. */
+export const HOST = { os: process.platform, cpu: process.arch };
+
+export function verifyInstall(input: { pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[]; omitted: Omitted; host?: { os: string; cpu: string } }): Verified {
   const problems: string[] = [];
   const now = existsSync(join(input.root, input.lockfile)) ? new Uint8Array(readFileSync(join(input.root, input.lockfile))) : null;
 
@@ -148,6 +164,14 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
   const visited = new Set<string>();
   const queue: { key: string; dir: string }[] = [];
   const rel = (p: string): string => relPath(root, p) || ".";
+  const host = input.host ?? HOST;
+
+  /**
+   * Whether a dependency may be missing: an optional edge, a node the lockfile marks optional, a devDependency of a
+   * production install, or a package built for another platform. A package for this platform that a required edge
+   * reaches must be there (review of 2b7767f, finding 2).
+   */
+  const mayBeMissing = (dep: LockDep, target: LockNode): boolean => dep.optional || target.optional || (dep.dev && input.omitted.dev) || !supportsHost(target.supports, host);
 
   /** The folder a bound workspace member must resolve to, or null when the node is no bound member. */
   const memberFolder = (n: LockNode): { dir: string; name: string; version: string | null } | null => {
@@ -171,7 +195,7 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     const at = resolveFrom({ root, from: from.dir, name: dep.name });
 
     if (at === null) {
-      if (!dep.optional && !target.optional) problems.push(`${dep.name} (${idOf(target)}), which ${from.label} needs, is not installed`);
+      if (!mayBeMissing(dep, target)) problems.push(`${dep.name} (${idOf(target)}), which ${from.label} needs, is not installed`);
 
       return;
     }
@@ -190,18 +214,19 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     const wrong =
       member !== null
         ? at !== (realOrNull(member.dir) ?? member.dir) || m.name !== member.name || (member.version !== null && m.version !== member.version)
-        : m.name !== target.name || (target.origin.kind === "registry" && m.version !== target.version);
+        : m.name !== target.name || (target.installedVersion !== null && m.version !== target.installedVersion);
 
     if (wrong) {
-      problems.push(`${from.label} resolves ${dep.name} to ${m.name}@${m.version} (${rel(at)}), but the checked lockfile locks ${member === null ? idOf(target) : `the workspace member ${member.name} in ${rel(member.dir)}`} there`);
+      problems.push(`${from.label} resolves ${dep.name} to ${m.name}@${m.version} (${rel(at)}), but the checked lockfile locks ${member === null ? lockedId(target) : `the workspace member ${member.name} in ${rel(member.dir)}`} there`);
 
       return;
     }
 
     place(target, at, m);
 
-    // a member is a folder the lockfile installs for: its edges are its importer's; nothing outside the project is walked
-    if (member !== null || !isInside(at, root) || visited.has(`${target.key}\0${at}`)) return;
+    // a member is a folder the lockfile installs for: its edges are its importer's. A package outside the project (an
+    // external store) is walked like any other: where it lives decides only what apm may remove
+    if (member !== null || visited.has(`${target.key}\0${at}`)) return;
     visited.add(`${target.key}\0${at}`);
     queue.push({ key: target.key, dir: at });
   };
@@ -247,7 +272,7 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
 
     const m = read.manifest;
 
-    if (m.name !== n.name || (n.origin.kind === "registry" && m.version !== n.version)) {
+    if (m.name !== n.name || (n.installedVersion !== null && m.version !== n.installedVersion)) {
       problems.push(`${n.key} holds ${m.name}@${m.version}, but the checked lockfile puts ${idOf(n)} there`);
       continue;
     }
@@ -356,4 +381,21 @@ export function removeInstalled(input: { root: string; members: readonly string[
   rmSync(target, { recursive: true, force: true });
 
   return { kind: "removed" };
+}
+
+/**
+ * The fresh packages pnpm can run the scripts of with `pnpm rebuild <spec>`, which reaches every copy of a version (a
+ * local package: of a name), peer contexts included: only those whose every installed copy is fresh. The others stay
+ * held, said so, rather than run again in a copy that was there before (review of 2b7767f, finding 5).
+ */
+export type Rebuild = { specs: string[]; held: string[] };
+
+export function pnpmRebuildable(input: { fresh: readonly Placed[]; installed: readonly { path: string; name: string; version: string }[] }): Rebuild {
+  const specOf = (p: { name: string; version: string }): string => (isRegistryVersion(p.version) ? idOf(p) : p.name);
+  const freshPaths = new Set(input.fresh.map((p) => p.path));
+  const specs = [...new Set(input.fresh.map(specOf))];
+  const old = new Set(input.installed.filter((p) => !freshPaths.has(p.path)).map((p) => [specOf(p), p.name]).flat());
+  const ok = specs.filter((s) => !old.has(s));
+
+  return { specs: ok, held: specs.filter((s) => !ok.includes(s)) };
 }

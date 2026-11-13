@@ -19,26 +19,59 @@ export type Origin = { kind: "registry" } | { kind: "git" | "file" | "link" | "t
 
 /**
  * A dependency edge of the lockfile: the name the dependent asks for (an alias is its own name), the key of the node
- * the lockfile resolves it to (null when the lockfile holds none, as for a link to a folder outside it), and whether
- * it may be missing (an optional dependency or an optional peer).
+ * the lockfile resolves it to (null when the lockfile holds none, as for a link to a folder outside it), whether it
+ * may be missing (an optional dependency or an optional peer), and whether it is a folder's devDependency (`dev`),
+ * which a production install leaves out (review of 2b7767f, finding 3).
  */
-export type LockDep = { name: string; key: string | null; optional: boolean };
+export type LockDep = { name: string; key: string | null; optional: boolean; dev: boolean };
+
+/**
+ * The platforms a package is built for, as its lockfile entry names them (npm's form: a list, `!name` excluding one).
+ * An empty list allows every platform.
+ */
+export type Supports = { os: readonly string[]; cpu: readonly string[] };
 
 /**
  * One installed package as the lockfile records it. `key` is the lockfile's own id for it (npm and bun: its install
- * path). `platform`: the entry names the os or cpu it is built for. `bundled`: it ships inside its parent's tarball
- * (npm's inBundle), so the parent's score covers its bytes and it has no artifact of its own. `optional`: the package
- * manager may leave it out (an optional dependency, or one for another platform). `deps`: its dependency edges.
+ * path). `version`: the version or source it is locked at (a registry version, or a file:, git or link locator).
+ * `installedVersion`: the version its package.json must hold, when the lockfile records one (a registry version, or
+ * the manifest version npm and pnpm record for a tarball or git entry), kept apart from the locator (review of
+ * 2b7767f, finding 4). `platform`: the entry names the os or cpu it is built for, and `supports` which (null when it names none).
+ * `bundled`: it ships inside its parent's tarball (npm's inBundle), so the parent's score covers its bytes and it has
+ * no artifact of its own. `optional`: the lockfile says the package manager may leave it out (it is only reached
+ * through optional edges). A platform is no optionality: a package built for this platform that a required edge
+ * reaches must be installed (review of 2b7767f, finding 2). `deps`: its dependency edges.
  */
-export type LockNode = { key: string; name: string; version: string; integrity: string | null; resolved: string | null; hasInstallScript: boolean; platform: boolean; origin: Origin; bundled: boolean; optional: boolean; deps: LockDep[] };
+export type LockNode = { key: string; name: string; version: string; installedVersion: string | null; integrity: string | null; resolved: string | null; hasInstallScript: boolean; platform: boolean; supports: Supports | null; origin: Origin; bundled: boolean; optional: boolean; deps: LockDep[] };
 
 /** A project folder the lockfile installs dependencies for: the root ("") or a workspace member, by its path. */
 export type LockImporter = { dir: string; deps: LockDep[] };
 
-/** An os or cpu field: a list, or (bun) one name. */
-const Platforms = z.union([z.array(z.string()), z.string()]).optional().catch(undefined);
+/** An os or cpu field: a list, or (bun) one name, read as a list. */
+const Platforms = z
+  .union([z.array(z.string()), z.string().transform((one) => [one])])
+  .optional()
+  .catch(undefined);
 
-const hasPlatform = (e: { os?: string[] | string | undefined; cpu?: string[] | string | undefined }): boolean => e.os !== undefined || e.cpu !== undefined;
+type PlatformFields = { os?: string[] | undefined; cpu?: string[] | undefined };
+
+const hasPlatform = (e: PlatformFields): boolean => e.os !== undefined || e.cpu !== undefined;
+
+/** The platforms an entry names, or null when it names none. */
+const supportsOf = (e: PlatformFields): Supports | null => (hasPlatform(e) ? { os: e.os ?? [], cpu: e.cpu ?? [] } : null);
+
+/** Whether `value` (this machine's os or cpu) is in a list of the lockfile's form: none listed, or listed and not excluded. */
+function allows(list: readonly string[], value: string): boolean {
+  if (list.includes(`!${value}`)) return false;
+  const wanted = list.filter((x) => !x.startsWith("!"));
+
+  return wanted.length === 0 || wanted.includes(value);
+}
+
+/** Whether a package built for `supports` installs on this machine (`host`: its os and cpu, as Node names them). */
+export function supportsHost(supports: Supports | null, host: { os: string; cpu: string }): boolean {
+  return supports === null || (allows(supports.os, host.os) && allows(supports.cpu, host.cpu));
+}
 
 /** The nodes of a lockfile and the folders it installs for, or why apm could not read them. */
 export type LockRead = { kind: "read"; path: string; nodes: LockNode[]; importers: LockImporter[] } | { kind: "missing" } | { kind: "unreadable"; path: string; reason: string };
@@ -234,14 +267,15 @@ function npmGraph(text: string, from: string, roots: Roots): Parsed {
 
     if (!e) return [];
     const optional = new Set([...Object.keys(e.optionalDependencies ?? {}), ...Object.entries(e.peerDependenciesMeta ?? {}).flatMap(([n, m]) => (m.optional === true ? [n] : []))]);
+    const prod = new Set([...Object.keys(e.dependencies ?? {}), ...Object.keys(e.optionalDependencies ?? {}), ...Object.keys(e.peerDependencies ?? {})]);
     const dev = opts.dev ? Object.keys(e.devDependencies ?? {}) : [];
-    const names = [...new Set([...Object.keys(e.dependencies ?? {}), ...dev, ...Object.keys(e.optionalDependencies ?? {}), ...Object.keys(e.peerDependencies ?? {})])];
+    const names = [...new Set([...prod, ...dev])];
 
     // a dependency the lockfile resolves nowhere (an optional peer nobody installs) has no edge to check
     return names.flatMap((name) => {
       const to = target(resolve(key, name));
 
-      return to === null ? [] : [{ name, key: to, optional: optional.has(name) }];
+      return to === null ? [] : [{ name, key: to, optional: optional.has(name), dev: !prod.has(name) }];
     });
   };
 
@@ -282,20 +316,20 @@ function npmNode(packages: NpmPackages, key: string | null, depsOf: (key: string
   if (e.link === true) {
     if (e.resolved !== undefined && packages[e.resolved]) return [];
 
-    return [{ key, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: e.resolved ?? null, hasInstallScript: false, platform: false, origin: npmOrigin(key, e), bundled: false, optional, deps: [] }];
+    return [{ key, name, version: `link:${e.resolved ?? ""}`, installedVersion: null, integrity: null, resolved: e.resolved ?? null, hasInstallScript: false, platform: false, supports: null, origin: npmOrigin(key, e), bundled: false, optional, deps: [] }];
   }
 
   // a workspace folder or a link's target: named by its own package.json
   const folderName = isInstallPath(key) ? name : (e.name ?? key.split("/").at(-1) ?? key);
 
-  return [{ key, name: folderName, version: e.version ?? "0.0.0", integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true, platform: hasPlatform(e), origin: npmOrigin(key, e), bundled: e.inBundle === true, optional, deps: depsOf(key) }];
+  return [{ key, name: folderName, version: e.version ?? "0.0.0", installedVersion: e.version ?? null, integrity: e.integrity ?? null, resolved: e.resolved ?? null, hasInstallScript: e.hasInstallScript === true, platform: hasPlatform(e), supports: supportsOf(e), origin: npmOrigin(key, e), bundled: e.inBundle === true, optional, deps: depsOf(key) }];
 }
 
 /** A top-level entry of a package-lock.json asked for as `name`: a link (a workspace package) is a node too, never a registry version. */
 function npmTop(packages: NpmPackages, name: string, key: string | null, node: (key: string | null) => LockNode[]): LockNode[] {
   const e = key === null ? undefined : packages[key];
 
-  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin: originOf(`link:${e.resolved ?? ""}`), bundled: false, optional: false, deps: [] }];
+  if (e?.link === true) return [{ key: name, name, version: `link:${e.resolved ?? ""}`, installedVersion: null, integrity: null, resolved: null, hasInstallScript: false, platform: false, supports: null, origin: originOf(`link:${e.resolved ?? ""}`), bundled: false, optional: false, deps: [] }];
 
   return node(key).map((n) => ({ ...n, key: name }));
 }
@@ -397,13 +431,14 @@ function bunGraph(text: string, roots: Roots): Parsed {
     return null;
   };
 
-  const depsFrom = (input: { names: string[]; required: Record<string, string>; optional: readonly string[] }): LockDep[] => {
+  const depsFrom = (input: { names: string[]; required: Record<string, string>; optional: readonly string[]; dev?: Record<string, string> }): LockDep[] => {
     const optional = new Set(input.optional);
+    const dev = Object.keys(input.dev ?? {}).filter((name) => !(name in input.required));
 
-    return Object.keys(input.required).flatMap((name) => {
+    return [...Object.keys(input.required).map((name) => ({ name, dev: false })), ...dev.map((name) => ({ name, dev: true }))].flatMap(({ name, dev: isDev }) => {
       const key = resolve(input.names, name);
 
-      return key === null ? [] : [{ name, key, optional: optional.has(name) }];
+      return key === null ? [] : [{ name, key, optional: optional.has(name), dev: isDev }];
     });
   };
 
@@ -429,13 +464,13 @@ function bunGraph(text: string, roots: Roots): Parsed {
     const base = bunOrigin(e);
     const origin: Origin = base.kind === "workspace" ? { ...base, version: versionOf(base.dir) } : base;
 
-    return [{ key, name: e.id.name, version: e.id.spec, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true, platform: hasPlatform(e.meta), origin, bundled: false, optional: hasPlatform(e.meta), deps: depsOf(key) }];
+    return [{ key, name: e.id.name, version: e.id.spec, installedVersion: isRegistryVersion(e.id.spec) ? e.id.spec : null, integrity: e.integrity, resolved: e.resolved, hasInstallScript: e.meta.hasInstallScript === true, platform: hasPlatform(e.meta), supports: supportsOf(e.meta), origin, bundled: false, optional: false, deps: depsOf(key) }];
   };
 
   // the root ("") and each member: a member's own versions are keyed under its name ("app/leaf")
   const importers: LockImporter[] = Object.entries(lock.workspaces ?? {}).map(([dir, w]) => ({
     dir,
-    deps: depsFrom({ names: dir === "" || w.name === undefined ? [] : [w.name], required: { ...w.dependencies, ...w.devDependencies, ...w.optionalDependencies, ...w.peerDependencies }, optional: Object.keys(w.optionalDependencies ?? {}) }),
+    deps: depsFrom({ names: dir === "" || w.name === undefined ? [] : [w.name], required: { ...w.dependencies, ...w.optionalDependencies, ...w.peerDependencies }, optional: Object.keys(w.optionalDependencies ?? {}), dev: w.devDependencies }),
   }));
 
   if (roots.kind === "top") return { nodes: roots.names.flatMap((n) => node(resolve([], n) ?? "").map((x) => ({ ...x, key: n }))), importers };
@@ -453,7 +488,7 @@ const PnpmImporter = z
 
 const PnpmSnapshot = z.object({ dependencies: DepMap.optional(), optionalDependencies: DepMap.optional(), optional: z.boolean().optional() }).loose();
 const PnpmResolution = z.object({ integrity: z.string().optional(), tarball: z.string().optional(), type: z.string().optional(), repo: z.string().optional(), commit: z.string().optional(), directory: z.string().optional() }).loose();
-const PnpmPackage = PnpmSnapshot.extend({ resolution: PnpmResolution.optional(), requiresBuild: z.boolean().optional(), os: Platforms, cpu: Platforms });
+const PnpmPackage = PnpmSnapshot.extend({ resolution: PnpmResolution.optional(), requiresBuild: z.boolean().optional(), version: z.string().optional().catch(undefined), os: Platforms, cpu: Platforms });
 
 const PnpmLock = z
   .object({
@@ -463,9 +498,18 @@ const PnpmLock = z
   })
   .loose();
 
-/** The snapshot key a dependency points at: "name@1.0.0(peer@2.0.0)", or the alias target "real@1.0.0". Null for link: and file: deps. */
-function pnpmKey(name: string, version: string): string | null {
-  if (/^(?:link|file|workspace):/.test(version)) return null;
+/**
+ * The snapshot key a dependency points at: "name@1.0.0(peer@2.0.0)", or the alias target "real@1.0.0". A file:
+ * dependency (a tarball or folder) is its own entry, "name@file:../x.tgz", when the lockfile holds one (review of
+ * 2b7767f, finding 4); `has` says whether it does. Null for link: and workspace: dependencies, and a file: one with no
+ * entry: those are folders of the project.
+ */
+function pnpmKey(input: { name: string; version: string; has: (key: string) => boolean }): string | null {
+  const { name, version } = input;
+
+  if (version.startsWith("file:")) return input.has(`${name}@${version}`) ? `${name}@${version}` : null;
+
+  if (/^(?:link|workspace):/.test(version)) return null;
 
   return /^@?[^@(]+@/.test(version) && !/^\d/.test(version) ? version : `${name}@${version}`;
 }
@@ -490,6 +534,8 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
   const snapshots = lock.snapshots;
   const pkgOf = (key: string): z.infer<typeof PnpmPackage> | undefined => packages[key.replace(/\(.*$/, "")] ?? packages[`/${key}`] ?? packages[`/${key.replace(/\(.*$/, "")}`];
   const snapOf = (key: string): z.infer<typeof PnpmSnapshot> | undefined => (snapshots ? snapshots[key] : packages[key] ?? packages[`/${key}`]);
+  const has = (key: string): boolean => snapOf(key) !== undefined && pkgOf(key) !== undefined;
+  const keyOf = (name: string, version: string): string | null => pnpmKey({ name, version, has });
   const importers = lock.importers ?? {};
   const top = importers[importer] ?? importers["."];
   const depsOfImporter = (imp: z.infer<typeof PnpmImporter> | undefined) => ({ ...imp?.dependencies, ...imp?.devDependencies, ...imp?.optionalDependencies });
@@ -498,7 +544,7 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
   const topKey = (r: string): string | null => {
     const v = topDeps[r];
 
-    return v === undefined ? null : pnpmKey(r, v);
+    return v === undefined ? null : keyOf(r, v);
   };
 
   /** The importer a `link:` dependency of the importer at `from` points at, when it is one of the lockfile's importers. */
@@ -523,9 +569,9 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
     const optional = new Set(Object.keys(s?.optionalDependencies ?? {}));
 
     return Object.entries({ ...s?.dependencies, ...s?.optionalDependencies }).flatMap(([name, v]) => {
-      const to = pnpmKey(name, v);
+      const to = keyOf(name, v);
 
-      return to === null ? [] : [{ name, key: to, optional: optional.has(name) }];
+      return to === null ? [] : [{ name, key: to, optional: optional.has(name), dev: false }];
     });
   };
 
@@ -537,18 +583,19 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
 
     if (!id || !p) return [];
 
-    return [{ key, name: id.name, version: id.spec, integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true, platform: hasPlatform(p), origin: pnpmOrigin(id.spec, p.resolution), bundled: false, optional: snapOf(key)?.optional === true || hasPlatform(p), deps: depsOf(key) }];
+    return [{ key, name: id.name, version: id.spec, installedVersion: p.version ?? (isRegistryVersion(id.spec) ? id.spec : null), integrity: p.resolution?.integrity ?? null, resolved: p.resolution?.tarball ?? null, hasInstallScript: p.requiresBuild === true, platform: hasPlatform(p), supports: supportsOf(p), origin: pnpmOrigin(id.spec, p.resolution), bundled: false, optional: snapOf(key)?.optional === true, deps: depsOf(key) }];
   };
 
-  const local = (name: string, spec: string): LockNode => ({ key: `${name}@${spec}`, name, version: spec, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin: originOf(spec), bundled: false, optional: false, deps: [] });
+  const local = (name: string, spec: string): LockNode => ({ key: `${name}@${spec}`, name, version: spec, installedVersion: null, integrity: null, resolved: null, hasInstallScript: false, platform: false, supports: null, origin: originOf(spec), bundled: false, optional: false, deps: [] });
 
   // every importer: the root ("") and each workspace member, with each dependency's edge
   const lockImporters: LockImporter[] = Object.entries(importers).map(([dir, imp]) => {
     const optional = new Set(Object.keys(imp.optionalDependencies ?? {}));
+    const prod = new Set([...Object.keys(imp.dependencies ?? {}), ...optional]);
 
     return {
       dir: dir === "." ? "" : dir,
-      deps: Object.entries(depsOfImporter(imp)).map(([name, v]) => ({ name, key: pnpmKey(name, v) ?? localKey(dir, name, v), optional: optional.has(name) })),
+      deps: Object.entries(depsOfImporter(imp)).map(([name, v]) => ({ name, key: keyOf(name, v) ?? localKey(dir, name, v), optional: optional.has(name), dev: !prod.has(name) })),
     };
   });
 
@@ -569,7 +616,9 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
   const nodes = walk({ roots: rootKeys, edges }).flatMap(node);
 
   if (roots.kind !== "all") return { nodes, importers: lockImporters };
-  // every importer's local dependencies (a workspace member, a link): each kept, with its origin (review of a2227d1, finding 4)
+  // every importer's local dependencies (a workspace member, a link): each kept, with its origin (review of a2227d1,
+  // finding 4), and never in place of a package entry of the same key (review of 2b7767f, finding 4)
+  const real = new Set(nodes.map((n) => n.key));
   const locals = new Map<string, LockNode>();
 
   // the workspace's own packages: each importer but the root, named by its directory (projectLayout knows its name)
@@ -580,11 +629,11 @@ function pnpmGraph(text: string, importer: string, roots: Roots): Parsed {
   for (const [dir, imp] of Object.entries(importers)) {
     for (const [n, v] of Object.entries(depsOfImporter(imp))) {
       // a link to another importer is that member's node, kept once above
-      if (pnpmKey(n, v) === null && linkedImporter(dir, v) === null) locals.set(`${n}@${v}`, local(n, v));
+      if (keyOf(n, v) === null && linkedImporter(dir, v) === null && !real.has(`${n}@${v}`)) locals.set(`${n}@${v}`, local(n, v));
     }
   }
 
-  return { nodes: [...nodes, ...locals.values()], importers: lockImporters };
+  return { nodes: [...nodes, ...[...locals.values()].filter((l) => !real.has(l.key))], importers: lockImporters };
 }
 
 // ---------- yarn berry: yarn.lock (YAML, version 4 and up) ----------
@@ -611,7 +660,7 @@ export function yarnBerryNodes(text: string): LockNode[] {
     const npm = /^npm:(.+)$/.exec(id.spec)?.[1];
     const origin: Origin = npm !== undefined && isRegistryVersion(npm) ? { kind: "registry" } : originOf(id.spec.replace(/^patch:/, "file:patch:"));
 
-    out.push({ key, name: id.name, version: npm ?? id.spec, integrity: null, resolved: null, hasInstallScript: false, platform: false, origin, bundled: false, optional: false, deps: [] });
+    out.push({ key, name: id.name, version: npm ?? id.spec, installedVersion: npm ?? null, integrity: null, resolved: null, hasInstallScript: false, platform: false, supports: null, origin, bundled: false, optional: false, deps: [] });
   }
 
   return out;

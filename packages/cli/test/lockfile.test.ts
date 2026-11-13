@@ -327,7 +327,7 @@ describe("readLock: the edges and folders each format installs for", () => {
         "node_modules/leaf": { version: "1.0.0", integrity: "sha512-1" },
         "packages/app": { name: "app", version: "2.0.0", dependencies: { leaf: "2.0.0" }, optionalDependencies: { opt: "1.0.0" } },
         "packages/app/node_modules/leaf": { version: "2.0.0", integrity: "sha512-2" },
-        "packages/app/node_modules/opt": { version: "1.0.0", integrity: "sha512-3", optional: true },
+        "packages/app/node_modules/opt": { version: "1.0.0", integrity: "sha512-3", optional: true, dev: false },
       },
     });
 
@@ -336,8 +336,8 @@ describe("readLock: the edges and folders each format installs for", () => {
 
     if (r.kind !== "read") throw new Error(r.kind);
     expect(r.importers).toEqual([
-      { dir: "", deps: [{ name: "leaf", key: "node_modules/leaf", optional: false }] },
-      { dir: "packages/app", deps: [{ name: "leaf", key: "packages/app/node_modules/leaf", optional: false }, { name: "opt", key: "packages/app/node_modules/opt", optional: true }] },
+      { dir: "", deps: [{ name: "leaf", key: "node_modules/leaf", optional: false, dev: false }] },
+      { dir: "packages/app", deps: [{ name: "leaf", key: "packages/app/node_modules/leaf", optional: false, dev: false }, { name: "opt", key: "packages/app/node_modules/opt", optional: true, dev: false }] },
     ]);
     expect(r.nodes.find((n) => n.key === "packages/app")?.origin).toEqual({ kind: "workspace", source: "packages/app", dir: "packages/app", version: "2.0.0" });
     expect(r.nodes.find((n) => n.key === "packages/app/node_modules/opt")?.optional).toBe(true);
@@ -348,15 +348,15 @@ describe("readLock: the edges and folders each format installs for", () => {
       lockfileVersion: "9.0",
       importers: { ".": { dependencies: { plug: { specifier: "1.0.0", version: "1.0.0(host@2.0.0)" } } }, "packages/app": { dependencies: { other: { specifier: "workspace:*", version: "link:../other" } } }, "packages/other": {} },
       packages: { "plug@1.0.0": { resolution: { integrity: "sha512-p" } }, "host@2.0.0": { resolution: { integrity: "sha512-h" } } },
-      snapshots: { "plug@1.0.0(host@2.0.0)": { dependencies: { host: "2.0.0" } }, "host@2.0.0": { optional: true } },
+      snapshots: { "plug@1.0.0(host@2.0.0)": { dependencies: { host: "2.0.0" } }, "host@2.0.0": { optional: true, dev: false } },
     });
 
     const dir = project("pnpm-lock.yaml", text);
     const r = readLock({ pm: "pnpm", path: join(dir, "pnpm-lock.yaml"), cwd: dir });
 
     if (r.kind !== "read") throw new Error(r.kind);
-    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "other", key: "workspace:packages/other", optional: false }]);
-    expect(r.nodes.find((n) => n.key === "plug@1.0.0(host@2.0.0)")?.deps).toEqual([{ name: "host", key: "host@2.0.0", optional: false }]);
+    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "other", key: "workspace:packages/other", optional: false, dev: false }]);
+    expect(r.nodes.find((n) => n.key === "plug@1.0.0(host@2.0.0)")?.deps).toEqual([{ name: "host", key: "host@2.0.0", optional: false, dev: false }]);
     expect(r.nodes.find((n) => n.key === "host@2.0.0")?.optional).toBe(true);
     // the link to packages/other is no separate local package: it is the member's own node
     expect(r.nodes.filter((n) => n.origin.kind !== "registry").map((n) => n.key).sort()).toEqual(["workspace:packages/app", "workspace:packages/other"]);
@@ -373,7 +373,7 @@ describe("readLock: the edges and folders each format installs for", () => {
     const r = readLock({ pm: "bun", path: join(dir, "bun.lock"), cwd: dir });
 
     if (r.kind !== "read") throw new Error(r.kind);
-    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "leaf", key: "app/leaf", optional: false }]);
+    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "leaf", key: "app/leaf", optional: false, dev: false }]);
     expect(r.nodes.find((n) => n.key === "app")?.origin).toEqual({ kind: "workspace", source: "workspace:packages/app", dir: "packages/app", version: "3.0.0" });
   });
 });

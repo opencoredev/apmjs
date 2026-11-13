@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { isBoundMember, lockGraph } from "../src/installed.ts";
 import type { LockNode } from "../src/lockfile.ts";
 
-const node = (key: string, name: string, version: string, extra: Partial<LockNode> = {}): LockNode => ({ key, name, version, integrity: "sha512-AAAA", resolved: null, hasInstallScript: false, platform: false, origin: { kind: "registry" }, bundled: false, optional: false, deps: [], ...extra });
+const node = (key: string, name: string, version: string, extra: Partial<LockNode> = {}): LockNode => ({ key, name, version, installedVersion: version, integrity: "sha512-AAAA", resolved: null, hasInstallScript: false, platform: false, supports: null, origin: { kind: "registry" }, bundled: false, optional: false, deps: [], ...extra });
 
 describe("lockGraph", () => {
   test("finding 9: an occurrence with no integrity is unchecked even when another occurrence of that version has one (on 2a098b1: noIntegrity was empty)", () => {

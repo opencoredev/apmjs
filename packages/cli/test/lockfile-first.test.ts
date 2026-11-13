@@ -7,7 +7,7 @@
 // The package managers are stand-ins (fixtures/fake-pm.ts) that write the lockfile a test describes, in each one's
 // format, and lay the node_modules it describes. tests/acceptance/lockfile-first.test.ts runs the real ones.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -224,7 +224,7 @@ const Json = z.object({
 type Run = { code: number; text: string; out: string; json: z.infer<typeof Json> | null; pmCalls: { args: string[]; cwd: string }[]; scripts: string[]; dir: string; fake: string; leftInTmp: string[] };
 
 /** package.json fields a test project sets besides its name. */
-type PackageFields = { dependencies?: Record<string, string>; workspaces?: string[]; description?: string };
+type PackageFields = { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; workspaces?: string[]; description?: string };
 
 let counter = 0;
 
@@ -247,6 +247,8 @@ async function apmRun(input: {
   lockText?: string;
   /** A directory of stand-ins found before the shared ones on PATH. */
   binFirst?: string;
+  /** More environment for apm (npm_config_omit, say). */
+  env?: Record<string, string>;
 }): Promise<Run & { before: ReturnType<typeof treeHash> }> {
   const base = join(root, `case-${++counter}`);
   const dir = join(base, "project");
@@ -294,7 +296,7 @@ async function apmRun(input: {
 
   const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), ...argv], {
     cwd: runIn,
-    env: { PATH: `${input.binFirst === undefined ? "" : `${input.binFirst}:`}${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: scratch, APM_REGISTRY: server.url.href, APM_FAKE_DIR: fake, NO_COLOR: "1", APM_PENDING_WAIT_MS: "0" },
+    env: { PATH: `${input.binFirst === undefined ? "" : `${input.binFirst}:`}${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: scratch, APM_REGISTRY: server.url.href, APM_FAKE_DIR: fake, NO_COLOR: "1", APM_PENDING_WAIT_MS: "0", ...input.env },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -968,5 +970,195 @@ describe("review of 2a098b1", () => {
     expect(r.text).toContain("packages/other/package.json changed while apm checked the add, so apm wrote nothing");
     expect(r.json?.installed?.touched).toBe(false);
     expect(r.scripts).toEqual([]);
+  });
+});
+
+/** A stand-in at `dir/<pm>` that runs the shared one, then `after` (a script run with the same arguments) when it exits 0. */
+function wrapped(input: { pm: Pm; name: string; after: string }): string {
+  const dir = join(root, input.name);
+  const helper = join(dir, "helper.ts");
+
+  mkdirSync(dir);
+  writeFileSync(
+    helper,
+    `import { chmodSync, mkdirSync, writeFileSync } from "node:fs";\nimport { join } from "node:path";\nconst args = process.argv.slice(2);\nconst p = Bun.spawn([${JSON.stringify(process.execPath)}, ${JSON.stringify(join(import.meta.dir, "fixtures", "fake-pm.ts"))}, ${JSON.stringify(input.pm)}, ...args], { stdout: "inherit", stderr: "inherit", env: process.env });\nconst code = await p.exited;\nif (code === 0) { ${input.after} }\nprocess.exit(code);\n`,
+  );
+  writeFileSync(join(dir, input.pm), `#!/bin/sh\nexec "${process.execPath}" "${helper}" "$@"\n`);
+  chmodSync(join(dir, input.pm), 0o755);
+
+  return dir;
+}
+
+describe("review of 2b7767f", () => {
+  test("finding 1: strict refuses an external pnpm store whose a@1.0.0 loads leaf@9.9.9 where the lockfile locks 2.0.0 (on 2b7767f: exit 0, stage done)", async () => {
+    const store = join(root, "external-store");
+    const a = join(store, "a@1.0.0", "node_modules", "a");
+
+    mkdirSync(join(a, "node_modules", "leaf"), { recursive: true });
+    writeFileSync(join(a, "package.json"), JSON.stringify({ name: "a", version: "1.0.0" }));
+    writeFileSync(join(a, "node_modules", "leaf", "package.json"), JSON.stringify({ name: "leaf", version: "9.9.9" }));
+    const after: Graph = { top: ["a"], nodes: [{ name: "a", version: "1.0.0", deps: ["leaf@2.0.0"] }, { name: "leaf", version: "2.0.0" }] };
+
+    const r = await apmRun({
+      pm: "pnpm",
+      pkg: {},
+      before: null,
+      after,
+      spec: "a",
+      strict: true,
+      scenario: { modules: [], keep: true },
+      prepare: (dir) => {
+        mkdirSync(join(dir, "node_modules"));
+        symlinkSync(store, join(dir, "node_modules", ".pnpm"));
+        symlinkSync(".pnpm/a@1.0.0/node_modules/a", join(dir, "node_modules", "a"));
+      },
+    });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.json?.installed?.stage).toBe("verify");
+    expect(r.text).toContain("resolves leaf to leaf@9.9.9");
+    expect(r.scripts).toEqual([]);
+  });
+
+  describe("finding 3: a production install", () => {
+    const tool = { name: "tool", version: "1.0.0" };
+    const devonly = { name: "devonly", version: "1.0.0" };
+    const tarball = (n: { name: string; version: string }): string => `${server.url.href}${n.name}/-/${n.name}-${n.version}.tgz`;
+
+    const locks: Record<Pm, () => string> = {
+      npm: () =>
+        JSON.stringify({
+          name: "project",
+          lockfileVersion: 3,
+          requires: true,
+          packages: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } }, "node_modules/tool": { version: "1.0.0", resolved: tarball(tool), integrity: integrity(tool) }, "node_modules/devonly": { version: "1.0.0", resolved: tarball(devonly), integrity: integrity(devonly), dev: true } },
+        }),
+      pnpm: () =>
+        JSON.stringify({
+          lockfileVersion: "9.0",
+          importers: { ".": { dependencies: { tool: { specifier: "1.0.0", version: "1.0.0" } }, devDependencies: { devonly: { specifier: "1.0.0", version: "1.0.0" } } } },
+          packages: { "tool@1.0.0": { resolution: { integrity: integrity(tool) } }, "devonly@1.0.0": { resolution: { integrity: integrity(devonly) } } },
+          snapshots: { "tool@1.0.0": {}, "devonly@1.0.0": {} },
+        }),
+      bun: () => JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "project", dependencies: { tool: "1.0.0" }, devDependencies: { devonly: "1.0.0" } } }, packages: { tool: ["tool@1.0.0", "", {}, integrity(tool)], devonly: ["devonly@1.0.0", "", {}, integrity(devonly)] } }),
+    };
+
+    // how each package manager is asked for a production install, and the flag apm hands its frozen install
+    const asks: Record<Pm, { env?: Record<string, string>; args?: string[]; flag: string }> = {
+      npm: { env: { npm_config_omit: "dev" }, flag: "--omit=dev" },
+      pnpm: { env: { npm_config_production: "true" }, flag: "--prod" },
+      bun: { args: ["--production"], flag: "--production" },
+    };
+
+    beforeAll(() => {
+      states.set("devonly@1.0.0", "clean");
+    });
+
+    for (const pm of PMS) {
+      test(`${pm}: the devDependency left out is what was asked, so the add passes and the install is told so (on 2b7767f: refused after the write)`, async () => {
+        const ask = asks[pm];
+        const r = await apmRun({ pm, pkg: { devDependencies: { devonly: "1.0.0" } }, before: null, after: { top: ["tool"], nodes: [tool] }, spec: "tool", strict: true, lockText: locks[pm](), env: ask.env, args: ask.args, scenario: { modules: [{ path: "node_modules/tool", ...tool }] } });
+
+        expect(r.code, r.text).toBe(0);
+        expect(r.json?.installed?.stage).toBe("done");
+        // the frozen install, the one call that runs in the project itself
+        expect(r.pmCalls.find((c) => c.cwd === r.dir)?.args, JSON.stringify(r.pmCalls)).toContain(ask.flag);
+      });
+
+      test(`${pm}: without it, the same tree is missing the devDependency and is refused`, async () => {
+        const r = await apmRun({ pm, pkg: { devDependencies: { devonly: "1.0.0" } }, before: null, after: { top: ["tool"], nodes: [tool] }, spec: "tool", strict: true, lockText: locks[pm](), scenario: { modules: [{ path: "node_modules/tool", ...tool }] } });
+
+        expect(r.code, r.text).toBe(1);
+        expect(r.text).toContain("devonly (devonly@1.0.0), which your project needs, is not installed");
+      });
+    }
+  });
+
+  test("finding 5: pnpm leaves held the script of a version with an older copy, and says how to run it (on 2b7767f: pnpm rebuild leaf@1.0.0 ran both)", async () => {
+    for (const id of ["new-root@1.0.0", "peer@1.0.0", "peer@2.0.0"]) states.set(id, "clean");
+    const n = (name: string, version: string) => ({ name, version });
+
+    const lock = JSON.stringify({
+      lockfileVersion: "9.0",
+      importers: { ".": { dependencies: { existing: { specifier: "1.0.0", version: "1.0.0" }, "new-root": { specifier: "1.0.0", version: "1.0.0" } } } },
+      packages: Object.fromEntries([n("existing", "1.0.0"), n("new-root", "1.0.0"), n("leaf", "1.0.0"), n("peer", "1.0.0"), n("peer", "2.0.0")].map((x) => [`${x.name}@${x.version}`, { resolution: { integrity: integrity(x) }, requiresBuild: x.name === "leaf" ? true : undefined }])),
+      snapshots: {
+        "existing@1.0.0": { dependencies: { leaf: "1.0.0(peer@1.0.0)", peer: "1.0.0" } },
+        "new-root@1.0.0": { dependencies: { leaf: "1.0.0(peer@2.0.0)", peer: "2.0.0" } },
+        "leaf@1.0.0(peer@1.0.0)": { dependencies: { peer: "1.0.0" } },
+        "leaf@1.0.0(peer@2.0.0)": { dependencies: { peer: "2.0.0" } },
+        "peer@1.0.0": {},
+        "peer@2.0.0": {},
+      },
+    });
+
+    const old = [
+      { path: "node_modules/existing", name: "existing", version: "1.0.0" },
+      { path: "node_modules/existing/node_modules/leaf", name: "leaf", version: "1.0.0" },
+      { path: "node_modules/existing/node_modules/peer", name: "peer", version: "1.0.0" },
+    ];
+
+    const fresh = [
+      { path: "node_modules/new-root", name: "new-root", version: "1.0.0" },
+      { path: "node_modules/new-root/node_modules/leaf", name: "leaf", version: "1.0.0" },
+      { path: "node_modules/new-root/node_modules/peer", name: "peer", version: "2.0.0" },
+    ];
+
+    const r = await apmRun({
+      pm: "pnpm",
+      pkg: { dependencies: { existing: "1.0.0" } },
+      before: null,
+      after: { top: [], nodes: [] },
+      spec: "new-root",
+      strict: false,
+      lockText: lock,
+      scenario: { modules: [...old, ...fresh] },
+      prepare: (dir) => {
+        for (const m of old) {
+          mkdirSync(join(dir, m.path), { recursive: true });
+          writeFileSync(join(dir, m.path, "package.json"), JSON.stringify({ name: m.name, version: m.version }));
+        }
+      },
+    });
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.pmCalls.filter((c) => c.args[0] === "rebuild"), JSON.stringify(r.pmCalls)).toEqual([]);
+    expect(r.scripts).toEqual([]);
+    expect(r.text).toContain("pnpm cannot run leaf@1.0.0's install script for only the new copy; run `pnpm rebuild leaf@1.0.0` yourself if you want it");
+  });
+
+  test("finding 6: bun's second install bringing a new package is refused, with the recovery kept (on 2b7767f: exit 0, stage done, stowaway kept)", async () => {
+    const binFirst = wrapped({ pm: "bun", name: "bun-stowaway", after: `if (args[0] === "install" && !args.includes("--ignore-scripts")) { const d = join(process.cwd(), "node_modules", "stowaway"); mkdirSync(d, { recursive: true }); writeFileSync(join(d, "package.json"), JSON.stringify({ name: "stowaway", version: "6.6.6" })); }` });
+    const r = await apmRun({ pm: "bun", pkg: {}, before: null, after: { top: ["tool"], nodes: [{ name: "tool", version: "1.0.0", script: true }] }, spec: "tool", strict: true, binFirst });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.json?.installed?.stage).toBe("scripts");
+    expect(r.json?.installed?.touched).toBe(true);
+    expect(r.json?.installed?.recovery?.length ?? 0).toBeGreaterThan(0);
+    expect(r.text).toContain("after bun installed packages again to run their scripts");
+    expect(r.text).toContain("stowaway@6.6.6");
+    expect(r.leftInTmp.some((x) => x.startsWith("apm-backup")), r.text).toBe(true);
+  });
+
+  test("finding 7: removing the copy failing after the write still reports the stage and the recovery (on 2b7767f: only an error, no recovery)", async () => {
+    const binFirst = wrapped({ pm: "npm", name: "cleanup-fails", after: `if (args.includes("--package-lock-only")) { const d = join(process.cwd(), "locked"); mkdirSync(join(d, "inner"), { recursive: true }); chmodSync(d, 0o500); }` });
+    const r = await apmRun({ pm: "npm", pkg: {}, before: null, after: { top: ["tool"], nodes: [{ name: "tool", version: "1.0.0" }] }, spec: "tool", strict: true, binFirst });
+
+    for (const entry of r.leftInTmp) {
+      const locked = join(r.dir, "..", "tmp", entry, "locked");
+
+      if (existsSync(locked)) chmodSync(locked, 0o700);
+    }
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.json?.installed?.stage, r.text).toBe("install");
+    expect(r.json?.installed?.touched).toBe(true);
+    expect(r.json?.installed?.recovery?.length ?? 0).toBeGreaterThan(0);
+    expect(r.text).toContain("apm could not remove its copy of your project");
+    expect(r.text).toContain("No install script ran.");
+    expect(r.scripts).toEqual([]);
+    // the checked package.json was written, and the backup to put it back is kept
+    expect(readFileSync(join(r.dir, "package.json"), "utf8")).toContain("tool");
+    expect(r.leftInTmp.some((x) => x.startsWith("apm-backup")), r.text).toBe(true);
   });
 });
