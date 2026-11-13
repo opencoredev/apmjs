@@ -8,7 +8,7 @@ import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { notify } from "./hooks.ts";
 import { readCapped } from "./http.ts";
-import { readPackument, type KeptPackument, type PackumentRead } from "./packument-read.ts";
+import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptBudget, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { createHash } from "node:crypto";
 
@@ -32,6 +32,11 @@ const UpPackument = z
   })
   .loose();
 
+/** What the DEV_DEPENDENCIES read keeps: `versions`, each with at most its devDependencies (read as they are). */
+const DevDependencies = z.object({ versions: z.record(z.string(), z.unknown()).default({}) });
+
+const DevDocument = z.object({ devDependencies: z.unknown().optional() });
+
 export type UpstreamPackage = {
   name: string;
   distTags: Record<string, string>;
@@ -45,6 +50,12 @@ export type UpstreamPackage = {
 
 /** "unknown" means the upstream could not be asked; it is never treated as "absent". */
 export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" } | { kind: "unknown" };
+
+/**
+ * A probe made under a request's KeptBudget: "over-budget" when the request already holds as much package metadata
+ * as it may, so this one was not read (or not kept). Not the same as "unknown": npm may well have answered.
+ */
+export type BudgetedProbe = Probe | { kind: "over-budget" };
 
 // One object of the upstream's /-/v1/search answer. Read loosely: extra fields (downloads, flags, links)
 // pass through untouched so the merged answer keeps npm's wire format.
@@ -146,6 +157,10 @@ export class IsolateCache<V> {
     this.budget = budget;
   }
   get(key: string, now: number): V | undefined {
+    return this.entry(key, now)?.value;
+  }
+  /** The value under `key` and the weight it was kept with, while it is fresh. */
+  entry(key: string, now: number): { readonly value: V; readonly weight: number } | undefined {
     const hit = this.entries.get(key);
 
     if (!hit) return undefined;
@@ -156,7 +171,7 @@ export class IsolateCache<V> {
       return undefined;
     }
 
-    return hit.value;
+    return hit;
   }
   /** Keeps `value` under `key`; `weight` counts toward the budget, and older entries leave to make room. */
   set(key: string, value: V, now: number, weight = 0): void {
@@ -217,8 +232,23 @@ export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 /** The data center's cache. Call it only inside a Worker request: Bun (the unit tests) has no `caches`. */
 const workerCache = (): Cache => caches.default;
 
-/** The Cache API key of a packument. This host is never fetched; it only names the entry. */
-export const packumentKey = (url: string): Request => new Request(`https://upstream-cache.apmjs.internal/v2/${encodeURIComponent(url)}`);
+/**
+ * The Cache API key of a packument as `profile` keeps it: the registry's own reads (TRIMMED) and the devDependencies
+ * the full packument adds back are kept apart. This host is never fetched; it only names the entry.
+ */
+export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Request =>
+  new Request(`https://upstream-cache.apmjs.internal/${profile === DEV_DEPENDENCIES ? "v2-dev" : "v2"}/${encodeURIComponent(url)}`);
+
+/**
+ * What asking for a packument came to. "ok": what readPackument kept, `kept` bytes of it. "status": npm answered
+ * something other than a 200 with a body. "refused": npm answered, but readPackument refused it (too large, not JSON),
+ * so it is an answer apm cannot use. "over-budget": the request's KeptBudget had no room for it.
+ */
+type PackumentAnswer =
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; kept: number }
+  | { kind: "status"; status: number; fetchedAt: number }
+  | { kind: "refused"; fetchedAt: number }
+  | { kind: "over-budget" };
 
 function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
@@ -231,10 +261,20 @@ export type UpstreamApi = {
   /** Whether `@scope` has packages upstream. */
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
   readonly probe: (name: string) => Effect.Effect<Probe, StoreError>;
+  /** probe under a request's budget for the package metadata it holds (scan: one lease per package). */
+  readonly probeWithin: (name: string, budget: KeptBudget) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string) => Effect.Effect<UpstreamListing>;
-  /** probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. */
-  readonly probeMany: (names: readonly string[]) => Effect.Effect<Map<string, Probe>, StoreError>;
+  /**
+   * probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. With
+   * a budget, every packument kept counts against it, cached ones included, and a name past it is "over-budget".
+   */
+  readonly probeMany: (names: readonly string[], budget?: KeptBudget) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
+  /**
+   * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
+   * packument apm serves adds them back. Null when npm could not be asked or the read was refused.
+   */
+  readonly devDependencies: (name: string) => Effect.Effect<ReadonlyMap<string, unknown> | null>;
   /** The package when upstream has it; null when it is absent or upstream cannot be asked. */
   readonly get: (name: string) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
@@ -365,25 +405,29 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         // `background` is set only inside a Worker request, where `caches` always exists
         const sharing = ttlMs >= SHARED_MIN_TTL_MS && background !== null;
 
-        /** A packument body read by readPackument; one it refused is logged, and reads as an answer apm cannot use. */
-        const keptOf = (url: string, read: PackumentRead): KeptPackument | null => {
-          if (read.kind === "ok") return read.body;
+        /** A packument read as an answer. One it refused is logged; one past the request's budget is not an error. */
+        const answerOf = (url: string, read: PackumentRead, fetchedAt: number): PackumentAnswer => {
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, kept: read.keptBytes };
+
+          if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
 
           console.error(JSON.stringify({ level: "error", event: "upstream-packument", error: read.kind === "too-large" ? "packument-too-large" : "packument-invalid", url, ...detail }));
 
-          return null;
+          return { kind: "refused", fetchedAt };
         };
 
         /**
-         * npm's packument, from the shared cache when another isolate fetched it within the TTL. `fetchedAt` is when npm
-         * sent it: `now` for a fresh fetch, the copy's own time for a shared one. The body is streamed through
-         * readPackument, never held whole, and only what it keeps is shared: vite's 39 MB packument is 3.9 MB kept.
+         * npm's packument as `profile` keeps it, from the shared cache when another isolate fetched it within the TTL.
+         * `fetchedAt` is when npm sent it: `now` for a fresh fetch, the copy's own time for a shared one. The body is
+         * streamed through readPackument, never held whole, and only what it keeps is shared: vite's 39 MB packument
+         * is 2.8 MB kept. What it keeps is taken from `budget`, when there is one.
          */
-        const fetchPackument = (url: string, now: number): Effect.Effect<{ status: number; body: unknown; fetchedAt: number; kept: number }, unknown> =>
+        const fetchPackument = (input: { url: string; now: number; profile: KeepProfile; budget: KeptBudget | null }): Effect.Effect<PackumentAnswer, unknown> =>
           Effect.tryPromise({
-            try: async (): Promise<{ status: number; body: unknown; fetchedAt: number; kept: number }> => {
-              const key = packumentKey(url);
+            try: async (): Promise<PackumentAnswer> => {
+              const { url, now, profile, budget } = input;
+              const key = packumentKey(url, profile);
               const shared = sharing ? workerCache() : null;
               const cacheStart = performance.now();
               const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
@@ -391,10 +435,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
 
               if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
-                const read = await readPackument(hit.body);
+                const read = await readPackument(hit.body, { profile, budget });
                 timing?.add("npm-cache", performance.now() - cacheStart);
 
-                return { status: 200, body: keptOf(url, read), fetchedAt: sentAt, kept: read.kind === "ok" ? read.keptBytes : 0 };
+                return answerOf(url, read, sentAt);
               }
 
               await hit?.body?.cancel();
@@ -405,11 +449,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                 await res.body?.cancel();
                 timing?.add("npm", performance.now() - npmStart);
 
-                return { status: res.status === 200 ? 502 : res.status, body: null, fetchedAt: now, kept: 0 };
+                return { kind: "status", status: res.status === 200 ? 502 : res.status, fetchedAt: now };
               }
 
-              const read = await readPackument(res.body);
-              const body = keptOf(url, read);
+              const read = await readPackument(res.body, { profile, budget });
               timing?.add("npm", performance.now() - npmStart);
 
               if (shared && background && read.kind === "ok") {
@@ -417,19 +460,17 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                 background(shared.put(key, new Response(JSON.stringify(read.body), { headers })).catch(() => undefined));
               }
 
-              return { status: 200, body, fetchedAt: now, kept: read.kind === "ok" ? read.keptBytes : 0 };
+              return answerOf(url, read, now);
             },
             catch: (cause) => cause,
           });
 
         /** A packument answer read into the package apm caches. */
-        const packageOf = (input: { name: string; status: number; body: unknown }): CachedProbe | { kind: "unknown" } => {
-          const { name, status, body } = input;
+        const packageOf = (name: string, answer: Exclude<PackumentAnswer, { kind: "over-budget" }>): CachedProbe | { kind: "unknown" } => {
+          if (answer.kind === "status") return answer.status === 404 ? { kind: "absent" } : { kind: "unknown" };
 
-          if (status === 404) return { kind: "absent" };
-
-          if (status !== 200) return { kind: "unknown" };
-          const parsed = UpPackument.safeParse(body);
+          if (answer.kind === "refused") return { kind: "unknown" };
+          const parsed = UpPackument.safeParse(answer.body);
 
           if (!parsed.success) return { kind: "unknown" };
           const raw = parsed.data;
@@ -482,31 +523,48 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           };
         };
 
-        /** The package as npm lists it, and when npm said so. */
-        const fetchPackage = (name: string, now: number): Effect.Effect<{ probe: CachedProbe | { kind: "unknown" }; fetchedAt: number; kept: number }> =>
-          fetchPackument(`${baseUrl}${encodeName(name)}`, now).pipe(
-            Effect.map(({ status, body, fetchedAt, kept }) => ({ probe: packageOf({ name, status, body }), fetchedAt, kept })),
-            Effect.orElseSucceed(() => ({ probe: { kind: "unknown" as const }, fetchedAt: now, kept: 0 })),
-          );
-
-        /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
-        const listing = (name: string): Effect.Effect<UpstreamListing> =>
+        /**
+         * The packument as npm lists it, from the isolate cache or npm, without its analyses. With a budget, what this
+         * request now holds is taken from it: a cached packument's weight, or what a fresh read kept.
+         */
+        const listed = (name: string, budget: KeptBudget | null): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
           Effect.gen(function* () {
             const t = yield* now;
-            const cached = caches.probes.get(name, t);
+            const cached = caches.probes.entry(name, t);
 
-            if (cached !== undefined) return cached;
-            const { probe: fresh, fetchedAt, kept } = yield* fetchPackage(name, t);
+            if (cached !== undefined) return budget && !budget.take(cached.weight) ? { kind: "over-budget" as const } : cached.value;
 
-            if (fresh.kind === "unknown") return fresh;
+            // nothing more fits: npm is not asked at all
+            if (budget?.exhausted) return { kind: "over-budget" as const };
+
+            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: TRIMMED, budget }).pipe(
+              Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })),
+            );
+
+            if (answer.kind === "over-budget") return answer;
+            const fresh = packageOf(name, answer);
+            const kept = answer.kind === "ok" ? answer.kept : 0;
+
+            if (fresh.kind === "unknown") {
+              // nothing of it is held
+              budget?.give(kept);
+
+              return fresh;
+            }
+
             // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
             // takes room from older ones (PROBE_CACHE_BYTES)
-            caches.probes.set(name, fresh, fetchedAt, kept);
+            caches.probes.set(name, fresh, answer.fetchedAt, kept);
 
             if (fresh.kind === "found") yield* notify((h) => h.upstreamFetched, { ...fresh.pkg, versions: fresh.pkg.versions.map((v) => ({ ...v, score: null })) });
 
             return fresh;
           });
+
+        /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
+        const listing = (name: string): Effect.Effect<UpstreamListing> =>
+          // with no budget there is nothing to be over
+          Effect.map(listed(name, null), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
         // an analysis counts only for the exact bytes it read, by the current scorer; a version it decided it can never
         // score says why
@@ -533,15 +591,46 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return scored(listed.pkg, yield* store.upstreamAnalyses(name));
           });
 
-        const probeMany = (names: readonly string[]): Effect.Effect<Map<string, Probe>, StoreError> =>
+        const probeWithin = (name: string, budget: KeptBudget): Effect.Effect<BudgetedProbe, StoreError> =>
+          Effect.gen(function* () {
+            const l = yield* listed(name, budget);
+
+            if (l.kind !== "found") return l;
+
+            return scored(l.pkg, yield* store.upstreamAnalyses(name));
+          });
+
+        const probeMany = (names: readonly string[], budget?: KeptBudget): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
             const wanted = [...new Set(names)];
-            const listed = yield* Effect.forEach(wanted, (name) => Effect.map(listing(name), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
-            const found = listed.flatMap(([name, l]) => (l.kind === "found" ? [name] : []));
+            // a few at once: the reads in flight share the budget, so together they keep no more than it allows
+            const got = yield* Effect.forEach(wanted, (name) => Effect.map(listed(name, budget ?? null), (l) => [name, l] as const), { concurrency: PROBE_CONCURRENCY });
+            const found = got.flatMap(([name, l]) => (l.kind === "found" ? [name] : []));
             const scores = yield* store.upstreamAnalysesOf(found);
             const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
 
-            return new Map(listed.map(([name, l]) => [name, l.kind === "found" ? scored(l.pkg, scores.get(name) ?? none) : l]));
+            return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scored(l.pkg, scores.get(name) ?? none) : l]));
+          });
+
+        /** Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate. */
+        const devDependencies = (name: string): Effect.Effect<ReadonlyMap<string, unknown> | null> =>
+          Effect.gen(function* () {
+            const t = yield* now;
+            const answer = yield* fetchPackument({ url: `${baseUrl}${encodeName(name)}`, now: t, profile: DEV_DEPENDENCIES, budget: null }).pipe(Effect.orElseSucceed(() => null));
+
+            if (answer?.kind !== "ok") return null;
+            const parsed = DevDependencies.safeParse(answer.body);
+
+            if (!parsed.success) return null;
+            const out = new Map<string, unknown>();
+
+            for (const [version, doc] of Object.entries(parsed.data.versions)) {
+              const one = DevDocument.safeParse(doc);
+
+              if (one.success && one.data.devDependencies !== undefined) out.set(version, one.data.devDependencies);
+            }
+
+            return out;
           });
 
         const api: UpstreamApi = {
@@ -585,8 +674,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return answer;
             }),
           probe,
+          probeWithin,
           listing,
           probeMany,
+          devDependencies,
           get: (name) => Effect.map(probe(name), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {

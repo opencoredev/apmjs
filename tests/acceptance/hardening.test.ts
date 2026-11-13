@@ -38,7 +38,12 @@ describe("upstream unknown is not upstream absent", () => {
   test("a first publish is refused while the public registry cannot be asked", async () => {
     const r = await publish(reg, alice, { name: "maybe-taken-upstream", version: "1.0.0" });
     expect(r.code).not.toBe(0);
-    expect((await getJson(`${reg.url}maybe-taken-upstream`)).status).toBe(404);
+    // npm could not be asked, so whether it has the name is not known: a registry error npm retries, never 404 (review
+    // of 89441a9, finding 7)
+    const res = await fetch(`${reg.url}maybe-taken-upstream`);
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe("30");
   });
 
   test("popular names are reserved even when upstream says nothing", async () => {

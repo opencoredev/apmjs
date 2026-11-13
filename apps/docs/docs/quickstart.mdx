@@ -43,6 +43,8 @@ Pick your package manager. Each setting goes in the project folder, so it applie
 
 Then install as usual (`bun install`, `npm install`, `pnpm install`). Packages come from apm, which fetches them from npm, checks each tarball against npm's checksum and scores it.
 
+apm's package documents leave out a few fields npm's have: each version's `licenseText`, `readme` and `readmeFilename`, and `devDependencies` in the abbreviated form installs use. `npm view <package> devDependencies` still works. The full list is in [What apm's packuments leave out](/reference/http-api#what-apms-packuments-leave-out).
+
 :::tip
 For npm and pnpm, the plain registry URL (without `~safe/`) serves every version npm has. Use it when you only want `apm add` to apply the checks.
 :::

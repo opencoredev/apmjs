@@ -42,7 +42,19 @@ Prefix any path with `/~safe` to read through the safe view: `https://registry.a
 | `DELETE /-/user/token/<token>` | token | Revoke the token that made the request. |
 | `PUT /-/user/org.couchdb.user:<name>` | none | npm password login. Only on self-hosted registries with `APM_LEGACY_AUTH=1`. |
 
-Packages that are not on apm are fetched from `https://registry.npmjs.org/`, checked against npm's checksum, and scored on first request.
+Packages that are not on apm are fetched from `https://registry.npmjs.org/`, checked against npm's checksum, and scored on first request. When npm cannot be reached, or sends a packument apm refuses to read (below), `GET /<package>` answers `503` with `Retry-After: 30`, so npm reports a registry error and tries again instead of saying the package does not exist.
+
+### What apm's packuments leave out
+
+For a package that is only on npm, apm reads npm's packument as a stream and keeps only what it serves, so a 39 MB packument (vite's) costs a few MB. Compared with npm's own packument:
+
+- No version has `licenseText`, `readme` or `readmeFilename`. npm repeats this text in every version (vite's `licenseText` is 35 MB of its 39 MB packument), and no install reads it. Each version's `license` field is kept, so `npm view <package> license` works, and so is the package's top-level `readme`.
+- The abbreviated packument (`Accept: application/vnd.npm.install-v1+json`, which npm, pnpm, yarn and bun install from) has no `devDependencies`. npm's has them, but no package manager installs a dependency's devDependencies.
+- The full packument (`Accept: application/json`, which `npm view` and yarn 1 read) has each version's `devDependencies`, read separately from the rest. If that read fails or goes over the limits below, the answer leaves them out.
+- At the top level it has `_id`, `name`, `description`, `dist-tags`, `versions`, `time`, `readme` and `maintainers`. npm's `_rev`, `users`, `keywords`, `repository`, `homepage`, `bugs`, `author`, `license` and `readmeFilename` at the top level are left out; each version keeps its own. `time` has one entry per version served, and no `created` or `modified`.
+- Each version also has `_apmScore`, which npm's does not.
+
+apm refuses an npm packument larger than 160 MB, one that would keep more than 24 MB or 1.5 million values, or one nested more than 100,000 levels deep. It refuses invalid JSON too, even in fields it does not keep. A refused packument answers `503`, like an unreachable npm. No real package comes near these limits: next keeps 15 MB and 0.8 million values.
 
 ## apm API
 

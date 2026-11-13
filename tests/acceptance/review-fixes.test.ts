@@ -223,7 +223,8 @@ describe("an npm outage never hands out scoped names", () => {
     const manifest = { name: "@alice/outage-claim", version: "1.0.0", license: "MIT", main: "index.js" };
     const r = await putPublish(reg, alice, manifest, pkgTgz(manifest));
     expect(r.status).toBe(503);
-    expect((await getJson(`${reg.url}@alice%2Foutage-claim`)).status).toBe(404);
+    // and its packument is a registry error npm retries, not a package that does not exist (review of 89441a9, finding 7)
+    expect((await getJson(`${reg.url}@alice%2Foutage-claim`)).status).toBe(503);
   });
 
   test("npm audit through apm says the advisory service is unavailable instead of answering clean", async () => {

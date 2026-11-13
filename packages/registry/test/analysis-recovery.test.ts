@@ -125,6 +125,8 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       scopeExists: () => Effect.succeed("unknown"),
       search: () => Effect.succeed({ kind: "unavailable" }),
       probe: (name) => Effect.succeed(probeOf(name)),
+      probeWithin: (name) => Effect.succeed(probeOf(name)),
+      devDependencies: () => Effect.succeed(null),
       probeMany: (names) => Effect.succeed(new Map(names.map((n) => [n, probeOf(n)]))),
       listing: () => Effect.succeed({ kind: "unknown" }),
       get: (name) => Effect.succeed(pkgOf(name)),

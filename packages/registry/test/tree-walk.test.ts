@@ -11,7 +11,7 @@ import { z } from "zod";
 import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, resolveResponse } from "../src/apm.ts";
+import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_KEPT_BYTES, resolveResponse } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
@@ -21,7 +21,8 @@ import { Upstream } from "../src/upstream.ts";
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DAY = 86_400_000;
 
-type Pkg = { name: string; dependencies?: Record<string, string> };
+/** `pad`: bytes of description its npm packument carries, which the registry keeps. */
+type Pkg = { name: string; dependencies?: Record<string, string>; pad?: number };
 
 const encoder = new TextEncoder();
 
@@ -80,6 +81,15 @@ async function seed(url: string, input: { local: readonly Pkg[]; upstream: reado
   }
 }
 
+/** The packument the stand-in sends: one version, and the padding a package asks for. */
+type FakePackument = {
+  name: string;
+  description?: string;
+  "dist-tags": Record<string, string>;
+  versions: Record<string, Manifest & { dist: { tarball: string; shasum: string; integrity: string } }>;
+  time: Record<string, string>;
+};
+
 /** A stand-in for npm: each package's packument, and how many were asked for. */
 function fakeNpm(pkgs: readonly Pkg[]) {
   const byName = new Map(pkgs.map((p) => [p.name, p]));
@@ -97,12 +107,16 @@ function fakeNpm(pkgs: readonly Pkg[]) {
       // the walk never downloads a tarball: its analysis is stored
       const dist = { tarball: `https://npm.invalid/${name}/-/${name}-1.0.0.tgz`, shasum: "1".repeat(40), integrity: integrityOf(name) };
 
-      return Response.json({
+      const packument: FakePackument = {
         name,
         "dist-tags": { latest: "1.0.0" },
         versions: { "1.0.0": { ...manifestOf(p), dist } },
         time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() },
-      });
+      };
+
+      if (p.pad !== undefined) packument.description = "d".repeat(p.pad);
+
+      return Response.json(packument);
     },
   });
 
@@ -308,5 +322,32 @@ describe("the resolve walk bounds its database work", () => {
         expect((await resolve({ url, name: "root", npm: down.url.href, strict: true })).status).toBe(503);
       }).finally(() => down.stop(true));
     });
+  });
+});
+
+// Review of 89441a9, finding 3: a walk holds every catalog it read until it answers, read six at a time, and the
+// isolate cache's eviction frees none a request still holds, so one request's package metadata had no bound.
+describe("the resolve walk bounds the package metadata it holds", () => {
+  test("past REQUEST_KEPT_BYTES the rest are unchecked with a warning, reads in flight included", () => {
+    // eight npm dependencies of about 6 MB kept each: 48 MB against a 40 MB budget, six of them read at once
+    const pad = 6 * 1024 * 1024;
+    const deps = Array.from({ length: 8 }, (_, i) => ({ name: `big${i}`, pad }));
+    const root = { name: "root", dependencies: Object.fromEntries(deps.map((d) => [d.name, "^1.0.0"])) };
+    const npm = fakeNpm(deps);
+
+    return withDatabase({ local: [root], upstream: deps }, async (url) => {
+      const r = await resolve({ url, name: "root", npm: npm.url });
+      const fits = Math.floor(REQUEST_KEPT_BYTES / pad);
+
+      report("8 packuments of 6 MB", r);
+      expect(r.status).toBe(200);
+      // on 89441a9 all eight were read, held and checked
+      expect(r.body.tree.packages.length).toBe(fits);
+      expect(r.body.tree.unchecked).toBe(deps.length - fits);
+      expect(r.body.tree.uncheckedDeps.map((d) => d.reason)).toEqual(Array.from({ length: deps.length - fits }, () => OVER_BUDGET_TEXT));
+      expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.text)).toEqual([`some dependencies were not checked: ${OVER_BUDGET_TEXT}`]);
+      // a walk cut short refuses in strict mode, as at its other limits
+      expect((await resolve({ url, name: "root", npm: npm.url, strict: true })).status).not.toBe(200);
+    }).finally(() => npm.stop());
   });
 });

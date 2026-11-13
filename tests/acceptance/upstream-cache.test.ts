@@ -48,9 +48,13 @@ afterAll(async () => {
 
 const Packument = z.object({ versions: z.record(z.string(), z.unknown()) });
 
-/** The versions apm serves for `name` now. */
+/**
+ * The versions apm serves for `name` now, in the abbreviated packument installs read. The full one also reads each
+ * version's devDependencies under a cache key of its own (upstream.ts, DEV_DEPENDENCIES), which these copies do not
+ * seed, so it would ask npm once more.
+ */
 async function versionsOf(name: string): Promise<string[]> {
-  const res = await getJson(`${reg.url}${name}`);
+  const res = await getJson(`${reg.url}${name}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
   const doc = Packument.safeParse(res.body);
 
   return res.status === 200 && doc.success ? Object.keys(doc.data.versions).sort() : [];

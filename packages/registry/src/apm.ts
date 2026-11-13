@@ -46,7 +46,7 @@ import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type PackageRecord, type Unscorable, type VersionRecord } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
-import { fail, json, parseBody } from "./http.ts";
+import { fail, json, parseBody, streamedJson } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
@@ -71,7 +71,8 @@ import {
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
-import { tooLargeText, Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
+import { KeptBudget } from "./packument-read.ts";
+import { tooLargeText, Upstream, type BudgetedProbe, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -200,6 +201,31 @@ const lookup = (name: string) =>
     return upstreamSource(up);
   });
 
+/**
+ * The package metadata one resolve walk, or one scan, holds at most, counted as the JSON readPackument kept (parsed,
+ * about one and a half times this). A walk holds every catalog it read until it answers, and the isolate cache's
+ * eviction frees none a request still holds, so without this a tree of big packuments (next 15 MB, typescript 11,
+ * @types/node 11, react 7) could take a Worker's 128 MB with the requests beside it. A dependency past it is reported
+ * unchecked, with a warning, never passed.
+ */
+export const REQUEST_KEPT_BYTES = 40 * 1024 * 1024;
+
+/** Why a dependency past REQUEST_KEPT_BYTES was not checked. */
+export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_KEPT_BYTES / (1024 * 1024)} MB of package metadata in one request, and this package's did not fit`;
+
+/** Like lookupOrUnknown, under a request's budget for the package metadata it holds (scan: one lease per package). */
+const lookupWithin = (name: string, budget: KeptBudget) =>
+  Effect.gen(function* () {
+    const pkg = yield* (yield* Store).getPackage(name);
+
+    if (pkg) return localSource(pkg, yield* versionsOf(name));
+    const upstream = yield* upstreamOrNull;
+
+    if (!upstream) return null;
+
+    return lookupOf(yield* upstream.probeWithin(name, budget));
+  });
+
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
 const lookupOrUnknown = (name: string) =>
   Effect.gen(function* () {
@@ -272,14 +298,20 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
   return problems;
 }
 
-/** `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known. */
-type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string };
+/**
+ * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
+ * `over-budget`: the request held as much package metadata as it may (REQUEST_KEPT_BYTES), so it was not read.
+ */
+type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string } | { kind: "over-budget"; reason: string };
 
 const missing = (reason: string): Picked => ({ kind: "missing", reason });
 const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, v });
 
-/** A package's catalog as a lookup finds it: here or upstream, nowhere (null), or upstream could not be asked. */
-type Lookup = Source | null | "unknown";
+/**
+ * A package's catalog as a lookup finds it: here or upstream, nowhere (null), upstream could not be asked, or the
+ * request had no room left to hold it (REQUEST_KEPT_BYTES).
+ */
+type Lookup = Source | null | "unknown" | "over-budget";
 
 /** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
 const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boolean) => Effect.map(lookupOrUnknown(dep.name), (src) => pickFrom(src, dep, keep));
@@ -287,6 +319,8 @@ const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boo
 /** pickDependency on a catalog already read. */
 function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Picked {
   if (src === "unknown") return { kind: "unavailable", reason: UNAVAILABLE_TEXT };
+
+  if (src === "over-budget") return { kind: "over-budget", reason: OVER_BUDGET_TEXT };
 
   if (src === null) return missing("not on this registry or upstream");
   let inRange: VersionRecord[];
@@ -314,7 +348,7 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord)
 }
 
 /** An upstream probe as a lookup; a name the batch has no answer for counts as "upstream could not be asked". */
-function lookupOf(p: Probe | undefined): Lookup {
+function lookupOf(p: BudgetedProbe | undefined): Lookup {
   if (p === undefined) return "unknown";
 
   switch (p.kind) {
@@ -324,6 +358,8 @@ function lookupOf(p: Probe | undefined): Lookup {
       return null;
     case "unknown":
       return "unknown";
+    case "over-budget":
+      return "over-budget";
     default: {
       const _exhaustive: never = p;
 
@@ -337,7 +373,7 @@ function lookupOf(p: Probe | undefined): Lookup {
  * (this registry's packages, versions and dismissals, then npm's packuments and their analyses); `get` reads a name
  * no batch has.
  */
-function catalogMemo() {
+function catalogMemo(budget: KeptBudget) {
   const known = new Map<string, Lookup>();
 
   const load = (names: readonly string[]) =>
@@ -363,7 +399,7 @@ function catalogMemo() {
         return;
       }
 
-      const probes = yield* upstream.probeMany(rest);
+      const probes = yield* upstream.probeMany(rest, budget);
 
       for (const n of rest) known.set(n, lookupOf(probes.get(n)));
     });
@@ -1549,9 +1585,9 @@ export const MAX_WALK_LOOKUPS = 400;
  */
 export const MAX_WALK_LEVELS = 32;
 
-export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number };
+export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number; maxKeptBytes: number };
 
-const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40 };
+const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxKeptBytes: REQUEST_KEPT_BYTES };
 
 /**
  * Walks the dependency tree the package manager would install (newest active version matching each
@@ -1582,7 +1618,9 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
     };
 
     const seen = new Set<string>();
-    const catalogs = catalogMemo();
+    // every catalog the walk reads, it holds until it answers: together they stay under maxKeptBytes
+    const catalogs = catalogMemo(new KeptBudget(limits.maxKeptBytes));
+    let overBudget = false;
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
     const active = (v: VersionRecord): boolean => v.status === "active";
@@ -1665,6 +1703,19 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
         // the registry or npm could not be asked: not a pass, and not the same as a walk limit
         unavailable.push({ dependency: describeDependency(dep), via: item.via });
         warnings.push(stateWarning({ kind: "unavailable", name: dep.name, version: dep.kind === "tag" ? dep.tag : dep.range, text: UNAVAILABLE_TEXT, url: `${webUrl}package/${dep.name}`, via: item.via }));
+        continue;
+      }
+
+      if (picked.kind === "over-budget") {
+        // a walk limit like the others: counted and listed, one warning, and refused in strict mode
+        miss(describeDependency(dep), picked.reason, item.via);
+
+        if (!overBudget) {
+          overBudget = true;
+          limited = true;
+          warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `some dependencies were not checked: ${OVER_BUDGET_TEXT}`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
+        }
+
         continue;
       }
 
@@ -2052,7 +2103,7 @@ type ScanOne =
   | { kind: "unchecked"; unchecked: ScanUnchecked }
   | { kind: "pending"; unchecked: ScanUnchecked };
 
-const scanOne = (p: { name: string; version: string }, strict: boolean, at: number) =>
+const scanOne = (p: { name: string; version: string }, strict: boolean, at: number, budget: KeptBudget) =>
   Effect.gen(function* () {
     const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne => ({ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } });
@@ -2067,7 +2118,9 @@ const scanOne = (p: { name: string; version: string }, strict: boolean, at: numb
       advisory: { package: p.name, version: p.version, level, description: `${warningLines(warning).slice(0, -1).join("\n")}${strict ? "" : "\napm lets it install; APM_SCANNER_STRICT=1 refuses it."}`, url: warning.url },
     });
 
-    const src = yield* lookupOrUnknown(p.name);
+    const src = yield* lookupWithin(p.name, budget);
+
+    if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 
     // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
     if (src === "unknown") return flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable");
@@ -2140,7 +2193,18 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // queued versions are listed twice: in `unchecked`, so a scanner from before `pending` never reads one as clean,
     // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
-    const results = yield* Effect.forEach(packages.slice(0, cap), (p) => scanOne(p, strict, at), { concurrency: SCAN_CONCURRENCY });
+    // the packuments of the packages being checked at once share one budget; each gives its share back when it is done
+    const budget = new KeptBudget(REQUEST_KEPT_BYTES);
+
+    const results = yield* Effect.forEach(
+      packages.slice(0, cap),
+      (p) => {
+        const lease = budget.lease();
+
+        return scanOne(p, strict, at, lease).pipe(Effect.ensuring(Effect.sync(() => lease.release())));
+      },
+      { concurrency: SCAN_CONCURRENCY },
+    );
 
     for (const r of results) {
       switch (r.kind) {
@@ -2275,8 +2339,22 @@ const ABBREV = [
   "deprecated",
 ];
 
-function upstreamPackument(input: { base: string; src: Extract<Source, { kind: "upstream" }>; abbreviated: boolean; view: PackumentView | null; at: number; confirmed: ReadonlySet<string> }): Record<string, unknown> {
-  const { base, src, abbreviated, view, at, confirmed } = input;
+/**
+ * The packument apm serves for a package only npm has. What the registry keeps of npm's leaves out every version's
+ * licenseText, readme and readmeFilename (readPackument, DROPPED_VERSION_FIELDS); the full packument adds back each
+ * version's devDependencies from a read of their own (`devDependencies`; null when that read failed, and then they are
+ * left out too). The abbreviated one has none of them.
+ */
+function upstreamPackument(input: {
+  base: string;
+  src: Extract<Source, { kind: "upstream" }>;
+  abbreviated: boolean;
+  view: PackumentView | null;
+  at: number;
+  confirmed: ReadonlySet<string>;
+  devDependencies: ReadonlyMap<string, unknown> | null;
+}): Record<string, unknown> {
+  const { base, src, abbreviated, view, at, confirmed, devDependencies } = input;
   // a version an apm reviewer confirmed malicious is not offered, in any view (confirmed.ts)
   const offered = src.versions.filter((v) => !confirmed.has(v.version));
   const kept = view ? offered.filter(view.keep) : offered;
@@ -2287,7 +2365,10 @@ function upstreamPackument(input: { base: string; src: Extract<Source, { kind: "
     // a view's tarballs stay inside the view, so a lockfile written from it keeps being checked
     // a manifest past the limits apm reads is served without the fields past them: serializing it whole recurses
     // deep enough to overflow the stack and fail the request for every version of the package
-    const doc: Record<string, unknown> = { ...servableManifest(v.manifest), dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
+    const dev = abbreviated ? undefined : devDependencies?.get(v.version);
+    // devDependencies read apart pass the same limits as the rest of the manifest
+    const manifest = dev === undefined ? v.manifest : { ...v.manifest, devDependencies: dev };
+    const doc: Record<string, unknown> = { ...servableManifest(manifest), dist: { tarball: tarballUrl(`${base}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity } };
     const r = reportFor(v, at);
 
     if (r) doc._apmScore = compact(r);
@@ -2337,6 +2418,9 @@ function upstreamPackument(input: { base: string; src: Extract<Source, { kind: "
   };
 }
 
+/** How long a client should wait before it asks again for a packument the upstream could not give, in seconds. */
+export const UPSTREAM_RETRY_AFTER_S = 30;
+
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
 export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
   Effect.gen(function* () {
@@ -2349,7 +2433,11 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const sp = splitPath(p);
 
     if (!sp || (yield* (yield* Store).getPackage(sp.name))) return null;
-    const src = yield* lookup(sp.name);
+    const src = yield* lookupOrUnknown(sp.name);
+
+    // npm could not be asked, or answered with a packument apm refused to read: a registry error the client retries,
+    // never "Not found", which npm reports as a package that does not exist
+    if (src === "unknown") return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
 
     if (!src || src.kind !== "upstream") return null;
     const at = yield* now;
@@ -2410,9 +2498,12 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       for (const v of cooled) yield* ensureAnalyzed(src, v);
     }
 
-    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions) });
+    // the full packument (npm view, yarn 1) adds back each version's devDependencies, read apart so the registry's own
+    // reads stay small; a HEAD sends no body, so it reads none
+    const devDependencies = abbreviated || req.method === "HEAD" ? null : yield* upstream.devDependencies(src.name);
+    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions), devDependencies });
 
-    return json(body, 200, { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });
+    return streamedJson(body, "versions", { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" });
   });
 
 // ---------- router ----------

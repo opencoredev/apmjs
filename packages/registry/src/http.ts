@@ -18,6 +18,77 @@ export function json(body: unknown, status = 200, headers: Readonly<Record<strin
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
+/** Bytes a streamed answer gathers before it sends them: big enough to keep the stream's overhead small. */
+const STREAM_CHUNK_CHARS = 64 * 1024;
+
+/** The JSON text of `body`, an object, in pieces: each member on its own, and the members of `spread` one at a time. */
+function* jsonPieces<T extends object>(body: T, spread: keyof T & string): Generator<string> {
+  let first = true;
+
+  for (const [key, value] of Object.entries(body)) {
+    const head = `${first ? "{" : ","}${JSON.stringify(key)}:`;
+
+    // an object (not an array, not null): JSON.stringify would write it as members too
+    if (key === spread && value instanceof Object && !Array.isArray(value)) {
+      let inner = true;
+
+      for (const [k, v] of Object.entries(value)) {
+        const text = JSON.stringify(v);
+
+        // as JSON.stringify does: a member whose value has no JSON form is left out
+        if (text === undefined) continue;
+        yield `${inner ? `${head}{` : ","}${JSON.stringify(k)}:${text}`;
+        inner = false;
+      }
+
+      yield inner ? `${head}{}` : "}";
+      first = false;
+      continue;
+    }
+
+    const text = JSON.stringify(value);
+
+    if (text === undefined) continue;
+    yield `${head}${text}`;
+    first = false;
+  }
+
+  yield first ? "{}" : "}";
+}
+
+/**
+ * Like json, for an object with one large member (`spread`, a packument's `versions`): the text is written as it is
+ * sent, one member of `spread` at a time, so the answer is never held whole as a string and again as bytes. next's
+ * full packument is 30 MB of JSON.
+ */
+export function streamedJson<T extends object>(body: T, spread: keyof T & string, headers: Readonly<Record<string, string>> = {}): Response {
+  const pieces = jsonPieces(body, spread);
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      let text = "";
+
+      while (text.length < STREAM_CHUNK_CHARS) {
+        const next = pieces.next();
+
+        if (next.done) {
+          if (text !== "") controller.enqueue(encoder.encode(text));
+          controller.close();
+
+          return;
+        }
+
+        text += next.value;
+      }
+
+      controller.enqueue(encoder.encode(text));
+    },
+  });
+
+  return new Response(stream, { status: 200, headers: { "content-type": "application/json", ...headers } });
+}
+
 export function fail(status: number, error: string, extra: ErrorExtra = {}): Response {
   return json({ error, ...extra }, status);
 }
