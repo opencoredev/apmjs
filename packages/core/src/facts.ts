@@ -64,9 +64,13 @@ const ENV_DESTRUCTURE = /\{([^{}]{1,600})\}\s*=\s*(?:process\s*\.\s*env|Bun\s*\.
 /** The environment object itself, ended: `process.env` or `Bun.env` with no member after it (`process.env.X` is one variable). */
 const ENV_OBJECT = String.raw`(?:\b(?:globalThis|global|window|self)\s*\.\s*)?\b(?:process\s*\.\s*env|Bun\s*\.\s*env)(?!\s*(?:\?\.|\.|\[|[\w$]))`;
 
-/** Methods that hand back the variables themselves, not one value: these read the whole environment. */
+/**
+ * Methods that hand back the variables themselves, not one value: these read the whole environment. No two blank runs
+ * sit next to each other with only optional text between them (`\s*(?:const)?\s*` split a run of n blanks n ways, from
+ * one `for (`), so a run is read once.
+ */
 const ENV_DUMP = new RegExp(
-  String.raw`\bJSON\s*\.\s*stringify\s*\(\s*${ENV_OBJECT}|\bObject\s*\.\s*(?:keys|entries|values|getOwnPropertyNames)\s*\(\s*${ENV_OBJECT}\s*\)|\bObject\s*\.\s*assign\s*\(\s*\{\s*\}\s*,\s*${ENV_OBJECT}\s*\)|\bfor\s*\(\s*(?:const|let|var)?\s*[\w$]+\s+in\s+${ENV_OBJECT}|\bDeno\s*\.\s*env\s*\.\s*toObject\s*\(|\bprintenv\b`,
+  String.raw`\bJSON\s*\.\s*stringify\s*\(\s*${ENV_OBJECT}|\bObject\s*\.\s*(?:keys|entries|values|getOwnPropertyNames)\s*\(\s*${ENV_OBJECT}\s*\)|\bObject\s*\.\s*assign\s*\(\s*\{\s*\}\s*,\s*${ENV_OBJECT}\s*\)|\bfor\s*\(\s*(?:(?:const|let|var)\s+)?[\w$]+\s+in\s+${ENV_OBJECT}|\bDeno\s*\.\s*env\s*\.\s*toObject\s*\(|\bprintenv\b`,
   "g",
 );
 

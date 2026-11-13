@@ -2,6 +2,8 @@
 // the tarball) and the scorer (what runs is read first), so the two lists cannot drift apart.
 import { z } from "zod";
 import { sameSubstitution } from "./glob.ts";
+import { ManifestTooLargeError, measureManifest } from "./manifest.ts";
+import { charge } from "./meter.ts";
 
 function stripDot(p: string): string {
   return p.replace(/^\.\//, "").replace(/^\//, "");
@@ -82,9 +84,13 @@ function pathsIn(field: string, v: z.infer<typeof PathOrMap>, keyed: (k: string)
  * Every entry point, most direct first: bin, main, module, browser, exports and imports (every subpath and
  * condition), then types and typings. `browser` may map paths to other paths or to false; its string values are
  * listed. A subpath pattern (`./docs/*.txt`) or folder mapping (`./lib/`) is listed as written; `targetFiles` says
- * which files it names.
+ * which files it names. Throws ManifestTooLargeError for a manifest past MANIFEST_LIMITS (manifest.ts).
  */
 export function entryPoints(manifest: Record<string, unknown>): EntryPoint[] {
+  // the schema below recurses into `exports`: a manifest past the limits is refused before it can overflow the stack
+  const reading = measureManifest(manifest);
+
+  if (reading.kind === "over") throw new ManifestTooLargeError(reading.limit);
   const m = Fields.parse(manifest);
   const out: EntryPoint[] = [...pathsIn("bin", m.bin, (k) => `bin.${k}`)];
 
@@ -130,7 +136,6 @@ export function missingEntries(manifest: Record<string, unknown>, files: readonl
 /** What an entry's target names: one path, or every file of `paths` a pattern or folder mapping matches. */
 export type Target = { kind: "path"; path: string } | { kind: "files"; files: string[] };
 
-
 /**
  * The files a target names. A pattern (`./docs/*.txt`) names every file it matches, with each `*` standing for the
  * same text, as node substitutes it; a folder mapping (`./lib/`) names every file under the folder. Anything else is
@@ -146,7 +151,17 @@ export function targetFiles(target: string, paths: readonly string[]): Target {
     return { kind: "files", files: paths.filter((p) => sameSubstitution(p, parts)) };
   }
 
-  if (target.endsWith("/") && target.startsWith("./")) return { kind: "files", files: paths.filter((p) => p.startsWith(t)) };
+  // each comparison is charged, as sameSubstitution charges its own
+  if (target.endsWith("/") && target.startsWith("./")) {
+    return {
+      kind: "files",
+      files: paths.filter((p) => {
+        charge("score", Math.ceil(Math.min(p.length, t.length) / 32) + 1);
+
+        return p.startsWith(t);
+      }),
+    };
+  }
 
   return { kind: "path", path: target };
 }

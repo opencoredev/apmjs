@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
+import { boundedManifest, measureManifest } from "./manifest.ts";
 import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { typoConflicts } from "./names.ts";
@@ -568,16 +569,27 @@ type DeclaredEntries = { paths: string[]; files: string[] };
 
 function declaredEntries(manifest: Record<string, unknown>, all: readonly string[]): DeclaredEntries {
   const paths: string[] = [];
-  const files: string[] = [];
+  const files = new Set<string>();
+  // a target named many times (1,600 conditions all naming "./lib/") is matched against the files once
+  const targets = new Set<string>();
 
   for (const e of entryPoints(manifest)) {
+    charge("score", 1);
+
+    if (targets.has(e.path)) continue;
+    targets.add(e.path);
     const t = targetFiles(e.path, all);
 
-    if (t.kind === "files") files.push(...t.files);
-    else if (t.path.startsWith(".") || /^[\w@]/.test(t.path)) paths.push(t.path);
+    // the set holds each file once, so it never grows past the tarball's file list; every insertion is charged
+    if (t.kind === "files") {
+      for (const f of t.files) {
+        charge("score", 1);
+        files.add(f);
+      }
+    } else if (t.path.startsWith(".") || /^[\w@]/.test(t.path)) paths.push(t.path);
   }
 
-  return { paths, files: [...new Set(files)] };
+  return { paths, files: [...files] };
 }
 
 /** Files node reads as data, not code, whatever exposes them: JSON, type declarations and native modules. */
@@ -848,8 +860,13 @@ function readLikeV3(w: V3Walk): V3Skips {
 
   if (w.gyp) first.push(w.gyp.path);
 
+  const entryPaths = new Set<string>();
+
   for (const e of entryPoints(w.manifest)) {
-    if (e.field.startsWith("imports") || !(e.path.startsWith(".") || /^[\w@]/.test(e.path))) continue;
+    charge("score", 1);
+
+    if (e.field.startsWith("imports") || !(e.path.startsWith(".") || /^[\w@]/.test(e.path)) || entryPaths.has(e.path)) continue;
+    entryPaths.add(e.path);
     const f = resolveIn(byPath, e.path);
 
     // type declarations listed under exports never run
@@ -967,7 +984,12 @@ export function analyze(input: AnalyzeInput): Analysis {
   let read: Analysis;
 
   try {
-    read = withMeter(meter, () => analyzeMetered(input));
+    read = withMeter(meter, () => {
+      // before anything that recurses into package.json (zod, JSON.stringify, the format check) reads it
+      const reading = measureManifest(input.manifest);
+
+      return reading.kind === "ok" ? analyzeMetered(input) : manifestOverAnalysis({ name: input.name, manifest: input.manifest, files: input.files, text: reading.text, because: input.incompleteBecause });
+    });
   } catch (e) {
     if (!(e instanceof MeterExhausted)) throw e;
 
@@ -994,13 +1016,40 @@ export function meterEvidence(phase: Phase, limit: number): string {
  * floor on `incomplete` alone. It charges nothing, so it can be built on a spent meter.
  */
 export function unfinishedAnalysis(u: Unfinished): Analysis {
-  const evidence = [meterEvidence(u.phase, u.limit), ...(u.because ?? [])];
+  return incompleteAnalysis({ manifest: u.manifest, files: u.files, evidence: [meterEvidence(u.phase, u.limit), ...(u.because ?? [])], notChecked: `everything past the analysis work limit (${PHASE_NAMES[u.phase]})` });
+}
 
+/** What `manifestOverAnalysis` needs: the version, which limit its package.json is past, and limits hit before. */
+export type ManifestOver = { name: string; manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; text: string; because?: readonly string[] | undefined };
+
+/**
+ * The analysis of a version whose package.json is past MANIFEST_LIMITS: `incomplete`, and nothing read past the
+ * check that found it, so no recursive reader ever sees it. Charges nothing.
+ */
+export function manifestOverAnalysis(u: ManifestOver): Analysis {
+  return incompleteAnalysis({ manifest: u.manifest, files: u.files, evidence: [`${u.text}, past what apm reads, so apm did not read this version and nothing it holds was cleared`, ...(u.because ?? [])], notChecked: "everything in this version: its package.json is past what apm reads" });
+}
+
+/**
+ * The analysis of a version whose run failed with an error before it finished, after the retries the registry allows:
+ * `incomplete`, naming the error's class only (its message may quote the package). Charges nothing.
+ */
+export function failedAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; errorClass: string; attempts: number }): Analysis {
+  return incompleteAnalysis({
+    manifest: u.manifest,
+    files: u.files,
+    evidence: [`analysis failed: ${u.attempts} runs of it ended with ${u.errorClass} before finishing, so nothing this version holds was cleared`],
+    notChecked: "everything in this version: its analysis failed before it finished",
+  });
+}
+
+/** `incomplete` and nothing that reads as a pass. Reads package.json only within MANIFEST_LIMITS (boundedManifest). */
+function incompleteAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; evidence: string[]; notChecked: string }): Analysis {
   return {
     scorer: SCORER,
-    signals: [signal("incomplete", evidence)],
-    facts: factsOf(u.manifest, u.files),
-    notChecked: [...NOT_CHECKED, `everything past the analysis work limit (${PHASE_NAMES[u.phase]})`],
+    signals: [signal("incomplete", u.evidence)],
+    facts: factsOf(boundedManifest(u.manifest), u.files),
+    notChecked: [...NOT_CHECKED, u.notChecked],
     skipped: [],
     capabilities: [],
     declaration: { kind: "none", notes: [] },
