@@ -9,6 +9,8 @@
 // 5. Optional dependencies were walked for every platform: a win32 binary could refuse a Linux install.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Effect, Layer, Option } from "effect";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Client } from "pg";
 import { z } from "zod";
 import { analyze, type Analysis as Scored } from "@apm/core";
@@ -88,6 +90,9 @@ const noBlobs = Layer.succeed(
   Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }),
 );
 
+/** One case the reviewer ran through npm's arborist: each node it installs, and where each of its peer edges goes. */
+const NpmCase = z.object({ case: z.string(), nodes: z.array(z.object({ path: z.string(), name: z.string(), version: z.string(), peers: z.record(z.string(), z.string()) })) });
+
 const Warning = z.object({ name: z.string(), version: z.string(), kind: z.string(), text: z.string(), via: z.array(z.string()) });
 
 const ResolveBody = z.object({
@@ -110,7 +115,6 @@ const ScanBody = z.object({
   advisories: z.array(z.object({ package: z.string(), version: z.string(), level: z.string(), description: z.string() })),
   warnings: z.array(Warning),
   unchecked: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })),
-  skippedForPlatform: z.array(z.object({ package: z.string(), version: z.string(), reason: z.string() })).default([]),
 });
 
 describe("the resolve walk and the scan, for the tree that installs", () => {
@@ -136,6 +140,14 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     pkg("met-by-top-peer", { peerDependencies: { react: "^2.0.0", "react-dom": "^1.0.0" } }),
     pkg("git-peer", { peerDependencies: { thing: "github:someone/thing" } }),
     pkg("missing-peer", { peerDependencies: { "no-such-peer": "^1.0.0" } }),
+    pkg("git-dep", { dependencies: { thing: "github:someone/thing" } }),
+    // review of 93274c8, finding 3: an ancestor installed under an alias does not meet a peer of its real name
+    // (tests/fixtures/npm-peers.jsonl, case "alias": the same packages, installed by npm 9.2.0's arborist)
+    pkg("root", { dependencies: { alias: "npm:foo@1.0.0" } }),
+    { name: "foo", versions: [v("1.0.0", { dependencies: { plugin: "1.0.0" } }), v("1.1.0", { ageMs: HOUR })] },
+    pkg("plugin", { peerDependencies: { foo: "^1.0.0" } }),
+    pkg("project-plugin", { peerDependencies: { "host-p": "^1.0.0" } }),
+    { name: "host-p", versions: [v("1.0.0", { ageMs: HOUR }), v("1.1.0")] },
     // 4. the root's candidates
     { name: "many-yanked", versions: [v("1.0.0"), ...Array.from({ length: 25 }, (_, i) => v(`2.0.${i}`, { status: "yanked", statusReason: "bad build" }))] },
     { name: "many-fresh", versions: [v("1.0.0"), ...Array.from({ length: 45 }, (_, i) => v(`2.0.${i}`, { ageMs: HOUR }))] },
@@ -151,6 +163,9 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     pkg("bin-revoked", { os: ["win32"], status: "revoked", statusReason: "malware" }),
     pkg("revoked-optional-app", { optionalDependencies: { "bin-revoked": "^1.0.0" } }),
     pkg("revoked-required-app", { dependencies: { "bin-revoked": "^1.0.0" } }),
+    // review of 93274c8, finding 1: a parent's optional ask for an older version must not hide the one installed
+    pkg("scan-parent", { optionalDependencies: { "scan-bin": "1.0.0" } }),
+    { name: "scan-bin", versions: [v("1.0.0", { os: ["win32"] }), v("2.0.0", { os: ["win32"], status: "revoked", statusReason: "malware" })] },
   ];
 
   beforeAll(async () => {
@@ -168,10 +183,42 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     return Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   };
 
-  const resolve = async (name: string, params: Record<string, string> = {}) => {
+  /** Whole version rows (manifest and score) the store has read since the counter was reset, by any read. */
+  const whole = { rows: 0 };
+
+  /** The real store, counting every whole version row it reads. */
+  const countingStore = () =>
+    Layer.provideMerge(
+      Layer.effect(
+        Store,
+        Effect.gen(function* () {
+          const real = yield* Store;
+
+          const counted = <A extends readonly unknown[]>(rows: A): A => {
+            whole.rows += rows.length;
+
+            return rows;
+          };
+
+          return Store.of({
+            ...real,
+            listVersions: (n) => Effect.map(real.listVersions(n), counted),
+            versionsIn: (n, vs) => Effect.map(real.versionsIn(n, vs), counted),
+            getVersion: (n, v) => Effect.map(real.getVersion(n, v), (row) => (row === null ? null : (counted([row])[0] ?? null))),
+            catalogsOf: (ns) => Effect.map(real.catalogsOf(ns), (m) => (counted([...m.values()].flatMap((c) => c.versions)), m)),
+            activeVersionsOf: (ns) => Effect.map(real.activeVersionsOf(ns), counted),
+          });
+        }),
+      ),
+      Store.postgres(db.url),
+    );
+
+  const resolve = async (name: string, params: Record<string, string> = {}, pool: MemoryPool = POOL) => {
     const u = new URL(`http://registry.test/-/apm/v1/resolve?${new URLSearchParams({ name, range: "latest", ...params })}`);
     const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, raw: await res.text() })));
-    const out = await Effect.runPromise(program.pipe(Effect.provide(layers()), Effect.scoped));
+    const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: null, legacyAuth: false, namePolicy: "open", admins: [] } as const;
+    const provided = Layer.mergeAll(countingStore(), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(pool));
+    const out = await Effect.runPromise(program.pipe(Effect.provide(provided), Effect.scoped));
 
     return { status: out.status, body: ResolveBody.parse(JSON.parse(out.raw)), raw: out.raw };
   };
@@ -181,7 +228,7 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     const program = Effect.flatMap(scanResponse(req, { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
     const out = await Effect.runPromise(program.pipe(Effect.provide(layers()), Effect.scoped));
 
-    return { status: out.status, body: out.status === 200 ? ScanBody.parse(JSON.parse(out.text)) : null };
+    return { status: out.status, body: out.status === 200 ? ScanBody.parse(JSON.parse(out.text)) : null, raw: out.text };
   };
 
   const names = (r: Awaited<ReturnType<typeof resolve>>) => (r.body.tree?.packages ?? []).map((p) => `${p.name}@${p.version}`).toSorted();
@@ -270,6 +317,66 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(missing.body.tree?.uncheckedDeps[0]?.dependency).toBe("no-such-peer@^1.0.0");
       expect(missing.body.tree?.uncheckedDeps[0]?.reason).toStartWith("peer dependency: ");
     });
+
+    // review of 93274c8, finding 3: npm installs plugin's peer foo@1.1.0 beside the alias. The reviewer's npm 9.2.0 run
+    // (arborist's ideal tree) put foo@1.0.0 at node_modules/alias and foo@1.1.0 at node_modules/foo, and plugin's peer
+    // edge goes to 1.1.0
+    test("an ancestor installed under an alias does not meet a peer named for its real package", async () => {
+      const r = await resolve("root");
+
+      // on 93274c8: 200 with foo@1.0.0 and plugin@1.0.0 only; foo@1.1.0, the version npm installs, unchecked
+      expect(names(r)).toEqual(["foo@1.0.0", "foo@1.1.0", "plugin@1.0.0"]);
+      expect(r.body.warnings.map((w) => [w.kind, `${w.name}@${w.version}`])).toEqual([["cooldown", "foo@1.1.0"]]);
+      // every peer npm resolved goes to a version the walk checked
+      const npm = NpmCase.parse(JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "..", "tests", "fixtures", "npm-peers.jsonl"), "utf8").split("\n")[0] ?? ""));
+      const peerTargets = npm.nodes.flatMap((n) => Object.entries(n.peers).map(([peer, version]) => `${peer}@${version}`));
+
+      expect(npm.case).toBe("alias");
+      expect(peerTargets).toEqual(["foo@1.1.0"]);
+
+      for (const t of peerTargets) expect(names(r)).toContain(t);
+
+      const strict = await resolve("root", { strict: "1" });
+
+      expect(strict.status).toBe(422);
+      expect(strict.body.tree?.blocks.map((b) => `${b.name}@${b.version}`)).toEqual(["foo@1.1.0"]);
+    });
+
+    test("a peer nothing in the walk installs is named as the project's when apm add says the project lists it", async () => {
+      const told = await resolve("project-plugin", { installed: "host-p,left-pad" });
+      const Peers = z.object({ tree: z.object({ projectPeers: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })) }) });
+
+      // on 93274c8: no way to say so; the walk still checks the version the range picks, as it did
+      expect(Peers.parse(JSON.parse(told.raw)).tree.projectPeers).toEqual([{ dependency: "host-p@^1.0.0", via: ["project-plugin@1.0.0"] }]);
+      expect(names(told)).toEqual(["host-p@1.1.0"]);
+      expect(Peers.parse(JSON.parse((await resolve("project-plugin")).raw)).tree.projectPeers).toEqual([]);
+      expect((await resolve("project-plugin", { installed: "Not A Name" })).status).toBe(400);
+      expect((await resolve("project-plugin", { installed: Array.from({ length: 501 }, (_, i) => `p${i}`).join(",") })).status).toBe(400);
+    });
+  });
+
+  // review of 93274c8, finding 4: a git peer and a missing peer answered strict mode 200 with unchecked: 1, no warning
+  // and no block
+  describe("unchecked dependencies warn, and strict mode refuses them", () => {
+    test("each unchecked dependency is a warning of its own in the default mode", async () => {
+      const git = await resolve("git-peer");
+
+      expect(git.status).toBe(200);
+      expect(git.body.warnings.map((w) => [w.kind, w.name, w.version, w.via])).toEqual([["unchecked", "thing", "github:someone/thing", ["git-peer@1.0.0"]]]);
+      expect(git.body.warnings[0]?.text).toStartWith("not checked: peer dependency: git dependency");
+      expect((await resolve("missing-peer")).body.warnings.map((w) => [w.kind, w.name, w.version])).toEqual([["unchecked", "no-such-peer", "^1.0.0"]]);
+      expect((await resolve("git-dep")).body.warnings.map((w) => w.kind)).toEqual(["unchecked"]);
+    });
+
+    test("strict mode refuses a tree with anything unchecked", async () => {
+      for (const name of ["git-peer", "missing-peer", "git-dep"]) {
+        const r = await resolve(name, { strict: "1" });
+
+        // on 93274c8: 200
+        expect([name, r.status]).toEqual([name, 422]);
+        expect(r.body.tree?.blocks.length).toBe(1);
+      }
+    });
   });
 
   describe("4. the root's search is not cut short by versions it cannot install", () => {
@@ -299,9 +406,23 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(r.status).toBe(422);
       expect(r.body.error).toContain(`apm looked at the newest ${MAX_ROOT_CANDIDATES} versions it could install`);
     });
+
+    // review of 93274c8, finding 5: 230 versions read whole ten times over (2,300 rows) and charged to no lease
+    test("each page reads every version as a head and only its own candidates whole, charged to the request", async () => {
+      const pool = new MemoryPool();
+      whole.rows = 0;
+      const r = await resolve("all-fresh", { strict: "1" }, pool);
+
+      expect(r.status).toBe(422);
+      // ten pages of 21 (20 candidates and the one that says another page follows): on 93274c8, 2,300
+      expect(whole.rows).toBeLessThanOrEqual(10 * 21);
+      // on 93274c8: 0, nothing a local page held was charged
+      expect(pool.peakCharged).toBeGreaterThan(0);
+      expect(pool.charged).toBe(0);
+    });
   });
 
-  describe("5. optional packages for another platform are skipped before any check", () => {
+  describe("5. optional packages for another platform are skipped by the walk, never by the scan", () => {
     test("on linux x64, the win32 and darwin binaries are skipped with what they depend on, not unchecked", async () => {
       const r = await resolve("native-app", { os: "linux", cpu: "x64", strict: "1" });
 
@@ -331,21 +452,24 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       for (const q of bad) expect((await resolve("native-app", q)).status).toBe(400);
     });
 
-    test("the scan skips a revoked win32 binary a package lists only as optional, and checks it when it is required", async () => {
+    test("the scan checks every package it is handed, whatever its platform and whoever lists it as optional", async () => {
+      const handed = [
+        { name: "scan-parent", version: "1.0.0" },
+        { name: "scan-bin", version: "2.0.0" },
+      ];
+
+      // on 93274c8: scan-parent's optional ask for scan-bin@1.0.0 made every scan-bin optional, so the revoked 2.0.0
+      // bun was about to install was skipped for its platform, with no advisory
+      const r = await scan({ packages: handed, os: "linux", cpu: "x64", strict: true });
+
+      expect(r.body?.advisories.map((a) => [a.package, a.version, a.level])).toEqual([["scan-bin", "2.0.0", "fatal"]]);
+      expect(r.raw).not.toContain("skippedForPlatform");
+      // the default mode, and an older scanner that sends no platform, see the same
+      expect((await scan({ packages: handed })).body?.advisories.map((a) => a.level)).toEqual(["fatal"]);
+      // a revoked win32 binary an optional parent lists is checked too: the scan never guesses what is optional
       const optional = await scan({ packages: [{ name: "revoked-optional-app", version: "1.0.0" }, { name: "bin-revoked", version: "1.0.0" }], os: "linux", cpu: "x64" });
 
-      // on 2fbf383: a fatal advisory for bin-revoked, which bun never installs on linux, cancelled the install
-      expect(optional.body?.advisories).toEqual([]);
-      expect(optional.body?.skippedForPlatform).toEqual([{ package: "bin-revoked", version: "1.0.0", reason: "built for os win32, not linux" }]);
-      expect(optional.body?.unchecked).toEqual([]);
-      const required = await scan({ packages: [{ name: "revoked-required-app", version: "1.0.0" }, { name: "bin-revoked", version: "1.0.0" }], os: "linux", cpu: "x64" });
-
-      expect(required.body?.advisories.map((a) => [a.package, a.level])).toEqual([["bin-revoked", "fatal"]]);
-      // nothing in the scan lists it: a dependency of the project itself, so it is checked
-      const alone = await scan({ packages: [{ name: "bin-revoked", version: "1.0.0" }], os: "linux", cpu: "x64" });
-
-      expect(alone.body?.advisories.map((a) => a.level)).toEqual(["fatal"]);
-      expect((await scan({ packages: [], os: "Linux" })).status).toBe(400);
+      expect(optional.body?.advisories.map((a) => [a.package, a.level])).toEqual([["bin-revoked", "fatal"]]);
     });
 
     test("the scan warns about a version inside the cooldown, and strict mode refuses it", async () => {

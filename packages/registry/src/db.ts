@@ -80,6 +80,14 @@ const VersionRow = z.object({
   score: z.unknown(),
 });
 
+/**
+ * A version as far as choosing among them goes: its number, age, order and state, without its manifest or score. What
+ * a resolve reads of every version of a package before it reads the few it picks (review of 93274c8, finding 5).
+ */
+const VersionHeadRow = VersionRow.pick({ version: true, published_at: true, seq: true, status: true, status_reason: true, status_at: true });
+
+export type VersionHead = z.infer<typeof VersionHeadRow>;
+
 /** A version as far as the package text it wrote goes (withheld.ts): its description and keywords, unparsed. */
 const TextSourceRow = VersionRow.pick({ package: true, status: true, status_at: true, published_at: true, seq: true })
   .extend({ description: z.unknown(), keywords: z.unknown() })
@@ -340,6 +348,10 @@ export type StoreApi = {
   readonly removeOwner: (name: string, user: string) => Effect.Effect<"removed" | "not-owner" | "last-owner", StoreError>;
 
   readonly listVersions: (name: string) => Effect.Effect<VersionRecord[], StoreError>;
+  /** Every version of a package as a head (number, age, order, state), in publish order: no manifest, no score. */
+  readonly versionHeads: (name: string) => Effect.Effect<VersionHead[], StoreError>;
+  /** The given versions of a package, whole, in publish order; one it does not have is left out. */
+  readonly versionsIn: (name: string, versions: readonly string[]) => Effect.Effect<VersionRecord[], StoreError>;
   /**
    * Several packages' catalogs in a fixed number of statements (packages, versions, dismissals): each name this
    * registry has, with its dist-tags and its versions as listVersions gives them. Names it does not have are left out.
@@ -791,6 +803,12 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "removeOwner", cause })))),
 
     listVersions: (name) => Effect.flatMap(run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
+    versionHeads: (name) =>
+      run("versionHeads", sql`SELECT version, published_at, seq, status, status_reason, status_at FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionHeadRow)),
+    versionsIn: (name, versions) =>
+      versions.length === 0
+        ? Effect.succeed([])
+        : Effect.flatMap(run("versionsIn", sql`SELECT * FROM versions WHERE package = ${name} AND version = ANY(${[...versions]}) ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
     catalogsOf: (names) =>
       Effect.gen(function* () {
         const out = new Map<string, { pkg: PackageRecord; versions: VersionRecord[] }>();

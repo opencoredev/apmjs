@@ -207,8 +207,9 @@ describe("the resolve walk bounds its database work", () => {
         expect(r.status).toBe(200);
         expect(r.body.tree.packages).toEqual([{ name: "leaf", version: "1.0.0" }]);
         expect(r.body.tree.unchecked).toBe(0);
-        // the root's catalog (package, versions, dismissals) and the leaf's, once each; AI review is off
-        expect(r.queries).toBeLessThanOrEqual(6);
+        // the root (package, version heads, its picked versions, dismissals) and the leaf's catalog, once each; AI
+        // review is off. The root reads heads first and only its candidates whole (review of 93274c8, finding 5)
+        expect(r.queries).toBeLessThanOrEqual(7);
       },
     ));
 
@@ -356,7 +357,8 @@ describe("the resolve walk bounds the package metadata it holds", () => {
       expect(checked * pad).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
       expect(r.body.tree.unchecked).toBe(deps.length - checked);
       expect(r.body.tree.uncheckedDeps.map((d) => d.reason)).toEqual(Array.from({ length: deps.length - checked }, () => OVER_BUDGET_TEXT));
-      expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.text)).toEqual([`some dependencies were not checked: ${OVER_BUDGET_TEXT}`]);
+      // one warning for each dependency it could not check (review of 93274c8, finding 4)
+      expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.text)).toEqual(Array.from({ length: deps.length - checked }, () => `not checked: ${OVER_BUDGET_TEXT}`));
       // a walk cut short refuses in strict mode, as at its other limits
       expect((await resolve({ url, name: "root", npm: npm.url, strict: true })).status).not.toBe(200);
     }).finally(() => npm.stop());
