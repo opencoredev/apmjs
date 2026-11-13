@@ -30,6 +30,7 @@ import { githubRepo } from "@/lib/repository";
 import { ReadmeView } from "@/components/readme-view";
 import { scoreLine, scoreLineText } from "@/lib/score-summary";
 import { unscoredNotice } from "@/lib/unscored";
+import { QueuedRefresh } from "@/components/queued-refresh";
 import { describeEvent } from "@/lib/package-events";
 import type { Metadata } from "next";
 import { JsonLd } from "@/components/json-ld";
@@ -733,7 +734,10 @@ async function PackageContent({ params, searchParams }: PageProps) {
             {score ? (
               <ScorePanel score={score} name={pkg.name} version={version} />
             ) : (
-              <p className={`rounded-xl px-5 py-4 text-pretty ${unscorable ? "bg-warn-soft text-foreground" : "bg-surface text-muted-foreground"}`}>{unscored?.text ?? "Not scored yet."}</p>
+              <p className={`rounded-xl px-5 py-4 text-pretty ${unscorable ? "bg-warn-soft text-foreground" : "bg-surface text-muted-foreground"}`}>
+                {unscored?.text ?? "Not scored yet."}
+                {unscored?.kind === "queued" && <QueuedRefresh />}
+              </p>
             )}
           </section>
 

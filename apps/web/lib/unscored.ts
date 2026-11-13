@@ -17,7 +17,7 @@ export function unscoredNotice(input: { pkg: Pick<PackageInfo, "unscored" | "ver
       case "unscorable":
         return { kind: "unscorable", text: `${pkg.unscored.text}. Installs through apm refuse it.` };
       case "queued":
-        return { kind: "queued", text: "Not scored yet: its tarball is queued for analysis. Check back in a minute." };
+        return { kind: "queued", text: "Not scored yet: its tarball is queued for analysis." };
       case "unreadable":
         return { kind: "unknown", text: "Not scored: its tarball could not be analyzed." };
       default: {

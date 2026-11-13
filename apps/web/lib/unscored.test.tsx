@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { ScoreBadge } from "@/components/score-badge";
 import type { PackageInfo } from "./registry";
 import { scoreLine, scoreLineText } from "./score-summary";
+import { REFRESH_EVERY_MS, REFRESH_FOR_MS, refreshStep } from "./queued-refresh";
 import { unscoredNotice } from "./unscored";
 
 type Row = PackageInfo["versions"][number];
@@ -31,7 +32,7 @@ describe("unscoredNotice", () => {
   test("queued says queued; a registry that sends neither field keeps the old words", () => {
     expect(unscoredNotice({ pkg: { latest: "1.0.0", unscored: { kind: "queued", text: "not scored yet: queued for analysis" }, versions: [row("1.0.0")] }, version: "1.0.0" })).toEqual({
       kind: "queued",
-      text: "Not scored yet: its tarball is queued for analysis. Check back in a minute.",
+      text: "Not scored yet: its tarball is queued for analysis.",
     });
     expect(unscoredNotice({ pkg: { latest: "1.0.0", versions: [row("1.0.0")] }, version: "1.0.0" })).toEqual({ kind: "unknown", text: "Not scored yet." });
   });
@@ -41,5 +42,14 @@ describe("unscoredNotice", () => {
     expect(scoreLineText(scoreLine(null))).toBe("Not scored yet");
     expect(renderToStaticMarkup(<ScoreBadge score={null} unscorable />)).toContain('title="Cannot be scored"');
     expect(renderToStaticMarkup(<ScoreBadge score={null} />)).toContain('title="Not scored yet"');
+  });
+});
+
+describe("the queued notice refreshes the page", () => {
+  test("every few seconds while queued, and no longer than five minutes", () => {
+    expect(refreshStep({ startedAt: 0, now: 0 })).toEqual({ kind: "wait", ms: REFRESH_EVERY_MS });
+    expect(refreshStep({ startedAt: 0, now: REFRESH_FOR_MS - 1_000 })).toEqual({ kind: "wait", ms: 1_000 });
+    expect(refreshStep({ startedAt: 0, now: REFRESH_FOR_MS })).toEqual({ kind: "stop" });
+    expect(REFRESH_FOR_MS).toBe(5 * 60_000);
   });
 });
