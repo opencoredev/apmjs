@@ -336,3 +336,89 @@ test("0015 and 0016 drop the outcomes the runtime caused and their reservations,
     await db.drop();
   }
 }, 30_000);
+
+// Production, 13 Nov: seven queue runs sharing one isolate were ended by its memory limit, and the next delivery of
+// five versions was the smaller re-run, which stored an incomplete 39. 0018 drops those results so they are scored
+// again in full, and nothing else. Review of 2326d2c, finding 9: it matched the old message anywhere in an analysis's
+// text, so a correct analysis that quotes it in a source evidence line was deleted too; it now matches only the five
+// versions' apm-score-v10 analyses whose `incomplete` signal has a line that begins with the message.
+test("0018 drops the five smaller re-runs stored after the 13 Nov memory stops, and no analysis that only quotes their reason", async () => {
+  const db = await migratedBefore("0018");
+  const c = await connect(db.url);
+  const reason = "an earlier analysis of this version was stopped by the platform's CPU limit or failed before it stored anything, so this one read at most 4 MB";
+  const skippedLines = Array.from({ length: 6 }, (_, i) => `not analyzed: lib/parser-${i}.js (nested past the parser's depth)`);
+  // as 3549541 stored them: the reason after the skipped-file lines, so past the five shown, in `more`
+  const rerunInMore = { score: 39, signals: [{ id: "incomplete", label: "incomplete", points: -61, evidence: skippedLines.slice(0, 5), more: [...skippedLines.slice(5), reason] }] };
+  const rerunShown = { score: 39, signals: [{ id: "incomplete", label: "incomplete", points: -61, evidence: [reason, "not analyzed: lib/big.js (0.8 MB, past the analysis budget)"] }] };
+  const clean = { score: 95, signals: [] };
+  // the reviewer's false positive: a correct analysis whose source evidence quotes the old message
+  const quoting = { score: 88, signals: [{ id: "network", label: "network", points: -12, evidence: [`lib/report.js:41: const note = "${reason}";`] }] };
+  // the message inside an incomplete line that does not begin with it
+  const quotedInIncomplete = { score: 70, signals: [{ id: "incomplete", label: "incomplete", points: -10, evidence: [`not analyzed: docs/${reason}.md (binary)`] }] };
+  // a re-run under the new rule names its own reason
+  const ownReason = { score: 30, signals: [{ id: "incomplete", label: "incomplete", points: -61, evidence: ["2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB"] }] };
+
+  const incident = [
+    ["express", "5.3.0", rerunInMore],
+    ["axios", "1.21.1", rerunShown],
+    ["eslint", "10.14.0", rerunInMore],
+    ["prettier", "3.10.1", rerunShown],
+    ["tailwindcss", "4.3.5", rerunInMore],
+  ] as const;
+
+  /** A stored analysis as these fixtures write it: a score and its signals. */
+  type Stored = { score: number; signals: readonly { id: string; label: string; points: number; evidence: readonly string[]; more?: readonly string[] }[] };
+
+  const analysis = (pkg: string, version: string, digest: string, scorer: string, value: Stored) =>
+    c.query("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5::jsonb, 1)", [pkg, version, digest, scorer, JSON.stringify(value)]);
+
+  try {
+    for (const [pkg, version, value] of incident) {
+      await analysis(pkg, version, "d", "apm-score-v10", value);
+      // the run the memory limit ended and the re-run: two starts, no outcome
+      await c.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ($1, $2, 'apm-score-v10', 2, 1)", [pkg, version]);
+      await c.query("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ($1, $2, 1)", [pkg, version]);
+    }
+
+    // must survive, each with its outcome row and reservation where it has one:
+    // - the reviewer's fixture: another package's analysis that quotes the message in a source line
+    await analysis("hono", "4.13.18", "d", "apm-score-v10", quoting);
+    // - one of the five versions, re-published (another digest) and scored in full, quoting the message too
+    await analysis("express", "5.3.0", "d2", "apm-score-v10", quoting);
+    // - one of the five whose incomplete line only contains the message
+    await analysis("axios", "1.21.1", "d2", "apm-score-v10", quotedInIncomplete);
+    // - one of the five under an older scorer, with the real line: not apm-score-v10's
+    await analysis("eslint", "10.14.0", "d", "apm-score-v9", rerunShown);
+    // - the same real line on a version not in the incident
+    await analysis("express", "5.2.1", "d", "apm-score-v10", rerunShown);
+    // - a clean analysis and a re-run under the new rule
+    await analysis("vite", "8.3.8", "d", "apm-score-v10", clean);
+    await analysis("three", "0.187.0", "d", "apm-score-v10", ownReason);
+    await c.query(
+      `INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at, outcome, detail) VALUES
+         ('hono', '4.13.18', 'apm-score-v10', 1, 1, NULL, NULL), ('express', '5.2.1', 'apm-score-v10', 2, 1, NULL, NULL),
+         ('three', '0.187.0', 'apm-score-v10', 3, 1, NULL, NULL), ('huge', '1.0.0', 'apm-score-v10', 1, 1, 'too-large', 'the tarball inflates to more than 48 MB')`,
+    );
+    await c.query(`INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('hono', '4.13.18', 1), ('express', '5.2.1', 1), ('huge', '1.0.0', 1)`);
+
+    expect(await migrate(db.url)).toEqual(idsFrom("0018"));
+    const rows = async (table: string, extra = "") => (await c.query<{ k: string }>(`SELECT package || '@' || version${extra} AS k FROM ${table} ORDER BY 1`)).rows.map((r) => r.k);
+
+    // on 2326d2c the reviewer's fixture (hono), express's full re-score and axios's quoted line were deleted too
+    expect(await rows("upstream_analysis", " || ' ' || digest || ' ' || scorer")).toEqual([
+      "axios@1.21.1 d2 apm-score-v10",
+      "eslint@10.14.0 d apm-score-v9",
+      "express@5.2.1 d apm-score-v10",
+      "express@5.3.0 d2 apm-score-v10",
+      "hono@4.13.18 d apm-score-v10",
+      "three@0.187.0 d apm-score-v10",
+      "vite@8.3.8 d apm-score-v10",
+    ]);
+    expect(await rows("analysis_outcomes")).toEqual(["express@5.2.1", "hono@4.13.18", "huge@1.0.0", "three@0.187.0"]);
+    expect(await rows("analysis_jobs")).toEqual(["express@5.2.1", "hono@4.13.18", "huge@1.0.0"]);
+    expect(await migrate(db.url)).toEqual([]);
+  } finally {
+    await c.end();
+    await db.drop();
+  }
+}, 30_000);
