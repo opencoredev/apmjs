@@ -9,7 +9,7 @@ import { installedPackages } from "../src/audit.ts";
 import { devGroup, releaseOmission } from "../src/groups.ts";
 import { readLock, type LockPm } from "../src/lockfile.ts";
 import { verifyInstall } from "../src/verify.ts";
-import { OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
+import { npmAnswer, OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
 
 const PNPM = join(import.meta.dir, "..", "..", "..", "node_modules", ".bin", "pnpm");
 let base: string;
@@ -194,6 +194,9 @@ describe("finding 3 of efef668: real npm and pnpm leave devDependencies out exac
       const lockName = pm === "npm" ? "package-lock.json" : "pnpm-lock.yaml";
       const lock = readFileSync(join(seed, lockName), "utf8");
       const wrong: string[] = [];
+      // the table's npm column for the npm on PATH: 9.2 type-checks its settings, 9.3 on does not
+      const [major = 0, minor = 0] = (await sh(["npm", "--version"], seed)).trim().split(".").map(Number);
+      const expected = (c: OmissionCase): string => (pm === "npm" ? npmAnswer(c, { major, minor }) : c.pnpm);
 
       const one = async (c: OmissionCase, i: number): Promise<void> => {
         const root = join(base, `omission-${pm}-${i}`, "project");
@@ -216,7 +219,7 @@ describe("finding 3 of efef668: real npm and pnpm leave devDependencies out exac
         const did = existsSync(join(root, "node_modules", "devonly")) ? "include" : "omit";
         const apm = devGroup({ pm, root, env: shEnv(env), production: false }).kind;
 
-        if (did !== c[pm] || apm !== did) wrong.push(`${c.name}: ${pm} ${did}d, the table says ${c[pm]}, apm says ${apm}`);
+        if (did !== expected(c) || apm !== did) wrong.push(`${c.name}: ${pm} ${did}d, the table says ${expected(c)}, apm says ${apm}`);
       };
 
       // four at a time

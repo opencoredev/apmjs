@@ -81,17 +81,11 @@ function pathSetting(layers: readonly Layer[], key: string, input: { root: strin
 /** npm's own directory, from the npm-cli.js the npm on PATH runs, or null when the npm on PATH is not that. */
 const npmRootOf = (npmCli: string | null): string | null => (npmCli !== null && basename(npmCli) === "npm-cli.js" ? dirname(dirname(npmCli)) : null);
 
-const IniPackage = z.object({ version: z.string() });
+const PackageVersion = z.object({ version: z.string() });
 
-/**
- * The section syntax of the ini package that npm reads its config files with (review of a24c6aa, finding 1): npm's
- * own copy, or the shared one a distribution installs beside it (Debian's /usr/share/nodejs/ini for its npm 9.2).
- * null when it cannot be found.
- */
-function npmSectionSyntax(npmRoot: string | null): SectionSyntax | null {
-  if (npmRoot === null) return null;
-
-  for (const dir of [join(npmRoot, "node_modules", "ini"), join(dirname(npmRoot), "ini")]) {
+/** Whether the first package.json of `dirs` that can be read has a version at least `min` (major, minor); null if none can. */
+function versionAtLeast(dirs: readonly string[], min: { major: number; minor: number }): boolean | null {
+  for (const dir of dirs) {
     let raw: unknown;
 
     try {
@@ -100,16 +94,43 @@ function npmSectionSyntax(npmRoot: string | null): SectionSyntax | null {
       continue;
     }
 
-    const pkg = IniPackage.safeParse(raw);
+    const pkg = PackageVersion.safeParse(raw);
     const v = pkg.success ? /^(\d+)\.(\d+)\./.exec(pkg.data.version) : null;
 
     if (v === null) return null;
     const [major, minor] = [Number(v[1]), Number(v[2])];
 
-    return major > 4 || (major === 4 && minor >= 1) ? "spaced" : "exact";
+    return major > min.major || (major === min.major && minor >= min.minor);
   }
 
   return null;
+}
+
+/**
+ * The section syntax of the ini package that npm reads its config files with (review of a24c6aa, finding 1): npm's
+ * own copy, or the shared one a distribution installs beside it (Debian's /usr/share/nodejs/ini for its npm 9.2).
+ * null when it cannot be found.
+ */
+function npmSectionSyntax(npmRoot: string | null): SectionSyntax | null {
+  if (npmRoot === null) return null;
+  const spaced = versionAtLeast([join(npmRoot, "node_modules", "ini"), join(dirname(npmRoot), "ini")], { major: 4, minor: 1 });
+
+  return spaced === null ? null : spaced ? "spaced" : "exact";
+}
+
+/**
+ * How npm's values reach the list of groups it omits (review of a24c6aa, finding 2). npm 9.3 and later build it from
+ * the values as read (`raw`): production=0 is the text "0", which is true, and a list keeps every item, valid or not.
+ * npm 9.2 and earlier type-check them first (`typed`): production=0 is false and invalid list items are dropped. Real
+ * installs with npm 9.2.0 (upstream and Debian's), 9.3.1 to 9.8.1, 9.9.4, 10.9.3 and 11.16.0 showed the split.
+ */
+type NpmReading = "typed" | "raw";
+
+function npmReading(npmRoot: string | null): NpmReading | null {
+  if (npmRoot === null) return null;
+  const raw = versionAtLeast([npmRoot], { major: 9, minor: 3 });
+
+  return raw === null ? null : raw ? "raw" : "typed";
 }
 
 /**
@@ -182,7 +203,7 @@ function npmList(v: IniValue | undefined, allowed: readonly string[], env: Env):
   });
 }
 
-/** One choice item: one of a few words, or null; anything else is dropped (`false` reads as null, as nopt does). */
+/** One typed choice item: one of a few words, or null; anything else is dropped (`false` reads as null, as nopt does). */
 function npmChoiceItem(i: IniScalar, allowed: readonly string[], env: Env): string | null | undefined {
   const f = npmField(i, { bool: false, env });
 
@@ -191,26 +212,38 @@ function npmChoiceItem(i: IniScalar, allowed: readonly string[], env: Env): stri
   return f.kind === "text" && allowed.includes(f.text) ? f.text : undefined;
 }
 
+/** A list item as npm leaves it in a list it does not parse: ini's text, or its literal as text (null as nothing). */
+const rawItem = (i: IniScalar): string => (i.kind === "text" ? i.text : i.value === null ? "" : String(i.value));
+
 /**
- * A choice setting (only, also). A `key[]=` list keeps its valid items and is a list to npm (review of a24c6aa,
- * finding 2), which tests it as text: the items joined by commas, a null as nothing. So `only[]=prod` is "prod" and
- * omits, while two items never read as one word. A list with no valid item sets nothing.
+ * A choice setting (only, also), as the text npm tests (null when it can match nothing). A `key[]=` list is a list to
+ * npm (review of a24c6aa, finding 2), tested as its items joined by commas: `only[]=prod` is "prod" and omits, two
+ * items never read as one word. Typed, invalid items are dropped first and a list with none left sets nothing; raw,
+ * every item stays, so `only[]=prod` with `only[]=bogus` is "prod,bogus".
  */
-function npmChoice(v: IniValue | undefined, allowed: readonly string[], env: Env): string | null | undefined {
+function npmChoice(v: IniValue | undefined, input: { allowed: readonly string[]; env: Env; reading: NpmReading }): string | null | undefined {
   if (v === undefined) return undefined;
 
-  if (v.kind === "one") return npmChoiceItem(v.item, allowed, env);
-  const kept = v.items.map((i) => npmChoiceItem(i, allowed, env)).filter((c) => c !== undefined);
+  if (input.reading === "raw") {
+    if (v.kind === "list") return v.items.map(rawItem).join(",");
+    const f = npmField(v.item, { bool: false, env: input.env });
+
+    return f.kind === "text" ? f.text : null;
+  }
+
+  if (v.kind === "one") return npmChoiceItem(v.item, input.allowed, input.env);
+  const kept = v.items.map((i) => npmChoiceItem(i, input.allowed, input.env)).filter((c) => c !== undefined);
 
   return kept.length === 0 ? undefined : kept.map((c) => c ?? "").join(",");
 }
 
 /**
- * A Boolean setting, as nopt reads one: a number is its truth, "false" and "null" are false, other text true. A
- * `key[]=` list stays a list (nopt keeps every item), and npm tests production and dev for truth, so any list is true
- * there, `production[]=false` included (review of a24c6aa, finding 2; checked on npm 9 and 11).
+ * A Boolean setting. A `key[]=` list stays a list, and npm tests production and dev for truth, so any list is true,
+ * `production[]=false` included (review of a24c6aa, finding 2). Raw, any text is true (production=0 too) and the text
+ * "undefined" hides the layers below it; typed, as nopt reads it: a number is its truth, "false" and "null" are false,
+ * other text true.
  */
-function npmBool(v: IniValue | undefined, input: { nullable: boolean; env: Env }): boolean | null | undefined {
+function npmBool(v: IniValue | undefined, input: { nullable: boolean; env: Env; reading: NpmReading }): boolean | null | undefined {
   if (v === undefined) return undefined;
 
   if (v.kind === "list") return true;
@@ -218,10 +251,12 @@ function npmBool(v: IniValue | undefined, input: { nullable: boolean; env: Env }
 
   switch (f.kind) {
     case "undefined":
-      return false;
+      return input.reading === "raw" && input.nullable ? null : false;
     case "literal":
       return f.value === null ? (input.nullable ? null : false) : f.value;
     case "text":
+      if (input.reading === "raw") return true;
+
       return f.text !== "" && !Number.isNaN(Number(f.text)) ? Number(f.text) !== 0 : f.text !== "false" && f.text !== "null";
     default: {
       const _exhaustive: never = f;
@@ -231,18 +266,20 @@ function npmBool(v: IniValue | undefined, input: { nullable: boolean; env: Env }
   }
 }
 
-function npmOwn(l: Layer, env: Env): NpmOwn {
-  const dev = npmBool(l.values.get("dev"), { nullable: false, env });
+function npmOwn(l: Layer, input: { env: Env; reading: NpmReading }): NpmOwn {
+  const { env, reading } = input;
+  // npm 9.2 reads dev as it is too: dev=0 with omit=dev installs devDependencies on every npm checked
+  const dev = npmBool(l.values.get("dev"), { nullable: false, env, reading: "raw" });
 
   return {
     omit: npmList(l.values.get("omit"), OMIT_TYPES, env),
     include: npmList(l.values.get("include"), INCLUDE_TYPES, env),
-    only: npmChoice(l.values.get("only"), ["prod", "production"], env),
-    also: npmChoice(l.values.get("also"), ["dev", "development"], env),
-    production: npmBool(l.values.get("production"), { nullable: true, env }),
+    only: npmChoice(l.values.get("only"), { allowed: ["prod", "production"], env, reading }),
+    also: npmChoice(l.values.get("also"), { allowed: ["dev", "development"], env, reading }),
+    production: npmBool(l.values.get("production"), { nullable: true, env, reading }),
     dev: dev === null ? false : dev,
     // npm tests optional only for === true and === false, so a list sets it to neither
-    optional: l.values.get("optional")?.kind === "list" ? null : npmBool(l.values.get("optional"), { nullable: true, env }),
+    optional: l.values.get("optional")?.kind === "list" ? null : npmBool(l.values.get("optional"), { nullable: true, env, reading }),
   };
 }
 
@@ -256,7 +293,7 @@ const isProdOnly = (only: string | null): boolean => only === "prod" || only ===
  * environment, each layer that sets omit, include, only, also, production, dev or optional folds them in. A dev an
  * include, production=false, also=dev or dev=true puts in the include list stays installed, whichever layer set it.
  */
-function npmFold(input: { env: Env; layers: readonly Layer[] }): DevGroup {
+function npmFold(input: { env: Env; layers: readonly Layer[]; reading: NpmReading }): DevGroup {
   const nodeEnv = input.env.NODE_ENV === "production";
   let omit: string[] = nodeEnv ? ["dev"] : [];
   let include: string[] = [];
@@ -264,7 +301,7 @@ function npmFold(input: { env: Env; layers: readonly Layer[] }): DevGroup {
   let eff: NpmEffective = { only: null, onlyFrom: "", also: null, production: null, productionFrom: "", dev: false };
 
   for (const l of input.layers) {
-    const own = npmOwn(l, input.env);
+    const own = npmOwn(l, input);
 
     if (Object.values(own).every((v) => v === undefined)) continue;
     eff = {
@@ -299,18 +336,19 @@ function npmFold(input: { env: Env; layers: readonly Layer[] }): DevGroup {
 }
 
 /**
- * npm's answer, with its config files read in the section syntax of the ini it uses. When that ini cannot be found,
- * the files are read both ways, and only an answer both readings give is "omit".
+ * npm's answer, with its config files read in the section syntax of the ini it uses and its values as its version
+ * reads them. What cannot be found (no npm-cli.js on PATH, no ini or version beside it) is tried every way, and the
+ * answer is "omit" only when every way omits.
  */
 function npmDevGroup(input: { root: string; env: Env }): DevGroup {
   const npmRoot = npmRootOf(onPath(input.env, "npm"));
-  const read = (sections: SectionSyntax): DevGroup => npmFold({ env: input.env, layers: npmLayers({ ...input, npmRoot, sections }) });
-  const sections = npmSectionSyntax(npmRoot);
+  const known = { sections: npmSectionSyntax(npmRoot), reading: npmReading(npmRoot) };
+  const sectionsTried: readonly SectionSyntax[] = known.sections === null ? ["exact", "spaced"] : [known.sections];
+  const readingsTried: readonly NpmReading[] = known.reading === null ? ["typed", "raw"] : [known.reading];
+  const answers = sectionsTried.flatMap((sections) => readingsTried.map((reading) => npmFold({ env: input.env, layers: npmLayers({ ...input, npmRoot, sections }), reading })));
+  const first = answers[0];
 
-  if (sections !== null) return read(sections);
-  const exact = read("exact");
-
-  return exact.kind === "omit" && read("spaced").kind === "omit" ? exact : { kind: "include" };
+  return first !== undefined && answers.every((a) => a.kind === "omit") ? first : { kind: "include" };
 }
 
 /** A value as pnpm takes it: a field, or a `key[]=` list, which pnpm keeps as a list. */
@@ -325,6 +363,7 @@ const pnpmTruthy = (f: PnpmValue): boolean => (f.kind === "text" ? f.text !== ""
  * no only, when production is set to anything but false or null (production=0 counts). It reads neither omit nor
  * NODE_ENV for this. Its .npmrc reader takes a section header only when the line ends at the `]` (checked on 10.18.3).
  * A list is truthy: `production[]=false` omits and `only[]=prod`, not the word prod, includes (real 10.18.3 installs).
+ * `production=undefined` hides a production=true below it.
  */
 function pnpmDevGroup(input: { root: string; env: Env }): DevGroup {
   const home = homeOf(input.env);
@@ -341,9 +380,9 @@ function pnpmDevGroup(input: { root: string; env: Env }): DevGroup {
       if (v === undefined) continue;
 
       if (v.kind === "list") return { value: { kind: "list" }, source: l.source };
-      const value = parseField(v.item, { bool, env: input.env, pm: "pnpm" });
 
-      if (value.kind !== "undefined") return { value, source: l.source };
+      // the text "undefined" is a value too: it hides the layers below it and is not set (real 10.18.3 installs)
+      return { value: parseField(v.item, { bool, env: input.env, pm: "pnpm" }), source: l.source };
     }
 
     return null;

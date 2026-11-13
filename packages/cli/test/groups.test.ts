@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
 import { decodeIni, type IniValue, text } from "../src/ini.ts";
-import { OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
+import { npmAnswer, OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
 
 const base = mkdtempSync(join(tmpdir(), "apm-groups-"));
 
@@ -35,12 +35,43 @@ function project(c: Pick<OmissionCase, "npmrc" | "user" | "global" | "env">) {
   return { root, env: { HOME: home, npm_config_globalconfig: join(home, "global-npmrc"), ...c.env } };
 }
 
+/**
+ * A PATH with an npm on it of `npmVersion` whose ini is `iniVersion`: bundled in npm's node_modules, or (debian) in
+ * the shared directory beside npm. apm reads only their package.json files.
+ */
+function npmOnPath(input: { npmVersion: string; iniVersion: string; layout: "bundled" | "debian" }): string {
+  const top = join(base, `npm${++n}`);
+  const npmRoot = input.layout === "bundled" ? join(top, "lib", "node_modules", "npm") : join(top, "share", "nodejs", "npm");
+  const iniDir = input.layout === "bundled" ? join(npmRoot, "node_modules", "ini") : join(top, "share", "nodejs", "ini");
+  const bin = join(top, "bin");
+
+  mkdirSync(join(npmRoot, "bin"), { recursive: true });
+  mkdirSync(iniDir, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(npmRoot, "package.json"), JSON.stringify({ name: "npm", version: input.npmVersion }));
+  writeFileSync(join(npmRoot, "bin", "npm-cli.js"), "");
+  writeFileSync(join(iniDir, "package.json"), JSON.stringify({ name: "ini", version: input.iniVersion }));
+  symlinkSync(join(npmRoot, "bin", "npm-cli.js"), join(bin, "npm"));
+
+  return bin;
+}
+
+const NPM11 = npmOnPath({ npmVersion: "11.16.0", iniVersion: "6.0.0", layout: "bundled" });
+const NPM92_DEBIAN = npmOnPath({ npmVersion: "9.2.0", iniVersion: "3.0.1", layout: "debian" });
+
 describe("each setting, as real npm and pnpm read it", () => {
   for (const c of OMISSION_CASES) {
-    test(`${c.name}: npm ${c.npm}s, pnpm ${c.pnpm}s devDependencies`, () => {
-      const p = project(c);
+    const npm92 = npmAnswer(c, { major: 9, minor: 2 });
+    // with no npm to read, apm omits only what every npm omits
+    const unknown = c.npm === "omit" && npm92 === "omit" ? "omit" : "include";
 
-      expect(devGroup({ pm: "npm", root: p.root, env: p.env, production: false }).kind).toBe(c.npm);
+    test(`${c.name}: npm ${c.npm}s (9.2: ${npm92}s), pnpm ${c.pnpm}s devDependencies`, () => {
+      const p = project(c);
+      const npm = (path: string | undefined) => devGroup({ pm: "npm", root: p.root, env: path === undefined ? p.env : { ...p.env, PATH: path }, production: false }).kind;
+
+      expect(npm(NPM11)).toBe(c.npm);
+      expect(npm(NPM92_DEBIAN)).toBe(npm92);
+      expect(npm(undefined)).toBe(unknown);
       expect(devGroup({ pm: "pnpm", root: p.root, env: p.env, production: false }).kind).toBe(c.pnpm);
     });
   }
@@ -72,23 +103,6 @@ describe("the .npmrc reader", () => {
 // upstream npm 9.6 on), and a bare key to ini 3 (Debian's npm 9.2) and to pnpm 10. apm reads the files with the
 // grammar of the ini the npm on PATH uses, and when it cannot find that ini, omits only when both readings do.
 describe("finding 1 of a24c6aa: section headers read with the grammar of npm's own ini", () => {
-  /** An npm on PATH whose ini is `iniVersion`: bundled in npm's node_modules, or (debian) beside npm. */
-  function npmOnPath(input: { iniVersion: string; layout: "bundled" | "debian" }): string {
-    const top = join(base, `npm${++n}`);
-    const npmRoot = input.layout === "bundled" ? join(top, "lib", "node_modules", "npm") : join(top, "share", "nodejs", "npm");
-    const iniDir = input.layout === "bundled" ? join(npmRoot, "node_modules", "ini") : join(top, "share", "nodejs", "ini");
-    const bin = join(top, "bin");
-
-    mkdirSync(join(npmRoot, "bin"), { recursive: true });
-    mkdirSync(iniDir, { recursive: true });
-    mkdirSync(bin, { recursive: true });
-    writeFileSync(join(npmRoot, "bin", "npm-cli.js"), "");
-    writeFileSync(join(iniDir, "package.json"), JSON.stringify({ name: "ini", version: input.iniVersion }));
-    symlinkSync(join(npmRoot, "bin", "npm-cli.js"), join(bin, "npm"));
-
-    return bin;
-  }
-
   const npmWith = (npmrc: string, path: string | undefined) => {
     const p = project({ npmrc });
 
@@ -96,10 +110,10 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
   };
 
   test("[section] then a space: npm 11's ini 6 opens a section, ini 3 reads a key (on a24c6aa: omit for ini 6, the install includes)", () => {
-    const ini6 = npmOnPath({ iniVersion: "6.0.0", layout: "bundled" });
-    const ini41 = npmOnPath({ iniVersion: "4.1.0", layout: "bundled" });
-    const ini40 = npmOnPath({ iniVersion: "4.0.0", layout: "bundled" });
-    const debian = npmOnPath({ iniVersion: "3.0.1", layout: "debian" });
+    const ini6 = NPM11;
+    const ini41 = npmOnPath({ npmVersion: "9.6.7", iniVersion: "4.1.0", layout: "bundled" });
+    const ini40 = npmOnPath({ npmVersion: "9.6.0", iniVersion: "4.0.0", layout: "bundled" });
+    const debian = NPM92_DEBIAN;
 
     expect(npmWith("[section] \nproduction=true\n", ini6)).toBe("include");
     expect(npmWith("[section]\t\nonly=prod\n", ini6)).toBe("include");
@@ -110,8 +124,7 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
   });
 
   test("the inverse: omit=dev before [section] and production=false omits with ini 6 (on a24c6aa: include, a false refusal)", () => {
-    const ini6 = npmOnPath({ iniVersion: "6.0.0", layout: "bundled" });
-    const debian = npmOnPath({ iniVersion: "3.0.1", layout: "debian" });
+    const [ini6, debian] = [NPM11, NPM92_DEBIAN];
 
     expect(npmWith("omit=dev\n[section] \nproduction=false\n", ini6)).toBe("omit");
     expect(npmWith("omit=dev\n[section] \nproduction=false\n", debian)).toBe("include");

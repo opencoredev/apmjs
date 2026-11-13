@@ -1,6 +1,9 @@
-// Review of efef668, finding 3: settings and whether real npm 9 and pnpm 10 leave a project's devDependency out with
+// Review of efef668, finding 3: settings and whether real npm and pnpm 10 leave a project's devDependency out with
 // them. groups.test.ts holds apm's reading to this table; real-layouts.test.ts holds the table to real npm and pnpm
 // installs, so the expected answers are what the package managers do, not what apm assumes.
+//
+// `npm` is what npm 9.3 and later do (checked with 9.3.1, 9.9.4, 10.9.3 and 11.16.0), `npm92` what npm 9.2 does
+// (upstream's and Debian's) where it differs: 9.2 type-checks values before it reads them (review of a24c6aa, finding 2).
 
 type Answer = "omit" | "include";
 
@@ -8,7 +11,10 @@ type Answer = "omit" | "include";
  * `npmrc`: the project's .npmrc. `user`: the user's (~/.npmrc). `global`: a file npm_config_globalconfig names.
  * `env`: the environment of the install.
  */
-export type OmissionCase = { name: string; npmrc?: string; user?: string; global?: string; env?: Record<string, string>; npm: Answer; pnpm: Answer };
+export type OmissionCase = { name: string; npmrc?: string; user?: string; global?: string; env?: Record<string, string>; npm: Answer; npm92?: Answer; pnpm: Answer };
+
+/** The table's answer for an npm of `version` (major, minor). */
+export const npmAnswer = (c: OmissionCase, version: { major: number; minor: number }): Answer => (version.major < 9 || (version.major === 9 && version.minor < 3) ? (c.npm92 ?? c.npm) : c.npm);
 
 export const OMISSION_CASES: readonly OmissionCase[] = [
   { name: "nothing set", npm: "include", pnpm: "include" },
@@ -48,9 +54,9 @@ export const OMISSION_CASES: readonly OmissionCase[] = [
   { name: "production=yes", npmrc: "production=yes\n", npm: "omit", pnpm: "omit" },
   { name: "production=1", npmrc: "production=1\n", npm: "omit", pnpm: "omit" },
   { name: "production=null", npmrc: "production=null\n", npm: "include", pnpm: "include" },
-  { name: "production=0 and NODE_ENV=production", npmrc: "production=0\n", env: { NODE_ENV: "production" }, npm: "include", pnpm: "omit" },
+  { name: "production=0 and NODE_ENV=production", npmrc: "production=0\n", env: { NODE_ENV: "production" }, npm: "omit", npm92: "include", pnpm: "omit" },
   { name: "production=${P} with P=true", npmrc: "production=${P}\n", env: { P: "true" }, npm: "omit", pnpm: "omit" },
-  { name: "production=${P} with P=false", npmrc: "production=${P}\n", env: { P: "false" }, npm: "include", pnpm: "omit" },
+  { name: "production=${P} with P=false", npmrc: "production=${P}\n", env: { P: "false" }, npm: "omit", npm92: "include", pnpm: "omit" },
   { name: "NODE_ENV=production", env: { NODE_ENV: "production" }, npm: "omit", pnpm: "include" },
   { name: "NODE_ENV=production and npm_config_production=false", env: { NODE_ENV: "production", npm_config_production: "false" }, npm: "include", pnpm: "include" },
   { name: "production=false and omit=dev", npmrc: "production=false\nomit=dev\n", npm: "include", pnpm: "include" },
@@ -72,7 +78,11 @@ export const OMISSION_CASES: readonly OmissionCase[] = [
   { name: "production=true, then production[]=false", npmrc: "production=true\nproduction[]=false\n", npm: "omit", pnpm: "omit" },
   { name: "only[]=prod", npmrc: "only[]=prod\n", npm: "omit", pnpm: "include" },
   { name: "only[]=prod twice (read as prod,prod)", npmrc: "only[]=prod\nonly[]=prod\n", npm: "include", pnpm: "include" },
-  { name: "only[]=prod, only[]=bogus (bogus dropped)", npmrc: "only[]=prod\nonly[]=bogus\n", npm: "omit", pnpm: "include" },
+  { name: "only[]=prod, only[]=bogus (9.2 drops bogus)", npmrc: "only[]=prod\nonly[]=bogus\n", npm: "include", npm92: "omit", pnpm: "include" },
+  { name: "only[]=true, only[]=prod (9.2 drops true)", npmrc: "only[]=true\nonly[]=prod\n", npm: "include", npm92: "omit", pnpm: "include" },
+  { name: "production=0 (the text 0 is true from npm 9.3)", npmrc: "production=0\n", npm: "omit", npm92: "include", pnpm: "omit" },
+  { name: "dev=0 and omit=dev (dev=0 is true to every npm)", npmrc: "dev=0\nomit=dev\n", npm: "include", pnpm: "include" },
+  { name: "production=undefined over the user's production=true", user: "production=true\n", npmrc: "production=undefined\n", npm: "omit", npm92: "include", pnpm: "include" },
   { name: "only[]=prod, only[]=false (false kept as null)", npmrc: "only[]=prod\nonly[]=false\n", npm: "include", pnpm: "include" },
   { name: "dev[]=false and production=true (a list is true)", npmrc: "dev[]=false\nproduction=true\n", npm: "include", pnpm: "omit" },
   { name: "also[]=dev and production=true", npmrc: "also[]=dev\nproduction=true\n", npm: "include", pnpm: "omit" },
