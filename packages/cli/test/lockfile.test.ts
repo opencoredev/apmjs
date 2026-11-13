@@ -303,3 +303,77 @@ snapshots:
     expect(yarnBerryNodes(lock).map((n) => `${n.name}@${n.version} ${n.origin.kind}`).sort()).toEqual(["fixed@patch:fixed@npm%3A1.0.0#./p.patch::version=1.0.0 file", "leaf@1.0.0 registry", "member@workspace:packages/member workspace"]);
   });
 });
+
+// review of 2a098b1, finding 14: a version cannot prove an origin
+describe("bun: a registry version whose tarball is somewhere else", () => {
+  test("is that tarball, not a registry package (on 2a098b1: registry, so strict let it through unchecked)", () => {
+    const text = JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "p", dependencies: { leaf: "1.0.0", reg: "1.0.0", plain: "1.0.0" } } }, packages: { leaf: ["leaf@1.0.0", "https://evil.invalid/custom.tgz", {}, "sha512-AAAA"], reg: ["reg@1.0.0", "https://registry.test/reg/-/reg-1.0.0.tgz", {}, "sha512-BBBB"], plain: ["plain@1.0.0", "", {}, "sha512-CCCC"] } });
+    const dir = project("bun.lock", text);
+    const r = readLock({ pm: "bun", path: join(dir, "bun.lock"), cwd: dir });
+
+    if (r.kind !== "read") throw new Error(r.kind);
+    expect(r.nodes.map((n) => `${n.name} ${n.origin.kind}${n.origin.kind === "registry" ? "" : ` ${n.origin.source}`}`).sort()).toEqual(["leaf tarball https://evil.invalid/custom.tgz", "plain registry", "reg registry"]);
+  });
+});
+
+// review of 2a098b1, findings 3 and the strict-workspace rule: edges, importers and bound workspace identities
+describe("readLock: the edges and folders each format installs for", () => {
+  test("npm: a workspace folder is an importer with its own edges, and its node carries its folder and version", () => {
+    const text = JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": { name: "p", workspaces: ["packages/*"], dependencies: { leaf: "1.0.0" } },
+        "node_modules/app": { resolved: "packages/app", link: true },
+        "node_modules/leaf": { version: "1.0.0", integrity: "sha512-1" },
+        "packages/app": { name: "app", version: "2.0.0", dependencies: { leaf: "2.0.0" }, optionalDependencies: { opt: "1.0.0" } },
+        "packages/app/node_modules/leaf": { version: "2.0.0", integrity: "sha512-2" },
+        "packages/app/node_modules/opt": { version: "1.0.0", integrity: "sha512-3", optional: true },
+      },
+    });
+
+    const dir = project("package-lock.json", text);
+    const r = readLock({ pm: "npm", path: join(dir, "package-lock.json"), cwd: dir });
+
+    if (r.kind !== "read") throw new Error(r.kind);
+    expect(r.importers).toEqual([
+      { dir: "", deps: [{ name: "leaf", key: "node_modules/leaf", optional: false }] },
+      { dir: "packages/app", deps: [{ name: "leaf", key: "packages/app/node_modules/leaf", optional: false }, { name: "opt", key: "packages/app/node_modules/opt", optional: true }] },
+    ]);
+    expect(r.nodes.find((n) => n.key === "packages/app")?.origin).toEqual({ kind: "workspace", source: "packages/app", dir: "packages/app", version: "2.0.0" });
+    expect(r.nodes.find((n) => n.key === "packages/app/node_modules/opt")?.optional).toBe(true);
+  });
+
+  test("pnpm: a link: dependency on another importer is that workspace member; a snapshot's peers are its edges", () => {
+    const text = JSON.stringify({
+      lockfileVersion: "9.0",
+      importers: { ".": { dependencies: { plug: { specifier: "1.0.0", version: "1.0.0(host@2.0.0)" } } }, "packages/app": { dependencies: { other: { specifier: "workspace:*", version: "link:../other" } } }, "packages/other": {} },
+      packages: { "plug@1.0.0": { resolution: { integrity: "sha512-p" } }, "host@2.0.0": { resolution: { integrity: "sha512-h" } } },
+      snapshots: { "plug@1.0.0(host@2.0.0)": { dependencies: { host: "2.0.0" } }, "host@2.0.0": { optional: true } },
+    });
+
+    const dir = project("pnpm-lock.yaml", text);
+    const r = readLock({ pm: "pnpm", path: join(dir, "pnpm-lock.yaml"), cwd: dir });
+
+    if (r.kind !== "read") throw new Error(r.kind);
+    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "other", key: "workspace:packages/other", optional: false }]);
+    expect(r.nodes.find((n) => n.key === "plug@1.0.0(host@2.0.0)")?.deps).toEqual([{ name: "host", key: "host@2.0.0", optional: false }]);
+    expect(r.nodes.find((n) => n.key === "host@2.0.0")?.optional).toBe(true);
+    // the link to packages/other is no separate local package: it is the member's own node
+    expect(r.nodes.filter((n) => n.origin.kind !== "registry").map((n) => n.key).sort()).toEqual(["workspace:packages/app", "workspace:packages/other"]);
+  });
+
+  test("bun: a member's own versions are keyed under its name, and its workspace node carries the version bun.lock records", () => {
+    const text = JSON.stringify({
+      lockfileVersion: 1,
+      workspaces: { "": { name: "p", dependencies: { leaf: "1.0.0" } }, "packages/app": { name: "app", version: "3.0.0", dependencies: { leaf: "2.0.0" } } },
+      packages: { app: ["app@workspace:packages/app"], leaf: ["leaf@1.0.0", "", {}, "sha512-1"], "app/leaf": ["leaf@2.0.0", "", {}, "sha512-2"] },
+    });
+
+    const dir = project("bun.lock", text);
+    const r = readLock({ pm: "bun", path: join(dir, "bun.lock"), cwd: dir });
+
+    if (r.kind !== "read") throw new Error(r.kind);
+    expect(r.importers.find((i) => i.dir === "packages/app")?.deps).toEqual([{ name: "leaf", key: "app/leaf", optional: false }]);
+    expect(r.nodes.find((n) => n.key === "app")?.origin).toEqual({ kind: "workspace", source: "workspace:packages/app", dir: "packages/app", version: "3.0.0" });
+  });
+});

@@ -2,7 +2,7 @@
 // now is of its own temporary directories: made fresh under TMPDIR, and removed without following a symlink out.
 // Its only writes to a project are package.json and the lockfile, each replaced in one rename.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { isOwnTemp, makeTemp, removeTemp, writeAtomic } from "../src/sandbox.ts";
@@ -62,6 +62,25 @@ describe("temporary directories", () => {
     // removeTemp takes only a TempDir, which only this guard makes; it asks again before it removes
     for (const d of [notOurs, link, unprefixed, outside]) expect(isOwnTemp(d)).toBe(false);
   });
+});
+
+// review of 2a098b1, finding 15: the umask must not take permission bits from the file a write replaces
+test("writeAtomic keeps a group-writable file's mode under umask 0022 (on 2a098b1: 0664 became 0644)", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "apm-mode-")));
+  const file = join(dir, "package.json");
+  const old = process.umask(0o022);
+
+  try {
+    writeFileSync(file, "{}");
+    chmodSync(file, 0o664);
+    writeAtomic(file, new TextEncoder().encode('{"new":true}'));
+
+    expect(lstatSync(file).mode & 0o777).toBe(0o664);
+    expect(readFileSync(file, "utf8")).toBe('{"new":true}');
+  } finally {
+    process.umask(old);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe("the writes to a project", () => {

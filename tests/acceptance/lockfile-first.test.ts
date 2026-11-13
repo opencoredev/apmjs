@@ -272,8 +272,18 @@ describe.each(PMS)("apm add with the real %s: an add that passes", (pm) => {
     expect(p.read(LOCKFILE[pm])).toContain("nest-new");
     expect(p.read("package.json")).toBe(top);
     expect(p.read("packages/other/package.json")).toBe(other);
-    // the workspace's own packages are not from a registry: they warn, and strict mode refuses them
-    expect(r.json.installed?.warnings.some((w) => w.name === "other-member" && w.kind === "unchecked"), r.out).toBe(true);
+    // the workspace's own members, bound to their folders, names and versions, are the project's source: no warning
+    expect(r.json.installed?.warnings.filter((w) => w.name === "other-member" || w.name === "app-member"), r.out).toEqual([]);
+    expect(r.ran, r.out).toEqual(["nest-new", "nleaf2"]);
+  });
+
+  test("a workspace in strict mode: the declared members are trusted, so a clean add passes (review of 2a098b1)", async () => {
+    const p = await project({ pm, deps: { "nest-old": "1.0.0" }, install: true, workspace: true });
+    const r = await add(p, ["nest-new", "--pm", pm, "--strict"]);
+
+    // on 2a098b1: refused, because app-member and other-member are not from a registry
+    expect(r.code, r.out).toBe(0);
+    expect(r.json.installed?.warnings, r.out).toEqual([]);
     expect(r.ran, r.out).toEqual(["nest-new", "nleaf2"]);
   });
 });

@@ -1,7 +1,7 @@
 // The directories apm add and apm x compute and check in, and the only writes apm makes to a project: two files,
 // each replaced whole. A temporary directory is made fresh under TMPDIR and removed without following a symlink out of
 // it (review of a2227d1, finding 12). See docs/ARCHITECTURE.md, "How `apm add` makes the package manager install what apm checked".
-import { lstatSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, lstatSync, mkdtempSync, openSync, realpathSync, renameSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -61,22 +61,30 @@ export function isSymlink(path: string): boolean {
 
 /**
  * Replaces `path` with `bytes` in one step: written beside it under a fresh name, then renamed over it, so a reader
- * sees the old file or the new one, never half of either. `mode` is kept from the file it replaces.
+ * sees the old file or the new one, never half of either. `mode` is kept from the file it replaces: the new file is
+ * made private, then given exactly that mode with fchmod, which the umask does not touch (review of 2a098b1, finding
+ * 15). A failure leaves no temporary file behind.
  */
 export function writeAtomic(path: string, bytes: Uint8Array): void {
   let mode = 0o644;
 
   try {
-    mode = lstatSync(path).mode & 0o777;
+    mode = lstatSync(path).mode & 0o7777;
   } catch {
     // a new file
   }
 
   const tmp = join(dirname(path), `.${basename(path)}.apm-${process.pid}-${Date.now().toString(36)}`);
-
-  writeFileSync(tmp, bytes, { flag: "wx", mode });
+  const fd = openSync(tmp, "wx", 0o600);
 
   try {
+    try {
+      for (let at = 0; at < bytes.length; ) at += writeSync(fd, bytes, at, bytes.length - at);
+      fchmodSync(fd, mode);
+    } finally {
+      closeSync(fd);
+    }
+
     renameSync(tmp, path);
   } catch (e) {
     rmSync(tmp, { force: true });

@@ -1,11 +1,19 @@
-// What `apm audit` reads from disk: every installed name@version in node_modules, in npm's nested
-// layout, pnpm's .pnpm store and bun's .bun store, plus what it could not read.
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+// What `apm audit` and the check after an install read from disk: every installed package in node_modules, in npm's
+// nested layout, pnpm's .pnpm store and bun's .bun store, where it is, and what could not be read. A directory that
+// cannot be listed, or a package directory with no package.json, is never an empty one (review of 2a098b1, finding 4).
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 import { z } from "zod";
 
-/** `unchecked`: what is in node_modules but could not be read, by path. */
-export type Installed = { packages: Map<string, Set<string>>; unchecked: { id: string; reason: string }[] };
+/** A package directory in node_modules: its real path from the root's real path ("/"-separated), and its package.json's name and version. */
+export type Found = { path: string; name: string; version: string };
+
+/**
+ * `packages`: every name with the versions installed. `found`: each package directory once, by real path. `unchecked`:
+ * what is in node_modules but could not be read (a package.json that is missing or not JSON, a directory that could
+ * not be listed), by path.
+ */
+export type Installed = { packages: Map<string, Set<string>>; found: Found[]; unchecked: { id: string; reason: string }[] };
 
 const MAX_DEPTH = 8;
 
@@ -21,28 +29,40 @@ function isDir(p: string): boolean {
   }
 }
 
-function listDir(p: string): string[] {
+/** A directory's entries, or why they could not be read. */
+function listDir(p: string): { kind: "listed"; entries: string[] } | { kind: "failed"; reason: string } {
   try {
-    return readdirSync(p);
-  } catch {
-    return [];
+    return { kind: "listed", entries: readdirSync(p) };
+  } catch (e) {
+    return { kind: "failed", reason: e instanceof Error && "code" in e ? `could not be listed (${String(e.code)})` : "could not be listed" };
   }
 }
 
-export function installedPackages(root: string): Installed {
+/** A path's real path, or itself when it has none (a dangling link). */
+function realOf(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/** Posix path of `p` from `base` ("" for base itself). */
+export function relPath(base: string, p: string): string {
+  return relative(base, p).split(sep).join("/");
+}
+
+/** Everything installed under `root`'s node_modules, and under each of `members` (workspace folders, relative to root). */
+export function installedPackages(root: string, members: readonly string[] = []): Installed {
   const packages = new Map<string, Set<string>>();
+  const found: Found[] = [];
   const unchecked: Installed["unchecked"] = [];
   const seen = new Set<string>();
+  const realRoot = realOf(root);
   const rel = (p: string): string => relative(root, p) || ".";
 
   const once = (p: string): boolean => {
-    let real = p;
-
-    try {
-      real = realpathSync(p);
-    } catch {
-      // keep the path as given
-    }
+    const real = realOf(p);
 
     if (seen.has(real)) return false;
     seen.add(real);
@@ -50,12 +70,24 @@ export function installedPackages(root: string): Installed {
     return true;
   };
 
+  const list = (p: string): string[] => {
+    const l = listDir(p);
+
+    if (l.kind === "listed") return l.entries;
+    unchecked.push({ id: rel(p), reason: l.reason });
+
+    return [];
+  };
+
   const visitPackage = (dir: string, depth: number): void => {
     if (!once(dir)) return;
 
     const pj = join(dir, "package.json");
 
-    if (existsSync(pj)) {
+    if (!existsSync(pj)) {
+      // a dangling link, or a directory with no package.json: something is there that apm cannot name
+      unchecked.push({ id: rel(dir), reason: isDir(dir) ? "no package.json" : "a link to nothing" });
+    } else {
       try {
         const parsed = PackageJson.safeParse(JSON.parse(readFileSync(pj, "utf8")));
 
@@ -64,6 +96,7 @@ export function installedPackages(root: string): Installed {
 
           set.add(parsed.data.version);
           packages.set(parsed.data.name, set);
+          found.push({ path: relPath(realRoot, realOf(dir)), name: parsed.data.name, version: parsed.data.version });
         } else {
           unchecked.push({ id: rel(dir), reason: "package.json has no name or version" });
         }
@@ -72,14 +105,14 @@ export function installedPackages(root: string): Installed {
       }
     }
 
-    visitModules(join(dir, "node_modules"), depth + 1);
+    if (isDir(dir)) visitModules(join(dir, "node_modules"), depth + 1);
   };
 
   // pnpm: node_modules/.pnpm/<id>/node_modules/<name>; bun's isolated linker: node_modules/.bun/<id>/node_modules/<name>
   const visitStore = (store: string, depth: number): void => {
     let found = false;
 
-    for (const id of listDir(store)) {
+    for (const id of list(store)) {
       const p = join(store, id);
 
       if (id === "node_modules") {
@@ -108,7 +141,7 @@ export function installedPackages(root: string): Installed {
       return;
     }
 
-    for (const entry of listDir(nm)) {
+    for (const entry of list(nm)) {
       const p = join(nm, entry);
 
       if (entry.startsWith(".")) {
@@ -117,17 +150,28 @@ export function installedPackages(root: string): Installed {
       }
 
       if (entry.startsWith("@")) {
-        for (const child of listDir(p)) visitPackage(join(p, child), depth);
+        for (const child of list(p)) visitPackage(join(p, child), depth);
         continue;
       }
 
-      if (isDir(p)) visitPackage(p, depth);
+      // a file directly in node_modules is no package; a link or a directory is one
+      if (isDir(p) || isLink(p)) visitPackage(p, depth);
     }
   };
 
   visitModules(join(root, "node_modules"), 0);
 
-  return { packages, unchecked };
+  for (const m of members) visitModules(join(root, m, "node_modules"), 0);
+
+  return { packages, found, unchecked };
+}
+
+function isLink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 // npm's range grammar (node-semver): `||`-separated sets of comparators or one hyphen range.

@@ -7,7 +7,7 @@
 // The package managers are stand-ins (fixtures/fake-pm.ts) that write the lockfile a test describes, in each one's
 // format, and lay the node_modules it describes. tests/acceptance/lockfile-first.test.ts runs the real ones.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -128,7 +128,7 @@ const scanSizes: number[] = [];
 const scanBodies: z.infer<typeof ScanBody>[] = [];
 const predicted = new Map<string, { name: string; version: string }[]>();
 
-const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string(), integrity: z.string().optional() })), cooldown: z.string().optional(), floor: z.number().optional() });
+const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string(), integrity: z.string().optional(), bundled: z.boolean().optional() })), cooldown: z.string().optional(), floor: z.number().optional() });
 
 type Warning = { name: string; version: string; kind: "cooldown" | "low-score"; score: number | null; grade: string | null; text: string; reasons: string[]; url: string; via: string[] };
 
@@ -144,6 +144,13 @@ function scanAnswer(body: z.infer<typeof ScanBody>) {
     const state = states.get(id);
 
     scanned.push(id);
+
+    // a bundled version: only its state counts, and one the registry does not know is its parent's to vouch for
+    if (p.bundled === true) {
+      if (state === "revoked") blocked.push({ package: p.name, version: p.version, kind: "revoked", reason: `${id} was revoked by its maintainer: compromised` });
+      else if (state === "yanked") blocked.push({ package: p.name, version: p.version, kind: "yanked", reason: `${id} was yanked by its maintainer` });
+      continue;
+    }
 
     if (state === undefined) unchecked.push({ package: p.name, version: p.version, reason: "no such version" });
     else if (p.integrity !== undefined && p.integrity !== integrity(p)) blocked.push({ package: p.name, version: p.version, kind: "integrity", reason: `${id}: the lockfile's integrity ${p.integrity} is not the ${integrity(p)} this registry serves` });
@@ -238,6 +245,8 @@ async function apmRun(input: {
   prepare?: (dir: string) => void;
   cwd?: (dir: string) => string;
   lockText?: string;
+  /** A directory of stand-ins found before the shared ones on PATH. */
+  binFirst?: string;
 }): Promise<Run & { before: ReturnType<typeof treeHash> }> {
   const base = join(root, `case-${++counter}`);
   const dir = join(base, "project");
@@ -285,7 +294,7 @@ async function apmRun(input: {
 
   const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), ...argv], {
     cwd: runIn,
-    env: { PATH: `${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: scratch, APM_REGISTRY: server.url.href, APM_FAKE_DIR: fake, NO_COLOR: "1", APM_PENDING_WAIT_MS: "0" },
+    env: { PATH: `${input.binFirst === undefined ? "" : `${input.binFirst}:`}${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: scratch, APM_REGISTRY: server.url.href, APM_FAKE_DIR: fake, NO_COLOR: "1", APM_PENDING_WAIT_MS: "0" },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -474,7 +483,9 @@ describe.each(PMS)("%s stand-in: an add that passes", (pm) => {
     expect(install?.args).toContain("--ignore-scripts");
     expect(install?.args.slice(0, 2)).toEqual(pm === "npm" ? ["install", "--ignore-scripts"] : ["install", "--frozen-lockfile"]);
     // leaf@1.0.0 was in place before the add: only transitive-root, which this add installed, has its script run
-    expect(r.scripts, r.text).toEqual([pm === "npm" ? "npm rebuild transitive-root@1.0.0" : pm === "pnpm" ? "pnpm rebuild --pending" : "bun install --frozen-lockfile --registry=" + server.url.href]);
+    // npm rebuilds that exact directory, pnpm that exact version (never --pending, which also ran builds left from before
+    // and the project's own postinstall; review of 2a098b1, finding 6)
+    expect(r.scripts, r.text).toEqual([pm === "npm" ? `npm rebuild ${join(realpathSync(r.dir), "node_modules", "transitive-root")}` : pm === "pnpm" ? "pnpm rebuild transitive-root@1.0.0" : "bun install --frozen-lockfile --registry=" + server.url.href]);
     expect(r.leftInTmp, r.text).toEqual([]);
   });
 
@@ -550,8 +561,9 @@ describe("what the check covers", () => {
     expect(r.code, r.text).toBe(0);
     expect(scanned).toContain("leaf@1.0.0");
     expect(scanned).toContain("leaf@2.0.0");
-    // on a2227d1: npm rebuild leaf, which ran both copies' scripts
-    expect(r.scripts).toEqual(["npm rebuild leaf@2.0.0"]);
+    // on a2227d1: npm rebuild leaf, which ran both copies' scripts; on 2a098b1: npm rebuild leaf@2.0.0, which also runs a
+    // same-version copy elsewhere. Now the exact directory this add installed
+    expect(r.scripts).toEqual([`npm rebuild ${join(realpathSync(r.dir), "node_modules", "consumer", "node_modules", "leaf")}`]);
   });
 
   test("git, file and workspace entries keep their origin: they warn, and strict refuses them", async () => {
@@ -575,15 +587,17 @@ describe("what the check covers", () => {
     expectUntouched(r);
   });
 
-  test("bundled dependencies are covered by their parent's score and are not asked about on their own", async () => {
+  test("bundled dependencies are covered by their parent's score: asked about only for their state", async () => {
     const after: Graph = { top: ["bundle-root"], nodes: [{ name: "bundle-root", version: "1.0.0", deps: ["inner"] }, { name: "inner", version: "9.9.9", bundled: true, key: { npm: "node_modules/bundle-root/node_modules/inner", bun: "bundle-root/inner" } }] };
 
     scanned.length = 0;
+    scanBodies.length = 0;
     const r = await apmRun({ pm: "npm", pkg: {}, before: null, after, spec: "bundle-root", strict: true });
 
     expect(r.code, r.text).toBe(0);
-    expect(scanned).toEqual(["bundle-root@1.0.0"]);
-    expect(r.text).toContain("1 bundled package ships inside its parent's tarball: the parent's score covers it");
+    expect(scanned.toSorted()).toEqual(["bundle-root@1.0.0", "inner@9.9.9"]);
+    expect(scanBodies.flatMap((b) => b.packages).find((p) => p.name === "inner")?.bundled).toBe(true);
+    expect(r.text).toContain("1 bundled package ships inside its parent's tarball: the parent's score covers its code, and apm checked that it is not revoked, yanked or confirmed malicious");
   });
 
   test("--force lifts the cooldown of the named version only: a fresh transitive version still refuses in strict mode", async () => {
@@ -683,9 +697,26 @@ describe("yarn", () => {
     const r = await apmRun({ pm: "yarn", pkg: {}, before: existing, after: transitive, spec: "transitive-root", strict: false, lockText: berryLock(transitive), scenario: { yarnVersion: "4.5.0" } });
 
     expect(r.code, r.text).toBe(0);
-    expect(r.text).toContain("yarn now installs it and runs its install scripts, which apm cannot hold back or check first");
+    expect(r.text).toContain("yarn now installs exactly it and runs its install scripts, which apm cannot hold back or check first");
     expect(r.text).not.toContain("before any install script");
-    expect(r.scripts).toEqual(["yarn install"]);
+    expect(r.scripts).toEqual(["yarn install --immutable"]);
+  });
+
+  test("review of 2a098b1, finding 11: berry installs immutably, and what it installed must be the checked lockfile, or apm says how to put the project back", async () => {
+    const rewrites = await apmRun({ pm: "yarn", pkg: {}, before: existing, after: transitive, spec: "transitive-root", strict: false, lockText: berryLock(transitive), scenario: { yarnVersion: "4.5.0", installRewritesLock: berryLock(existing) } });
+
+    expect(rewrites.pmCalls.at(-1)?.args).toEqual(["install", "--immutable"]);
+    // on 2a098b1: exit 0, stage done, the backup deleted
+    expect(rewrites.code, rewrites.text).toBe(1);
+    expect(rewrites.text).toContain("refused: what yarn installed is not the checked lockfile: yarn.lock is not the lockfile apm checked");
+    expect(rewrites.text).toContain("Install scripts may have run: yarn ran them as it installed.");
+    expect(rewrites.json?.installed?.stage).toBe("verify");
+    expect(rewrites.json?.installed?.recovery?.[0], rewrites.text).toMatch(/^cp '.*apm-backup-.*' /);
+
+    const stowaway = await apmRun({ pm: "yarn", pkg: {}, before: existing, after: transitive, spec: "transitive-root", strict: false, lockText: berryLock(transitive), scenario: { yarnVersion: "4.5.0", modules: [...modulesOf("npm", transitive), { path: "node_modules/stowaway", name: "stowaway", version: "6.6.6" }] } });
+
+    expect(stowaway.code, stowaway.text).toBe(1);
+    expect(stowaway.text).toContain("node_modules holds a package the checked lockfile does not: stowaway@6.6.6");
   });
 
   test("classic yarn: no lockfile-only mode, so apm says it checks only after yarn installed and ran scripts", async () => {
@@ -748,5 +779,194 @@ describe("501 dependencies", () => {
     expect(Math.max(...scanSizes)).toBeLessThanOrEqual(200);
     expect(warned(r)).toEqual(["leaf@1.0.0"]);
     expectUntouched(r);
+  });
+});
+
+describe("review of 2a098b1", () => {
+  const bundle: Graph = { top: ["bundle-root"], nodes: [{ name: "bundle-root", version: "1.0.0", deps: ["inner"] }, { name: "inner", version: "9.9.9", bundled: true, key: { npm: "node_modules/bundle-root/node_modules/inner", bun: "bundle-root/inner" } }] };
+
+  test("finding 2: a revoked bundled version refuses in every mode, with nothing installed (on 2a098b1: strict exited 0)", async () => {
+    states.set("inner@9.9.9", "revoked");
+
+    try {
+      for (const strict of [true, false]) {
+        const r = await apmRun({ pm: "npm", pkg: {}, before: null, after: bundle, spec: "bundle-root", strict });
+
+        expect(r.json?.installed?.blocked.map((b) => `${b.name}@${b.version}`), r.text).toEqual(["inner@9.9.9"]);
+        expectUntouched(r);
+      }
+    } finally {
+      states.delete("inner@9.9.9");
+    }
+  });
+
+  test("finding 8: pnpm leaves a bundled package out of its lockfile; inside a bundling parent it is checked for its state, not refused as extra", async () => {
+    const after: Graph = { top: ["bundle-root"], nodes: [{ name: "bundle-root", version: "1.0.0" }] };
+
+    const modules = [
+      { path: "node_modules/bundle-root", name: "bundle-root", version: "1.0.0", raw: JSON.stringify({ name: "bundle-root", version: "1.0.0", bundleDependencies: ["inner"] }) },
+      { path: "node_modules/bundle-root/node_modules/inner", name: "inner", version: "9.9.9" },
+    ];
+
+    const ok = await apmRun({ pm: "pnpm", pkg: {}, before: null, after, spec: "bundle-root", strict: true, scenario: { modules } });
+
+    // on 2a098b1: refused, "node_modules holds a package the checked lockfile does not: inner@9.9.9"
+    expect(ok.code, ok.text).toBe(0);
+    expect(ok.text).toContain("1 package ships inside a checked package's tarball (inner@9.9.9)");
+    states.set("inner@9.9.9", "revoked");
+
+    try {
+      const bad = await apmRun({ pm: "pnpm", pkg: {}, before: null, after, spec: "bundle-root", strict: false, scenario: { modules } });
+
+      expect(bad.code, bad.text).toBe(1);
+      expect(bad.text).toContain("refused: inner@9.9.9, bundled in bundle-root@1.0.0: inner@9.9.9 was revoked by its maintainer");
+      expect(bad.json?.installed?.stage).toBe("verify");
+      expect(bad.scripts).toEqual([]);
+    } finally {
+      states.delete("inner@9.9.9");
+    }
+  });
+
+  test.each(PMS)("finding 4 (%s): a required package the install did not lay refuses before any script, in every mode (on 2a098b1: exit 0, stage done)", async (pm) => {
+    const modules = modulesOf(pm, transitive).filter((m) => m.name !== "transitive-root");
+    const r = await apmRun({ pm, pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: false, scenario: { modules } });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.text).toContain("transitive-root (transitive-root@1.0.0), which your project needs, is not installed");
+    expect(r.json?.installed?.stage).toBe("verify");
+    expect(r.scripts).toEqual([]);
+  });
+
+  test("finding 4: a package directory with no package.json warns, and strict refuses it", async () => {
+    const modules = [...modulesOf("npm", transitive), { path: "node_modules/nameless", name: "nameless", version: "0.0.0", bare: true }];
+    const strict = await apmRun({ pm: "npm", pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: true, args: ["--no-cooldown"], scenario: { modules } });
+
+    // on 2a098b1: neither an inventory entry nor a warning, and strict exited 0
+    expect(strict.text).toContain("not read: node_modules/nameless (no package.json)");
+    expect(strict.code, strict.text).toBe(1);
+    expect(strict.scripts).toEqual([]);
+    const loose = await apmRun({ pm: "npm", pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: false, scenario: { modules } });
+
+    expect(loose.text).toContain("not read: node_modules/nameless (no package.json)");
+    expect(loose.code, loose.text).toBe(0);
+  });
+
+  test("findings 3 and 4: a package left in node_modules from before, outside the lockfile, warns, and strict refuses it", async () => {
+    const prepare = (dir: string): void => {
+      mkdirSync(join(dir, "node_modules", "old-thing"), { recursive: true });
+      writeFileSync(join(dir, "node_modules", "old-thing", "package.json"), JSON.stringify({ name: "old-thing", version: "1.0.0" }));
+    };
+
+    const loose = await apmRun({ pm: "npm", pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: false, scenario: { keep: true }, prepare });
+
+    expect(loose.code, loose.text).toBe(0);
+    expect(loose.text).toContain("old-thing@1.0.0 (node_modules/old-thing) is in node_modules but not in the checked lockfile: it was there before, and install scripts could load it");
+    const strict = await apmRun({ pm: "npm", pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: true, args: ["--no-cooldown"], scenario: { keep: true }, prepare });
+
+    expect(strict.code, strict.text).toBe(1);
+    expect(strict.text).toContain("refused: strict mode refuses a package in node_modules outside the checked lockfile");
+    expect(strict.scripts).toEqual([]);
+  });
+
+  test("finding 7: bun runs a local dependency's install script, found where the lockfile resolves it (on 2a098b1: held forever)", async () => {
+    const after: Graph = { top: ["local-leaf"], nodes: [{ name: "local-leaf", version: "1.0.0", resolved: "file:../local-leaf-1.0.0.tgz", script: true }] };
+    const r = await apmRun({ pm: "bun", pkg: {}, before: null, after, spec: "local-leaf", strict: false });
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.scripts, r.text).toEqual([`bun install --frozen-lockfile --registry=${server.url.href}`]);
+  });
+
+  test("finding 9: a nested copy with no integrity is unchecked though the hoisted copy has one: strict refuses it (on 2a098b1: exit 0)", async () => {
+    states.set("host@1.0.0", "clean");
+    const after: Graph = { top: ["a", "host"], nodes: [{ name: "a", version: "1.0.0" }, { name: "host", version: "1.0.0" }, { name: "a", version: "1.0.0", integrity: null, key: { npm: "node_modules/host/node_modules/a", bun: "host/a" } }] };
+    const r = await apmRun({ pm: "npm", pkg: {}, before: null, after, spec: "host", strict: true });
+
+    expect(r.text).toContain("a@1.0.0 not checked: the lockfile records no integrity for it");
+    expectUntouched(r);
+  });
+
+  test("finding 12: a package manager that cannot start after the write still says how to put the project back (on 2a098b1: only ENOENT)", async () => {
+    const breaks = join(root, "bin-breaks");
+    const fake = join(import.meta.dir, "fixtures", "fake-pm.ts");
+
+    mkdirSync(breaks, { recursive: true });
+    // computes the lockfile, then loses its interpreter, so the install cannot even start
+    writeFileSync(join(breaks, "npm"), `#!/bin/sh\n"${process.execPath}" "${fake}" npm "$@"\ncode=$?\nprintf '#!/nonexistent/interpreter\\n' > "$0"\nexit $code\n`, { mode: 0o755 });
+    const r = await apmRun({ pm: "npm", pkg: { dependencies: { existing: "1.0.0" } }, before: existing, after: transitive, spec: "transitive-root", strict: false, binFirst: breaks });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.text).toContain("apm add: installing the checked lockfile failed");
+    expect(r.text).toContain("No install script ran.");
+    expect(r.text).toContain("To put your project back as it was before apm add, run:");
+    expect(r.json?.installed?.stage).toBe("install");
+    expect(r.json?.installed?.recovery?.[0], r.text).toMatch(/^cp '.*apm-backup-.*' '.*package\.json'$/);
+  });
+
+  /** An npm workspace's lockfile: packages/app (at `memberVersion`) needs transitive-root. */
+  const workspaceLock = (memberVersion: string): string =>
+    JSON.stringify({
+      name: "project",
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        "": { name: "project", workspaces: ["packages/*"] },
+        "node_modules/app": { resolved: "packages/app", link: true },
+        "packages/app": { name: "app", version: memberVersion, dependencies: { "transitive-root": "1.0.0" } },
+        "node_modules/transitive-root": { version: "1.0.0", resolved: `${server.url.href}transitive-root/-/transitive-root-1.0.0.tgz`, integrity: integrity({ name: "transitive-root", version: "1.0.0" }) },
+      },
+    });
+
+  const inWorkspace = (memberVersion: string) =>
+    apmRun({
+      pm: "npm",
+      pkg: { workspaces: ["packages/*"] },
+      before: null,
+      after: { top: ["transitive-root"], nodes: [{ name: "transitive-root", version: "1.0.0" }] },
+      spec: "transitive-root",
+      strict: true,
+      lockText: workspaceLock(memberVersion),
+      scenario: { lockAt: "../../package-lock.json" },
+      prepare: (dir) => {
+        mkdirSync(join(dir, "packages", "app"), { recursive: true });
+        writeFileSync(join(dir, "packages", "app", "package.json"), JSON.stringify({ name: "app", version: "1.0.0" }));
+      },
+      cwd: (dir) => join(dir, "packages", "app"),
+    });
+
+  test("strict workspaces: a member bound to its folder, name and version is trusted, so a clean add passes (on 2a098b1: refused as unchecked)", async () => {
+    const r = await inWorkspace("1.0.0");
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.json?.installed?.warnings).toEqual([]);
+    expect(r.text).toContain("app@1.0.0: your workspace's own member, matched to its folder, name and version, so not asked about");
+  });
+
+  test("strict workspaces: a lockfile naming the member at another version is not the member: strict refuses it", async () => {
+    const r = await inWorkspace("6.6.6");
+
+    expect(r.json?.installed?.warnings.map((w) => `${w.name}@${w.version}:${w.kind}`), r.text).toEqual(["app@6.6.6:unchecked"]);
+    expectUntouched(r);
+  });
+
+  test("a workspace member's package.json edited while apm checked: refused, nothing written (the lockfile was computed from the old one)", async () => {
+    const r = await apmRun({
+      pm: "npm",
+      pkg: { workspaces: ["packages/*"], dependencies: { existing: "1.0.0" } },
+      before: existing,
+      after: transitive,
+      spec: "transitive-root",
+      strict: false,
+      scenario: { editsProject: "packages/other/package.json" },
+      prepare: (dir) => {
+        mkdirSync(join(dir, "packages", "other"), { recursive: true });
+        writeFileSync(join(dir, "packages", "other", "package.json"), JSON.stringify({ name: "other", version: "1.0.0" }));
+      },
+    });
+
+    // on 2a098b1: only the two files apm writes were compared, so the add went ahead
+    expect(r.code, r.text).toBe(1);
+    expect(r.text).toContain("packages/other/package.json changed while apm checked the add, so apm wrote nothing");
+    expect(r.json?.installed?.touched).toBe(false);
+    expect(r.scripts).toEqual([]);
   });
 });

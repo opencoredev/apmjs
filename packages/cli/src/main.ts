@@ -7,15 +7,15 @@ import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
-import { installedPackages, isValidRange, type Installed } from "./audit.ts";
+import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
-import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockNode, type LockPm } from "./lockfile.ts";
+import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { addArgs, detectPm, frozenInstallArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
-import { checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph } from "./installed.ts";
-import { freshNodes, removeBunInstall, verifyInstall } from "./verify.ts";
+import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
+import { removeInstalled, verifyInstall, type Placed } from "./verify.ts";
 import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
@@ -655,29 +655,38 @@ function earlyKeys(results: readonly Resolved[]): Set<string> {
 /** The verdict on a lockfile: what is refused in every mode (`blocked`), the warnings, and whether the mode refuses. */
 type LockCheck = { graph: LockGraph; blocked: Blocked[]; warnings: InstallWarning[]; refused: boolean };
 
+const plural = (n: number, one: string, many: string): string => (n === 1 ? one : many);
+
 /**
  * Checks every package of `graph` at its exact version and integrity in one pass (scan). A revoked, yanked or confirmed
  * malicious version, or one whose integrity is not the registry's, refuses in every mode; strict mode refuses every
- * warning too, a git, file, link or workspace entry included. Prints the verdict: the warnings, without those the early
- * answer printed already, and where the lockfile holds another version than the early answer checked. `headline`: what
- * was checked, and when.
+ * warning too, a git, file, link or workspace entry included. Bundled versions are asked about only for their state,
+ * and declared workspace members not at all: they are the project's own folders. Prints the verdict: the warnings,
+ * without those the early answer printed already, and where the lockfile holds another version than the early answer
+ * checked. `headline`: what was checked, and when.
  */
 async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; results: readonly Resolved[]; headline: string; policy: CheckPolicy }): Promise<LockCheck> {
   const { api, graph, strict } = input;
-  const verdict = await checkGraph({ api, packages: graph.packages, local: graph.local, noIntegrity: graph.noIntegrity, waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: input.policy });
+  const verdict = await checkGraph({ api, packages: [...graph.packages, ...graph.bundled], local: graph.local, noIntegrity: graph.noIntegrity, waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: input.policy });
   const blocked = [...graph.conflicts, ...verdict.blocked.filter((b) => !graph.conflicts.some((c) => idOf(c) === idOf(b)))];
   const refused = blocked.length > 0 || (strict && verdict.warnings.length > 0);
-  const total = graph.packages.length + graph.local.length;
+  const total = checkedCount(graph);
 
   say();
   say(dim(`apm: checked the ${total} package${total === 1 ? "" : "s"} ${input.headline}`));
 
-  if (graph.bundled > 0) say(dim(`  ${graph.bundled} bundled package${graph.bundled === 1 ? " ships" : "s ship"} inside ${graph.bundled === 1 ? "its parent's tarball" : "their parents' tarballs"}: the parent's score covers ${graph.bundled === 1 ? "it" : "them"}`));
+  if (graph.bundled.length > 0) {
+    const n = graph.bundled.length;
+
+    say(dim(`  ${n} ${plural(n, "bundled package ships inside its parent's tarball", "bundled packages ship inside their parents' tarballs")}: the parent's score covers ${plural(n, "its", "their")} code, and apm checked that ${plural(n, "it is not", "none is")} revoked, yanked or confirmed malicious`));
+  }
+
+  if (graph.members.length > 0) say(dim(`  ${graph.members.map(idOf).join(", ")}: your workspace's own ${plural(graph.members.length, "member", "members")}, matched to ${plural(graph.members.length, "its folder", "their folders")}, name and version, so not asked about`));
 
   // the early answer checked a version the lockfile does not hold: say which it holds instead
   const locked = new Set(graph.packages.map(idOf));
   const swapped = input.results.flatMap((r) => r.tree.filter((p) => !locked.has(idOf(p))).flatMap((p) => {
-    const instead = graph.packages.filter((g) => g.name === p.name).map((g) => g.version);
+    const instead = [...new Set(graph.packages.filter((g) => g.name === p.name).map((g) => g.version))];
 
     return instead.length > 0 ? [`${p.name}: the early check read ${p.version}, the lockfile holds ${instead.join(" and ")}`] : [];
   }));
@@ -708,48 +717,138 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
 
 /** The --json report of a check, at the stage it stopped. */
 function reportOf(check: LockCheck, rest: { source?: InstalledReport["source"]; touched: boolean; stage: InstalledReport["stage"]; recovery?: string[] | null; refused?: boolean }): InstalledReport {
-  return { source: rest.source ?? "lockfile", checked: check.graph.packages.length + check.graph.local.length, blocked: check.blocked, warnings: check.warnings, refused: rest.refused ?? check.refused, touched: rest.touched, stage: rest.stage, recovery: rest.recovery ?? null };
+  return { source: rest.source ?? "lockfile", checked: checkedCount(check.graph), blocked: check.blocked, warnings: check.warnings, refused: rest.refused ?? check.refused, touched: rest.touched, stage: rest.stage, recovery: rest.recovery ?? null };
 }
 
+/** `path name@version` of a package directory, to tell what an install put in place from what was there before. */
+const placeKey = (p: { path: string; name: string; version: string }): string => `${p.path} ${idOf(p)}`;
+
+/** What the check of an install decided: refused before any script (it said why), or the packages whose scripts run. */
+type Held = { kind: "refused" } | { kind: "held"; fresh: Placed[] };
+
 /**
- * Runs the install scripts of what the install put in place, now that it is verified to be the checked lockfile: npm
- * rebuilds those exact name@versions (`npm rebuild leaf@2.0.0` leaves a nested leaf@1.0.0 alone), pnpm builds what it
- * recorded as pending, and bun installs those packages again from the checked lockfile (it runs scripts only while it
- * installs a package, and only for trusted ones). Everything installed is in the checked lockfile, so none of these can
- * reach a package apm did not check (review of a2227d1, finding 1). A rebuild fetches nothing: the registry is pinned
- * in its environment, as for every package manager apm runs.
+ * The check after a frozen install, before any install script (review of 2a098b1, findings 2 to 4 and 8): the install
+ * must be the checked lockfile (verifyInstall). A package directory apm cannot read, or a package outside the lockfile
+ * left from before this install, warns, and strict mode refuses it, since install scripts could load it. A package
+ * found inside a bundling package's tarball is asked about for its state, and a revoked, yanked or confirmed malicious
+ * one refuses in every mode. `fresh`: the packages this install put in place that run an install script, by location.
  */
-async function releaseScripts(input: { pm: LockPm; root: string; fresh: readonly LockNode[]; registry: string; scopes: string[]; quiet: boolean }): Promise<number> {
-  // a pnpm workspace builds each member's pending packages only when asked recursively
-  const recursive = input.pm === "pnpm" && existsSync(join(input.root, "pnpm-workspace.yaml")) ? ["--recursive"] : [];
+async function checkInstall(input: { api: Api; pm: LockPm; root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; importers: readonly LockImporter[]; members: readonly Member[]; before: readonly Found[]; strict: boolean; refuse: (line: string) => void }): Promise<Held> {
+  const { pm, strict, refuse } = input;
+  const verified = verifyInstall({ pm, root: input.root, lockfile: input.lockfile, checked: input.checked, nodes: input.nodes, importers: input.importers, members: input.members, before: input.before });
+
+  for (const u of verified.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
+
+  if (verified.kind === "mismatch") {
+    for (const p of verified.problems) refuse(`what ${pm} installed is not the checked lockfile: ${p}`);
+
+    return { kind: "refused" };
+  }
+
+  if (strict && verified.unreadable.length > 0) {
+    refuse(`strict mode refuses ${verified.unreadable.length === 1 ? "a package directory" : `${verified.unreadable.length} package directories`} apm could not read in node_modules`);
+
+    return { kind: "refused" };
+  }
+
+  for (const f of verified.extraneous.slice(0, 5)) say(`  ${yellow("!")} ${idOf(f)} (${f.path}) is in node_modules but not in the checked lockfile: it was there before, and install scripts could load it`);
+
+  if (verified.extraneous.length > 5) say(dim(`  … and ${verified.extraneous.length - 5} more`));
+
+  if (verified.extraneous.length > 0) {
+    if (strict) {
+      refuse(`strict mode refuses ${verified.extraneous.length === 1 ? "a package" : `${verified.extraneous.length} packages`} in node_modules outside the checked lockfile`);
+
+      return { kind: "refused" };
+    }
+
+    say(dim(`apm: remove ${verified.extraneous.length === 1 ? "it" : "them"} (or node_modules, then install again) so nothing outside the checked lockfile stays installed`));
+  }
+
+  if (verified.embedded.length > 0) {
+    const bundled = [...new Map(verified.embedded.map((e) => [idOf(e), { name: e.name, version: e.version, integrity: null, platform: false, bundled: true }])).values()];
+    const verdict = await checkGraph({ api: input.api, packages: bundled, local: [], noIntegrity: [], waitMs: 0, progress: (line) => say(dim(line)), policy: DEFAULT_CHECK });
+    const under = new Map(verified.embedded.map((e) => [idOf(e), e.under]));
+
+    say(dim(`apm: ${bundled.length} ${plural(bundled.length, "package ships", "packages ship")} inside ${plural(bundled.length, "a checked package's tarball", "checked packages' tarballs")} (${bundled.slice(0, 5).map(idOf).join(", ")}): checked that none is revoked, yanked or confirmed malicious`));
+
+    for (const b of verdict.blocked) refuse(`${idOf(b)}, bundled in ${under.get(idOf(b)) ?? "a checked package"}: ${b.reason}`);
+
+    if (verdict.blocked.length > 0) return { kind: "refused" };
+
+    for (const w of verdict.warnings) say(`  ${yellow("!")} ${idOf(w)}: ${w.text}`);
+
+    if (strict && verdict.warnings.length > 0) {
+      refuse(`strict mode refuses ${verdict.warnings.length === 1 ? "this warning" : `these ${verdict.warnings.length} warnings`} about bundled packages`);
+
+      return { kind: "refused" };
+    }
+  }
+
+  const before = new Set(input.before.map(placeKey));
+  const fresh = new Map(verified.placed.filter((p) => p.scripts && !before.has(placeKey(p))).map((p) => [p.path, p]));
+
+  return { kind: "held", fresh: [...fresh.values()] };
+}
+
+/** What releasing install scripts did: the exit code, whether bun installed packages again, and scripts apm could not run. */
+type Released = { code: number; reinstalled: boolean; notRun: string[] };
+
+/**
+ * Runs the install scripts of what the install put in place, now that it is verified to be the checked lockfile, at
+ * those locations only (review of 2a098b1, finding 6): npm rebuilds those exact directories (`npm rebuild <dir>`
+ * matches a location, so a same-version copy elsewhere is left alone), pnpm rebuilds those exact name@versions (never
+ * the project's own scripts, nor builds left pending from before), and bun installs those directories again from the
+ * checked lockfile after apm removed them (bun runs scripts only while it installs a package). A local package's
+ * location comes from the lockfile's edges, not its version (finding 7). A folder outside node_modules (a link) is the
+ * project's own: apm runs none of its scripts and says so. A rebuild fetches nothing: the registry is pinned in its
+ * environment, as for every package manager apm runs.
+ */
+async function releaseScripts(input: { pm: LockPm; root: string; members: readonly string[]; fresh: readonly Placed[]; registry: string; scopes: string[]; quiet: boolean }): Promise<Released> {
   const { pm, root } = input;
-  const withScripts = input.fresh.filter((n) => n.hasInstallScript);
   const env = pmEnv(input.registry, input.scopes);
   const opts = { cwd: root, env, stdoutToStderr: jsonMode || input.quiet };
+  const inModules = input.fresh.filter((p) => p.path.startsWith("node_modules/") || p.path.includes("/node_modules/"));
+  const notRun = input.fresh.filter((p) => !inModules.includes(p)).map((p) => `${idOf(p)} (${p.path}) is a folder of your own, linked in: apm does not run its scripts`);
+  const realRoot = realpathSync(root);
+
+  if (inModules.length === 0) return { code: 0, reinstalled: false, notRun };
 
   switch (pm) {
     case "npm": {
-      const specs = [...new Set(withScripts.map((n) => (n.origin.kind === "registry" ? `${n.name}@${n.version}` : n.name)))];
+      const dirs = inModules.map((p) => join(realRoot, ...p.path.split("/")));
 
-      if (specs.length === 0) return 0;
-      say(dim(`→ npm rebuild ${specs.join(" ")}`));
+      say(dim(`→ npm rebuild ${inModules.map((p) => p.path).join(" ")}`));
 
-      return (await runCmd(["npm", "rebuild", ...specs], opts)).code;
+      return { code: (await runCmd(["npm", "rebuild", ...dirs], opts)).code, reinstalled: false, notRun };
     }
 
-    case "pnpm":
-      say(dim(`→ pnpm rebuild --pending${recursive.length > 0 ? " --recursive" : ""}`));
+    case "pnpm": {
+      // a pnpm workspace builds a member's packages only when asked recursively
+      const recursive = existsSync(join(root, "pnpm-workspace.yaml")) ? ["--recursive"] : [];
+      const specs = [...new Set(inModules.map((p) => (isRegistryVersion(p.version) ? idOf(p) : p.name)))];
 
-      return (await runCmd(["pnpm", "rebuild", "--pending", ...recursive], opts)).code;
+      say(dim(`→ pnpm rebuild ${[...specs, ...recursive].join(" ")}`));
+
+      return { code: (await runCmd(["pnpm", "rebuild", ...specs, ...recursive], opts)).code, reinstalled: false, notRun };
+    }
+
     case "bun": {
-      const again = withScripts.filter((n) => removeBunInstall({ root, node: n }));
+      const again: Placed[] = [];
 
-      if (again.length === 0) return 0;
+      for (const p of inModules) {
+        const r = removeInstalled({ root, members: input.members, path: p.path });
+
+        if (r.kind === "removed") again.push(p);
+        else notRun.push(`${idOf(p)}: apm would not remove ${p.path} for bun to install it again (${r.reason})`);
+      }
+
+      if (again.length === 0) return { code: 0, reinstalled: false, notRun };
       const cmd = ["bun", "install", "--frozen-lockfile", ...registryArgs("bun", input.registry, input.scopes)];
 
-      say(dim(`→ ${cmd.join(" ")}  (installs ${again.map(idOf).join(", ")} again, running their install scripts)`));
+      say(dim(`→ ${cmd.join(" ")}  (installs ${again.map(idOf).join(", ")} again, running their install scripts; bun also runs your package.json's own install scripts)`));
 
-      return (await runCmd(cmd, opts)).code;
+      return { code: (await runCmd(cmd, opts)).code, reinstalled: true, notRun };
     }
 
     default: {
@@ -772,18 +871,20 @@ function ownInstallScripts(root: string): string[] {
 }
 
 /**
- * The add went wrong after apm wrote the checked package.json and lockfile: no install script ran, and apm undoes
- * nothing (an undo that half works is worse than none; review of a2227d1, findings 8 to 10). Says exactly how to put
- * the project back. Returns those commands, for --json.
+ * The add went wrong after apm wrote the checked package.json and lockfile: apm undoes nothing (an undo that half works
+ * is worse than none; review of a2227d1, findings 8 to 10). Says exactly how to put the project back, and whether any
+ * install script may have run: `scripts` is "none" before apm released them, "maybe" from then on. Returns those
+ * commands, for --json.
  */
-function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm }): string[] {
+function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm; scripts: "none" | "maybe" }): string[] {
   const t = targets(input.layout);
   const restore = restoreCommands({ layout: input.layout, backup: input.backup });
   const reinstall = input.pm === "yarn" ? "yarn install" : frozenInstallArgs(input.pm, { keepNodeModules: true }).join(" ");
   const commands = [...restore, `cd '${input.layout.root.replaceAll("'", "'\\''")}' && ${reinstall}`];
+  const scripts = input.scripts === "none" ? "No install script ran." : `Install scripts may have run: ${input.pm === "yarn" ? "yarn ran them as it installed" : "apm had started them"}.`;
 
   say();
-  say(`No install script ran. apm wrote only ${t.manifest} and ${t.lockfile}, and leaves node_modules as ${input.pm} installed it: apm does not undo installs.`);
+  say(`${scripts} apm wrote only ${t.manifest} and ${t.lockfile}, and leaves node_modules as ${input.pm} installed it: apm does not undo installs.`);
   say("To put your project back as it was before apm add, run:");
 
   for (const c of commands) say(`  ${c}`);
@@ -793,7 +894,7 @@ function afterApplyFailure(input: { layout: Layout; backup: Backup; pm: Pm }): s
 }
 
 /** A lockfile that passed and was written to the project: what the install, the check of it and the scripts need. */
-type Checked = { check: LockCheck; nodes: LockNode[]; computed: Extract<Computed, { kind: "computed" }>; backup: Backup; scopes: string[] };
+type Checked = { check: LockCheck; nodes: LockNode[]; importers: LockImporter[]; computed: Extract<Computed, { kind: "computed" }>; backup: Backup; scopes: string[] };
 
 /**
  * apm add, lockfile first. In a copy of the project the package manager computes the add's lockfile and installs
@@ -850,7 +951,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       return 1;
     }
 
-    const check = await checkLock({ api, graph: lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true }), strict, results, headline: `in the ${t.lockfile} ${pm} computed for this add, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, results) });
+    const check = await checkLock({ api, graph: lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true, members: layout.members }), strict, results, headline: `in the ${t.lockfile} ${pm} computed for this add, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, results) });
 
     if (check.refused) {
       const error = lastError;
@@ -875,7 +976,7 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       case "failed": {
         fail(`apm add: writing the checked files failed: ${applied.reason}`);
         const error = lastError;
-        const recovery = afterApplyFailure({ layout, backup: applied.backup, pm });
+        const recovery = afterApplyFailure({ layout, backup: applied.backup, pm, scripts: "none" });
 
         emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage: "install", recovery, refused: true }) });
 
@@ -891,69 +992,88 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       }
     }
 
-    checked = { check, nodes: read.nodes, computed, backup: applied.backup, scopes };
+    checked = { check, nodes: read.nodes, importers: read.importers, computed, backup: applied.backup, scopes };
   } finally {
     removeTemp(copy.dir);
   }
 
-  const { check, nodes, computed, backup, scopes } = checked;
-  const failed = (stage: InstalledReport["stage"]): number => {
-    const error = lastError;
-    const recovery = afterApplyFailure({ layout, backup, pm });
+  const { check, nodes, importers, computed, backup, scopes } = checked;
+  // where the add is once the checked files are written, for the recovery a failure reports, a thrown one included
+  let stage: InstalledReport["stage"] = "install";
+  let scripts: "none" | "maybe" = "none";
 
-    emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage, recovery, refused: true }) });
+  const failed = (at: InstalledReport["stage"]): number => {
+    const error = lastError;
+    const recovery = afterApplyFailure({ layout, backup, pm, scripts });
+
+    emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage: at, recovery, refused: true }) });
 
     return 1;
   };
 
-  const keep = existsSync(join(layout.root, "node_modules"));
-  // read before the install: what it puts in place is what gets its install scripts run
-  const fresh = freshNodes({ pm, root: layout.root, nodes });
-  const install = [...frozenInstallArgs(pm, { keepNodeModules: keep }), ...registryArgs(pm, registry, scopes)];
+  const memberDirs = layout.members.map((m) => m.dir);
+  const refuse = (line: string): void => fail(`refused: ${line}`);
 
-  say();
-  say(dim(`→ ${install.join(" ")}  (wrote the checked ${t.manifest} and ${t.lockfile}; installing exactly that, every install script held back)`));
-  const installed = await runCmd(install, { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode });
+  // review of 2a098b1, finding 12: whatever throws after the write (a package manager that cannot start, a filesystem
+  // error) still reports the stage and the commands that put the project back
+  try {
+    // read before the install: what it puts in place is what gets its install scripts run
+    const before = installedPackages(layout.root, memberDirs).found;
+    const keep = existsSync(join(layout.root, "node_modules"));
+    const install = [...frozenInstallArgs(pm, { keepNodeModules: keep }), ...registryArgs(pm, registry, scopes)];
 
-  if (installed.code !== 0) {
-    fail(`apm add: ${pm} could not install the checked lockfile (exit ${installed.code})`);
+    say();
+    say(dim(`→ ${install.join(" ")}  (wrote the checked ${t.manifest} and ${t.lockfile}; installing exactly that, every install script held back)`));
+    const installed = await runCmd(install, { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode });
 
-    return failed("install");
+    if (installed.code !== 0) {
+      fail(`apm add: ${pm} could not install the checked lockfile (exit ${installed.code})`);
+
+      return failed("install");
+    }
+
+    stage = "verify";
+    const held = await checkInstall({ api, pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before, strict, refuse });
+
+    if (held.kind === "refused") return failed("verify");
+
+    stage = "scripts";
+    scripts = "maybe";
+    say(dim(`apm: node_modules is the checked ${t.lockfile}; running install scripts`));
+    const released = await releaseScripts({ pm, root: layout.root, members: memberDirs, fresh: held.fresh, registry, scopes, quiet: false });
+
+    for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
+
+    if (released.code !== 0) {
+      fail(`apm: the install scripts failed (exit ${released.code})`);
+      failed("scripts");
+
+      return released.code;
+    }
+
+    // bun installed packages again: the result must still be the checked lockfile, with nothing new beside it
+    if (released.reinstalled) {
+      const again = verifyInstall({ pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before: installedPackages(layout.root, memberDirs).found });
+
+      if (again.kind === "mismatch") {
+        for (const p of again.problems) refuse(`what bun installed again is not the checked lockfile: ${p}`);
+
+        return failed("scripts");
+      }
+    }
+
+    removeTemp(backup.dir);
+    const own = ownInstallScripts(join(layout.root, layout.member));
+
+    if (own.length > 0 && !released.reinstalled) say(dim(`apm: your package.json's own ${own.join(", ")} script${own.length === 1 ? "" : "s"} did not run; run ${own.map((s) => `${pm} run ${s}`).join(" and ")} if you need ${own.length === 1 ? "it" : "them"}`));
+    emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
+
+    return 0;
+  } catch (e) {
+    fail(`apm add: ${stage === "install" ? `installing the checked lockfile failed` : stage === "verify" ? "checking what was installed failed" : "running install scripts failed"}: ${e instanceof Error ? e.message : String(e)}`);
+
+    return failed(stage);
   }
-
-  const verified = verifyInstall({ pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, members: layout.members });
-
-  for (const u of verified.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
-
-  if (verified.kind === "mismatch") {
-    for (const p of verified.problems) fail(`refused: what ${pm} installed is not the checked lockfile: ${p}`);
-
-    return failed("verify");
-  }
-
-  if (strict && verified.unreadable.length > 0) {
-    fail(`refused: strict mode refuses ${verified.unreadable.length === 1 ? "a package directory" : `${verified.unreadable.length} package directories`} apm could not read in node_modules`);
-
-    return failed("verify");
-  }
-
-  say(dim(`apm: node_modules is the checked ${t.lockfile}; running install scripts`));
-  const code = await releaseScripts({ pm, root: layout.root, fresh, registry, scopes, quiet: false });
-
-  if (code !== 0) {
-    fail(`apm: the install scripts failed (exit ${code})`);
-    emitJson({ ok: false, det, results, error: lastError, installed: reportOf(check, { touched: true, stage: "scripts" }) });
-
-    return code;
-  }
-
-  removeTemp(backup.dir);
-  const own = pm === "bun" ? [] : ownInstallScripts(layout.root);
-
-  if (own.length > 0) say(dim(`apm: your package.json's own ${own.join(", ")} script${own.length === 1 ? "" : "s"} did not run; run ${own.map((s) => `${pm} run ${s}`).join(" and ")} if you need ${own.length === 1 ? "it" : "them"}`));
-  emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
-
-  return 0;
 }
 
 /** What node_modules holds, as the check takes it, and the package directories apm could not read. */
@@ -969,12 +1089,12 @@ function nodeModulesGraph(disk: Installed): DiskGraph {
 
   for (const [name, versions] of disk.packages) {
     for (const version of versions) {
-      if (isRegistryVersion(version)) packages.push({ name, version, integrity: null, platform: false });
+      if (isRegistryVersion(version)) packages.push({ name, version, integrity: null, platform: false, bundled: false });
       else local.push({ name, version, origin: { kind: "file", source: `node_modules, version ${version}` } });
     }
   }
 
-  return { graph: { packages, local, conflicts: [], noIntegrity: [], bundled: 0 }, unreadable: disk.unchecked };
+  return { graph: { packages, local, members: [], conflicts: [], noIntegrity: [], bundled: [] }, unreadable: disk.unchecked };
 }
 
 /** What yarn berry's lockfile-first add came to: finished (with its exit code), or nothing checked, and why. */
@@ -983,9 +1103,29 @@ type BerryOutcome = { kind: "done"; code: number } | { kind: "fallback"; why: st
 type YarnInput = { a: Args; api: Api; det: Detection; layout: Layout; results: Resolved[]; scopes: string[] };
 
 /**
+ * How what yarn berry installed differs from the lockfile apm checked (review of 2a098b1, finding 11): yarn.lock is no
+ * longer the checked bytes, or node_modules holds a package the checked lockfile does not. Empty when it is the same.
+ */
+function berryDrift(input: { root: string; lockfile: string; checked: Uint8Array; nodes: readonly LockNode[]; members: readonly Member[] }): string[] {
+  const out: string[] = [];
+  const path = join(input.root, input.lockfile);
+  const now = existsSync(path) ? new Uint8Array(readFileSync(path)) : null;
+
+  if (now === null || !Buffer.from(now).equals(Buffer.from(input.checked))) out.push(`${input.lockfile} is not the lockfile apm checked: yarn changed it while it installed`);
+  const allowed = new Set(input.nodes.filter((n) => n.origin.kind === "registry").map(idOf));
+  const named = new Set([...input.nodes.filter((n) => n.origin.kind !== "registry").map((n) => n.name), ...input.members.flatMap((m) => (m.name === null ? [] : [m.name]))]);
+  const extra = installedPackages(input.root, input.members.map((m) => m.dir)).found.filter((f) => !allowed.has(idOf(f)) && !named.has(f.name));
+
+  if (extra.length > 0) out.push(`node_modules holds ${extra.length === 1 ? "a package" : `${extra.length} packages`} the checked lockfile does not: ${extra.slice(0, 10).map(idOf).join(", ")}`);
+
+  return out;
+}
+
+/**
  * yarn berry, lockfile first: yarn computes the lockfile in the copy (--mode update-lockfile), apm checks it, and a
- * refusal leaves the project untouched. A lockfile that passes is written back and yarn installs it, running install
- * scripts itself, before apm can check what it installed: apm says so.
+ * refusal leaves the project untouched. A lockfile that passes is written back and yarn installs exactly it
+ * (--immutable), running install scripts itself, before apm can check what it installed: apm says so, then checks the
+ * install is the checked lockfile and keeps the backup until it has (review of 2a098b1, finding 11).
  */
 async function addWithBerry(input: YarnInput & { copy: Copy }): Promise<BerryOutcome> {
   const { a, api, det, layout, results, scopes, copy } = input;
@@ -1008,7 +1148,7 @@ async function addWithBerry(input: YarnInput & { copy: Copy }): Promise<BerryOut
     return { kind: "fallback", why: `apm could not read the yarn.lock yarn computed (${e instanceof Error ? e.message : String(e)})` };
   }
 
-  const check = await checkLock({ api, graph: lockGraph(withMemberNames(nodes, layout.members), { integrityKnown: false }), strict: false, results, headline: "in the yarn.lock yarn computed for this add, at the exact versions it locks (yarn's checksums are not the registry's, so not by integrity), before yarn installs anything", policy: checkPolicy(a, results) });
+  const check = await checkLock({ api, graph: lockGraph(withMemberNames(nodes, layout.members), { integrityKnown: false, members: layout.members }), strict: false, results, headline: "in the yarn.lock yarn computed for this add, at the exact versions it locks (yarn's checksums are not the registry's, so not by integrity), before yarn installs anything", policy: checkPolicy(a, results) });
 
   if (check.refused) {
     const error = lastError;
@@ -1031,27 +1171,51 @@ async function addWithBerry(input: YarnInput & { copy: Copy }): Promise<BerryOut
   if (applied.kind === "failed") {
     fail(`apm add: writing the checked files failed: ${applied.reason}`);
     const error = lastError;
-    const recovery = afterApplyFailure({ layout, backup: applied.backup, pm: "yarn" });
+    const recovery = afterApplyFailure({ layout, backup: applied.backup, pm: "yarn", scripts: "none" });
 
     emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage: "install", recovery, refused: true }) });
 
     return { kind: "done", code: 1 };
   }
 
-  say(yellow("apm checked the lockfile; yarn now installs it and runs its install scripts, which apm cannot hold back or check first."));
-  say(dim("→ yarn install"));
-  const code = (await runCmd(["yarn", "install"], { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode })).code;
+  const backup = applied.backup;
 
-  if (code !== 0) {
-    fail(`apm add: yarn install failed (exit ${code})`);
-    const recovery = afterApplyFailure({ layout, backup: applied.backup, pm: "yarn" });
+  const failed = (stage: InstalledReport["stage"], code: number): BerryOutcome => {
+    const error = lastError;
+    const recovery = afterApplyFailure({ layout, backup, pm: "yarn", scripts: "maybe" });
 
-    emitJson({ ok: false, det, results, error: lastError, installed: reportOf(check, { touched: true, stage: "install", recovery, refused: true }) });
+    emitJson({ ok: false, det, results, error, installed: reportOf(check, { touched: true, stage, recovery, refused: true }) });
 
     return { kind: "done", code };
+  };
+
+  try {
+    say(yellow("apm checked the lockfile; yarn now installs exactly it and runs its install scripts, which apm cannot hold back or check first."));
+    const install = ["yarn", "install", "--immutable"];
+
+    say(dim(`→ ${install.join(" ")}`));
+    const code = (await runCmd(install, { cwd: layout.root, env: pmEnv(registry, scopes), stdoutToStderr: jsonMode })).code;
+
+    if (code !== 0) {
+      fail(`apm add: yarn install failed (exit ${code})`);
+
+      return failed("install", code);
+    }
+
+    const drift = berryDrift({ root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, members: layout.members });
+
+    if (drift.length > 0) {
+      for (const d of drift) fail(`refused: what yarn installed is not the checked lockfile: ${d}`);
+
+      return failed("verify", 1);
+    }
+  } catch (e) {
+    fail(`apm add: yarn install failed: ${e instanceof Error ? e.message : String(e)}`);
+
+    return failed("install", 1);
   }
 
-  removeTemp(applied.backup.dir);
+  removeTemp(backup.dir);
   emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
 
   return { kind: "done", code: 0 };
@@ -1307,23 +1471,26 @@ async function cmdX(a: Args): Promise<number> {
       return installed.code;
     }
 
-    const verified = verifyInstall({ pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, members: [] });
+    const held = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: [], strict, refuse: (line) => fail(`refused to run ${r.name}: ${line}`) });
 
-    for (const u of verified.unreadable.slice(0, 5)) say(`  ${yellow("!")} not read: ${u.id} (${u.reason})`);
-
-    if (verified.kind === "mismatch" || (strict && verified.unreadable.length > 0)) {
-      for (const p of verified.kind === "mismatch" ? verified.problems : verified.unreadable.map((u) => `apm could not read ${u.id} (${u.reason})`)) fail(`refused to run ${r.name}: ${p}`);
+    if (held.kind === "refused") {
       say("apm ran no install script and no binary; the directory it installed into is removed.");
 
       return 1;
     }
 
-    const code = await releaseScripts({ pm: xpm, root: dir, fresh: read.nodes, registry: cfg.registry, scopes, quiet: true });
+    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, registry: cfg.registry, scopes, quiet: true });
 
-    if (code !== 0) {
-      fail(`apm x: the install scripts failed (exit ${code})`);
+    if (released.code !== 0) {
+      fail(`apm x: the install scripts failed (exit ${released.code})`);
 
-      return code;
+      return released.code;
+    }
+
+    if (released.reinstalled && verifyInstall({ pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: [] }).kind === "mismatch") {
+      fail(`refused to run ${r.name}: what ${xpm} installed again is not the checked lockfile`);
+
+      return 1;
     }
 
     const bin = binOf(dir, r.name);

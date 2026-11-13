@@ -87,14 +87,17 @@ export type Applied = { kind: "applied"; backup: Backup } | { kind: "refused"; r
 
 /**
  * Writes the checked package.json and lockfile over the project's, each in one rename. Refuses, writing nothing, when
- * either changed since apm copied it (someone else edited the project while apm checked) or is a symlink (a rename
- * would replace the link, not the file it points at). The files from before go into a backup first.
+ * either changed since apm copied it, or any other file apm copied to compute the lockfile did (a workspace member's
+ * package.json, the configuration): someone else edited the project while apm checked, so the lockfile apm checked
+ * may not be the one the project now computes. Also when either target is a symlink (a rename would replace the link,
+ * not the file it points at). The files from before go into a backup first.
  */
 export function applyChecked(input: { layout: Layout; copy: Copy; computed: Extract<Computed, { kind: "computed" }> }): Applied {
   const { layout, copy, computed } = input;
   const t = targets(layout);
   const now = { manifest: bytesOf(join(layout.root, t.manifest)), lockfile: bytesOf(join(layout.root, t.lockfile)) };
-  const changed = [...(same(now.manifest, copy.original.manifest) ? [] : [t.manifest]), ...(same(now.lockfile, copy.original.lockfile) ? [] : [t.lockfile])];
+  const inputs = [...copy.copied].flatMap(([rel, bytes]) => (rel !== t.manifest && rel !== t.lockfile && !same(bytesOf(join(layout.root, rel)), bytes) ? [rel] : []));
+  const changed = [...(same(now.manifest, copy.original.manifest) ? [] : [t.manifest]), ...(same(now.lockfile, copy.original.lockfile) ? [] : [t.lockfile]), ...inputs];
 
   if (changed.length > 0) return { kind: "refused", reason: `${changed.join(" and ")} changed while apm checked the add, so apm wrote nothing. Run apm add again` };
   const linked = [t.manifest, t.lockfile].filter((rel) => isSymlink(join(layout.root, rel)));

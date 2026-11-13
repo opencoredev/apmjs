@@ -3,14 +3,16 @@
 // locks, before anything is installed (see docs/ARCHITECTURE.md, "How `apm add` makes the package manager install what apm checked"). apm audit checks node_modules
 // with the same code.
 import { z } from "zod";
+import { formatSri, integritiesConflict, parseSri } from "@apm/core";
 import { InstallWarning, type Api } from "./api.ts";
 import type { LockNode, Origin } from "./lockfile.ts";
 
 /**
  * A registry package as the check asks about it. `integrity`: the lockfile's, which the registry compares with the bytes
- * it serves. `platform`: built for one os or cpu, so summed up with its family when printed.
+ * it serves. `platform`: built for one os or cpu, so summed up with its family when printed. `bundled`: it ships inside
+ * another package's tarball, so the registry is asked only about its state (revoked, yanked, confirmed malicious).
  */
-export type InstalledPackage = { name: string; version: string; integrity: string | null; platform: boolean };
+export type InstalledPackage = { name: string; version: string; integrity: string | null; platform: boolean; bundled: boolean };
 
 /** A package from somewhere no registry can check: git, a file, a link, the project's own workspace, a remote tarball. */
 export type LocalPackage = { name: string; version: string; origin: Exclude<Origin, { kind: "registry" }> };
@@ -19,42 +21,100 @@ export type LocalPackage = { name: string; version: string; origin: Exclude<Orig
 export const idOf = (p: { name: string; version: string }): string => `${p.name}@${p.version}`;
 
 /**
- * What a lockfile asks the check about. `packages`: every registry package, one per name@version (a nested leaf@1.0.0
- * beside a hoisted leaf@2.0.0 is two). `local`: the rest, kept with their origin. `conflicts`: a name@version the
- * lockfile locks to two different artifacts, refused in every mode. `noIntegrity`: registry entries with no integrity,
- * whose bytes apm cannot confirm. `bundled`: entries inside their parent's tarball, which the parent's score covers.
+ * What a lockfile asks the check about. `packages`: every registry package, one per name@version and artifact (a nested
+ * leaf@1.0.0 beside a hoisted leaf@2.0.0 is two; one version locked with two integrities is asked about with each).
+ * `local`: the rest, kept with their origin. `members`: the project's own workspace members, bound to a declared member
+ * by folder, name and version, which strict mode trusts as the project's own source. `conflicts`: a name@version the
+ * lockfile locks to two different artifacts, refused in every mode. `noIntegrity`: registry versions with an entry that
+ * has no integrity, whose bytes apm cannot confirm. `bundled`: versions inside their parent's tarball, asked about only
+ * for their state.
  */
-export type LockGraph = { packages: InstalledPackage[]; local: LocalPackage[]; conflicts: Blocked[]; noIntegrity: InstalledPackage[]; bundled: number };
+export type LockGraph = { packages: InstalledPackage[]; local: LocalPackage[]; members: LocalPackage[]; conflicts: Blocked[]; noIntegrity: InstalledPackage[]; bundled: InstalledPackage[] };
 
-/** Every node of a lockfile, as the check takes them. `integrityKnown`: false for yarn, whose checksums are not the registry's. */
-export function lockGraph(nodes: readonly LockNode[], opts: { integrityKnown: boolean }): LockGraph {
-  const byId = new Map<string, InstalledPackage>();
+/** A declared workspace member: its folder from the install root and its package.json's name and version. */
+export type Member = { dir: string; name: string | null; version: string | null };
+
+/**
+ * Whether a workspace node of the lockfile is a declared member: the folder it names is the member's, with the member's
+ * package.json name (and version, where the lockfile records one). Not a name alone, nor any folder of the project.
+ */
+export function isBoundMember(node: Pick<LockNode, "name" | "origin">, members: readonly Member[]): boolean {
+  const o = node.origin;
+
+  if (o.kind !== "workspace" || o.dir === null) return false;
+  const dir = o.dir;
+  const m = members.find((x) => x.dir === dir);
+
+  return m !== undefined && m.name !== null && m.name === node.name && (o.version === null || o.version === m.version);
+}
+
+/** Distinct integrities, compared as parsed SRI so the same hashes in another order are one (review of 2a098b1, finding 10). */
+function canonical(integrity: string): string {
+  return formatSri(parseSri(integrity)) || integrity;
+}
+
+/**
+ * Every node of a lockfile, as the check takes them. `integrityKnown`: false for yarn, whose checksums are not the
+ * registry's. `members`: the workspace's declared members.
+ */
+export function lockGraph(nodes: readonly LockNode[], opts: { integrityKnown: boolean; members?: readonly Member[] }): LockGraph {
+  const byId = new Map<string, { node: LockNode; integrities: Set<string>; missing: boolean }>();
   const local = new Map<string, LocalPackage>();
+  const members = new Map<string, LocalPackage>();
+  const bundled = new Map<string, InstalledPackage>();
   const conflicts = new Map<string, Blocked>();
-  let bundled = 0;
 
   for (const n of nodes) {
+    const id = idOf(n);
+
+    // a bundled version has no artifact of its own, but a revoked or yanked one still refuses (review of 2a098b1, finding 2)
     if (n.bundled) {
-      bundled++;
+      bundled.set(id, { name: n.name, version: n.version, integrity: null, platform: n.platform, bundled: true });
       continue;
     }
 
     if (n.origin.kind !== "registry") {
-      local.set(`${idOf(n)} ${n.origin.source}`, { name: n.name, version: n.version, origin: n.origin });
+      const entry = { name: n.name, version: n.version, origin: n.origin };
+
+      if (isBoundMember(n, opts.members ?? [])) members.set(id, entry);
+      else local.set(`${id} ${n.origin.source}`, entry);
       continue;
     }
 
-    const id = idOf(n);
-    const seen = byId.get(id);
+    // every occurrence keeps its own proof: one with an integrity does not vouch for one without (finding 9)
+    const seen = byId.get(id) ?? { node: n, integrities: new Set<string>(), missing: false };
 
-    if (seen === undefined) byId.set(id, { name: n.name, version: n.version, integrity: n.integrity, platform: n.platform });
-    else if (seen.integrity === null) byId.set(id, { ...seen, integrity: n.integrity });
-    else if (n.integrity !== null && n.integrity !== seen.integrity) conflicts.set(id, { name: n.name, version: n.version, reason: `the lockfile locks ${id} to two different artifacts (${seen.integrity} and ${n.integrity})` });
+    if (n.integrity === null) seen.missing = true;
+    else seen.integrities.add(canonical(n.integrity));
+    byId.set(id, seen);
   }
 
-  const packages = [...byId.values()];
+  const packages: InstalledPackage[] = [];
+  const noIntegrity: InstalledPackage[] = [];
 
-  return { packages, local: [...local.values()], conflicts: [...conflicts.values()], noIntegrity: opts.integrityKnown ? packages.filter((p) => p.integrity === null) : [], bundled };
+  for (const [id, { node, integrities, missing }] of byId) {
+    const list = [...integrities];
+    const base = { name: node.name, version: node.version, platform: node.platform, bundled: false };
+
+    for (const [i, a] of list.entries()) {
+      const b = list.slice(i + 1).find((x) => integritiesConflict(a, x));
+
+      if (b !== undefined) conflicts.set(id, { name: node.name, version: node.version, reason: `the lockfile locks ${id} to two different artifacts (${a} and ${b})` });
+    }
+
+    if (list.length === 0) packages.push({ ...base, integrity: null });
+
+    for (const integrity of list) packages.push({ ...base, integrity });
+
+    if (missing && opts.integrityKnown) noIntegrity.push({ ...base, integrity: null });
+  }
+
+  return { packages, local: [...local.values()], members: [...members.values()], conflicts: [...conflicts.values()], noIntegrity, bundled: [...bundled.values()] };
+}
+
+/** The number of distinct versions a graph checks: its registry versions, its other entries and its members. */
+export function checkedCount(graph: Pick<LockGraph, "packages" | "local" | "members">): number {
+  return new Set(graph.packages.map(idOf)).size + graph.local.length + graph.members.length;
 }
 
 // ---------- the registry's verdict ----------
@@ -102,7 +162,7 @@ export const DEFAULT_CHECK: CheckPolicy = { cooldown: null, floor: null, lifted:
 async function scanBatch(api: Api, batch: readonly InstalledPackage[], policy: CheckPolicy): Promise<{ kind: "answer"; answer: ScanAnswer } | { kind: "failed"; reason: string }> {
   try {
     // an unknown integrity, cooldown or floor is left out of the JSON (undefined), so the registry's default applies
-    const packages = batch.map((p) => ({ name: p.name, version: p.version, integrity: p.integrity ?? undefined }));
+    const packages = batch.map((p) => ({ name: p.name, version: p.version, integrity: p.integrity ?? undefined, bundled: p.bundled ? true : undefined }));
     const body = { packages, strict: false, cooldown: policy.cooldown ?? undefined, floor: policy.floor ?? undefined };
     const r = await api.raw("-/apm/v1/scan", { method: "POST", body });
 
@@ -143,7 +203,9 @@ async function scanAll(api: Api, packages: readonly InstalledPackage[], policy: 
  */
 export async function checkGraph(input: { api: Api; packages: readonly InstalledPackage[]; local: readonly LocalPackage[]; noIntegrity: readonly InstalledPackage[]; waitMs: number; progress: (line: string) => void; policy: CheckPolicy }): Promise<GraphVerdict> {
   const { api, policy } = input;
-  const byId = new Map(input.packages.map((p) => [idOf(p), p]));
+  const byId = new Map<string, InstalledPackage[]>();
+
+  for (const p of input.packages) byId.set(idOf(p), [...(byId.get(idOf(p)) ?? []), p]);
   const blocked = new Map<string, Blocked>();
   const warnings = new Map<string, InstallWarning>();
   const unchecked = new Map<string, string>();
@@ -164,7 +226,7 @@ export async function checkGraph(input: { api: Api; packages: readonly Installed
       const waiting = new Set(a.pending.map((p) => idOf({ name: p.package, version: p.version })));
 
       for (const u of a.unchecked) if (!waiting.has(idOf({ name: u.package, version: u.version }))) unchecked.set(idOf({ name: u.package, version: u.version }), u.reason);
-      pending.push(...[...waiting].flatMap((id) => byId.get(id) ?? []));
+      pending.push(...[...waiting].flatMap((id) => byId.get(id) ?? []).filter((p) => !p.bundled));
     }
   };
 
@@ -195,7 +257,7 @@ export async function checkGraph(input: { api: Api; packages: readonly Installed
   for (const p of pending) warnings.set(`${idOf(p)}:pending`, ownWarning({ name: p.name, version: p.version, kind: "pending", text: `not scored yet: ${api.cfg.registry} is still analysing it` }));
 
   for (const [id, reason] of unchecked) {
-    const p = byId.get(id);
+    const p = byId.get(id)?.[0];
 
     if (p && !blocked.has(id)) warnings.set(`${id}:unchecked`, ownWarning({ name: p.name, version: p.version, kind: "unchecked", text: `not checked: ${reason}` }));
   }
@@ -209,5 +271,5 @@ export async function checkGraph(input: { api: Api; packages: readonly Installed
   const lifted = (w: InstallWarning): boolean => policy.lifted.has(idOf(w)) && (w.kind === "low-score" || w.kind === "cooldown");
   const shown = [...warnings.values()].filter((w) => !blocked.has(idOf(w)) && !lifted(w));
 
-  return { checked: input.packages.length, blocked: [...blocked.values()], warnings: shown };
+  return { checked: new Set(input.packages.map(idOf)).size, blocked: [...blocked.values()], warnings: shown };
 }

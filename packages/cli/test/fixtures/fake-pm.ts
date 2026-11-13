@@ -7,8 +7,8 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync,
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
-/** A package directory the install lays: `path` relative to the install root, `raw` a package.json that is not JSON. */
-export const Module = z.object({ path: z.string(), name: z.string(), version: z.string(), bin: z.string().optional(), raw: z.string().optional() });
+/** A package directory the install lays: `path` relative to the install root, `raw` a package.json that is not JSON, `bare` none at all. */
+export const Module = z.object({ path: z.string(), name: z.string(), version: z.string(), bin: z.string().optional(), raw: z.string().optional(), bare: z.boolean().optional() });
 
 export const Scenario = z.object({
   /** The lockfile the add computes, relative to where the add runs (a workspace member writes ../../<lockfile>). */
@@ -26,6 +26,8 @@ export const Scenario = z.object({
   installRewritesLock: z.string().optional(),
   /** The add fails with this exit code. */
   addFails: z.number().optional(),
+  /** The install keeps what node_modules held, laying `modules` over it (a package left from before stays). */
+  keep: z.boolean().optional(),
   yarnVersion: z.string().optional(),
 });
 
@@ -40,14 +42,21 @@ appendFileSync(join(dir, "pm.log"), `${JSON.stringify({ pm, args, cwd })}\n`);
 const scenario = Scenario.parse(JSON.parse(readFileSync(join(dir, "scenario.json"), "utf8")));
 const ran = (what: string): void => appendFileSync(join(dir, "scripts-ran"), `${what}\n`);
 
-/** node_modules holds exactly `modules`. */
+/** node_modules holds exactly `modules` (with `keep`, what it held besides). */
 function lay(modules: readonly z.infer<typeof Module>[]): void {
-  rmSync(join(cwd, "node_modules"), { recursive: true, force: true });
+  if (scenario.keep !== true) rmSync(join(cwd, "node_modules"), { recursive: true, force: true });
 
   for (const m of modules) {
     const at = join(cwd, m.path);
 
     mkdirSync(at, { recursive: true });
+
+    // `bare`: code with no package.json at all
+    if (m.bare === true) {
+      writeFileSync(join(at, "index.js"), "module.exports = 'unnamed';\n");
+      continue;
+    }
+
     writeFileSync(join(at, "package.json"), m.raw ?? JSON.stringify({ name: m.name, version: m.version, bin: m.bin === undefined ? undefined : { [m.name]: "cli.sh" } }));
 
     if (m.bin !== undefined) {
