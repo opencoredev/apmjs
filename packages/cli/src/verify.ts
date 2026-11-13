@@ -223,7 +223,7 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     for (const dep of n.deps) follow({ label: `${idOf(n)} (${rel(item.dir)})`, dir: item.dir }, dep);
   }
 
-  // npm's lockfile keys are install paths: each must hold its locked version, with the integrity npm recorded installing
+  // npm's lockfile keys are install paths: each one there must hold its locked version, with the integrity npm recorded
   const hoisted = input.pm === "npm" || (input.pm === "bun" && !existsSync(join(root, "node_modules", ".bun")));
   const recorded = input.pm === "npm" ? hiddenIntegrities(root) : new Map<string, string>();
 
@@ -234,10 +234,9 @@ export function verifyInstall(input: { pm: LockPm; root: string; lockfile: strin
     if (logical === null) continue;
     const at = realOrNull(logical);
 
-    if (at === null) {
-      if (!n.optional) problems.push(`${n.key} is not installed, but the checked lockfile puts ${idOf(n)} there`);
-      continue;
-    }
+    // whether a missing package may be missing is the edges' to say (an optional dependency, and everything only it
+    // needs, can be left out); here only what is there is checked
+    if (at === null) continue;
 
     const read = manifestAt(at);
 

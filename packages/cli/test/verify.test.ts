@@ -147,6 +147,32 @@ describe("missing packages and package directories apm cannot read (finding 4)",
   });
 });
 
+describe("optional dependencies the package manager left out", () => {
+  test("bun: an optional dependency with no os or cpu of its own, and what only it needs, may both be missing (apm add next on staging)", () => {
+    const root = project();
+
+    const lock = JSON.stringify({
+      lockfileVersion: 1,
+      workspaces: { "": { name: "p", dependencies: { sharp: "0.35.5" } } },
+      packages: {
+        sharp: ["sharp@0.35.5", "", { dependencies: { colour: "^1.1.0" }, optionalDependencies: { "sharp-wasm32": "0.35.5" } }, "sha512-s"],
+        colour: ["colour@1.1.0", "", {}, "sha512-c"],
+        "sharp-wasm32": ["sharp-wasm32@0.35.5", "", { dependencies: { "emnapi-runtime": "^1.11.3" } }, "sha512-w"],
+        "emnapi-runtime": ["emnapi-runtime@1.11.3", "", {}, "sha512-e"],
+      },
+    });
+
+    pkg(join(root, "node_modules", "sharp"), "sharp", "0.35.5");
+    pkg(join(root, "node_modules", "colour"), "colour", "1.1.0");
+    const r = verify({ pm: "bun", root, file: "bun.lock", text: lock });
+
+    expect(r.problems).toEqual([]);
+    rmSync(join(root, "node_modules", "colour"), { recursive: true });
+    // a required dependency of an installed package is still required
+    expect(verify({ pm: "bun", root, file: "bun.lock", text: lock }).problems).toEqual(["colour (colour@1.1.0), which sharp@0.35.5 (node_modules/sharp) needs, is not installed"]);
+  });
+});
+
 describe("packages outside the lockfile (finding 3)", () => {
   const lock = npmLock({ "": { name: "p", dependencies: { leaf: "1.0.0" } }, "node_modules/leaf": { version: "1.0.0", resolved: "https://r.test/leaf/-/leaf-1.0.0.tgz", integrity: sha("l") } });
 
