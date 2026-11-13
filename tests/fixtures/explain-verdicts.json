@@ -1,5 +1,5 @@
 {
-  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here.",
+  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. Since the warn-not-block policy (2026-11) a score, an incomplete analysis, no score or a flagged dependency is review-first with a summary that says it installs; do-not-install is only for revoked, yanked and confirmed malicious.",
   "cases": [
     {
       "name": "clean, scored, every dependency reviewed clean or not picked: install",
@@ -727,7 +727,7 @@
       }
     },
     {
-      "name": "unscored: review first",
+      "name": "unscored: installs, and says nothing has read its code yet",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -752,7 +752,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.",
+        "summary": "Installs, but apm has not scored x@1.0.0 yet, so nothing has read its code. Review it before installing.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
@@ -760,7 +760,7 @@
       }
     },
     {
-      "name": "the policy refused the range: do not install",
+      "name": "a cooldown refused the range: review first, not do-not-install, and no command",
       "resolve": {
         "kind": "refused",
         "reason": "x@2.0.0: published 3h ago (cooldown 24h)",
@@ -776,9 +776,9 @@
         "kind": "unreadable"
       },
       "expect": {
-        "verdict": "do-not-install",
+        "verdict": "review-first",
         "commands": false,
-        "summary": "Do not install x: apm's install policy refused it. The reasons say why.",
+        "summary": "Review x before installing: apm's install policy holds it back for now, and nothing in its answer says it is malicious. The reasons say why.",
         "reasons": [
           "The registry said: `x@2.0.0: published 3h ago (cooldown 24h)`",
           "Skipped `2.0.0`: `published 3h ago (cooldown 24h)`."
@@ -1316,6 +1316,224 @@
         "coverage": {
           "aiReview": "unreadable",
           "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "a score under the floor installs with a warning: review first, never do-not-install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 30,
+        "lost": [
+          {
+            "label": "Sends the whole environment in a request",
+            "points": -50
+          },
+          {
+            "label": "Uses the network",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Sends the whole environment in a request. Review it before installing. No AI review: apm never picked this version for one.",
+        "reasons": [
+          "Sends the whole environment in a request (-50 points)."
+        ],
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "an incomplete analysis installs with a warning that says what apm did not read",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Analysis incomplete",
+            "points": -61,
+            "evidence": [
+              "index.js:1: send(body) (apm stopped following a value here at a value passed through more than 32 steps)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but apm could not fully analyse x@1.0.0: it scores 39/100 (C), and the reasons say what apm did not read. Review it before installing.",
+        "reasons": [
+          "apm did not read: `index.js:1: send(body) (apm stopped following a value here at a value passed through more than 32 steps)`"
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "a version apm cannot score installs with a warning naming why",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "unscorable",
+            "text": "apm cannot score this version: it is too large for apm to analyze (stand-in)",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but apm cannot score x@1.0.0, so nothing has read its code. Review it before installing.",
+        "reasons": [
+          "The registry said: `apm cannot score this version: it is too large for apm to analyze (stand-in)`"
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "dependencies apm flagged (a low score, a lookup that failed): review first, naming them",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep-low",
+            "version": "1.0.0",
+            "kind": "low-score",
+            "text": "scores 12/100 (F), under the floor of 40",
+            "via": [
+              "x@1.0.0"
+            ]
+          },
+          {
+            "name": "dep-down",
+            "version": "^1.0.0",
+            "kind": "unavailable",
+            "text": "could not be checked: registry or upstream unavailable",
+            "via": [
+              "x@1.0.0"
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (a score under 40, an incomplete analysis, no score, or a lookup that failed).",
+        "reasons": [
+          "apm flagged 2 dependencies: `dep-low@1.0.0: scores 12/100 (F), under the floor of 40`, `dep-down@^1.0.0: could not be checked: registry or upstream unavailable`."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
+      "name": "refused because a dependency was confirmed malicious: do not install",
+      "resolve": {
+        "kind": "refused",
+        "reason": "x@1.0.0 would install evil@1.0.0, which apm reviewers confirmed is malicious.",
+        "newest": "1.0.0",
+        "skipped": [],
+        "confirmed": [
+          {
+            "name": "evil",
+            "version": "1.0.0"
+          }
+        ]
+      },
+      "review": {
+        "kind": "unreadable"
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x: it would install `evil@1.0.0`, which apm reviewers confirmed is malicious.",
+        "coverage": {
+          "aiReview": "not-read",
+          "dependencies": "not-read"
         }
       }
     }

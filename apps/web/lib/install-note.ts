@@ -11,7 +11,7 @@ export type InstallClient = z.infer<typeof InstallClient>;
 
 export const BUN_SCANNER = "@apm/bun-scanner";
 
-const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your config.";
+const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your config, and warns about a low score (--strict refuses it).";
 
 export type InstallNote =
   /** apm add: the checks run before the package manager does. */
@@ -60,7 +60,7 @@ export function installNote({ client, registry }: { client: InstallClient; regis
         lead: "Plain bun skips apm’s checks. Point it at apm and add the scanner in bunfig.toml:",
         file: "bunfig.toml",
         config: `[install]\nregistry = "${url}"\n\n[install.security]\nscanner = "${BUN_SCANNER}"`,
-        checks: `The scanner refuses revoked versions and packages scoring under 40. ${APM_ADD_CHECKS}`,
+        checks: `The scanner refuses revoked and confirmed-malicious versions and warns about packages scoring under 40 (APM_SCANNER_STRICT=1 refuses them). ${APM_ADD_CHECKS}`,
         docs: "/docs#bun",
       };
     case "npm":

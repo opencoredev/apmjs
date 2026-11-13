@@ -14,7 +14,7 @@ const row = (version: string, unscorable: string | null = null): Row => ({ versi
 const TOO_LARGE = "apm cannot score this version: it is too large for apm to analyze (the tarball (43.7 MB) is larger than the 32 MiB apm downloads)";
 
 describe("unscoredNotice", () => {
-  test("the latest version that can never be scored gives the registry's reason, and that installs refuse it", () => {
+  test("the latest version that can never be scored gives the registry's reason, and that installs warn about it", () => {
     const n = unscoredNotice({ pkg: { latest: "16.4.6", unscored: { kind: "unscorable", reason: "too-large", text: TOO_LARGE }, versions: [row("16.4.6", TOO_LARGE)] }, version: "16.4.6" });
 
     expect(n.kind).toBe("unscorable");
@@ -38,7 +38,7 @@ describe("unscoredNotice", () => {
   });
 
   test("the phone's line and the badge tell unscorable from not yet", () => {
-    expect(scoreLineText(scoreLine(null, true))).toBe("Cannot be scored; installs refuse it");
+    expect(scoreLineText(scoreLine(null, true))).toBe("Cannot be scored; installs warn about it");
     expect(scoreLineText(scoreLine(null))).toBe("Not scored yet");
     expect(renderToStaticMarkup(<ScoreBadge score={null} unscorable />)).toContain('title="Cannot be scored"');
     expect(renderToStaticMarkup(<ScoreBadge score={null} />)).toContain('title="Not scored yet"');

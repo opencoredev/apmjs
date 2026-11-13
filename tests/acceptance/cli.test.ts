@@ -93,12 +93,18 @@ describe("apm: runtime detection and pass-through", () => {
   test("apm add --json prints one machine-readable result and never prompts", async () => {
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
-    const r = await apm(["add", "evil-dep", "--json"], { cwd: app, env: sb.env });
+    const r = await apm(["add", "evil-dep", "--json", "--strict"], { cwd: app, env: sb.env });
     expect(r.code).not.toBe(0);
     const body: unknown = JSON.parse(r.stdout);
     expect(dig(body, "ok")).toBe(false);
     expect(dig(body, "packages", 0, "name")).toBe("evil-dep");
     expect(typeof dig(body, "packages", 0, "score")).toBe("number");
+    // by default it installs, and the JSON carries the warning
+    const warned = await apm(["add", "evil-dep", "--json"], { cwd: bunProject({}, alice), env: sb.env });
+    const doc: unknown = JSON.parse(warned.stdout);
+    expect(warned.code, warned.out).toBe(0);
+    expect(dig(doc, "ok")).toBe(true);
+    expect(dig(doc, "packages", 0, "warnings", 0, "kind")).toBe("low-score");
   });
 
   test("--pm overrides detection", async () => {
@@ -111,10 +117,25 @@ describe("apm: runtime detection and pass-through", () => {
 });
 
 describe("apm: install gate", () => {
-  test("apm add refuses a package that scores below the floor and explains why", async () => {
+  // a score informs, it does not block (the owner's policy, 2026-11): the warning names the score, the reasons and a link
+  test("apm add warns about a package that scores below the floor, says why, and installs it", async () => {
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
     const r = await apm(["add", "evil-dep"], { cwd: app, env: sb.env });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toMatch(/WARNING.*evil-dep@1\.0\.0.*scores \d+\/100 \(F\), under the floor of 40/);
+    expect(r.out).toMatch(/x\.js:1/);
+    expect(r.out).toContain("/package/evil-dep/v/1.0.0");
+    expect(r.out).toContain("--strict");
+    expect(installedVersion(app, "evil-dep")).toBe("1.0.0");
+  });
+
+  test("apm add --strict (or APM_STRICT=1) refuses a package that scores below the floor and explains why", async () => {
+    const sb = makeSandbox(reg, alice);
+    const app = bunProject({}, alice);
+    const viaEnv = await apm(["add", "evil-dep"], { cwd: app, env: { ...sb.env, APM_STRICT: "1" } });
+    expect(viaEnv.code).not.toBe(0);
+    const r = await apm(["add", "evil-dep", "--strict"], { cwd: app, env: sb.env });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("evil-dep");
     expect(r.out.toLowerCase()).toContain("install-script");

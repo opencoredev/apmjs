@@ -18,7 +18,7 @@ const AGENTS_GUIDE = "https://github.com/opencoredev/apmjs/blob/main/docs/AGENTS
 
 // The ids stay stable: package pages and the AI review section link to /docs#bun, #npm, #cli, #capabilities and #ai-review; llms.txt and the MCP server link to #agents.
 const SECTIONS = [
-  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at the registry and add @apm/bun-scanner. Plain bun install then refuses revoked versions and packages scoring under 40.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
+  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at the registry and add @apm/bun-scanner. Plain bun install then refuses revoked and confirmed-malicious versions and warns about packages scoring under 40.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
   { id: "npm", title: "Use it with npm or pnpm", body: "Set registry=https://registry.apmjs.dev/~safe/ in .npmrc. The view skips versions younger than 24 hours and versions scoring under 40.", href: `${DOCS}/guides/safe-view`, link: "The ~safe view" },
   { id: "cli", title: "The CLI", body: "apm add, apm x and apm publish check first, then hand the work to the package manager your project already uses.", href: `${DOCS}/reference/cli`, link: "CLI reference" },
   { id: "pulling", title: "Pulling a bad version", body: "Yank hides a version from new installs. Revoke pulls a malicious one for everyone, with a fresh second factor; a version under 72 hours old is revoked at once, even when other packages depend on it. apm incident revokes every token and recent version after a compromise.", href: `${DOCS}/guides/pull-a-version`, link: "Yank, revoke and incident response" },

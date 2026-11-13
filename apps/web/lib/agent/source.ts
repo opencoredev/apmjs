@@ -38,6 +38,14 @@ const TreeReviewsWire = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("on"), confirmed: z.array(DepRefWire), underReview: z.array(DepRefWire), pending: z.array(DepRefWire), noAnswer: z.array(DepRefWire) }),
 ]);
 
+/**
+ * One of resolve's warnings on an install that goes ahead: a low or incomplete score, no score, a dependency the
+ * registry could not look up, a walk cut short. `via` is empty for the version itself. Older registries send none.
+ */
+const WarningWire = z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), via: z.array(z.string()) }).loose();
+
+export type WarningInput = Pick<z.infer<typeof WarningWire>, "name" | "version" | "kind" | "text" | "via">;
+
 /** GET /-/apm/v1/resolve with a 200: the newest version in range that passes the policy, and its dependency walk. */
 export const ResolveOkWire = z.object({
   name: z.string(),
@@ -54,6 +62,7 @@ export const ResolveOkWire = z.object({
     })
     .loose()
     .optional(),
+  warnings: z.array(WarningWire).default([]),
 });
 
 export type DepRef = z.infer<typeof DepRefWire>;
@@ -61,20 +70,30 @@ export type DepRef = z.infer<typeof DepRefWire>;
 /** How the AI reviews of the dependencies stand; "unknown" when the registry did not say. */
 export type DepReviews = z.infer<typeof TreeReviewsWire> | { kind: "unknown" };
 
-/** The dependency walk as the verdict reads it: what apm could not score (the total and up to 50 named) and the AI reviews. */
-export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews };
+/**
+ * The dependency walk as the verdict reads it: what apm could not score (the total and up to 50 named), the AI
+ * reviews, and the registry's warnings on the install.
+ */
+export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[] };
 
-/** GET /-/apm/v1/resolve with a 422: nothing in range passes, or the newest that does pulls in a dangerous dependency. */
+/**
+ * GET /-/apm/v1/resolve with a 422: nothing in range passes (revoked, yanked, the cooldown), or the newest that does
+ * pulls in a version an apm reviewer confirmed malicious (`confirmed`) or one inside its cooldown.
+ */
 export const ResolveRefusedWire = z.object({
   error: z.string(),
   skipped: Skipped,
   newest: z.object({ version: z.string() }).loose().nullish(),
+  confirmed: z.array(DepRefWire).default([]),
 });
 
-/** What the registry's install policy (24-hour cooldown, score floor 40, revokes, the dependency walk) says about a range. */
+/**
+ * What the registry's install policy (24-hour cooldown, revokes, confirmed malice, the dependency walk, and the score
+ * floor of 40 as a warning) says about a range.
+ */
 export type ResolveOutcome =
   | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[] } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable" };
 
@@ -94,14 +113,14 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
       source: ok.data.source ?? "local",
       report: r ? { score: r.score, grade: r.grade, signals: r.signals, notChecked: r.notChecked ?? [] } : null,
       skipped: ok.data.skipped,
-      deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" } },
+      deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" }, warnings: ok.data.warnings },
     };
   }
 
   if (status === 422) {
     const refused = ResolveRefusedWire.safeParse(body);
 
-    return refused.success ? { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped } : { kind: "unavailable" };
+    return refused.success ? { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped, confirmed: refused.data.confirmed } : { kind: "unavailable" };
   }
 
   if (status === 404) {

@@ -83,7 +83,7 @@ const GROUPS: readonly Group[] = [
   {
     title: "Compatibility",
     rows: [
-      { label: "Bun", npm: "Just another client.", apm: "One `bunfig.toml` line makes plain `bun install` refuse bad versions." },
+      { label: "Bun", npm: "Just another client.", apm: "One `bunfig.toml` line makes plain `bun install` refuse revoked and confirmed-malicious versions and warn about low scores." },
       { label: "Coverage", npm: "Everything on npm.", apm: "Same packages, proxied from npm and scored on first request.", same: true },
     ],
   },

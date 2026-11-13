@@ -199,7 +199,9 @@ describe("the explain_install MCP tool keeps registry and publisher text inert",
 
   for (const payload of [...PAYLOADS, LINK]) {
     test(`a refused range whose reasons carry ${JSON.stringify(payload)}`, async () => {
-      const text = await callExplain(fakeSource({ resolve: () => ({ kind: "refused", reason: `left-pad@2.0.0: ${payload}`, newest: "2.0.0", skipped: [{ version: "2.0.0", reason: payload }] }) }));
+      // a yank reason is publisher text, and a yank is what still refuses
+      const yank = payload.startsWith("yanked") ? payload : `yanked: ${payload}`;
+      const text = await callExplain(fakeSource({ resolve: () => ({ kind: "refused", reason: `left-pad@2.0.0: ${yank}`, newest: "2.0.0", skipped: [{ version: "2.0.0", reason: yank }], confirmed: [] }) }));
 
       expect(text.split("\n")[0]).toBe("Verdict: do-not-install");
       expect(text.split("\n")[1]).toBe("Do not install left-pad: apm's install policy refused it. The reasons say why.");
@@ -216,7 +218,7 @@ describe("the explain_install MCP tool keeps registry and publisher text inert",
             source: "upstream",
             report: { score: 92, grade: "A", signals: [], notChecked: [] },
             skipped: [{ version: payload, reason: payload }],
-            deps: { unchecked: 1, uncheckedDeps: [{ dependency: payload, reason: payload }], reviews: { kind: "on", confirmed: [], underReview: [{ name: payload, version: payload }], pending: [], noAnswer: [] } },
+            deps: { unchecked: 1, uncheckedDeps: [{ dependency: payload, reason: payload }], reviews: { kind: "on", confirmed: [], underReview: [{ name: payload, version: payload }], pending: [], noAnswer: [] }, warnings: [] },
           }),
           reviews: { "left-pad@1.3.0": REVIEW_CLEAN },
         }),
@@ -229,7 +231,7 @@ describe("the explain_install MCP tool keeps registry and publisher text inert",
   }
 
   test("the reported yank reason is a code span, and no link or HTML node exists anywhere in the answer", async () => {
-    const text = await callExplain(fakeSource({ resolve: () => ({ kind: "refused", reason: "No version of left-pad matching latest passes the policy.", newest: "2.0.0", skipped: [{ version: "2.0.0", reason: LINK }] }) }));
+    const text = await callExplain(fakeSource({ resolve: () => ({ kind: "refused", reason: "No version of left-pad matching latest passes the policy.", newest: "2.0.0", skipped: [{ version: "2.0.0", reason: LINK }], confirmed: [] }) }));
 
     expect(text).toContain(`- Skipped \`2.0.0\`: \`${LINK}\`.`);
     const kinds = new Set<string>();

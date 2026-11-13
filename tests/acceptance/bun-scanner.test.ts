@@ -65,16 +65,24 @@ describe("@apm/bun-scanner with stock bun", () => {
     expect(installedVersion(app, "good-pkg")).toBe("1.0.0");
   });
 
-  test("bun add of a dangerous package is cancelled with the reason", async () => {
+  // a score informs, it does not block (the owner's policy, 2026-11): outside a terminal the warning is printed and
+  // bun goes on; APM_SCANNER_STRICT=1 cancels the install, as the default did before
+  test("bun add of a dangerous package warns with the reason and installs; strict mode cancels it", async () => {
     const sb = makeSandbox(reg, alice);
     const app = scannedApp();
     const s = await run(["bun", "add", "-d", "@apm/bun-scanner"], { cwd: app, env: sb.env });
     expect(s.code, s.out).toBe(0);
-    const r = await run(["bun", "add", "bad-pkg"], { cwd: app, env: sb.env });
+    const warned = await run(["bun", "add", "bad-pkg"], { cwd: app, env: sb.env });
+    expect(warned.code, warned.out).toBe(0);
+    expect(warned.out).toMatch(/apm scanner: warning: bad-pkg@1\.0\.0: scores \d+\/100/);
+    expect(installedVersion(app, "bad-pkg")).toBe("1.0.0");
+    const strictApp = scannedApp();
+    expect((await run(["bun", "add", "-d", "@apm/bun-scanner"], { cwd: strictApp, env: sb.env })).code).toBe(0);
+    const r = await run(["bun", "add", "bad-pkg"], { cwd: strictApp, env: { ...sb.env, APM_SCANNER_STRICT: "1" } });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("bad-pkg");
     expect(r.out.toLowerCase()).toMatch(/score|install-script/);
-    expect(installedVersion(app, "bad-pkg")).toBeNull();
+    expect(installedVersion(strictApp, "bad-pkg")).toBeNull();
   });
 
   test("bun install refuses a lockfile that contains a version revoked after it was locked", async () => {
@@ -143,8 +151,8 @@ describe("@apm/bun-scanner trusts only the configured registry", () => {
     await spy.stop(true);
     expect(seen).toEqual([]);
     expect(r.code, r.out).toBe(0);
-    expect(r.stdout).toContain("bad-pkg");
-    expect(r.stdout).toContain("fatal");
+    // the configured registry answered (its warning), and the other host is reported
+    expect(r.stderr).toContain("apm scanner: warning: bad-pkg@1.0.0: scores");
     expect(r.stderr).toContain("not checked: bad-pkg@1.0.0");
   });
 
@@ -153,7 +161,7 @@ describe("@apm/bun-scanner trusts only the configured registry", () => {
     const r = await scanIn({ cwd, env, packages: [pkg("bad-pkg", `${reg.url}tarballs/bad-pkg-1.0.0.tgz`)] });
 
     expect(r.code, r.out).toBe(0);
-    expect(r.stdout).toContain("fatal");
+    expect(r.stderr).toContain("apm scanner: warning: bad-pkg@1.0.0: scores");
   });
 
   test("finding 7: with no registry configured every package is reported, and strict mode cancels", async () => {

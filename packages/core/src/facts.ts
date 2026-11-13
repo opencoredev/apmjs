@@ -160,6 +160,7 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
     const n = counts.get(kind) ?? 0;
 
     if (!inCode(index)) return false;
+
     // past MAX_PER_KIND, a harvest kind is still placed: one beside a network call is recorded (up to MAX_PER_KIND
     // more), so forty far ones cannot hide the one next to the request
     if (n >= MAX_PER_KIND && (!PLACED_PAST_CAP.has(kind) || (nearCounts.get(kind) ?? 0) >= MAX_PER_KIND || text.length < SMALL_FILE)) return false;
@@ -171,6 +172,7 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
     counts.set(kind, n + 1);
 
     if (near) nearCounts.set(kind, (nearCounts.get(kind) ?? 0) + 1);
+
     const where = lineOf(text, index);
     out.push(name === undefined ? { kind, ...where, text: isText, near } : { kind, ...where, name, text: isText, near });
 

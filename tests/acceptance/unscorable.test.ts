@@ -9,7 +9,7 @@ import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { apm, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, writeConsumer, type Registry } from "./harness";
+import { apm, dig, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, writeConsumer, type Registry } from "./harness";
 
 const clock = Date.parse("2026-11-01T00:00:00Z");
 
@@ -123,21 +123,27 @@ describe("versions that can never be scored", () => {
     expect(pkg.unscored?.text).toContain(words);
     expect(pkg.versions.find((v) => v.version === "1.0.0")?.unscorable ?? "").toContain(words);
 
-    // apm add: still refused, now with the reason
-    const resolve = await getJson(`${reg.url}-/apm/v1/resolve?name=${name}`);
+    // apm add --strict: refused, with the reason; by default it installs with a warning that gives the reason
+    const resolve = await getJson(`${reg.url}-/apm/v1/resolve?name=${name}&strict=1`);
 
     expect(resolve.status).toBe(422);
     expect(ResolveAnswer.parse(resolve.body).skipped.map((s) => s.reason).join("\n")).toContain(words);
+    const warned = await getJson(`${reg.url}-/apm/v1/resolve?name=${name}`);
 
-    // the Bun scanner: a fatal advisory with the reason, which blocks in either scanner mode (before: only unchecked,
-    // which the default mode lets through with a warning)
-    const scan = await getJson(`${reg.url}-/apm/v1/scan`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: [{ name, version: "1.0.0" }] }) });
-    const answer = ScanAnswer.parse(scan.body);
-    const advisory = answer.advisories.find((a) => a.package === name);
+    expect(warned.status).toBe(200);
+    expect(JSON.stringify(dig(warned.body, "warnings"))).toContain(words);
+    expect(dig(warned.body, "warnings", 0, "kind")).toBe("unscorable");
 
-    expect(advisory?.level).toBe("fatal");
-    expect(advisory?.description ?? "").toContain(words);
-    expect(answer.unchecked.find((u) => u.package === name)).toBeUndefined();
+    // the Bun scanner: an advisory with the reason, never only unchecked: warn by default, fatal in strict mode
+    for (const strict of [false, true]) {
+      const scan = await getJson(`${reg.url}-/apm/v1/scan`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: [{ name, version: "1.0.0" }], strict }) });
+      const answer = ScanAnswer.parse(scan.body);
+      const advisory = answer.advisories.find((a) => a.package === name);
+
+      expect(advisory?.level).toBe(strict ? "fatal" : "warn");
+      expect(advisory?.description ?? "").toContain(words);
+      expect(answer.unchecked.find((u) => u.package === name)).toBeUndefined();
+    }
   }
 
   test("a tarball over the 32 MiB download cap is recorded too large, once, and every surface says so", async () => {
@@ -195,7 +201,7 @@ describe("versions that can never be scored", () => {
     expect(ScoreAnswer.parse(score.body).pending).toBe(true);
   }, 60_000);
 
-  test("apm add and apm x refuse a package whose dependency apm can never score, naming why", async () => {
+  test("apm add and apm x warn about a dependency apm can never score, naming why, and install; --strict refuses", async () => {
     // the root is scored clean by the queue; its dependency is decided analysis-limit
     expect(await reg.analysisJob({ name: "needs-limit-dep", version: "1.0.0" })).toBe("ack");
     await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ('limit-dep', '1.0.0', 'apm-score-v10', 'analysis-limit', 'two analyses of it were stopped', $1)", [clock]);
@@ -203,15 +209,21 @@ describe("versions that can never be scored", () => {
     const app = writeConsumer(mkdtempSync(join(tmpdir(), "apm-unscorable-")), reg, undefined, {});
     const env = { ...sb.env, APM_PENDING_WAIT_MS: "0" };
 
-    for (const args of [["add", "needs-limit-dep"], ["x", "needs-limit-dep"]]) {
+    for (const args of [["add", "needs-limit-dep", "--strict"], ["x", "needs-limit-dep", "--strict"]]) {
       const r = await apm(args, { cwd: app, env, timeoutMs: 60_000 });
 
-      // before: resolve answered 200 with the dependency only unchecked, and apm installed it with a warning
+      // on 9913a74: resolve answered 200 with the dependency only unchecked, and apm installed it with a warning
       expect(r.code, r.out).not.toBe(0);
       expect(r.out).toContain("limit-dep@1.0.0 apm cannot score this version: its analysis runs past the registry's limits");
     }
 
     expect(installedVersion(app, "needs-limit-dep")).toBeNull();
     expect(installedVersion(app, "limit-dep")).toBeNull();
+    // the default: a warning naming the dependency and the reason, then the install
+    const r = await apm(["add", "needs-limit-dep"], { cwd: app, env, timeoutMs: 60_000 });
+
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toMatch(/WARNING.*limit-dep@1\.0\.0.*apm cannot score this version: its analysis runs past the registry's limits/);
+    expect(installedVersion(app, "needs-limit-dep")).toBe("1.0.0");
   }, 120_000);
 });

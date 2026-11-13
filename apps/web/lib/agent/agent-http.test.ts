@@ -16,7 +16,7 @@ const clean: ResolveOutcome = {
   source: "upstream",
   report: { score: 92, grade: "A", signals: [], notChecked: [] },
   skipped: [],
-  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] } },
+  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
 };
 
 /** The longest a response may be stored, in seconds; 0 for no-store or no-cache. */

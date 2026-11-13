@@ -1497,7 +1497,10 @@ const CUT_CALL: Record<Sink["kind"], string> = {
  * command. What a relative import carries is what that file exports (worked out the same way, through its own imports),
  * so a read in one file and a request in another are one flow.
  */
-function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>, maxSteps?: number): { cross: CrossFile; cut: string[] } {
+/** The cross-file resolution the facts came from, and why cut flows make the analysis incomplete. */
+type FlowFacts = { cross: CrossFile; cut: string[] };
+
+function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFinding[]; exports: Exports }>, fileFacts: Map<string, Fact[]>, byPath: ReadonlyMap<string, TarEntry>, maxSteps?: number): FlowFacts {
   const cross = new CrossFile(
     (path) => fileFlows.get(path)?.exports,
     (from, spec) => resolveIn(byPath, joinPath(dirOf(from), spec))?.path,
@@ -1527,6 +1530,7 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
 
     for (const f of flows) {
       const labels = resolve(path, f.labels);
+
       const bounds = [...labels].flatMap((l): Bound[] => {
         const b = boundOf(l);
 

@@ -20,7 +20,7 @@ export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "202
 
 export const SERVER_INFO = { name: "apm", title: "apm package registry", version: "1.0.0" } as const;
 
-const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy skips versions under 24 hours old, scoring under 40, yanked or revoked. Before adding a dependency, call explain_install and follow its verdict: install, review-first (show the reasons to the user), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer). A score never means a version is safe; each answer says what was not checked. ${UNTRUSTED_NOTE}`;
+const INSTRUCTIONS = `apm scores every npm package version out of 100 with file:line evidence, and its install policy skips versions under 24 hours old, yanked, revoked or confirmed malicious, and warns about (never refuses) a score under 40. Before adding a dependency, call explain_install and follow its verdict: install, review-first (show the reasons to the user), do-not-install, not-found (check the spelling; it may be a typosquat) or unknown (the registry did not answer). A score never means a version is safe; each answer says what was not checked. ${UNTRUSTED_NOTE}`;
 
 // ---------- JSON-RPC ----------
 
@@ -175,7 +175,7 @@ const checkName: Tool<typeof CheckNameInput> = {
 const explain: Tool<typeof ExplainInput> = {
   name: "explain_install",
   title: "Should I install this?",
-  description: "Before adding a dependency: runs apm's install policy (24-hour cooldown, score floor 40, revokes, the dependency tree) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons and the command to run.",
+  description: "Before adding a dependency: runs apm's install policy (24-hour cooldown, revokes, confirmed malice, the dependency tree, and the score floor of 40 as a warning) and the AI review for name@version, and answers install, review-first, do-not-install, not-found or unknown, with reasons and the command to run.",
   input: ExplainInput,
   async run({ name, version }, source) {
     const verdict = await explainFor({ name, range: version ?? null, source });

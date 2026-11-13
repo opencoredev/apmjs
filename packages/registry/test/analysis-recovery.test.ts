@@ -330,6 +330,7 @@ describe("no request analyses anything", () => {
       const v = pkg?.versions[0];
 
       if (!pkg || !v) throw new Error("no package");
+
       const broken = Layer.effect(
         Upstream,
         Effect.gen(function* () {

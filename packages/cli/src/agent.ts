@@ -96,13 +96,19 @@ async function resolvedFor(api: Api, name: string, range: string | null): Promis
     const uncheckedDeps = tree?.uncheckedDeps ?? [];
 
     // the registry's total, not the length of the list (it names at most 50); no review summary is unknown, not clean
-    return { kind: "ok", version: ok.data.version, report: ok.data.report, skipped: ok.data.skipped, deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" } } };
+    return {
+      kind: "ok",
+      version: ok.data.version,
+      report: ok.data.report,
+      skipped: ok.data.skipped,
+      deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" }, warnings: ok.data.warnings },
+    };
   }
 
   if (r.status === 422) {
-    const f = ResolveFail.extend({ newest: z.object({ version: z.string() }).loose().nullish() }).safeParse(r.body);
+    const f = ResolveFail.extend({ newest: z.object({ version: z.string() }).loose().nullish(), confirmed: z.array(z.object({ name: z.string(), version: z.string() })).default([]) }).safeParse(r.body);
 
-    return f.success ? { kind: "refused", reason: f.data.error, newest: f.data.newest?.version ?? null, skipped: f.data.skipped } : { kind: "unavailable", reason: UNREADABLE };
+    return f.success ? { kind: "refused", reason: f.data.error, newest: f.data.newest?.version ?? null, skipped: f.data.skipped, confirmed: f.data.confirmed } : { kind: "unavailable", reason: UNREADABLE };
   }
 
   if (r.status === 404) return { kind: "missing", reason: error.success ? error.data.error : `No package named ${name}.` };

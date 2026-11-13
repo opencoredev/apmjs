@@ -14,6 +14,7 @@ import { Analysis } from "../src/analysis.ts";
 import { MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, resolveResponse } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
+import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
 import { Upstream } from "../src/upstream.ts";
 
@@ -110,7 +111,14 @@ function fakeNpm(pkgs: readonly Pkg[]) {
 
 const ResolveBody = z.object({
   version: z.string().nullish(),
-  tree: z.object({ unchecked: z.number(), packages: z.array(z.object({ name: z.string(), version: z.string() })), uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })) }),
+  error: z.string().optional(),
+  tree: z.object({
+    unchecked: z.number(),
+    packages: z.array(z.object({ name: z.string(), version: z.string() })),
+    uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
+    unavailable: z.array(z.object({ dependency: z.string(), via: z.array(z.string()) })).optional(),
+  }),
+  warnings: z.array(z.object({ name: z.string(), kind: z.string(), text: z.string() })).optional(),
 });
 
 type Resolved = { status: number; body: z.infer<typeof ResolveBody>; queries: number };
@@ -122,7 +130,7 @@ const noBlobs = Layer.succeed(
 );
 
 /** GET /-/apm/v1/resolve?name=… against the database (and npm, when given), counting every SQL statement it runs. */
-async function resolve(input: { url: string; name: string; npm?: string }): Promise<Resolved> {
+async function resolve(input: { url: string; name: string; npm?: string; strict?: boolean }): Promise<Resolved> {
   let queries = 0;
 
   const counter: Statement.Transformer = (self) =>
@@ -132,9 +140,13 @@ async function resolve(input: { url: string; name: string; npm?: string }): Prom
       return self;
     });
 
-  const u = new URL(`http://registry.test/-/apm/v1/resolve?${new URLSearchParams({ name: input.name, range: "latest" })}`);
+  const params = new URLSearchParams({ name: input.name, range: "latest" });
+
+  if (input.strict) params.set("strict", "1");
+  const u = new URL(`http://registry.test/-/apm/v1/resolve?${params}`);
   const store = Store.postgres(input.url);
-  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs);
+  const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: input.npm ?? null, legacyAuth: false, namePolicy: "open", admins: [] } as const;
+  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings));
   const layers = input.npm === undefined ? base : Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
 
   const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, body: ResolveBody.parse(await res.json()) })));
@@ -234,6 +246,14 @@ describe("the resolve walk bounds its database work", () => {
       expect(r.body.tree.uncheckedDeps[0]?.reason).toBe(`the check stops after ${MAX_WALK_LEVELS} levels of dependencies`);
       // three statements per level read, plus the root's
       expect(r.queries).toBeLessThanOrEqual(3 * MAX_WALK_LEVELS + 6);
+      // a walk cut short at its limits installs with a warning that says so (at 5b5b492: 200 and no warning), and
+      // strict mode refuses it
+      expect(r.body.warnings?.map((w) => [w.name, w.kind])).toEqual([["c0", "unchecked"]]);
+      expect(r.body.warnings?.[0]?.text).toBe(`1 more dependency was not checked: the check stops after ${MAX_WALK_LEVELS} levels of dependencies`);
+      const strict = await resolve({ url, name: "c0", strict: true });
+
+      expect(strict.status).toBe(422);
+      expect(strict.body.error).toContain("not checked");
     });
   });
 
@@ -280,8 +300,12 @@ describe("the resolve walk bounds its database work", () => {
       return withDatabase({ local: [{ name: "root", dependencies: { "some-npm-dep": "^1.0.0" } }] }, async (url) => {
         const r = await resolve({ url, name: "root", npm: down.url.href });
 
+        // its own state, not a walk limit and not unchecked (review of 5b5b492, finding 2)
         expect(r.status).toBe(200);
-        expect(r.body.tree.uncheckedDeps).toEqual([{ dependency: "some-npm-dep@^1.0.0", reason: "the upstream registry could not be asked" }]);
+        expect(r.body.tree.uncheckedDeps).toEqual([]);
+        expect(r.body.tree.unavailable).toEqual([{ dependency: "some-npm-dep@^1.0.0", via: ["root@1.0.0"] }]);
+        expect(r.body.warnings?.map((w) => w.kind)).toEqual(["unavailable"]);
+        expect((await resolve({ url, name: "root", npm: down.url.href, strict: true })).status).toBe(503);
       }).finally(() => down.stop(true));
     });
   });

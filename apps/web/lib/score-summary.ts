@@ -45,7 +45,7 @@ export function scoreLineText(line: ScoreLine): string {
     case "unscored":
       return "Not scored yet";
     case "unscorable":
-      return "Cannot be scored; installs refuse it";
+      return "Cannot be scored; installs warn about it";
     case "clean":
       return "No points lost";
     case "lost":

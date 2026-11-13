@@ -359,7 +359,7 @@ export function StagedReview({ s, account, config, onDecided }: { s: StagedDetai
               {s.analysis === "incomplete"
                 ? "The analysis did not finish: the tarball could not be read in full. Nothing below was checked. Look at the files yourself before you approve."
                 : belowFloor
-                  ? `Score ${s.score?.score ?? 0} is under the floor of ${s.floor}. apm installs refuse versions this low unless forced. ${risks.length} risk signal${risks.length === 1 ? "" : "s"} below.`
+                  ? `Score ${s.score?.score ?? 0} is under the floor of ${s.floor}. apm installs warn about versions this low, and strict installs refuse them. ${risks.length} risk signal${risks.length === 1 ? "" : "s"} below.`
                   : risks.length === 0
                     ? "No risk signals found. The score is a heuristic: read the files if anything about this upload is unexpected."
                     : `${risks.length} risk signal${risks.length === 1 ? "" : "s"} found. Read each one and its evidence before you approve.`}

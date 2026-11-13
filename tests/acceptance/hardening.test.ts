@@ -198,7 +198,7 @@ describe("council round 2: Sol and DeepSeek findings", () => {
     }
   });
 
-  test("apm add refuses a package whose dependency tree contains a dangerous version", async () => {
+  test("apm add --strict refuses a package whose dependency tree contains a dangerous version; the default warns", async () => {
     const { apm } = await import("./harness");
     expect((await publish(reg, alice, { name: "bad-leaf", version: "1.0.0", scripts: { postinstall: "node x.js" }, files: { "index.js": "module.exports=1;\n", "x.js": EXFIL } })).code).toBe(0);
     expect((await publish(reg, alice, { name: "middle-layer", version: "1.0.0", dependencies: { "bad-leaf": "^1.0.0" } })).code).toBe(0);
@@ -206,11 +206,15 @@ describe("council round 2: Sol and DeepSeek findings", () => {
     clock += 2 * DAY;
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
-    const r = await apm(["add", "top-level-pkg"], { cwd: app, env: sb.env });
+    const r = await apm(["add", "top-level-pkg", "--strict"], { cwd: app, env: sb.env });
     expect(r.code).not.toBe(0);
     expect(r.out).toContain("bad-leaf");
     const { installedVersion } = await import("./harness");
     expect(installedVersion(app, "top-level-pkg")).toBeNull();
+    // by default it installs, and the warning names the dependency and the path to it
+    const warned = await apm(["add", "top-level-pkg"], { cwd: app, env: sb.env });
+    expect(warned.code, warned.out).toBe(0);
+    expect(warned.out).toMatch(/WARNING.*bad-leaf@1\.0\.0.*via top-level-pkg@1\.0\.0 > middle-layer@1\.0\.0/);
   });
 
   test("with only APM_REGISTRY set, the package manager installs from the same registry apm checked", async () => {

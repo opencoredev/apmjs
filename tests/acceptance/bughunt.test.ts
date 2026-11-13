@@ -70,9 +70,13 @@ describe("the dependency tree is checked the way npm installs it", () => {
   });
 
   test("a dependency on a dist-tag is checked at the version the tag points to", async () => {
-    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app`);
+    // strict mode refuses it; the default installs, warning about the version the tag points to
+    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app&strict=1`);
     expect(r.status, JSON.stringify(r.body)).toBe(422);
     expect(JSON.stringify(dig(r.body, "tree", "blocks"))).toContain("2.0.0-beta.1");
+    const warned = await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app`);
+    expect(warned.status, JSON.stringify(warned.body)).toBe(200);
+    expect(dig(warned.body, "warnings", 0, "version")).toBe("2.0.0-beta.1");
   });
 
   test("a dependency published inside the cooldown blocks the tree", async () => {
@@ -90,7 +94,7 @@ describe("the dependency tree is checked the way npm installs it", () => {
       expect(r.status, q).toBe(400);
     }
 
-    expect((await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app&floor=40`)).status).toBe(422);
+    expect((await getJson(`${reg.url}-/apm/v1/resolve?name=tag-app&floor=40&strict=1`)).status).toBe(422);
   });
 });
 
@@ -191,11 +195,19 @@ describe("scans reuse stored analyses", () => {
     expect(anonymous.status).toBe(200);
     expect(JSON.stringify(anonymous.body)).toContain("queued");
     expect(tarballFetches).toBe(before);
-    // a token caller's scan analyses it once; the next scan, anonymous or not, reuses the stored analysis
+    // the queue's run analyses it once (no request analyses inline, signed in or not); every later scan, anonymous or
+    // not, reuses the stored analysis
     const tok = await addUser(reg, "scanner", PASSWORD);
-    expect((await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body, tok))).status).toBe(200);
+    let scanned = await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body, tok));
+
+    for (let i = 0; i < 60 && JSON.stringify(dig(scanned.body, "pending")) !== "[]"; i++) {
+      await Bun.sleep(250);
+      scanned = await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body, tok));
+    }
+
+    expect(dig(scanned.body, "pending")).toEqual([]);
     const after = tarballFetches;
-    expect(after).toBeGreaterThan(before);
+    expect(after).toBe(before + 1);
     expect((await getJson(`${reg.url}-/apm/v1/scan`, json("POST", body))).status).toBe(200);
     expect(tarballFetches).toBe(after);
   });

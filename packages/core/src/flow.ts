@@ -352,6 +352,12 @@ type PathRef = { node: AnyNode } | { text: string };
 /** What a call runs from a file: JavaScript a loader or an interpreter reads (`js`), or a program (`program`). */
 type RunTarget = { path: PathRef; kind: "js" | "program" };
 
+/** The files one call runs, and whether its command came from a variable with more values than apm reads. */
+type RunTargets = { targets: RunTarget[]; cut: boolean };
+
+/** The values a name is given, the first MAX_VALUES, and whether it has more. */
+type Values = { nodes: AnyNode[]; more: boolean };
+
 /** Reads where values go in one program. Built once per program, after the reader has visited it. */
 export class Flow {
   private readonly memo = new Map<AnyNode, Labels>();
@@ -1682,9 +1688,9 @@ export class Flow {
    * The files a call runs: what a loader, `fork` or a Worker loads, what an interpreter is given, the program run.
    * `cut` says the command came from a variable given more values than `valuesOf` reads.
    */
-  private runTargets(site: CallSite): { targets: RunTarget[]; cut: boolean } {
+  private runTargets(site: CallSite): RunTargets {
     const n = site.node;
-    const none = { targets: [], cut: false };
+    const none: RunTargets = { targets: [], cut: false };
 
     if (n.callee.type === "Super") return none;
     const refs = this.host.refsOf(unwrap(n.callee));
@@ -1708,7 +1714,7 @@ export class Flow {
     }
 
     // a variable set to one command or another (`let command = ''; … command = `setsid nohup ./npm …``): each of them
-    const values = prog ? { nodes: [], more: false } : this.valuesOf(first);
+    const values: Values = prog ? { nodes: [], more: false } : this.valuesOf(first);
     const texts = prog ? [prog] : values.nodes.flatMap((v) => this.host.str(v) ?? []);
     const out: RunTarget[] = [{ path: { node: first }, kind: "program" }];
 
@@ -1732,13 +1738,14 @@ export class Flow {
   }
 
   /** The values a name is given: its initializer and every assignment to it, the first MAX_VALUES; `more` if it has more. */
-  private valuesOf(n: AnyNode): { nodes: AnyNode[]; more: boolean } {
+  private valuesOf(n: AnyNode): Values {
+    const none: Values = { nodes: [], more: false };
     const t = unwrap(n);
 
-    if (t.type !== "Identifier") return { nodes: [], more: false };
+    if (t.type !== "Identifier") return none;
     const b = this.host.bindingOf(t);
 
-    if (b === null || b === "dynamic") return { nodes: [], more: false };
+    if (b === null || b === "dynamic") return none;
     const all = [...(b.origin.kind === "value" && b.origin.init !== t ? [b.origin.init] : []), ...(this.assigns.get(b) ?? [])];
 
     if (all.length > MAX_VALUES) this.host.limit("assignments");

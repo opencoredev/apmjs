@@ -4,7 +4,10 @@
 //
 // The rule: "install" only when apm knows the version and everything it brings in is fine. Anything apm could not
 // read is "unknown"; anything it read but has not finished checking is "review-first". Like the rest of apm it never
-// calls a version "safe".
+// calls a version "safe". A score never makes it "do-not-install" (the owner's warn-not-block policy, 2026-11): a low
+// or incomplete score, no score, or a dependency apm flagged installs with a warning, so it is "review-first", and the
+// summary says it installs and why. "do-not-install" is only for a revoked or yanked version and one an apm reviewer
+// confirmed malicious, the version or anything in its tree.
 import type { Report } from "./api.ts";
 
 export const VERDICTS = ["install", "review-first", "do-not-install", "not-found", "unknown"] as const;
@@ -14,6 +17,9 @@ export type VerdictKind = (typeof VERDICTS)[number];
 /** Scores at or above this are clean (the site's green badge); below it the lost points are worth a look. */
 export const CLEAN_SCORE = 75;
 
+/** The registry's score floor: below it `apm add` warns (and `--strict` refuses). */
+export const SCORE_FLOOR = 40;
+
 /** Exit codes, so a script can branch without parsing: 2 stays the CLI's usage error. */
 export const EXIT: Record<VerdictKind, number> = { install: 0, "do-not-install": 1, "not-found": 1, "review-first": 3, unknown: 4 };
 
@@ -22,12 +28,22 @@ export type DepRef = { name: string; version: string };
 /** How the AI reviews of the dependencies stand; "unknown" when the registry did not say. */
 export type DepReviews = { kind: "off" } | { kind: "unknown" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
 
-/** The dependency walk: what apm could not score (the registry's total, and up to 50 named) and the AI reviews. */
-export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews };
+/**
+ * One of the registry's warnings on an install that goes ahead (resolve's `warnings`): `via` empty for the version
+ * itself, the dependency path for one it brings in. Older registries send none.
+ */
+export type WarningInput = { name: string; version: string; kind: "low-score" | "incomplete" | "unscorable" | "pending" | "unavailable" | "unchecked"; text: string; via: string[] };
 
+/**
+ * The dependency walk: what apm could not score (the registry's total, and up to 50 named), the AI reviews, and the
+ * registry's warnings on the install.
+ */
+export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[] };
+
+/** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
@@ -282,6 +298,14 @@ function reviewHold(review: ReviewInput): string | null {
   }
 }
 
+/** A skip that is a version pulled from installs (revoked, being revoked, yanked) or confirmed malicious: not a score. */
+const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer)/;
+
+/** Whether the registry refused because a version was pulled: every version it skipped was revoked or yanked. */
+export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean {
+  return skipped.length > 0 && skipped.every((s) => PULLED_REASON.test(s.reason));
+}
+
 export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
   const { name, resolved, review } = input;
   const range = input.range ?? "latest";
@@ -296,8 +320,16 @@ export function explain(input: { name: string; range: string | null; resolved: R
       return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [`The registry said: ${quoted(resolved.reason)}`], commands: null, coverage: NOT_READ };
     case "refused": {
       const skips = resolved.skipped.slice(0, SHOWN).map((s) => `Skipped ${quoted(s.version)}: ${quoted(s.reason)}.`);
+      const reasons = [`The registry said: ${quoted(resolved.reason)}`, ...skips];
 
-      return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons: [`The registry said: ${quoted(resolved.reason)}`, ...skips], commands: null, coverage: NOT_READ };
+      if (resolved.confirmed.length > 0) {
+        return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: it would install ${listed(resolved.confirmed)}, which apm reviewers confirmed ${resolved.confirmed.length === 1 ? "is" : "are"} malicious.`, reasons, commands: null, coverage: NOT_READ };
+      }
+
+      if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      // held back for another reason (a cooldown): not a sign of malice, so a look first, and no command to run now
+      return { ...base, verdict: "review-first", version: resolved.newest, score: null, summary: `Review ${asked} before installing: apm's install policy holds it back for now, and nothing in its answer says it is malicious. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
     }
 
     case "ok":
@@ -374,6 +406,19 @@ export function explain(input: { name: string; range: string | null; resolved: R
     if (noAnswer.length > 0) holds.push({ why: "the AI review of a dependency ended without an answer", reason: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
   }
 
+  // what the registry warned about in the tree: it installs, but each was flagged
+  const flaggedDeps = deps.warnings.filter((w) => w.via.length > 0);
+
+  if (flaggedDeps.length > 0) {
+    holds.push({
+      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (a score under ${SCORE_FLOOR}, an incomplete analysis, no score, or a lookup that failed)`,
+      reason: `apm flagged ${plural(flaggedDeps.length, "dependency", "dependencies")}: ${flaggedDeps
+        .slice(0, SHOWN)
+        .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))
+        .join(", ")}${flaggedDeps.length > SHOWN ? ` and ${flaggedDeps.length - SHOWN} more` : ""}.`,
+    });
+  }
+
   if (report !== null && report.score < CLEAN_SCORE) holds.push({ why: `it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}`, reason: "" });
 
   if (deps.unchecked > 0) {
@@ -396,9 +441,26 @@ export function explain(input: { name: string; range: string | null; resolved: R
   if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${skippedText(resolved.skipped)}.`);
   const run = commands(name, version);
   const note = noReviewNote(aiReview);
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0);
 
-  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.${note}`, reasons, commands: run };
+  // the version itself has no score: it installs, and nothing has read its code
+  if (report === null) {
+    if (ownWarning?.kind === "unscorable") reasons.unshift(`The registry said: ${quoted(ownWarning.text)}`);
+
+    return { ...known, verdict: "review-first", summary: `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands: run };
+  }
+
   const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
+  const incomplete = report.signals.find((s) => s.id === "incomplete");
+
+  // an analysis that did not read everything, or a score under the floor: it installs with a warning
+  if (incomplete) {
+    reasons.unshift(...incomplete.evidence.slice(0, SHOWN).map((e) => `apm did not read: ${quoted(e)}`));
+
+    return { ...known, verdict: "review-first", summary: `Installs, but apm could not fully analyse ${id}: it ${scoreText}, and the reasons say what apm did not read. Review it before installing.${note}`, reasons, commands: run };
+  }
+
+  if (report.score < SCORE_FLOOR) return { ...known, verdict: "review-first", summary: `Installs, but ${id} ${scoreText}: it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}. Review it before installing.${note}`, reasons, commands: run };
   const first = holds[0];
 
   if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.${note}`, reasons, commands: run };

@@ -232,7 +232,7 @@ export function openApiDocument() {
           416: err("line is past the end of the file"),
         },
       }),
-      "/-/apm/v1/resolve": readOnly("The install policy: the newest version in a range past the cooldown and over the score floor, with its dependency walk", {
+      "/-/apm/v1/resolve": readOnly("The install policy: the newest version in a range past the cooldown and not revoked, yanked or confirmed malicious, with its dependency walk and a warning for each low or missing score (strict=1 refuses those)", {
         operationId: "resolve",
         parameters: [
           { name: "name", in: "query", required: true, schema: { type: "string" }, example: "zod" },

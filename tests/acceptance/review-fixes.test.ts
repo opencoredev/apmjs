@@ -251,10 +251,13 @@ describe("dependency checks see through aliases", () => {
     await reg?.stop();
   });
 
-  test("resolve refuses a package whose npm: alias points at a dangerous version", async () => {
-    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=alias-top`);
+  test("resolve sees a dangerous version through an npm: alias: a warning naming it by default, a refusal in strict mode", async () => {
+    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=alias-top&strict=1`);
     expect(r.status, JSON.stringify(r.body)).toBe(422);
     expect(JSON.stringify(r.body)).toContain("danger-leaf");
+    const warned = await getJson(`${reg.url}-/apm/v1/resolve?name=alias-top`);
+    expect(warned.status, JSON.stringify(warned.body)).toBe(200);
+    expect(dig(warned.body, "warnings", 0, "name")).toBe("danger-leaf");
   });
 
   test("the publish-time dependency check follows the alias too", async () => {
@@ -291,8 +294,12 @@ describe("an analysis that could not read everything is not a pass", () => {
     expect(Number(dig(s.body, "score"))).toBeLessThan(40);
     expect(JSON.stringify(dig(s.body, "signals"))).toContain("incomplete");
     expect(JSON.stringify(dig(s.body, "skipped"))).toContain("index.js");
-    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=padded-evil`);
+    // incomplete: a warning by default, refused in strict mode
+    const r = await getJson(`${reg.url}-/apm/v1/resolve?name=padded-evil&strict=1`);
     expect(r.status).toBe(422);
+    const warned = await getJson(`${reg.url}-/apm/v1/resolve?name=padded-evil`);
+    expect(warned.status).toBe(200);
+    expect(dig(warned.body, "warnings", 0, "kind")).toBe("incomplete");
   });
 
   test("a file too large for the secret scan is named in a publish warning", async () => {

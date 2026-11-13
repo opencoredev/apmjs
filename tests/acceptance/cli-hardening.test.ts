@@ -307,10 +307,11 @@ describe("finding 10: --force advice is accurate and never skips the dependency 
     expect(forced.code).not.toBe(0);
   });
 
+  // strict mode, where a dangerous dependency refuses: --force lifts the named package's floor only
   test("--force on a package with a dangerous dependency still refuses and names the dependency", async () => {
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice);
-    const r = await apm(["add", "hard-wrapper", "--force"], { cwd: app, env: sb.env });
+    const r = await apm(["add", "hard-wrapper", "--force", "--strict"], { cwd: app, env: sb.env });
 
     expect(r.code, r.out).not.toBe(0);
     expect(r.out).toContain("hard-evil");

@@ -2,7 +2,9 @@
 // refused at once by `apm add`, and a cold malicious dependency of a scored root installed with no block. Now the
 // registry waits for the queue (the Worker's analysis queue, simulated by Miniflare) and the install paths wait for the
 // registry, so a cold clean package installs after a short wait, and a cold malicious one, or a root that pulls one in,
-// is refused, never installed as clean. A second in-process registry stands in for npm; nothing here signs in.
+// is never installed as clean. Since the warn-not-block policy (2026-11) it installs with a warning that names its
+// score, and strict mode (apm add --strict, APM_SCANNER_STRICT=1) refuses it. No request analyses anything: every cold
+// version waits for the queue. A second in-process registry stands in for npm; nothing here signs in.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -83,17 +85,26 @@ describe("cold packages, anonymous installs", () => {
     expect(installedVersion(app, "cold-ok")).toBe("1.0.0");
   }, 150_000);
 
-  test("apm add of a cold root that pulls in a cold malicious dependency is refused", async () => {
+  test("apm add of a cold root that pulls in a cold malicious dependency waits, warns naming it, and installs; --strict refuses", async () => {
     const { app, env } = anonymousApp(false);
     const t0 = performance.now();
     const r = await apm(["add", "cold-root"], { cwd: app, env, timeoutMs: 120_000 });
 
-    timed("apm add cold-root (cold, malicious dependency)", performance.now() - t0);
-    expect(r.code).not.toBe(0);
-    expect(r.out).toContain("cold-evil");
-    expect(installedVersion(app, "cold-root")).toBeNull();
-    expect(installedVersion(app, "cold-evil")).toBeNull();
-  }, 150_000);
+    timed("apm add cold-root (cold, malicious dependency, warned)", performance.now() - t0);
+    expect(r.code, r.out).toBe(0);
+    // the score landed while it waited: the warning is the score's, not "not scored yet"
+    expect(r.out).toMatch(/WARNING.*cold-evil@1\.0\.0.*scores \d+\/100/);
+    expect(installedVersion(app, "cold-root")).toBe("1.0.0");
+    const strict = anonymousApp(false);
+    const t1 = performance.now();
+    const refused = await apm(["add", "cold-root", "--strict"], { cwd: strict.app, env: strict.env, timeoutMs: 120_000 });
+
+    timed("apm add cold-root --strict (scored, malicious dependency, refused)", performance.now() - t1);
+    expect(refused.code).not.toBe(0);
+    expect(refused.out).toContain("cold-evil");
+    expect(installedVersion(strict.app, "cold-root")).toBeNull();
+    expect(installedVersion(strict.app, "cold-evil")).toBeNull();
+  }, 300_000);
 
   test("bun add with the scanner: a cold clean package installs, a cold malicious one is cancelled", async () => {
     const { app, env } = anonymousApp(true);
@@ -109,9 +120,20 @@ describe("cold packages, anonymous installs", () => {
     const t1 = performance.now();
     const bad = await run(["bun", "add", "cold-bun-evil"], { cwd: app, env, timeoutMs: 120_000 });
 
-    timed("bun add cold-bun-evil (cold, malicious, scanner)", performance.now() - t1);
-    expect(bad.code).not.toBe(0);
-    expect(bad.out).toContain("cold-bun-evil");
-    expect(installedVersion(app, "cold-bun-evil")).toBeNull();
+    timed("bun add cold-bun-evil (cold, malicious, scanner, warned)", performance.now() - t1);
+    // not a terminal, so the scanner prints the warning and bun goes on (a warn advisory would cancel it here)
+    expect(bad.code, bad.out).toBe(0);
+    expect(bad.out).toMatch(/apm scanner: warning: cold-bun-evil@1\.0\.0: scores \d+\/100/);
+    expect(installedVersion(app, "cold-bun-evil")).toBe("1.0.0");
+    const strict = anonymousApp(true);
+
+    expect((await run(["bun", "add", "-d", "@apm/bun-scanner"], { cwd: strict.app, env: strict.env })).code).toBe(0);
+    const t2 = performance.now();
+    const cancelled = await run(["bun", "add", "cold-bun-evil"], { cwd: strict.app, env: { ...strict.env, APM_SCANNER_STRICT: "1" }, timeoutMs: 120_000 });
+
+    timed("bun add cold-bun-evil with APM_SCANNER_STRICT=1 (scored, malicious, cancelled)", performance.now() - t2);
+    expect(cancelled.code).not.toBe(0);
+    expect(cancelled.out).toContain("cold-bun-evil");
+    expect(installedVersion(strict.app, "cold-bun-evil")).toBeNull();
   }, 300_000);
 });

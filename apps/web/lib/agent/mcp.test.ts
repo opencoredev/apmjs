@@ -142,7 +142,7 @@ describe("tools", () => {
         source: "upstream",
         report: { score: 92, grade: "A", signals: [], notChecked: [] },
         skipped: [],
-        deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] } },
+        deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
       }),
       reviews: { "left-pad@1.3.0": REVIEW_CLEAN },
     });

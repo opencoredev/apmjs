@@ -46,12 +46,31 @@ export const Tree = z
   .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(DepRef).default([]), reviews: TreeReviews.optional() })
   .loose();
 
-export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional() });
+/**
+ * Why an install that goes ahead was flagged: a score under the floor, an incomplete analysis, a version apm cannot
+ * score or has not scored yet, a dependency the registry could not look up, or a walk cut short (older registries
+ * send none, and refused these instead). `score` and `grade` only for a scored version.
+ */
+export const InstallWarning = z.object({
+  name: z.string(),
+  version: z.string(),
+  kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]),
+  score: z.number().nullable(),
+  grade: z.string().nullable(),
+  text: z.string(),
+  reasons: z.array(z.string()),
+  url: z.string(),
+  via: z.array(z.string()),
+});
+
+export type InstallWarning = z.infer<typeof InstallWarning>;
+
+export const ResolveOk = z.object({ name: z.string(), version: z.string(), report: ReportSchema.nullable(), skipped: Skipped, source: z.string().optional(), tree: Tree.optional(), warnings: z.array(InstallWarning).default([]) });
 export const ResolveFail = z.object({ error: z.string(), name: z.string(), version: z.null(), skipped: Skipped });
 
 /**
- * A 202 from /resolve: the version, or a version in its tree, is queued for analysis and has no score yet. Nothing in
- * it is a pass; `apm add` and `apm x` ask again for a while, then refuse.
+ * A 202 from /resolve (strict mode only): the version, or a version in its tree, is queued for analysis and has no
+ * score yet. `apm add --strict` and `apm x --strict` ask again for a while, then refuse.
  */
 export const ResolvePending = z.object({
   error: z.string(),

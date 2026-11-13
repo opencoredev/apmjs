@@ -6,9 +6,12 @@
 // learns what you install. Every package it could not check gets its own warning, and with
 // APM_SCANNER_STRICT=1 any unchecked package cancels the install.
 //
-// A version the registry has queued for analysis is pending, not unchecked: it has no score yet, so it is never
-// let through as clean. The scanner asks again for up to PENDING_WAIT_MS, then cancels the install for anything
-// still pending, in either mode, saying why and when to try again.
+// A score never cancels an install by default (the project owner's policy since 2026-11): a score under 40, an
+// incomplete analysis, a version apm cannot score, one still being analysed after PENDING_WAIT_MS and a package the
+// registry could not look up are each a warning, and the install goes ahead. In a terminal they are `warn`
+// advisories, which bun shows and asks about; anywhere else (CI) bun cancels on a `warn` advisory, so the scanner
+// prints them instead. APM_SCANNER_STRICT=1 makes each of them fatal. A revoked version, and one an apm reviewer
+// confirmed malicious, are fatal in both modes.
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -37,7 +40,7 @@ function isUnchecked(v: unknown): v is RegistryUnchecked {
   return isPending(v) && "reason" in v && typeof v.reason === "string";
 }
 
-/** How long the scanner waits for queued versions to be scored before it cancels the install: 60 s. */
+/** How long the scanner waits for queued versions to be scored before it warns (strict: cancels): 60 s. */
 export const PENDING_WAIT_MS = 60_000;
 
 /** How often it asks again while it waits. */
@@ -99,12 +102,12 @@ function originOf(url: string): string | null {
 
 type Answer = { kind: "advisories"; advisories: ScanAdvisory[]; unchecked: RegistryUnchecked[]; pending: Pending[] } | { kind: "unavailable"; reason: string };
 
-async function ask(registry: string, packages: Bun.Security.Package[]): Promise<Answer> {
+async function ask(registry: string, packages: Bun.Security.Package[], strict: boolean): Promise<Answer> {
   try {
     const res = await fetch(`${registry}-/apm/v1/scan`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })) }),
+      body: JSON.stringify({ packages: packages.map((p) => ({ name: p.name, version: p.version })), strict }),
       signal: AbortSignal.timeout(20_000),
     });
 
@@ -128,9 +131,9 @@ async function ask(registry: string, packages: Bun.Security.Package[]): Promise<
 const BATCH = 200;
 
 /** Asks about every package, BATCH at a time in parallel. Unavailable when any batch could not be asked. */
-async function askAll(registry: string, packages: Bun.Security.Package[]): Promise<Answer> {
+async function askAll(registry: string, packages: Bun.Security.Package[], strict: boolean): Promise<Answer> {
   const batches = Array.from({ length: Math.ceil(packages.length / BATCH) }, (_, i) => packages.slice(i * BATCH, (i + 1) * BATCH));
-  const answers = await Promise.all(batches.map((b) => ask(registry, b)));
+  const answers = await Promise.all(batches.map((b) => ask(registry, b, strict)));
   const advisories: ScanAdvisory[] = [];
   const unchecked: RegistryUnchecked[] = [];
   const pending: Pending[] = [];
@@ -151,8 +154,8 @@ const keyOf = (p: { package: string; version: string }): string => `${p.package}
  * Asks about every package, then asks again about the pending ones until none is pending or `waitMs` is over. What
  * landed meanwhile replaces its pending entry; what is still pending at the end is returned as pending.
  */
-async function askUntilScored(input: { registry: string; packages: Bun.Security.Package[]; waitMs: number; pollMs: number; warn: (line: string) => void; sleep: (ms: number) => Promise<void> }): Promise<Answer> {
-  const first = await askAll(input.registry, input.packages);
+async function askUntilScored(input: { registry: string; packages: Bun.Security.Package[]; strict: boolean; waitMs: number; pollMs: number; warn: (line: string) => void; sleep: (ms: number) => Promise<void> }): Promise<Answer> {
+  const first = await askAll(input.registry, input.packages, input.strict);
 
   if (first.kind === "unavailable" || first.pending.length === 0) return first;
   const started = Date.now();
@@ -162,9 +165,9 @@ async function askUntilScored(input: { registry: string; packages: Bun.Security.
     input.warn(`apm scanner: waiting for ${answer.pending.length} package(s) the registry is still analysing (${Math.round((Date.now() - started) / 1000)}s of ${Math.round(input.waitMs / 1000)}s): ${answer.pending.slice(0, 5).map(keyOf).join(", ")}${answer.pending.length > 5 ? ", …" : ""}`);
     await input.sleep(Math.min(input.pollMs, Math.max(0, input.waitMs - (Date.now() - started))));
     const waiting = new Set(answer.pending.map(keyOf));
-    const again = await askAll(input.registry, input.packages.filter((p) => waiting.has(`${p.name}@${p.version}`)));
+    const again = await askAll(input.registry, input.packages.filter((p) => waiting.has(`${p.name}@${p.version}`)), input.strict);
 
-    // the registry could not be asked again: what was pending stays pending, and blocks below
+    // the registry could not be asked again: what was pending stays pending, and is warned about (strict: blocked) below
     if (again.kind === "unavailable") break;
     const asked = (p: { package: string; version: string }): boolean => waiting.has(keyOf(p));
 
@@ -188,10 +191,20 @@ export function isRegistryVersion(version: string): boolean {
 }
 
 /**
- * The scan itself, with its inputs explicit so tests can drive it. `waitMs` and `sleep` default to PENDING_WAIT_MS
- * (or APM_SCANNER_WAIT_MS) and a timer.
+ * Whether bun can ask the person installing about a `warn` advisory: both stdin and stdout are a terminal. Bun
+ * cancels the install on a `warn` advisory when it cannot ask.
  */
-export async function scanPackages(input: { packages: Bun.Security.Package[]; env: Env; cwd: string; warn: (line: string) => void; waitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<Bun.Security.Advisory[]> {
+function canAsk(): boolean {
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+/**
+ * The scan itself, with its inputs explicit so tests can drive it. `waitMs` and `sleep` default to PENDING_WAIT_MS
+ * (or APM_SCANNER_WAIT_MS) and a timer; `interactive` (whether bun can ask about a warning) to the terminal's.
+ */
+export async function scanPackages(input: { packages: Bun.Security.Package[]; env: Env; cwd: string; warn: (line: string) => void; waitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; interactive?: boolean }): Promise<Bun.Security.Advisory[]> {
+  const strict = input.env.APM_SCANNER_STRICT === "1";
+  const interactive = input.interactive ?? canAsk();
   // git, file and link dependencies are not on a registry: nothing can vouch for them, so each is reported
   const onRegistry = input.packages.filter((p) => isRegistryVersion(p.version));
   const registry = configuredRegistry({ env: input.env, cwd: input.cwd });
@@ -208,22 +221,34 @@ export async function scanPackages(input: { packages: Bun.Security.Package[]; en
     const envWait = Number(input.env.APM_SCANNER_WAIT_MS);
     const waitMs = input.waitMs ?? (Number.isFinite(envWait) && envWait >= 0 ? envWait : PENDING_WAIT_MS);
     const sleep = input.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    const answer = await askUntilScored({ registry, packages: onRegistry, waitMs, pollMs: input.pollMs ?? PENDING_POLL_MS, warn: input.warn, sleep });
+    const answer = await askUntilScored({ registry, packages: onRegistry, strict, waitMs, pollMs: input.pollMs ?? PENDING_POLL_MS, warn: input.warn, sleep });
 
     if (answer.kind === "unavailable") {
       for (const pkg of onRegistry) unchecked.push({ id: `${pkg.name}@${pkg.version}`, reason: answer.reason });
     } else {
-      for (const a of answer.advisories) out.push({ level: a.level, package: a.package, url: a.url, description: a.description });
+      const advisories: Bun.Security.Advisory[] = answer.advisories.map((a) => ({ level: a.level, package: a.package, url: a.url, description: a.description }));
       const stillPending = new Set(answer.pending.map(keyOf));
 
-      // no score yet is not a pass: blocked in either mode, with when to try again
+      // no score yet is not a pass: a warning, with when it will have one (strict: the install is cancelled)
       for (const p of answer.pending) {
-        out.push({
-          level: "fatal",
+        advisories.push({
+          level: strict ? "fatal" : "warn",
           package: p.package,
           url: null,
-          description: `${keyOf(p)} is still being analysed by ${registry} (waited ${Math.round(waitMs / 1000)}s). apm installs no version before it has a score; try again in a minute.`,
+          description: strict
+            ? `${keyOf(p)} is still being analysed by ${registry} (waited ${Math.round(waitMs / 1000)}s). APM_SCANNER_STRICT=1 installs no version before it has a score; try again in a minute.`
+            : `${keyOf(p)}: not scored yet: ${registry} is still analysing it (waited ${Math.round(waitMs / 1000)}s). apm lets it install; APM_SCANNER_STRICT=1 refuses it.`,
         });
+      }
+
+      // a warning bun cannot ask about would cancel the install, so outside a terminal it is printed and the install goes ahead
+      for (const a of advisories) {
+        if (a.level === "fatal" || interactive) out.push(a);
+        else {
+          const text = a.description ?? `${a.package}: flagged by ${registry}`;
+
+          input.warn(`apm scanner: warning: ${text.split("\n").join("\n  ")}${a.url && !text.includes(a.url) ? `\n  ${a.url}` : ""}`);
+        }
       }
 
       for (const u of answer.unchecked) if (!stillPending.has(keyOf(u))) unchecked.push({ id: `${u.package}@${u.version}`, reason: `${registry} could not check it: ${u.reason}` });

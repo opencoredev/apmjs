@@ -472,11 +472,14 @@ function probes(): Probe[] {
   // REVOKED was published an hour ago: inside the 24-hour cooldown, so /~safe/ and a plain resolve leave it out
   const cooling = (v: string): boolean => v === REVOKED;
 
-  /** What resolve answers: 422 when the newest version the range allows is refused (withheld, or cooling without an override). */
-  const resolveStatus = (range: string, override: boolean) => (a: Ask) => {
+  /**
+   * What resolve answers: 422 when every version the range allows is refused (withheld, cooling without an override,
+   * or, before the revoke, REVOKED, whose flag an apm reviewer confirmed: skipped in every mode).
+   */
+  const resolveStatus = (range: string, _override: boolean) => (a: Ask) => {
     if (a.phase === "after") return [PENDING, REVOKED, "^1.0.0"].includes(range) ? 422 : 200;
 
-    return range === REVOKED && !override ? 422 : 200;
+    return range === REVOKED ? 422 : 200;
   };
 
   // a withheld version's files answer 410; a shown one's 200, and a path it does not have 404
@@ -539,7 +542,8 @@ function probes(): Probe[] {
     v1("recent-packages?limit=50", "recent-packages", 200),
     // the dependency walk and the AI review standings of what it walked (tree.reviews); DEPENDENT is inside its cooldown
     v1(`resolve?name=${DEPENDENT}`, "resolve", 422),
-    v1(`resolve?name=${DEPENDENT}&floor=0&cooldown=0`, "resolve", 200),
+    // before the revoke, the dependency's newest version is REVOKED, confirmed malicious: refused in every mode
+    v1(`resolve?name=${DEPENDENT}&floor=0&cooldown=0`, "resolve", (a) => (a.phase === "after" ? 200 : 422)),
     // files and readmes (files.ts)
     ...files,
     // the clean version's tarball has no README file

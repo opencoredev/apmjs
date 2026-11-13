@@ -208,15 +208,21 @@ describe("upstream proxy", () => {
     expect(dig(body, "versions", "9.0.0")).toBeUndefined();
   });
 
-  test("apm add gates upstream packages by score and cooldown", async () => {
+  test("apm add gates upstream packages by cooldown, and by score in strict mode", async () => {
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice, {});
     const ok = await apm(["add", "up-pkg"], { cwd: app, env: sb.env });
     expect(ok.code, ok.out).toBe(0);
     expect(installedVersion(app, "up-pkg")).toBe("1.1.0");
-    const bad = await apm(["add", "up-evil"], { cwd: app, env: sb.env });
+    // a low score warns and installs by default; --strict refuses it
+    const strictApp = writeConsumer(work, reg, alice, {});
+    const bad = await apm(["add", "up-evil", "--strict"], { cwd: strictApp, env: sb.env });
     expect(bad.code).not.toBe(0);
-    expect(installedVersion(app, "up-evil")).toBeNull();
+    expect(installedVersion(strictApp, "up-evil")).toBeNull();
+    const warned = await apm(["add", "up-evil"], { cwd: app, env: sb.env });
+    expect(warned.code, warned.out).toBe(0);
+    expect(warned.out).toContain("WARNING");
+    expect(installedVersion(app, "up-evil")).toBe("1.0.0");
   });
 
   test("audit through apm includes upstream advisories", async () => {

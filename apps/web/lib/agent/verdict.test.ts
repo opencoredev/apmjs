@@ -20,17 +20,20 @@ const Case = z.object({
       kind: z.literal("ok"),
       version: z.string(),
       score: z.number().nullable(),
-      lost: z.array(z.object({ label: z.string(), points: z.number() })),
+      // `id` and `evidence` for a signal the verdict reads by id (incomplete); the rest are s0, s1, …
+      lost: z.array(z.object({ label: z.string(), points: z.number(), id: z.string().optional(), evidence: z.array(z.string()).default([]) })),
       skipped: z.array(z.object({ version: z.string(), reason: z.string() })),
       unchecked: z.number(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
+      // the registry's warnings on the install (resolve's `warnings`): via empty for the version itself
+      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked"]), text: z.string(), via: z.array(z.string()) })).default([]),
       depReviews: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("off") }),
         z.object({ kind: z.literal("unknown") }),
         z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
       ]),
     }),
-    z.object({ kind: z.literal("refused"), reason: z.string(), newest: z.string().nullable(), skipped: z.array(z.object({ version: z.string(), reason: z.string() })) }),
+    z.object({ kind: z.literal("refused"), reason: z.string(), newest: z.string().nullable(), skipped: z.array(z.object({ version: z.string(), reason: z.string() })), confirmed: z.array(DepRef).default([]) }),
     z.object({ kind: z.literal("missing"), reason: z.string() }),
     z.object({ kind: z.literal("unavailable") }),
   ]),
@@ -73,9 +76,9 @@ function resolveOf(c: z.infer<typeof Case>["resolve"]): ResolveOutcome {
         kind: "ok",
         version: c.version,
         source: "upstream",
-        report: c.score === null ? null : { score: c.score, grade: grade(c.score), signals: c.lost.map((l, i) => signal({ id: `s${i}`, label: l.label, points: l.points })), notChecked: [] },
+        report: c.score === null ? null : { score: c.score, grade: grade(c.score), signals: c.lost.map((l, i) => signal({ id: l.id ?? `s${i}`, label: l.label, points: l.points, evidence: l.evidence })), notChecked: [] },
         skipped: c.skipped,
-        deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews },
+        deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews, warnings: c.warnings },
       };
     case "refused":
     case "missing":
@@ -128,7 +131,7 @@ const ok = (score: number, over: Partial<Extract<ResolveOutcome, { kind: "ok" }>
   source: "upstream",
   report: { score, grade: grade(score), signals: score < 100 ? [NETWORK] : [], notChecked: [] },
   skipped: [],
-  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] } },
+  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
   ...over,
 });
 
@@ -154,7 +157,7 @@ describe("parseResolve", () => {
       version: "4.1.0",
       deps: { unchecked: 7, uncheckedDeps: [{ dependency: "a@1" }], reviews: { kind: "off" } },
     });
-    expect(parseResolve(422, { error: "too new", name: "zod", version: null, skipped: [], newest: { version: "5.0.0", report: {} } })).toEqual({ kind: "refused", reason: "too new", newest: "5.0.0", skipped: [] });
+    expect(parseResolve(422, { error: "too new", name: "zod", version: null, skipped: [], newest: { version: "5.0.0", report: {} } })).toEqual({ kind: "refused", reason: "too new", newest: "5.0.0", skipped: [], confirmed: [] });
     expect(parseResolve(404, { error: "No package named q." })).toEqual({ kind: "missing", reason: "No package named q." });
     expect(parseResolve(500, {})).toEqual({ kind: "unavailable" });
     expect(parseResolve(200, { nope: true })).toEqual({ kind: "unavailable" });

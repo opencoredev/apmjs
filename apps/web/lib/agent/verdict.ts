@@ -6,6 +6,10 @@
 // The rule: "install" only when apm knows the version and everything it brings in is fine. Anything apm could not
 // read is "unknown"; anything it read but has not finished checking is "review-first". Like the rest of the site it
 // never calls a version "safe": "install" means it passed apm's checks, and the limits of those checks travel with it.
+// A score never makes it "do-not-install" (the owner's warn-not-block policy, 2026-11): a low or incomplete score, no
+// score, or a dependency apm flagged installs with a warning, so it is "review-first", and the summary says it installs
+// and why. "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious, the
+// version or anything in its tree.
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
 import type { Fetched } from "../registry";
 import type { PublicReview, ReviewAnswer } from "../review-schema";
@@ -18,6 +22,17 @@ export type VerdictKind = (typeof VERDICTS)[number];
 
 /** Scores at or above this read as clean on the site (the green badge); below it, the lost points are worth a look. */
 export const CLEAN_SCORE = 75;
+
+/** The registry's score floor: below it an install warns (and `apm add --strict` refuses). */
+export const SCORE_FLOOR = 40;
+
+/** A skip that is a version pulled from installs (revoked, being revoked, yanked): not a score. */
+const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer)/;
+
+/** Whether the registry refused because a version was pulled: every version it skipped was revoked or yanked. */
+export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean {
+  return skipped.length > 0 && skipped.every((s) => PULLED_REASON.test(s.reason));
+}
 
 /**
  * Why the registry no longer offers a version its install policy picked a moment before: it was yanked or revoked,
@@ -249,8 +264,16 @@ export function explainInstall(input: { name: string; range: string | null; reso
       return { ...base, verdict: "not-found", version: null, score: null, summary: `No package named ${name} on apm or npm. Check the spelling: a near miss can be a typosquat.`, reasons: [`The registry said: ${quoted(resolve.reason)}`], commands: null, coverage: NOT_READ };
     case "refused": {
       const skips = resolve.skipped.slice(0, SHOWN).map((s) => `Skipped ${quoted(s.version)}: ${quoted(s.reason)}.`);
+      const reasons = [`The registry said: ${quoted(resolve.reason)}`, ...skips];
 
-      return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons: [`The registry said: ${quoted(resolve.reason)}`, ...skips], commands: null, coverage: NOT_READ };
+      if (resolve.confirmed.length > 0) {
+        return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: it would install ${listed(resolve.confirmed)}, which apm reviewers confirmed ${resolve.confirmed.length === 1 ? "is" : "are"} malicious.`, reasons, commands: null, coverage: NOT_READ };
+      }
+
+      if (refusedAsPulled(resolve.skipped)) return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      // held back for another reason (a cooldown): not a sign of malice, so a look first, and no command to run now
+      return { ...base, verdict: "review-first", version: resolve.newest, score: null, summary: `Review ${asked} before installing: apm's install policy holds it back for now, and nothing in its answer says it is malicious. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
     }
 
     case "ok":
@@ -327,6 +350,19 @@ export function explainInstall(input: { name: string; range: string | null; reso
     if (noAnswer.length > 0) holds.push({ why: "the AI review of a dependency ended without an answer", reason: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
   }
 
+  // what the registry warned about in the tree: it installs, but each was flagged
+  const flaggedDeps = deps.warnings.filter((w) => w.via.length > 0);
+
+  if (flaggedDeps.length > 0) {
+    holds.push({
+      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (a score under ${SCORE_FLOOR}, an incomplete analysis, no score, or a lookup that failed)`,
+      reason: `apm flagged ${plural(flaggedDeps.length, "dependency", "dependencies")}: ${flaggedDeps
+        .slice(0, SHOWN)
+        .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))
+        .join(", ")}${flaggedDeps.length > SHOWN ? ` and ${flaggedDeps.length - SHOWN} more` : ""}.`,
+    });
+  }
+
   if (report !== null && report.score < CLEAN_SCORE) holds.push({ why: `it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}`, reason: "" });
 
   if (deps.unchecked > 0) {
@@ -350,8 +386,26 @@ export function explainInstall(input: { name: string; range: string | null; reso
   const commands = commandsFor(name, version);
   const note = noReviewNote(aiReview);
 
-  if (report === null) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and is not scored yet, so nothing has read its code.${note}`, reasons, commands };
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0);
+
+  // the version itself has no score: it installs, and nothing has read its code
+  if (report === null) {
+    if (ownWarning?.kind === "unscorable") reasons.unshift(`The registry said: ${quoted(ownWarning.text)}`);
+
+    return { ...known, verdict: "review-first", summary: `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands };
+  }
+
   const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
+  const incomplete = report.signals.find((s) => s.id === "incomplete");
+
+  // an analysis that did not read everything, or a score under the floor: it installs with a warning
+  if (incomplete) {
+    reasons.unshift(...incomplete.evidence.slice(0, SHOWN).map((e) => `apm did not read: ${quoted(e)}`));
+
+    return { ...known, verdict: "review-first", summary: `Installs, but apm could not fully analyse ${id}: it ${scoreText}, and the reasons say what apm did not read. Review it before installing.${note}`, reasons, commands };
+  }
+
+  if (report.score < SCORE_FLOOR) return { ...known, verdict: "review-first", summary: `Installs, but ${id} ${scoreText}: it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}. Review it before installing.${note}`, reasons, commands };
   const first = holds[0];
 
   if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.${note}`, reasons, commands };

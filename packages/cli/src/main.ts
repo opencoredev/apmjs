@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, missingEntries, readTarball, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScanResponse, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -220,7 +220,10 @@ type UncheckedDeps = z.infer<typeof Tree>["uncheckedDeps"];
  */
 type TreePackages = z.infer<typeof Tree>["packages"];
 
-/** `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry. */
+/**
+ * `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry.
+ * `warnings`: what installs anyway, and why it was flagged (a low or incomplete score, no score, a failed lookup).
+ */
 type Resolved = {
   name: string;
   version: string | null;
@@ -231,9 +234,18 @@ type Resolved = {
   source: string;
   unchecked: UncheckedDeps;
   tree: TreePackages;
+  warnings: InstallWarning[];
 };
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
+
+/**
+ * Strict mode: refuse a score under 40, an incomplete analysis, a version apm cannot score or has not scored yet, and
+ * a dependency the registry could not look up, as apm did before scores became warnings. --strict or APM_STRICT=1.
+ */
+function strictMode(a: Args): boolean {
+  return has(a, "strict") || process.env.APM_STRICT === "1";
+}
 
 /**
  * How long `apm add` and `apm x` keep asking about a version the registry is still analysing: 90 s in all, each ask
@@ -274,7 +286,10 @@ async function resolveWaiting(api: Api, name: string, params: URLSearchParams): 
 async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   const { name, range } = parseSpec(spec);
   const force = has(a, "force");
+  const strict = strictMode(a);
   const params = new URLSearchParams({ name, range: range ?? "latest" });
+
+  if (strict) params.set("strict", "1");
   // --force overrides this package's score floor and cooldown; revoked and yanked versions stay blocked,
   // and the registry still checks its dependency tree at the default floor
   if (has(a, "no-cooldown") || force) params.set("cooldown", "0");
@@ -285,7 +300,7 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [] };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
@@ -293,11 +308,19 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [] };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [] };
+  }
+
+  if (r.status === 503) {
+    // the registry or npm could not be asked about the package or a dependency (strict), or the package itself
+    const said = z.object({ error: z.string() }).safeParse(r.body);
+    const msg = said.success ? said.data.error : `the registry could not check ${name} (HTTP 503)`;
+
+    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [] };
   }
 
   if (r.status === 202) {
-    // still pending after the wait: no score is not a pass, and --force cannot lift it
+    // still pending after the wait (strict): no score is not a pass, and --force cannot lift it
     const p = ResolvePending.parse(r.body);
     const count = p.pendingCount ?? p.pending.length;
     const listed = p.pending.slice(0, 5).map((d) => `${d.name}@${d.version}`).join(", ");
@@ -312,12 +335,13 @@ async function resolveSpec(api: Api, spec: string, a: Args): Promise<Resolved> {
       source: "apm",
       unchecked: [],
       tree: [],
+      warnings: [],
     };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [] };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [] };
   }
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
@@ -331,15 +355,38 @@ async function scoreOf(api: Api, name: string, version: string): Promise<Report 
 }
 
 function printResolved(r: Resolved): void {
-  printCard(`${r.blocked ? red("✗") : green("✓")} ${r.name}@${r.version ?? "?"}`, r.report);
+  printCard(`${r.blocked ? red("✗") : r.warnings.length > 0 ? yellow("!") : green("✓")} ${r.name}@${r.version ?? "?"}`, r.report);
   for (const s of r.skipped.slice(0, 5)) say(`  ${dim(`skipped ${s.version}: ${s.reason}${s.revokeReason ? ` (${s.revokeReason})` : ""}`)}`);
   // dependencies apm could not score install unchecked: say which, so nobody reads silence as clean
   for (const u of r.unchecked.slice(0, 10)) say(`  ${yellow("!")} not checked: ${u.dependency} (${u.reason})`);
   if (r.unchecked.length > 10) say(`  ${yellow("!")} and ${r.unchecked.length - 10} more dependencies not checked`);
+  printWarnings(r.warnings);
+}
+
+/** At most this many warnings are printed per package; --json has them all. */
+const MAX_PRINTED_WARNINGS = 10;
+
+/**
+ * Each warning on an install that goes ahead, as a block: what, why (up to three reasons, each with its file and
+ * line) and where to read more. A score never refuses by default; this is how the person installing is told.
+ */
+function printWarnings(warnings: readonly InstallWarning[]): void {
+  if (warnings.length === 0) return;
+  say();
+
+  for (const w of warnings.slice(0, MAX_PRINTED_WARNINGS)) {
+    say(`${yellow(bold("WARNING"))} ${bold(`${w.name}@${w.version}`)} ${w.text}${w.via.length > 0 ? dim(` (via ${w.via.join(" > ")})`) : ""}`);
+
+    for (const reason of w.reasons) say(`  - ${reason}`);
+    say(`  ${dim(w.url)}`);
+  }
+
+  if (warnings.length > MAX_PRINTED_WARNINGS) say(yellow(`and ${warnings.length - MAX_PRINTED_WARNINGS} more warnings (apm ... --json lists them all)`));
+  say(yellow("apm installs it anyway: a score informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1)."));
 }
 
 /** What to tell someone whose install was refused: --force only when it would help, and what it does. */
-function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
+function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean): void {
   const forceable = blocked.filter((b) => b.forceable);
   const stuck = blocked.filter((b) => !b.forceable);
 
@@ -348,11 +395,11 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x"): void {
     say(dim("  --force lifts the score floor and the cooldown for the named package only; its dependencies are still checked."));
   }
 
-  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm has not scored or cannot score, unknown names and dangerous dependencies stay blocked.`);
+  if (stuck.length > 0) say(`--force does not help for ${stuck.map((b) => b.name).join(", ")}: revoked or yanked versions, versions apm reviewers confirmed malicious, unknown names and dependencies inside their cooldown stay blocked${strict ? "; in strict mode, so do versions apm has not scored or cannot score and dependencies under the floor" : ""}.`);
 
-  const analysing = blocked.filter((b) => b.blocked?.includes("still being analysed"));
+  const analysing = blocked.filter((b) => b.blocked?.includes("still being analysed") || b.blocked?.includes("could not be checked"));
 
-  if (analysing.length > 0) say(`apm scores a version before anything installs it. Run apm ${verb} ${analysing.map((b) => b.name).join(" ")} again in a minute.`);
+  if (analysing.length > 0) say(`Run apm ${verb} ${analysing.map((b) => b.name).join(" ")} again in a minute${strict ? ", or without --strict to install with a warning" : ""}.`);
 }
 
 const DistSchema = z.object({ versions: z.record(z.string(), z.object({ dist: z.object({ integrity: z.string().optional(), tarball: z.string().optional() }).loose() }).loose()) }).loose();
@@ -494,7 +541,7 @@ async function cmdAdd(a: Args): Promise<number> {
   if (blocked.length > 0) {
     say();
     for (const b of blocked) say(red(`refused: ${b.blocked ?? `${b.name}: nothing to install`}`));
-    refusalAdvice(blocked, "add");
+    refusalAdvice(blocked, "add", strictMode(a));
     emitJson(false, det, results);
 
     return 1;
@@ -557,6 +604,7 @@ function emitJson(ok: boolean, det: Detection, results: Resolved[], error: strin
       signals: r.report?.signals.map((s) => ({ id: s.id, points: s.points })) ?? [],
       skipped: r.skipped,
       unchecked: r.unchecked,
+      warnings: r.warnings,
       blocked: r.blocked !== null,
       reason: r.blocked,
       forceable: r.forceable,
@@ -579,14 +627,14 @@ async function cmdX(a: Args): Promise<number> {
   printResolved(r);
   if (r.blocked !== null || r.version === null) {
     say(red(`refused to run ${r.name}: ${r.blocked ?? "no version"}`));
-    refusalAdvice([r], "x");
+    refusalAdvice([r], "x", strictMode(a));
     return 1;
   }
 
   const scopes = treeScopes([r]);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "run")) return 1;
-  const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown"].includes(x));
+  const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown", "--strict"].includes(x));
   const cmd = execArgs(det.pm, `${r.name}@${r.version}`, rest.length > 0 ? passArgs : []);
   say(dim(`→ ${cmd.join(" ")}`));
 
@@ -1068,8 +1116,8 @@ async function cmdPublish(a: Args): Promise<number> {
 // ---------- help / passthrough ----------
 const HELP = `apm ${VERSION}: checks before you install, run or publish; your package manager does the rest.
 
-  apm add <pkg>[@range]...   resolve with a 24h cooldown and score floor, then <pm> add the exact version
-  apm x <pkg> [args]         show the risk card, then run it (bunx / npx)
+  apm add <pkg>[@range]...   resolve with a 24h cooldown, warn on a score under 40, then <pm> add the exact version
+  apm x <pkg> [args]         show the risk card and any warning, then run it (bunx / npx)
   apm publish [--bump patch|minor|major] [--dry-run] [--tag t]
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
   apm explain <pkg>[@range]  install, review-first or do-not-install, and why (exit 0, 3 or 1)
@@ -1082,7 +1130,9 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm login | whoami        sign in through the browser; publishes then wait for your approval
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
 
-Flags: --pm bun|npm|pnpm|yarn, --force, --no-cooldown, --json, --otp <code>, --no-browser
+Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --json, --otp <code>, --no-browser
+  --strict (or APM_STRICT=1): refuse a score under 40, an incomplete analysis, no score yet or ever, and a
+  dependency the registry could not look up, instead of warning about them
 Registry: APM_REGISTRY or registry= in .npmrc (default ${DEFAULT_REGISTRY})`;
 
 // Commands that run package install scripts: their env gets no credentials. `apm run` keeps the env, as `bun run` would.

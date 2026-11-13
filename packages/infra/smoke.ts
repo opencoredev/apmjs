@@ -87,35 +87,48 @@ async function stockClients(): Promise<void> {
 }
 
 /**
- * The refusals apm add gives a version it does not install, by what the registry knows of it: scored below the floor,
- * still being analysed when the wait ran out, or decided as one apm can never score. Each is a refusal; null when the
+ * What apm add says about a version it flags, by what the registry knows of it. By default each is a warning and the
+ * install goes ahead (the owner's warn-not-block policy, 2026-11); with --strict each is a refusal. Null when the
  * output shows none of them.
  */
+const WARNINGS = [
+  ["scored below the floor", /under the floor of 40/],
+  ["incomplete", /could not fully analyse it/],
+  ["not scored yet", /not scored yet/],
+  ["cannot be scored", /apm cannot score this version/],
+] as const;
+
 const REFUSALS = [
   ["scored below the floor", /below 40/],
   ["still being analysed", /is still being analysed, try again in a minute/],
   ["cannot be scored", /apm cannot score this version/],
 ] as const;
 
-function refusalOf(out: string): string | null {
-  return REFUSALS.find(([, re]) => re.test(out))?.[0] ?? null;
+function matchOf(list: readonly (readonly [string, RegExp])[], out: string): string | null {
+  return list.find(([, re]) => re.test(out))?.[0] ?? null;
 }
 
-// Anonymous, so the registry analyses nothing inline: a version not scored yet is queued, the registry waits for the
-// queue (about 20 s), and apm add asks again for up to 90 s before it refuses. A cold analysis can take longer than
-// that, or end in an outcome that is not a score, so any of the three refusals passes, and the detail says which, and
-// how long each took.
-async function apmRefusal(): Promise<void> {
+// Anonymous: a version not scored yet is queued, and the registry waits for the queue (about 20 s) before it answers.
+// A cold analysis can take longer than that, or end in an outcome that is not a score, so any of the warnings (and,
+// with --strict, any of the refusals) passes, and the detail says which, and how long each took. puppeteer's own
+// postinstall would download Chromium once the install goes ahead; the smoke check does not need it.
+async function apmWarning(): Promise<void> {
+  const env = { APM_REGISTRY: registry, PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1", PUPPETEER_SKIP_DOWNLOAD: "1" };
   const dir = project("apm-app");
-  const env = { APM_REGISTRY: registry };
   const t0 = Date.now();
-  const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0"], dir, env);
-  const refusal = refusalOf(bad.out);
+  const warned = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0"], dir, env);
+  const warning = /WARNING/.test(warned.out) ? matchOf(WARNINGS, warned.out) : null;
 
-  record(bad.code !== 0 && installed(dir, "puppeteer") === null && refusal !== null, "apm add refuses a low-score npm package (puppeteer@1.20.0)", `exit ${bad.code}, installed ${installed(dir, "puppeteer")}, refused as ${refusal ?? "nothing apm says"}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  record(warned.code === 0 && installed(dir, "puppeteer") === "1.20.0" && warning !== null, "apm add warns about a low-score npm package (puppeteer@1.20.0) and installs it", `exit ${warned.code}, installed ${installed(dir, "puppeteer")}, warned as ${warning ?? "nothing apm says"}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  const strictDir = project("apm-strict-app");
   const t1 = Date.now();
+  const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "puppeteer@1.20.0", "--strict"], strictDir, env);
+  const refusal = matchOf(REFUSALS, bad.out);
+
+  record(bad.code !== 0 && installed(strictDir, "puppeteer") === null && refusal !== null, "apm add --strict refuses it", `exit ${bad.code}, installed ${installed(strictDir, "puppeteer")}, refused as ${refusal ?? "nothing apm says"}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+  const t2 = Date.now();
   const good = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "ms"], dir, env);
-  record(good.code === 0 && installed(dir, "ms") !== null, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
+  record(good.code === 0 && installed(dir, "ms") !== null, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t2) / 1000).toFixed(1)} s`);
 }
 
 async function bunAudit(): Promise<void> {
@@ -295,7 +308,7 @@ await docsSite();
 
 await stockClients();
 
-await apmRefusal();
+await apmWarning();
 
 await stagedPublish();
 

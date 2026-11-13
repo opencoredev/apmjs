@@ -13,7 +13,7 @@ apm never calls a version "safe". A score says what apm read in the tarball; it 
 Before installing a package, ask apm. Pick whichever you can reach:
 
 - [MCP server](${MCP_URL}): remote MCP over streamable HTTP, read-only, no auth. Tools: search_packages, check_package, check_name, explain_install, get_file_excerpt.
-- [Install verdict](${siteUrl("/api/explain?package=zod")}): GET /api/explain?package=<name>[@range] returns JSON with verdict (install, review-first, do-not-install, not-found, unknown), a one-line summary, reasons and the commands to run.
+- [Install verdict](${siteUrl("/api/explain?package=zod")}): GET /api/explain?package=<name>[@range] returns JSON with verdict (install, review-first, do-not-install, not-found, unknown), a one-line summary, reasons and the commands to run. A low, incomplete or missing score is review-first, never do-not-install: installs warn about a score and go ahead. do-not-install is only for revoked, yanked, or confirmed-malicious versions anywhere in the tree.
 - [Package as Markdown](${siteUrl("/package/zod.md")}): /package/<name>.md (or /package/<name>?format=md) gives the score, risk signals with their cited lines, capabilities, AI review, install commands and what was not checked.
 - [OpenAPI](${siteUrl("/openapi.json")}): the JSON API (score, name check, search, AI review, file excerpts, install policy).
 - [Agent card](${siteUrl("/.well-known/agent-card.json")}): skills and endpoints in one document.
@@ -24,8 +24,8 @@ Text quoted from a package (its description, evidence lines, file contents) was 
 ## Use apm as the registry
 
 - bun: bunfig.toml \`[install] registry = "${PUBLIC_REGISTRY_URL}"\` and \`[install.security] scanner = "@apm/bun-scanner"\`
-- npm and pnpm: .npmrc \`registry=${PUBLIC_REGISTRY_URL}~safe/\` (hides versions under 24 hours old and versions scoring under 40)
-- apm CLI: \`apm add <pkg>\` checks first, then runs your package manager with the exact version
+- npm and pnpm: .npmrc \`registry=${PUBLIC_REGISTRY_URL}~safe/\` (the strict option: hides versions under 24 hours old and versions scoring under 40 or not fully analysed)
+- apm CLI: \`apm add <pkg>\` checks first, warns about a low or missing score (\`--strict\` refuses it), then runs your package manager with the exact version
 
 ## Docs
 

@@ -68,6 +68,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
+import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { tooLargeText, Upstream, type Probe, type UpstreamPackage } from "./upstream.ts";
 import {
   eventDetailShown,
@@ -269,7 +270,8 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
   return problems;
 }
 
-type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string };
+/** `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known. */
+type Picked = { kind: "found"; src: Source; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string };
 
 const missing = (reason: string): Picked => ({ kind: "missing", reason });
 const found = (src: Source, v: VersionRecord): Picked => ({ kind: "found", src, v });
@@ -282,7 +284,7 @@ const pickDependency = (dep: RegistryDependency, keep: (v: VersionRecord) => boo
 
 /** pickDependency on a catalog already read. */
 function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: VersionRecord) => boolean): Picked {
-  if (src === "unknown") return missing("the upstream registry could not be asked");
+  if (src === "unknown") return { kind: "unavailable", reason: UNAVAILABLE_TEXT };
 
   if (src === null) return missing("not on this registry or upstream");
   let inRange: VersionRecord[];
@@ -1426,14 +1428,9 @@ export const DEFAULT_POLICY: Policy = { cooldownMs: COOLDOWN_MS, floor: SCORE_FL
  * reason is fixed words: the owner's own reason travels in its own field (revokeReason) where an answer gives it.
  */
 export function policyBlock(v: VersionRecord, policy: Policy, at: number): string | null {
-  if (v.status === "revoked") return "revoked by its owner";
+  const hard = hardBlock(v, policy, at);
 
-  if (v.status === "revoke-pending") return "revocation pending";
-
-  if (v.status === "yanked") return `yanked${v.status_reason ? `: ${v.status_reason}` : ""}`;
-  const age = at - v.published_at;
-
-  if (age < policy.cooldownMs) return `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`;
+  if (hard !== null) return hard;
   const r = reportFor(v, at, { ignoreRecent: true });
 
   if (!r) return v.unscorable ? notScored({ kind: "upstream" }, v).text : "not scored yet";
@@ -1446,6 +1443,22 @@ export function policyBlock(v: VersionRecord, policy: Policy, at: number): strin
   }
 
   return null;
+}
+
+/**
+ * Why a version is not installed in any mode: revoked, revocation pending, yanked, or inside the cooldown. None is a
+ * score, so each holds in the default mode too; policyBlock adds the score floor and a missing score (strict mode and
+ * the ~safe view).
+ */
+export function hardBlock(v: VersionRecord, policy: Policy, at: number): string | null {
+  if (v.status === "revoked") return "revoked by its owner";
+
+  if (v.status === "revoke-pending") return "revocation pending";
+
+  if (v.status === "yanked") return `yanked${v.status_reason ? `: ${v.status_reason}` : ""}`;
+  const age = at - v.published_at;
+
+  return age < policy.cooldownMs ? `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)` : null;
 }
 
 /** The URL prefix of the safe view: versions past the cooldown that score at or above the floor. */
@@ -1494,7 +1507,24 @@ type UncheckedDep = { dependency: string; reason: string; via: string[] };
  * `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry.
  * `digests`: the tarball digest of each of those, which keys its AI review; not sent.
  */
-type Tree = { blocks: TreeBlock[]; unchecked: number; uncheckedDeps: UncheckedDep[]; pending: PendingDep[]; packages: { name: string; version: string }[]; digests: (string | null)[] };
+/**
+ * `blocks`: what refuses the install in every mode (a dependency inside its cooldown). `warnings`: what strict mode
+ * refuses and the default mode installs with a warning (a low or incomplete score, a version apm cannot score, a
+ * lookup that failed, the walk's limits); pending versions get theirs only once the resolve stops waiting.
+ * `unscorable` and `unavailable` list those two kinds apart. `limited`: the walk stopped at one of its limits.
+ */
+type Tree = {
+  blocks: TreeBlock[];
+  warnings: InstallWarning[];
+  unchecked: number;
+  uncheckedDeps: UncheckedDep[];
+  pending: PendingDep[];
+  unscorable: (DepRef & { reason: string; via: string[] })[];
+  unavailable: { dependency: string; via: string[] }[];
+  limited: boolean;
+  packages: { name: string; version: string }[];
+  digests: (string | null)[];
+};
 
 /**
  * A version in the tree with no score yet that the registry will score: an upstream version queued for analysis. Never
@@ -1531,7 +1561,12 @@ const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, m
 const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WALK_LIMITS) =>
   Effect.gen(function* () {
     const at = yield* now;
+    const { webUrl } = yield* RegistryConfig;
     const blocks: TreeBlock[] = [];
+    const warnings: InstallWarning[] = [];
+    const unscorable: Tree["unscorable"] = [];
+    const unavailable: Tree["unavailable"] = [];
+    let limited = false;
     const uncheckedDeps: UncheckedDep[] = [];
     const pending: PendingDep[] = [];
     const packages: Tree["packages"] = [];
@@ -1561,6 +1596,8 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       const rest = queue.length - qi;
       unchecked += rest;
       uncheckedDeps.push({ dependency: `${rest} more`, reason, via: [rootId] });
+      limited = true;
+      warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${rest} more ${rest === 1 ? "dependency was" : "dependencies were"} not checked: ${reason}`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     };
 
     /** The names a level still needs, from `qi` on, for at most as many new lookups as the budget has left. */
@@ -1622,6 +1659,13 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
         resolved.set(lookupKey(dep), picked);
       }
 
+      if (picked.kind === "unavailable") {
+        // the registry or npm could not be asked: not a pass, and not the same as a walk limit
+        unavailable.push({ dependency: describeDependency(dep), via: item.via });
+        warnings.push(stateWarning({ kind: "unavailable", name: dep.name, version: dep.kind === "tag" ? dep.tag : dep.range, text: UNAVAILABLE_TEXT, url: `${webUrl}package/${dep.name}`, via: item.via }));
+        continue;
+      }
+
       if (picked.kind !== "found") {
         miss(describeDependency(dep), picked.reason, item.via);
         continue;
@@ -1652,28 +1696,26 @@ const treeBlocks = (root: VersionRecord, policy: Policy, limits: WalkLimits = WA
       } else if (!r) {
         const why = notScored(picked.src, v);
 
-        // queued for analysis is pending: the answer waits for it and never passes it. A version decided unscorable
-        // (too large, unavailable, unreadable, past the analysis limits) or one with no score for any other reason
-        // never gets one: it blocks the tree as a low score does, since the package manager would install it
+        // queued for analysis is pending: the answer waits for it, then warns (strict: 202). A version decided
+        // unscorable (too large, unavailable, unreadable, past the analysis limits) or one with no score for any other
+        // reason never gets one: a warning (strict: refused), since the package manager would install it
         if (why.kind === "queued") pending.push({ name: dep.name, version: v.version, via: item.via });
-        else blocks.push({ name: dep.name, version: v.version, reason: why.text, via: item.via });
-      } else if (r.score < policy.floor)
-        blocks.push({
-          name: dep.name,
-          version: v.version,
-          reason: `score ${r.score}/100 (${r.signals
-            .filter((s) => s.points < 0)
-            .map((s) => s.id)
-            .join(", ")})`,
-          via: item.via,
-        });
+        else {
+          unscorable.push({ name: dep.name, version: v.version, reason: why.text, via: item.via });
+          warnings.push(stateWarning({ kind: "unscorable", name: dep.name, version: v.version, text: why.text, url: versionUrl(webUrl, dep.name, v.version), via: item.via }));
+        }
+      } else {
+        const w = scoreWarning({ name: dep.name, version: v.version, report: r, floor: policy.floor, url: versionUrl(webUrl, dep.name, v.version), via: item.via });
+
+        if (w) warnings.push(w);
+      }
 
       // every package is checked once (seen), every name and range looked up once (resolved), and the walk stops at
       // its limits, counting the rest as unchecked: a cut-off never drops part of the tree without saying so
       for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key], level: item.level + 1 });
     }
 
-    const tree: Tree = { blocks, unchecked, uncheckedDeps, pending, packages, digests };
+    const tree: Tree = { blocks, warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, packages, digests };
 
     return tree;
   });
@@ -1725,8 +1767,27 @@ const treeReviews = (tree: Tree) =>
     return out;
   });
 
+/** Whether an apm reviewer confirmed this version malicious. False when this registry runs no AI review. */
+const reviewerConfirmed = (v: VersionRecord) =>
+  Effect.gen(function* () {
+    if (Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return false;
+    const digest = digestOf(v);
+    const standings = yield* reviewStandings([{ name: v.package, version: v.version, digest: digest ? digestLabel(digest) : null }]);
+
+    return standings.get(`${v.package}@${v.version}`) === "confirmed";
+  });
+
 /** The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. */
-const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({ blocks: tree.blocks, unchecked: tree.unchecked, uncheckedDeps: tree.uncheckedDeps, pending: tree.pending, packages: tree.packages, reviews });
+const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({
+  blocks: tree.blocks,
+  unchecked: tree.unchecked,
+  uncheckedDeps: tree.uncheckedDeps,
+  pending: tree.pending,
+  unscorable: tree.unscorable,
+  unavailable: tree.unavailable,
+  packages: tree.packages,
+  reviews,
+});
 
 /**
  * How long a resolve waits for queued analyses to land before it answers that they are pending, and how often it
@@ -1746,14 +1807,26 @@ type ResolvePass = { kind: "answer"; response: Response } | { kind: "pending"; v
 /** What policyBlock says of a version with no score that the registry will score: the root of a pending resolve. */
 const NOT_SCORED_YET = "not scored yet";
 
+/** Why resolve skips a version an apm reviewer confirmed malicious, in every mode. */
+const CONFIRMED_SKIP = "confirmed malicious by an apm reviewer";
+
 const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
 
 const waitingOn = (p: Omit<Extract<ResolvePass, { kind: "pending" }>, "kind">): ResolvePass => ({ kind: "pending", ...p });
 
-const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source }) =>
+/**
+ * The resolve answers' modes. `strict` (apm add --strict, APM_STRICT=1): a score under the floor, an incomplete
+ * analysis, a version apm cannot score, one still pending after the wait, a dependency the registry could not look
+ * up, and a walk cut short at its limits each refuse, as before. Default: each is a warning, and the install goes
+ * ahead. `final`: the wait is over, so what is still pending is warned about rather than waited for.
+ */
+type ResolveMode = { strict: boolean; final: boolean };
+
+const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Source; mode: ResolveMode }) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, src } = input;
+    const { name, range, policy, treePolicy, src, mode } = input;
     const at = yield* now;
+    const { webUrl } = yield* RegistryConfig;
     const tagged = tagTarget(src.distTags, range);
     // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
     // below it, but a stable tag never falls back to a prerelease.
@@ -1771,30 +1844,69 @@ const resolvePass = (input: { name: string; range: string; policy: Policy; treeP
       // analyze a bounded number of candidates; upstream analysis means downloading the tarball
       const v = analyzedCount < 5 ? yield* ensureAnalyzed(src, v0) : v0;
       analyzedCount++;
-      const block = policyBlock(v, policy, at);
+      // strict skips a version under the floor or with no score; the default mode installs it with a warning. A version
+      // an apm reviewer confirmed malicious is skipped in every mode, as a revoked one is
+      const policyWhy = mode.strict ? policyBlock(v, policy, at) : hardBlock(v, policy, at);
+      const block = policyWhy === null && (yield* reviewerConfirmed(v)) ? CONFIRMED_SKIP : policyWhy;
+      const report = reportFor(v, at);
+      const unscored = report === null ? notScored(src, v) : null;
       // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
-      const pendingRoot = block === NOT_SCORED_YET && src.kind === "upstream";
+      const pendingRoot = (block === null || block === NOT_SCORED_YET) && unscored?.kind === "queued";
 
       if (block === null || pendingRoot) {
-        const report = reportFor(v, at);
         // a pending root's tree is walked too, so its dependencies are queued while it is
         const walked = yield* treeBlocks(v, treePolicy);
         const tree = treeAnswer(walked, yield* treeReviews(walked));
+        const newest = { version: v.version, report: embeddedReport(v, report) };
 
-        if (walked.blocks.length > 0) {
-          const list = walked.blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ");
+        // a dependency confirmed malicious by an apm reviewer: refused in every mode, since the package manager would
+        // install it (the version itself was skipped above)
+        const confirmed = tree.reviews.kind === "on" ? tree.reviews.confirmed : [];
 
-          return answered(json({ error: `${name}@${v.version} would install dangerous dependencies: ${list}`, name, range, version: null, skipped, newest: { version: v.version, report: embeddedReport(v, report) }, tree }, 422));
+        if (confirmed.length > 0) {
+          return answered(json({ error: `${name}@${v.version} would install ${confirmed.map((c) => `${c.name}@${c.version}`).join(", ")}, which apm reviewers confirmed ${confirmed.length === 1 ? "is" : "are"} malicious.`, name, range, version: null, skipped, newest, tree, confirmed }, 422));
         }
 
-        if (pendingRoot || walked.pending.length > 0) {
+        // the refused dependencies are the tree's blocks, as the answer lists them
+        const refuse = (blocks: TreeBlock[]) =>
+          answered(json({ error: `${name}@${v.version} would install dangerous dependencies: ${blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ")}`, name, range, version: null, skipped, newest, tree: { ...tree, blocks } }, 422));
+
+        // a dependency inside its cooldown: not a score, refused in every mode
+        if (walked.blocks.length > 0) return refuse(walked.blocks);
+
+        if (mode.strict) {
+          // the registry or npm could not be asked about a dependency: not a pass, and a retry may succeed
+          if (walked.unavailable.length > 0) {
+            return answered(
+              json(
+                { error: `${name}@${v.version}: ${walked.unavailable.length === 1 ? "a dependency" : `${walked.unavailable.length} dependencies`} ${UNAVAILABLE_TEXT} (${walked.unavailable.map((u) => u.dependency).join(", ")}). Nothing was installed as if it passed; try again in a minute.`, name, range, version: null, unavailable: walked.unavailable, retryAfter: PENDING_RETRY_AFTER_S, skipped, newest, tree },
+                503,
+                { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
+              ),
+            );
+          }
+
+          const scored = walked.warnings.filter((w) => w.kind !== "unavailable");
+
+          if (scored.length > 0) return refuse(scored.map((w) => ({ name: w.name, version: w.version, reason: w.text, via: w.via })));
+        }
+
+        if (!mode.final && (pendingRoot || walked.pending.length > 0)) {
           const pending = [...(pendingRoot ? [{ name, version: v.version, via: [] }] : []), ...walked.pending];
 
           return waitingOn({ version: v.version, pending, skipped });
         }
 
+        // what installs with a warning: the version itself, then its tree, then what is still pending
+        const url = versionUrl(webUrl, name, v.version);
+        // judged as the floor judges it: a fresh publish's own signal is the cooldown's business, not the score's
+        const judged = reportFor(v, at, { ignoreRecent: true });
+        const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [] }) : null;
+        const stillPending = [...(pendingRoot ? [] : walked.pending)].map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
+        const warnings = [...(own ? [own] : []), ...walked.warnings, ...stillPending];
+
         // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
-        return answered(json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor } }, 200, { "cache-control": "no-store" }));
+        return answered(json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, warnings, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor, strict: mode.strict } }, 200, { "cache-control": "no-store" }));
       }
 
       skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
@@ -1821,16 +1933,21 @@ const landed = (pending: readonly PendingDep[]) =>
     return pending.every((p) => decided.has(`${p.name} ${p.version}`));
   });
 
+/** `strict=1` (or `true`) asks for strict mode; anything else, or nothing, is the default mode. */
+const strictParam = (v: string | null | undefined): boolean => v === "1" || v === "true";
+
 /**
  * GET /-/apm/v1/resolve: the newest version in range that passes the policy, and its dependency walk. A version in it
- * that is queued for analysis (the root or a dependency) is never passed: the registry waits up to RESOLVE_WAIT for
- * the queue to score it, polling the database, then answers from what landed. Anything still pending is answered with
- * 202, the list of pending versions and Retry-After, never with 200.
+ * that is queued for analysis (the root or a dependency) is waited for: the registry waits up to RESOLVE_WAIT for the
+ * queue to score it, polling the database, then answers from what landed. In the default mode what is still pending
+ * then is a warning on a 200, like a low score or a dependency it could not look up; in strict mode (`strict=1`)
+ * it is a 202 with the pending versions and Retry-After, a lookup that failed is a 503, and a low score a 422.
  */
 export const resolveResponse = (url: URL) =>
   Effect.gen(function* () {
     const name = url.searchParams.get("name") ?? "";
     const range = url.searchParams.get("range") || "latest";
+    const strict = strictParam(url.searchParams.get("strict"));
 
     const parsedPolicy = parsePolicy(url);
 
@@ -1840,14 +1957,21 @@ export const resolveResponse = (url: URL) =>
     // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
     const treePolicy: Policy = { floor: Math.max(policy.floor, DEFAULT_POLICY.floor), cooldownMs: policy.cooldownMs };
 
-    let src = yield* lookup(name);
+    const first = yield* lookupOrUnknown(name);
+
+    // the package itself could not be looked up: there is no version to install, and a retry may find one
+    if (first === "unknown") {
+      return json({ error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) });
+    }
+
+    let src = first;
     const wait = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
     const looks = Math.max(0, Math.ceil(wait.maxMs / Math.max(1, wait.pollMs)));
     let waited = 0;
 
     for (;;) {
       if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, src });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: false } });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -1858,6 +1982,16 @@ export const resolveResponse = (url: URL) =>
         yield* Effect.sleep(wait.pollMs);
         waited++;
         ready = yield* landed(pass.pending);
+      }
+
+      if (!ready && !strict) {
+        // the wait is over: what landed is read afresh, and what is still pending is a warning
+        const latest = yield* lookup(name);
+
+        if (!latest) return fail(404, `No package named ${name}.`);
+        const last = yield* resolvePass({ name, range, policy, treePolicy, src: latest, mode: { strict, final: true } });
+
+        if (last.kind === "answer") return last.response;
       }
 
       if (!ready) {
@@ -1884,36 +2018,57 @@ export const resolveResponse = (url: URL) =>
     }
   });
 
-const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })) });
+const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })), strict: z.boolean().optional() });
 
 /** Packages one scan checks: signed in, and without a token. Each may mean an upstream packument and tarball. */
 export const MAX_SCAN = 2000;
 export const MAX_SCAN_ANONYMOUS = 200;
 
-/** Upstream lookups one scan runs at once. Inline analyses still run one at a time (Analysis.ensure). */
+/** Upstream lookups one scan runs at once. */
 const SCAN_CONCURRENCY = 8;
 
 type ScanAdvisory = { package: string; version: string; level: "fatal" | "warn"; description: string; url: string | null };
 
 type ScanUnchecked = { package: string; version: string; reason: string };
 
-/** A version queued for analysis: not clean and not merely unchecked. The scanner waits for it, then blocks it. */
+/** A version queued for analysis: not clean and not merely unchecked. The scanner waits for it, then warns (strict: blocks). */
 type ScanPending = { package: string; version: string };
 
-type ScanOne = { kind: "clean" } | { kind: "advisory"; advisory: ScanAdvisory } | { kind: "unchecked"; unchecked: ScanUnchecked } | { kind: "pending"; unchecked: ScanUnchecked };
+/**
+ * One package's scan. `flagged`: what the default mode installs with a warning and strict mode refuses, as an
+ * advisory at the level the mode gives it, with the warning itself and which list it also goes in.
+ */
+type ScanOne =
+  | { kind: "clean" }
+  | { kind: "advisory"; advisory: ScanAdvisory }
+  | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "unscorable" | "unavailable" }
+  | { kind: "unchecked"; unchecked: ScanUnchecked }
+  | { kind: "pending"; unchecked: ScanUnchecked };
 
-const scanOne = (p: { name: string; version: string }, baseUrl: string, at: number) =>
+const scanOne = (p: { name: string; version: string }, strict: boolean, at: number) =>
   Effect.gen(function* () {
+    const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne => ({ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } });
+    const url = versionUrl(webUrl, p.name, p.version);
+    const level = strict ? "fatal" : "warn";
+
+    const flagged = (warning: InstallWarning, list: Extract<ScanOne, { kind: "flagged" }>["list"]): ScanOne => ({
+      kind: "flagged",
+      warning,
+      list,
+      // the link travels in `url`, which bun prints after the description
+      advisory: { package: p.name, version: p.version, level, description: `${warningLines(warning).slice(0, -1).join("\n")}${strict ? "" : "\napm lets it install; APM_SCANNER_STRICT=1 refuses it."}`, url: warning.url },
+    });
+
     const src = yield* lookupOrUnknown(p.name);
 
-    if (src === "unknown") return unchecked("the upstream registry could not be asked");
+    // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
+    if (src === "unknown") return flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable");
 
     if (src === null) return unchecked("not on this registry or upstream");
     const v0 = src.versions.find((x) => x.version === p.version);
 
     if (!v0) return unchecked("no such version");
-    const url = `${baseUrl}package/${p.name}`;
 
     if (v0.status === "revoked" || v0.status === "revoke-pending") {
       const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url };
@@ -1921,7 +2076,12 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
       return { kind: "advisory", advisory } satisfies ScanOne;
     }
 
-    // a stored analysis of these exact bytes is reused; only a version never analyzed is downloaded
+    // confirmed malicious by an apm reviewer: refused in every mode
+    if (yield* reviewerConfirmed(v0)) {
+      return { kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version}: apm reviewers confirmed this version is malicious.`, url } } satisfies ScanOne;
+    }
+
+    // a stored analysis of these exact bytes is reused; a version never analyzed is queued
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
 
@@ -1930,36 +2090,27 @@ const scanOne = (p: { name: string; version: string }, baseUrl: string, at: numb
 
       if (why.kind === "queued") return { kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } } satisfies ScanOne;
 
-      // decided, not waiting: no score will come, and a version with no score is never installed as if it passed,
-      // whatever mode the scanner runs in
-      const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} has no apm score and will not get one: ${why.text}. apm installs no version without a score.`, url };
-
-      return { kind: "advisory", advisory } satisfies ScanOne;
+      // decided, not waiting: no score will come
+      return flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [] }), "unscorable");
     }
 
-    if (r.score >= SCORE_FLOOR) return { kind: "clean" } satisfies ScanOne;
+    const w = scoreWarning({ name: p.name, version: p.version, report: r, floor: SCORE_FLOOR, url, via: [] });
 
-    const why = r.signals
-      .filter((s) => s.points < 0)
-      .map((s) => s.id)
-      .join(", ");
-
-    const advisory: ScanAdvisory = {
-      package: p.name,
-      version: p.version,
-      level: "fatal",
-      description: `${p.name}@${p.version} has apm score ${r.score}/100 (${why}). Review it, then allow it with apm add ${p.name} --force.`,
-      url,
-    };
-
-    return { kind: "advisory", advisory } satisfies ScanOne;
+    return w ? flagged(w, "scored") : ({ kind: "clean" } satisfies ScanOne);
   });
 
+/**
+ * POST /-/apm/v1/scan, the Bun scanner's question. A revoked version and one an apm reviewer confirmed malicious are
+ * `fatal` advisories in every mode. A score under the floor, an incomplete analysis, a version apm cannot score and a
+ * package the registry could not look up are `warn` advisories (strict: `fatal`), each with its warning in
+ * `warnings`; `unscorable` and `unavailable` list the last two apart. A queued version is in `pending` (and in
+ * `unchecked`, for scanners from before `pending`): the scanner asks again, then warns (strict: blocks).
+ */
 export const scanResponse = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
-    const { baseUrl } = yield* RegistryConfig;
     const at = yield* now;
     const body = yield* parseBody(req, ScanBody);
+    const strict = body.strict === true || strictParam(new URL(req.url).searchParams.get("strict"));
     const signedIn = caller.kind === "user";
     const cap = signedIn ? MAX_SCAN : MAX_SCAN_ANONYMOUS;
     const seen = new Set<string>();
@@ -1974,17 +2125,28 @@ export const scanResponse = (req: Request, caller: Caller) =>
     });
 
     const advisories: ScanAdvisory[] = [];
+    const warnings: InstallWarning[] = [];
+    const unscorable: ScanUnchecked[] = [];
+    const unavailable: ScanPending[] = [];
     // Versions the scan could not judge. Missing from `advisories` is not the same as clean.
     const unchecked: ScanUnchecked[] = [];
     // queued versions are listed twice: in `unchecked`, so a scanner from before `pending` never reads one as clean,
-    // and in `pending`, which a scanner that knows it waits on and then blocks
+    // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
-    const results = yield* Effect.forEach(packages.slice(0, cap), (p) => scanOne(p, baseUrl, at), { concurrency: SCAN_CONCURRENCY });
+    const results = yield* Effect.forEach(packages.slice(0, cap), (p) => scanOne(p, strict, at), { concurrency: SCAN_CONCURRENCY });
 
     for (const r of results) {
       switch (r.kind) {
         case "advisory":
           advisories.push(r.advisory);
+          break;
+        case "flagged":
+          advisories.push(r.advisory);
+          warnings.push(r.warning);
+
+          if (r.list === "unscorable") unscorable.push({ package: r.warning.name, version: r.warning.version, reason: r.warning.text });
+
+          if (r.list === "unavailable") unavailable.push({ package: r.warning.name, version: r.warning.version });
           break;
         case "unchecked":
           unchecked.push(r.unchecked);
@@ -2008,8 +2170,9 @@ export const scanResponse = (req: Request, caller: Caller) =>
       : `a scan without a token checks at most ${MAX_SCAN_ANONYMOUS} packages; sign in (apm login) to check up to ${MAX_SCAN}, or send the rest in another request`;
 
     for (const p of packages.slice(cap)) unchecked.push({ package: p.name, version: p.version, reason: over });
+    const answer = { advisories, warnings, unchecked, pending, unscorable, unavailable, strict };
 
-    return json(pending.length > 0 ? { advisories, unchecked, pending, retryAfter: PENDING_RETRY_AFTER_S } : { advisories, unchecked, pending });
+    return json(pending.length > 0 ? { ...answer, retryAfter: PENDING_RETRY_AFTER_S } : answer);
   });
 
 const AuditBody = z.record(z.string(), z.array(z.string()));

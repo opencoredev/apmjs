@@ -270,6 +270,7 @@ test("0014 gives up at its lock_timeout behind a long write, drops the invalid i
     await holder.query("BEGIN");
     await holder.query("INSERT INTO analysis_jobs (package, version, queued_at) VALUES ('long-running', '1.0.0', 1)");
     const started = Date.now();
+
     const failed = await migrate(db.url).then(
       () => null,
       (e: Error) => e.message,

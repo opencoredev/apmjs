@@ -880,9 +880,19 @@ describe("AI review standings for install decisions", () => {
     await reg.query("UPDATE reviews SET human_state = 'confirmed', human_at = $1 WHERE package = $2", [clock, DEP]);
     const confirmed = await resolve();
 
-    // still a 200: the policy (score, cooldown, revokes) passed; the answer says what the AI review found below it
-    expect(confirmed.status).toBe(200);
+    // confirmed malicious by an apm reviewer refuses in every mode, unlike a score (the warn-not-block policy):
+    // the root that brings it in, the version itself, and a scan of it, which the Bun scanner blocks in both modes
+    expect(confirmed.status).toBe(422);
+    expect(dig(confirmed.body, "confirmed")).toEqual(dep);
+    expect(String(dig(confirmed.body, "error"))).toContain("which apm reviewers confirmed is malicious");
     expect(dig(confirmed.body, "tree", "reviews")).toEqual({ ...empty, confirmed: dep, noAnswer: mute });
+    const itself = await fetch(`${reg.url}-/apm/v1/resolve?name=${DEP}`);
+
+    expect(itself.status).toBe(422);
+    const scan = await fetch(`${reg.url}-/apm/v1/scan`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: [{ name: DEP, version: "1.0.0" }] }) });
+    const advisories = dig(await scan.json(), "advisories");
+
+    expect(Array.isArray(advisories) ? advisories.map((a) => [dig(a, "level"), String(dig(a, "description"))]) : []).toEqual([["fatal", `${DEP}@1.0.0: apm reviewers confirmed this version is malicious.`]]);
 
     await reg.query("UPDATE reviews SET human_state = 'dismissed', human_at = $1 WHERE package = ANY($2)", [clock, [DEP, MUTE]]);
     expect(dig((await review(DEP, "1.0.0")).body, "review", "state")).toBe("cleared");
@@ -912,7 +922,9 @@ describe("AI review standings for install decisions", () => {
     const res = await fetch(`${reg.url}-/apm/v1/resolve?name=${at(0)}`);
     const body: unknown = await res.json();
 
-    expect(res.status, JSON.stringify(body)).toBe(200);
+    // refused: confirmed malicious anywhere in the tree
+    expect(res.status, JSON.stringify(body)).toBe(422);
+    expect(dig(body, "confirmed")).toEqual([{ name: at(13), version: "1.0.0" }]);
     expect(dig(body, "tree", "reviews", "confirmed")).toEqual([{ name: at(13), version: "1.0.0" }]);
     expect(dig(body, "tree", "unchecked")).toBe(0);
     // the whole chain was walked, the leaf below the confirmed one included
