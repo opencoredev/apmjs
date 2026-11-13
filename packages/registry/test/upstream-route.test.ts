@@ -140,7 +140,10 @@ describe("the npm packument route", () => {
   test("devDependencies that do not fit beside the packument in the request's budget are left out, not held", async () => {
     // each read on its own is within every limit
     for (const profile of [undefined, DEV_DEPENDENCIES]) expect((await readPackument(new Blob([HEAVY]).stream(), { profile, lease: new MemoryPool().request() })).kind).toBe("ok");
-    const full = await get("/heavy");
+    // the two together (about 68 MiB) fit one request's 72 MiB, but not while the isolate's pool holds 20 MiB for others
+    const others = POOL.request();
+    expect(others.take(20 * 1024 * 1024)).toBe(true);
+    const full = await get("/heavy").finally(() => others.release());
 
     expect(full?.status).toBe(200);
     const body = Served.parse(JSON.parse(full?.text ?? ""));
