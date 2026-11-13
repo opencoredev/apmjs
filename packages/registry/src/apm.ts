@@ -8,6 +8,14 @@ import {
   ArchiveError,
   dependencySpecs,
   describeDependency,
+  installEdges,
+  isTargetValue,
+  platformMismatch,
+  type DependencyEdge,
+  type DependencySpec,
+  type InstallManifest,
+  type InstallTarget,
+  ANY_TARGET,
   describeSkip,
   finalize,
   findSecrets,
@@ -70,10 +78,10 @@ import {
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
-import { scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
+import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
-import { summarize, summaryVersion, type Catalog, type Summary } from "./walk-catalog.ts";
+import { keptSummary, keptVersion, summarize, summaryVersion, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
   fileReferences,
@@ -275,10 +283,10 @@ const catalogWithin = (name: string, lease: Lease, select: (full: Catalog) => Ve
 
     if (!upstream) return null;
 
-    const got = yield* upstream.summaries([name], lease, (up) => {
+    const got = yield* upstream.summaries([name], lease, (up, reserve) => {
       const full = upstreamSource(up);
 
-      return summarize({ kind: full.kind, name: full.name, distTags: full.distTags, versions: select(full) });
+      return keptSummary({ kind: full.kind, name: full.name, distTags: full.distTags, versions: select(full) }, reserve);
     });
 
     return lookupOf(got.get(name));
@@ -429,12 +437,31 @@ function lookupOf(p: Summarized<Catalog> | undefined): Lookup {
 /** What decides a pick: the package and the range or tag, not the alias it is installed under. */
 const pickKey = (dep: RegistryDependency): string => `${dep.name}\u0000${dep.kind === "tag" ? `tag:${dep.tag}` : dep.range}`;
 
+/** One pick kept: a catalog of the one version it picked, summarized. */
+const keptPick = (full: Catalog, v: VersionRecord): Picked => found({ kind: full.kind, name: full.name, distTags: {}, versions: [v] }, v);
+
 /**
- * Each pick of `deps` (all of one package) from its full catalog, keeping of the catalog only the version each picks:
- * none of it refers to `full`, so the packument it came from can be let go. What the kept versions weigh is the
- * summary's weight (walk-catalog.ts).
+ * Each pick of `deps` (all of one package) from a local catalog, keeping of it only the version each picks. Its
+ * versions come from the database and are not charged, as they never were.
  */
-function picksFrom(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean): Summary<Map<string, Picked>> {
+function localPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean): Map<string, Picked> {
+  const picks = new Map<string, Picked>();
+
+  for (const dep of deps) {
+    const p = pickFrom(full, dep, keep);
+    picks.set(pickKey(dep), p.kind === "found" ? keptPick(full, summaryVersion(p.v).summary) : p);
+  }
+
+  return picks;
+}
+
+/**
+ * Each pick of `deps` (all of one package) from npm's catalog, keeping of it only the version each picks: none of it
+ * refers to `full`, so the packument it came from can be let go. Each kept version is reserved from `reserve` before
+ * it is cut down (walk-catalog.ts, keptVersion), and what stays taken is the summary's weight. null, with nothing
+ * taken, when they do not fit.
+ */
+function upstreamPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: VersionRecord) => boolean, reserve: Reserve): Summary<Map<string, Picked>> | null {
   const picks = new Map<string, Picked>();
   let weight = 0;
 
@@ -446,9 +473,16 @@ function picksFrom(full: Catalog, deps: readonly RegistryDependency[], keep: (v:
       continue;
     }
 
-    const one = summaryVersion(p.v);
+    const one = keptVersion(p.v, reserve);
+
+    if (one === null) {
+      reserve.give(weight);
+
+      return null;
+    }
+
     weight += one.weight;
-    picks.set(pickKey(dep), found({ kind: full.kind, name: full.name, distTags: {}, versions: [one.summary] }, one.summary));
+    picks.set(pickKey(dep), keptPick(full, one.summary));
   }
 
   return { summary: picks, weight };
@@ -457,7 +491,7 @@ function picksFrom(full: Catalog, deps: readonly RegistryDependency[], keep: (v:
 /**
  * The picks one walk makes, each package and range once. `load` reads the packages a batch of dependencies needs in a
  * fixed number of statements (this registry's packages, versions and dismissals, then npm's analyses and packuments)
- * and keeps of each only the versions its ranges pick (picksFrom): what stays taken from `lease` is those, and a
+ * and keeps of each only the versions its ranges pick (localPicks, upstreamPicks): what stays taken from `lease` is those, and a
  * packument is held only while it is read and picked from. `pick` loads a dependency no batch had.
  */
 function pickMemo(lease: Lease, keep: (v: VersionRecord) => boolean) {
@@ -480,16 +514,16 @@ function pickMemo(lease: Lease, keep: (v: VersionRecord) => boolean) {
       const local = yield* (yield* Store).catalogsOf([...byName.keys()]);
 
       for (const [name, c] of local) {
-        const picks = picksFrom(localSource(c.pkg, c.versions.map((v) => atTime(v, at))), byName.get(name) ?? [], keep);
+        const picks = localPicks(localSource(c.pkg, c.versions.map((v) => atTime(v, at))), byName.get(name) ?? [], keep);
 
-        for (const [k, p] of picks.summary) known.set(k, p);
+        for (const [k, p] of picks) known.set(k, p);
       }
 
       const rest = [...byName.keys()].filter((n) => !local.has(n));
       const upstream = yield* upstreamOrNull;
 
       if (rest.length === 0) return;
-      const got = upstream ? yield* upstream.summaries<Map<string, Picked>>(rest, lease, (up) => picksFrom(upstreamSource(up), byName.get(up.name) ?? [], keep)) : null;
+      const got = upstream ? yield* upstream.summaries<Map<string, Picked>>(rest, lease, (up, reserve) => upstreamPicks(upstreamSource(up), byName.get(up.name) ?? [], keep, reserve)) : null;
 
       for (const name of rest) {
         const answer = got === null ? { kind: "absent" as const } : got.get(name);
@@ -1622,19 +1656,33 @@ export function policyBlock(v: VersionRecord, policy: Policy, at: number): strin
 }
 
 /**
- * Why a version is not installed in any mode: revoked, revocation pending, yanked, or inside the cooldown. None is a
- * score, so each holds in the default mode too; policyBlock adds the score floor and a missing score (strict mode and
- * the ~safe view).
+ * Why a version is not installed in any mode: revoked, revocation pending or yanked (a yanked one only on a new
+ * resolve). Never a score or an age, so each holds in the default mode too.
  */
-export function hardBlock(v: VersionRecord, policy: Policy, at: number): string | null {
+export function withheldBlock(v: VersionRecord): string | null {
   if (v.status === "revoked") return "revoked by its owner";
 
   if (v.status === "revoke-pending") return "revocation pending";
 
   if (v.status === "yanked") return `yanked${v.status_reason ? `: ${v.status_reason}` : ""}`;
+
+  return null;
+}
+
+/**
+ * Why a version is inside the cooldown, or null. The default mode installs such a version with a warning (the package
+ * manager reads the plain registry and installs it whatever its age, so it is the one checked); strict mode and the
+ * ~safe view skip it.
+ */
+export function cooldownBlock(v: VersionRecord, policy: Policy, at: number): string | null {
   const age = at - v.published_at;
 
   return age < policy.cooldownMs ? `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)` : null;
+}
+
+/** What strict mode and the ~safe view skip besides a score: a withheld version, and one inside the cooldown. */
+export function hardBlock(v: VersionRecord, policy: Policy, at: number): string | null {
+  return withheldBlock(v) ?? cooldownBlock(v, policy, at);
 }
 
 /** The URL prefix of the safe view: versions past the cooldown that score at or above the floor. */
@@ -1674,23 +1722,45 @@ function parsePolicy(url: URL): PolicyParse {
   return { kind: "ok", policy: { floor, cooldownMs } };
 }
 
+type TargetParse = { kind: "ok"; target: InstallTarget } | { kind: "invalid"; error: string };
+
+/**
+ * The platform an install is for (`os` and `cpu`, as node's process.platform and process.arch name them), "any" for
+ * each the caller leaves out: an optional dependency built for another platform is skipped, as the package manager
+ * skips it. A value apm cannot read is an error, never "any".
+ */
+function parseTarget(input: { os: string | null | undefined; cpu: string | null | undefined }): TargetParse {
+  const os = input.os ?? "any";
+  const cpu = input.cpu ?? "any";
+
+  if (!isTargetValue(os)) return { kind: "invalid", error: `os must be "any" or a platform such as linux, darwin or win32 (got "${os}")` };
+
+  if (!isTargetValue(cpu)) return { kind: "invalid", error: `cpu must be "any" or an architecture such as x64 or arm64 (got "${cpu}")` };
+
+  return { kind: "ok", target: { os, cpu } };
+}
+
 type TreeBlock = { name: string; version: string; reason: string; via: string[] };
 
 /** A dependency the walk could not score: a git or URL spec, a missing package, a failed analysis or the walk's limit. */
 type UncheckedDep = { dependency: string; reason: string; via: string[] };
 
 /**
- * `packages`: every name@version the walk checked, so the CLI can pin each scope in the tree to this registry.
- * `digests`: the tarball digest of each of those, which keys its AI review; not sent.
+ * An optional dependency built for another platform than the install's: the package manager skips it, so the walk
+ * neither checks it nor walks what it depends on. Not unchecked: it is not installed.
  */
+type PlatformSkip = { dependency: string; version: string; reason: string; via: string[] };
+
 /**
- * `blocks`: what refuses the install in every mode (a dependency inside its cooldown). `warnings`: what strict mode
- * refuses and the default mode installs with a warning (a low or incomplete score, a version apm cannot score, a
- * lookup that failed, the walk's limits); pending versions get theirs only once the resolve stops waiting.
- * `unscorable` and `unavailable` list those two kinds apart. `limited`: the walk stopped at one of its limits.
+ * `warnings`: what strict mode refuses and the default mode installs with a warning (a version inside the cooldown, a
+ * low or incomplete score, a version apm cannot score, a lookup that failed, the walk's limits); pending versions get
+ * theirs only once the resolve stops waiting. `unscorable` and `unavailable` list those two kinds apart. `limited`:
+ * the walk stopped at one of its limits. `skippedForPlatform`: optional dependencies the install's platform does not
+ * take (at most MAX_UNCHECKED_LISTED listed, `platformSkips` counts them all). `packages`: every name@version the walk
+ * checked, so the CLI can pin each scope in the tree to this registry. `digests`: the tarball digest of each of those,
+ * which keys its AI review; not sent.
  */
 type Tree = {
-  blocks: TreeBlock[];
   warnings: InstallWarning[];
   unchecked: number;
   uncheckedDeps: UncheckedDep[];
@@ -1698,6 +1768,8 @@ type Tree = {
   unscorable: (DepRef & { reason: string; via: string[] })[];
   unavailable: { dependency: string; via: string[] }[];
   limited: boolean;
+  skippedForPlatform: PlatformSkip[];
+  platformSkips: number;
   packages: { name: string; version: string }[];
   digests: (string | null)[];
 };
@@ -1727,18 +1799,47 @@ export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: numb
 
 const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxWeight: REQUEST_METADATA_WEIGHT };
 
+/** A walked package's key, `name@version`, split back: a scoped name's own `@` comes first. */
+function splitKey(key: string): { name: string; version: string } {
+  const at = key.lastIndexOf("@");
+
+  return at > 0 ? { name: key.slice(0, at), version: key.slice(at + 1) } : { name: key, version: "" };
+}
+
+/** A package's dependencies that install into node_modules beside it, by the folder name each installs under. */
+function installedChildren(manifest: InstallManifest): Map<string, RegistryDependency> {
+  const out = new Map<string, RegistryDependency>();
+
+  for (const e of installEdges(manifest)) if (e.edge !== "peer" && isRegistryDependency(e.spec)) out.set(e.spec.key, e.spec);
+
+  return out;
+}
+
+/** Where the walk files what installs at the top of node_modules beside the root: no package key is empty. */
+const TOP = "";
+
+/** One dependency the walk has still to look at: what it is, how it comes in, and the path from the root to it. */
+type WalkItem = { dep: DependencySpec; edge: DependencyEdge; via: string[]; level: number };
+
 /**
- * Walks the dependency tree the package manager would install (newest active version matching each
- * range, npm: aliases followed to the package they install) and returns the versions that are revoked
- * or score below the floor. Bounded: at most `maxNodes` packages, `maxLookups` lookups, `maxLevels` levels and
- * `maxAnalyses` tarball analyses. Each name's catalog is read once per walk, a level's names in one batch, and each
- * name and range is resolved once. Everything it could not score is counted and listed, never dropped.
+ * Walks the dependency tree the package manager would install (newest active version matching each range, npm:
+ * aliases followed to the package they install) for the install's platform, and returns what it found to warn about.
+ * dependencies and optionalDependencies are walked, and each required peer the tree does not already meet: a peer of
+ * a package is met by the nearest version its parent or an ancestor installs (or an ancestor itself) when that version
+ * is in the peer's range; otherwise the package manager adds the version the range picks, and the walk checks that one
+ * (review of 2fbf383, finding 2). An optional dependency built for another platform is skipped, with what it depends
+ * on, before any check (finding 5). A version inside the cooldown is a warning: it is the version the package manager
+ * installs, so it is the one checked (finding 1). Bounded: at most `maxNodes` packages, `maxLookups` lookups,
+ * `maxLevels` levels and `maxAnalyses` tarball analyses. Each name's catalog is read once per walk, a level's names in
+ * one batch, and each name and range is resolved once. Everything it could not score is counted and listed, never
+ * dropped.
  */
-const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: WalkLimits = WALK_LIMITS) =>
+const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; limits?: WalkLimits }) =>
   Effect.gen(function* () {
+    const { root, policy, target, lease } = input;
+    const limits = input.limits ?? WALK_LIMITS;
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
-    const blocks: TreeBlock[] = [];
     const warnings: InstallWarning[] = [];
     const unscorable: Tree["unscorable"] = [];
     const unavailable: Tree["unavailable"] = [];
@@ -1747,6 +1848,8 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
     const pending: PendingDep[] = [];
     const packages: Tree["packages"] = [];
     const digests: Tree["digests"] = [];
+    const skippedForPlatform: PlatformSkip[] = [];
+    const platformSkipped = new Set<string>();
     let unchecked = 0;
 
     const miss = (dependency: string, reason: string, via: string[]): void => {
@@ -1767,7 +1870,41 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
     let analyses = 0;
     let loadedLevel = 0;
     const rootId = `${root.package}@${root.version}`;
-    const queue = dependencySpecs(root.manifest).map((dep) => ({ dep, via: [rootId], level: 1 }));
+
+    // each walked package's installed dependencies, so a peer can be met by what is already beside it; a peer the walk
+    // adds is installed beside the package that wants it, so it counts among its parent's (the root's, at the top)
+    const children = new Map<string, Map<string, RegistryDependency>>([
+      [rootId, installedChildren(root.manifest)],
+      [TOP, new Map()],
+    ]);
+
+    const queue: WalkItem[] = installEdges(root.manifest).map((e) => ({ dep: e.spec, edge: e.edge, via: [rootId], level: 1 }));
+
+    /**
+     * The version a peer of the package at the end of `via` finds already installed: the nearest of its parent's
+     * dependencies, then each ancestor's, or an ancestor itself, as node resolves it from beside that package. null
+     * when nothing in the walk installs it (or its lookup did not find a version).
+     */
+    const installedPeer = (peer: RegistryDependency, via: readonly string[]): string | null => {
+      for (let i = via.length - 2; i >= -1; i--) {
+        const ancestor = i >= 0 ? via[i] : TOP;
+
+        if (ancestor === undefined) continue;
+        const dep = children.get(ancestor)?.get(peer.key);
+
+        if (dep) {
+          const p = resolved.get(lookupKey(dep));
+
+          return p?.kind === "found" ? p.v.version : null;
+        }
+
+        const own = splitKey(ancestor);
+
+        if (own.name === peer.key) return own.version;
+      }
+
+      return null;
+    };
 
     const stop = (qi: number, reason: string): void => {
       const rest = queue.length - qi;
@@ -1813,8 +1950,23 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
       const dep = item.dep;
 
       if (!isRegistryDependency(dep)) {
-        miss(describeDependency(dep), uncheckableReason(dep), item.via);
+        // a peer the walk cannot pick a version for is listed as one, never left out
+        miss(describeDependency(dep), item.edge === "peer" ? `peer dependency: ${uncheckableReason(dep)}` : uncheckableReason(dep), item.via);
         continue;
+      }
+
+      if (item.edge === "peer" && dep.kind === "registry") {
+        // met by the version already beside the package: nothing more is installed for it
+        const there = installedPeer(dep, item.via);
+
+        if (there !== null && satisfies(there, dep.range)) continue;
+      }
+
+      if (item.edge === "peer") {
+        // added beside the package that wants it: a peer of a package beside it, or below it, is met by this one
+        const beside = children.get(item.via.length >= 2 ? (item.via[item.via.length - 2] ?? TOP) : TOP);
+
+        if (beside && !beside.has(dep.key)) beside.set(dep.key, dep);
       }
 
       let picked = resolved.get(lookupKey(dep));
@@ -1857,11 +2009,27 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
       }
 
       if (picked.kind !== "found") {
-        miss(describeDependency(dep), picked.reason, item.via);
+        miss(describeDependency(dep), item.edge === "peer" ? `peer dependency: ${picked.reason}` : picked.reason, item.via);
         continue;
       }
 
       const key = `${dep.name}@${picked.v.version}`;
+
+      if (item.edge === "optional") {
+        // the package manager skips an optional dependency built for another platform: it is not checked, and nothing
+        // it depends on is walked, so it cannot change what the install is told
+        const other = platformMismatch(picked.v.manifest, target);
+
+        if (other !== null) {
+          if (!platformSkipped.has(key)) {
+            platformSkipped.add(key);
+
+            if (skippedForPlatform.length < MAX_UNCHECKED_LISTED) skippedForPlatform.push({ dependency: dep.name, version: picked.v.version, reason: other, via: item.via });
+          }
+
+          continue;
+        }
+      }
 
       if (seen.has(key)) continue;
       seen.add(key);
@@ -1877,13 +2045,14 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
         } else if (picked.src.kind === "upstream" && !v.unscorable) yield* Effect.flatMap(Analysis, (a) => a.enqueue(dep.name, v.version));
       }
 
-      const age = at - v.published_at;
+      const url = versionUrl(webUrl, dep.name, v.version);
+      // the package manager installs this version whatever its age: a warning (strict: refused), and the version checked
+      const fresh = cooldownWarning({ name: dep.name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: item.via });
+
+      if (fresh) warnings.push(fresh);
       const r = reportFor(v, at, { ignoreRecent: true });
 
-      // the package manager installs this version whatever its age, so a fresh one blocks the tree like a low score
-      if (age < policy.cooldownMs) {
-        blocks.push({ name: dep.name, version: v.version, reason: `published ${Math.floor(age / HOUR)}h ago (cooldown ${Math.round(policy.cooldownMs / HOUR)}h)`, via: item.via });
-      } else if (!r) {
+      if (!r) {
         const why = notScored(picked.src, v);
 
         // queued for analysis is pending: the answer waits for it, then warns (strict: 202). A version decided
@@ -1892,20 +2061,22 @@ const treeBlocks = (root: VersionRecord, policy: Policy, lease: Lease, limits: W
         if (why.kind === "queued") pending.push({ name: dep.name, version: v.version, via: item.via });
         else {
           unscorable.push({ name: dep.name, version: v.version, reason: why.text, via: item.via });
-          warnings.push(stateWarning({ kind: "unscorable", name: dep.name, version: v.version, text: why.text, url: versionUrl(webUrl, dep.name, v.version), via: item.via }));
+          warnings.push(stateWarning({ kind: "unscorable", name: dep.name, version: v.version, text: why.text, url, via: item.via }));
         }
       } else {
-        const w = scoreWarning({ name: dep.name, version: v.version, report: r, floor: policy.floor, url: versionUrl(webUrl, dep.name, v.version), via: item.via });
+        const w = scoreWarning({ name: dep.name, version: v.version, report: r, floor: policy.floor, url, via: item.via });
 
         if (w) warnings.push(w);
       }
 
       // every package is checked once (seen), every name and range looked up once (resolved), and the walk stops at
       // its limits, counting the rest as unchecked: a cut-off never drops part of the tree without saying so
-      for (const d of dependencySpecs(v.manifest)) queue.push({ dep: d, via: [...item.via, key], level: item.level + 1 });
+      children.set(key, installedChildren(v.manifest));
+
+      for (const e of installEdges(v.manifest)) queue.push({ dep: e.spec, edge: e.edge, via: [...item.via, key], level: item.level + 1 });
     }
 
-    const tree: Tree = { blocks, warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, packages, digests };
+    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, skippedForPlatform, platformSkips: platformSkipped.size, packages, digests };
 
     return tree;
   });
@@ -1967,14 +2138,22 @@ const reviewerConfirmed = (v: VersionRecord) =>
     return standings.get(`${v.package}@${v.version}`) === "confirmed";
   });
 
-/** The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. */
+/**
+ * The walk as the resolve answer sends it: the internal digests stay out, the AI review standings go in. `blocks` is
+ * what strict mode refused in the tree; empty on an install that goes ahead (it once held the dependencies inside their
+ * cooldown, which every mode refused, and older clients still read it).
+ */
+const NO_BLOCKS: readonly TreeBlock[] = [];
+
 const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({
-  blocks: tree.blocks,
+  blocks: NO_BLOCKS,
   unchecked: tree.unchecked,
   uncheckedDeps: tree.uncheckedDeps,
   pending: tree.pending,
   unscorable: tree.unscorable,
   unavailable: tree.unavailable,
+  skippedForPlatform: tree.skippedForPlatform,
+  platformSkips: tree.platformSkips,
   packages: tree.packages,
   reviews,
 });
@@ -2015,125 +2194,253 @@ type ResolveMode = { strict: boolean; final: boolean };
  * One pass of resolve over `src`. Its walk holds what it reads under a child of `lease`, given back when the pass has
  * its answer: what it returns refers to no catalog.
  */
-const resolvePass = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Catalog; mode: ResolveMode; lease: Lease }) =>
+/** A later page of a resolve's root, read under `lease` (rootPage): the catalog, or why it could not be read. */
+type PageRead = (offset: number, lease: Lease) => ReturnType<typeof catalogWithin>;
+
+type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead };
+
+const resolvePass = (input: PassInput) =>
   Effect.suspend(() => {
     const walk = input.lease.child();
 
     return resolveWalk({ ...input, lease: walk }).pipe(Effect.ensuring(Effect.sync(() => walk.release())));
   });
 
-/** The versions of a resolve's root it skips at most before it answers that none passes the policy. */
+/** The skipped versions a resolve answer lists at most. */
 const MAX_ROOT_SKIPPED = 20;
 
+/** The candidates for the root one page of it keeps: the root's summary holds only a page at a time. */
+const ROOT_PAGE = 20;
+
 /**
- * The versions a resolve of `range` looks at, newest first: those in range, or for a tag those in its channel, and no
- * more than it can skip (MAX_ROOT_SKIPPED), so the root's summary keeps only these.
+ * The candidates for the root a resolve looks at in all, a page at a time, before it answers that none passes. Withheld
+ * versions are not among them: they are dropped before a page is cut.
  */
-function rootCandidates(src: Catalog, range: string): VersionRecord[] {
+export const MAX_ROOT_CANDIDATES = 200;
+
+/** The versions a resolve of `range` may install, newest first: those in range, or for a tag those in its channel. */
+function inRange(src: Catalog, range: string): VersionRecord[] {
   const tagged = tagTarget(src.distTags, range);
   // A tag keeps its channel: `next` -> 2.0.0-beta.3 may fall back to 2.0.0-beta.2 or a stable release
   // below it, but a stable tag never falls back to a prerelease.
   const base = (v: string): string => v.split("-")[0] ?? v;
   const inChannel = (v: string, t: string): boolean => order(v, t) <= 0 && (!v.includes("-") || (t.includes("-") && base(v) === base(t)));
 
-  return src.versions
-    .filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range)))
-    .sort((a, b) => newestFirst(a.version, b.version))
-    .slice(0, MAX_ROOT_SKIPPED);
+  return src.versions.filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range))).sort((a, b) => newestFirst(a.version, b.version));
 }
 
-const resolveWalk = (input: { name: string; range: string; policy: Policy; treePolicy: Policy; src: Catalog; mode: ResolveMode; lease: Lease }) =>
-  Effect.gen(function* () {
-    const { name, range, policy, treePolicy, src, mode, lease } = input;
-    const at = yield* now;
-    const { webUrl } = yield* RegistryConfig;
-    const matches = rootCandidates(src, range);
+/**
+ * One page of a resolve's root, newest first: from the `offset`th candidate on, ROOT_PAGE candidates and one more that
+ * says another page follows. A withheld version (revoked, revocation pending, yanked) is never a candidate: it is
+ * dropped before the page is cut, so any number of them above an installable version cannot hide it (review of
+ * 2fbf383, finding 4). The first page keeps those newer than its last candidate too, at most MAX_ROOT_SKIPPED, for the
+ * answer to list as skipped. The root's summary keeps only these.
+ */
+function rootPage(src: Catalog, range: string, offset: number): VersionRecord[] {
+  const kept: VersionRecord[] = [];
+  let candidates = 0;
+  let withheld = 0;
 
-    const skipped: { version: string; reason: string; revokeReason: string | null }[] = [];
-    let analyzedCount = 0;
-
-    for (const v0 of matches) {
-      // analyze a bounded number of candidates; upstream analysis means downloading the tarball
-      const v = analyzedCount < 5 ? yield* ensureAnalyzed(src, v0) : v0;
-      analyzedCount++;
-      // strict skips a version under the floor or with no score; the default mode installs it with a warning. A version
-      // an apm reviewer confirmed malicious is skipped in every mode, as a revoked one is
-      const policyWhy = mode.strict ? policyBlock(v, policy, at) : hardBlock(v, policy, at);
-      const block = policyWhy === null && (yield* reviewerConfirmed(v)) ? CONFIRMED_SKIP : policyWhy;
-      const report = reportFor(v, at);
-      const unscored = report === null ? notScored(src, v) : null;
-      // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
-      const pendingRoot = (block === null || block === NOT_SCORED_YET) && unscored?.kind === "queued";
-
-      if (block === null || pendingRoot) {
-        // a pending root's tree is walked too, so its dependencies are queued while it is
-        const walked = yield* treeBlocks(v, treePolicy, lease);
-        const tree = treeAnswer(walked, yield* treeReviews(walked));
-        const newest = { version: v.version, report: embeddedReport(v, report) };
-
-        // a dependency confirmed malicious by an apm reviewer: refused in every mode, since the package manager would
-        // install it (the version itself was skipped above)
-        const confirmed = tree.reviews.kind === "on" ? tree.reviews.confirmed : [];
-
-        if (confirmed.length > 0) {
-          return answered(json({ error: `${name}@${v.version} would install ${confirmed.map((c) => `${c.name}@${c.version}`).join(", ")}, which apm reviewers confirmed ${confirmed.length === 1 ? "is" : "are"} malicious.`, name, range, version: null, skipped, newest, tree, confirmed }, 422));
-        }
-
-        // the refused dependencies are the tree's blocks, as the answer lists them
-        const refuse = (blocks: TreeBlock[]) =>
-          answered(json({ error: `${name}@${v.version} would install dangerous dependencies: ${blocks.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ")}`, name, range, version: null, skipped, newest, tree: { ...tree, blocks } }, 422));
-
-        // a dependency inside its cooldown: not a score, refused in every mode
-        if (walked.blocks.length > 0) return refuse(walked.blocks);
-
-        if (mode.strict) {
-          // the registry or npm could not be asked about a dependency: not a pass, and a retry may succeed
-          if (walked.unavailable.length > 0) {
-            return answered(
-              json(
-                { error: `${name}@${v.version}: ${walked.unavailable.length === 1 ? "a dependency" : `${walked.unavailable.length} dependencies`} ${UNAVAILABLE_TEXT} (${walked.unavailable.map((u) => u.dependency).join(", ")}). Nothing was installed as if it passed; try again in a minute.`, name, range, version: null, unavailable: walked.unavailable, retryAfter: PENDING_RETRY_AFTER_S, skipped, newest, tree },
-                503,
-                { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
-              ),
-            );
-          }
-
-          const scored = walked.warnings.filter((w) => w.kind !== "unavailable");
-
-          if (scored.length > 0) return refuse(scored.map((w) => ({ name: w.name, version: w.version, reason: w.text, via: w.via })));
-        }
-
-        if (!mode.final && (pendingRoot || walked.pending.length > 0)) {
-          const pending = [...(pendingRoot ? [{ name, version: v.version, via: [] }] : []), ...walked.pending];
-
-          return waitingOn({ version: v.version, pending, skipped });
-        }
-
-        // what installs with a warning: the version itself, then its tree, then what is still pending
-        const url = versionUrl(webUrl, name, v.version);
-        // judged as the floor judges it: a fresh publish's own signal is the cooldown's business, not the score's
-        const judged = reportFor(v, at, { ignoreRecent: true });
-        const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [] }) : null;
-        // every dependency still pending warns, the root's own pending included (review of a76b9fc, finding 3)
-        const stillPending = walked.pending.map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
-        const warnings = [...(own ? [own] : []), ...walked.warnings, ...stillPending];
-
-        // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
-        return answered(json({ name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, warnings, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor, strict: mode.strict } }, 200, { "cache-control": "no-store" }));
+  for (const v of inRange(src, range)) {
+    if (withheldBlock(v) !== null) {
+      if (offset === 0 && withheld < MAX_ROOT_SKIPPED) {
+        kept.push(v);
+        withheld++;
       }
 
-      skipped.push({ version: v.version, reason: block, revokeReason: isWithheld(v.status) ? (v.status_reason ?? "no reason given") : null });
-
-      if (skipped.length >= MAX_ROOT_SKIPPED) break;
+      continue;
     }
 
-    const newest = matches[0];
+    if (candidates >= offset) kept.push(v);
+    candidates++;
+
+    if (candidates > offset + ROOT_PAGE) break;
+  }
+
+  return kept;
+}
+
+/** Which of `versions` an apm reviewer confirmed malicious: one read for them all, none when this registry runs no AI review. */
+const confirmedAmong = (versions: readonly VersionRecord[]) =>
+  Effect.gen(function* () {
+    if (versions.length === 0 || Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return new Set<string>();
+    const standings = yield* reviewStandings(versions.map((v) => ({ name: v.package, version: v.version, digest: digestLabelOf(v) })));
+
+    return new Set(versions.flatMap((v) => (standings.get(`${v.package}@${v.version}`) === "confirmed" ? [v.version] : [])));
+  });
+
+/** The digest label that keys a version's AI review, or null. */
+function digestLabelOf(v: VersionRecord): string | null {
+  const digest = digestOf(v);
+
+  return digest ? digestLabel(digest) : null;
+}
+
+/** A version of the root a resolve skipped, as its answer lists it. */
+type Skipped = { version: string; reason: string; revokeReason: string | null };
+
+/**
+ * The root's candidates, newest first, a page at a time (rootPage), until one passes or MAX_ROOT_CANDIDATES have been
+ * looked at. A page after the first is read under a child of `lease` of its own, given back when the next is read, so
+ * what the search keeps stays one page whatever it skips; `skipped` lists at most MAX_ROOT_SKIPPED of what it skipped.
+ */
+const resolveWalk = (input: PassInput) =>
+  Effect.gen(function* () {
+    const { name, range, policy, treePolicy, target, src, mode, lease } = input;
+    const at = yield* now;
+    const { webUrl } = yield* RegistryConfig;
+    const skipped: Skipped[] = [];
+
+    const skip = (s: Skipped): void => {
+      if (skipped.length < MAX_ROOT_SKIPPED) skipped.push(s);
+    };
+
+    let analyzedCount = 0;
+    let looked = 0;
+    let offset = 0;
+    let page = src;
+    let pageLease: Lease | null = null;
+    const newest = src.versions[0];
+
+    for (;;) {
+      const candidates = page.versions.filter((v) => withheldBlock(v) === null);
+      const more = candidates.length > ROOT_PAGE;
+      const current = candidates.slice(0, ROOT_PAGE);
+      // whether an apm reviewer confirmed any of this page malicious: one read a page
+      const confirmed = yield* confirmedAmong(current);
+
+      for (const v0 of page.versions) {
+        const held = withheldBlock(v0);
+
+        // a withheld version is listed as skipped, and never looked at further
+        if (held !== null) {
+          skip({ version: v0.version, reason: held, revokeReason: isWithheld(v0.status) ? (v0.status_reason ?? "no reason given") : null });
+          continue;
+        }
+
+        if (!current.includes(v0)) break;
+        looked++;
+        // analyze a bounded number of candidates; upstream analysis means downloading the tarball
+        const v = analyzedCount < 5 ? yield* ensureAnalyzed(page, v0) : v0;
+        analyzedCount++;
+        // strict skips a version under the floor, with no score or inside the cooldown; the default mode installs each
+        // with a warning. A version an apm reviewer confirmed malicious is skipped in every mode, as a revoked one is
+        const policyWhy = mode.strict ? policyBlock(v, policy, at) : null;
+        const block = policyWhy === null && confirmed.has(v.version) ? CONFIRMED_SKIP : policyWhy;
+        const report = reportFor(v, at);
+        const unscored = report === null ? notScored(page, v) : null;
+        // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
+        const pendingRoot = (block === null || block === NOT_SCORED_YET) && unscored?.kind === "queued";
+
+        if (block === null || pendingRoot) return yield* rootAnswer({ name, range, policy, treePolicy, target, mode, lease, src: page, v, report, unscored, pendingRoot, skipped, at, webUrl });
+        skip({ version: v.version, reason: block, revokeReason: null });
+      }
+
+      if (!more || looked >= MAX_ROOT_CANDIDATES) break;
+      // the next page, under a lease of its own: the page before it is given back (the first is the caller's)
+      offset += ROOT_PAGE;
+      const nextLease = lease.child();
+      const got = yield* input.page(offset, nextLease);
+      pageLease?.release();
+      pageLease = nextLease;
+
+      if (got === null || got === "unknown" || got === "over-budget") {
+        return answered(json({ error: `${name} ${UNAVAILABLE_TEXT}: apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
+      }
+
+      page = got;
+    }
+
     const newestReport = newest ? reportFor(newest, at) : null;
+    const searched = looked >= MAX_ROOT_CANDIDATES ? ` apm looked at the newest ${MAX_ROOT_CANDIDATES} versions it could install.` : "";
 
     return answered(
       json(
-        { error: `No version of ${name} matching ${range} passes the policy.`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
+        { error: `No version of ${name} matching ${range} passes the policy.${searched}`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
         422,
+      ),
+    );
+  });
+
+/**
+ * The answer for the root version `v` a resolve picked: its tree walked for `target`, then refused (a dependency an
+ * apm reviewer confirmed malicious, in every mode; in strict mode anything the walk warned about), waited for (what is
+ * still queued for analysis), or installed with the warnings it carries.
+ */
+const rootAnswer = (input: {
+  name: string;
+  range: string;
+  policy: Policy;
+  treePolicy: Policy;
+  target: InstallTarget;
+  mode: ResolveMode;
+  lease: Lease;
+  src: Catalog;
+  v: VersionRecord;
+  report: ReturnType<typeof reportFor>;
+  unscored: ReturnType<typeof notScored> | null;
+  pendingRoot: boolean;
+  skipped: Skipped[];
+  at: number;
+  webUrl: string;
+}) =>
+  Effect.gen(function* () {
+    const { name, range, policy, treePolicy, target, mode, lease, src, v, report, unscored, pendingRoot, skipped, at, webUrl } = input;
+    // a pending root's tree is walked too, so its dependencies are queued while it is
+    const walked = yield* walkTree({ root: v, policy: treePolicy, target, lease });
+    const tree = treeAnswer(walked, yield* treeReviews(walked));
+    const newest = { version: v.version, report: embeddedReport(v, report) };
+
+    // a dependency confirmed malicious by an apm reviewer: refused in every mode, since the package manager would
+    // install it (the version itself was skipped above)
+    const confirmed = tree.reviews.kind === "on" ? tree.reviews.confirmed : [];
+
+    if (confirmed.length > 0) {
+      return answered(json({ error: `${name}@${v.version} would install ${confirmed.map((c) => `${c.name}@${c.version}`).join(", ")}, which apm reviewers confirmed ${confirmed.length === 1 ? "is" : "are"} malicious.`, name, range, version: null, skipped, newest, tree, confirmed }, 422));
+    }
+
+    if (mode.strict) {
+      // the registry or npm could not be asked about a dependency: not a pass, and a retry may succeed
+      if (walked.unavailable.length > 0) {
+        return answered(
+          json(
+            { error: `${name}@${v.version}: ${walked.unavailable.length === 1 ? "a dependency" : `${walked.unavailable.length} dependencies`} ${UNAVAILABLE_TEXT} (${walked.unavailable.map((u) => u.dependency).join(", ")}). Nothing was installed as if it passed; try again in a minute.`, name, range, version: null, unavailable: walked.unavailable, retryAfter: PENDING_RETRY_AFTER_S, skipped, newest, tree },
+            503,
+            { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
+          ),
+        );
+      }
+
+      // a dependency inside its cooldown, a low or missing score, a walk cut short: each refused, and listed as blocks
+      const refused = walked.warnings.filter((w) => w.kind !== "unavailable").map((w): TreeBlock => ({ name: w.name, version: w.version, reason: w.text, via: w.via }));
+
+      if (refused.length > 0) {
+        return answered(json({ error: `${name}@${v.version} would install dangerous dependencies: ${refused.map((b) => `${b.name}@${b.version} ${b.reason} via ${b.via.join(" > ")}`).join("; ")}`, name, range, version: null, skipped, newest, tree: { ...tree, blocks: refused } }, 422));
+      }
+    }
+
+    if (!mode.final && (pendingRoot || walked.pending.length > 0)) {
+      const pending = [...(pendingRoot ? [{ name, version: v.version, via: [] }] : []), ...walked.pending];
+
+      return waitingOn({ version: v.version, pending, skipped });
+    }
+
+    // what installs with a warning: the version itself (its age, then its score), then its tree, then what is pending
+    const url = versionUrl(webUrl, name, v.version);
+    const fresh = cooldownWarning({ name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
+    // judged as the floor judges it: a fresh publish's own signal is the cooldown's business, not the score's
+    const judged = reportFor(v, at, { ignoreRecent: true });
+    const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [] }) : null;
+    // every dependency still pending warns, the root's own pending included (review of a76b9fc, finding 3)
+    const stillPending = walked.pending.map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
+    const warnings = [...(fresh ? [fresh] : []), ...(own ? [own] : []), ...walked.warnings, ...stillPending];
+
+    // the verdict and `apm add` act on this answer: it is never cached, version states change at any time
+    return answered(
+      json(
+        { name, range, source: src.kind, version: v.version, report: embeddedReport(v, report), skipped, tree, warnings, policy: { cooldownHours: policy.cooldownMs / HOUR, floor: policy.floor, strict: mode.strict, os: target.os, cpu: target.cpu } },
+        200,
+        { "cache-control": "no-store" },
       ),
     );
   });
@@ -2169,6 +2476,11 @@ export const resolveResponse = (url: URL) =>
     const asked = parseWait(url.searchParams.get(WAIT_PARAM));
 
     if (asked.kind === "invalid") return fail(400, asked.error);
+    // the platform the install is for: an optional dependency built for another is skipped (review of 2fbf383, finding 5)
+    const parsedTarget = parseTarget({ os: url.searchParams.get("os"), cpu: url.searchParams.get("cpu") });
+
+    if (parsedTarget.kind === "invalid") return fail(400, parsedTarget.error);
+    const target = parsedTarget.target;
     const policy = parsedPolicy.policy;
     // A lower floor (apm add --force sends 0) applies to the named package only; its dependencies are
     // always checked at the default floor or the stricter one asked for. The cooldown is the one asked for.
@@ -2181,7 +2493,9 @@ export const resolveResponse = (url: URL) =>
     let rootLease = lease.child();
     // one variable holds the root, so a catalog its lease gave back is never still reachable; a root that did not fit
     // could not be looked up, as before
-    const candidates = (full: Catalog) => rootCandidates(full, range);
+    const candidates = (full: Catalog) => rootPage(full, range, 0);
+    // a later page of the root's candidates, when the first is all skipped (review of 2fbf383, finding 4)
+    const page: PageRead = (offset, under) => catalogWithin(name, under, (full) => rootPage(full, range, offset));
     const first = yield* catalogWithin(name, rootLease, candidates);
     let src: Catalog | null | "unknown" = first === "over-budget" ? "unknown" : first;
 
@@ -2207,7 +2521,7 @@ export const resolveResponse = (url: URL) =>
 
     for (;;) {
       if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: false }, lease });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, src, page, mode: { strict, final: false }, lease });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -2225,7 +2539,7 @@ export const resolveResponse = (url: URL) =>
         src = yield* reload;
 
         if (!src) return fail(404, `No package named ${name}.`);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, src, mode: { strict, final: true }, lease });
+        const last = yield* resolvePass({ name, range, policy, treePolicy, target, src, page, mode: { strict, final: true }, lease });
 
         if (last.kind === "answer") return last.response;
       }
@@ -2254,7 +2568,11 @@ export const resolveResponse = (url: URL) =>
     }
   });
 
-const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })), strict: z.boolean().optional() });
+/**
+ * A scan request: the packages the package manager proposes to install, and what for. `os` and `cpu` are the
+ * install's platform (process.platform and process.arch; "any", the default, for none in particular).
+ */
+const ScanBody = z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })), strict: z.boolean().optional(), os: z.string().optional(), cpu: z.string().optional() });
 
 /** Packages one scan checks: signed in, and without a token. Each may mean an upstream packument and tarball. */
 export const MAX_SCAN = 2000;
@@ -2271,20 +2589,45 @@ type ScanUnchecked = { package: string; version: string; reason: string };
 type ScanPending = { package: string; version: string };
 
 /**
- * One package's scan. `flagged`: what the default mode installs with a warning and strict mode refuses, as an
- * advisory at the level the mode gives it, with the warning itself and which list it also goes in.
+ * One finding of a package's scan. `flagged`: what the default mode installs with a warning and strict mode refuses,
+ * as an advisory at the level the mode gives it, with the warning itself and which list it also goes in.
  */
 type ScanOne =
   | { kind: "clean" }
   | { kind: "advisory"; advisory: ScanAdvisory }
-  | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "unscorable" | "unavailable" }
+  | { kind: "flagged"; advisory: ScanAdvisory; warning: InstallWarning; list: "scored" | "cooldown" | "unscorable" | "unavailable" }
   | { kind: "unchecked"; unchecked: ScanUnchecked }
   | { kind: "pending"; unchecked: ScanUnchecked };
 
-const scanOne = (p: { name: string; version: string }, strict: boolean, at: number, lease: Lease) =>
+/** The names a scanned version brings in, by how: what decides whether a package built for another platform installs. */
+type ScanEdges = { required: string[]; optional: string[] };
+
+/**
+ * One package's scan: its findings, or `deferred` for a version built for another platform than the install's, which
+ * is checked only if nothing in the scan shows it is optional (scanResponse). `edges`: what the version brings in.
+ */
+type ScanRead = { kind: "done"; findings: ScanOne[]; edges: ScanEdges | null } | { kind: "deferred"; reason: string; edges: ScanEdges };
+
+/** The names `manifest` brings in, by edge: a required peer counts as required. Each under its folder name and the name it installs. */
+function scanEdges(manifest: InstallManifest): ScanEdges {
+  const required: string[] = [];
+  const optional: string[] = [];
+
+  for (const e of installEdges(manifest)) {
+    const names = isRegistryDependency(e.spec) ? [e.spec.key, e.spec.name] : [e.spec.key];
+
+    (e.edge === "optional" ? optional : required).push(...names);
+  }
+
+  return { required, optional };
+}
+
+const scanOne = (input: { p: { name: string; version: string }; strict: boolean; at: number; lease: Lease; target: InstallTarget }) =>
   Effect.gen(function* () {
+    const { p, strict, at, lease, target } = input;
     const { webUrl } = yield* RegistryConfig;
-    const unchecked = (reason: string): ScanOne => ({ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } });
+    const done = (findings: ScanOne[], edges: ScanEdges | null = null): ScanRead => ({ kind: "done", findings, edges });
+    const unchecked = (reason: string): ScanRead => done([{ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } }]);
     const url = versionUrl(webUrl, p.name, p.version);
     const level = strict ? "fatal" : "warn";
 
@@ -2302,24 +2645,32 @@ const scanOne = (p: { name: string; version: string }, strict: boolean, at: numb
     if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 
     // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
-    if (src === "unknown") return flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable");
+    if (src === "unknown") return done([flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")]);
 
     if (src === null) return unchecked("not on this registry or upstream");
     const v0 = src.versions.find((x) => x.version === p.version);
 
     if (!v0) return unchecked("no such version");
+    const edges = scanEdges(v0.manifest);
+    // built for another platform: nothing is decided until the scan knows whether it is only optional
+    const other = platformMismatch(v0.manifest, target);
+
+    if (other !== null) return { kind: "deferred", reason: other, edges } satisfies ScanRead;
 
     if (v0.status === "revoked" || v0.status === "revoke-pending") {
       const advisory: ScanAdvisory = { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version} was revoked by its maintainer: ${v0.status_reason ?? "no reason given"}`, url };
 
-      return { kind: "advisory", advisory } satisfies ScanOne;
+      return done([{ kind: "advisory", advisory }], edges);
     }
 
     // confirmed malicious by an apm reviewer: refused in every mode
     if (yield* reviewerConfirmed(v0)) {
-      return { kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version}: apm reviewers confirmed this version is malicious.`, url } } satisfies ScanOne;
+      return done([{ kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description: `${p.name}@${p.version}: apm reviewers confirmed this version is malicious.`, url } }], edges);
     }
 
+    // inside the cooldown: a warning (strict: refused), and the version is still checked
+    const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: DEFAULT_POLICY.cooldownMs, url, via: [] });
+    const findings: ScanOne[] = fresh ? [flagged(fresh, "cooldown")] : [];
     // a stored analysis of these exact bytes is reused; a version never analyzed is queued
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
@@ -2327,29 +2678,36 @@ const scanOne = (p: { name: string; version: string }, strict: boolean, at: numb
     if (!r) {
       const why = notScored(src, v);
 
-      if (why.kind === "queued") return { kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } } satisfies ScanOne;
+      if (why.kind === "queued") return done([...findings, { kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } }], edges);
 
       // decided, not waiting: no score will come
-      return flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [] }), "unscorable");
+      return done([...findings, flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [] }), "unscorable")], edges);
     }
 
     const w = scoreWarning({ name: p.name, version: p.version, report: r, floor: SCORE_FLOOR, url, via: [] });
 
-    return w ? flagged(w, "scored") : ({ kind: "clean" } satisfies ScanOne);
+    return done([...findings, w ? flagged(w, "scored") : { kind: "clean" }], edges);
   });
 
 /**
  * POST /-/apm/v1/scan, the Bun scanner's question. A revoked version and one an apm reviewer confirmed malicious are
- * `fatal` advisories in every mode. A score under the floor, an incomplete analysis, a version apm cannot score and a
- * package the registry could not look up are `warn` advisories (strict: `fatal`), each with its warning in
- * `warnings`; `unscorable` and `unavailable` list the last two apart. A queued version is in `pending` (and in
- * `unchecked`, for scanners from before `pending`): the scanner asks again, then warns (strict: blocks).
+ * `fatal` advisories in every mode. A version inside the 24-hour cooldown, a score under the floor, an incomplete
+ * analysis, a version apm cannot score and a package the registry could not look up are `warn` advisories (strict:
+ * `fatal`), each with its warning in `warnings`; `unscorable` and `unavailable` list the last two apart. A queued
+ * version is in `pending` (and in `unchecked`, for scanners from before `pending`): the scanner asks again, then warns
+ * (strict: blocks). A version built for another platform than `os` and `cpu` that the scanned packages list only as an
+ * optionalDependency is not installed, so it is not checked: it is in `skippedForPlatform`, not `unchecked`. One a
+ * package requires, or that nothing in the scan lists (a dependency of the project itself), is checked as any other.
  */
 export const scanResponse = (req: Request, caller: Caller) =>
   Effect.gen(function* () {
     const at = yield* now;
     const body = yield* parseBody(req, ScanBody);
     const strict = body.strict === true || strictParam(new URL(req.url).searchParams.get("strict"));
+    const parsedTarget = parseTarget({ os: body.os, cpu: body.cpu });
+
+    if (parsedTarget.kind === "invalid") return fail(400, parsedTarget.error);
+    const target = parsedTarget.target;
     const signedIn = caller.kind === "user";
     const cap = signedIn ? MAX_SCAN : MAX_SCAN_ANONYMOUS;
     const seen = new Set<string>();
@@ -2372,9 +2730,38 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // queued versions are listed twice: in `unchecked`, so a scanner from before `pending` never reads one as clean,
     // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
+    const skippedForPlatform: ScanUnchecked[] = [];
+    const checked = packages.slice(0, cap);
     // the packuments of the packages being checked at once share the request's lease, each under a child of it given
     // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
-    const results = yield* Effect.forEach(packages.slice(0, cap), (p) => briefly((lease) => scanOne(p, strict, at, lease)), { concurrency: SCAN_CONCURRENCY });
+    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, target })), { concurrency: SCAN_CONCURRENCY });
+    // what the scanned packages bring in: a package is optional only when some list it as optional and none requires it
+    const required = new Set<string>();
+    const optional = new Set<string>();
+
+    for (const r of reads) {
+      for (const n of r.edges?.required ?? []) required.add(n);
+
+      for (const n of r.edges?.optional ?? []) optional.add(n);
+    }
+
+    const results: ScanOne[] = [];
+    const recheck: { name: string; version: string }[] = [];
+
+    for (const [i, r] of reads.entries()) {
+      const p = checked[i];
+
+      if (!p) continue;
+
+      if (r.kind === "done") results.push(...r.findings);
+      else if (optional.has(p.name) && !required.has(p.name)) skippedForPlatform.push({ package: p.name, version: p.version, reason: r.reason });
+      else recheck.push(p);
+    }
+
+    // built for another platform but required, or asked for by the project: the package manager may install it anyway
+    const rechecked = yield* Effect.forEach(recheck, (p) => briefly((lease) => scanOne({ p, strict, at, lease, target: ANY_TARGET })), { concurrency: SCAN_CONCURRENCY });
+
+    for (const r of rechecked) if (r.kind === "done") results.push(...r.findings);
 
     for (const r of results) {
       switch (r.kind) {
@@ -2411,7 +2798,7 @@ export const scanResponse = (req: Request, caller: Caller) =>
       : `a scan without a token checks at most ${MAX_SCAN_ANONYMOUS} packages; sign in (apm login) to check up to ${MAX_SCAN}, or send the rest in another request`;
 
     for (const p of packages.slice(cap)) unchecked.push({ package: p.name, version: p.version, reason: over });
-    const answer = { advisories, warnings, unchecked, pending, unscorable, unavailable, strict };
+    const answer = { advisories, warnings, unchecked, pending, unscorable, unavailable, skippedForPlatform, strict, target };
 
     return json(pending.length > 0 ? { ...answer, retryAfter: PENDING_RETRY_AFTER_S } : answer);
   });

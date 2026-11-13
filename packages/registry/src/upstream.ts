@@ -12,7 +12,7 @@ import { CACHE_WEIGHT, type Block, type Lease, type MemoryPool } from "./memory.
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { verifiedStream } from "./verified-stream.ts";
-import { reviewSummary, type Summary } from "./walk-catalog.ts";
+import { reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -473,14 +473,16 @@ export type UpstreamApi = {
   readonly probeMany: (names: readonly string[], lease: Lease) => Effect.Effect<Map<string, BudgetedProbe>, StoreError>;
   /**
    * probeMany for a caller that needs only part of each package (the resolve walk, its root, a scan): `keep` is handed
-   * each package with its analyses as soon as it is read, and only what it returns stays taken from `lease`. A package
+   * each package with its analyses as soon as it is read, and `lease` to reserve what it keeps before it builds it
+   * (walk-catalog.ts, keptSummary); it returns null, with nothing taken, when that does not fit. Only what it returns
+   * stays taken from `lease`. A package
    * the isolate cache has stays the cache's: it is never held by `lease`, and is pinned while it is kept so the pool
    * cannot take it back meanwhile. One read from npm is held under a child of `lease` only while it is converted and
    * kept, then left to the isolate cache (which keeps it if it fits, beside older entries). Names
    * that did not fit beside the others read at the same time are read again one at a time. `keep` must return
    * nothing that refers to the package, or that memory would be held with nothing counting it.
    */
-  readonly summaries: <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage) => Summary<S>) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
+  readonly summaries: <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage, reserve: Reserve) => Summary<S> | null) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
@@ -830,10 +832,11 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (Option.isNone(hooks)) return;
             const held = pool.backgroundLease();
-            const looked = held.hold(block) ? reviewSummary(pkg) : null;
+            // reserved from `held` as it is built, so the pool counts it while it is built (review of 2fbf383, finding 3)
+            const looked = held.hold(block) ? reviewSummary(pkg, held) : null;
             held.drop(block);
 
-            if (looked === null || !held.take(looked.weight)) {
+            if (looked === null) {
               held.release();
 
               return;
@@ -941,7 +944,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return new Map(got.map(([name, l]) => [name, l.kind === "found" ? scoredPackage(l.pkg, scores.get(name) ?? none) : l]));
           });
 
-        const summaries = <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage) => Summary<S>): Effect.Effect<Map<string, Summarized<S>>, StoreError> =>
+        const summaries = <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage, reserve: Reserve) => Summary<S> | null): Effect.Effect<Map<string, Summarized<S>>, StoreError> =>
           Effect.gen(function* () {
             const wanted = [...new Set(names)];
             // read before the packuments, so each package is kept the moment it is read: a name npm has no package for
@@ -950,20 +953,38 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
 
             /**
-             * What `keep` returns for `pkg`, its weight taken from `lease`. The scored copy keep is handed is charged
-             * while it runs unless the read already charged it (`copyCharged`: listed takes it with the package).
+             * What `keep` returns for `pkg`, reserved from `lease` by keep as it builds it, beside the scored copy keep
+             * is handed: that copy is charged while keep runs unless the read already charged it (`copyCharged`: listed
+             * takes it with the package). Both are alive at once, so both are charged at once (review of 2fbf383,
+             * finding 3).
              */
             const kept = (name: string, pkg: CachedPackage, copyCharged: boolean): Summarized<S> => {
               const copy = copyCharged ? 0 : pkg.versions.length * SCORED_WEIGHT;
 
               if (!lease.take(copy)) return { kind: "over-budget" };
               const scored = scoredPackage(pkg, analyses.get(name) ?? none);
-              const made = scored.kind === "found" ? keep(scored.pkg) : null;
+
+              if (scored.kind !== "found") {
+                lease.give(copy);
+
+                return { kind: "unknown" };
+              }
+
+              const before = lease.taken;
+              const made = keep(scored.pkg, lease);
               lease.give(copy);
 
-              if (made === null) return { kind: "unknown" };
+              if (made === null) return { kind: "over-budget" };
+              // a keep that did not reserve all it kept has the rest taken here, so nothing it keeps goes uncounted
+              const short = made.weight - (lease.taken + copy - before);
 
-              return lease.take(made.weight) ? { kind: "found", summary: made.summary } : { kind: "over-budget" };
+              if (short > 0 && !lease.take(short)) {
+                lease.give(made.weight - short);
+
+                return { kind: "over-budget" };
+              }
+
+              return { kind: "found", summary: made.summary };
             };
 
             const one = (name: string): Effect.Effect<Summarized<S>> =>

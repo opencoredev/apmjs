@@ -132,11 +132,12 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       probeWithin: (name) => Effect.succeed(probeOf(name)),
       devDependencies: () => Effect.succeed(null),
       probeMany: (names) => Effect.succeed(new Map(names.map((n) => [n, probeOf(n)]))),
-      summaries: (names, _lease, keep) =>
+      summaries: (names, lease, keep) =>
         Effect.succeed(new Map(names.map((n) => {
           const p = pkgOf(n);
+          const kept = p ? keep(p, lease) : null;
 
-          return [n, p ? { kind: "found" as const, summary: keep(p).summary } : { kind: "absent" as const }];
+          return [n, p ? (kept ? { kind: "found" as const, summary: kept.summary } : { kind: "over-budget" as const }) : { kind: "absent" as const }];
         }))),
       listing: () => Effect.succeed({ kind: "unknown" }),
       get: (name) => Effect.succeed(pkgOf(name)),

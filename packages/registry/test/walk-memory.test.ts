@@ -30,7 +30,24 @@ const DAY = 86_400_000;
 const REAL = process.env.APM_PACKUMENTS ?? join(homedir(), ".cache", "apm-packuments");
 const NEXT = join(REAL, "next.json");
 
-const Packument = z.object({ "dist-tags": z.object({ latest: z.string() }), versions: z.record(z.string(), z.object({ dependencies: z.record(z.string(), z.string()).optional(), optionalDependencies: z.record(z.string(), z.string()).optional() }).loose()), time: z.record(z.string(), z.string()) });
+const Packument = z.object({
+  "dist-tags": z.object({ latest: z.string() }),
+  versions: z.record(
+    z.string(),
+    z
+      .object({
+        dependencies: z.record(z.string(), z.string()).optional(),
+        optionalDependencies: z.record(z.string(), z.string()).optional(),
+        peerDependencies: z.record(z.string(), z.string()).optional(),
+        peerDependenciesMeta: z.record(z.string(), z.object({ optional: z.boolean().optional() })).optional(),
+      })
+      .loose(),
+  ),
+  time: z.record(z.string(), z.string()),
+});
+
+/** The version of react and react-dom the fixtures serve for next's required peers. */
+const REACT = "19.2.0";
 
 /** How many versions npm lists for each of next 16's direct dependencies (the @next/* packages: about 2,800). */
 const VERSIONS = new Map([
@@ -40,13 +57,16 @@ const VERSIONS = new Map([
   ["caniuse-lite", 973],
   ["baseline-browser-mapping", 188],
   ["sharp", 194],
+  // next's required peers, with their canary and experimental releases
+  ["react", 2600],
+  ["react-dom", 2600],
 ]);
 
 /** A version a range is met by: an exact version itself, a caret range its lower bound. */
 const versionFor = (range: string): string => range.replace(/^[\^~]/, "");
 
 /** The platform fields an @next/swc-* binary's versions carry. */
-type Platform = { os?: string[]; cpu?: string[] };
+type Platform = { os?: string[]; cpu?: string[]; peerDependencies?: Record<string, string> };
 
 /** A version document as long as npm's for an @next/swc-* binary (about 2 KB), with its platform for those. */
 function versionDoc(name: string, version: string, at: number) {
@@ -58,6 +78,9 @@ function versionDoc(name: string, version: string, at: number) {
     fields.os = [platform[1]];
     fields.cpu = [platform[2]];
   }
+
+  // react-dom wants the react beside it, which next's own peer puts there
+  if (name === "react-dom") fields.peerDependencies = { react: `^${REACT}` };
 
   return {
     name,
@@ -126,7 +149,10 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
   const next = Packument.parse(JSON.parse(nextText));
   const latest = next["dist-tags"].latest;
   const manifest = next.versions[latest];
-  const deps = { ...manifest?.dependencies, ...manifest?.optionalDependencies };
+  const meta = manifest?.peerDependenciesMeta ?? {};
+  // the peers npm, pnpm and bun install for next: those not marked optional (react and react-dom)
+  const peers = Object.fromEntries(Object.keys(manifest?.peerDependencies ?? {}).flatMap((n) => (meta[n]?.optional === true ? [] : [[n, REACT]])));
+  const deps = { ...manifest?.dependencies, ...manifest?.optionalDependencies, ...peers };
   // a week after next's latest was published: nothing in the tree is inside its cooldown
   const now = Date.parse(next.time[latest] ?? "") + 7 * DAY;
   const texts = new Map(Object.entries(deps).map(([name, range]) => [name, dependencyPackument(name, range, now - 30 * DAY)]));

@@ -1,4 +1,5 @@
 // Versions, ranges and dependency specs, parsed the way npm reads package.json. Pure.
+import { z } from "zod";
 import { isValidPackageName } from "./names.ts";
 
 const NUM = "(?:0|[1-9]\\d*)";
@@ -162,4 +163,92 @@ export function uncheckableReason(d: Exclude<DependencySpec, RegistryDependency>
       return _exhaustive;
     }
   }
+}
+
+/**
+ * How a package manager brings a dependency in: `required` (dependencies), `optional` (optionalDependencies: skipped
+ * where it does not install, its os or cpu not the target's) or `peer` (a peerDependency it adds beside the package
+ * when nothing in the tree already has one that fits).
+ */
+export type DependencyEdge = "required" | "optional" | "peer";
+
+export type Dependency = { spec: DependencySpec; edge: DependencyEdge };
+
+/** A dependency field as npm reads it: an object of specs, or nothing when it is anything else. */
+const SpecField = z.record(z.string(), z.unknown()).optional().catch(undefined);
+
+/** An os or cpu field: a name or a list of them, as npm reads it; anything else lists nothing. */
+const PlatformField = z
+  .union([z.string().transform((s) => [s]), z.array(z.unknown()).transform((xs) => xs.flatMap((x) => z.string().safeParse(x).data ?? []))])
+  .optional()
+  .catch(undefined)
+  .transform((xs) => xs ?? []);
+
+/** The fields of a manifest that decide what installs with it, and where. */
+const InstallFields = z.object({
+  dependencies: SpecField,
+  optionalDependencies: SpecField,
+  peerDependencies: SpecField,
+  peerDependenciesMeta: z.record(z.string(), z.object({ optional: z.boolean().optional().catch(undefined) }).catch({})).optional().catch(undefined),
+  os: PlatformField,
+  cpu: PlatformField,
+});
+
+/** A manifest as read for its install fields: any object, each field it does not hold in npm's shape read as absent. */
+export type InstallManifest = z.input<typeof InstallFields>;
+
+/**
+ * Every dependency a package manager installs for `manifest`: dependencies and optionalDependencies (optional wins
+ * for a key in both, as in npm), then each peerDependency neither of those lists, unless peerDependenciesMeta marks it
+ * optional: npm 7 and later, pnpm and bun add a required peer the tree does not already have, and leave optional
+ * peers to the project.
+ */
+export function installEdges(manifest: InstallManifest): Dependency[] {
+  const m = InstallFields.parse(manifest);
+  const merged = new Map<string, { value: unknown; edge: DependencyEdge }>();
+
+  for (const [k, v] of Object.entries(m.dependencies ?? {})) merged.set(k, { value: v, edge: "required" });
+
+  for (const [k, v] of Object.entries(m.optionalDependencies ?? {})) merged.set(k, { value: v, edge: "optional" });
+
+  for (const [k, v] of Object.entries(m.peerDependencies ?? {})) {
+    if (merged.has(k) || m.peerDependenciesMeta?.[k]?.optional === true) continue;
+    merged.set(k, { value: v, edge: "peer" });
+  }
+
+  return [...merged].map(([k, { value, edge }]) => ({ spec: parseDependencySpec(k, value), edge }));
+}
+
+/** What an install is for: node's `process.platform` and `process.arch`, or "any" for no platform in particular. */
+export type InstallTarget = { os: string; cpu: string };
+
+export const ANY_TARGET: InstallTarget = { os: "any", cpu: "any" };
+
+const TARGET_RE = /^[a-z0-9_]{1,32}$/;
+
+/** A target os or cpu as a query or a request body gives it: "any", or a lowercase platform or architecture name. */
+export function isTargetValue(s: string): boolean {
+  return s === "any" || TARGET_RE.test(s);
+}
+
+/** Whether `value` is allowed by a field's values: a `!name` forbids it, and when any plain name is listed it must be one. */
+function allows(values: readonly string[], value: string): boolean {
+  if (values.includes(`!${value}`)) return false;
+  const listed = values.filter((x) => !x.startsWith("!"));
+
+  return listed.length === 0 || listed.includes(value) || listed.includes("any");
+}
+
+/**
+ * Why `manifest`'s os or cpu field rules `target` out, or null when it installs there (npm's rule: a listed value
+ * allows, a `!`-prefixed one forbids). A target of "any" is ruled out by nothing.
+ */
+export function platformMismatch(manifest: InstallManifest, target: InstallTarget): string | null {
+  const { os, cpu } = InstallFields.parse(manifest);
+
+  if (target.os !== "any" && !allows(os, target.os)) return `built for os ${os.join(", ")}, not ${target.os}`;
+
+  if (target.cpu !== "any" && !allows(cpu, target.cpu)) return `built for cpu ${cpu.join(", ")}, not ${target.cpu}`;
+
+  return null;
 }

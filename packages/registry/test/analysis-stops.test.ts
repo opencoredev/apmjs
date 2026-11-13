@@ -101,7 +101,16 @@ const STUB: UpstreamApi = {
     probeWithin: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     devDependencies: () => Effect.succeed(null),
     probeMany: (names) => Effect.succeed(new Map(names.map((n) => [n, { kind: "found" as const, pkg: pkg() }]))),
-    summaries: (names, _lease, keep) => Effect.succeed(new Map(names.map((n) => [n, { kind: "found" as const, summary: keep(pkg()).summary }]))),
+    summaries: (names, lease, keep) =>
+      Effect.succeed(
+        new Map(
+          names.map((n) => {
+            const kept = keep(pkg(), lease);
+
+            return [n, kept ? { kind: "found" as const, summary: kept.summary } : { kind: "over-budget" as const }];
+          }),
+        ),
+      ),
     listing: () => Effect.succeed({ kind: "unknown" }),
     get: () => Effect.succeed(pkg()),
     tarball: () => Effect.succeed({ kind: "ok", bytes: BYTES, digest: { algo: "sha512", hex: createHash("sha512").update(BYTES).digest("hex") } }),
