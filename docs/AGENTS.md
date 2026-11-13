@@ -10,9 +10,9 @@ None of them calls a version "safe". A score says what apm read in the tarball. 
 
 | Verdict | When |
 | --- | --- |
-| `do-not-install` | The install policy refused the range (cooldown, score floor, yank, revoke, a refused dependency), or apm reviewers confirmed the version or any dependency in its tree malicious. |
+| `do-not-install` | Only for what is not a score: every version in the range was revoked or yanked, or apm reviewers confirmed the version or any dependency in its tree malicious. A score never gives `do-not-install`. |
 | `unknown` | apm could not read what it needs: the registry, the version's AI review, or the AI review state of its dependencies. Nothing was decided; try again. |
-| `review-first` | The version passes the policy, but something is not settled: its AI review or a dependency's is queued, running, flagged or ended without an answer; it scores under 75; it is not scored; or apm could not score some of its dependencies. |
+| `review-first` | It installs, but something is not settled: it scores under 40 ("Installs, but scores 30/100 (F): …"), its analysis is incomplete ("Installs, but apm could not fully analyse it: …"), it is not scored yet or never will be, a dependency was flagged the same way or could not be looked up, its AI review or a dependency's is queued, running, flagged or ended without an answer, it scores under 75, or apm could not score some of its dependencies. Also a range the policy holds back for now (the cooldown), with no command to run. |
 | `install` | It passes the policy, scores 75 or more, nothing in its tree was refused, flagged or left unscored, and no AI review in the tree is open. A version apm never picked for AI review, or one on a registry that runs none, can still be `install` on these checks; the summary then says "No AI review", and `coverage.aiReview` is `not-selected` or `disabled`. |
 
 ## MCP server
@@ -24,7 +24,7 @@ None of them calls a version "safe". A score says what apm read in the tarball. 
 | `search_packages` | Packages matching a query, with the latest version, weekly downloads and the apm score where apm already scored it. |
 | `check_package` | One version's score and grade, every risk signal with its cited file:line evidence, capabilities (network, shell, credentials, eval, install scripts, a binary), the AI review, install commands and what was not checked. |
 | `check_name` | Whether a name is free to publish: taken and by whom, too close to a popular package, and which variations are free under your scope. |
-| `explain_install` | Should I install `name@range`? Runs apm's install policy (24-hour cooldown, score floor 40, revokes, the dependency tree) and the AI review, and answers `install`, `review-first`, `do-not-install`, `not-found` or `unknown`, with reasons and the command to run. |
+| `explain_install` | Should I install `name@range`? Runs apm's install policy (24-hour cooldown, revokes, confirmed malice, the dependency tree, and the score floor of 40 as a warning) and the AI review, and answers `install`, `review-first`, `do-not-install`, `not-found` or `unknown`, with reasons and the command to run. |
 | `get_file_excerpt` | Lines around one line of a file in a published version, to check a cited signal. Any file size. |
 
 ### Claude Code

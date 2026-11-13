@@ -15,6 +15,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 | Manifest confusion | Metadata is served from the tarball's package.json; a publish whose request hides install scripts is refused |
 | Typosquats, no name check | Domain-search-style name check; new names one edit from popular packages are refused |
 | No cooldown by default | `apm add` skips versions under 24h; `https://<registry>/~safe/` gives any client the same filter |
+| A score that blocks, or one that is ignored | A score informs, it does not block: `apm add`, `apm x`, the registry's resolve and scan answers and the Bun scanner warn about a score under 40, an incomplete analysis, a version apm cannot score or has not scored yet, and a dependency the registry could not look up, with the score, the top reasons (file and line) and a link, then install. `--strict` (or `APM_STRICT=1`, `APM_SCANNER_STRICT=1`, the `~safe/` view) refuses them instead. Revoked and yanked versions, and ones an apm reviewer confirmed malicious, are refused in every mode |
 | Coverage | Proxies the public registry: every npm package gets scored on demand; names that exist upstream can't be published here |
 
 ## Layout
@@ -23,7 +24,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 - `packages/infra`: the Alchemy stack that deploys the registry and the website, plus the deploy and smoke scripts
 - `packages/core`: score engine, secret scanner, typo distance, tarball reader
 - `packages/cli`: `apm`
-- `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and low-scoring versions
+- `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and confirmed-malicious versions and warn about low-scoring ones (`APM_SCANNER_STRICT=1` refuses those too)
 - `apps/web`: Next.js + shadcn UI (search with name check, package pages), deployed as a Worker through OpenNext
 - `apps/docs`: the documentation site at https://docs.apmjs.dev, built with [Blume](https://useblume.dev) and served as static assets (`cd apps/docs && bun run dev`)
 - `tests/acceptance`: over 180 tests that drive real bun, npm and pnpm against the registry's Worker build in Miniflare, on Postgres 18

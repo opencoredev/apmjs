@@ -34,7 +34,8 @@ Registry order: `APM_REGISTRY`, `npm_config_registry`, the nearest project `.npm
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `APM_REGISTRY` | none | The registry the scanner asks. Otherwise `[install] registry` from the project's `bunfig.toml`, then your global one. |
-| `APM_SCANNER_STRICT` | unset | `1` cancels the install when any package could not be checked. |
+| `APM_SCANNER_STRICT` | unset | `1` cancels the install on a score under 40, an incomplete analysis, no score yet or ever, a package the registry could not look up, and any package the scanner could not check. Unset, those warn and the install goes ahead. |
+| `APM_STRICT` | unset | `1` makes `apm add` and `apm x` refuse what they otherwise warn about, as `--strict` does. |
 
 ## Registry
 
@@ -59,7 +60,7 @@ The registry Worker reads these settings (`packages/registry/src/worker.ts` pars
 | `APM_NPM_DOWNLOADS_URL` | The download-count API. Default `https://api.npmjs.org/downloads/point/last-week/`. |
 | `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning. |
 
-Fixed limits, not settings: a 24-hour cooldown and a floor of 40 for `~safe` and the scanner; 24 hours for a staged upload to be approved; 5 staged uploads per package, 20 per account, 256 MB per account; 32 MB publish bodies; 1 MB `package.json` and readme.
+Fixed limits, not settings: a 24-hour cooldown, and a floor of 40 that `~safe` and strict mode refuse under and the default mode warns under; 24 hours for a staged upload to be approved; 5 staged uploads per package, 20 per account, 256 MB per account; 32 MB publish bodies; 1 MB `package.json` and readme.
 
 ## Running a registry locally
 

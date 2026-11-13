@@ -13,7 +13,7 @@ Pick your package manager. Each setting goes in the project folder, so it applie
 
 <Tabs>
   <Tab title="Bun">
-    Add this to `bunfig.toml`. The scanner makes plain `bun install` refuse revoked versions and versions scoring under 40.
+    Add this to `bunfig.toml`. The scanner makes plain `bun install` refuse revoked and confirmed-malicious versions, and warn about versions scoring under 40 (`APM_SCANNER_STRICT=1` refuses those too).
 
     ```toml title="bunfig.toml"
     [install]
@@ -68,7 +68,7 @@ apm uses the package manager your project already uses: it reads the lockfile, t
 apm add zod
 ```
 
-apm asks the registry for the newest version that is at least 24 hours old and scores 40 or more, prints its score card, and checks every package under it. Then it runs your package manager with the exact version, holds back install scripts until it has compared every installed package with what the registry served, and runs the scripts last.
+apm asks the registry for the newest version that is at least 24 hours old and not revoked, yanked or confirmed malicious, prints its score card, and checks every package under it. Then it runs your package manager with the exact version, holds back install scripts until it has compared every installed package with what the registry served, and runs the scripts last.
 
 ```text
 ✓ zod@4.6.7  score 90/100 (A)
@@ -76,7 +76,9 @@ apm asks the registry for the newest version that is at least 24 hours old and s
         v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);
 ```
 
-If a package is refused, apm says why and whether `--force` would help. `--force` lifts the score floor and the cooldown for the named package only. Revoked and yanked versions stay blocked.
+A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
+
+If a package is refused, apm says why and whether `--force` would help. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
 
 ## Next steps
 

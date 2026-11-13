@@ -5,6 +5,8 @@ description: A registry URL that hides versions under 24 hours old, versions sco
 
 `https://registry.apmjs.dev/~safe/` is the same registry with a filter in front. Any client that lets you set the registry URL gets the filter, with no apm tools installed.
 
+It is the strict option for npm and pnpm. `apm add`, the registry's resolve and scan answers and the Bun scanner warn about a low or missing score and install anyway; the view still hides such versions, because using it is the choice to filter them. It matches `apm add --strict`, and `APM_SCANNER_STRICT=1` for Bun.
+
 ```ini title=".npmrc"
 registry=https://registry.apmjs.dev/~safe/
 ```
@@ -17,8 +19,8 @@ A version is served only when all of these hold:
 | --- | --- |
 | Not pulled | It is revoked, waiting to be revoked, or yanked. |
 | Cooldown | It was published less than 24 hours ago. |
-| Score floor | It scores under 40 out of 100. |
-| Scored | apm has not scored it yet. |
+| Score floor | It scores under 40 out of 100, which includes every analysis that is incomplete. |
+| Scored | apm has not scored it yet, or can never score it. |
 
 The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason, for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
 
@@ -28,7 +30,7 @@ Dist-tags point at what the view serves. If the newest version is hidden, `lates
 
 ## Scoring on first request
 
-Every npm package is scored the first time apm sees it. When a client asks the view for a package, apm scores the five newest versions past the cooldown before it answers. Versions that are still unscored stay hidden. Small tarballs are scored during the request; large ones go to a queue, so a version can be missing for a short time and then appear.
+Every npm package is scored the first time apm sees it. When a client asks the view for a package, apm queues the five newest versions past the cooldown for analysis. Versions that are still unscored stay hidden, so a version can be missing for a short time and then appear. No request analyses a tarball itself; the queue does, whoever asked.
 
 ## When to use it, and when not
 

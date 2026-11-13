@@ -1,13 +1,23 @@
 ---
 title: Bun scanner
-description: Make stock bun install and bun add ask apm about every package, and cancel the install on revoked or low-scoring versions. Strict mode for CI.
+description: Make stock bun install and bun add ask apm about every package, cancel the install on revoked or confirmed-malicious versions, and warn about low scores. Strict mode refuses those too.
 ---
 
-`@apm/bun-scanner` plugs into Bun's security scanner hook. Before `bun install` or `bun add` installs anything, Bun hands the scanner the package list, the scanner asks the apm registry about each package, and Bun cancels the install when a version is:
+`@apm/bun-scanner` plugs into Bun's security scanner hook. Before `bun install` or `bun add` installs anything, Bun hands the scanner the package list and the scanner asks the apm registry about each package.
+
+Bun cancels the install when a version is:
 
 - revoked, or waiting to be revoked;
-- scored below 40;
-- still being analysed after the scanner has waited 60 s for it.
+- confirmed malicious by an apm reviewer.
+
+A score informs; it does not block. The scanner warns, and the install goes ahead, when a version:
+
+- scores below 40, or its analysis is incomplete;
+- can never be scored (too large, not served in a form apm can check, unreadable, or past the analysis limits);
+- is still being analysed after the scanner has waited 60 s for it;
+- could not be checked because the registry or npm did not answer.
+
+Each warning names the package, the score and grade or the state, up to three reasons with the file and line they cite, and a link to the version's page. With `APM_SCANNER_STRICT=1` each of these cancels the install instead.
 
 You keep using plain `bun`. No wrapper, no alias.
 
@@ -34,7 +44,18 @@ registry = "https://registry.apmjs.dev/"
 scanner = "@apm/bun-scanner"
 ```
 
-Run `bun install`. A refused install stops with the package, the version and the reason.
+Run `bun install`. A cancelled install stops with the package, the version and the reason; a warning is printed and the install goes on.
+
+## How a warning reaches you
+
+Bun treats a `warn` advisory differently in a terminal and elsewhere: in a terminal it shows the advisory and asks whether to continue, and anywhere else (CI, a script) it cancels the install. So the scanner hands Bun `warn` advisories only when Bun can ask. Elsewhere it prints the same text to stderr and lets the install continue:
+
+```text
+apm scanner: warning: left-pad@1.3.0: scores 30/100 (F), under the floor of 40
+    - Sends what it collected: index.js:12: fetch(…) (sends the whole environment in a request)
+    https://apmjs.dev/package/left-pad/v/1.3.0
+  apm lets it install; APM_SCANNER_STRICT=1 refuses it.
+```
 
 ## Which registry it asks
 
@@ -47,18 +68,16 @@ It never takes a registry from package data, so a tarball URL in a lockfile cann
 
 ## Versions still being analysed
 
-A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package usually gets its score in a few seconds, and the install then goes ahead or is cancelled on that score. Anything still pending after 60 s cancels the install, in default mode and in strict mode:
+A version nobody has scored yet is queued for analysis. The scanner treats it as pending, never as clean: it asks again every few seconds for up to 60 s, printing which packages it is waiting for. A cold package usually gets its score in a few seconds, and the install then goes ahead, with a warning if the score is under 40. Anything still pending after 60 s is a warning ("not scored yet"), and with `APM_SCANNER_STRICT=1` it cancels the install:
 
 ```text
 apm scanner: waiting for 1 package(s) the registry is still analysing (0s of 60s): left-pad@1.3.0
-error: left-pad@1.3.0 is still being analysed by https://registry.apmjs.dev/ (waited 60s). apm installs no version before it has a score; try again in a minute.
+error: left-pad@1.3.0 is still being analysed by https://registry.apmjs.dev/ (waited 60s). APM_SCANNER_STRICT=1 installs no version before it has a score; try again in a minute.
 ```
 
-Run the install again a minute later. Set `APM_SCANNER_WAIT_MS` to wait longer or shorter.
+Set `APM_SCANNER_WAIT_MS` to wait longer or shorter.
 
-The scanner blocks every pending version, not only ones new to the registry: it cannot tell a long-published package nobody has installed through apm from one published a minute ago, and both have no score.
-
-Some versions never get a score: a tarball too large to download or unpack, one the upstream serves in no form apm can check, one apm cannot read, or one whose analysis keeps running past the registry's limits. The registry answers each with a `fatal` advisory naming the reason, so the install is cancelled in default mode and in strict mode, including when the version was pending at first and its analysis ended that way while the scanner waited.
+Some versions never get a score: a tarball too large to download or unpack, one the upstream serves in no form apm can check, one apm cannot read, or one whose analysis keeps running past the registry's limits. The registry answers each with an advisory naming the reason: a warning by default, fatal in strict mode, including when the version was pending at first and its analysis ended that way while the scanner waited. A package the registry could not look up because it or npm did not answer gets its own advisory, "could not be checked: registry or upstream unavailable", on the same terms.
 
 ## What it cannot check
 
@@ -73,7 +92,7 @@ By default those installs go ahead, so a registry outage does not stop your work
 
 ## Strict mode for CI
 
-In CI, set `APM_SCANNER_STRICT=1`. Any package the scanner could not check then cancels the install:
+In CI, set `APM_SCANNER_STRICT=1`. The scanner then asks the registry for strict answers, so a score under 40, an incomplete analysis, a version with no score and a package the registry could not look up each cancel the install, and so does any package the scanner could not check:
 
 ```bash
 APM_SCANNER_STRICT=1 bun install --frozen-lockfile

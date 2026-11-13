@@ -34,7 +34,7 @@ apm is early. The registry, CLI and score engine work and are tested, and the re
 | `~safe` view | The same registry with young and low-scoring versions hidden. Works with any client. | `https://registry.apmjs.dev/~safe/` |
 | Website | Package search, version pages with evidence, publish approvals, your account. | `https://apmjs.dev` |
 | `apm` CLI | Checks before it hands the work to bun, npm, pnpm or yarn. | [CLI reference](/reference/cli) |
-| Bun scanner | Makes plain `bun install` refuse revoked and low-scoring versions. | [Bun scanner](/guides/bun-scanner) |
+| Bun scanner | Makes plain `bun install` refuse revoked and confirmed-malicious versions and warn about low scores. | [Bun scanner](/guides/bun-scanner) |
 | AI release review | A language model reads each new release and reports cited findings next to the score. | [AI review](/concepts/ai-review) |
 
 ## Where to go next

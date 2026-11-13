@@ -56,7 +56,7 @@ The page never says "safe" and never shows the model's confidence number, which 
 
 A model's flag is a question, not a verdict. Every flagged or unanswered review waits for a person on apm's review list, who confirms or dismisses it on the website with a fresh authenticator code or passkey. No token can open the queue or decide.
 
-A confirmed result is labelled in public. It does not block installs by itself yet; for a package on apm, the owner or apm revokes the version.
+A confirmed result is labelled in public, and it refuses installs: `apm add`, `apm x` and the registry's resolve skip a confirmed version and refuse a tree that would install one, the Bun scanner cancels the install in every mode, and the agent verdict is `do-not-install`. Unlike a score, it is not a warning. For a package on apm, the owner or apm also revokes the version.
 
 ## Measured limits
 

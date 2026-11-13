@@ -9,7 +9,7 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 
 | In CI you want to | Use | Status |
 | --- | --- | --- |
-| Fail the install on revoked or low-scoring versions | Bun scanner with `APM_SCANNER_STRICT=1` | Works |
+| Fail the install on revoked or low-scoring versions (by default a low score only warns) | Bun scanner with `APM_SCANNER_STRICT=1`, or `apm add --strict` | Works |
 | Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works |
 | Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
@@ -18,7 +18,7 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 
 ## Check installs in CI
 
-With Bun, use the [scanner in strict mode](/guides/bun-scanner#strict-mode-for-ci) so any package it could not check cancels the install:
+A score informs; it does not block, so by default a low or missing score only warns, in CI too. With Bun, use the [scanner in strict mode](/guides/bun-scanner#strict-mode-for-ci) so a score under 40, an incomplete or missing score, and any package it could not check cancel the install (`apm add --strict` does the same for apm's own CLI):
 
 ```bash
 APM_SCANNER_STRICT=1 bun install --frozen-lockfile
