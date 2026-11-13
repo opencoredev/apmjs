@@ -655,8 +655,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "raw-ts-mutation",
@@ -685,8 +685,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "raw-txt-mutation",
@@ -715,8 +715,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "conversion-in",
@@ -827,8 +827,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "padded-ts-patch",
@@ -855,8 +855,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  },
  {
   "name": "padded-txt-patch",
@@ -883,7 +883,7 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 62,
-  "v10why": "above the floor by design: apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: obfuscated -20, suspicious-combination -15, credential-mention -3"
+  "v10": 1,
+  "v10why": "apm-score-v10 lists network, env, shell, eval as capabilities at no cost; risk signals: incomplete -61, obfuscated -20, suspicious-combination -15, credential-mention -3"
  }
 ]

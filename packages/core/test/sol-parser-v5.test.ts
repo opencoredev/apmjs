@@ -157,6 +157,13 @@ describe("a file with no tree is read at least as strongly as apm-score-v3 read 
 
     if (!f) return;
 
-    for (const pad of ["js", "ts"] as const) expect(score({ ...f, file: pad === "js" ? "index.js" : "index.ts", pad }).score).toBe(score(f).score);
+    // padding past the parser's limit leaves the tree unread: incomplete, never above what the payload scores alone
+    for (const pad of ["js", "ts"] as const) {
+      const r = score({ ...f, file: pad === "js" ? "index.js" : "index.ts", pad });
+
+      expect(r.signals.map((s) => s.id)).toContain("incomplete");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+      expect(r.score).toBeLessThanOrEqual(score(f).score);
+    }
   });
 });

@@ -1075,6 +1075,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   const add = found.add;
   const byPath = new Map(files.map((f) => [f.path, f]));
   const hooks = expandHooks(manifest);
+
+  // a hook whose commands apm stopped expanding runs commands apm did not read
+  for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
@@ -1360,6 +1363,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     const bytes = list.reduce((n, s) => n + s.size, 0);
 
     add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
+    // a file no entry point reaches can still be loaded by its path or run by a command: left unread, it leaves the
+    // analysis incomplete, not clean (the full budget is the most a tarball unpacks to, so only a smaller one gets here)
+    add("incomplete", `not analyzed: ${list.length} file(s) past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
   }
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);

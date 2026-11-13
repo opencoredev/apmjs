@@ -9,7 +9,7 @@ import { childNodes, isFunctionNode, UNKNOWN, unwrap } from "./ast.ts";
 import { Allowance, charge, chargeNow, chargeText, CHARS_PER_UNIT, inPhase } from "./meter.ts";
 import { MAX_DECODER_STEPS, runDecoder, type Known } from "./decode.ts";
 import { Flow, FlowExhausted, MAX_FLOW_WORK, type CallSite, type Exports, type FlowRead, type Label, type Sink } from "./flow.ts";
-import { parseEach, type Dialect, type Parsed, type Range } from "./parse.ts";
+import { parseEach, type Dialect, type ParseOutcome, type Parsed, type Range } from "./parse.ts";
 import { scanTextRules } from "./textrules.ts";
 import {
   escapedTextAt,
@@ -1910,13 +1910,17 @@ class Reader {
     return known ? { value, exact, how, pieces, via, numeric: false } : null;
   }
 
-  /** A decoded string the file's decoded-text budget still has room for; null (and the limit noted) when it has none. */
-  private decoded(value: string | null, from: Str, via: string): Str | null {
+  /**
+   * A decoded string the file's decoded-text budget still has room for. Past the budget it is null, and the code
+   * decoded it at `at` is code apm did not read: the file is incomplete.
+   */
+  private decoded(value: string | null, from: Str, via: string, at: number): Str | null {
     if (value === null) return null;
 
     // the whole result must fit: one large decode cannot go past what is left
     if (value.length > this.budget.decoded) {
       this.budget.notes.add(LIMIT_NOTES.decoded);
+      this.stop(at, `decodes ${via} past the ${MAX_DECODED_BYTES / 1024} KB of decoded text apm reads in one file, so what it decodes there was not read`);
 
       return null;
     }
@@ -1941,7 +1945,7 @@ class Reader {
 
     chargeText("decode", from.value.length, 3);
 
-    return this.decoded(decode(), from, via);
+    return this.decoded(decode(), from, via, at);
   }
 
   /** A limit that leaves code unread: the file is incomplete. A nested reading hands it to the outer one. */
@@ -1996,7 +2000,7 @@ class Reader {
       return a0;
     }
 
-    if (name === "String.fromCharCode") return this.charCodes(n.arguments);
+    if (name === "String.fromCharCode") return this.charCodes(n.arguments, n.start);
 
     if (name === "decodeURIComponent" || name === "decodeURI" || name === "unescape") {
       if (!a0?.exact) return null;
@@ -2017,7 +2021,7 @@ class Reader {
     const method = target.property.name;
 
     // String.fromCharCode.apply(null, codes)
-    if (method === "apply" && nameOf(this.resolve(target.object)) === "String.fromCharCode") return this.charCodes(n.arguments.slice(1));
+    if (method === "apply" && nameOf(this.resolve(target.object)) === "String.fromCharCode") return this.charCodes(n.arguments.slice(1), n.start);
 
     if (method === "join") {
       const parts = this.arrayStrings(target.object);
@@ -2107,7 +2111,7 @@ class Reader {
     // what a decoder returns is unknown when apm stopped, not because the program hides nothing: the analysis says so,
     // as it does for code it does not read
     const stopped = (limit: string): null => {
-      if (this.unread.length < MAX_EXECUTED) this.unread.push({ at: n.start, why: `calls a decoder function it defines, which apm stopped running at its limit (${limit}), so what it returns was not read` });
+      this.stop(n.start, `calls a decoder function it defines, which apm stopped running at its limit (${limit}), so what it returns was not read`);
 
       return null;
     };
@@ -2115,7 +2119,7 @@ class Reader {
     switch (run.kind) {
       case "decoded":
         // the file's decoded-text budget refusing the result is a limit too
-        return this.decoded(run.value, { value: "", exact: true, how: "as written", pieces, via: null, numeric: false }, "a decoder function it defines") ?? stopped(LIMIT_NOTES.decoded);
+        return this.decoded(run.value, { value: "", exact: true, how: "as written", pieces, via: null, numeric: false }, "a decoder function it defines", n.start) ?? stopped(LIMIT_NOTES.decoded);
       case "unsupported":
         return null;
       case "exhausted":
@@ -2203,7 +2207,7 @@ class Reader {
     return out;
   }
 
-  private charCodes(args: readonly AnyNode[]): Str | null {
+  private charCodes(args: readonly AnyNode[], at: number): Str | null {
     let codes: number[] | null = [];
 
     if (args.length === 1 && args[0]?.type === "SpreadElement") codes = this.numbers(args[0].argument);
@@ -2227,7 +2231,13 @@ class Reader {
     if (codes.some((c) => c < 0 || c > 0xffff)) return null;
     const from: Str = { value: "", exact: true, how: "as written", pieces: codes.length, via: null, numeric: false };
 
-    return this.decoded(String.fromCharCode(...codes.slice(0, 65536)), from, "char codes");
+    // built in pieces, never cut: spreading more arguments than the engine takes would throw, and a cut string would
+    // read as all the code there is
+    let built = "";
+
+    for (let i = 0; i < codes.length; i += 32_768) built += String.fromCharCode(...codes.slice(i, i + 32_768));
+
+    return this.decoded(built, from, "char codes", at);
   }
 
   // ----- reading strings by role -----
@@ -2252,7 +2262,13 @@ class Reader {
     if (s.exact && isHeldCode(s.value)) this.hold(at, s.value, this.dataStrings.has(n) ? "data" : "held");
 
     // what the program hands a shell or a process, for the risk signals that read commands (apm-score-v10)
-    if (role === "shell" && this.commands.length < MAX_COMMANDS) this.commands.push({ at, value: s.value.slice(0, MAX_COMMAND_CHARS) });
+    if (role === "shell") {
+      if (this.commands.length < MAX_COMMANDS) this.commands.push({ at, value: s.value.slice(0, MAX_COMMAND_CHARS) });
+
+      // a command past either bound is one the risk signals did not read in full: the file is incomplete, not clean
+      if (this.commands.length >= MAX_COMMANDS && !this.commands.some((c) => c.at === at)) this.stop(at, `hands more than ${MAX_COMMANDS} commands to a shell or a process, more than apm reads in one file`);
+      else if (s.value.length > MAX_COMMAND_CHARS) this.stop(at, `hands a shell or a process a command of ${s.value.length} characters, more than the ${MAX_COMMAND_CHARS} apm reads`);
+    }
 
     // a dangerous name built from pieces or decoded: `'chi' + 'ld_process'`, `'\x65xec'`
     if (s.exact && s.how !== "as written") {
@@ -3187,7 +3203,7 @@ export type JsScan =
       /** Code the file runs that apm did not read, which makes the analysis incomplete. */
       unread: Unread[];
     }
-  | { kind: "failed"; reason: "syntax" | "too-large" };
+  | { kind: "failed"; reason: Exclude<ParseOutcome, "parsed"> };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
 type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; executed: Executed[]; unread: { at: number; why: string }[] };
@@ -3216,7 +3232,7 @@ function isHeldCode(s: string): boolean {
 const NO_FLOW: FlowRead = { sinks: [], recovered: [], exports: new Map(), env: [], ranWritten: [] };
 
 /** Reads every program `text` parses to, one at a time. Null when no parser accepted it or a tree was too large or too deep. */
-function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: "syntax" | "too-large" } {
+function readText(text: string, dialect: Dialect, depth: number, budget: Budget): { outcome: "parsed"; reads: Read[] } | { outcome: Exclude<ParseOutcome, "parsed"> } {
   const reads: Read[] = [];
   let deep = false;
 
@@ -3236,8 +3252,8 @@ function readText(text: string, dialect: Dialect, depth: number, budget: Budget)
 
   if (outcome !== "parsed") return { outcome };
 
-  // a tree deep enough to exhaust the stack is read raw rather than half read
-  return deep ? { outcome: "too-large" } : { outcome, reads };
+  // a tree deep enough to exhaust the reader's stack is not read at all rather than half read, and says so
+  return deep ? { outcome: "too-deep" } : { outcome, reads };
 }
 
 type Inner = { hits: Hit[]; paths: string[]; dynamic: boolean };
@@ -3329,8 +3345,9 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
     if (best) findings.push(best);
   }
 
-  const paths = [...new Set(r.reads.flatMap((x) => x.paths))].slice(0, 500);
-  const loads = [...new Set(r.reads.flatMap((x) => x.loads))].slice(0, 500);
+  // every path, however many: a file a cut list left out would be read as one nothing loads
+  const paths = [...new Set(r.reads.flatMap((x) => x.paths))];
+  const loads = [...new Set(r.reads.flatMap((x) => x.loads))];
 
   const dynamic = [...new Set(r.reads.flatMap((x) => x.dynamic))]
     .sort((a, b) => a - b)

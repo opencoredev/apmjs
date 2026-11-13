@@ -26,8 +26,12 @@ export const LIFECYCLE = {
 /** One command a hook runs, after following script references. `from` says how it was reached. */
 export type HookCommand = { from: string; text: string; viaEval: boolean };
 
-/** A lifecycle hook, the commands it reaches and the names of the scripts it runs (itself included). */
-export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[] };
+/**
+ * A lifecycle hook, the commands it reaches and the names of the scripts it runs (itself included). `cut` says why the
+ * expansion stopped before it reached every command (nesting past MAX_DEPTH, or more than MAX_COMMANDS commands), or
+ * is null when it read them all: a hook read in part is never read as one that runs nothing more.
+ */
+export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[]; cut: string | null };
 
 const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
@@ -84,9 +88,21 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     if (own === undefined) continue;
     const commands: HookCommand[] = [];
     const followed = new Set<string>([hook]);
+    let cut: string | null = null;
 
     const visit = (text: string, from: string, depth: number, viaEval: boolean): void => {
-      if (depth > MAX_DEPTH || commands.length >= MAX_COMMANDS) return;
+      if (depth > MAX_DEPTH) {
+        cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
+
+        return;
+      }
+
+      if (commands.length >= MAX_COMMANDS) {
+        cut ??= `${from}: more than ${MAX_COMMANDS} commands`;
+
+        return;
+      }
+
       const evals = viaEval || INLINE_EVAL.test(text);
       commands.push({ from, text, viaEval: evals });
 
@@ -106,7 +122,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     };
 
     visit(own, `scripts.${hook}`, 0, false);
-    out.push({ hook, kind, commands, scripts: [...followed] });
+    out.push({ hook, kind, commands, scripts: [...followed], cut });
   }
 
   return out;

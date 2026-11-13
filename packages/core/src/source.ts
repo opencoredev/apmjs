@@ -2,8 +2,8 @@
 // pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
 // codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
 import { scanJs, type Command, type EnvRead, type ExecutedCode, type FlowFinding, type Imports, type Unread } from "./js.ts";
-import type { Dialect, Range } from "./parse.ts";
-import { parseEach } from "./parse.ts";
+import type { Dialect, ParseOutcome, Range } from "./parse.ts";
+import { MAX_PARSED_TOKENS, MAX_PARSED_TS_BYTES, parseEach } from "./parse.ts";
 import { joinStrings, scanTextRules } from "./textrules.ts";
 import { tokenText } from "./tokens.ts";
 import { lineOf, type Hidden, type TextFinding } from "./rules.ts";
@@ -113,7 +113,7 @@ function scanUnparsed(text: string): FileScan {
     for (const p of found.loads) loads.add(p);
   }
 
-  const imports: Imports = { paths: [...paths].slice(0, 500), loads: [...loads].slice(0, 500), dynamic: rawImports.dynamic };
+  const imports: Imports = { paths: [...paths], loads: [...loads], dynamic: rawImports.dynamic };
 
   return { findings: [...raw, ...more], imports, read: "raw", rejected: false, notes: [] };
 }
@@ -199,7 +199,8 @@ export function importsOf(text: string): Imports {
     else break;
   }
 
-  return { paths: paths.slice(0, 500), loads: loads.slice(0, 500), dynamic };
+  // every path, however many: a file a cut list left out would be read as one nothing loads
+  return { paths, loads, dynamic };
 }
 
 // ---------- one file ----------
@@ -234,10 +235,18 @@ export type FileScan = {
 /** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
 const WHOLE_FILE_HIDDEN: Partial<Record<Lang, Hidden>> = { json: "json", declaration: "type" };
 
+/** Why a file no tree was read for is unread, by the parser limit it hit (parse.ts). */
+const PARSE_LIMIT_WHY: Record<Exclude<ParseOutcome, "parsed" | "syntax">, string> = {
+  "too-large": `the file is too large for apm to read as a tree (more than ${MAX_PARSED_TOKENS} tokens, or ${MAX_PARSED_TS_BYTES / (1024 * 1024)} MB of TypeScript), so where its values go was not followed; its text rules still counted`,
+  "too-deep": "the file nests too deeply for apm to read as a tree (the reading ran out of stack), so where its values go was not followed; its text rules still counted",
+};
+
 /**
  * Reads one file as `lang`. JavaScript and TypeScript go to the parser, and the text rules read the whole file (the
- * floor, js.ts); when no parser accepts the file, or it is too large to hold as a tree, it is read raw: every match
- * counts, as in apm-score-v3, and its tokens are read too, so escapes and comments cannot hide a name from the rules.
+ * floor, js.ts). When no parser accepts the file it is read raw: every match counts, as in apm-score-v3, and its
+ * tokens are read too, so escapes and comments cannot hide a name from the rules. A file a parser stopped on at one of
+ * its limits (too large, too deep) is read raw the same way, and its raw findings all count, but they never stand in
+ * for the tree's reading: the file is listed as unread, which makes the analysis incomplete.
  */
 export function scanFile(text: string, lang: Lang): FileScan {
   if (isDialect(lang)) {
@@ -247,7 +256,9 @@ export function scanFile(text: string, lang: Lang): FileScan {
       return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env, unread: js.unread };
     }
 
-    return { ...scanUnparsed(text), rejected: js.reason === "syntax" };
+    if (js.reason === "syntax") return { ...scanUnparsed(text), rejected: true };
+
+    return { ...scanUnparsed(text), rejected: false, unread: [{ ...lineOf(text, 0), why: PARSE_LIMIT_WHY[js.reason] }] };
   }
 
   const kind = WHOLE_FILE_HIDDEN[lang];

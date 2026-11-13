@@ -17,8 +17,13 @@ export type Range = [number, number];
 /** One way the file parsed: the program, every comment's range, and the goal and dialect it parsed under. */
 export type Parsed = { program: Program; comments: Range[]; goal: Goal; dialect: Dialect };
 
-/** How parsing went: every program was handed over (`parsed`), no parser accepted the file, or it is too large to hold as a tree. */
-export type ParseOutcome = "parsed" | "syntax" | "too-large";
+/**
+ * How parsing went: every program was handed over (`parsed`), no parser accepted the file (`syntax`), or a parser
+ * stopped at one of its own limits before it could say either: too many tokens or bytes to hold as a tree
+ * (`too-large`), or nesting deep enough to exhaust the stack (`too-deep`). Only `syntax` is a verdict on the file; the
+ * two limits leave it unread, which makes an analysis incomplete (source.ts).
+ */
+export type ParseOutcome = "parsed" | "syntax" | "too-large" | "too-deep";
 
 /**
  * The most tokens one file may have and still be parsed into a tree. acorn's tree costs 90 to 95 bytes a token in V8
@@ -42,6 +47,9 @@ const PARSE_UNITS_PER_TOKEN = 4;
 const BABEL_PASSES = 64;
 
 class TooLarge extends Error {}
+
+/** A parser's recursion ran out of stack: a limit of the parser, not a syntax error in the file. */
+class TooDeep extends Error {}
 
 function acornParse(text: string, goal: Goal, withJsx: boolean): Parsed | "syntax" {
   const comments: Range[] = [];
@@ -75,6 +83,10 @@ function acornParse(text: string, goal: Goal, withJsx: boolean): Parsed | "synta
   } catch (e) {
     if (e instanceof TooLarge || e instanceof MeterExhausted) throw e;
 
+    // a stack too deep for acorn's recursion says nothing about the syntax: node may well run the file. V8 throws a
+    // RangeError for it, and nothing else in the parsers does
+    if (e instanceof RangeError) throw new TooDeep();
+
     return "syntax";
   }
 }
@@ -106,6 +118,8 @@ function babelParse(text: string, goal: Goal, base: readonly ParserPlugin[], dia
       return { program, comments, goal, dialect };
     } catch (e) {
       if (e instanceof MeterExhausted) throw e;
+
+      if (e instanceof RangeError) throw new TooDeep();
       // the other decorator dialect, if any, is tried next
     }
   }
@@ -134,8 +148,25 @@ function hasHtmlComment(text: string, comments: readonly Range[]): boolean {
  */
 export type ReadEach = (p: Parsed) => boolean;
 
+/** Runs a parse, turning a parser limit it hit into its outcome. */
+function limited(parse: () => ParseOutcome): ParseOutcome {
+  try {
+    return parse();
+  } catch (e) {
+    if (e instanceof TooLarge) return "too-large";
+
+    if (e instanceof TooDeep) return "too-deep";
+    throw e;
+  }
+}
+
 function parseTs(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
   if (text.length > MAX_PARSED_TS_BYTES) return "too-large";
+
+  return limited(() => parseTsUnlimited(text, withJsx, each));
+}
+
+function parseTsUnlimited(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
   const base: ParserPlugin[] = withJsx ? ["estree", "typescript", "jsx"] : ["estree", "typescript"];
 
   for (const goal of ["module", "script"] as const) {
@@ -160,26 +191,21 @@ function parseTs(text: string, withJsx: boolean, each: ReadEach): ParseOutcome {
  * JavaScript. So when acorn accepts the file its JavaScript programs are read too, the same way a `.js` file's are.
  */
 function alsoAsJs(text: string, each: ReadEach): ParseOutcome {
-  try {
-    const script = acornParse(text, "script", false);
+  const script = acornParse(text, "script", false);
 
-    if (script !== "syntax") {
-      if (each(script) || hasHtmlComment(text, script.comments)) {
-        const module = acornParse(text, "module", false);
+  if (script !== "syntax") {
+    if (each(script) || hasHtmlComment(text, script.comments)) {
+      const module = acornParse(text, "module", false);
 
-        if (module !== "syntax") each(module);
-      }
-
-      return "parsed";
+      if (module !== "syntax") each(module);
     }
 
-    const module = acornParse(text, "module", false);
-
-    if (module !== "syntax") each(module);
-  } catch (e) {
-    if (e instanceof TooLarge) return "too-large";
-    throw e;
+    return "parsed";
   }
+
+  const module = acornParse(text, "module", false);
+
+  if (module !== "syntax") each(module);
 
   return "parsed";
 }
@@ -189,6 +215,8 @@ function alsoAsJs(text: string, each: ReadEach): ParseOutcome {
  * acorn's, so this is held to the TypeScript size cap. Flow is not enabled: its type annotations would read as code.
  */
 function parseJsWithBabel(text: string, each: ReadEach): ParseOutcome {
+  // acorn, which reads all of the JavaScript node runs, rejected the file: its verdict stands, and Babel only adds the
+  // decorator dialect node does not run, so skipping it on a large file leaves nothing node would run unread
   if (text.length > MAX_PARSED_TS_BYTES) return "syntax";
 
   for (const goal of ["module", "script"] as const) {
@@ -216,34 +244,33 @@ function parseJsWithBabel(text: string, each: ReadEach): ParseOutcome {
 export function parseEach(text: string, dialect: Dialect, each: ReadEach): ParseOutcome {
   if (dialect === "ts" || dialect === "tsx") return parseTs(text, dialect === "tsx", each);
 
-  try {
-    for (const withJsx of dialect === "jsx" ? [true] : [false, true]) {
-      const script = acornParse(text, "script", withJsx);
+  return limited(() => parseJs(text, dialect, each));
+}
 
-      if (script !== "syntax") {
-        const html = hasHtmlComment(text, script.comments);
-        const twice = each(script) || html;
+function parseJs(text: string, dialect: Dialect, each: ReadEach): ParseOutcome {
+  for (const withJsx of dialect === "jsx" ? [true] : [false, true]) {
+    const script = acornParse(text, "script", withJsx);
 
-        if (twice) {
-          const module = acornParse(text, "module", withJsx);
+    if (script !== "syntax") {
+      const html = hasHtmlComment(text, script.comments);
+      const twice = each(script) || html;
 
-          if (module !== "syntax") each(module);
-        }
+      if (twice) {
+        const module = acornParse(text, "module", withJsx);
 
-        return "parsed";
+        if (module !== "syntax") each(module);
       }
 
-      const module = acornParse(text, "module", withJsx);
-
-      if (module !== "syntax") {
-        each(module);
-
-        return "parsed";
-      }
+      return "parsed";
     }
-  } catch (e) {
-    if (e instanceof TooLarge) return "too-large";
-    throw e;
+
+    const module = acornParse(text, "module", withJsx);
+
+    if (module !== "syntax") {
+      each(module);
+
+      return "parsed";
+    }
   }
 
   return parseJsWithBabel(text, each);

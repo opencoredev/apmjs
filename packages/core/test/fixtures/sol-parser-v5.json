@@ -645,8 +645,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 35,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
+  "v10": 0,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: incomplete -61, credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "fallback-js-padded",
@@ -665,8 +665,8 @@
    "eval": "confirmed",
    "obfuscated": "confirmed"
   },
-  "v10": 35,
-  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: credential-read -30, obfuscated -20, suspicious-combination -15"
+  "v10": 0,
+  "v10why": "apm-score-v10 lists network, shell, eval as capabilities at no cost; risk signals: incomplete -61, credential-read -30, obfuscated -20, suspicious-combination -15"
  },
  {
   "name": "scope-type-declaration",
