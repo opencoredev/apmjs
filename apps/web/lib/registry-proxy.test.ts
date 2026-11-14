@@ -28,6 +28,9 @@ beforeAll(() => {
         return new Response(null, { status: 302, headers });
       }
 
+      // a successful sign-in: Better Auth sends the callbackURL back as the browser gave it
+      if (url.pathname === "/api/auth/callback/relative") return new Response(null, { status: 302, headers: { location: "/account?tab=keys", "set-cookie": "a=1; Path=/" } });
+
       return Response.json({ ok: true }, { headers: { vary: "Accept-Encoding" } });
     },
   });
@@ -64,6 +67,14 @@ describe("forwardToRegistry", () => {
     expect(res.headers.getSetCookie()).toEqual(["a=1; Path=/; HttpOnly", "b=2; Path=/; HttpOnly"]);
     expect(res.headers.get("cache-control")).toBe("private, no-store");
     expect(seen.at(-1)?.path).toBe("/api/auth/callback/github?code=c&state=s");
+  });
+
+  test("a relative Location is made absolute on this site, which Next.js's proxy needs", async () => {
+    const res = await forward("/api/auth/callback/relative?code=c&state=s");
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://apm.example/account?tab=keys");
+    expect(res.headers.getSetCookie()).toEqual(["a=1; Path=/"]);
   });
 
   test("POST bodies are forwarded with the origin and the site's host", async () => {

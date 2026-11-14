@@ -69,6 +69,11 @@ export async function forwardToRegistry(request: Request, opts: ForwardOptions):
   const out = new Headers(upstream.headers);
 
   for (const name of RESPONSE_DROP) out.delete(name);
+  // Better Auth sends a sign-in's callbackURL back as given ("/account"). Next.js reads a proxy answer's Location
+  // with new URL() and no base, so a relative one throws and the browser gets a 500. Resolved against this site.
+  const location = out.get("location");
+
+  if (location !== null) out.set("location", new URL(location, request.url).toString());
 
   return withSiteHeaders(new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out }), opts.dev);
 }
