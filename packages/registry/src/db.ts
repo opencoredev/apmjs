@@ -313,6 +313,9 @@ export type PasswordAttempt = "reserved" | "locked";
 // Serializes staged inserts so two concurrent uploads cannot both pass the quota checks (staged uploads are rare).
 const STAGED_INSERT_LOCK = 0x617_06d_5747;
 
+// Serializes new latest_scores rows so two at once cannot both pass the capacity check (new rows are rare: a package's first ask).
+const LATEST_SCORE_INSERT_LOCK = 0x617_06d_4c53;
+
 // The first key of the two-key advisory locks on blob keys ("blob"); the second is the key's hash. Two-key
 // advisory locks never conflict with one-key ones such as STAGED_INSERT_LOCK.
 const BLOB_LOCK_CLASS = 0x626c_6f62;
@@ -1075,19 +1078,32 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         all(KeptLatestScoreRow),
       ),
     keepLatestScore: ({ score, at, capacity }) =>
-      run(
-        "keepLatestScore",
-        // anyone can name any package: a new row only for a scored answer, and only while there is room
-        sql`WITH replaced AS (
-              UPDATE latest_scores SET version = ${score.version}, score = ${score.score}, grade = ${score.grade}, computed_at = ${at}, asked_at = ${at}
-               WHERE package = ${score.name} RETURNING 1
-            )
-            INSERT INTO latest_scores (package, version, score, grade, computed_at, asked_at)
-            SELECT ${score.name}, ${score.version}, ${score.score}, ${score.grade}, ${at}, ${at}
-             WHERE ${score.version !== null} AND NOT EXISTS (SELECT 1 FROM replaced) AND (SELECT count(*) FROM latest_scores) < ${capacity}
-            ON CONFLICT (package) DO NOTHING`,
-        none,
-      ),
+      Effect.gen(function* () {
+        const replaced = yield* run(
+          "keepLatestScore: replace",
+          sql`UPDATE latest_scores SET version = ${score.version}, score = ${score.score}, grade = ${score.grade}, computed_at = ${at}, asked_at = ${at}
+               WHERE package = ${score.name} RETURNING 1`,
+          changed,
+        );
+
+        // anyone can name any package: a new row only for a scored answer, and only while there is room. New rows
+        // queue behind each other, so two at once cannot both count the last free place (review of d7ac98c).
+        if (replaced || score.version === null) return;
+
+        yield* api.tx(
+          Effect.gen(function* () {
+            yield* run("keepLatestScore: lock", sql`SELECT pg_advisory_xact_lock(${LATEST_SCORE_INSERT_LOCK})`, none);
+            yield* run(
+              "keepLatestScore: add",
+              sql`INSERT INTO latest_scores (package, version, score, grade, computed_at, asked_at)
+                  SELECT ${score.name}, ${score.version}, ${score.score}, ${score.grade}, ${at}, ${at}
+                   WHERE (SELECT count(*) FROM latest_scores) < ${capacity}
+                  ON CONFLICT (package) DO NOTHING`,
+              none,
+            );
+          }),
+        );
+      }),
     refreshLatestScore: ({ score, at }) =>
       run(
         "refreshLatestScore",
