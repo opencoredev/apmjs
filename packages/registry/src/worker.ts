@@ -5,7 +5,7 @@ import { Cause, Effect, Exit, Layer } from "effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
-import { matureRevocations } from "./apm.ts";
+import { matureRevocations, refreshLatestScores } from "./apm.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
@@ -332,13 +332,18 @@ const recoverAnalyses = Effect.flatMap(Analysis, (a) => a.recover).pipe(
   Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "analysis-recover", requeued: n }))) : Effect.void)),
 );
 
-/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. Requeues analyses the platform stopped. */
+/** Works the kept popular-scores answers out again (apm.ts), last: it reads whole packuments, the slowest part. */
+const refreshPopular = refreshLatestScores.pipe(
+  Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "latest-score-refresh", refreshed: n }))) : Effect.void)),
+);
+
+/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. Requeues analyses the platform stopped, then refreshes popular-scores' kept answers. */
 export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

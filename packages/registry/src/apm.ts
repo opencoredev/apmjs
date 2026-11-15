@@ -56,7 +56,7 @@ import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
-import { Store, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
+import { Store, type LatestScore, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
 import { refuse, type HttpFailure } from "./errors.ts";
 import { fail, json, LazyMembers, longestPiece, parseBody, streamedJson, streamWeight } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
@@ -1436,11 +1436,57 @@ const versionResponse = (name: string, version: string) =>
 /** Names one /popular-scores request may ask about: the home page shows a dozen. */
 export const MAX_POPULAR_NAMES = 24;
 
+/** A kept latest score older than this is worked out again inline: the sweep refreshes every one asked about in the last day every 10 minutes, so only a stopped sweep lets one get this old. */
+export const LATEST_SCORE_MAX_AGE_MS = 60 * 60_000;
+
+/** The sweep works a kept score out again once it is this old: every sweep (each 10 minutes) refreshes the ones asked about. */
+export const LATEST_SCORE_REFRESH_MS = 5 * 60_000;
+
+/** The sweep refreshes the kept scores asked about in this window, and drops the ones nobody asked about for LATEST_SCORE_DROP_MS. */
+export const LATEST_SCORE_ASKED_WINDOW_MS = 24 * 60 * 60_000;
+
+export const LATEST_SCORE_DROP_MS = 7 * 24 * 60 * 60_000;
+
+/** Kept scores one sweep works out at most, one package's metadata at a time: two home pages' worth. */
+export const LATEST_SCORE_REFRESH_LIMIT = 2 * MAX_POPULAR_NAMES;
+
+/** One name's latest score worked out now. A package published on apm is "local": its score is never kept, so a revoke shows at once. */
+type WorkedOut = { kind: "local" | "upstream"; score: LatestScore };
+
+/**
+ * Reads the package's metadata (the whole upstream packument: seconds for next or react) and its latest version's
+ * stored analysis. Never starts an analysis: a latest version with none stored yet is nulls.
+ */
+const workOutLatestScore = (name: string) =>
+  briefly((lease) =>
+    Effect.gen(function* () {
+      const at = yield* now;
+      const store = yield* Store;
+      const none: LatestScore = { name, version: null, score: null, grade: null };
+      const local = (yield* store.getPackage(name)) !== null;
+      const kind = local ? "local" : "upstream";
+
+      // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
+      if (!local && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind, score: none } satisfies WorkedOut;
+      const src = yield* lookup(name, lease);
+      const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
+      // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
+      const r = latest ? reportFor(latest, at) : null;
+      const score: LatestScore = latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
+
+      return { kind, score } satisfies WorkedOut;
+    }),
+  );
+
 /**
  * GET /-/apm/v1/popular-scores?names=a,b,c: the latest version's score of each package, in one answer, so the website's
  * popular list costs one request however many packages it shows. Read-only: it answers from analyses apm already
  * stored and never starts one, so a request naming 24 packages nobody has scored costs no tarball downloads. A name
  * whose latest version has no stored analysis is null.
+ *
+ * An upstream package's answer is kept (migration 0019) and refreshed by the sweep (refreshLatestScores), so the home
+ * page reads one row per package instead of twelve whole packuments (7 s, past the website's 4 s budget). A name
+ * asked about for the first time, or whose kept answer is older than LATEST_SCORE_MAX_AGE_MS, is worked out here.
  */
 const popularScoresResponse = (url: URL) =>
   Effect.gen(function* () {
@@ -1448,32 +1494,57 @@ const popularScoresResponse = (url: URL) =>
     const names = [...new Set((url.searchParams.get("names") ?? "").split(",").map((n) => n.trim()).filter((n) => n.length > 0))];
 
     if (names.length === 0 || names.length > MAX_POPULAR_NAMES) return fail(400, `names must list 1 to ${MAX_POPULAR_NAMES} package names, comma-separated`);
+    const store = yield* Store;
+    const kept = new Map((yield* store.latestScores({ names, at })).filter((k) => at - k.computedAt < LATEST_SCORE_MAX_AGE_MS).map((k) => [k.score.name, k.score]));
 
-    // the names read at once share the request's lease, each under a child of it given back once its score is read
-    // (review of 6862fc7, finding 4)
+    // the names worked out at once share the request's lease, each under a child of it given back once its score is
+    // read (review of 6862fc7, finding 4)
     const packages = yield* Effect.forEach(
       names,
-      (name) =>
-        briefly((lease) =>
-          Effect.gen(function* () {
-            const none = { name, version: null, score: null, grade: null };
-            const store = yield* Store;
+      (name) => {
+        const hit = kept.get(name);
 
-            // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
-            if (!(yield* store.getPackage(name)) && (yield* store.upstreamAnalyses(name)).scores.size === 0) return none;
-            const src = yield* lookup(name, lease);
-            const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
-            // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
-            const r = latest ? reportFor(latest, at) : null;
+        if (hit) return Effect.succeed(hit);
 
-            return latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
-          }),
-        ),
+        return Effect.flatMap(workOutLatestScore(name), (w) => (w.kind === "local" ? Effect.succeed(w.score) : Effect.as(store.keepLatestScore({ score: w.score, at }), w.score)));
+      },
       { concurrency: 4 },
     );
 
     return json({ packages });
   });
+
+/**
+ * The cron's part for popular-scores: drops kept answers nobody asked about for a week, then works out again the ones
+ * asked about in the last day that are older than LATEST_SCORE_REFRESH_MS, oldest first and one at a time. A name now
+ * published on apm is dropped. One package that fails is logged and keeps its old answer. Returns how many it refreshed.
+ */
+export const refreshLatestScores = Effect.gen(function* () {
+  const at = yield* now;
+  const store = yield* Store;
+
+  yield* store.dropLatestScores({ kind: "asked-before", askedBefore: at - LATEST_SCORE_DROP_MS });
+  const names = yield* store.latestScoresToRefresh({ askedSince: at - LATEST_SCORE_ASKED_WINDOW_MS, computedBefore: at - LATEST_SCORE_REFRESH_MS, limit: LATEST_SCORE_REFRESH_LIMIT });
+
+  const refreshed = yield* Effect.forEach(
+    names,
+    (name) =>
+      workOutLatestScore(name).pipe(
+        Effect.flatMap((w) => (w.kind === "local" ? store.dropLatestScores({ kind: "name", name }) : store.refreshLatestScore({ score: w.score, at }))),
+        Effect.as(1),
+        Effect.catch((e) =>
+          Effect.sync(() => {
+            console.error(JSON.stringify({ level: "error", event: "latest-score-refresh", name, tag: e._tag, error: String(e) }));
+
+            return 0;
+          }),
+        ),
+      ),
+    { concurrency: 1 },
+  );
+
+  return refreshed.reduce((a, b) => a + b, 0);
+});
 
 type LimitParse = { kind: "ok"; limit: number } | { kind: "invalid"; error: string };
 

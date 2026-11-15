@@ -21,6 +21,26 @@ export type StoredScope = "publish" | "stage" | "legacy";
 /** int8 columns arrive as bigint; every time and size here fits a double. */
 const Int = z.union([z.bigint(), z.number()]).transform((n) => Number(n));
 const IntOrNull = Int.nullable();
+
+/** What popular-scores answers for one package: its latest version's score, or nulls when none is stored yet. */
+export type LatestScore = { name: string; version: string; score: number; grade: string } | { name: string; version: null; score: null; grade: null };
+
+/** A kept LatestScore and when it was worked out. */
+export type KeptLatestScore = { score: LatestScore; computedAt: number };
+
+/** A latest_scores row: the table's CHECK keeps version, score and grade all set or all null. */
+const KeptLatestScoreRow = z
+  .union([
+    z.object({ package: z.string(), version: z.string(), score: Int, grade: z.string(), computed_at: Int }),
+    z.object({ package: z.string(), version: z.null(), score: z.null(), grade: z.null(), computed_at: Int }),
+  ])
+  .transform((r): KeptLatestScore => ({
+    score: r.version === null ? { name: r.package, version: null, score: null, grade: null } : { name: r.package, version: r.version, score: r.score, grade: r.grade },
+    computedAt: r.computed_at,
+  }));
+
+/** A kept answer is marked asked about at most this often, so a busy home page writes once an hour per name. */
+const LATEST_SCORE_ASKED_MARK_MS = 60 * 60_000;
 const JsonObject = z.record(z.string(), z.unknown());
 
 /** A package.json, as stored and served: any JSON object. Its fields are read with the parsers in @apm/core. */
@@ -437,6 +457,19 @@ export type StoreApi = {
   readonly upstreamAnalyses: (name: string) => Effect.Effect<UpstreamAnalyses, StoreError>;
   /** upstreamAnalyses for several packages in three statements, keyed by package name; a package with neither is left out. */
   readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
+  /**
+   * The kept popular-scores answers for these names (migration 0019), never one for a package published on apm. Marks
+   * them asked about at `at`, at most once an hour each, so the sweep keeps refreshing them.
+   */
+  readonly latestScores: (input: { names: readonly string[]; at: number }) => Effect.Effect<KeptLatestScore[], StoreError>;
+  /** Keeps a popular-scores answer worked out at `at` for a name asked about at `at`. */
+  readonly keepLatestScore: (input: { score: LatestScore; at: number }) => Effect.Effect<void, StoreError>;
+  /** Replaces a kept answer with one the sweep worked out at `at`; when it was asked about stays as it was. */
+  readonly refreshLatestScore: (input: { score: LatestScore; at: number }) => Effect.Effect<void, StoreError>;
+  /** Kept answers asked about at or after `askedSince` and worked out before `computedBefore`, oldest first. */
+  readonly latestScoresToRefresh: (input: { askedSince: number; computedBefore: number; limit: number }) => Effect.Effect<string[], StoreError>;
+  /** Drops kept answers last asked about before `askedBefore`, or the one for `name`. */
+  readonly dropLatestScores: (input: { kind: "asked-before"; askedBefore: number } | { kind: "name"; name: string }) => Effect.Effect<void, StoreError>;
   /**
    * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
    * keyed `"<name> <version>"`, in one query however many versions are asked for.
@@ -1027,6 +1060,43 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           unscorable: new Map((row?.unscorable ?? []).map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "" }] as const)),
         };
       }),
+    latestScores: ({ names, at }) =>
+      run(
+        "latestScores",
+        // the CTE's update runs whether or not the select reads it; the select sees the rows as they were
+        sql`WITH asked AS (
+              UPDATE latest_scores SET asked_at = ${at} WHERE package = ANY(${[...names]}) AND asked_at < ${at - LATEST_SCORE_ASKED_MARK_MS}
+            )
+            SELECT l.package, l.version, l.score, l.grade, l.computed_at FROM latest_scores l
+             WHERE l.package = ANY(${[...names]}) AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = l.package)`,
+        all(KeptLatestScoreRow),
+      ),
+    keepLatestScore: ({ score, at }) =>
+      run(
+        "keepLatestScore",
+        sql`INSERT INTO latest_scores (package, version, score, grade, computed_at, asked_at)
+            VALUES (${score.name}, ${score.version}, ${score.score}, ${score.grade}, ${at}, ${at})
+            ON CONFLICT (package) DO UPDATE SET version = EXCLUDED.version, score = EXCLUDED.score, grade = EXCLUDED.grade,
+              computed_at = EXCLUDED.computed_at, asked_at = EXCLUDED.asked_at`,
+        none,
+      ),
+    refreshLatestScore: ({ score, at }) =>
+      run(
+        "refreshLatestScore",
+        sql`UPDATE latest_scores SET version = ${score.version}, score = ${score.score}, grade = ${score.grade}, computed_at = ${at} WHERE package = ${score.name}`,
+        none,
+      ),
+    latestScoresToRefresh: ({ askedSince, computedBefore, limit }) =>
+      run(
+        "latestScoresToRefresh",
+        sql`SELECT package FROM latest_scores WHERE asked_at >= ${askedSince} AND computed_at < ${computedBefore} ORDER BY computed_at, package LIMIT ${limit}`,
+        all(z.object({ package: z.string() }).transform((r) => r.package)),
+      ),
+    dropLatestScores: (which) =>
+      which.kind === "name"
+        ? run("dropLatestScores", sql`DELETE FROM latest_scores WHERE package = ${which.name}`, none)
+        : run("dropLatestScores", sql`DELETE FROM latest_scores WHERE asked_at < ${which.askedBefore}`, none),
+
     upstreamAnalysesOf: (names) =>
       Effect.gen(function* () {
         const out = new Map<string, UpstreamAnalyses>();

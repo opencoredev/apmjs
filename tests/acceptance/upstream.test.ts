@@ -183,6 +183,53 @@ describe("upstream proxy", () => {
     expect(await reg.query("SELECT 1 FROM analysis_jobs WHERE package = $1", ["up-cold"])).toEqual([]);
   });
 
+  // popular-scores read twelve whole packuments per request (7 s), past the website's 4 s budget, so the home page
+  // showed no scores. An upstream package's answer is now kept and the sweep works it out again.
+  test("popular-scores answers from the kept score, the sweep refreshes it, and a package on apm is never kept", async () => {
+    const Kept = z.array(z.object({ score: z.number().nullable(), grade: z.string().nullable() }));
+    const kept = async () => Kept.parse(await reg.query("SELECT score, grade FROM latest_scores WHERE package = $1", ["up-pkg"]));
+    const asked = async () => {
+      const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg`);
+
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+
+      return z.object({ packages: z.array(z.object({ score: z.number().nullable() })) }).parse(r.body).packages[0]?.score;
+    };
+
+    // the tests above asked about up-pkg, so its answer is kept
+    const [first] = await kept();
+    const real = first?.score ?? null;
+
+    expect(real).not.toBeNull();
+    // the kept row is what is served: change it and ask again
+    await reg.query("UPDATE latest_scores SET score = 1, grade = 'F' WHERE package = $1", ["up-pkg"]);
+    expect(await asked()).toBe(1);
+
+    // the sweep works out again an answer older than 5 minutes
+    await reg.query("UPDATE latest_scores SET computed_at = computed_at - $2 WHERE package = $1", ["up-pkg", 6 * 60_000]);
+    await reg.sweep();
+    expect((await kept())[0]?.score).toBe(real);
+
+    // with the sweep stopped, an answer older than an hour is worked out inline
+    await reg.query("UPDATE latest_scores SET score = 1, grade = 'F', computed_at = computed_at - $2 WHERE package = $1", ["up-pkg", 2 * HOUR]);
+    expect(await asked()).toBe(real);
+    expect((await kept())[0]?.score).toBe(real);
+
+    // nobody asked about it for a week: the sweep drops it
+    await reg.query("UPDATE latest_scores SET asked_at = asked_at - $2 WHERE package = $1", ["up-pkg", 8 * DAY]);
+    await reg.sweep();
+    expect(await kept()).toEqual([]);
+
+    // a package published on apm is worked out on every request, so a revoke shows at once
+    const sb = makeSandbox(reg, alice);
+    const d = writePackage(work, { name: "local-popular", version: "1.0.0" }, reg, alice);
+    const pub = await run(["npm", "publish"], { cwd: d, env: sb.env });
+
+    expect(pub.code, pub.out).toBe(0);
+    expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=local-popular`)).status).toBe(200);
+    expect(await reg.query("SELECT 1 FROM latest_scores WHERE package = $1", ["local-popular"])).toEqual([]);
+  });
+
   test("a resolve answer says the AI review is off when this registry runs none, and is never cached", async () => {
     const res = await fetch(`${reg.url}-/apm/v1/resolve?name=up-pkg&range=1.1.0`);
     const body: unknown = await res.json();
