@@ -462,8 +462,11 @@ export type StoreApi = {
    * them asked about at `at`, at most once an hour each, so the sweep keeps refreshing them.
    */
   readonly latestScores: (input: { names: readonly string[]; at: number }) => Effect.Effect<KeptLatestScore[], StoreError>;
-  /** Keeps a popular-scores answer worked out at `at` for a name asked about at `at`. */
-  readonly keepLatestScore: (input: { score: LatestScore; at: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * Keeps a popular-scores answer worked out at `at` for a name asked about at `at`. A kept one is replaced; a new row
+   * is added only for a scored answer while the table holds fewer than `capacity`.
+   */
+  readonly keepLatestScore: (input: { score: LatestScore; at: number; capacity: number }) => Effect.Effect<void, StoreError>;
   /** Replaces a kept answer with one the sweep worked out at `at`; when it was asked about stays as it was. */
   readonly refreshLatestScore: (input: { score: LatestScore; at: number }) => Effect.Effect<void, StoreError>;
   /** Kept answers asked about at or after `askedSince` and worked out before `computedBefore`, oldest first. */
@@ -1071,13 +1074,18 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
              WHERE l.package = ANY(${[...names]}) AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = l.package)`,
         all(KeptLatestScoreRow),
       ),
-    keepLatestScore: ({ score, at }) =>
+    keepLatestScore: ({ score, at, capacity }) =>
       run(
         "keepLatestScore",
-        sql`INSERT INTO latest_scores (package, version, score, grade, computed_at, asked_at)
-            VALUES (${score.name}, ${score.version}, ${score.score}, ${score.grade}, ${at}, ${at})
-            ON CONFLICT (package) DO UPDATE SET version = EXCLUDED.version, score = EXCLUDED.score, grade = EXCLUDED.grade,
-              computed_at = EXCLUDED.computed_at, asked_at = EXCLUDED.asked_at`,
+        // anyone can name any package: a new row only for a scored answer, and only while there is room
+        sql`WITH replaced AS (
+              UPDATE latest_scores SET version = ${score.version}, score = ${score.score}, grade = ${score.grade}, computed_at = ${at}, asked_at = ${at}
+               WHERE package = ${score.name} RETURNING 1
+            )
+            INSERT INTO latest_scores (package, version, score, grade, computed_at, asked_at)
+            SELECT ${score.name}, ${score.version}, ${score.score}, ${score.grade}, ${at}, ${at}
+             WHERE ${score.version !== null} AND NOT EXISTS (SELECT 1 FROM replaced) AND (SELECT count(*) FROM latest_scores) < ${capacity}
+            ON CONFLICT (package) DO NOTHING`,
         none,
       ),
     refreshLatestScore: ({ score, at }) =>

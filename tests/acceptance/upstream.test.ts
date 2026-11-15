@@ -188,6 +188,7 @@ describe("upstream proxy", () => {
   test("popular-scores answers from the kept score, the sweep refreshes it, and a package on apm is never kept", async () => {
     const Kept = z.array(z.object({ score: z.number().nullable(), grade: z.string().nullable() }));
     const kept = async () => Kept.parse(await reg.query("SELECT score, grade FROM latest_scores WHERE package = $1", ["up-pkg"]));
+
     const asked = async () => {
       const r = await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-pkg`);
 
@@ -219,6 +220,10 @@ describe("upstream proxy", () => {
     await reg.query("UPDATE latest_scores SET asked_at = asked_at - $2 WHERE package = $1", ["up-pkg", 8 * DAY]);
     await reg.sweep();
     expect(await kept()).toEqual([]);
+
+    // anyone can name any package: one with no score gets no row (review of aa4881d, finding 1)
+    expect((await getJson(`${reg.url}-/apm/v1/popular-scores?names=up-cold,no-such-package-anywhere`)).status).toBe(200);
+    expect(await reg.query("SELECT package FROM latest_scores WHERE package = ANY($1)", [["up-cold", "no-such-package-anywhere"]])).toEqual([]);
 
     // a package published on apm is worked out on every request, so a revoke shows at once
     const sb = makeSandbox(reg, alice);
@@ -291,5 +296,71 @@ describe("upstream proxy", () => {
     });
     expect(r.status).toBe(200);
     expect(JSON.stringify(r.body)).toContain("upstream says compromised");
+  });
+});
+
+// review of aa4881d, finding 2: a refresh while npm was down replaced a kept score with nulls, and the next request sent
+// them. This registry reads npm through a proxy that can answer 503, and trusts no cached packument.
+describe("popular-scores while npm is down", () => {
+  let proxy: ReturnType<typeof Bun.serve>;
+  let down: Registry;
+  let npmDown = false;
+
+  beforeAll(async () => {
+    proxy = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        if (npmDown) return new Response("down", { status: 503 });
+        const u = new URL(req.url);
+        const res = await fetch(`${upstream.url}${u.pathname.slice(1)}${u.search}`, { headers: { accept: req.headers.get("accept") ?? "*/*" } });
+
+        if (u.pathname.endsWith(".tgz")) return new Response(await res.arrayBuffer(), { status: res.status });
+        const text = (await res.text()).replaceAll(upstream.url, proxy.url.toString());
+
+        return new Response(text, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
+      },
+    });
+    down = await startRegistry({ now: () => clock, upstream: proxy.url.toString(), upstreamTtlMs: 0 });
+  });
+
+  afterAll(async () => {
+    await down?.stop();
+    proxy?.stop(true);
+  });
+
+  test("a kept score stays as it was through a sweep, and an hour later it is still sent", async () => {
+    const Row = z.array(z.object({ score: z.number().nullable(), computed_at: z.union([z.string(), z.number()]).transform(Number) }));
+    const row = async () => Row.parse(await down.query("SELECT score, computed_at FROM latest_scores WHERE package = $1", ["up-pkg"]))[0];
+
+    const asked = async () => {
+      const r = await getJson(`${down.url}-/apm/v1/popular-scores?names=up-pkg`);
+
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+
+      return z.object({ packages: z.array(z.object({ score: z.number().nullable() })) }).parse(r.body).packages[0]?.score;
+    };
+
+    const latest = String(dig((await getJson(`${upstream.url}up-pkg`)).body, "dist-tags", "latest"));
+
+    expect((await scoredJson(`${down.url}-/apm/v1/score/up-pkg/${latest}`)).status).toBe(200);
+    expect(await asked()).not.toBeNull();
+    // a value no refresh would write, so a refresh that read npm would show
+    await down.query("UPDATE latest_scores SET score = 42, grade = 'B', computed_at = computed_at - $2 WHERE package = $1", ["up-pkg", 6 * 60_000]);
+    const before = await row();
+
+    npmDown = true;
+    await down.sweep();
+    expect(await row()).toEqual(before);
+
+    // past the hour a kept answer is sent as it is: npm is still down, so the old answer is still better than none
+    await down.query("UPDATE latest_scores SET computed_at = computed_at - $2 WHERE package = $1", ["up-pkg", 2 * HOUR]);
+    expect(await asked()).toBe(42);
+    expect((await row())?.score).toBe(42);
+
+    // npm is back: the next sweep works it out again
+    npmDown = false;
+    await down.sweep();
+    expect((await row())?.score).not.toBe(42);
   });
 });
