@@ -305,6 +305,7 @@ describe("popular-scores while npm is down", () => {
   let proxy: ReturnType<typeof Bun.serve>;
   let down: Registry;
   let npmDown = false;
+  let npmReads = 0;
 
   beforeAll(async () => {
     proxy = Bun.serve({
@@ -313,6 +314,8 @@ describe("popular-scores while npm is down", () => {
       async fetch(req) {
         if (npmDown) return new Response("down", { status: 503 });
         const u = new URL(req.url);
+
+        npmReads++;
         const res = await fetch(`${upstream.url}${u.pathname.slice(1)}${u.search}`, { headers: { accept: req.headers.get("accept") ?? "*/*" } });
 
         if (u.pathname.endsWith(".tgz")) return new Response(await res.arrayBuffer(), { status: res.status });
@@ -362,5 +365,24 @@ describe("popular-scores while npm is down", () => {
     npmDown = false;
     await down.sweep();
     expect((await row())?.score).not.toBe(42);
+  });
+
+  // next's latest had no score yet: kept as nulls, it would otherwise read next's whole packument on every request
+  test("a latest version not scored yet is kept as nulls, so asking again reads nothing from npm", async () => {
+    await publishUpstream("up-pkg", "1.3.0");
+    // as for next on apmjs.dev: no row yet
+    await down.query("DELETE FROM latest_scores WHERE package = $1", ["up-pkg"]);
+    const Answer = z.object({ packages: z.array(z.object({ version: z.string().nullable(), score: z.number().nullable() })) });
+    const first = await getJson(`${down.url}-/apm/v1/popular-scores?names=up-pkg`);
+
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(Answer.parse(first.body).packages[0]).toEqual({ version: null, score: null });
+    expect(await down.query("SELECT version, score, grade FROM latest_scores WHERE package = $1", ["up-pkg"])).toEqual([{ version: null, score: null, grade: null }]);
+
+    const before = npmReads;
+    const again = await getJson(`${down.url}-/apm/v1/popular-scores?names=up-pkg`);
+
+    expect(Answer.parse(again.body).packages[0]).toEqual({ version: null, score: null });
+    expect(npmReads).toBe(before);
   });
 });

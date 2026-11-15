@@ -1451,17 +1451,23 @@ export const LATEST_SCORE_DROP_MS = 7 * 24 * 60 * 60_000;
 export const LATEST_SCORE_REFRESH_LIMIT = 2 * MAX_POPULAR_NAMES;
 
 /**
- * Rows latest_scores holds at most. Only a package with a stored analysis of its latest version gets a new row, and
- * anyone can name any package, so this bounds the table and the sweep's search however many names are asked about.
+ * Rows latest_scores holds at most. Only a package apm stored an analysis of (of any version) gets a row, and anyone
+ * can name any package, so this bounds the table and the sweep's search however many names are asked about.
  */
 export const LATEST_SCORE_CAPACITY = 1_000;
 
 /**
  * One name's latest score worked out now. A package published on apm is "local": its score is never kept, so a revoke
- * shows at once. "unavailable" when npm did not answer or the packument did not fit the memory lease: a kept answer
- * stays as it was.
+ * shows at once. "unanalysed" for a name apm stored no analysis of: nulls, found without reading npm, and never given
+ * a row, so made-up names cost no storage. "upstream" is kept, nulls included: a latest version not scored yet (next's,
+ * whose packument is the largest) would otherwise be read from npm on every request. "unavailable" when npm did not
+ * answer or the packument did not fit the memory lease: a kept answer stays as it was.
  */
-type WorkedOut = { kind: "local"; score: LatestScore } | { kind: "upstream"; score: LatestScore } | { kind: "unavailable" };
+type WorkedOut =
+  | { kind: "local"; score: LatestScore }
+  | { kind: "unanalysed"; score: LatestScore }
+  | { kind: "upstream"; score: LatestScore }
+  | { kind: "unavailable" };
 
 /**
  * Reads the package's metadata (the whole upstream packument: seconds for next or react) and its latest version's
@@ -1477,7 +1483,7 @@ const workOutLatestScore = (name: string) =>
       const kind = local ? "local" : "upstream";
 
       // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
-      if (!local && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind, score: none } satisfies WorkedOut;
+      if (!local && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind: "unanalysed", score: none } satisfies WorkedOut;
       const src = yield* lookupWithin(name, lease);
 
       if (src === "unknown" || src === "over-budget") return { kind: "unavailable" } satisfies WorkedOut;
@@ -1522,6 +1528,7 @@ const popularScoresResponse = (url: URL) =>
         return Effect.flatMap(workOutLatestScore(name), (w): Effect.Effect<LatestScore, StoreError> => {
           switch (w.kind) {
             case "local":
+            case "unanalysed":
               return Effect.succeed(w.score);
             case "upstream":
               return Effect.as(store.keepLatestScore({ score: w.score, at, capacity: LATEST_SCORE_CAPACITY }), w.score);
@@ -1562,6 +1569,7 @@ export const refreshLatestScores = Effect.gen(function* () {
           switch (w.kind) {
             case "local":
               return Effect.as(store.dropLatestScores({ kind: "name", name }), 1);
+            case "unanalysed":
             case "upstream":
               return Effect.as(store.refreshLatestScore({ score: w.score, at }), 1);
             case "unavailable":

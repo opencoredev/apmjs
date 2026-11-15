@@ -72,7 +72,7 @@ describe("keepLatestScore", () => {
     }
   });
 
-  test("an unscored answer never adds a row, and replaces a kept one", async () => {
+  test("an unscored answer adds a row, and replaces a kept one", async () => {
     const db = await freshDatabase();
     const c = new Client({ connectionString: db.url });
 
@@ -82,8 +82,8 @@ describe("keepLatestScore", () => {
       const run = <A>(effect: Effect.Effect<A, unknown, Store>) => Effect.runPromise(effect.pipe(Effect.provide(Store.postgres(db.url)), Effect.scoped));
       const unscored = (name: string): LatestScore => ({ name, version: null, score: null, grade: null });
 
-      await run(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: unscored("never-scored"), at: 1, capacity: CAPACITY })));
-      expect((await c.query("SELECT 1 FROM latest_scores WHERE package = 'never-scored'")).rows).toEqual([]);
+      await run(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: unscored("latest-unscored"), at: 1, capacity: CAPACITY })));
+      expect((await c.query("SELECT version, score, grade FROM latest_scores WHERE package = 'latest-unscored'")).rows).toEqual([{ version: null, score: null, grade: null }]);
 
       await run(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: scored("kept"), at: 1, capacity: CAPACITY })));
       await run(Effect.flatMap(Store, (s) => s.keepLatestScore({ score: unscored("kept"), at: 2, capacity: CAPACITY })));

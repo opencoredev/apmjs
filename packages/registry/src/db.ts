@@ -467,7 +467,7 @@ export type StoreApi = {
   readonly latestScores: (input: { names: readonly string[]; at: number }) => Effect.Effect<KeptLatestScore[], StoreError>;
   /**
    * Keeps a popular-scores answer worked out at `at` for a name asked about at `at`. A kept one is replaced; a new row
-   * is added only for a scored answer while the table holds fewer than `capacity`.
+   * is added only while the table holds fewer than `capacity`. Which names may have a row is the caller's call (apm.ts).
    */
   readonly keepLatestScore: (input: { score: LatestScore; at: number; capacity: number }) => Effect.Effect<void, StoreError>;
   /** Replaces a kept answer with one the sweep worked out at `at`; when it was asked about stays as it was. */
@@ -1086,9 +1086,9 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           changed,
         );
 
-        // anyone can name any package: a new row only for a scored answer, and only while there is room. New rows
-        // queue behind each other, so two at once cannot both count the last free place (review of d7ac98c).
-        if (replaced || score.version === null) return;
+        // anyone can name any package: a new row only while there is room. New rows queue behind each other, so two
+        // at once cannot both count the last free place (review of d7ac98c).
+        if (replaced) return;
 
         yield* api.tx(
           Effect.gen(function* () {
