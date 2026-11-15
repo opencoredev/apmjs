@@ -19,6 +19,9 @@ describe("keepLatestScore", () => {
     const c = new Client({ connectionString: db.url });
 
     await c.connect();
+    // both runs are let go and drained before the database is dropped, whether the test passes or not
+    const { promise: commit, resolve: release } = Promise.withResolvers<void>();
+    const running: Promise<unknown>[] = [];
 
     try {
       const run = <A>(effect: Effect.Effect<A, unknown, Store>) => Effect.runPromise(effect.pipe(Effect.provide(Store.postgres(db.url)), Effect.scoped));
@@ -27,7 +30,6 @@ describe("keepLatestScore", () => {
       await c.query("INSERT INTO latest_scores SELECT 'seed-' || i, '1.0.0', 90, 'A', 1, 1 FROM generate_series(1, $1::int) i", [CAPACITY - 1]);
       // the first new row is added inside a transaction held open, so it has counted 999 and not committed yet
       const { promise: added, resolve: onAdded } = Promise.withResolvers<void>();
-      const { promise: commit, resolve: release } = Promise.withResolvers<void>();
 
       const first = run(
         Effect.flatMap(Store, (s) =>
@@ -41,8 +43,11 @@ describe("keepLatestScore", () => {
         ),
       );
 
+      running.push(first);
       await added;
       const second = run(keep("race-b"));
+
+      running.push(second);
       // the second waits for the first's lock instead of counting the same 999
       const deadline = Date.now() + 5_000;
 
@@ -60,6 +65,8 @@ describe("keepLatestScore", () => {
       expect(Count.parse((await c.query("SELECT count(*) FROM latest_scores")).rows)[0]?.count).toBe(CAPACITY);
       expect((await c.query("SELECT 1 FROM latest_scores WHERE package = 'race-b'")).rows).toEqual([]);
     } finally {
+      release();
+      await Promise.allSettled(running);
       await c.end();
       await db.drop();
     }
