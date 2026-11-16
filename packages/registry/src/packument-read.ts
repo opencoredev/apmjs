@@ -5,7 +5,7 @@
 // The reader is a validating JSON scanner: it checks the whole grammar byte by byte, the regions it discards included,
 // and accepts exactly what JSON.parse accepts of the text res.text() would give (a leading byte order mark is skipped,
 // as the UTF-8 decode does). It keeps only the parts a profile names (KeepProfile): TRIMMED, what the registry reads,
-// is the top-level fields in TOP_FIELDS and each version's document without the fields in DROPPED_VERSION_FIELDS.
+// is the top-level fields in TOP_FIELDS, each version's KEPT_VERSION_FIELDS and, of its `dist`, KEPT_DIST_FIELDS.
 // Each kept part is parsed on its own with JSON.parse, and duplicate keys resolve as JSON.parse resolves them: the last
 // one wins, a second `versions` object included, and a version a profile does not keep removes an earlier one.
 //
@@ -31,34 +31,91 @@ import type { Lease } from "./memory.ts";
 const TOP_FIELDS: ReadonlySet<string> = new Set(["name", "dist-tags", "versions", "time", "description", "readme", "maintainers"]);
 
 /**
- * Version fields never kept for the registry's own reads, because no install, page or score reads them from the
- * packument:
- * - licenseText, readme and readmeFilename: text a full document may repeat in every version (vite: 35 MB of its 39).
- *   npm's abbreviated packument has none of them; a version's readme is shown from its tarball, the package's from
- *   the top-level field. They are left out of every packument apm serves (docs: HTTP API, npm compatibility).
- * - devDependencies: 17 MB of next's 31 MB. npm, pnpm, yarn and bun install a registry dependency's dependencies,
- *   optional and peer dependencies, never its devDependencies, and the scorer reads the tarball's own package.json.
- *   The full packument apm serves (`Accept: application/json`, which `npm view` asks for) reads them separately
- *   (DEV_DEPENDENCIES), so the registry's own reads stay small.
+ * The version fields the registry keeps of npm's packument: the fields npm's abbreviated packument (the one `npm
+ * install` asks for) carries, what the registry itself reads from a version (its tarball and checksums, publisher,
+ * install scripts, and the page's description, links and license), and the few the full packument's readers (npm
+ * view, yarn 1, pnpm, Renovate) look at besides. Everything else is left out of every read and every packument apm
+ * serves: a version's licenseText, readme and readmeFilename (text a document may repeat in every version: vite, 35 MB
+ * of its 39), its `exports` map (@mastra/core: 17 MB of its 28, 1.2 million values), the per-version maintainers,
+ * per-version maintainers and contributors, npm's own bookkeeping, and anything else a publisher adds. A version's readme is shown from its tarball,
+ * the package's from the top-level field, and the scorer reads the tarball's own package.json.
+ *
+ * devDependencies are left out too (17 MB of next's 31 MB): npm, pnpm, yarn and bun install a registry dependency's
+ * dependencies, optional and peer dependencies, never its devDependencies. The full packument apm serves (`Accept:
+ * application/json`, which `npm view` asks for) reads them separately (DEV_DEPENDENCIES), so the registry's own reads
+ * stay small.
  */
-export const DROPPED_VERSION_FIELDS: ReadonlySet<string> = new Set(["licenseText", "readme", "readmeFilename", "devDependencies"]);
+export const KEPT_VERSION_FIELDS: ReadonlySet<string> = new Set([
+  // npm's abbreviated packument
+  "name",
+  "version",
+  "dependencies",
+  "optionalDependencies",
+  "peerDependencies",
+  "peerDependenciesMeta",
+  // yarn berry reads it from the registry (optional: true marks a dependency whose build may fail) and writes it to yarn.lock
+  "dependenciesMeta",
+  "bundleDependencies",
+  "bundledDependencies",
+  "acceptDependencies",
+  "bin",
+  "directories",
+  "engines",
+  "os",
+  "cpu",
+  "libc",
+  "_hasShrinkwrap",
+  "hasInstallScript",
+  "deprecated",
+  "funding",
+  "dist",
+  // what the registry reads: the publisher, install scripts, and the package page's text and links
+  "_id",
+  "_npmUser",
+  "scripts",
+  "description",
+  "keywords",
+  "license",
+  "homepage",
+  "repository",
+  "bugs",
+  "author",
+  // what the full packument's readers look at
+  "main",
+  "module",
+  "types",
+  "typings",
+  "type",
+  "gitHead",
+]);
+
+/**
+ * The members of a version's `dist` the registry reads: the tarball's URL and its checksums. npm's `dist` also carries
+ * the tarball's signatures, its npm-signature (PGP, about 800 bytes a version) and attestations: 7.7 MB of
+ * @prisma/client's 68 MB. apm serves a `dist` of its own, with its own tarball URL and npm's checksums, so none of them
+ * is ever served.
+ */
+export const KEPT_DIST_FIELDS: ReadonlySet<string> = new Set(["tarball", "shasum", "integrity"]);
 
 /**
  * What a read keeps. `top`: the top-level fields kept; `versions` among them is read into, one version document at a
- * time. `fields`: which fields of each version document are kept, all but some or only some. `otherVersions`: whether a
- * `versions` entry that is not an object (no real packument has one) is kept as it is.
+ * time. `fields`: which fields of each version document are kept, all but some or only some. `within`: a kept version
+ * field that, when it is an object, is read into as well, keeping only the members it names (any other value is kept
+ * as it is). `otherVersions`: whether a `versions` entry that is not an object (no real packument has one) is kept as
+ * it is.
  */
 export type KeepProfile = {
   readonly top: ReadonlySet<string>;
   readonly fields: { readonly kind: "except" | "only"; readonly names: ReadonlySet<string> };
+  readonly within: { readonly field: string; readonly names: ReadonlySet<string> } | null;
   readonly otherVersions: boolean;
 };
 
-/** What the registry reads: what JSON.parse gives, minus the top-level fields it never reads and DROPPED_VERSION_FIELDS. */
-export const TRIMMED: KeepProfile = { top: TOP_FIELDS, fields: { kind: "except", names: DROPPED_VERSION_FIELDS }, otherVersions: true };
+/** What the registry reads: the top-level fields it reads, each version's KEPT_VERSION_FIELDS, and KEPT_DIST_FIELDS. */
+export const TRIMMED: KeepProfile = { top: TOP_FIELDS, fields: { kind: "only", names: KEPT_VERSION_FIELDS }, within: { field: "dist", names: KEPT_DIST_FIELDS }, otherVersions: true };
 
 /** Only each version's devDependencies: what the full packument adds back to TRIMMED. */
-export const DEV_DEPENDENCIES: KeepProfile = { top: new Set(["versions"]), fields: { kind: "only", names: new Set(["devDependencies"]) }, otherVersions: false };
+export const DEV_DEPENDENCIES: KeepProfile = { top: new Set(["versions"]), fields: { kind: "only", names: new Set(["devDependencies"]) }, within: null, otherVersions: false };
 
 /**
  * What JSON.stringify writes for a number, at most ("-1.7976931348623157e+308"): what a number of one digit may grow to
@@ -73,16 +130,19 @@ export const MAX_PACKUMENT_BYTES = 160 * 1024 * 1024;
 export const MAX_KEPT_PACKUMENT_BYTES = 24 * 1024 * 1024;
 
 /**
- * The most values and keys kept from one packument. Of the real packuments the reader is checked against, next keeps
- * the most: 0.80 million under TRIMMED, and 1.18 million for its devDependencies alone (DEV_DEPENDENCIES). This bounds
- * the reader's work; the memory a node costs is charged as weight (MAX_PACKUMENT_WEIGHT).
+ * The most values and keys kept from one packument. Of the real packuments the reader is checked against,
+ * @prisma/client keeps the most under TRIMMED, 0.97 million (next 0.58, @clerk/nextjs 0.64), and next 1.18 million for
+ * its devDependencies alone (DEV_DEPENDENCIES); @prisma/client's devDependencies are 1.64 million and are refused, so its
+ * full packument is served without them. When TRIMMED kept every version field but four, @mastra/core (1.64 million),
+ * @clerk/backend and @clerk/shared (1.55) passed this and every npm install of them answered 503. This bounds the
+ * reader's work; the memory a node costs is charged as weight (MAX_PACKUMENT_WEIGHT).
  */
 export const MAX_KEPT_PACKUMENT_NODES = 1_500_000;
 
 /**
  * The most one packument may weigh (WEIGHTS): an upper bound on the heap it is held in once parsed, each parse's
- * moment included. In MiB, with the heap workerd holds it in: next 24.5 under TRIMMED (13.4), @types/node 19.6 (12.9),
- * typescript 18.6 (11.4), and next's devDependencies 32.0 (16.9), the most of any real one.
+ * moment included. In MiB, with the heap workerd holds it in: @prisma/client 38.4 under TRIMMED (23.3), the most of any
+ * real one, prisma 30.6 (18.1), next 17.0 (8.3), @mastra/core 8.6 (4.5), and next's devDependencies 32.0 (16.9).
  */
 export const MAX_PACKUMENT_WEIGHT = 48 * 1024 * 1024;
 
@@ -124,7 +184,7 @@ export const PACKUMENT_LIMITS: PackumentLimits = {
  *   a hidden class of its own: `[{"k0":0},{"k1":0},...]` is 112 bytes of heap an object, and a version whose only
  *   field has a name of its own 125. The key's text is charged with it. Orders are told apart by a hash of their key
  *   bytes, seeded per read, and the set of hashes is charged here too.
- * Real packuments weigh 1.5 to 1.9 times their heap under TRIMMED (MAX_PACKUMENT_WEIGHT).
+ * Real packuments weigh 1.6 to 2.1 times their heap under TRIMMED (MAX_PACKUMENT_WEIGHT).
  */
 export const WEIGHTS = { text: 1, parse: 2, value: 20, container: 40, key: 8, dictKey: 28, dictAt: 128, hiddenClass: 128 } as const;
 
@@ -231,7 +291,7 @@ const isSpace = (b: number): boolean => b === 0x20 || b === 0x0a || b === 0x0d |
  * A value being kept: where it goes once it ends, and the depth it started at. Its bytes so far are in the slabs;
  * `bytes` and `numbers` count its text and the numbers in it, which bound what JSON.stringify writes for it.
  */
-type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "key"; readonly name: string; from: number; bytes: number; numbers: number };
+type Capture = { readonly depth: number; readonly into: "top" | "version" | "field" | "within" | "key"; readonly name: string; from: number; bytes: number; numbers: number };
 
 /**
  * The key of a member the reader decides about, once read: its text, or IGNORED when it is longer than any name the
@@ -401,19 +461,24 @@ class Scanner {
   /** Hidden classes seen in this read, as 30-bit hashes, and the seed that makes them unguessable. */
   private readonly classes = new Set<number>();
   private readonly seed: number;
-  /** The hidden classes of the objects the reader builds: the root, the `versions` object and the version document. */
+  /**
+   * The hidden classes of the objects the reader builds: the root, the `versions` object, the version document and the
+   * field of it read into (KeepProfile.within).
+   */
   private topClass: number;
   private versionsClass: number;
   private fieldsClass: number;
+  private withinClass: number;
   /**
-   * The key of the member being read at the root, in `versions`, and in a version document, as long as the reader holds
-   * it: each is charged (heldKeys, by depth) from when it is built until the next key at its depth replaces it. Its
-   * text's length is kept (keyBytes) for maxPieceChars.
+   * The key of the member being read at the root, in `versions`, in a version document and in the field of it read
+   * into, as long as the reader holds it: each is charged (heldKeys, by depth) from when it is built until the next key
+   * at its depth replaces it. Its text's length is kept (keyBytes) for maxPieceChars.
    */
   private rootKey: DecisionKey = null;
   private versionKey: string | null = null;
   private fieldKey: DecisionKey = null;
-  private readonly heldKeys = [0, 0, 0, 0];
+  private withinKey: DecisionKey = null;
+  private readonly heldKeys = [0, 0, 0, 0, 0];
   /**
    * The charge of keys put in what the reader builds (adoptKey): the root's members until the read ends, `versions`'
    * until it closes (its Map, then the object made from it), and a version document's until it closes.
@@ -421,21 +486,32 @@ class Scanner {
   private topKeys = 0;
   private versionKeys = 0;
   private docKeys = 0;
-  private readonly keyBytes = [0, 0, 0, 0];
+  private withinKeys = 0;
+  private readonly keyBytes = [0, 0, 0, 0, 0];
   /** The decision key being read: the most bytes it may take before it is known to name nothing kept, and whether it did. */
   private keyLimit = Number.POSITIVE_INFINITY;
   private keyOverlong = false;
   private readonly topKeyMax: number;
   private readonly fieldKeyMax: number;
-  /** What JSON.stringify writes for the version document being read, at most; and for any one member, at most. */
+  private readonly withinKeyMax: number;
+  /**
+   * What JSON.stringify writes for the version document being read, at most, and for the field of it read into; and
+   * for any one member, at most.
+   */
   private docChars = 0;
+  private withinChars = 0;
   maxPieceChars = 0;
-  /** Whether the container at depth 2 is the `versions` object, and the one at depth 3 a version document read into. */
+  /**
+   * Whether the container at depth 2 is the `versions` object, the one at depth 3 a version document read into, and the
+   * one at depth 4 its field read into (KeepProfile.within).
+   */
   private inVersions = false;
   private inVersion = false;
+  private inWithin = false;
   private readonly top: [string, JsonValue][] = [];
   private versions: Versions = new Map();
   private fields: [string, JsonValue][] = [];
+  private withinFields: [string, JsonValue][] = [];
   bytes = 0;
   keptBytes = 0;
   keptNodes = 0;
@@ -460,10 +536,12 @@ class Scanner {
     this.lease = input.lease;
     this.topKeyMax = rawKeyMax(input.profile.top);
     this.fieldKeyMax = input.profile.fields.kind === "only" ? rawKeyMax(input.profile.fields.names) : Number.POSITIVE_INFINITY;
+    this.withinKeyMax = input.profile.within ? rawKeyMax(input.profile.within.names) : Number.POSITIVE_INFINITY;
     this.seed = crypto.getRandomValues(new Uint32Array(1))[0] ?? 0x811c9dc5;
     this.topClass = this.seed;
     this.versionsClass = this.seed;
     this.fieldsClass = this.seed;
+    this.withinClass = this.seed;
   }
 
   feed(chunk: Uint8Array): void {
@@ -685,7 +763,7 @@ class Scanner {
     // keys matter only where the reader decides what to keep. At the root, and in a version document a profile keeps
     // only some fields of, a key is only compared with the names kept there: one longer than any of them can be is
     // not built at all (review of 6862fc7, finding 1)
-    if (this.depth === 1 || (this.depth === 2 && this.inVersions) || (this.depth === 3 && this.inVersion)) {
+    if (this.depth === 1 || (this.depth === 2 && this.inVersions) || (this.depth === 3 && this.inVersion) || (this.depth === 4 && this.inWithin)) {
       this.keyLimit = this.keyLimitAt(this.depth);
       this.keyOverlong = false;
       this.capture = { depth: this.depth, into: "key", name: "", from: at, bytes: 0, numbers: 0 };
@@ -795,7 +873,8 @@ class Scanner {
         this.holdKey(this.depth, 0);
 
         if (this.depth === 1) this.rootKey = IGNORED;
-        else this.fieldKey = IGNORED;
+        else if (this.depth === 3) this.fieldKey = IGNORED;
+        else this.withinKey = IGNORED;
 
         return;
       }
@@ -809,7 +888,8 @@ class Scanner {
 
       if (this.depth === 1) this.rootKey = key.data;
       else if (this.depth === 2) this.versionKey = key.data;
-      else this.fieldKey = key.data;
+      else if (this.depth === 3) this.fieldKey = key.data;
+      else this.withinKey = key.data;
 
       return;
     }
@@ -824,6 +904,8 @@ class Scanner {
     if (depth === 1) return this.topKeyMax;
 
     if (depth === 3) return this.fieldKeyMax;
+
+    if (depth === 4) return this.withinKeyMax;
 
     // a version's key is always kept
     return Number.POSITIVE_INFINITY;
@@ -908,6 +990,24 @@ class Scanner {
     }
 
     this.state = S_AFTER;
+
+    if (this.depth === 3 && this.inWithin) {
+      this.inWithin = false;
+      const key = this.fieldKey;
+
+      if (key === null || key === IGNORED) throw new InvalidPackument("a member with no key");
+      // the object read into, as a member of the version document: `"key":{` and `}`, and a comma before it
+      this.node();
+      this.charge(WEIGHTS.container);
+      this.docChars += (this.keyBytes[3] ?? 0) + this.withinChars + 4;
+      this.fieldEntry(key, Object.fromEntries(this.withinFields));
+      this.withinFields = [];
+      // its own keys are held by it now (charged as its members), the ones read for it are gone
+      this.charge(-this.withinKeys);
+      this.withinKeys = 0;
+
+      return;
+    }
 
     if (this.depth === 2 && this.inVersion) {
       this.inVersion = false;
@@ -1011,6 +1111,13 @@ class Scanner {
     this.docWeight += memberWeight(this.fields.length + 1);
     this.member(key, this.fieldsClass, this.fields.length + 1);
     this.fields.push([key, value]);
+  }
+
+  private withinEntry(key: string, value: JsonValue): void {
+    this.withinKeys += this.adoptKey(4);
+    this.withinClass = hashString(this.withinClass, key);
+    this.member(key, this.withinClass, this.withinFields.length + 1);
+    this.withinFields.push([key, value]);
   }
 
   private keep(part: Uint8Array): void {
@@ -1127,7 +1234,27 @@ class Scanner {
         if (!this.inVersion || key === null || key === IGNORED) return;
         const listed = this.profile.fields.names.has(key);
 
-        if (this.profile.fields.kind === "except" ? !listed : listed) this.startCapture({ at, kind, into: "field", name: key });
+        if (this.profile.fields.kind === "except" ? listed : !listed) return;
+
+        if (opensObject && this.profile.within?.field === key) {
+          this.inWithin = true;
+          this.withinFields = [];
+          this.withinClass = this.seed;
+          this.withinChars = 0;
+
+          return;
+        }
+
+        this.startCapture({ at, kind, into: "field", name: key });
+
+        return;
+      }
+
+      case 4: {
+        const key = this.withinKey;
+
+        if (!this.inWithin || key === null || key === IGNORED || !this.profile.within?.names.has(key)) return;
+        this.startCapture({ at, kind, into: "within", name: key });
 
         return;
       }
@@ -1136,7 +1263,7 @@ class Scanner {
     }
   }
 
-  private startCapture(input: { at: number; kind: number | null; into: "top" | "version" | "field"; name: string }): void {
+  private startCapture(input: { at: number; kind: number | null; into: "top" | "version" | "field" | "within"; name: string }): void {
     this.node();
     this.charge(input.kind === null ? WEIGHTS.value : WEIGHTS.container);
     this.capture = { depth: this.depth, into: input.into, name: input.name, from: input.at, bytes: 0, numbers: 0 };
@@ -1168,6 +1295,11 @@ class Scanner {
       case "field":
         this.docChars += (this.keyBytes[3] ?? 0) + chars;
         this.fieldEntry(c.name, value);
+
+        break;
+      case "within":
+        this.withinChars += (this.keyBytes[4] ?? 0) + chars;
+        this.withinEntry(c.name, value);
 
         break;
       default: {

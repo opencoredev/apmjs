@@ -3417,8 +3417,8 @@ const ABBREV = [
 ];
 
 /**
- * The packument apm serves for a package only npm has. What the registry keeps of npm's leaves out every version's
- * licenseText, readme and readmeFilename (readPackument, DROPPED_VERSION_FIELDS); the full packument adds back each
+ * The packument apm serves for a package only npm has. What the registry keeps of npm's is each version's
+ * KEPT_VERSION_FIELDS and of its dist KEPT_DIST_FIELDS (readPackument, TRIMMED); the full packument adds back each
  * version's devDependencies from a read of their own (`devDependencies`; null when that read failed, and then they are
  * left out too). The abbreviated one has none of them.
  *

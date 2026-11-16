@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import {
   DEV_DEPENDENCIES,
-  DROPPED_VERSION_FIELDS,
+  KEPT_DIST_FIELDS,
+  KEPT_VERSION_FIELDS,
   MAX_KEPT_PACKUMENT_NODES,
   MAX_PACKUMENT_DEPTH,
   MAX_PACKUMENT_WEIGHT,
@@ -60,9 +61,18 @@ type JsonObject = { readonly [key: string]: JsonValue };
 /** A JSON value that is an object, not an array: JSON.parse's objects are instances of Object, its strings are not. */
 const isJsonObject = (v: JsonValue): v is JsonObject => v instanceof Object && !Array.isArray(v);
 
+/** A version document as the reader keeps it: its KEPT_VERSION_FIELDS, and of a `dist` that is an object, KEPT_DIST_FIELDS. */
+function keptDoc(doc: JsonObject): JsonObject {
+  return Object.fromEntries(
+    Object.entries(doc)
+      .filter(([f]) => KEPT_VERSION_FIELDS.has(f))
+      .map(([f, v]) => [f, f === "dist" && isJsonObject(v) ? Object.fromEntries(Object.entries(v).filter(([k]) => KEPT_DIST_FIELDS.has(k))) : v]),
+  );
+}
+
 /**
- * What the reader should keep: JSON.parse of the packument, its top-level fields and versions minus the dropped
- * fields. Built from JSON.parse's own value with Object.entries and Object.fromEntries (never a schema, which would
+ * What the reader should keep: JSON.parse of the packument, its top-level fields and each version's kept fields
+ * (keptDoc). Built from JSON.parse's own value with Object.entries and Object.fromEntries (never a schema, which would
  * rebuild objects and drop a `__proto__` key), so duplicate keys resolve exactly as JSON.parse resolves them.
  */
 function expected(packument: JsonValue): KeptPackument {
@@ -71,9 +81,7 @@ function expected(packument: JsonValue): KeptPackument {
   const versions = out.versions;
 
   if (versions !== undefined && isJsonObject(versions)) {
-    out.versions = Object.fromEntries(
-      Object.entries(versions).map(([v, d]) => [v, isJsonObject(d) ? Object.fromEntries(Object.entries(d).filter(([f]) => !DROPPED_VERSION_FIELDS.has(f))) : d]),
-    );
+    out.versions = Object.fromEntries(Object.entries(versions).map(([v, d]) => [v, isJsonObject(d) ? keptDoc(d) : d]));
   }
 
   return out;
@@ -167,18 +175,84 @@ describe("readPackument", () => {
   });
 
   test("a key named __proto__ is an own property, not the prototype", async () => {
-    const text = '{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","__proto__":{"polluted":true},"dist":{"tarball":"t"}}}}';
+    // a version named __proto__ is a member of the `versions` object the reader builds; one in a version document is a
+    // field no profile keeps, and is read past
+    const text = '{"name":"p","versions":{"__proto__":{"name":"p","version":"1.0.0","__proto__":{"polluted":true},"dist":{"tarball":"t","__proto__":{"polluted":true}}}}}';
     const r = await readPackument(streamOf(text, 5), { limits: LIMITS });
 
     expect(r.kind).toBe("ok");
 
     if (r.kind !== "ok") return;
     // read without a schema: zod rebuilds objects and drops a __proto__ key itself
-    const v = Object.values(r.body.versions ?? {})[0];
+    const versions = r.body.versions;
 
-    expect(Object.getPrototypeOf(v)).toBe(Object.prototype);
-    expect(Object.keys(v ?? {})).toContain("__proto__");
+    if (versions === undefined || !isJsonObject(versions)) throw new Error("no versions object");
+    expect(Object.getPrototypeOf(versions)).toBe(Object.prototype);
+    expect(Object.keys(versions)).toEqual(["__proto__"]);
+    expect(Object.values(versions)[0]).toEqual({ name: "p", version: "1.0.0", dist: { tarball: "t" } });
     expect("polluted" in {}).toBe(false);
+  });
+
+  // @mastra/core's packument kept 1.64 million values when the reader kept every version field but a few: 1.2 million
+  // of them its `exports` maps, which no install reads, and it was refused, so npm install of it answered 503. This
+  // one has 2,500 versions of 150 subpaths each (1.5 million values in `exports`) and npm's dist signatures.
+  test("a packument with @mastra/core's shape keeps only what installs read, well inside the limits", async () => {
+    const encoder = new TextEncoder();
+    const count = 2_500;
+    const subpaths = Array.from({ length: 150 }, (_, i) => `"./s${i}":{"types":"./dist/s${i}.d.ts","import":"./dist/s${i}.js","require":"./dist/s${i}.cjs"}`).join(",");
+    const signature = "A".repeat(800);
+
+    const version = (i: number): string =>
+      `"1.0.${i}":{"name":"@m/core","version":"1.0.${i}","exports":{${subpaths}},"maintainers":[{"name":"m"}],"dependencies":{"zod":"^4"},"scripts":{"build":"tsup"},` +
+      `"dist":{"tarball":"https://registry.npmjs.org/@m/core/-/core-1.0.${i}.tgz","shasum":"ab","integrity":"sha512-${"A".repeat(86)}==","npm-signature":"${signature}","signatures":[{"keyid":"k","sig":"${signature}"}]}}`;
+
+    let at = 0;
+
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (at === 0) c.enqueue(encoder.encode('{"name":"@m/core","dist-tags":{"latest":"1.0.0"},"versions":{'));
+
+        if (at < count) {
+          c.enqueue(encoder.encode((at > 0 ? "," : "") + version(at)));
+          at++;
+
+          return;
+        }
+
+        c.enqueue(encoder.encode("}}"));
+        c.close();
+      },
+    });
+
+    const r = await readPackument(body);
+
+    if (r.kind !== "ok") throw new Error(`refused: ${JSON.stringify(r)}`);
+    expect(r.versionCount).toBe(count);
+    expect(r.keptNodes).toBeLessThan(MAX_KEPT_PACKUMENT_NODES / 20);
+    expect(r.weight).toBeLessThan(MAX_PACKUMENT_WEIGHT / 10);
+
+    const versions = r.body.versions;
+
+    if (versions === undefined || !isJsonObject(versions)) throw new Error("no versions object");
+    expect(Object.values(versions)[count - 1]).toEqual({
+      name: "@m/core",
+      version: `1.0.${count - 1}`,
+      dependencies: { zod: "^4" },
+      scripts: { build: "tsup" },
+      dist: { tarball: `https://registry.npmjs.org/@m/core/-/core-1.0.${count - 1}.tgz`, shasum: "ab", integrity: `sha512-${"A".repeat(86)}==` },
+    });
+  }, 60_000);
+
+  // review of 91d0628: yarn berry reads dependenciesMeta from the registry and writes it to yarn.lock; dropping it turned
+  // an optional dependency into a required one, so its failed build would abort the install
+  test("every field an install reads is kept, dependenciesMeta included, under both the install and full profiles", async () => {
+    const meta = { child: { optional: true } };
+    const text = JSON.stringify({ name: "p", "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": { name: "p", version: "1.0.0", dependencies: { child: "1" }, dependenciesMeta: meta, exports: { ".": "./i.js" } } } });
+    const r = await readPackument(streamOf(text, 7), { limits: LIMITS });
+
+    if (r.kind !== "ok") throw new Error(`refused: ${JSON.stringify(r)}`);
+    expect(r.body).toEqual({ name: "p", "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": { name: "p", version: "1.0.0", dependencies: { child: "1" }, dependenciesMeta: meta } } });
+    expect(KEPT_VERSION_FIELDS.has("dependenciesMeta")).toBe(true);
   });
 
   test("past the read cap it stops reading and says how far it got", async () => {
@@ -219,12 +293,12 @@ describe("readPackument", () => {
   });
 
   test("a kept field cheap as text and dear as objects is refused at the node cap", async () => {
-    const arrays = `{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"t"},"x":[${Array.from({ length: 5_000 }, () => "[]").join(",")}]}}}`;
+    const arrays = `{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"t"},"keywords":[${Array.from({ length: 5_000 }, () => "[]").join(",")}]}}}`;
 
     // 15 KB of text: under the kept bytes cap, past 1,000 nodes
     expect(await readPackument(streamOf(arrays, 512), { limits: { ...LIMITS, maxKeptNodes: 1_000 } })).toMatchObject({ kind: "too-large", over: "nodes", limit: 1_000 });
     // the same arrays in a dropped field are only read past
-    const dropped = arrays.replace('"x":', '"readme":');
+    const dropped = arrays.replace('"keywords":', '"readme":');
 
     expect((await readPackument(streamOf(dropped, 512), { limits: { ...LIMITS, maxKeptNodes: 1_000 } })).kind).toBe("ok");
   });
@@ -264,7 +338,7 @@ describe("readPackument", () => {
   // (1.49 million empty arrays: 4.5 MB of text, 30 MB of heap) was read and held
   test("a packument whose parsed weight passes MAX_PACKUMENT_WEIGHT is refused, under the node cap", async () => {
     const count = 1_490_000;
-    const text = `{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"t"},"x":[${"[],".repeat(count - 1)}[]]}}}`;
+    const text = `{"name":"p","versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"t"},"keywords":[${"[],".repeat(count - 1)}[]]}}}`;
     const r = await readPackument(streamOf(text, 65_536));
 
     expect(count).toBeLessThan(MAX_KEPT_PACKUMENT_NODES);
@@ -487,7 +561,7 @@ function rng(seed: number): () => number {
   };
 }
 
-const KEYS = ["name", "versions", "time", "readme", "users", "dependencies", "devDependencies", "licenseText", "dist", "a", "", "__proto__", "1.0.0", "2.0.0", "é", "\\u0041"];
+const KEYS = ["name", "versions", "time", "readme", "users", "dependencies", "devDependencies", "licenseText", "dist", "tarball", "integrity", "npm-signature", "a", "", "__proto__", "1.0.0", "2.0.0", "é", "\\u0041"];
 const STRINGS = ["", "x", 'q\\"q', "\\\\", "\\/", "\\b\\f\\n\\r\\t", "\\u00e9\\uD83D\\uDE00", "\\uD800", "é€😀", "}]{[,:", " "];
 const NUMBERS = ["0", "-0", "1", "-12", "3.25", "1e3", "1E-3", "-0.5e+10", "123456789012345678901234567890"];
 
@@ -515,7 +589,14 @@ function generate(next: () => number, depth: number): string {
 /** A packument-shaped document with random JSON in kept, dropped and discarded places. */
 function packumentLike(next: () => number): string {
   // one version document: kept, dropped and unknown fields, each random
-  const version = (v: string): string => `"${v}":{"name":"p","version":"${v}","dependencies":${generate(next, 2)},"licenseText":${generate(next, 2)},"devDependencies":${generate(next, 2)},"${KEYS[Math.floor(next() * KEYS.length)]}":${generate(next, 2)}}`;
+
+  // a `dist` the reader reads into (TRIMMED keeps only some of its members), or any other value
+  const dist = (): string =>
+    next() < 0.7 ? `{"tarball":${generate(next, 4)},"npm-signature":${generate(next, 4)},"${KEYS[Math.floor(next() * KEYS.length)]}":${generate(next, 4)},"integrity":${generate(next, 4)}}` : generate(next, 3);
+
+  const version = (v: string): string =>
+    `"${v}":{"name":"p","version":"${v}","dist":${dist()},"dependencies":${generate(next, 2)},"licenseText":${generate(next, 2)},"devDependencies":${generate(next, 2)},"${KEYS[Math.floor(next() * KEYS.length)]}":${generate(next, 2)}}`;
+
   const versions = Array.from({ length: 1 + Math.floor(next() * 3) }, (_, i) => version(next() < 0.2 ? "1.0.0" : `1.0.${i}`)).join(",");
   const extra = next() < 0.3 ? `,"versions":${next() < 0.5 ? generate(next, 1) : `{${version("9.9.9")}}`}` : "";
 
@@ -634,7 +715,7 @@ describe("readPackument against JSON.parse, on a fuzz corpus", () => {
 const REAL = process.env.APM_PACKUMENTS ?? join(homedir(), ".cache", "apm-packuments");
 
 describe.skipIf(!existsSync(REAL))("readPackument against JSON.parse, on real packuments", () => {
-  for (const name of ["_types_node", "aws-sdk", "esbuild", "lodash", "next", "react", "typescript", "vite"]) {
+  for (const name of ["_clerk_backend", "_clerk_clerk-react", "_clerk_nextjs", "_clerk_shared", "_clerk_types", "_mastra_core", "_prisma_client", "_types_node", "aws-sdk", "esbuild", "firebase", "lodash", "next", "prisma", "react", "typescript", "vite"]) {
     test(`${name}: what JSON.parse gives, under both profiles, within the default limits`, async () => {
       const file = Bun.file(join(REAL, `${name}.json`));
       const want = oracle(new Uint8Array(await file.arrayBuffer()));
@@ -644,7 +725,10 @@ describe.skipIf(!existsSync(REAL))("readPackument against JSON.parse, on real pa
       const dev = await readPackument(file.stream(), { profile: DEV_DEPENDENCIES });
 
       expect(trimmed).toMatchObject({ kind: "ok", body: expected(want.value) });
-      expect(dev).toMatchObject({ kind: "ok", body: expectedDev(want.value) });
+
+      // @prisma/client's devDependencies are 1.64 million values: its full packument is served without them
+      if (name === "_prisma_client") expect(dev).toMatchObject({ kind: "too-large", over: "nodes", limit: MAX_KEPT_PACKUMENT_NODES });
+      else expect(dev).toMatchObject({ kind: "ok", body: expectedDev(want.value) });
 
       // what serializing it a member at a time holds is charged from this bound (http.ts, streamWeight)
       for (const r of [trimmed, dev]) if (r.kind === "ok") expect(r.maxPieceChars).toBeGreaterThanOrEqual(longestPiece(r.body));

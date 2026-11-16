@@ -28,12 +28,15 @@ const noBlobs = Layer.succeed(
   Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }),
 );
 
-/** npm, standing in: one package with a shallow 1.0.0 and a 2.0.0 whose exports nest DEPTH levels deep. */
+/**
+ * npm, standing in: one package with a shallow 1.0.0 and a 2.0.0 whose `bin` nests DEPTH levels deep, and whose
+ * `exports`, a field apm does not keep, does too.
+ */
 function fakeNpm() {
   const dist = (v: string) => JSON.stringify({ tarball: `https://npm.invalid/deep-review/-/deep-review-${v}.tgz`, shasum: "1".repeat(40), integrity: `sha512-${createHash("sha512").update(v).digest("base64")}` });
   const deep = `${'{"node":'.repeat(DEPTH)}"./index.js"${"}".repeat(DEPTH)}`;
   const shallow = `{"name":"deep-review","version":"1.0.0","main":"index.js","license":"MIT","dist":${dist("1.0.0")}}`;
-  const deepVersion = `{"name":"deep-review","version":"2.0.0","main":"index.js","license":"MIT","dependencies":{"left-pad":"^1.0.0"},"exports":${deep},"dist":${dist("2.0.0")}}`;
+  const deepVersion = `{"name":"deep-review","version":"2.0.0","main":"index.js","license":"MIT","dependencies":{"left-pad":"^1.0.0"},"exports":${deep},"bin":${deep},"dist":${dist("2.0.0")}}`;
   const body = `{"name":"deep-review","dist-tags":{"latest":"2.0.0"},"versions":{"1.0.0":${shallow},"2.0.0":${deepVersion}},"time":{"1.0.0":"2026-10-01T00:00:00Z","2.0.0":"2026-10-02T00:00:00Z"}}`;
 
   const server = Bun.serve({
@@ -66,9 +69,10 @@ describe("a packument with a manifest past the limits apm reads", () => {
       const deep = versions["2.0.0"];
 
       expect(deep?.exports).toBeUndefined();
+      expect(deep?.bin).toBeUndefined();
       expect(deep?.dependencies).toEqual({ "left-pad": "^1.0.0" });
       expect(deep?.dist.tarball).toBe("http://registry.test/deep-review/-/deep-review-2.0.0.tgz");
-      expect(String(deep?.[TRIMMED_FIELD])).toBe("package.json nests deeper than 64 levels, past what apm serves; left out: exports");
+      expect(String(deep?.[TRIMMED_FIELD])).toBe("package.json nests deeper than 64 levels, past what apm serves; left out: bin");
       expect(versions["1.0.0"]?.[TRIMMED_FIELD]).toBeUndefined();
       expect(versions["1.0.0"]?.main).toBe("index.js");
     } finally {

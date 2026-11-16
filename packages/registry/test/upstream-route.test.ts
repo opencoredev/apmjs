@@ -57,7 +57,7 @@ const HEAVY = JSON.stringify({
   versions: Object.fromEntries(
     Array.from({ length: 2_000 }, (_, i) => [
       `1.0.${i}`,
-      { name: "heavy", version: `1.0.${i}`, notes: "n".repeat(12_200), devDependencies: Object.fromEntries(Array.from({ length: 364 }, (_, j) => [`dev${j}`, {}])), dist: dist("heavy", `1.0.${i}`) },
+      { name: "heavy", version: `1.0.${i}`, description: "n".repeat(12_200), devDependencies: Object.fromEntries(Array.from({ length: 364 }, (_, j) => [`dev${j}`, {}])), dist: dist("heavy", `1.0.${i}`) },
     ]),
   ),
 });
@@ -149,7 +149,7 @@ describe("the npm packument route", () => {
     const body = Served.parse(JSON.parse(full?.text ?? ""));
 
     expect(Object.keys(body.versions)).toHaveLength(2_000);
-    expect(body.versions["1.0.7"]?.notes).toBe("n".repeat(12_200));
+    expect(body.versions["1.0.7"]?.description).toBe("n".repeat(12_200));
     // on f0e533a the second read had no budget: all of them were read and held beside the packument
     expect(Object.values(body.versions).some((v) => "devDependencies" in v)).toBe(false);
   }, 60_000);

@@ -25,7 +25,7 @@ const HEAP_CEILING = 64 * MB;
 const NOISE = 256 * 1024;
 
 const ENTRY = `
-import { DEV_DEPENDENCIES, readPackument, TRIMMED } from ${JSON.stringify(join(SRC, "packument-read.ts"))};
+import { DEV_DEPENDENCIES, KEPT_VERSION_FIELDS, readPackument, TRIMMED } from ${JSON.stringify(join(SRC, "packument-read.ts"))};
 import { MemoryPool } from ${JSON.stringify(join(SRC, "memory.ts"))};
 import { cachedPackage, packageMoment, packageWeight, scoredPackage } from ${JSON.stringify(join(SRC, "upstream.ts"))};
 ${MEASURE}
@@ -33,11 +33,11 @@ const encoder = new TextEncoder();
 /** A lease with no limit, in a pool of its own: for a read that measures the reader alone. */
 const free = () => new MemoryPool(Infinity).request(Infinity);
 
-/** A packument whose version 1.0.0 keeps a field "x": an array of \`count\` copies of \`item\`, streamed about \`chunk\` bytes at a time. */
+/** A packument whose version 1.0.0 keeps a field "keywords": an array of \`count\` copies of \`item\`, streamed about \`chunk\` bytes at a time. */
 function repeated({ name, item, count, chunk }) {
   const per = Math.max(1, Math.floor(chunk / (item.length + 1)));
   const full = encoder.encode((item + ",").repeat(per));
-  const parts = [encoder.encode('{"name":"' + name + '","versions":{"1.0.0":{"name":"' + name + '","version":"1.0.0","dist":{"tarball":"t"},"x":[')];
+  const parts = [encoder.encode('{"name":"' + name + '","versions":{"1.0.0":{"name":"' + name + '","version":"1.0.0","dist":{"tarball":"t"},"keywords":[')];
   let left = count - 1;
   return new ReadableStream({
     pull(c) {
@@ -69,16 +69,17 @@ function generated(make, chunk) {
 }
 
 const FIXTURES = {
-  emptyArrays: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n; i++) yield i ? ",[]" : "[]"; yield "]}}}"; },
-  emptyObjects: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n; i++) yield i ? ",{}" : "{}"; yield "]}}}"; },
-  nestedArrays: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n; i++) yield i ? ",[[[]]]" : "[[[]]]"; yield "]}}}"; },
-  distinctKeyObjects: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n; i++) yield (i ? "," : "") + '{"k' + i + '":0}'; yield "]}}}"; },
-  shortStrings: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"' + i + '"'; yield "]}}}"; },
-  boxedNumbers: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":[{}'; for (let i = 0; i < n; i++) yield ",1.5"; yield "]}}}"; },
-  dictionaryObjects: (n) => function* () { const o = "{" + Array.from({ length: 2000 }, (_, j) => '"k' + j + '":{}').join(",") + "}"; yield '{"name":"p","versions":{"1.0.0":{"x":['; for (let i = 0; i < n / 2000; i++) yield (i ? "," : "") + o; yield "]}}}"; },
-  versionsOwnFields: (n) => function* () { yield '{"name":"p","versions":{'; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"' + i + '":{"f' + i + '":0}'; yield "}}"; },
+  emptyArrays: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n; i++) yield i ? ",[]" : "[]"; yield "]}}}"; },
+  emptyObjects: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n; i++) yield i ? ",{}" : "{}"; yield "]}}}"; },
+  nestedArrays: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n; i++) yield i ? ",[[[]]]" : "[[[]]]"; yield "]}}}"; },
+  distinctKeyObjects: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n; i++) yield (i ? "," : "") + '{"k' + i + '":0}'; yield "]}}}"; },
+  shortStrings: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"' + i + '"'; yield "]}}}"; },
+  boxedNumbers: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":[{}'; for (let i = 0; i < n; i++) yield ",1.5"; yield "]}}}"; },
+  dictionaryObjects: (n) => function* () { const o = "{" + Array.from({ length: 2000 }, (_, j) => '"k' + j + '":{}').join(",") + "}"; yield '{"name":"p","versions":{"1.0.0":{"keywords":['; for (let i = 0; i < n / 2000; i++) yield (i ? "," : "") + o; yield "]}}}"; },
+  // a version document's fields can only be kept names, so the most hidden classes they make is one per order of them
+  versionsOwnOrders: (n) => function* () { const k = [...KEPT_VERSION_FIELDS]; yield '{"name":"p","versions":{'; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"' + i + '":{"' + k[i % k.length] + '":0,"' + k[Math.floor(i / k.length) % k.length] + '":0,"' + k[Math.floor(i / k.length / k.length) % k.length] + '":0}'; yield "}}"; },
   wideString: (n) => function* () { yield '{"name":"p","description":"\\u20ac'; for (let i = 0; i < n / 1000; i++) yield "a".repeat(1000); yield '"}'; },
-  wideKeys: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"x":{'; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"€' + i + '":0'; yield "}}}}"; },
+  wideKeys: (n) => function* () { yield '{"name":"p","versions":{"1.0.0":{"keywords":{'; for (let i = 0; i < n; i++) yield (i ? "," : "") + '"€' + i + '":0'; yield "}}}}"; },
 };
 
 const ok = (r) => r.kind === "ok" ? { kind: "ok", weight: r.weight, keptNodes: r.keptNodes, keptBytes: r.keptBytes } : { kind: r.kind, over: r.over, reason: r.reason };
@@ -221,7 +222,7 @@ describe("the packument reader's heap in workerd", () => {
     ["shortStrings", 500_000],
     ["boxedNumbers", 1_000_000],
     ["dictionaryObjects", 400_000],
-    ["versionsOwnFields", 100_000],
+    ["versionsOwnOrders", 300_000],
     ["wideString", 8_000_000],
     ["wideKeys", 300_000],
   ] as const) {
@@ -254,7 +255,13 @@ describe("the packument reader's heap in workerd", () => {
 
 // The real packuments the reader is checked against, saved from registry.npmjs.org (not in the repository: 118 MB).
 const REAL = process.env.APM_PACKUMENTS ?? join(homedir(), ".cache", "apm-packuments");
-const REAL_NAMES = ["_types_node", "aws-sdk", "esbuild", "lodash", "next", "react", "typescript", "vite"];
+const REAL_NAMES = ["_clerk_backend", "_clerk_clerk-react", "_clerk_nextjs", "_clerk_shared", "_clerk_types", "_mastra_core", "_prisma_client", "_types_node", "aws-sdk", "esbuild", "firebase", "lodash", "next", "prisma", "react", "typescript", "vite"];
+
+/**
+ * The reads of real packuments refused at a limit, and which: @prisma/client's devDependencies are 1.64 million values,
+ * past MAX_KEPT_PACKUMENT_NODES, so its full packument is served without them, as any devDependencies past a limit are.
+ */
+const REAL_REFUSED: ReadonlyMap<string, string> = new Map([["_prisma_client dev", "nodes"]]);
 
 describe.skipIf(!existsSync(REAL))("real packuments in workerd", () => {
   for (const name of REAL_NAMES) {
@@ -262,6 +269,15 @@ describe.skipIf(!existsSync(REAL))("real packuments in workerd", () => {
       test(`${name} (${profile}): read, and weighs at least its heap`, async () => {
         const res = await heap.dispatch(`/real?profile=${profile}`, { method: "POST", body: Bun.file(join(REAL, `${name}.json`)).stream(), duplex: "half" });
         const got = z.object({ read: Read, held: z.number() }).parse(await res.json());
+
+        const refused = REAL_REFUSED.get(`${name} ${profile}`);
+
+        if (refused !== undefined) {
+          expect(got.read).toMatchObject({ kind: "too-large", over: refused });
+          expect(got.held).toBeLessThan(NOISE);
+
+          return;
+        }
 
         if (got.read.kind !== "ok") throw new Error(`${name} was not read: ${JSON.stringify(got.read)}`);
         process.stdout.write(`[heap] ${name} ${profile}: ${got.read.keptNodes} nodes, weight ${mb(got.read.weight)}, heap ${mb(got.held)}\n`);
