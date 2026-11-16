@@ -7,12 +7,11 @@ import { PgClient } from "@effect/sql-pg";
 import { z } from "zod";
 import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
-import type { Socket } from "node:net";
 import { digestLabel, digestOf } from "./digest.ts";
 import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
 import { StoreError } from "./errors.ts";
 import { timed, timingOrNull } from "./timing.ts";
-import { connectionOptions, Guard, guardFor, type DatabaseGuard, type GuardTimings } from "./db-health.ts";
+import { connectionOptions, Guard, guardFor, RequestConnections, type DatabaseGuard, type GuardTimings } from "./db-health.ts";
 
 export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
 
@@ -746,14 +745,14 @@ export class Store extends Context.Service<Store, StoreApi>()("@apm/registry/Sto
   static postgres(url: string, faults: ReadonlySet<StoreFault> = new Set(), timings: GuardTimings = {}): Layer.Layer<Store | SqlClient.SqlClient | Guard, StoreError> {
     return Layer.effectContext(
       Effect.gen(function* () {
-        // this request's connections, which its guard closes at once when it takes the database as unreachable
-        const open = new Set<Socket>();
+        // this request's connections, which its guard closes at once when it takes the database as unavailable
+        const conns = new RequestConnections();
 
-        const services = yield* Layer.build(PgClient.layer({ ...connectionOptions(url, open, timings.stallMs), maxConnections: 1 })).pipe(
+        const services = yield* Layer.build(PgClient.layer({ ...connectionOptions(url, conns, timings.stallMs), maxConnections: 1 })).pipe(
           Effect.mapError((cause) => new StoreError({ operation: "connect", cause })),
         );
 
-        const guard = guardFor(url, timings, open);
+        const guard = guardFor(timings, conns);
         const store = yield* make(faults, guard).pipe(Effect.provide(services));
 
         return Context.add(Context.add(services, Store, store), Guard, guard);

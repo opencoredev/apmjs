@@ -86,7 +86,6 @@ const WorkerEnv = z.object({
   APM_REVIEW_REQUESTS_PER_HOUR: z.coerce.number().int().min(0).optional(),
   APM_REVIEW_MAX_ATTEMPTS: z.coerce.number().int().min(1).optional(),
   /** How long an isolate takes the database as down after it failed to answer (db-health.ts). For tests; production keeps the default. */
-  APM_DB_DOWN_WINDOW_MS: z.coerce.number().int().min(0).optional(),
   /** sha256 (hex) of the operator's debug token: a request whose x-apm-debug header is that token gets the full Server-Timing (timing.ts). */
   APM_DEBUG_TOKEN_HASH: z
     .string()
@@ -172,7 +171,7 @@ export type Background = ((work: Promise<void>) => void) | null;
  * connection: the request's connection closes with the request.
  */
 function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<Clock>, background: Background) {
-  const fresh = Layer.mergeAll(Store.postgres(env.HYPERDRIVE.connectionString, new Set(), { windowMs: env.APM_DB_DOWN_WINDOW_MS }), clock, Layer.succeed(ReviewConfig, review));
+  const fresh = Layer.mergeAll(Store.postgres(env.HYPERDRIVE.connectionString), clock, Layer.succeed(ReviewConfig, review));
 
   return Layer.effect(
     ReleaseHooks,
@@ -224,7 +223,7 @@ export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: L
 function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, faults: ReadonlySet<StoreFault>) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
-  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults, { windowMs: env.APM_DB_DOWN_WINDOW_MS }), Blobs.r2(env.BLOBS), Blocklist.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
+  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults), Blobs.r2(env.BLOBS), Blocklist.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
@@ -368,7 +367,7 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
 
   // before the router: it answers whatever else is down, and reads nothing a request's services would
   if ((req.method === "GET" || req.method === "HEAD") && routePath(path).path === HEALTH_PATH) {
-    return healthResponse(req, { databaseUrl: env.HYPERDRIVE.connectionString, downWindowMs: env.APM_DB_DOWN_WINDOW_MS, bucket: env.BLOBS, queueBound: env.ANALYSIS_QUEUE !== undefined, upstreamUrl: settings.upstreamUrl });
+    return healthResponse(req, { databaseUrl: env.HYPERDRIVE.connectionString, bucket: env.BLOBS, queueBound: env.ANALYSIS_QUEUE !== undefined, upstreamUrl: settings.upstreamUrl });
   }
 
   const program = route(req).pipe(

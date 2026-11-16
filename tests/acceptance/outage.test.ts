@@ -60,7 +60,7 @@ async function timedGet(path: string, init?: RequestInit): Promise<{ res: Respon
 }
 
 beforeAll(async () => {
-  reg = await startRegistry({ upstream: NPM, databaseLink: true, env: { APM_DB_DOWN_WINDOW_MS: "1500" } });
+  reg = await startRegistry({ upstream: NPM, databaseLink: true });
   work = mkdtempSync(join(tmpdir(), "apm-outage-"));
   const alice = await addUser(reg, "alice");
   const pkg = writePackage(work, { name: LOCAL, version: "1.0.0" }, reg, alice);
@@ -169,8 +169,10 @@ for (const mode of ["hang", "refuse"] as const) {
 
       process.stdout.write(`[outage:${mode}] next packument: HTTP ${second.res.status} in ${second.ms.toFixed(0)} ms\n`);
       expect(second.res.status).toBe(200);
-      // the isolate took the database as down: it does not wait on it again within the window
-      expect(second.ms).toBeLessThan(1_500);
+      expect(second.res.headers.get("x-apm-degraded")).toBe("database-unavailable");
+      // nothing is shared between requests (db-health.ts): each pays its own connect attempt, within its bound, and is
+      // still answered without the database
+      expect(second.ms).toBeLessThan(6_000);
       await second.res.arrayBuffer();
     }, 30_000);
 
@@ -227,9 +229,10 @@ for (const mode of ["hang", "refuse"] as const) {
         expect(res.headers.get("retry-after")).toBe("30");
         expect(String(dig(body, "error"))).toContain("is published on apm");
       }
-    });
+      // a hung database is checked again by each request, about 3 s apiece (db-health.ts)
+    }, 20_000);
 
-    test("routes that need the database answer 503 with the reason, at once", async () => {
+    test("routes that need the database answer 503 with the reason, each within the bound", async () => {
       for (const path of [`-/apm/v1/packages/${GOOD.name}`, `-/apm/v1/resolve?name=${GOOD.name}`, `~safe/${GOOD.name}`]) {
         const { res, ms } = await timedGet(path);
         const body = await res.json();
@@ -238,7 +241,7 @@ for (const mode of ["hang", "refuse"] as const) {
         expect(dig(body, "reason")).toBe("database-unavailable");
         expect(ms).toBeLessThan(6_000);
       }
-    });
+    }, 30_000);
 
     test("the health check reports the database down and installs working for npm's packages", async () => {
       // an isolate reuses its last answer for 5 s

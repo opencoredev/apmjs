@@ -1567,7 +1567,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, or a lookup that failed).",
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it).",
         "reasons": [
           "apm flagged 2 dependencies: `dep-low@1.0.0: scores 12/100 (F), under the floor of 40`, `dep-down@^1.0.0: could not be checked: registry or upstream unavailable`."
         ],
@@ -1710,7 +1710,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 1 dependency apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, or a lookup that failed).",
+        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 1 dependency apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it).",
         "reasons": [
           "apm flagged 1 dependency: `baseline-browser-mapping@2.11.37: published 3 hours ago, inside apm's 24-hour cooldown`."
         ],

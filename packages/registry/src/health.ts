@@ -7,7 +7,7 @@ import { Duration, Effect, Exit } from "effect";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { readFrom, type BlocklistReader } from "./blocklist.ts";
-import { downReason, Guard } from "./db-health.ts";
+import { Guard } from "./db-health.ts";
 import { Store } from "./db.ts";
 
 export const HEALTH_PATH = "/-/apm/v1/health";
@@ -51,8 +51,6 @@ export type Health = {
 
 export type HealthEnv = {
   readonly databaseUrl: string;
-  /** How long a failed check marks the database down for this isolate's other requests (db-health.ts). */
-  readonly downWindowMs: number | undefined;
   /** The registry's bucket, as the health check reads it: the block list and the queue probe's record. */
   readonly bucket: BlocklistReader;
   readonly queueBound: boolean;
@@ -75,12 +73,8 @@ async function timedCheck(run: () => Promise<Omit<Check, "ms">>): Promise<Check>
   }
 }
 
-async function database(url: string, downWindowMs: number | undefined): Promise<Check> {
-  const down = downReason(url);
-
-  // taken as down by this isolate a moment ago: not asked again until its window ends (db-health.ts)
-  if (down !== null) return { status: "down", ms: null, detail: down };
-
+/** The database's status from a check of its own, every time: nothing is kept between requests (db-health.ts). */
+async function database(url: string): Promise<Check> {
   return timedCheck(async () => {
     const program = Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -88,8 +82,8 @@ async function database(url: string, downWindowMs: number | undefined): Promise<
       return yield* (yield* Guard).statement("health", sql`SELECT 1 AS ok`);
     }).pipe(
       Effect.timeoutOrElse({ duration: Duration.millis(CHECK_TIMEOUT_MS), orElse: () => Effect.fail("timeout" as const) }),
-      // probing early enough that the guard's verdict, not the check's own time limit, says what is wrong
-      Effect.provide(Store.postgres(url, new Set(), { windowMs: downWindowMs, probeAfterMs: 500, statementMs: CHECK_TIMEOUT_MS - 200 })),
+      // the statement's own deadline ends before the check's, so the guard's verdict says what is wrong
+      Effect.provide(Store.postgres(url, new Set(), { statementMs: CHECK_TIMEOUT_MS - 200 })),
       Effect.scoped,
     );
 
@@ -183,7 +177,7 @@ export function summarize(checks: Health["checks"], upstreamProxied: boolean): P
 }
 
 export async function checkHealth(env: HealthEnv, now: number = Date.now()): Promise<Health> {
-  const [db, storage, q, up] = await Promise.all([database(env.databaseUrl, env.downWindowMs), r2(env.bucket), queue(env.bucket, env.queueBound, now), upstream(env.upstreamUrl)]);
+  const [db, storage, q, up] = await Promise.all([database(env.databaseUrl), r2(env.bucket), queue(env.bucket, env.queueBound, now), upstream(env.upstreamUrl)]);
   const checks = { database: db, r2: storage.r2, blocklist: storage.blocklist, queue: q, upstream: up };
 
   const { status, installs } = summarize(checks, env.upstreamUrl !== null);

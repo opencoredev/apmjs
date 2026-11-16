@@ -12,7 +12,7 @@ import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
 import { Auth } from "../src/auth.ts";
-import { apmRoute, MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, REQUEST_METADATA_WEIGHT, resolveResponse } from "../src/apm.ts";
+import { apmRoute, MAX_WALK_LEVELS, MAX_WALK_LOOKUPS, OVER_BUDGET_TEXT, outOfTimeText, REQUEST_METADATA_WEIGHT, resolveResponse, WalkBudget } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
@@ -153,7 +153,7 @@ const noBlobs = Layer.succeed(
 );
 
 /** GET /-/apm/v1/resolve?name=… against the database (and npm, when given), counting every SQL statement it runs. */
-async function resolve(input: { url: string; name: string; npm?: string; strict?: boolean }): Promise<Resolved> {
+async function resolve(input: { url: string; name: string; npm?: string; strict?: boolean; walkMs?: number }): Promise<Resolved> {
   let queries = 0;
 
   const counter: Statement.Transformer = (self) =>
@@ -169,7 +169,8 @@ async function resolve(input: { url: string; name: string; npm?: string; strict?
   const u = new URL(`http://registry.test/-/apm/v1/resolve?${params}`);
   const store = Store.postgres(input.url);
   const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: input.npm ?? null, legacyAuth: false, namePolicy: "open", admins: [] } as const;
-  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
+  const budget = input.walkMs === undefined ? Layer.empty : Layer.succeed(WalkBudget, { ms: input.walkMs });
+  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL), budget);
   const layers = input.npm === undefined ? base : Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
 
   const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, body: ResolveBody.parse(await res.json()) })));
@@ -338,6 +339,64 @@ describe("the resolve walk bounds its database work", () => {
       }).finally(() => down.stop(true));
     });
   });
+});
+
+// Production, 2026-11-16: firebase's walk read npm for 30 to 44 s, so the website's 25 s limit answered "unknown", and
+// the isolate, busy all that time, took its own database as down. A walk now reads for WALK_BUDGET_MS at most.
+describe("the resolve walk stops at its time budget", () => {
+  test("a dependency npm is still sending at the deadline is unchecked for that reason; what was read in time is checked and kept", () => {
+    const slowMs = 3_000;
+
+    // npm answers quick at once, and slow only after 3 s, each with a strong ETag
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req): Promise<Response> {
+        const name = decodeURIComponent(new URL(req.url).pathname.slice(1));
+
+        if (name !== "quick" && name !== "slow") return Response.json({ error: "Not found" }, { status: 404 });
+
+        if (name === "slow") await Bun.sleep(slowMs);
+        const dist = { tarball: `https://npm.invalid/${name}/-/${name}-1.0.0.tgz`, shasum: "1".repeat(40), integrity: integrityOf(name) };
+        const packument: FakePackument = { name, "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": { ...manifestOf({ name }), dist } }, time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() } };
+
+        return Response.json(packument, { headers: { etag: `"${name}-1"` } });
+      },
+    });
+
+    const root = { name: "root", dependencies: { quick: "^1.0.0", slow: "^1.0.0" } };
+
+    return withDatabase({ local: [root], upstream: [{ name: "quick" }, { name: "slow" }] }, async (url) => {
+      const t0 = performance.now();
+      const r = await resolve({ url, name: "root", npm: npm.url.href, walkMs: 500 });
+      const ms = performance.now() - t0;
+
+      process.stdout.write(`[tree-walk] walk budget 0.5 s, one dependency 3 s slow: answered in ${ms.toFixed(0)} ms\n`);
+      // answered at the budget, not when npm finished
+      expect(ms).toBeLessThan(slowMs - 1_000);
+      expect(r.status).toBe(200);
+      expect(r.body.tree.packages).toEqual([{ name: "quick", version: "1.0.0" }]);
+      // never reported as checked, nor as npm being down: unchecked, with the time as the reason
+      expect(r.body.tree.unchecked).toBe(1);
+      expect(r.body.tree.uncheckedDeps).toEqual([{ dependency: "slow@^1.0.0", reason: outOfTimeText(500) }]);
+      expect(r.body.tree.unavailable).toEqual([]);
+      expect(r.body.warnings?.map((w) => [w.name, w.kind, w.text])).toEqual([["slow", "unchecked", `not checked: ${outOfTimeText(500)}`]]);
+      // the read that finished keeps its choice for the next resolve; the one stopped keeps nothing
+      const c = new Client({ connectionString: url });
+      await c.connect();
+
+      try {
+        const kept = await c.query<{ document: string }>("SELECT document FROM upstream_choices ORDER BY document");
+
+        expect(kept.rows.map((row) => row.document)).toEqual([`${npm.url.href}quick`]);
+      } finally {
+        await c.end();
+      }
+
+      // strict mode refuses a tree it did not finish checking
+      expect((await resolve({ url, name: "root", npm: npm.url.href, walkMs: 500, strict: true })).status).toBe(422);
+    }).finally(() => npm.stop(true));
+  }, 30_000);
 });
 
 // Review of 89441a9, finding 3: a walk holds every catalog it read until it answers, read six at a time, and the

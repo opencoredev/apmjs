@@ -402,14 +402,15 @@ describe("the install packument's copy at the hour", () => {
   }, 60_000);
 });
 
-// re-check of 977b103, finding 3: the database taken as down after this request read the confirmed set (by another
-// request, while this one waited on npm) did not stop it serving the copy or writing one
+// re-check of 977b103, finding 3: the database lost after this request read the confirmed set (while it waited on npm)
+// did not stop it serving the copy or writing one. Nothing is shared between requests (db-health.ts): the request
+// learns it from its own connection closing under it
 describe("the install packument's copy when the database goes down mid-request", () => {
   let linked: Registry;
   const LINK_TTL = 2_000;
 
   beforeAll(async () => {
-    linked = await startRegistry({ upstream: npm.url.toString(), upstreamTtlMs: LINK_TTL, databaseLink: true, env: { APM_DB_DOWN_WINDOW_MS: "1500" } });
+    linked = await startRegistry({ upstream: npm.url.toString(), upstreamTtlMs: LINK_TTL, databaseLink: true });
     // the cron writes the block list, which the degraded route needs
     await linked.sweep();
   });
@@ -426,18 +427,17 @@ describe("the install packument's copy when the database goes down mid-request",
 
   const get = (name: string): Promise<Response> => fetch(`${linked.url}${name}`, { headers: { accept: INSTALL } });
 
-  /** Cuts the database, and has another request find it unreachable, so the isolate takes it as down. */
-  async function breakerOpens(): Promise<void> {
+  /** Cuts the database: the link closes every connection, the waiting request's own included. */
+  async function connectionLost(): Promise<void> {
     link().set("refuse");
-    await (await get("breaker-trigger")).arrayBuffer();
+    await Bun.sleep(100);
   }
 
   async function backUp(): Promise<void> {
     link().set("up");
-    await Bun.sleep(1_600);
   }
 
-  test("a copy is not served once the database is taken as down: the degraded route answers", async () => {
+  test("a copy is not served once the request lost its database: the degraded route answers", async () => {
     const name = "copy-mid";
     listed.set(name, ["1.0.0"]);
     await (await get(name)).arrayBuffer();
@@ -448,7 +448,7 @@ describe("the install packument's copy when the database goes down mid-request",
     const pending = get(name);
 
     await held.arrived;
-    await breakerOpens();
+    await connectionLost();
     held.open();
     const res = await pending;
 
@@ -467,7 +467,7 @@ describe("the install packument's copy when the database goes down mid-request",
     const pending = get(name);
 
     await held.arrived;
-    await breakerOpens();
+    await connectionLost();
     held.open();
     const res = await pending;
 

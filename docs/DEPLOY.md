@@ -198,6 +198,5 @@ The registry Worker reads these (`packages/registry/src/worker.ts` parses them):
 | `APM_REVIEW_TOKEN_HASH` | sha256 (hex) of the AI reviewer's service token. Turns the AI review on. |
 | `APM_ADMINS` | GitHub logins that may confirm or dismiss flagged reviews. |
 | `APM_REVIEW_POPULAR_WEEKLY`, `APM_NPM_DOWNLOADS_URL`, `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning; defaults in `review.ts`. |
-| `APM_DB_DOWN_WINDOW_MS` | How long an isolate takes Postgres as down after it failed to answer (default 15000, `db-health.ts`). Tests shorten it; the stack does not set it. |
 
 The website Worker gets `REGISTRY` (a service binding to the registry Worker) and `APM_REGISTRY`.

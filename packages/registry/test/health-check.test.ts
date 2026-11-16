@@ -34,7 +34,7 @@ function bucket(objects: Record<string, string>, fails = false): HealthEnv["buck
 const SYNCED = JSON.stringify({ format: 1, syncedAt: Date.now() - 60_000, local: [], confirmed: [] });
 
 function env(over: Partial<HealthEnv>): HealthEnv {
-  return { databaseUrl: db.url, downWindowMs: 1, bucket: bucket({ [BLOCKLIST_KEY]: SYNCED }), queueBound: false, upstreamUrl: `http://127.0.0.1:${npm.port}/`, ...over };
+  return { databaseUrl: db.url, bucket: bucket({ [BLOCKLIST_KEY]: SYNCED }), queueBound: false, upstreamUrl: `http://127.0.0.1:${npm.port}/`, ...over };
 }
 
 /** A database nothing listens on: the check fails fast with a refused connection. */

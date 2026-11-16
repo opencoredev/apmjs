@@ -480,7 +480,7 @@ function decide(input: { name: string; range: string | null; resolved: ResolvedI
 
   if (flaggedDeps.length > 0) {
     holds.push({
-      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (published inside the cooldown, a score under ${SCORE_FLOOR}, an incomplete analysis, no score, or a lookup that failed)`,
+      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (published inside the cooldown, a score under ${SCORE_FLOOR}, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it)`,
       reason: `apm flagged ${plural(flaggedDeps.length, "dependency", "dependencies")}: ${flaggedDeps
         .slice(0, SHOWN)
         .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))

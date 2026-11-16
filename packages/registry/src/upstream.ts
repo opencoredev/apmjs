@@ -75,6 +75,9 @@ export type BudgetedProbe = Probe | { kind: "over-budget" };
 /** A summaries answer for one name: BudgetedProbe, with what the caller kept in place of the package. */
 export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" };
 
+/** What Upstream.chosen answers for a package: a summary's answer, or "out-of-time" when its deadline came first. */
+export type ChosenAnswer<S> = Summarized<S> | { kind: "out-of-time" };
+
 // One object of the upstream's /-/v1/search answer. Read loosely: extra fields (downloads, flags, links)
 // pass through untouched so the merged answer keeps npm's wire format.
 const UpSearchObject = z
@@ -651,7 +654,8 @@ export type UpstreamApi = {
    * (SHARE_TIMEOUT_MS), and at once when nothing is written (no data center cache, or npm sent no ETag); it may run
    * twice, so it must do its work once. The caller holds what the answer refers to until then. `ready` is the
    * database's guard (db-health.ts, Guard.ready), checked once more just before the write: a copy is never written
-   * while the database is taken as down, since only a request that read the confirmed set from it may make one.
+   * once this request has taken the database as unavailable, since only a request that read the confirmed set from it
+   * may make one.
    */
   readonly keepInstallCopy: (input: { name: string; served: string; stamp: string; pkg: CachedPackage; write: InstallWriter; ready: Effect.Effect<void, StoreError>; onDone: () => void }) => Effect.Effect<void>;
   /** One version's document (a few KiB): whether npm still lists the version, and its checksums. Kept for the TTL. */
@@ -676,9 +680,11 @@ export type UpstreamApi = {
   /**
    * summaries for a reader that makes named choices of each package's versions (kept-choices.ts): `keep` is handed
    * only the versions each choice took. What it chose is kept with npm's ETag, and answered from there while npm says
-   * the packument has not changed (304), without reading it.
+   * the packument has not changed (304), without reading it. `deadline` (Date.now() milliseconds): a package with no
+   * answer by then is "out-of-time", its read stopped (its stream cancelled, its lease given back); the packages
+   * answered before it keep their choices as usual.
    */
-  readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null }) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
+  readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; deadline?: number }) => Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
@@ -1361,7 +1367,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * has its answer, the planned rows are written one at a time, each under a short reservation of `lease` given
          * back before the next (keepPlans). A write that fails is logged and the answer stands.
          */
-        const chosen = <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null }): Effect.Effect<Map<string, Summarized<S>>, StoreError> =>
+        const chosen = <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; deadline?: number }): Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError> =>
           Effect.gen(function* () {
             const { lease, choices, keep } = input;
             const wanted = [...new Set(input.names)];
@@ -1539,11 +1545,29 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                   return again === "row-gone" ? { kind: "unknown" as const } : again;
                 });
 
-              const first = yield* Effect.forEach(wanted, (name) => Effect.map(one(name), (s) => [name, s] as const), { concurrency: PROBE_CONCURRENCY });
-              const out = new Map<string, Summarized<S>>(first);
+              /**
+               * one, stopped at the batch's deadline: interrupting it cancels its read (joinedPromise) and gives back
+               * its lease. A package answered before then planned its row already (fromPackage), so it is kept.
+               */
+              const inTime = (name: string): Effect.Effect<ChosenAnswer<S>> => {
+                const deadline = input.deadline;
+
+                if (deadline === undefined) return one(name);
+
+                return Effect.suspend(() => {
+                  const left = deadline - Date.now();
+
+                  if (left <= 0) return Effect.succeed({ kind: "out-of-time" as const });
+
+                  return Effect.map(Effect.timeoutOption(one(name), Duration.millis(left)), (o): ChosenAnswer<S> => Option.getOrElse(o, () => ({ kind: "out-of-time" as const })));
+                });
+              };
+
+              const first = yield* Effect.forEach(wanted, (name) => Effect.map(inTime(name), (s) => [name, s] as const), { concurrency: PROBE_CONCURRENCY });
+              const out = new Map<string, ChosenAnswer<S>>(first);
 
               // a package that did not fit beside the others is read again alone: nothing keeping holds is in its way
-              for (const [name, s] of first) if (s.kind === "over-budget") out.set(name, yield* one(name));
+              for (const [name, s] of first) if (s.kind === "over-budget") out.set(name, yield* inTime(name));
 
               // every package has its answer: no row is needed any more
               for (const entry of rows.values()) side.letGo(entry.holding);

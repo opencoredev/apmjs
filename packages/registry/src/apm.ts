@@ -83,12 +83,12 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
-import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
+import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
-import { installStamp, scoredPackage, Upstream, type Summarized, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
+import { installStamp, scoredPackage, Upstream, type ChosenAnswer, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
 import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
@@ -214,6 +214,12 @@ export const upstreamSource = (pkg: UpstreamPackage): Extract<Source, { kind: "u
  * reported unchecked, with a warning, never passed.
  */
 export const REQUEST_METADATA_WEIGHT = REQUEST_WEIGHT;
+
+/**
+ * Why a walk left dependencies unchecked when its time ran out (WALK_BUDGET_MS, or WalkBudget's): the ones still being
+ * read then, and every one after them.
+ */
+export const outOfTimeText = (ms: number): string => `the check stops after ${ms / 1000} seconds; ask again for a fuller check`;
 
 /** Why a dependency past REQUEST_METADATA_WEIGHT, or past what the isolate had room for, was not checked. */
 export const OVER_BUDGET_TEXT = `apm checks at most ${REQUEST_METADATA_WEIGHT / (1024 * 1024)} MB of package metadata in one request, and less while the registry holds others, and this package's did not fit`;
@@ -513,8 +519,14 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
 /**
  * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
  * `over-budget`: the request held as much package metadata as it may (REQUEST_METADATA_WEIGHT), so it was not read.
+ * `out-of-time`: the walk's time ran out (WALK_BUDGET_MS) before it was read.
  */
-type Picked = { kind: "found"; src: Catalog; v: VersionRecord } | { kind: "missing"; reason: string } | { kind: "unavailable"; reason: string } | { kind: "over-budget"; reason: string };
+type Picked =
+  | { kind: "found"; src: Catalog; v: VersionRecord }
+  | { kind: "missing"; reason: string }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "over-budget"; reason: string }
+  | { kind: "out-of-time"; reason: string };
 
 const missing = (reason: string): Picked => ({ kind: "missing", reason });
 const found = (src: Catalog, v: VersionRecord): Picked => ({ kind: "found", src, v });
@@ -568,8 +580,12 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: Keepable) => b
   return best ? found(src, best) : missing(`no installable version matches ${describeDependency(dep)}`);
 }
 
-/** An upstream summary as a lookup; a name the batch has no answer for counts as "upstream could not be asked". */
-function lookupOf(p: Summarized<Catalog> | undefined): Lookup {
+/**
+ * An upstream summary as a lookup; a name the batch has no answer for counts as "upstream could not be asked". Only a
+ * batch given a deadline answers "out-of-time", and the readers that come here (a resolve's root) give none: it would
+ * mean the package was not read, so it counts as not asked.
+ */
+function lookupOf(p: ChosenAnswer<Catalog> | undefined): Lookup {
   if (p === undefined) return "unknown";
 
   switch (p.kind) {
@@ -578,6 +594,7 @@ function lookupOf(p: Summarized<Catalog> | undefined): Lookup {
     case "absent":
       return null;
     case "unknown":
+    case "out-of-time":
       return "unknown";
     case "over-budget":
       return "over-budget";
@@ -683,8 +700,9 @@ function upstreamPicks(c: Chosen, deps: readonly RegistryDependency[], reserve: 
  * registry's dist-tags in one statement, then each local package's heads and picked rows, then npm's analyses and
  * packuments) and keeps of each only the versions its ranges pick (localPicks, upstreamPicks): what stays taken from
  * `lease` is those, and a packument is held only while it is read and picked from. `pick` loads a dependency no batch had.
+ * npm's packages not read by `deadline.at` (Date.now() milliseconds) are out of time.
  */
-function pickMemo(lease: Lease, keep: (v: Keepable) => boolean) {
+function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: number; ms: number }) {
   const known = new Map<string, Picked>();
 
   const load = (deps: readonly RegistryDependency[]) =>
@@ -711,15 +729,23 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean) {
       if (rest.length === 0) return;
 
       const got = upstream
-        ? yield* upstream.chosen<Map<string, Picked>>({ names: rest, lease, choices: (name) => (byName.get(name) ?? []).map((d) => dependencyChoice(d, keep)), keep: (c, reserve) => upstreamPicks(c, byName.get(c.name) ?? [], reserve) })
+        ? yield* upstream.chosen<Map<string, Picked>>({
+            names: rest,
+            lease,
+            choices: (name) => (byName.get(name) ?? []).map((d) => dependencyChoice(d, keep)),
+            keep: (c, reserve) => upstreamPicks(c, byName.get(c.name) ?? [], reserve),
+            deadline: deadline.at,
+          })
         : null;
 
       for (const name of rest) {
         const answer = got === null ? { kind: "absent" as const } : got.get(name);
 
         for (const d of byName.get(name) ?? []) {
-          // a package npm had: its picks; otherwise every range of it is picked from what the lookup came to
+          // a package npm had: its picks; one not read in time: unchecked, for that reason; otherwise every range of it
+          // is picked from what the lookup came to
           if (answer?.kind === "found") known.set(pickKey(d), answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT });
+          else if (answer?.kind === "out-of-time") known.set(pickKey(d), { kind: "out-of-time", reason: outOfTimeText(deadline.ms) });
           else known.set(pickKey(d), pickFrom(answer === undefined ? "unknown" : answer.kind === "absent" ? null : answer.kind, d, keep));
         }
       }
@@ -2141,9 +2167,10 @@ type PlatformSkip = { dependency: string; version: string; reason: string; via: 
  * `warnings`: what strict mode refuses and the default mode installs with a warning (a version inside the cooldown, a
  * low or incomplete score, a version apm cannot score, a lookup that failed, the walk's limits); pending versions get
  * theirs only once the resolve stops waiting. `unscorable` and `unavailable` list those two kinds apart. `limited`:
- * the walk stopped at one of its limits. `skippedForPlatform`: optional dependencies the install's platform does not
- * take (at most MAX_UNCHECKED_LISTED listed, `platformSkips` counts them all). `packages`: every name@version the walk
- * checked, so the CLI can pin each scope in the tree to this registry. `projectPeers`: required peers nothing in the
+ * the walk stopped at one of its limits. `timedOut`: its time (WALK_BUDGET_MS) ran out before it read everything, so a
+ * resolve answers at once rather than wait and walk again. `skippedForPlatform`: optional dependencies the install's
+ * platform does not take (at most MAX_UNCHECKED_LISTED listed, `platformSkips` counts them all). `packages`: every
+ * name@version the walk checked, so the CLI can pin each scope in the tree to this registry. `projectPeers`: required peers nothing in the
  * walk installs whose names the project's package.json lists (resolve's `installed`), with the version checked for
  * each. `withdrawn`: versions the project's lockfile pins that are revoked or yanked, refused in every mode. `digests`:
  * the tarball digest of each of those, which keys its AI review; not sent.
@@ -2156,6 +2183,7 @@ type Tree = {
   unscorable: (DepRef & { reason: string; via: string[] })[];
   unavailable: { dependency: string; via: string[] }[];
   limited: boolean;
+  timedOut: boolean;
   skippedForPlatform: PlatformSkip[];
   platformSkips: number;
   projectPeers: ProjectPeer[];
@@ -2194,6 +2222,11 @@ export const MAX_WALK_LEVELS = 32;
 export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: number; maxAnalyses: number; maxWeight: number };
 
 const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxWeight: REQUEST_METADATA_WEIGHT };
+
+/** How long one walk may read for (WALK_BUDGET_MS when absent). Tests provide a shorter one. */
+export class WalkBudget extends Context.Service<WalkBudget, { readonly ms: number }>()("@apm/registry/WalkBudget") {}
+
+export { WALK_BUDGET_MS };
 
 /** A walked package's key, `name@version`, split back: a scoped name's own `@` comes first. */
 function splitKey(key: string): { name: string; version: string } {
@@ -2262,8 +2295,9 @@ type ProjectPeer = { dependency: string; via: string[]; kind: "lockfile" | "newe
  * (review of 2fbf383, finding 2). An optional dependency built for another platform is skipped, with what it depends
  * on, before any check (finding 5). A version inside the cooldown is a warning: it is the version the package manager
  * installs, so it is the one checked (finding 1). Bounded: at most `maxNodes` packages, `maxLookups` lookups,
- * `maxLevels` levels and `maxAnalyses` tarball analyses. Each name's catalog is read once per walk, a level's names in
- * one batch, and each name and range is resolved once. Everything it could not score is counted and listed, never
+ * `maxLevels` levels and `maxAnalyses` tarball analyses, and WALK_BUDGET_MS on the wall clock: a level that starts past
+ * it is not read, and npm's packages still being read at it are stopped, each unchecked with the time as the reason.
+ * Each name's catalog is read once per walk, a level's names in one batch, and each name and range is resolved once. Everything it could not score is counted and listed, never
  * dropped.
  */
 const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; project?: ProjectDeps; limits?: WalkLimits }) =>
@@ -2280,6 +2314,10 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
     const unscorable: Tree["unscorable"] = [];
     const unavailable: Tree["unavailable"] = [];
     let limited = false;
+    let timedOut = false;
+    const budget = Option.getOrElse(yield* Effect.serviceOption(WalkBudget), () => ({ ms: WALK_BUDGET_MS }));
+    // the wall clock, not the registry's (tests move that one): this bounds how long the request works
+    const deadline = { at: Date.now() + budget.ms, ms: budget.ms };
     const uncheckedDeps: UncheckedDep[] = [];
     const pending: PendingDep[] = [];
     const packages: Tree["packages"] = [];
@@ -2317,7 +2355,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
     // a version the project's lockfile pins is what installs, so it is found whatever its state, and refused below
     // when it is withdrawn; the package manager would never pick any other withdrawn version
     const pins = new Set([...project].flatMap(([n, d]) => (d.kind === "pinned" ? [`${n}@${d.version}`] : [])));
-    const catalogs = pickMemo(lease.child(limits.maxWeight), (v) => v.status === "active" || pins.has(`${v.package}@${v.version}`));
+    const catalogs = pickMemo(lease.child(limits.maxWeight), (v) => v.status === "active" || pins.has(`${v.package}@${v.version}`), deadline);
     // what the package manager would pick: the newest active version in range (pulled versions are hidden)
     const resolved = new Map<string, Picked>();
     const lookupKey = pickKey;
@@ -2460,8 +2498,14 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
           break;
         }
 
-        // the first lookup of a level reads every catalog the level needs in one batch
+        // the first lookup of a level reads every catalog the level needs in one batch, while the walk has time
         if (item.level > loadedLevel) {
+          if (Date.now() >= deadline.at) {
+            timedOut = true;
+            stop(qi, outOfTimeText(deadline.ms));
+            break;
+          }
+
           yield* catalogs.load(levelDeps(qi, item.level));
           loadedLevel = item.level;
         }
@@ -2478,10 +2522,11 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         continue;
       }
 
-      if (picked.kind === "over-budget") {
+      if (picked.kind === "over-budget" || picked.kind === "out-of-time") {
         // a walk limit like the others: counted, listed and warned about, and refused in strict mode
         miss(dep, picked.reason, item.via);
         limited = true;
+        timedOut ||= picked.kind === "out-of-time";
         continue;
       }
 
@@ -2569,7 +2614,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${unlisted} more ${unlisted === 1 ? "dependency was" : "dependencies were"} not checked (git or URL specs, missing packages or the walk's limits)`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     }
 
-    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, withdrawn, packages, digests };
+    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, timedOut, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, withdrawn, packages, digests };
 
     return tree;
   });
@@ -2926,7 +2971,8 @@ const rootAnswer = (input: {
       }
     }
 
-    if (!mode.final && (pendingRoot || walked.pending.length > 0)) {
+    // a walk that ran out of time answers now: waiting would walk the tree again, as long, for no fuller answer
+    if (!mode.final && !walked.timedOut && (pendingRoot || walked.pending.length > 0)) {
       const pending = [...(pendingRoot ? [{ name, version: v.version, via: [] }] : []), ...walked.pending];
 
       return waitingOn({ version: v.version, pending, skipped });
@@ -3541,9 +3587,10 @@ const installPackument = (name: string, upstream: UpstreamApi) =>
     const { baseUrl } = yield* RegistryConfig;
     const lease = yield* RequestMemory;
     const got = yield* upstream.installCopy({ name, served: baseUrl, stamp, lease });
-    // the database may have been taken as down (by this request or another) while the copy or npm was read: then the
-    // confirmed set read above is no longer the registry's word, and this request is answered as every install is
-    // while the database is down (degraded.ts, from worker.ts), never from the copy, nor making one
+    // this request may have lost the database (a statement failed, or its connection closed: db-health.ts) while the
+    // copy or npm was read: then the confirmed set read above is no longer the registry's word, and this request is
+    // answered as every install is while the database is down (degraded.ts, from worker.ts), never from the copy, nor
+    // making one
     const guard = Option.getOrNull(yield* Effect.serviceOption(Guard));
     const ready = guard === null ? Effect.void : guard.ready("installPackument");
     const up = yield* Effect.exit(ready);

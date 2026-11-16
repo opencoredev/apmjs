@@ -12,6 +12,8 @@ export type DatabaseLink = {
   /** The database URL through the link. */
   readonly url: string;
   readonly set: (mode: LinkMode) => void;
+  /** How many connections the link has accepted (or refused) since it started. */
+  readonly accepted: () => number;
   readonly stop: () => Promise<void>;
 };
 
@@ -20,8 +22,10 @@ export async function startDatabaseLink(databaseUrl: string): Promise<DatabaseLi
   const open = new Set<Socket>();
   const pairs = new Set<{ client: Socket; upstream: Socket }>();
   let mode: LinkMode = "up";
+  let accepted = 0;
 
   const server = createServer((client) => {
+    accepted++;
     open.add(client);
     client.on("close", () => open.delete(client));
     client.on("error", () => client.destroy());
@@ -57,6 +61,7 @@ export async function startDatabaseLink(databaseUrl: string): Promise<DatabaseLi
 
   return {
     url: url.toString(),
+    accepted: () => accepted,
     set: (next) => {
       mode = next;
 

@@ -4,6 +4,19 @@
 /** About 20 s, polling the database each second: what the CLI's resolve waits by default, inside its 60 s timeout. */
 export const RESOLVE_WAIT = { maxMs: 20_000, pollMs: 1_000 } as const;
 
+/**
+ * How long one walk of a resolve's dependency tree may read for, on the wall clock. Past it, what the walk has not
+ * read is reported unchecked, with a warning (strict mode refuses it), and the reads that finished keep their choices
+ * (kept-choices.ts), so the next resolve of the same tree starts further on. A resolve walks at most twice (before and
+ * after its wait for queued analyses), and a walk cut short answers at once, without the wait. Before this, firebase's
+ * walk read for 30 to 44 s of CPU in production: the website gave up at 25 s, and the isolate, busy that long, failed
+ * its own database probes and took Postgres as down for everyone it served (2026-11-16). The limit is checked where the
+ * walk waits on I/O (before each level, and by a timer on each npm read), where Workers' clock moves; one synchronous
+ * step (converting a packument already read) cannot be interrupted, and the walk's count limits (300 packages, 400
+ * lookups, 32 levels) bound how many such steps there are.
+ */
+export const WALK_BUDGET_MS = 6_000;
+
 /** The query parameter a caller sets to wait less: whole milliseconds, 0 to RESOLVE_WAIT.maxMs. */
 export const WAIT_PARAM = "wait";
 

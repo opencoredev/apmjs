@@ -13,7 +13,7 @@ export const RESOLVE_TIMEOUT_MS = 25_000;
 export const EXPLAIN_RESOLVE_WAIT_MS = 3_000;
 
 /**
- * What the registry's two walks of a large tree may take besides the wait: vite's took about 3 s each on staging, and
- * the allowance keeps several times that.
+ * What the registry's two walks of a large tree may take besides the wait: each reads for at most the registry's
+ * WALK_BUDGET_MS (6 s), and a walk cut short by it answers without the second (resolve-budget.test.ts checks it).
  */
 export const RESOLVE_WALK_ALLOWANCE_MS = 12_000;
