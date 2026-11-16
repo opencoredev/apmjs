@@ -111,7 +111,7 @@ export const KeptPackage = z.object({
 export type KeptPackage = z.infer<typeof KeptPackage>;
 
 /** What a summary is cut from: a package as npm lists it, with or without when it was fetched (a summary never reads that). */
-type SummarySource = Omit<CachedPackage, "fetchedAt">;
+type SummarySource = Omit<CachedPackage, "fetchedAt" | "readAt">;
 
 /** The summary of a package as npm lists it now; null when its JSON is more than KEPT_PACKAGE_MAX_BYTES as UTF-8. */
 export function summarize(pkg: SummarySource): KeptPackage | null {
@@ -190,8 +190,10 @@ export function expand(kept: KeptPackage): CachedPackage {
     tarballs: new Map(kept.versions.filter((v) => v.tarball !== "").map((v) => [v.version, v.tarball])),
     serveCost: { versionDocs: 0, maxPieceChars: 0 },
     etag: kept.etag,
-    // not a fetch from npm: a resolve's kept choice is never made young from a summary (kept-choices.ts)
+    // not a fetch from npm: a resolve's kept choice is never made young from a summary (kept-choices.ts), nor an
+    // install copy (upstream.ts, installCopy)
     fetchedAt: Number.NEGATIVE_INFINITY,
+    readAt: Number.NEGATIVE_INFINITY,
   };
 }
 

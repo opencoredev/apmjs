@@ -42,7 +42,8 @@ export type WorkerRegistry = {
   /** Runs the cron's sweep (matured revokes, expired staged versions) at the test clock. */
   sweep: () => Promise<void>;
   /** Puts npm's packument for `url` in the shared Cache API as another isolate would have, sent at `fetchedAt` (null: no time). */
-  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null }) => Promise<void>;
+  /** `readAt`: the whole read's time the copy carries; `fetchedAt` when left out, none when null. */
+  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null; readAt?: number | null }) => Promise<void>;
   /** The registry's Postgres, for tests that hold a lock or change rows from another connection. */
   databaseUrl: string;
   /** Runs the analysis queue's consumer on one job, as the queue would deliver it; says whether it acked or asked for a retry. */

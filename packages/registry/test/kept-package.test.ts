@@ -46,6 +46,7 @@ function cached(versions: readonly string[], tags: Record<string, string>, readm
     serveCost: { versionDocs: 0, maxPieceChars: 0 },
     etag: null,
     fetchedAt: Number.NEGATIVE_INFINITY,
+    readAt: Number.NEGATIVE_INFINITY,
   };
 }
 

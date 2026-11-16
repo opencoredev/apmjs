@@ -663,6 +663,12 @@ export type StoreApi = {
   readonly decidedAnalyses: (versions: readonly { name: string; version: string }[]) => Effect.Effect<Set<string>, StoreError>;
   /** The tarballs of `name` an apm reviewer confirmed malicious, each as its version and digest label (confirmed.ts). */
   readonly confirmedReviews: (name: string) => Effect.Effect<{ version: string; digest: string }[], StoreError>;
+  /**
+   * What the install packument of a package only npm has needs from the database, in one round trip: whether the name
+   * is published here (then it is not npm's to serve), and the versions apm reviewers confirmed malicious, as
+   * confirmedReviews reads them, in a stable order.
+   */
+  readonly installRead: (name: string) => Effect.Effect<{ local: boolean; confirmed: { version: string; digest: string }[] }, StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -1593,6 +1599,14 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
       ),
     confirmedReviews: (name) =>
       run("confirmedReviews", sql`SELECT version, digest FROM reviews WHERE package = ${name} AND human_state = 'confirmed'`, all(z.object({ version: z.string(), digest: z.string() }))),
+    installRead: (name) =>
+      run(
+        "installRead",
+        sql`SELECT EXISTS (SELECT 1 FROM packages WHERE name = ${name}) AS local,
+                   coalesce((SELECT jsonb_agg(jsonb_build_object('version', version, 'digest', digest) ORDER BY version, digest)
+                             FROM reviews WHERE package = ${name} AND human_state = 'confirmed'), '[]'::jsonb) AS confirmed`,
+        one(z.object({ local: z.boolean(), confirmed: z.array(z.object({ version: z.string(), digest: z.string() })) })),
+      ).pipe(Effect.map((row) => row ?? { local: false, confirmed: [] })),
     decidedAnalyses: (versions) =>
       versions.length === 0
         ? Effect.succeed(new Set<string>())

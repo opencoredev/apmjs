@@ -3,7 +3,8 @@
 // manifest, 410 for its tarball. Before this (review of a76b9fc, finding 1) resolve refused such a version and scan
 // reported it fatal, but the packuments still listed it and both tarball routes served its bytes, so a plain
 // `npm install` or a lockfile fetched it. A reviewer who later dismisses the flag makes the version served again on the
-// next request: nothing here is cached.
+// next request: the set is read on every request, and the one copy kept of an answer built from it, the install
+// packument's (upstream.ts, installCopy), answers only a request that read the same set.
 import { Effect } from "effect";
 import { Store } from "./db.ts";
 import { digestLabel, digestOf } from "./digest.ts";

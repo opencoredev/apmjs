@@ -129,6 +129,8 @@ const STUB: UpstreamApi = {
     serve: () => Effect.succeed({ kind: "absent" }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
     listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
+    installCopy: () => Effect.succeed({ kind: "read", listing: { kind: "unknown" } }),
+    keepInstallCopy: ({ onDone }) => Effect.sync(onDone),
     versionOf: () => Effect.succeed({ kind: "unknown" }),
 };
 

@@ -1,7 +1,7 @@
 // apm extensions on top of the npm protocol: publish guards, scoring, version states,
 // incident response, name search, the ~safe view, server-side resolve, the scan API and
 // the upstream proxy.
-import { Context, Effect, Option } from "effect";
+import { Context, Effect, Exit, Option } from "effect";
 import { z } from "zod";
 import {
   analyze,
@@ -55,8 +55,9 @@ import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
+import { Guard } from "./db-health.ts";
 import { digestLabel, digestOf } from "./digest.ts";
-import { confirmedText, confirmedVersions } from "./confirmed.ts";
+import { confirmedAmong as confirmedIn, confirmedText, confirmedVersions } from "./confirmed.ts";
 import { Store, type LatestScore, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
 import { refuse, type HttpFailure, type StoreError } from "./errors.ts";
 import { fail, json, LazyMembers, longestPiece, parseBody, streamedJson, streamWeight } from "./http.ts";
@@ -87,7 +88,7 @@ import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionU
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
-import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
+import { installStamp, scoredPackage, Upstream, type Summarized, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
 import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
@@ -3521,6 +3522,82 @@ export const SERVED_VERSION_WEIGHT = 64;
 /** How long a client should wait before it asks again for a packument the upstream could not give, in seconds. */
 export const UPSTREAM_RETRY_AFTER_S = 30;
 
+/** The headers of the install packument (npm's abbreviated form) of a package only npm has. */
+const INSTALL_HEADERS = { "content-type": "application/vnd.npm.install-v1+json; charset=utf-8", "cache-control": "no-cache" } as const;
+
+/**
+ * The install packument (the abbreviated form npm, pnpm and bun install from) of a package only npm has, outside
+ * ~safe: null when the name is published here, or npm has no such package. It carries no score, so the analyses are
+ * not read; what is published here and what apm reviewers confirmed malicious come in one round trip, every request.
+ * The text served is kept in the data center's cache (Upstream.installCopy) and answers the next request only while
+ * that confirmed set and npm's packument are the ones it was made from, so a block shows on the very next request.
+ */
+const installPackument = (name: string, upstream: UpstreamApi) =>
+  Effect.gen(function* () {
+    const read = yield* (yield* Store).installRead(name);
+
+    if (read.local) return null;
+    const stamp = yield* Effect.promise(() => installStamp(read.confirmed));
+    const { baseUrl } = yield* RegistryConfig;
+    const lease = yield* RequestMemory;
+    const got = yield* upstream.installCopy({ name, served: baseUrl, stamp, lease });
+    // the database may have been taken as down (by this request or another) while the copy or npm was read: then the
+    // confirmed set read above is no longer the registry's word, and this request is answered as every install is
+    // while the database is down (degraded.ts, from worker.ts), never from the copy, nor making one
+    const guard = Option.getOrNull(yield* Effect.serviceOption(Guard));
+    const ready = guard === null ? Effect.void : guard.ready("installPackument");
+    const up = yield* Effect.exit(ready);
+
+    if (Exit.isFailure(up)) {
+      if (got.kind === "copy") yield* Effect.promise(() => got.body.cancel().catch(() => undefined));
+
+      return yield* up;
+    }
+
+    if (got.kind === "copy") return new Response(got.body, { headers: INSTALL_HEADERS });
+    const listing = got.listing;
+
+    if (listing.kind === "absent") return null;
+
+    // npm could not be asked, or sent a packument apm refused or could not hold: a registry error the client retries
+    if (listing.kind !== "found") return pageRefused(name);
+    const probe = scoredPackage(listing.pkg, { scores: new Map(), unscorable: new Map() });
+
+    if (probe.kind !== "found") return pageRefused(name);
+    const src = { kind: "upstream" as const, name: probe.pkg.name, distTags: probe.pkg.distTags, versions: probe.pkg.versions, pkg: probe.pkg };
+    const at = yield* now;
+    const confirmed = confirmedIn(read.confirmed, src.versions);
+    // what an answer holds while it is sent, charged before it is made (as upstreamRoute charges it)
+    const serving = listing.pkg.serveCost.versionDocs + src.versions.length * SERVED_VERSION_WEIGHT + streamWeight(listing.pkg.serveCost.maxPieceChars + SERVED_EXTRA_CHARS);
+
+    if (!lease.take(serving)) return pageRefused(name);
+    const make = () => upstreamPackument({ base: baseUrl, src, abbreviated: true, view: null, at, confirmed, devDependencies: null });
+
+    // the data center's copy is a second answer written after the response, charged as this one; skipped if it does not fit
+    if (lease.take(serving)) {
+      const letGo = lease.retain();
+      let done = false;
+
+      yield* upstream.keepInstallCopy({
+        name,
+        served: baseUrl,
+        stamp,
+        pkg: listing.pkg,
+        write: (headers, options) => streamedJson(make(), "versions", headers, options),
+        ready,
+        onDone: () => {
+          if (done) return;
+          done = true;
+          lease.give(serving);
+          letGo();
+        },
+      });
+    }
+
+    // the request's lease stays open until the last byte is sent: the stream refers to the package until then
+    return streamedJson(make(), "versions", INSTALL_HEADERS, { onDone: lease.retain() });
+  });
+
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
 export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
   Effect.gen(function* () {
@@ -3534,7 +3611,15 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
 
     // a name npm cannot have (a scanner's /backend%2f.env) is not found here either: asking npm gets a 405, which
     // would read as the upstream failing
-    if (!sp || !isPossibleNpmName(sp.name) || (yield* (yield* Store).getPackage(sp.name))) return null;
+    if (!sp || !isPossibleNpmName(sp.name)) return null;
+    // npm install's own document: answered on its own path, which reads less and answers from a copy shared by every
+    // request (installPackument). A request with credentials never reads or writes that copy, though the document is
+    // public: what one person's request made is never handed to another
+    const credentialed = req.headers.has("authorization") || req.headers.has("cookie");
+
+    if (sp.rest.length === 0 && req.method === "GET" && !viaSafe && !credentialed && (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json")) return yield* installPackument(sp.name, upstream);
+
+    if (yield* (yield* Store).getPackage(sp.name)) return null;
     // the packument and the devDependencies the full one adds back are held together under the request's lease until
     // the answer is sent
     const lease = yield* RequestMemory;

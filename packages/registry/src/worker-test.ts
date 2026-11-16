@@ -14,7 +14,7 @@ import { Clock } from "./clock.ts";
 import { Store, type StoreFault } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
-import { FETCHED_AT_HEADER, packumentKey } from "./upstream.ts";
+import { FETCHED_AT_HEADER, packumentKey, READ_AT_HEADER } from "./upstream.ts";
 import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
 
 /** A positive millisecond time from a test header, or null. */
@@ -94,7 +94,7 @@ async function blobControl(req: Request, env: TestEnv, path: string): Promise<Re
   return fail(405, "Method not allowed");
 }
 
-const SeedBody = z.object({ url: z.string().url(), packument: z.string(), fetchedAt: z.number().nullable() });
+const SeedBody = z.object({ url: z.string().url(), packument: z.string(), fetchedAt: z.number().nullable(), readAt: z.number().nullable().optional() });
 
 /** Puts npm's answer for `url` in the data center's cache, sent at `fetchedAt` (null: a copy from before copies carried a time). */
 async function seedUpstreamCache(req: Request): Promise<Response> {
@@ -104,6 +104,11 @@ async function seedUpstreamCache(req: Request): Promise<Response> {
   const headers = new Headers({ "content-type": "application/json", "cache-control": "public, max-age=600" });
 
   if (body.data.fetchedAt !== null) headers.set(FETCHED_AT_HEADER, String(body.data.fetchedAt));
+  // a copy another isolate wrote of npm's whole answer: read whole when npm sent it, unless the test says otherwise
+  const readAt = body.data.readAt === undefined ? body.data.fetchedAt : body.data.readAt;
+
+  if (readAt !== null) headers.set(READ_AT_HEADER, String(readAt));
+
   await caches.default.put(packumentKey(body.data.url), new Response(body.data.packument, { headers }));
 
   return json({ ok: true });

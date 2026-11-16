@@ -1,18 +1,18 @@
 // Read-only proxy of a public registry (registry.npmjs.org in production). Packuments are fetched on demand
 // and rewritten so tarballs flow through apm, where they are verified, cached in R2 and scored.
-import { Context, Effect, Layer, Option } from "effect";
+import { Context, Duration, Effect, Exit, Layer, Option } from "effect";
 import { z } from "zod";
 import { Blobs } from "./blobs.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { Store, type KeptChoicesRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
-import { readCapped, streamedJson, streamWeight } from "./http.ts";
+import { readCapped, streamedJson, streamWeight, type StreamOptions } from "./http.ts";
 import { CACHE_WEIGHT, RequestMemory, type Block, type Lease, type MemoryPool } from "./memory.ts";
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { verifiedStream } from "./verified-stream.ts";
-import { ChoicesWriter, choiceHolds, isStrongEtag, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
+import { ChoicesWriter, choiceHolds, isStrongEtag, KEPT_CHOICES_MAX_AGE_MS, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
 import { Clock } from "./clock.ts";
 import { reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
@@ -168,8 +168,11 @@ const MAX_HOPS = 5;
  * The parsed packument without apm's scores; scores are attached per request from the store. `etag`: npm's ETag for
  * it, when npm sent one and answered directly, which a kept row of its choices is kept for (kept-choices.ts).
  * `fetchedAt`: when npm sent it (wall-clock ms; a shared copy's own time), which a choice made of it is as old as.
+ * `readAt`: when npm's packument it was read from was read whole from npm, by the registry's clock: this isolate's
+ * read, or the one a shared copy carries (READ_AT_HEADER); minus infinity when that is not known. Only a whole read
+ * from npm sets it; the install copy's whole-read deadline counts from it (installCopy).
  */
-export type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[]; fetchedAt: number };
+export type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[]; fetchedAt: number; readAt: number };
 
 type CachedProbe = { kind: "found"; pkg: CachedPackage } | { kind: "absent" };
 
@@ -180,7 +183,7 @@ export type UpstreamListing = CachedProbe | { kind: "unknown" };
  * The package apm caches, read from the packument readPackument kept: each version npm lists with a valid document,
  * in publish order. Null when the packument is not one.
  */
-export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost, etag: string | null, fetchedAt: number = Number.NEGATIVE_INFINITY): CachedPackage | null {
+export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost, etag: string | null, fetchedAt: number = Number.NEGATIVE_INFINITY, readAt: number = Number.NEGATIVE_INFINITY): CachedPackage | null {
   const parsed = UpPackument.safeParse(body);
 
   if (!parsed.success) return null;
@@ -231,6 +234,7 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
     serveCost,
     etag,
     fetchedAt,
+    readAt,
   };
 }
 
@@ -239,7 +243,7 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
  * and a summary read of them, so a reader can be handed them as it is handed a package npm sent.
  */
 export function keptPackage(name: string, row: KeptChoicesRow): CachedPackage {
-  return { name, distTags: row.kept.distTags, description: "", readme: "", maintainers: [], versions: Object.values(row.kept.records), tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: row.etag, fetchedAt: Number.NEGATIVE_INFINITY };
+  return { name, distTags: row.kept.distTags, description: "", readme: "", maintainers: [], versions: Object.values(row.kept.records), tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: row.etag, fetchedAt: Number.NEGATIVE_INFINITY, readAt: Number.NEGATIVE_INFINITY };
 }
 
 /**
@@ -406,6 +410,11 @@ type Caches = {
    * goes straight to the packument as it did before summaries were kept, instead of waiting on npm once more first.
    */
   failures: IsolateCache<true>;
+  /**
+   * npm's ETag of each package whose install copy npm said is current (a 304), kept for the TTL from then: within it,
+   * this isolate serves that copy without asking npm again.
+   */
+  validated: IsolateCache<string>;
 };
 
 /**
@@ -429,7 +438,7 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   const known = isolateCaches.get(key);
 
   if (known) return known;
-  const made: Caches = { searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs), versions: new IsolateCache(ttlMs), failures: new IsolateCache(Math.min(ttlMs, NPM_FAILURE_MS)) };
+  const made: Caches = { searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs), versions: new IsolateCache(ttlMs), failures: new IsolateCache(Math.min(ttlMs, NPM_FAILURE_MS)), validated: new IsolateCache(ttlMs) };
   isolateCaches.set(key, made);
 
   return made;
@@ -464,8 +473,113 @@ const SHARED_MIN_TTL_MS = 1_000;
 /** When npm sent a shared packument (ms since the epoch): its TTL counts from then, in every isolate that reads it. */
 export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 
+/** When npm's packument a shared copy holds was read whole from npm, by the registry's clock (CachedPackage.readAt). */
+export const READ_AT_HEADER = "x-apm-read-at";
+
 /** npm's ETag for a shared packument, so a copy read from the data center's cache can be revalidated as npm's own. */
 const ETAG_HEADER = "x-apm-npm-etag";
+
+/**
+ * The install packument apm served for a package only npm has (the abbreviated document npm, pnpm and bun install
+ * from, outside ~safe) is a function of npm's packument and of the versions apm reviewers confirmed malicious, and of
+ * nothing else: it carries no score, and an npm package has no apm revoke or yank. So the served text is kept in the
+ * data center's cache under the package and the registry URL its tarball links name, with npm's ETag and the confirmed
+ * set's stamp (installStamp) beside it, and answers a request whose stamp, read from the database by that request, is
+ * the same, while npm's packument is: within the TTL from when npm sent it, or once npm answers a conditional read of
+ * that ETag with a 304. A block or an unblock changes the stamp, so the very next request makes a new copy; a new npm
+ * version changes the ETag. A copy answers for at most KEPT_CHOICES_MAX_AGE_MS from the whole read it was made of,
+ * however many 304s came since: then npm's packument is read whole again, and what a whole read runs (the AI review's
+ * look at new versions, upstreamFetched) runs, retried if it failed before. INSTALL_COPY_FORMAT names the copy's shape, so one written by another build is never read.
+ */
+const INSTALL_COPY_FORMAT = "install-v1";
+const INSTALL_STAMP_HEADER = "x-apm-install-stamp";
+const INSTALL_FORMAT_HEADER = "x-apm-install-format";
+/**
+ * When npm's packument the copy was made of was read whole from npm, by the registry's clock (CachedPackage.readAt;
+ * the TTL counts on the wall's, FETCHED_AT_HEADER, and tests move only the registry's): its age is checked against
+ * KEPT_CHOICES_MAX_AGE_MS.
+ */
+
+const INSTALL_READ_AT_HEADER = "x-apm-install-read-at";
+/** How long the data center keeps an install copy; it answers only while it is validated as above. */
+
+const INSTALL_COPY_MAX_AGE_S = 24 * 60 * 60;
+
+/**
+ * The forms of npm's packument ETag this isolate has logged: strong, weak (`W/`) or none. kept-choices.ts keeps a row
+ * only for a strong one, and which form a Worker's fetch receives from npm in production has not been observed, so
+ * the first answer of each form in an isolate is logged (event "npm-etag-form"), a few lines an isolate at most.
+ */
+const etagFormsSeen = new Set<string>();
+
+function noteEtagForm(etag: string | null): void {
+  const form = etag === null || etag === "" ? "none" : etag.startsWith("W/") ? "weak" : "strong";
+
+  if (etagFormsSeen.has(form)) return;
+  etagFormsSeen.add(form);
+  console.log(JSON.stringify({ level: "info", event: "npm-etag-form", form }));
+}
+
+/** How far a whole read's time may be ahead of the registry's clock and still count: two isolates' clocks may differ. */
+const READ_AT_SKEW_MS = 60_000;
+
+/**
+ * Whether a whole read of npm's packument at `readAt` counts at `now` for a caller that needs one since `since`: after
+ * `since`, and not later than `now` (and READ_AT_SKEW_MS). A time from tomorrow, or none, never counts.
+ */
+function wholeReadCounts(readAt: number, since: number, now: number): boolean {
+  return readAt > since && readAt <= now + READ_AT_SKEW_MS;
+}
+
+/**
+ * The packages this isolate is reading whole from npm for a caller that needs a whole read (listedOrSame with
+ * `wholeSince`), by upstream and name: a second such request for one of them waits for that read to land in the isolate
+ * cache instead of reading npm again. Per isolate only: two isolates, or two data centers, may each read once.
+ */
+const refreshing = new Set<string>();
+
+/** How long a request waits for another's whole read before it reads npm itself, and how often it looks. */
+const SINGLE_FLIGHT_WAIT_MS = 10_000;
+const SINGLE_FLIGHT_POLL_MS = 25;
+
+/** A read time from a header (ms since the epoch on the registry's clock), or minus infinity when it is missing or not a number. */
+function readTime(header: string | null): number {
+  const n = header === null || header.trim() === "" ? Number.NaN : Number(header);
+
+  return Number.isFinite(n) ? n : Number.NEGATIVE_INFINITY;
+}
+
+/** The Cache API key of the install copy of `name` from `upstream`, whose tarball links name `served`. */
+const installKey = (input: { upstream: string; served: string; name: string }): Request =>
+  new Request(`https://upstream-cache.apmjs.internal/${INSTALL_COPY_FORMAT}/${encodeURIComponent(input.upstream)}/${encodeURIComponent(input.served)}/${encodeURIComponent(input.name)}`);
+
+/**
+ * npm's ETag for a packument, as the copy keeps and revalidates it, or null when npm sent none. npm's edge sends the
+ * hash of the document as a strong tag and weakens it (`W/"<hash>"`) when it compresses the answer, which it always
+ * does for a Worker's fetch; it answers If-None-Match with either form, by that hash. So the weak form is used as
+ * npm sends it: it changes whenever npm's packument does, which is all the copy needs it for.
+ */
+const npmEtag = (etag: string | null): string | null => (etag !== null && etag !== "" ? etag : null);
+
+/**
+ * The stamp of a set of confirmed reviews (version and digest), as installRead reads them: the SHA-256 of their sorted
+ * lines, so any change to the set changes it.
+ */
+export async function installStamp(rows: readonly { version: string; digest: string }[]): Promise<string> {
+  const lines = rows.map((r) => `${r.version} ${r.digest}`).toSorted().join("\n");
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(lines)));
+
+  return [...hash].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * What installCopy came to: the kept copy's text, still current ("copy"), or no copy that may answer, and the package
+ * as npm lists it now, read under the request's lease ("read").
+ */
+/** Makes the install packument as a streamed answer (http.ts, streamedJson) with these headers and options. */
+export type InstallWriter = (headers: Readonly<Record<string, string>>, options: StreamOptions) => Response;
+
+export type InstallCopy = { kind: "copy"; body: ReadableStream<Uint8Array> } | { kind: "read"; listing: UpstreamListing | { kind: "over-budget" } };
 
 /** What npm says of one version now, from its version document: its tarball's URL and the checksums npm publishes for it ("" when absent). */
 export type UpstreamVersion = { kind: "found"; tarball: string; integrity: string; shasum: string } | { kind: "absent" } | { kind: "unknown" };
@@ -493,7 +607,7 @@ export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Reque
  * "over-budget": the lease had no room for it. "not-modified": npm's 304 for the ETag it was asked with.
  */
 type PackumentAnswer =
-  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean; etag: string | null; conditional: boolean }
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; readAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean; etag: string | null; conditional: boolean }
   | { kind: "not-modified"; fetchedAt: number }
   | { kind: "status"; status: number; fetchedAt: number }
   | { kind: "refused"; fetchedAt: number }
@@ -525,6 +639,21 @@ export type UpstreamApi = {
    * that did not fit `lease` is "over-budget"; with a null `etag` this is listing.
    */
   readonly listingIfChanged: (name: string, lease: Lease, etag: string | null) => Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }>;
+  /**
+   * The install packument kept for `name` (INSTALL_COPY_FORMAT) when it was made for `served` and `stamp` and npm's
+   * packument is still the one it was made from; otherwise the package as `listingIfChanged` reads it, under `lease`
+   * (with the copy's ETag when there is one, so a 304 needs no read and a 200 is the new packument).
+   */
+  readonly installCopy: (input: { name: string; served: string; stamp: string; lease: Lease }) => Effect.Effect<InstallCopy>;
+  /**
+   * Keeps the install packument made from `pkg` for `served` and `stamp`, after the response: `write` makes it as a
+   * streamed answer with the headers and stream options it is given. `onDone` runs once the write settles or is stopped
+   * (SHARE_TIMEOUT_MS), and at once when nothing is written (no data center cache, or npm sent no ETag); it may run
+   * twice, so it must do its work once. The caller holds what the answer refers to until then. `ready` is the
+   * database's guard (db-health.ts, Guard.ready), checked once more just before the write: a copy is never written
+   * while the database is taken as down, since only a request that read the confirmed set from it may make one.
+   */
+  readonly keepInstallCopy: (input: { name: string; served: string; stamp: string; pkg: CachedPackage; write: InstallWriter; ready: Effect.Effect<void, StoreError>; onDone: () => void }) => Effect.Effect<void>;
   /** One version's document (a few KiB): whether npm still lists the version, and its checksums. Kept for the TTL. */
   readonly versionOf: (name: string, version: string) => Effect.Effect<UpstreamVersion>;
   /**
@@ -799,10 +928,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           );
 
         /** A packument read as an answer. One it refused is logged; one past the request's lease is not an error. */
-        const answerOf = (input: { url: string; read: PackumentRead; fetchedAt: number; fresh: boolean; etag: string | null; conditional?: boolean }): PackumentAnswer => {
-          const { url, read, fetchedAt, fresh, etag } = input;
+        const answerOf = (input: { url: string; read: PackumentRead; fetchedAt: number; readAt: number; fresh: boolean; etag: string | null; conditional?: boolean }): PackumentAnswer => {
+          const { url, read, fetchedAt, readAt, fresh, etag } = input;
 
-          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh, etag, conditional: input.conditional === true };
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, readAt, read, fresh, etag, conditional: input.conditional === true };
 
           if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
@@ -826,7 +955,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * packument, read from that same answer; it follows no redirect, and a redirect is a whole read of the
          * document it leads to (re-check of 3366a36, finding 4). A read that answered through a redirect keeps no ETag.
          */
-        const fetchPackument = (input: { name: string; url: string; now: number; profile: KeepProfile; lease: Lease; etag?: string | null }): Effect.Effect<PackumentAnswer, unknown> =>
+        const fetchPackument = (input: { name: string; url: string; now: number; readNow: number; profile: KeepProfile; lease: Lease; etag?: string | null; wholeSince?: number | null }): Effect.Effect<PackumentAnswer, unknown> =>
           // an interrupted read (a sibling of a parallel lookup failed, the request ended) cancels its stream and gives
           // its charge back before the fiber ends, so the lease is never released under it
           joinedPromise(async (interrupted): Promise<PackumentAnswer> => {
@@ -877,7 +1006,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
                 if (read.kind !== "ok" && !(read.kind === "too-large" && read.over === "budget")) fail();
 
-                return answerOf({ url, read, fetchedAt: now, fresh: true, etag: asked.headers.get("etag"), conditional: true });
+                noteEtagForm(asked.headers.get("etag"));
+
+                return answerOf({ url, read, fetchedAt: now, readAt: input.readNow, fresh: true, etag: asked.headers.get("etag"), conditional: true });
               }
 
               if (asked?.status === 404) {
@@ -899,14 +1030,17 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const shared = sharing ? workerCache() : null;
             const cacheStart = performance.now();
             const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
-            // a copy with no time (written before copies carried one) or past its TTL is not used
+            // a copy with no time (written before copies carried one) or past its TTL is not used, nor, when the caller
+            // needs a whole read of npm's packument since `wholeSince`, one whose read is older or not known
             const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
+            const sharedReadAt = readTime(hit?.headers.get(READ_AT_HEADER) ?? null);
+            const wholeSince = input.wholeSince ?? null;
 
-            if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs) {
+            if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs && (wholeSince === null || wholeReadCounts(sharedReadAt, wholeSince, input.readNow))) {
               const read = await readPackument(hit.body, { profile, lease, signal: interrupted });
               timing?.add("npm-cache", performance.now() - cacheStart);
 
-              return answerOf({ url, read, fetchedAt: sentAt, fresh: false, etag: hit.headers.get(ETAG_HEADER) });
+              return answerOf({ url, read, fetchedAt: sentAt, readAt: sharedReadAt, fresh: false, etag: hit.headers.get(ETAG_HEADER) });
             }
 
             await hit?.body?.cancel();
@@ -923,9 +1057,11 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const read = await readPackument(res.body, { profile, lease, signal });
             timing?.add("npm", performance.now() - npmStart);
 
+            if (!res.redirected) noteEtagForm(res.headers.get("etag"));
+
             // a document that answered through a redirect keeps no ETag: a row or a summary is kept only for one that
             // answered directly (re-check of 3366a36, finding 4)
-            return answerOf({ url, read, fetchedAt: now, fresh: true, etag: res.redirected ? null : res.headers.get("etag") });
+            return answerOf({ url, read, fetchedAt: now, readAt: input.readNow, fresh: true, etag: res.redirected ? null : res.headers.get("etag") });
           });
 
         /**
@@ -935,7 +1071,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * settles or is stopped (SHARE_TIMEOUT_MS, or its lease's deadline). Nothing is written when that does not
          * fit (review of 6862fc7, finding 3).
          */
-        const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool; etag: string | null }): void => {
+        const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; readAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool; etag: string | null }): void => {
           if (!sharing || background === null) return;
           const work = input.pool.backgroundLease();
 
@@ -946,7 +1082,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           }
 
           const done = (): void => work.release();
-          const base = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt) };
+          const base = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt), [READ_AT_HEADER]: String(input.readAt) };
           const headers = input.etag === null ? base : { ...base, [ETAG_HEADER]: input.etag };
           // stopped at SHARE_TIMEOUT_MS, or at the lease's deadline: the stream then drops the package, and only that
           // lets the lease go before the put settles
@@ -997,26 +1133,57 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * or a fresh read, the moment converting it takes (packageMoment), and its scored copy. A fresh package becomes
          * a block the lease holds, which the isolate cache and a shared-cache write may hold too.
          */
-        const listedOrSame = (name: string, lease: Lease, etag: string | null): Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }> =>
+        const listedOrSame = (name: string, lease: Lease, etag: string | null, wholeSince: number | null = null): Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }> =>
           Effect.gen(function* () {
-            const t = yield* now;
             const probes = probeCacheFor(lease.pool, baseUrl, ttlMs);
-            const cached = probes.entry(name, t);
+            const flight = `${baseUrl} ${name}`;
+            let waited = 0;
 
-            if (cached !== undefined) {
-              if (cached.value.kind !== "found") return cached.value;
-              const scored = cached.value.pkg.versions.length * SCORED_WEIGHT;
+            for (;;) {
+              const t = yield* now;
+              const readNow = yield* keptNow;
+              // with `wholeSince`, a package this isolate holds is used only if npm's packument was read whole since then
+              const entry = probes.entry(name, t);
+              const cached = entry !== undefined && wholeSince !== null && entry.value.kind === "found" && !wholeReadCounts(entry.value.pkg.readAt, wholeSince, readNow) ? undefined : entry;
 
-              if ((cached.block !== null && !lease.hold(cached.block)) || !lease.take(scored)) return { kind: "over-budget" as const };
+              if (cached !== undefined) {
+                if (cached.value.kind !== "found") return cached.value;
+                const scored = cached.value.pkg.versions.length * SCORED_WEIGHT;
 
-              return cached.value;
+                if ((cached.block !== null && !lease.hold(cached.block)) || !lease.take(scored)) return { kind: "over-budget" as const };
+
+                return cached.value;
+              }
+
+              // a whole read of this package is already under way in this isolate: wait for it to publish its result
+              // in this isolate's cache, then use that, rather than read npm's packument once more (no promise is
+              // shared between requests: each waiter looks again on its own timer)
+              if (wholeSince !== null && refreshing.has(flight) && waited < SINGLE_FLIGHT_WAIT_MS) {
+                yield* Effect.sleep(Duration.millis(SINGLE_FLIGHT_POLL_MS));
+                waited += SINGLE_FLIGHT_POLL_MS;
+                continue;
+              }
+
+              if (wholeSince === null) return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes });
+              // this read leads: its result is in the isolate's cache before the mark goes (npmListing's probes.set)
+              const leads = !refreshing.has(flight);
+
+              if (leads) refreshing.add(flight);
+
+              return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes }).pipe(Effect.ensuring(Effect.sync(() => (leads ? refreshing.delete(flight) : undefined))));
             }
+          });
+
+        /** listedOrSame's read of npm's packument (or a shared copy), for a package the isolate cache does not answer. */
+        const npmListing = (input: { name: string; lease: Lease; etag: string | null; wholeSince: number | null; t: number; readNow: number; probes: IsolateCache<CachedProbe> }): Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }> =>
+          Effect.gen(function* () {
+            const { name, lease, etag, wholeSince, t, readNow, probes } = input;
 
             // nothing more fits: npm is not asked at all
             if (lease.exhausted) return { kind: "over-budget" as const };
             const url = `${baseUrl}${encodeName(name)}`;
 
-            const answer = yield* fetchPackument({ name, url, now: t, profile: TRIMMED, lease, etag }).pipe(Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })));
+            const answer = yield* fetchPackument({ name, url, now: t, readNow, profile: TRIMMED, lease, etag, wholeSince }).pipe(Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })));
 
             if (answer.kind === "over-budget") return answer;
 
@@ -1041,7 +1208,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return { kind: "over-budget" as const };
             }
 
-            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars }, answer.etag, answer.fetchedAt);
+            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars }, answer.etag, answer.fetchedAt, answer.readAt);
             lease.give(moment);
 
             if (!pkg) {
@@ -1057,7 +1224,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             const block = lease.seal(packageWeight(read));
 
-            if (answer.fresh) shareCopy({ url, profile: TRIMMED, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
+            if (answer.fresh) shareCopy({ url, profile: TRIMMED, fetchedAt: answer.fetchedAt, readAt: answer.readAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
             const fresh: CachedProbe = { kind: "found", pkg };
             // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
             // takes room from older ones (PROBE_CACHE_WEIGHT)
@@ -1418,7 +1585,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           Effect.gen(function* () {
             const t = yield* now;
             const url = `${baseUrl}${encodeName(name)}`;
-            const answer = yield* fetchPackument({ name, url, now: t, profile: DEV_DEPENDENCIES, lease }).pipe(Effect.orElseSucceed(() => null));
+            const answer = yield* fetchPackument({ name, url, now: t, readNow: yield* keptNow, profile: DEV_DEPENDENCIES, lease }).pipe(Effect.orElseSucceed(() => null));
 
             if (answer?.kind !== "ok") return null;
             const { read } = answer;
@@ -1448,10 +1615,86 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (answer.fresh) {
               const block = lease.seal(read.weight + moment);
-              shareCopy({ url, profile: DEV_DEPENDENCIES, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
+              shareCopy({ url, profile: DEV_DEPENDENCIES, fetchedAt: answer.fetchedAt, readAt: answer.readAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
             }
 
             return { byVersion, maxPieceChars: read.maxPieceChars };
+          });
+
+        const installCopy = (input: { name: string; served: string; stamp: string; lease: Lease }): Effect.Effect<InstallCopy> =>
+          Effect.gen(function* () {
+            const { name, lease } = input;
+            const t = yield* now;
+            const hit = sharing ? yield* Effect.promise(() => workerCache().match(installKey({ upstream: baseUrl, served: input.served, name })).catch(() => undefined)) : undefined;
+            const etag = npmEtag(hit?.headers.get(ETAG_HEADER) ?? null);
+            const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
+            // npm's packument must have been read whole since `since`, by the registry's clock (tests move it): the
+            // copy, and any packument this path builds a copy from (the isolate's, a shared copy), counts from that
+            // read, whatever the upstream TTL. Past it the packument is read whole from npm, which runs what a whole
+            // read runs (`fetched`: the AI review's look at new versions, retried there when it failed). A 304 never
+            // makes anything younger, nor does making a copy again from what was read before
+            const at = yield* keptNow;
+            const since = at - KEPT_CHOICES_MAX_AGE_MS;
+            const readAt = readTime(hit?.headers.get(INSTALL_READ_AT_HEADER) ?? null);
+            const young = wholeReadCounts(readAt, since, at);
+            const usable = hit?.body && etag !== null && young && hit.headers.get(INSTALL_FORMAT_HEADER) === INSTALL_COPY_FORMAT && hit.headers.get(INSTALL_STAMP_HEADER) === input.stamp;
+
+            if (!usable || !hit.body) {
+              yield* Effect.promise(() => hit?.body?.cancel() ?? Promise.resolve());
+
+              return { kind: "read", listing: yield* listedOrSame(name, lease, null, since).pipe(Effect.map((l) => (l.kind === "not-modified" ? { kind: "unknown" as const } : l))) };
+            }
+
+            const body = hit.body;
+
+            // npm sent it within the TTL, or said it is current within the TTL: no need to ask
+            if ((Number.isFinite(sentAt) && t - sentAt >= 0 && t - sentAt < ttlMs) || caches.validated.get(name, t) === etag) return { kind: "copy", body };
+            const l = yield* listedOrSame(name, lease, etag, since);
+
+            if (l.kind === "not-modified" || (l.kind === "found" && l.pkg.etag === etag)) {
+              caches.validated.set(name, etag, t);
+
+              return { kind: "copy", body };
+            }
+
+            yield* Effect.promise(() => body.cancel().catch(() => undefined));
+
+            return { kind: "read", listing: l };
+          });
+
+        const keepInstallCopy = (input: { name: string; served: string; stamp: string; pkg: CachedPackage; write: InstallWriter; ready: Effect.Effect<void, StoreError>; onDone: () => void }): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            const etag = npmEtag(input.pkg.etag);
+            // the time of the whole read the package was made of, carried as it is: never made younger here
+            const readAt = input.pkg.readAt;
+
+            if (!sharing || background === null || etag === null || !Number.isFinite(readAt) || Exit.isFailure(yield* Effect.exit(input.ready))) {
+              input.onDone();
+
+              return;
+            }
+
+            const signal = AbortSignal.timeout(SHARE_TIMEOUT_MS);
+
+            const headers = {
+              "content-type": "application/vnd.npm.install-v1+json; charset=utf-8",
+              "cache-control": `public, max-age=${INSTALL_COPY_MAX_AGE_S}`,
+              [FETCHED_AT_HEADER]: String(input.pkg.fetchedAt),
+              [INSTALL_READ_AT_HEADER]: String(readAt),
+              [ETAG_HEADER]: etag,
+              [INSTALL_STAMP_HEADER]: input.stamp,
+              [INSTALL_FORMAT_HEADER]: INSTALL_COPY_FORMAT,
+            };
+            // stopped at SHARE_TIMEOUT_MS: the stream then drops the body, and its holder may let go before the put settles
+
+            const copy = input.write(headers, { signal, onDone: () => (signal.aborted ? input.onDone() : undefined) });
+
+            background(
+              workerCache()
+                .put(installKey({ upstream: baseUrl, served: input.served, name: input.name }), copy)
+                .catch(() => undefined)
+                .finally(input.onDone),
+            );
           });
 
         const api: UpstreamApi = {
@@ -1498,6 +1741,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           probeWithin,
           listing,
           listingIfChanged: listedOrSame,
+          installCopy,
+          keepInstallCopy,
           versionOf: (name, version) =>
             Effect.gen(function* () {
               const key = `${name}@${version}`;

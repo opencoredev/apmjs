@@ -86,7 +86,7 @@ export type Registry = {
   /** Test-only: runs the analysis queue's consumer on one job; "retry" when it handed the message back to the queue. */
   analysisJob: (job: { name: string; version: string }) => Promise<"ack" | "retry">;
   /** Test-only: puts npm's packument for `url` in the shared Cache API as another isolate would have, sent at `fetchedAt` (null: no time). */
-  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null }) => Promise<void>;
+  seedUpstreamCache: (input: { url: string; packument: string; fetchedAt: number | null; readAt?: number | null }) => Promise<void>;
 };
 
 export type TokenScope = "publish" | "stage";

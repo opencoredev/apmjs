@@ -20,6 +20,9 @@ const GOOD = { name: "ms", version: "2.1.3" } as const;
 const BLOCKED = { name: "ms", version: "2.1.2" } as const;
 const LOCAL = "outage-local";
 
+/** npm install's Accept header: the install packument, which a copy kept while the database answered may serve. */
+const INSTALL = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+
 const Blocklist = z.object({
   syncedAt: z.number().nullable(),
   local: z.array(z.object({ name: z.string() })),
@@ -71,6 +74,12 @@ beforeAll(async () => {
     await npmDigest(BLOCKED.name, BLOCKED.version),
     Date.now(),
   ]);
+  // an install while the database answers: its packument is kept as the install copy (upstream.ts, installCopy)
+  const install = await fetch(`${reg.url}${GOOD.name}`, { headers: { accept: INSTALL } });
+
+  if (install.status !== 200 || install.headers.get("x-apm-degraded") !== null) throw new Error(`the install packument answered ${install.status} before the outage`);
+  await install.arrayBuffer();
+  await Bun.sleep(500);
 }, 120_000);
 
 afterAll(async () => {
@@ -163,6 +172,19 @@ for (const mode of ["hang", "refuse"] as const) {
       // the isolate took the database as down: it does not wait on it again within the window
       expect(second.ms).toBeLessThan(1_500);
       await second.res.arrayBuffer();
+    }, 30_000);
+
+    // the install copy is served only to a request that read the confirmed set from the database just now: while it
+    // cannot, the install packument comes from the degraded route and the block list, never from the copy
+    test("the install packument kept while the database answered is not served: the degraded route answers", async () => {
+      const res = await fetch(`${reg.url}${GOOD.name}`, { headers: { accept: INSTALL } });
+      const body = await res.json();
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-apm-degraded")).toBe("database-unavailable");
+      expect(dig(body, "_apmDegraded", "scores")).toBe("unknown");
+      expect(dig(body, "versions", GOOD.version)).toBeDefined();
+      expect(dig(body, "versions", BLOCKED.version)).toBeUndefined();
     }, 30_000);
 
     test("npm and bun install a real npm package through the registry", async () => {
