@@ -1,0 +1,6 @@
+# This repo installs its own dependencies straight from npm with bun, even on machines whose user config points bun at apm:
+# a fix for an apm outage must still build and deploy while registry.apmjs.dev is down.
+# The apm Bun scanner follows this registry too, so to try the scanner from inside this repo, run it with
+# APM_REGISTRY=https://registry.apmjs.dev/ set.
+[install]
+registry = "https://registry.npmjs.org/"
