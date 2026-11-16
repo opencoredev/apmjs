@@ -37,7 +37,7 @@ function record(ok: boolean, name: string, detail: string): void {
 async function run(cmd: string[], cwd: string, env: Record<string, string> = {}): Promise<{ code: number; out: string }> {
   const proc = Bun.spawn(cmd, {
     cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), ...env },
+    env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), TMPDIR: tmpdir(), ...env },
     stdout: "pipe",
     stderr: "pipe",
   });

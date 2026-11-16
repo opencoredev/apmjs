@@ -165,6 +165,8 @@ const child = Bun.spawn(
     env: {
       PATH: process.env.PATH ?? "",
       HOME: homedir(),
+      // build and install temp files follow the caller's TMPDIR (the /tmp RAM disk on the build box has filled)
+      TMPDIR: tmpdir(),
       CI: "1",
       CLOUDFLARE_API_TOKEN: token,
       CLOUDFLARE_ACCOUNT_ID: accountId,
