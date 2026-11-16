@@ -25,6 +25,8 @@ import { splitPath, tagTarget, tarballUrl, type Caller } from "./server.ts";
 import { ProofFields, secondFactor } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
+import { Guard } from "./db-health.ts";
+import { blockBeforeCommit } from "./blocklist.ts";
 import { fileReferences, INVALID_DEPENDENCY, isWithheld, WITHHELD_ISSUE } from "./withheld.ts";
 
 export type ReviewSettings = {
@@ -172,8 +174,12 @@ const DownloadsAnswer = z.object({ downloads: z.number() });
 
 // ---------- storage ----------
 const query = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
-  Effect.flatMap(timingOrNull, (timing) => timed(timing, "db")(effect)).pipe(
-    Effect.mapError((cause) => new StoreError({ operation: `review.${operation}`, cause })),
+  Effect.flatMap(Effect.all([timingOrNull, Effect.serviceOption(Guard)]), ([timing, guard]) => {
+    const timedEffect = timed(timing, "db")(effect);
+
+    // bounded like the Store's own statements (db-health.ts) wherever the request's database came with its guard
+    return Option.isSome(guard) ? guard.value.statement(`review.${operation}`, timedEffect) : timedEffect.pipe(Effect.mapError((cause) => new StoreError({ operation: `review.${operation}`, cause })));
+  }).pipe(
     Effect.flatMap((rows) => {
       const parsed = schema.safeParse(rows);
 
@@ -1008,6 +1014,15 @@ const decideResponse = (req: Request, viewer: SessionViewer) =>
     const sql = yield* SqlClient.SqlClient;
     const at = yield* (yield* Clock).now;
     const note = d.note === "" ? null : d.note;
+
+    // a confirmed version is refused by the install routes while Postgres is down too: it goes on the block list
+    // first, and the decision is not written when that fails (blocklist.ts). A dismissal leaves it for the cron's sync.
+    if (d.decision === "confirm") {
+      yield* blockBeforeCommit({ confirmed: [{ name: d.name, version: d.version, digest: d.digest }] }).pipe(
+        Effect.mapError(() => refuse(503, "The registry could not record this decision where the install routes read it during an outage, so nothing changed. Try again.")),
+      );
+    }
+
     yield* query(
       "decide",
       sql`UPDATE reviews SET human_state = ${d.decision === "confirm" ? "confirmed" : "dismissed"}, human_by = ${viewer.githubLogin ?? viewer.user.name},

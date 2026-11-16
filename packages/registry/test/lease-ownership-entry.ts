@@ -65,11 +65,16 @@ export default {
         async cancel() { await sleep(20); cancelled = true; },
       }));
       const base = await measure(env);
-      const sibling = Effect.promise(() => parked).pipe(Effect.andThen(Effect.fail("a sibling lookup failed")));
+      // the sibling fails only once both of the moment's measurements are taken, so the heap and the charge are read
+      // while the read is parked, not while its interruption is already under way
+      let openGate;
+      const gate = new Promise((r) => (openGate = r));
+      const sibling = Effect.promise(() => gate).pipe(Effect.andThen(Effect.fail("a sibling lookup failed")));
       const both = Effect.all([Effect.flatMap(Upstream, (u) => u.listing("p", lease)), sibling], { concurrency: "unbounded" });
       const pending = Effect.runPromiseExit(both.pipe(Effect.provide(layerWith(null)), Effect.scoped, Effect.ensuring(Effect.sync(() => lease.release()))));
       await parked;
       const during = { held: (await measure(env)) - base, charged: pool.charged };
+      openGate();
       const exit = await pending;
       // the moment the lease is released: what the isolate holds now is what the interrupted read left behind
       const after = { held: (await measure(env)) - base, charged: pool.charged, open: lease.open, cancelled };

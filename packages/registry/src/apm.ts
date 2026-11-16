@@ -199,7 +199,7 @@ type Source =
   | { kind: "upstream"; name: string; distTags: Record<string, string>; versions: VersionRecord[]; pkg: UpstreamPackage };
 
 const localSource = (pkg: PackageRecord, versions: VersionRecord[]): Source => ({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions, pkg });
-const upstreamSource = (pkg: UpstreamPackage): Source => ({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions, pkg });
+export const upstreamSource = (pkg: UpstreamPackage): Extract<Source, { kind: "upstream" }> => ({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions, pkg });
 
 /**
  * The package metadata one request holds at most (a resolve walk, a scan, or the packument route's two reads), as
@@ -3427,7 +3427,7 @@ const ABBREV = [
  * servable (servableManifest, which walks it without recursion) here, so what is made later is copies of values within
  * MANIFEST_LIMITS, which JSON.stringify writes without fail.
  */
-function upstreamPackument(input: {
+export function upstreamPackument(input: {
   base: string;
   src: Extract<Source, { kind: "upstream" }>;
   abbreviated: boolean;
@@ -3512,10 +3512,10 @@ function upstreamPackument(input: {
  * What a served version document has beyond the packument's own (upstreamPackument): its `dist` with the tarball URL
  * apm serves, its compact score, and the field that says what servableManifest left out, as JSON characters at most.
  */
-const SERVED_EXTRA_CHARS = 16 * 1024;
+export const SERVED_EXTRA_CHARS = 16 * 1024;
 
 /** What the served answer holds for each version while it is sent: its places in the filtered lists, its manifest's. */
-const SERVED_VERSION_WEIGHT = 64;
+export const SERVED_VERSION_WEIGHT = 64;
 
 /** How long a client should wait before it asks again for a packument the upstream could not give, in seconds. */
 export const UPSTREAM_RETRY_AFTER_S = 30;

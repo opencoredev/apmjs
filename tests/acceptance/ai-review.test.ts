@@ -454,6 +454,10 @@ describe("AI review", () => {
     expect(dig(after.body, "review", "state")).toBe("confirmed");
     expect(dig(after.body, "review", "findings", 0, "line")).toBe(2);
     expect(dig(after.body, "review", "note")).toBe("Checked by hand.");
+    // the confirmed version went on the block list the install routes read while Postgres is down (blocklist.ts)
+    const blocklist: unknown = JSON.parse((await reg.blobs.text("state/install-blocklist.json")) ?? "null");
+
+    expect(dig(blocklist, "confirmed")).toContainEqual(expect.objectContaining({ name: "ai-review-telemetry-demo", version: "1.0.0", digest }));
   });
 
   test("a verdict that flips between the two asks is not settled and is not called clean", async () => {

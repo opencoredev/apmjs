@@ -9,6 +9,7 @@ import { hashPassword } from "better-auth/crypto";
 import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CAPABILITIES, type AccessServices, type Refusal as AccessRefusal, type TokenScope } from "./access.ts";
 import type { Analysis } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
+import { blockBeforeCommit } from "./blocklist.ts";
 import { Clock } from "./clock.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { RegistryConfig, type NamePolicy } from "./config.ts";
@@ -639,6 +640,10 @@ export const commitVersion = (v: {
         }
 
         const created = yield* store.createPackage(v.name, at, v.publisher);
+
+        // a package's data lives only here, so the install routes refuse it while Postgres is down rather than answer
+        // from npm under its name: it goes on the block list before the transaction can commit (blocklist.ts)
+        if (created) yield* blockBeforeCommit({ local: [v.name] });
         const pkg = yield* store.lockPackage(v.name);
 
         if (!pkg) return yield* Effect.fail(refuse(500, "Internal error"));

@@ -6,7 +6,7 @@
 // for: a code or a passkey check issues a confirmation for that session, action and parameters, used once. A
 // passkey check answers a challenge made for one named action, so a passkey sign-in never confirms anything.
 import { timingSafeEqual } from "node:crypto";
-import { Context, Effect, Layer, Result, Scope } from "effect";
+import { Context, Duration, Effect, Layer, Result, Scope } from "effect";
 import { betterAuth } from "better-auth";
 import { genericOAuth, twoFactor, deviceAuthorization } from "better-auth/plugins";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
@@ -17,6 +17,7 @@ import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type Linked, type User } from "./db.ts";
 import { AuthError, type StoreError } from "./errors.ts";
+import { CONNECT_TIMEOUT, STATEMENT_TIMEOUT_MS } from "./db-health.ts";
 import { isAccountChange, sessionActionKey } from "./actions.ts";
 import { matchingStep, parseProofHeader, parseSixDigits, PROOF_HEADER, type CodeCheck, type CodeProof, type ConfirmationId, type FactorProof, type ProofCheck, type SixDigits } from "./factors.ts";
 
@@ -279,7 +280,8 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
         const instance = yield* Effect.cached(
           Effect.acquireRelease(
             Effect.sync(() => {
-              const pool = new Pool({ connectionString: input.databaseUrl, max: 1 });
+              // sign-in waits on Postgres no longer than the Store does (db-health.ts)
+              const pool = new Pool({ connectionString: input.databaseUrl, max: 1, connectionTimeoutMillis: Duration.toMillis(CONNECT_TIMEOUT), query_timeout: STATEMENT_TIMEOUT_MS });
 
               return { pool, auth: buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs }) };
             }),

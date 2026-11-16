@@ -1,8 +1,8 @@
 // The acceptance suite's entry: the production Worker plus test-only controls, never deployed.
 // x-apm-test-now sets the registry clock for one request and x-apm-test-totp-now the wall clock authenticator
 // codes are checked against; POST /__test/mint issues a token without a login flow.
-// /__test/blobs lists the blob store's keys (GET) and overwrites one (PUT /__test/blobs/<key>), so tests can
-// tamper with stored bytes. POST /__test/upstream-cache puts a packument in the shared cache as another isolate would
+// /__test/blobs lists the blob store's keys (GET), reads one (GET /__test/blobs/<key>) and overwrites one
+// (PUT /__test/blobs/<key>), so tests can check and tamper with stored bytes. POST /__test/upstream-cache puts a packument in the shared cache as another isolate would
 // have, with the fetch time the test names. POST /__test/sweep runs the cron's sweep at the test clock. POST /__test/analysis-job runs
 // the queue consumer on one job and says whether it acked the message or asked for a retry. x-apm-test-queue: fail
 // makes the analysis queue refuse every send for that request, and x-apm-test-fault: event-insert makes every
@@ -77,6 +77,12 @@ async function blobControl(req: Request, env: TestEnv, path: string): Promise<Re
     } while (cursor !== undefined);
 
     return json({ keys });
+  }
+
+  if (req.method === "GET" && path.startsWith("/__test/blobs/")) {
+    const obj = await bucket.get(decodeURIComponent(path.slice("/__test/blobs/".length)));
+
+    return obj === null ? fail(404, "No such blob") : new Response(obj.body, { headers: { "content-type": "application/octet-stream" } });
   }
 
   if (req.method === "PUT") {

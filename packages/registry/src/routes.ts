@@ -58,6 +58,8 @@ const REGISTRY_ROUTES = [
   { name: "versions", pattern: path(`/-/apm/v1/packages/${NAME}/versions/${SEG}`) },
   { name: "popular-scores", pattern: path("/-/apm/v1/popular-scores") },
   { name: "recent-packages", pattern: path("/-/apm/v1/recent-packages") },
+  // what external monitors check (health.ts); worker.ts answers it before the router
+  { name: "health", pattern: path("/-/apm/v1/health") },
   // a version's files and readme (files.ts)
   { name: "file", pattern: path(`/-/apm/v1/file/${NAME}/${SEG}`) },
   { name: "readme", pattern: path(`/-/apm/v1/readme/${NAME}/${SEG}`) },

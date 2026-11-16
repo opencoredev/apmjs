@@ -52,7 +52,7 @@ Migrations run first, then Alchemy updates the registry Worker, then the website
 
 ## What the stack creates
 
-Per stage: the R2 bucket `apmjs-blobs-<stage>`, the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
+Per stage: the R2 bucket `apmjs-blobs-<stage>` (tarballs under `sha512/`, file views under `files/`, and under `state/` the install block list and the queue probe's last record), the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
 
 ## State
 
@@ -65,6 +65,35 @@ Migrations are SQL files in `packages/registry/migrations`, applied in order, ea
 ## Rolling back
 
 Deploy the previous commit. The database stays on the newer schema, which is why migrations stay additive.
+
+## Health checks
+
+`GET https://registry.apmjs.dev/-/apm/v1/health` is for external monitors (Instatus). It is never cached (`Cache-Control: no-store`), sends no secret or address, and an isolate runs its checks at most once every 5 seconds, so a check every 30 seconds from several regions costs a `SELECT 1`, two small R2 reads (the block list, parsed as the install routes parse it, and the queue probe's record) and an npm ping per isolate per check at most. It answers **200 while installs work** and **503 when they do not**:
+
+```json
+{
+  "status": "ok",
+  "installs": "working",
+  "checkedAt": "2026-11-16T14:32:52.242Z",
+  "checks": {
+    "database": { "status": "up", "ms": 4, "detail": "answers" },
+    "r2": { "status": "up", "ms": 1, "detail": "answers" },
+    "blocklist": { "status": "up", "ms": null, "detail": "synced from the database", "syncedAt": "2026-11-16T14:30:00.000Z" },
+    "queue": { "status": "up", "ms": 2, "detail": "the cron's probe was consumed 2 min ago", "lastConsumedAt": "2026-11-16T14:30:04.000Z" },
+    "upstream": { "status": "up", "ms": 101, "detail": "answers" }
+  }
+}
+```
+
+| `status` | `installs` | HTTP | Meaning |
+| --- | --- | --- | --- |
+| `ok` | `working` | 200 | Everything answers. |
+| `degraded` | `working` | 200 | Installs work; something else does not answer (usually the queue: scores wait). |
+| `degraded` | `npm-only` | 200 | Postgres does not answer. npm's packages install without scores; apm's own packages, sign-in, publish and scores answer 503 (docs/ARCHITECTURE.md, "When Postgres is down"). |
+| `down` | `down` | 503 | R2 does not answer (tarballs are read through it), npm does not, or Postgres does not and the block list is missing, unreadable or never synced. |
+
+Each check is `up`, `down` or `unknown`. The queue check reads when the consumer last took the probe message the cron sends every 10 minutes, and reports `down` after 25 minutes without one: the consumer is stopped or far behind. Set Instatus to alert on a non-200, and, to hear about a degraded registry too, on the body not containing `"status":"ok"`. For a plain install probe, `GET https://registry.apmjs.dev/ms` must answer 200 with a packument; during a database outage that answer carries `x-apm-degraded: database-unavailable`.
+
 
 ## Local development
 
@@ -89,5 +118,6 @@ The registry Worker reads these (`packages/registry/src/worker.ts` parses them):
 | `APM_REVIEW_TOKEN_HASH` | sha256 (hex) of the AI reviewer's service token. Turns the AI review on. |
 | `APM_ADMINS` | GitHub logins that may confirm or dismiss flagged reviews. |
 | `APM_REVIEW_POPULAR_WEEKLY`, `APM_NPM_DOWNLOADS_URL`, `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning; defaults in `review.ts`. |
+| `APM_DB_DOWN_WINDOW_MS` | How long an isolate takes Postgres as down after it failed to answer (default 15000, `db-health.ts`). Tests shorten it; the stack does not set it. |
 
 The website Worker gets `REGISTRY` (a service binding to the registry Worker) and `APM_REGISTRY`.

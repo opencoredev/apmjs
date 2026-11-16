@@ -13,7 +13,7 @@ let postgres: Promise<Postgres> | null = null;
 let template: Promise<string> | null = null;
 let counter = 0;
 
-function findInitdb(): string | null {
+export function findInitdb(): string | null {
   const onPath = spawnSync("sh", ["-c", "command -v initdb"], { encoding: "utf8" }).stdout.trim();
 
   if (onPath) return onPath;

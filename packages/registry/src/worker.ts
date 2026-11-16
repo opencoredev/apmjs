@@ -2,7 +2,7 @@
 // that writes down time-based state changes. Services are built per request from the Worker's bindings.
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Cause, Effect, Exit, Layer } from "effect";
-import type * as SqlClient from "effect/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
 import { matureRevocations, refreshLatestScores } from "./apm.ts";
@@ -10,11 +10,15 @@ import { KeptRefresh, refreshKeptPackages, runRefresh } from "./kept-package.ts"
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
+import { Blocklist, blockTruth } from "./blocklist.ts";
+import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
+import { degradedRoute, isInstallRead, unavailable } from "./degraded.ts";
+import { HEALTH_PATH, healthResponse, QUEUE_PROBE_KEY, QueueProbe } from "./health.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { Store, type StoreFault } from "./db.ts";
-import type { HttpFailure, InfraError } from "./errors.ts";
-import { fail, failureResponse, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
+import type { HttpFailure, InfraError, StoreError } from "./errors.ts";
+import { fail, failureResponse, routePath, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
 import { ChoicesWriter, dropStaleChoices } from "./kept-choices.ts";
 import { route } from "./router.ts";
 import { ISOLATE_POOL, RequestMemory } from "./memory.ts";
@@ -81,6 +85,8 @@ const WorkerEnv = z.object({
   APM_REVIEW_LEASE_MS: z.coerce.number().int().min(1).optional(),
   APM_REVIEW_REQUESTS_PER_HOUR: z.coerce.number().int().min(0).optional(),
   APM_REVIEW_MAX_ATTEMPTS: z.coerce.number().int().min(1).optional(),
+  /** How long an isolate takes the database as down after it failed to answer (db-health.ts). For tests; production keeps the default. */
+  APM_DB_DOWN_WINDOW_MS: z.coerce.number().int().min(0).optional(),
   /** sha256 (hex) of the operator's debug token: a request whose x-apm-debug header is that token gets the full Server-Timing (timing.ts). */
   APM_DEBUG_TOKEN_HASH: z
     .string()
@@ -162,7 +168,7 @@ export type Background = ((work: Promise<void>) => void) | null;
  * connection: the request's connection closes with the request.
  */
 function reviewHooks(env: WorkerEnv, review: ReviewSettings, clock: Layer.Layer<Clock>, background: Background) {
-  const fresh = Layer.mergeAll(Store.postgres(env.HYPERDRIVE.connectionString), clock, Layer.succeed(ReviewConfig, review));
+  const fresh = Layer.mergeAll(Store.postgres(env.HYPERDRIVE.connectionString, new Set(), { windowMs: env.APM_DB_DOWN_WINDOW_MS }), clock, Layer.succeed(ReviewConfig, review));
 
   return Layer.effect(
     ReleaseHooks,
@@ -214,7 +220,7 @@ export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: L
 function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, faults: ReadonlySet<StoreFault>) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
-  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults), Blobs.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
+  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults, { windowMs: env.APM_DB_DOWN_WINDOW_MS }), Blobs.r2(env.BLOBS), Blocklist.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
@@ -286,6 +292,13 @@ function logFailure(event: string, fields: LogFields, error: string): void {
   console.error(JSON.stringify({ level: "error", event, ...fields, error }));
 }
 
+/** One line per request answered without the database: a warning, since the answer was still made. */
+function logDegraded(fields: LogFields, cause: unknown): void {
+  const reason = cause instanceof DatabaseUnavailable ? cause.reason : String(cause);
+
+  console.warn(JSON.stringify({ level: "warn", event: "degraded", ...fields, reason }));
+}
+
 /**
  * Runs the router for one request. `clock` is the system clock in production, and `faults` is empty there: only the
  * test entry (worker-test.ts) switches one on. Per-user answers are marked private, whichever route made them.
@@ -332,8 +345,23 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
 
   const path = new URL(req.url).pathname;
 
+  // before the router: it answers whatever else is down, and reads nothing a request's services would
+  if ((req.method === "GET" || req.method === "HEAD") && routePath(path).path === HEALTH_PATH) {
+    return healthResponse(req, { databaseUrl: env.HYPERDRIVE.connectionString, downWindowMs: env.APM_DB_DOWN_WINDOW_MS, bucket: env.BLOBS, queueBound: env.ANALYSIS_QUEUE !== undefined, upstreamUrl: settings.upstreamUrl });
+  }
+
   const program = route(req).pipe(
     Effect.catchTag("HttpFailure", (f: HttpFailure) => Effect.succeed(failureResponse(f))),
+    // an install read that could not use the database is answered without it, from npm and the block list
+    // (degraded.ts); anything else that needs a database it cannot reach says so, rather than "Internal error"
+    Effect.catchTag("StoreError", (e: StoreError) => {
+      // only a database that cannot be reached: a statement that failed on a database that answers is a bug or a bad
+      // row, and answering around it would hide it (and skip what the database would have refused)
+      if (!isDatabaseUnavailable(e)) return Effect.fail(e);
+      const answer = isInstallRead(req) ? degradedRoute(req) : Effect.succeed(unavailable("this request needs it"));
+
+      return Effect.andThen(Effect.sync(() => logDegraded({ method: req.method, path, operation: e.operation }, e.cause)), answer);
+    }),
     Effect.catch((e: InfraError) =>
       Effect.sync(() => {
         logFailure("request", { method: req.method, path, tag: e._tag, operation: e.operation }, String(e.cause));
@@ -367,6 +395,15 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   for (const message of batch.messages) {
+    const probe = QueueProbe.safeParse(message.body);
+
+    // the cron's probe (health.ts): the queue delivered it, which is all the health check needs to know
+    if (probe.success) {
+      await recordProbe(env.BLOBS, probe.data.sentAt);
+      message.ack();
+      continue;
+    }
+
     const job = Job.safeParse(message.body);
 
     if (!job.success) {
@@ -386,6 +423,39 @@ export async function consume(batch: MessageBatch<unknown>, rawEnv: RawEnv): Pro
     else message.ack();
   }
 }
+
+/** Records that the queue delivered the cron's probe sent at `sentAt`. A failed write is logged: the health check then reports the queue stale. */
+async function recordProbe(bucket: R2Bucket, sentAt: number): Promise<void> {
+  try {
+    await bucket.put(QUEUE_PROBE_KEY, JSON.stringify({ sentAt, receivedAt: Date.now() }), { httpMetadata: { contentType: "application/json" } });
+  } catch (e) {
+    logFailure("queue-probe", {}, String(e));
+  }
+}
+
+/** Sends the health check's queue probe (health.ts). Runs first in the sweep and never stops it. */
+async function sendProbe(queue: Queue<AnalysisJob> | undefined): Promise<void> {
+  if (queue === undefined) return;
+
+  try {
+    // the queue carries analysis jobs; the consumer tells a probe apart by its shape (QueueProbe)
+    const any: Queue<unknown> = queue;
+    await any.send({ probe: "health", sentAt: Date.now() });
+  } catch (e) {
+    logFailure("queue-probe", {}, String(e));
+  }
+}
+
+/**
+ * Rewrites the install routes' block list from the database (blocklist.ts): the safety net under the writes that add
+ * to it. It runs before the rest of the sweep, and a failure is logged without stopping the rest.
+ */
+const syncBlocklist = Effect.gen(function* () {
+  const truth = yield* blockTruth(yield* SqlClient.SqlClient);
+  const list = yield* (yield* Blocklist).sync(truth);
+
+  console.log(JSON.stringify({ level: "info", event: "blocklist-sync", local: list.local.length, confirmed: list.confirmed.length }));
+}).pipe(Effect.catch((e) => Effect.sync(() => logFailure("blocklist-sync", {}, String(e)))));
 
 /** Requeues analyses the platform stopped: every run that began and never stored anything (analysis.ts, `recover`). */
 const recoverAnalyses = Effect.flatMap(Analysis, (a) => a.recover).pipe(
@@ -410,8 +480,10 @@ export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.sy
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
+  await sendProbe(env.ANALYSIS_QUEUE);
+
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([syncBlocklist, matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

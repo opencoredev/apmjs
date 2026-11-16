@@ -1,16 +1,18 @@
 // Postgres storage for the registry (Neon through Hyperdrive in production). Rows are parsed into domain
 // types here, at the storage boundary. Every method is an Effect that fails with StoreError.
-import { Context, Effect, Layer, Redacted } from "effect";
+import { Context, Effect, Layer } from "effect";
 import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
 import { z } from "zod";
 import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
+import type { Socket } from "node:net";
 import { digestLabel, digestOf } from "./digest.ts";
 import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
 import { StoreError } from "./errors.ts";
 import { timed, timingOrNull } from "./timing.ts";
+import { connectionOptions, Guard, guardFor, type DatabaseGuard, type GuardTimings } from "./db-health.ts";
 
 export type VersionStatus = "active" | "yanked" | "revoke-pending" | "revoked";
 
@@ -735,16 +737,20 @@ export class Store extends Context.Service<Store, StoreApi>()("@apm/registry/Sto
    * The store over a Postgres URL (Hyperdrive's connection string on Workers), one connection per request. The
    * layer also provides that connection's SqlClient, for modules that own their own tables (review.ts).
    */
-  static postgres(url: string, faults: ReadonlySet<StoreFault> = new Set()): Layer.Layer<Store | SqlClient.SqlClient, StoreError> {
+  static postgres(url: string, faults: ReadonlySet<StoreFault> = new Set(), timings: GuardTimings = {}): Layer.Layer<Store | SqlClient.SqlClient | Guard, StoreError> {
     return Layer.effectContext(
       Effect.gen(function* () {
-        const services = yield* Layer.build(PgClient.layer({ url: Redacted.make(url), maxConnections: 1 })).pipe(
+        // this request's connections, which its guard closes at once when it takes the database as unreachable
+        const open = new Set<Socket>();
+
+        const services = yield* Layer.build(PgClient.layer({ ...connectionOptions(url, open, timings.stallMs), maxConnections: 1 })).pipe(
           Effect.mapError((cause) => new StoreError({ operation: "connect", cause })),
         );
 
-        const store = yield* make(faults).pipe(Effect.provide(services));
+        const guard = guardFor(url, timings, open);
+        const store = yield* make(faults, guard).pipe(Effect.provide(services));
 
-        return Context.add(services, Store, store);
+        return Context.add(Context.add(services, Store, store), Guard, guard);
       }),
     );
   }
@@ -768,14 +774,12 @@ const none = z.array(z.unknown()).transform(() => undefined);
 const changed = z.array(z.unknown()).transform((rows) => rows.length > 0);
 const count = z.array(z.unknown()).transform((rows) => rows.length);
 
-const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
+const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const timeQuery = timed(yield* timingOrNull, "db");
 
   const run = <S extends z.ZodType>(operation: string, effect: Effect.Effect<ReadonlyArray<unknown>, SqlError>, schema: S): Effect.Effect<z.output<S>, StoreError> =>
-    effect.pipe(
-      timeQuery,
-      Effect.mapError((cause) => new StoreError({ operation, cause })),
+    guard.statement(operation, timeQuery(effect)).pipe(
       Effect.flatMap((rows) => {
         const parsed = schema.safeParse(rows);
 
@@ -833,7 +837,8 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
     );
 
   const api: StoreApi = {
-    tx: (effect) => sql.withTransaction(effect).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "transaction", cause })))),
+    // BEGIN, COMMIT and ROLLBACK are bounded by the connection (db-health.ts, watchedSocket) and the whole by guard.transaction
+    tx: (effect) => guard.transaction("transaction", sql.withTransaction(effect)),
 
     getUser: (name) => run("getUser", sql`SELECT * FROM users WHERE name = ${name}`, one(UserRow)),
     getUserByAuthId: (id) => run("getUserByAuthId", sql`SELECT * FROM users WHERE auth_user_id = ${id}`, one(UserRow)),
@@ -1018,8 +1023,9 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           ),
     addOwner: (name, user) => run("addOwner", sql`INSERT INTO owners (package, "user") VALUES (${name}, ${user}) ON CONFLICT DO NOTHING`, none),
     removeOwner: (name, user) =>
-      sql
-        .withTransaction(
+      guard.transaction(
+        "removeOwner",
+        sql.withTransaction(
           Effect.gen(function* () {
             yield* run("removeOwner: lock", sql`SELECT name FROM packages WHERE name = ${name} FOR UPDATE`, none);
             const owners = yield* run("removeOwner: owners", sql`SELECT "user" FROM owners WHERE package = ${name}`, all(z.object({ "user": z.string() }).transform((r) => r.user)));
@@ -1031,8 +1037,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
 
             return "removed" as const;
           }),
-        )
-        .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "removeOwner", cause })))),
+        )),
 
     listVersions: (name) => Effect.flatMap(run("listVersions", sql`SELECT * FROM versions WHERE package = ${name} ORDER BY published_at, seq`, all(VersionRow)), withDismissals),
     localHeadsOf: (names) =>
@@ -1718,8 +1723,9 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         ),
       ),
     enableTwoFactor: (authUserId) =>
-      sql
-        .withTransaction(
+      guard.transaction(
+        "enableTwoFactor",
+        sql.withTransaction(
           Effect.all(
             [
               run("enableTwoFactor", sql`UPDATE "twoFactor" SET verified = true WHERE "userId" = ${authUserId}`, none),
@@ -1727,8 +1733,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             ],
             { discard: true },
           ),
-        )
-        .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "enableTwoFactor", cause })))),
+        )),
     swapBackupCodes: (input) =>
       run(
         "swapBackupCodes",
@@ -1738,8 +1743,9 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
     takeSession: (token) => run("takeSession", sql`DELETE FROM session WHERE token = ${token} RETURNING "userId"`, one(z.object({ userId: z.string() }).transform((r) => r.userId))),
 
     reserveAttempt: (input) =>
-      sql
-        .withTransaction(
+      guard.transaction(
+        "reserveAttempt",
+        sql.withTransaction(
           Effect.gen(function* () {
             // one account's reservations queue behind each other, so the count below is never stale
             yield* run("reserveAttempt: lock", sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.authUserId}, 0)) IS NULL AS locked`, none);
@@ -1760,18 +1766,17 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
 
             return { kind: "reserved", id } satisfies Reservation;
           }),
-        )
-        .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "reserveAttempt", cause })))),
+        )),
     settleAttempt: (input) =>
-      sql
-        .withTransaction(
+      guard.transaction(
+        "settleAttempt",
+        sql.withTransaction(
           Effect.gen(function* () {
             yield* run("settleAttempt", sql`UPDATE factor_attempts SET outcome = ${input.ok ? "ok" : "bad"} WHERE id = ${input.id}`, none);
 
             if (input.ok) yield* run("settleAttempt: clear", sql`DELETE FROM factor_attempts WHERE auth_user_id = ${input.authUserId} AND outcome = 'bad'`, none);
           }),
-        )
-        .pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new StoreError({ operation: "settleAttempt", cause })))),
+        )),
     acceptStep: (input) =>
       run(
         "acceptStep",

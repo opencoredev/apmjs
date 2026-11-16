@@ -544,6 +544,7 @@ function probes(): Probe[] {
     ...VERSIONS.map((v) => v1(`packages/${NAME}/versions/${v}`, "versions", 200)),
     v1(`popular-scores?names=${NAME},${DEPENDENT}`, "popular-scores", 200),
     v1("recent-packages?limit=50", "recent-packages", 200),
+    v1("health", "health", 200),
     // the dependency walk and the AI review standings of what it walked (tree.reviews); DEPENDENT is inside its
     // cooldown, which warns (review of 2fbf383, finding 1): its tree decides, as with the cooldown lifted below
     v1(`resolve?name=${DEPENDENT}`, "resolve", (a) => (a.phase === "after" ? 200 : 422)),

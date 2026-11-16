@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { z } from "zod";
+import type { DatabaseLink } from "./db-link.ts";
 import { startWorkerRegistry, type WorkerRegistryOptions } from "./worker-registry.ts";
 
 export const ROOT = join(import.meta.dir, "..", "..");
@@ -73,7 +74,9 @@ export type Registry = {
   /** Test-only: a token for `user` without any login flow. "publish" goes live at once (the CI trusted-publishing path); "stage" needs approval. */
   mintToken: (input: { user: string; scope: TokenScope }) => Promise<string>;
   /** Test-only: the registry's blob store (R2), to check what was stored and to tamper with it. */
-  blobs: { keys: () => Promise<string[]>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
+  blobs: { keys: () => Promise<string[]>; text: (key: string) => Promise<string | null>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
+  /** Test-only: the link between the Worker and its database, with `databaseLink: true`; cutting it makes an outage. */
+  databaseLink: DatabaseLink | null;
   /** Test-only: runs one SQL statement against the registry's Postgres database and returns its rows. */
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
   /** Runs the cron's sweep at the test clock: expires staged versions and writes down matured revokes. */
@@ -120,6 +123,8 @@ export type StartOptions = {
   admins?: readonly string[];
   /** Worker variables to set or override (APM_PUBLIC_URL, APM_ALLOW_LEGACY_IN_PROD, ...). */
   env?: Readonly<Record<string, string>>;
+  /** Puts a link the test can cut between the Worker and its database (db-link.ts). */
+  databaseLink?: boolean;
 };
 
 export async function startRegistry(opts: StartOptions = {}): Promise<Registry> {
@@ -137,6 +142,8 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   if (opts.upstreamTtlMs !== undefined) options.upstreamTtlMs = opts.upstreamTtlMs;
 
+  if (opts.databaseLink) options.databaseLink = true;
+
   if (opts.github) options.github = { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints };
 
   const admins: Record<string, string> = {};
@@ -149,7 +156,7 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
 
   const url = srv.url.endsWith("/") ? srv.url : `${srv.url}/`;
 
-  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep, databaseUrl: srv.databaseUrl, analysisJob: srv.analysisJob, seedUpstreamCache: srv.seedUpstreamCache };
+  return { url, stop: srv.stop, mintToken: srv.mint, blobs: srv.blobs, query: srv.query, sweep: srv.sweep, databaseUrl: srv.databaseUrl, databaseLink: srv.databaseLink, analysisJob: srv.analysisJob, seedUpstreamCache: srv.seedUpstreamCache };
 }
 
 /** The Worker variables that turn the AI review on, as the deploy sets them; none when it is off. */

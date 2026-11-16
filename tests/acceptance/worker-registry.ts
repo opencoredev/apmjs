@@ -10,6 +10,7 @@ import { Client } from "pg";
 import { z } from "zod";
 import { buildWorker } from "../../packages/registry/scripts/build.ts";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/compat.ts";
+import { startDatabaseLink, type DatabaseLink } from "./db-link.ts";
 import { freshDatabase } from "./postgres.ts";
 
 export type WorkerRegistryOptions = {
@@ -24,14 +25,18 @@ export type WorkerRegistryOptions = {
   github?: { clientId: string; clientSecret: string; endpoints: { authorize: string; token: string; user: string; emails: string } };
   /** Worker variables to set or override, as the deploy would. */
   env?: Readonly<Record<string, string>>;
+  /** Puts a link the test can cut (db-link.ts) between the Worker's Hyperdrive and its database. */
+  databaseLink?: boolean;
 };
 
 export type WorkerRegistry = {
   url: string;
   stop: () => Promise<void>;
   mint: (input: { user: string; scope: "publish" | "stage" }) => Promise<string>;
-  /** The blob store (R2) as the Worker sees it: list keys, overwrite one. */
-  blobs: { keys: () => Promise<string[]>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
+  /** The blob store (R2) as the Worker sees it: list keys, read one (null when absent), overwrite one. */
+  blobs: { keys: () => Promise<string[]>; text: (key: string) => Promise<string | null>; put: (key: string, bytes: Uint8Array | string) => Promise<void> };
+  /** The link between the Worker and its database, when the registry was started with one: cut it to make an outage. */
+  databaseLink: DatabaseLink | null;
   /** Runs one SQL statement against this registry's database and returns its rows. */
   query: (text: string, params?: readonly unknown[]) => Promise<unknown[]>;
   /** Runs the cron's sweep (matured revokes, expired staged versions) at the test clock. */
@@ -61,6 +66,7 @@ function buildBundle(): Promise<string> {
 export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<WorkerRegistry> {
   bundle ??= buildBundle();
   const [database, script] = await Promise.all([freshDatabase(), bundle]);
+  const link = opts.databaseLink === true ? await startDatabaseLink(database.url) : null;
 
   const queue = `apm-analysis-${++counter}`;
 
@@ -116,7 +122,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     r2Buckets: ["BLOBS"],
     queueProducers: { ANALYSIS_QUEUE: { queueName: queue } },
     queueConsumers: { [queue]: { maxBatchTimeout: 1, maxBatchSize: 10 } },
-    hyperdrives: { HYPERDRIVE: database.url },
+    hyperdrives: { HYPERDRIVE: link?.url ?? database.url },
     host: "127.0.0.1",
     port: 0,
   });
@@ -128,6 +134,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     stop: async () => {
       await proxy.stop(true);
       await mf.dispose();
+      await link?.stop();
       await database.drop();
     },
     blobs: {
@@ -138,6 +145,15 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
         if (!body.success) throw new Error(`blob list failed: ${res.status}`);
 
         return body.data.keys;
+      },
+      text: async (key) => {
+        const res = await fetch(`${target}__test/blobs/${encodeURIComponent(key)}`, { headers: { "x-apm-test-control": CONTROL } });
+
+        if (res.status === 404) return null;
+
+        if (res.status !== 200) throw new Error(`blob read failed: ${res.status}`);
+
+        return res.text();
       },
       put: async (key, bytes) => {
         const res = await fetch(`${target}__test/blobs/${encodeURIComponent(key)}`, { method: "PUT", headers: { "x-apm-test-control": CONTROL }, body: bytes });
@@ -169,6 +185,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
       if (res.status !== 200) throw new Error(`upstream cache seed failed: ${res.status}`);
     },
     databaseUrl: database.url,
+    databaseLink: link,
     analysisJob: async (job) => {
       const res = await fetch(`${target}__test/analysis-job`, {
         method: "POST",
