@@ -2,7 +2,12 @@
 // refuses a low-score package, a login token stages a publish that goes live only after a TOTP approval, and
 // bun audit reads advisories through it. Prints one PASS/FAIL line per check; exits non-zero on any FAIL.
 //
-//   bun packages/infra/smoke.ts --stage staging
+//   bun packages/infra/smoke.ts --stage staging [--build <id> --subdomain <workers.dev subdomain>]
+//
+// deploy.ts passes --build (its run's build id) and --subdomain (the account's, as it resolved it). With --build, the
+// registry and the website must answer uncached with that build before the behavioural checks and again after them
+// (smoke-identity.ts): an old version that still gives the same answers fails the check. Without it, run by hand,
+// which version answers is not checked.
 //
 // The staged-publish check needs a signed-in person. GitHub sign-in needs a real browser login, so on staging this
 // script makes a check identity directly in the stage's database (user "apm-staging-check" with a GitHub account
@@ -16,16 +21,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "pg";
 import { z } from "zod";
+import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
-const Stage = z.enum(["staging", "production"]);
-const stageAt = process.argv.indexOf("--stage");
-const stage = Stage.parse(stageAt > 0 ? process.argv[stageAt + 1] : "staging");
-const SUBDOMAIN = process.env.WORKERS_SUBDOMAIN ?? "leoisadev";
-const registry = stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${stage}.${SUBDOMAIN}.workers.dev/`;
-const web = stage === "production" ? "https://apmjs.dev/" : `https://apmjs-web-${stage}.${SUBDOMAIN}.workers.dev/`;
-const docs = stage === "production" ? "https://docs.apmjs.dev/" : `https://apmjs-docs-${stage}.${SUBDOMAIN}.workers.dev/`;
+const { stage, build, subdomain } = parseSmokeArgs(process.argv.slice(2));
+const { registry, web, docs } = smokeTargets(stage, subdomain);
 const work = mkdtempSync(join(tmpdir(), "apm-smoke-"));
 const results: { ok: boolean; name: string; detail: string }[] = [];
 
@@ -63,6 +64,25 @@ function installed(dir: string, name: string): string | null {
   const p = join(dir, "node_modules", ...name.split("/"), "package.json");
 
   return existsSync(p) ? z.object({ version: z.string() }).parse(JSON.parse(readFileSync(p, "utf8"))).version : null;
+}
+
+// ---------- which version answers ----------
+/** How long the check before the behavioural ones waits for the new versions to take the traffic. */
+const TAKEOVER_MS = 120_000;
+
+/** Both Workers that run code answer with this run's build: `wait` before the checks, no waiting after them. */
+async function identity(when: "before" | "after"): Promise<void> {
+  if (build === null) {
+    if (when === "before") process.stdout.write("which version answers: not checked (no --build)\n");
+
+    return;
+  }
+
+  for (const [name, url] of [["the registry", `${registry}-/ping`], ["the website", `${web}api/build`]] as const) {
+    const r = await confirmBuild({ name, url, expected: build, consecutive: 3, deadlineMs: when === "before" ? TAKEOVER_MS : 0 });
+
+    record(r.ok, `${name} answers with this run's build ${when} the checks`, r.detail);
+  }
 }
 
 // ---------- docs ----------
@@ -327,6 +347,8 @@ async function stagedPublish(): Promise<void> {
 
 process.stdout.write(`smoke: ${stage} registry ${registry}\n`);
 
+await identity("before");
+
 await docsSite();
 
 await stockClients();
@@ -336,6 +358,8 @@ await apmWarning();
 await stagedPublish();
 
 await bunAudit();
+
+await identity("after");
 
 rmSync(work, { recursive: true, force: true });
 

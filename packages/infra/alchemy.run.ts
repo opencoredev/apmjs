@@ -7,6 +7,7 @@ import * as Alchemy from "alchemy";
 import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
+import { z } from "zod";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS, WORKER_CPU_MS } from "../registry/scripts/compat.ts";
 import { websiteAgentEnv } from "./web-env.ts";
 import { WEB_ASSETS, WEB_BUILD } from "./web-build.ts";
@@ -55,6 +56,9 @@ export default Alchemy.Stack(
     const debugTokenHash = yield* Config.withDefault(Config.String("DEBUG_TOKEN_HASH"), "");
     const debug = Object.fromEntries(debugTokenHash === "" ? [] : [["APM_DEBUG_TOKEN_HASH", debugTokenHash]]);
 
+    // plain-text variables only: a commit id, a build id and migration ids (deploy.ts), stamped on the registry and the website
+    const provenance = z.record(z.string().regex(/^APM_[A-Z0-9_]+$/), z.string()).parse(JSON.parse(yield* Config.withDefault(Config.String("APM_PROVENANCE"), "{}")));
+
     const registry = yield* Cloudflare.Worker("Registry", {
       name: registryName,
       main: yield* Config.withDefault(Config.String("APM_REGISTRY_BUNDLE"), resolve(import.meta.dirname, "../registry/dist/worker.js")),
@@ -79,6 +83,9 @@ export default Alchemy.Stack(
         APM_AUTH_SECRET: yield* Config.Redacted("AUTH_SECRET"),
         APM_GITHUB_CLIENT_ID: yield* Config.String("GITHUB_CLIENT_ID"),
         APM_GITHUB_CLIENT_SECRET: yield* Config.Redacted("GITHUB_CLIENT_SECRET"),
+        // what built this version: its commit, its deploy run and its sealed migration manifest (rollback.ts provenanceVars).
+        // deploy-record.ts confirms the live version carries them before it records the run, and /-/ping reports APM_BUILD
+        ...provenance,
         ...review,
         ...debug,
       },
@@ -108,7 +115,7 @@ export default Alchemy.Stack(
       rootDir: resolve(import.meta.dirname, "../../apps/web"),
       // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs. It also makes the
       // registry deploy first: Alchemy starts the website only once the registry has finished (deploy.ts, "Order")
-      env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage) },
+      env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage), ...provenance },
       openNext: WEB_BUILD,
       assets: { runWorkerFirst: WEB_ASSETS.runWorkerFirst === true ? true : [...WEB_ASSETS.runWorkerFirst] },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },

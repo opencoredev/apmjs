@@ -6,4 +6,6 @@ interface CloudflareEnv {
   APM_REGISTRY?: string;
   /** The Workers rate limiting binding the agent routes (/mcp, /api/explain) share; see lib/agent/agent-limit.ts. */
   AGENT_RATE_LIMIT?: { limit: (options: { key: string }) => Promise<{ success: boolean }> };
+  /** The deploy run that uploaded this version (packages/infra/deploy.ts); GET /api/build reports it. */
+  APM_BUILD?: string;
 }

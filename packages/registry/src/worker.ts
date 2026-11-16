@@ -92,9 +92,13 @@ const WorkerEnv = z.object({
     .string()
     .regex(/^[0-9a-fA-F]{64}$/, "APM_DEBUG_TOKEN_HASH must be a sha256 hex digest")
     .optional(),
+  /** The deploy run that uploaded this version (packages/infra/deploy.ts): /-/ping answers with it in BUILD_HEADER. */
+  APM_BUILD: OptionalText,
 });
 
 const DebugEnv = WorkerEnv.pick({ APM_DEBUG_TOKEN_HASH: true });
+
+const BuildEnv = WorkerEnv.pick({ APM_BUILD: true });
 
 /** "full" only when the request's x-apm-debug header hashes to APM_DEBUG_TOKEN_HASH; anyone else gets "none". */
 export function timingDetail(req: Request, rawEnv: RawEnv): TimingDetail {
@@ -314,7 +318,24 @@ export async function handle(
   const timing = Timing.make();
   const res = await respond({ req, rawEnv, clock, ctx, faults, timing });
 
-  return withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail: timingDetail(req, rawEnv) }));
+  return withBuild(req, withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail: timingDetail(req, rawEnv) })), rawEnv);
+}
+
+/** The header /-/ping carries this version's build id in (APM_BUILD), for the deploy's smoke check (packages/infra/smoke-identity.ts). */
+export const BUILD_HEADER = "x-apm-build";
+
+/** /-/ping's answer with the version's build id, never cached; every other answer unchanged. */
+function withBuild(req: Request, res: Response, rawEnv: RawEnv): Response {
+  const parsed = BuildEnv.safeParse(rawEnv);
+  const build = parsed.success ? (parsed.data.APM_BUILD ?? "") : "";
+
+  if (build === "" || routePath(new URL(req.url).pathname).path !== "/-/ping") return res;
+  const stamped = new Response(res.body, res);
+
+  stamped.headers.set(BUILD_HEADER, build);
+  stamped.headers.set("cache-control", "no-store");
+
+  return stamped;
 }
 
 type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: ExecutionContext | null; faults: ReadonlySet<StoreFault>; timing: TimingApi };

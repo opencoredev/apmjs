@@ -8,6 +8,25 @@
 //   bun packages/infra/deploy.ts deploy  --stage production
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
 //
+// After Alchemy, a deploy runs the stage's smoke check (smoke.ts) once, with this run's build: the registry and the
+// website must answer with it before and after the behavioural checks. When it passes, still under the lock, it reads
+// each Worker's live deployment, confirms the registry's and the website's live versions carry this run's stamp, and
+// appends one line to the release record (deploy-record.ts, releases.ts): build id, git SHA, stage, migration manifest
+// and the live version ids. That record is all rollback.ts trusts. When Alchemy, the smoke check or the record fails,
+// nothing is recorded, nothing is rolled back, and the deploy exits 1 with what to do next (deploy-finish.ts): the
+// rollback.ts command to the last recorded build, or fix forward when this run left a version live it did not record.
+//
+// The registry and website versions this script uploads carry APM_REVISION, APM_BUILD (a new id each run) and the
+// sealed migration manifest as plain-text variables (rollback.ts, provenanceVars); because the build id changes every
+// run, every deploy uploads both. The docs Worker is assets-only: Alchemy uploads it only when its pages change, and
+// Cloudflare keeps no variables on it.
+//
+// Lock: a deploy holds the release lock (release-lock.ts) for its whole run: an exclusive flock on
+// /home/leo/.config/apmjs/release.lock, or on the path in APM_RELEASE_LOCK, shared with rollback.ts and the incident
+// agent's helper. It is taken before anything else (secrets, migrations, builds) and held until this process and the
+// children it starts to change anything (Alchemy, the smoke check, which get the lock's descriptor) have exited. The
+// holder is recorded in release.lock.json beside it. A held lock stops the deploy at once with exit code 6.
+//
 // Order: migrations, then the registry Worker, then the website. The website binds the registry (REGISTRY in
 // alchemy.run.ts), and Alchemy starts a resource only after every resource it depends on has finished, and not at all
 // when one failed (Apply.ts, waitForDeps on readyStable). Keep that binding: the registry is the only gate for a
@@ -18,10 +37,16 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { buildWorker } from "../registry/scripts/build.ts";
 import { authSecret, prepareDatabase, type DatabaseReport } from "./stage.ts";
+import { migrationFiles } from "../registry/scripts/migrate.ts";
+import { BUSY_CODE, lockedSpawn, takeReleaseLock, type ReleaseLock } from "./release-lock.ts";
+import { recordLiveRelease } from "./deploy-record.ts";
+import { finishDeploy, recoveryAdvice, smokeCommand } from "./deploy-finish.ts";
+import { readReleases } from "./releases.ts";
+import { provenanceVars, type Cloudflare } from "./rollback.ts";
 
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
 const INFRA = import.meta.dirname;
@@ -29,6 +54,23 @@ const INFRA = import.meta.dirname;
 const Args = z.object({ action: z.enum(["plan", "deploy"]), stage: z.enum(["staging", "production"]) });
 const stageAt = process.argv.indexOf("--stage");
 const args = Args.parse({ action: process.argv[2], stage: stageAt > 0 ? process.argv[stageAt + 1] : "staging" });
+
+// one change to apm at a time, on this machine: the release lock (APM_RELEASE_LOCK), held from here until this process
+// and the children it starts to change anything (Alchemy, the smoke check) have exited. A plan changes nothing and
+// takes no lock.
+let lock: ReleaseLock | null = null;
+
+if (args.action === "deploy") {
+  const taken = takeReleaseLock({ script: import.meta.path, argv: process.argv.slice(2), stage: args.stage });
+
+  if (taken.kind === "busy") {
+    process.stdout.write(`deploy ${taken.text}\n`);
+    process.exit(BUSY_CODE);
+  }
+
+  lock = taken.lock;
+  process.stdout.write(`release lock: held (${lock.path})\n`);
+}
 
 /** The Neon database each stage owns. Production keeps Neon's default database. */
 const DATABASES = { staging: "apmjs_staging", production: "neondb" } as const;
@@ -128,6 +170,8 @@ const database = DATABASES[args.stage];
 
 process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"})\n`);
 
+const cf: Cloudflare = { apiBase: process.env.APM_CLOUDFLARE_API ?? "https://api.cloudflare.com/client/v4", token, accountId };
+
 const report = await prepareDatabase({
   action: args.action,
   adminUrl: databaseUrl(neonUrl, new URL(neonUrl).pathname.slice(1)),
@@ -149,6 +193,12 @@ const bundle = planDir === null ? await buildWorker("worker") : await buildWorke
 process.stdout.write(`registry bundle: ${bundle}\n`);
 
 const subdomain = await workersSubdomain(token, accountId);
+const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: INFRA }).stdout.toString().trim() || "unknown";
+
+// a tree with uncommitted changes is not the commit it names
+const dirty = Bun.spawnSync(["git", "status", "--porcelain", "--untracked-files=no"], { cwd: INFRA }).stdout.toString().trim() !== "";
+const revision = dirty ? `${head}-dirty` : head;
+const build = randomUUID();
 const alchemyFlags: string[] = [];
 
 if (args.action === "deploy") alchemyFlags.push("--yes");
@@ -156,12 +206,10 @@ if (args.action === "deploy") alchemyFlags.push("--yes");
 // adopts existing resources when the local Alchemy state was lost (docs/DEPLOY.md, "State")
 if (process.argv.includes("--adopt")) alchemyFlags.push("--adopt");
 
-const child = Bun.spawn(
-  ["bun", join(INFRA, "node_modules", ".bin", "alchemy"), args.action, "--stage", args.stage, "--no-input", ...alchemyFlags],
-  {
+const alchemyCommand = ["bun", join(INFRA, "node_modules", ".bin", "alchemy"), args.action, "--stage", args.stage, "--no-input", ...alchemyFlags];
+
+const alchemyOptions = {
     cwd: INFRA,
-    stdout: "inherit",
-    stderr: "inherit",
     env: {
       PATH: process.env.PATH ?? "",
       HOME: homedir(),
@@ -180,16 +228,40 @@ const child = Bun.spawn(
       REVIEW_TOKEN_HASH: review.hash,
       APM_ADMINS: review.admins,
       DEBUG_TOKEN_HASH: debugHash,
+      // what built the registry and the website: this run's commit, build id and migration manifest. The record waits
+      // for the live versions to carry it (deploy-record.ts), and the smoke check for them to answer with the build
+      APM_PROVENANCE: JSON.stringify(provenanceVars(revision, build, migrationFiles().map((m) => m.id))),
       // the website's registry URL for anything it renders at build time
       APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
       ALCHEMY_TELEMETRY_DISABLED: "1",
       DO_NOT_TRACK: "1",
     },
-  },
-);
+  };
+
+// a deploy's Alchemy holds the release lock with this process: killing this one mid-upload leaves it held
+const child = lock === null ? Bun.spawn(alchemyCommand, { ...alchemyOptions, stdout: "inherit", stderr: "inherit" }) : lockedSpawn(lock, alchemyCommand, alchemyOptions);
 
 const exitCode = await child.exited;
 
 if (planDir !== null) rmSync(planDir, { recursive: true, force: true });
 
-process.exit(exitCode);
+if (args.action !== "deploy") process.exit(exitCode);
+
+// the smoke check (with this run's build and the subdomain resolved above) and the record, under the lock
+const smoke = async (): Promise<number> => {
+  const command = smokeCommand(INFRA, args.stage, build, subdomain);
+  const run = lock === null ? Bun.spawn(command, { cwd: INFRA, stdout: "inherit", stderr: "inherit", env: { ...process.env } }) : lockedSpawn(lock, command, { cwd: INFRA, env: { ...process.env } });
+
+  return run.exited;
+};
+
+process.exit(
+  await finishDeploy({
+    alchemyExit: exitCode,
+    smoke,
+    // what is live now, confirmed to be this run's versions: the line every later rollback trusts
+    record: () => recordLiveRelease({ cf, stage: args.stage, build, sha: revision, manifest: migrationFiles().map((m) => m.id) }),
+    advice: async () => recoveryAdvice({ cf, stage: args.stage, releases: readReleases(args.stage) }),
+    log: (line) => process.stdout.write(`${line}\n`),
+  }),
+);

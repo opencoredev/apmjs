@@ -62,9 +62,90 @@ Alchemy keeps what it deployed in `packages/infra/.alchemy/` on the machine that
 
 Migrations are SQL files in `packages/registry/migrations`, applied in order, each once, inside a transaction, before the Workers update. A run holds a Postgres advisory lock for its whole length, so two runs against one database take turns and the second finds nothing to do. `plan` only lists a missing database, pending migrations and a missing auth secret; `deploy` creates and applies them. They only move forward. Write a new numbered file for every schema change; never edit one that has been applied to staging or production. A deploy whose code needs a new migration applies it first, so the old Worker runs briefly against the new schema: keep changes additive, and drop old columns or tables one release later.
 
+A migration that the previous release's code still runs correctly against (a new table or index, a nullable column) says so with a `-- apm:rollback-safe` line in its leading comment, optionally followed by why (`-- apm:rollback-safe: a new table nothing older reads`). Only then may `rollback.ts` put older Workers back after it ran; without the marker it refuses.
+
 ## Rolling back
 
-Deploy the previous commit. The database stays on the newer schema, which is why migrations stay additive.
+### Scope
+
+- **Where:** every production and staging deploy, and every rollback, runs on evo-1 from `/home/leo/code/apmjs`, through `packages/infra/deploy.ts` or `packages/infra/rollback.ts`.
+- **Unsupported:** deploying from another machine, from another clone, or through the Cloudflare dashboard (a dashboard edit, a dashboard rollback, `wrangler deploy`). Such a deploy is in no release record. `rollback.ts` then refuses to change any Worker running it, or to go back to it, but it can still confuse which build is current. Don't do it, and if it happened, run `rollback.ts list` and decide by hand.
+- **The lock is machine-local** (below): it keeps runs on evo-1 apart, not runs anywhere else.
+- **Nothing rolls back on its own:** a failed deploy prints the command to run.
+
+### The release lock
+
+One exclusive lock covers every change to apm's Workers and database. The incident agent's helper uses the same lock; this is the contract agreed with it.
+
+- **The lock:** an exclusive `flock(LOCK_EX|LOCK_NB)` on `/home/leo/.config/apmjs/release.lock` (`~/.config/apmjs/release.lock` for whoever runs it). The `APM_RELEASE_LOCK` environment variable overrides the path, and `deploy.ts`, `rollback.ts` and `release-lock.ts` honour it.
+- **Busy means refused:** a run that finds it held changes nothing, prints who holds it and exits with code 6. Nothing waits for it, and nothing releases it on a timer.
+- **Held for the whole run:**
+  - `deploy.ts deploy` takes it before anything else (secrets, migrations, builds) and holds it through the upload, the smoke check and the release record;
+  - `rollback.ts ... --yes` takes it before it reads anything and holds it through the rollback;
+  - `deploy.ts plan`, `rollback.ts list` and runs without `--yes` change nothing and take no lock.
+- **Held by the children that change things:** Alchemy's upload and the smoke check hold it with the run, so killing `deploy.ts` while Alchemy is still uploading leaves the lock held until Alchemy ends.
+- **No other way in:** no environment variable or record makes a run the holder. Every run takes the lock itself.
+- **The holder record:** `release.lock.json` next to the lock records `pid`, `started`, `command`, `sha` (the checkout's git SHA) and `stage`, and is removed when the run ends. It only describes the holder; whether the lock is held is always the kernel's answer.
+
+How it is held (`packages/infra/release-lock.ts`): Bun's standard library has no `flock`, so a run opens the lock file and has util-linux's `flock(1)` lock that open file description: `flock -n 3`, with the descriptor handed to it as its fd 3. A flock belongs to the open file description, not to a process, so the lock stays held while any process has that description open. That is the run itself and every child it starts through `lockedSpawn`, which hands the same description to the child as its fd 3 (Bun closes other descriptors in children). evo-1 has `flock` from util-linux 2.41.
+
+A small CLI reports on the lock for the incident agent and anyone else. It asks the kernel (a non-blocking `flock` on a fresh descriptor, released at once) and prints the holder record only as a description, so a holder without a record still shows as held:
+
+```sh
+bun packages/infra/release-lock.ts status                  # FREE (exit 0), or HELD {"pid":...,"started":...,"command":[...],"sha":...,"stage":...} (exit 6)
+bun packages/infra/release-lock.ts wait --timeout 1800     # FREE (exit 0) once it is free, or HELD (exit 6) at the timeout
+bun packages/infra/release-lock.ts path                    # the lock file and its holder record
+```
+
+Free when it answers is not a reservation: run `deploy.ts` or `rollback.ts ... --yes` next, which take it themselves and exit 6 if someone got there first.
+
+### What each deploy uploads and records
+
+- **Uploads:** every run of `deploy.ts deploy` uploads the registry and the website, changed or not. Each carries plain-text variables saying what built it:
+  - `APM_REVISION`: the git commit, with `-dirty` when the tree had uncommitted changes;
+  - `APM_BUILD`: a new random id every run, which is why both change every run;
+  - the migration manifest, every migration id in that commit, in parts of at most 4,000 characters (`APM_MIGRATIONS_0`, ..., counted by `APM_MIGRATIONS_PARTS`), sealed by `APM_MIGRATIONS_SHA256`.
+
+  The docs Worker is assets-only: Alchemy uploads it only when its pages change, and Cloudflare keeps no variables on its versions.
+- **Smoke check:** after Alchemy, a deploy runs `smoke.ts` for its stage once, with the run's build and the account's workers.dev subdomain. Before its behavioural checks the registry (`GET /-/ping`) and the website (`GET /api/build`) must each answer three times in a row, uncached, with that build in `x-apm-build`; it waits up to 2 minutes for Cloudflare to move the traffic. After them they must answer with it again, with no waiting. An old version that still gives the right answers fails the check. The docs run no code, so which docs version answers is not checked.
+- **The release record** (`releases.ts`, `deploy-record.ts`): when the smoke check passes, still under the lock, the deploy reads each Worker's live deployment and appends one line to `/home/leo/.config/apmjs/releases.jsonl`. The file has mode 0600, and `APM_RELEASES_LEDGER` overrides the path. The line holds the build id, git SHA, stage, migration manifest and the three live version ids.
+  - The registry's and the website's live versions must carry this run's `APM_BUILD`, `APM_REVISION` and sealed manifest in their settings. Cloudflare's deployment list can lag an upload and still name the previous version; the deploy reads again for up to 60 seconds, one deadline that cuts short every request and wait and is checked again just before the append, and then leaves the run unrecorded rather than label an old version with this run's manifest. The variables only confirm this run at that moment: no rollback trusts a version's variables, since a dashboard edit could carry the same values.
+  - The docs Worker's live version is recorded as it is.
+  - A Worker that does not route all its traffic to one version leaves the run unrecorded.
+  - A last line that was left unterminated is ended first, so it stays a broken line of its own.
+  - A line that does not parse vouches for nothing, and neither does a build id whose lines disagree.
+- **When a deploy fails** (Alchemy fails, the smoke check fails, the run could not be recorded, or reading Cloudflare to record it failed), nothing is recorded, nothing is rolled back, and the deploy exits 1 with what to do next, judged by what is live:
+  - every live version is in the record: the `rollback.ts to --build <id>` command for the last recorded build, to run after deciding to;
+  - the registry or the website runs a version the record does not name (this run uploaded it and then failed, or was stopped, before recording it): fix forward, by deploying a fixed commit. `rollback.ts` never replaces a version it cannot identify, so there is no rollback from that state. This is the cost of failing closed: the record is written only after a passing smoke check, and nothing records an upload on its own;
+  - only the docs run an unrecorded version: the rollback command still works for the registry and the website.
+
+### By hand
+
+`packages/infra/rollback.ts` is the only way to roll back, for a person or the incident agent. It runs on evo-1 from `/home/leo/code/apmjs`, because it needs `~/.config/apmjs/cloudflare-token` and the release record, which only that machine's deploys write. It never prints the token, and changes nothing without `--yes`.
+
+```sh
+bun packages/infra/rollback.ts list     --stage production              # recent deployments of each Worker, live first, with the recorded build of each
+bun packages/infra/rollback.ts to --stage production --build <id>       # what it would do: website and registry (add --worker docs for the docs) back to that build
+bun packages/infra/rollback.ts to --stage production --build <id> --yes # do it
+bun packages/infra/rollback.ts previous --stage production [--yes]      # each named Worker (default website and registry) to its previous deployment, if that is a recorded pair
+bun packages/infra/rollback.ts to --stage production --worker docs --deployment <id> --yes
+```
+
+Before it changes anything it refuses (exit 1, and nothing changed) unless all of these hold:
+
+- **Recorded live versions:** every version a Worker being rolled back runs now is named by the release record. One that is not (a deploy that failed or was stopped after its upload, or a change outside `deploy.ts`) is never replaced: fix forward.
+- **Recorded targets:** every version a Worker being rolled back would route traffic to, on every share of a split deployment, is named by a canonical line of the release record as that Worker.
+- **One-line pair:** afterwards, every registry and website version receiving traffic, rolled back or left as it is, is named by one canonical line: a pair one deploy left live. There is no time-window rule. So the registry and the website go back together (`to --build <id>`); either one alone is refused unless the other already runs that line's version. The docs pair with nothing.
+- **Migrations fit:** that line's manifest fits the stage's migration ledger (`apm_migrations`, read only, through `neon-url`, within 15 s): every migration in it is applied, and every applied migration not in it is marked `-- apm:rollback-safe`, wherever its number sorts. `--skip-migration-check` skips only this comparison, for someone who has checked the schema by hand; nothing skips the others.
+
+With `--yes` it takes the release lock first (exit 6 while someone else holds it, nothing changed). Once it has started changing Workers (website, then docs, then registry), it can still stop part-way, also with exit 1:
+
+- **Live re-read:** just before changing each Worker it reads its live deployment again, and stops if that is not the deployment it planned from, or runs a version the record does not name.
+- **A refused change:** Cloudflare refuses a deployment, or a read fails.
+
+Workers it already changed stay changed, and it prints which went back and which did not. Read that output before running anything else.
+
+The database itself never rolls back.
 
 ## Health checks
 
@@ -93,7 +174,6 @@ Deploy the previous commit. The database stays on the newer schema, which is why
 | `down` | `down` | 503 | R2 does not answer (tarballs are read through it), npm does not, or Postgres does not and the block list is missing, unreadable or never synced. |
 
 Each check is `up`, `down` or `unknown`. The queue check reads when the consumer last took the probe message the cron sends every 10 minutes, and reports `down` after 25 minutes without one: the consumer is stopped or far behind. Set Instatus to alert on a non-200, and, to hear about a degraded registry too, on the body not containing `"status":"ok"`. For a plain install probe, `GET https://registry.apmjs.dev/ms` must answer 200 with a packument; during a database outage that answer carries `x-apm-degraded: database-unavailable`.
-
 
 ## Local development
 
