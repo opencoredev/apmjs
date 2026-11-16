@@ -3,7 +3,8 @@
 //  1. Forwarding headers: drop every client-supplied one, so neither the registry nor the search rate
 //     limit trusts an address the client made up.
 //  2. Registry routes: /api/auth/* and /-/apm/v1/* are forwarded to the registry from here, with the
-//     security headers and a private, no-store cache policy on every answer.
+//     security headers and a private, no-store cache policy on every answer. The sign-in options, the same for
+//     everyone, come from the edge cache (lib/auth-config.ts).
 //  3. Package pages and file views: with Cache Components the page shell is sent before the page can look
 //     the package up, so the response status is decided here: a rewrite to an unmatched path for a registry
 //     404 (Next.js renders its not-found page with a 404), and a standalone 503 page when it can't be read. A file
@@ -12,6 +13,7 @@
 //     file, and a package or file known to exist is answered from the edge cache (lib/package-status.ts).
 import { NextResponse, type NextRequest } from "next/server";
 import { markdownApiPath, markdownRoute } from "@/lib/agent/md-route";
+import { cachedAuthConfig } from "@/lib/auth-config";
 import { forwardingHeaders } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
 import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
@@ -38,7 +40,12 @@ export async function proxy(request: NextRequest): Promise<Response> {
   const headers = forwardedHeaders(request);
   const { pathname } = request.nextUrl;
 
-  if (isRegistryPath(pathname)) return forwardToRegistry(request, { registry: REGISTRY, headers, dev: process.env.NODE_ENV === "development" });
+  if (isRegistryPath(pathname)) {
+    const dev = process.env.NODE_ENV === "development";
+
+    return (await cachedAuthConfig(request, { registry: REGISTRY, dev })) ?? forwardToRegistry(request, { registry: REGISTRY, headers, dev });
+  }
+
   // /package/<name>.md and ?format=md: the Markdown view for agents, rendered by app/api/package-md
   const md = request.method === "GET" || request.method === "HEAD" ? markdownRoute(request.nextUrl) : null;
 

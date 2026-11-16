@@ -1,0 +1,16 @@
+diff --git a/dist/cli/build/bundle-server.js b/dist/cli/build/bundle-server.js
+index 7420316008e9651c5a1e41d2edcc3d00b8d023f8..57a2c0303d9313aab7e6c413ed14f7fc6637e959 100644
+--- a/dist/cli/build/bundle-server.js
++++ b/dist/cli/build/bundle-server.js
+@@ -83,6 +83,11 @@ export async function bundleServer(buildOpts, projectOpts) {
+         // Minify code as much as possible but stay safe by not renaming identifiers
+         minifyWhitespace: projectOpts.minify && !debug,
+         minifyIdentifiers: false,
++        // Keep every function's own name. esbuild renames a top-level function whose name another module already
++        // took (Next's AppRouter "io" became "io2"), and React checks component names when it resumes a prerendered
++        // page: a renamed one fails the check, so every streamed part of the page was thrown away and rendered again
++        // in the browser.
++        keepNames: true,
+         minifySyntax: projectOpts.minify && !debug,
+         legalComments: "none",
+         metafile: true,

@@ -19,7 +19,9 @@ export async function buildWorker(entry: "worker" | "worker-test", outDir = join
     plugins: [cloudflareRolldown({ compatibilityDate: COMPATIBILITY_DATE, compatibilityFlags: [...COMPATIBILITY_FLAGS] })],
   });
 
-  await bundle.write({ dir: outDir, format: "esm", entryFileNames: "[name].js", codeSplitting: false, minify: false, sourcemap: false });
+  // minified, a cold isolate has less than half the JavaScript to load; keepNames leaves every function and class its
+  // own name, so error causes in the logs still name what failed
+  await bundle.write({ dir: outDir, format: "esm", entryFileNames: "[name].js", codeSplitting: false, minify: true, keepNames: true, sourcemap: false });
   await bundle.close();
 
   return join(outDir, `${entry}.js`);

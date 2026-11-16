@@ -48,6 +48,37 @@ function forward(path: string, init: RequestInit = {}): Promise<Response> {
 }
 
 describe("forwardToRegistry", () => {
+  test("the account check from a visitor with no cookie is answered here, as the registry would: a private 401", async () => {
+    const before = seen.length;
+    const res = await forward("/-/apm/v1/account");
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "Sign in at https://apm.example/ first." });
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(res.headers.get("vary")).toBe("Authorization, Cookie");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(seen.length).toBe(before);
+  });
+
+  test("an account check with a cookie or a token, and every other account route, still goes to the registry", async () => {
+    const signedIn: RequestInit[] = [{ headers: { cookie: "session=x" } }, { headers: { authorization: "Bearer t" } }, { method: "POST", body: "{}" }, { method: "HEAD" }];
+
+    for (const init of signedIn) {
+      const before = seen.length;
+      const res = await forward("/-/apm/v1/account", init);
+
+      expect(res.status).toBe(200);
+      expect(seen.length).toBe(before + 1);
+    }
+
+    for (const path of ["/-/apm/v1/account/tokens", "/-/apm/v1/staged", "/api/auth/get-session"]) {
+      const before = seen.length;
+      await forward(path);
+
+      expect(seen.length).toBe(before + 1);
+    }
+  });
+
   test("every answer is private, no-store, varies on Cookie and has the security headers", async () => {
     const res = await forward("/-/apm/v1/account", { headers: { cookie: "session=x" } });
 
@@ -118,7 +149,8 @@ describe("forwardToRegistry", () => {
     const url = `http://127.0.0.1:${closed.port}/`;
 
     await closed.stop(true);
-    const res = await forwardToRegistry(new Request("https://apm.example/-/apm/v1/account"), { registry: url, headers: new Headers(), dev: false });
+    const request = new Request("https://apm.example/-/apm/v1/account", { headers: { cookie: "session=x" } });
+    const res = await forwardToRegistry(request, { registry: url, headers: new Headers(request.headers), dev: false });
 
     expect(res.status).toBe(502);
     expect(res.headers.get("cache-control")).toBe("private, no-store");

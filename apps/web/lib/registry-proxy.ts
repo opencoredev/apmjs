@@ -29,8 +29,29 @@ export type ForwardOptions = {
   dev: boolean;
 };
 
+/**
+ * The header's account check (GET /-/apm/v1/account, nothing else) from a visitor with no cookie and no token: the
+ * registry answers it with a 401 before reading anything (packages/registry/src/account.ts, signedIn), so the same
+ * answer is made here and the registry is not woken for every page view. Null for any other request, which goes on to
+ * the registry.
+ */
+export function signedOutAccount(request: Request, dev: boolean): Response | null {
+  const url = new URL(request.url);
+
+  // GET only: the registry answers a HEAD of this route 405 (review of de5c7b7, finding 4), so that goes on to it
+  if (request.method !== "GET" || url.pathname !== "/-/apm/v1/account" || request.headers.has("cookie") || request.headers.has("authorization")) return null;
+  const res = Response.json({ error: `Sign in at ${new URL("/", url).toString()} first.` }, { status: 401 });
+  // what the registry's own answer varies on (packages/registry/src/http.ts); withSiteHeaders adds Cookie
+  res.headers.set("Vary", "Authorization");
+
+  return withSiteHeaders(res, dev);
+}
+
 /** Sends the request on to the registry and returns its answer with this site's headers on it. */
 export async function forwardToRegistry(request: Request, opts: ForwardOptions): Promise<Response> {
+  const signedOut = signedOutAccount(request, opts.dev);
+
+  if (signedOut) return signedOut;
   const url = new URL(request.url);
   const target = new URL(`${url.pathname.slice(1)}${url.search}`, opts.registry);
   const base = new URL(opts.registry);
@@ -78,7 +99,8 @@ export async function forwardToRegistry(request: Request, opts: ForwardOptions):
   return withSiteHeaders(new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out }), opts.dev);
 }
 
-function withSiteHeaders(res: Response, dev: boolean): Response {
+/** `res` with this site's security headers and the private, no-store policy every registry answer here gets. */
+export function withSiteHeaders(res: Response, dev: boolean): Response {
   for (const h of securityHeaders(dev)) res.headers.set(h.key, h.value);
 
   for (const h of PRIVATE_HEADERS) {

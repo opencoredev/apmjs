@@ -144,4 +144,30 @@ describe("the recent feed leaves out the staging smoke check", () => {
     const { events } = z.object({ events: z.array(z.object({ package: z.string() })) }).parse(r.body);
     expect(events.map((e) => e.package)).toEqual(["@alice/real-thing"]);
   });
+
+  test("each row carries its version's state and score as of now: a revoked version is listed as revoked, with the reason", async () => {
+    const bob = await addUser(reg, "bob");
+
+    for (const version of ["1.0.0", "1.0.1"]) expect((await putPublish(reg, bob, { name: "@bob/feed", version, license: "MIT", main: "index.js" })).status).toBeLessThan(300);
+
+    const rv = await getJson(`${reg.url}-/apm/v1/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${bob}` },
+      body: JSON.stringify({ name: "@bob/feed", version: "1.0.0", reason: "leaked a key", password: "correct-horse-battery" }),
+    });
+
+    expect(rv.status).toBe(200);
+
+    const r = await getJson(`${reg.url}-/apm/v1/recent?limit=3`);
+    const Row = z.object({ package: z.string(), version: z.string(), kind: z.string(), reason: z.string().nullable(), status: z.string().nullable(), score: z.number().nullable(), grade: z.string().nullable() });
+    const { events } = z.object({ events: z.array(Row) }).parse(r.body);
+
+    expect(events.map((e) => [e.kind, e.version, e.status, e.reason])).toEqual([
+      ["revoke", "1.0.0", "revoked", "leaked a key"],
+      ["publish", "1.0.1", "active", null],
+      ["publish", "1.0.0", "revoked", null],
+    ]);
+    expect(events[1]?.score).toBeNumber();
+    expect(events[1]?.grade).toBeString();
+  });
 });

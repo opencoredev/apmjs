@@ -1,0 +1,11 @@
+# Header rules for the files Cloudflare's asset layer serves without the Worker (packages/infra/web-build.ts,
+# WEB_ASSETS). The build's files under /_next/static are named by their content, so a browser may keep each one. They
+# get the same security headers every other answer gets from next.config.ts (lib/security-headers.ts, production);
+# lib/static-headers.test.ts keeps the two the same.
+/_next/static/*
+  Cache-Control: public, max-age=31536000, immutable
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)

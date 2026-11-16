@@ -1,0 +1,11 @@
+# Header rules for Cloudflare's asset layer (the docs site is assets only, packages/infra/alchemy.run.ts). Astro names
+# every file under /_astro by its content, so a browser may keep each one instead of asking again on every page. They
+# get the website's security headers (apps/web/lib/security-headers.ts); apps/web/lib/static-headers.test.ts keeps
+# them the same.
+/_astro/*
+  Cache-Control: public, max-age=31536000, immutable
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)

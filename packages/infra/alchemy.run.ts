@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS, WORKER_CPU_MS } from "../registry/scripts/compat.ts";
 import { websiteAgentEnv } from "./web-env.ts";
+import { WEB_ASSETS, WEB_BUILD } from "./web-build.ts";
 
 const PRODUCTION = { registry: "registry.apmjs.dev", web: "apmjs.dev", docs: "docs.apmjs.dev" } as const;
 
@@ -103,7 +104,8 @@ export default Alchemy.Stack(
       // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs. It also makes the
       // registry deploy first: Alchemy starts the website only once the registry has finished (deploy.ts, "Order")
       env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage) },
-      openNext: { buildCommand: "bun run build" },
+      openNext: WEB_BUILD,
+      assets: { runWorkerFirst: WEB_ASSETS.runWorkerFirst === true ? true : [...WEB_ASSETS.runWorkerFirst] },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },
       domain: production ? PRODUCTION.web : undefined,
     });

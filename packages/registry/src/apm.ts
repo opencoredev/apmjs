@@ -1798,9 +1798,10 @@ const searchResponse = (url: URL) =>
   Effect.gen(function* () {
     const upstream = yield* upstreamOrNull;
     const { text, size, from } = searchPaging(url);
-    const local = yield* localSearchObjects(text, compactScore);
     // npm refuses text shorter than two characters, so asking it would only look like an outage
-    const up = upstream && text.trim().length >= 2 ? yield* upstream.search(text.trim(), Math.min(250, from + size)) : null;
+    const upstreamSearch = upstream && text.trim().length >= 2 ? upstream.search(text.trim(), Math.min(250, from + size)) : Effect.succeed(null);
+    // this registry's own packages are read while npm answers, not before it is asked
+    const [local, up] = yield* Effect.all([localSearchObjects(text, compactScore), upstreamSearch], { concurrency: 2 });
 
     // one query for every hit's stored score, not one per hit: they would queue on the request's one connection
     const hits = up?.kind === "ok" ? up.objects : [];

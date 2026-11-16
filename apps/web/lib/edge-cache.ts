@@ -191,5 +191,9 @@ export const POLICIES = {
   fileExists: { freshMs: 10 * 60_000, staleMs: 24 * 60 * 60_000 },
   /** A package's public log. */
   events: { freshMs: 10_000, staleMs: 60_000 },
+  /** The home page's recent activity: the same log across packages, kept as long as one package's. */
+  recent: { freshMs: 10_000, staleMs: 60_000 },
   search: { freshMs: 60_000, staleMs: 5 * 60_000 },
+  /** The sign-in options (GET /-/apm/v1/auth/config): the registry's configuration, which changes with a deploy. */
+  authConfig: { freshMs: 60_000, staleMs: 60 * 60_000 },
 } as const satisfies Record<string, CachePolicy>;

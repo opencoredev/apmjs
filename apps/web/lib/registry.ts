@@ -239,7 +239,7 @@ export async function getTarballReadme(input: { name: string; version: string })
 }
 
 export async function getRecent(limit: number): Promise<Fetched<RecentEvent[]>> {
-  const r = await getJson(`-/apm/v1/recent?limit=${limit}`, Recent);
+  const r = await getJson(`-/apm/v1/recent?limit=${limit}`, Recent, { cache: { policy: POLICIES.recent, keep: () => true } });
 
   return r.kind === "ok" ? { kind: "ok", value: r.value.events } : r;
 }

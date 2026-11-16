@@ -83,14 +83,15 @@ export type FetchJsonOptions<T> = {
 };
 
 /**
- * Registry answers the site may keep: search results, a package's public log and the popular packages' scores (name,
- * version, score, grade). None carries a version's source (file text, excerpts, readmes, review quotes, score
+ * Registry answers the site may keep: search results, a package's public log, the registry's recent activity (the same
+ * log across packages, each row with its version's state and score) and the popular packages' scores (name, version,
+ * score, grade), and the sign-in options (which providers this registry has set up, the same for everyone). None carries a version's source (file text, excerpts, readmes, review quotes, score
  * evidence), so a revoke has nothing to take back from them.
  * Search keeps only answers made of npm's packages (lib/registry.ts): a local package's description changes when one
  * of its versions is revoked. Everything else is read from the registry on every view, and the registry decides then
  * whether it may be shown.
  */
-const SOURCE_FREE: readonly RegExp[] = [/\/-\/v1\/search$/, /\/-\/apm\/v1\/packages\/[^/]+\/events$/, /\/-\/apm\/v1\/popular-scores$/];
+const SOURCE_FREE: readonly RegExp[] = [/\/-\/v1\/search$/, /\/-\/apm\/v1\/packages\/[^/]+\/events$/, /\/-\/apm\/v1\/popular-scores$/, /\/-\/apm\/v1\/recent$/, /\/-\/apm\/v1\/auth\/config$/];
 
 /** Whether `url` names a registry answer that carries no source, so the edge cache may keep it. */
 export function isSourceFree(url: string): boolean {
