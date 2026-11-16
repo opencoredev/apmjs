@@ -379,15 +379,15 @@ const catalog = (name: string) =>
  */
 const catalogListing = (name: string, spec: string) =>
   Effect.gen(function* () {
-    const store = yield* Store;
-    const pkg = yield* store.getPackage(name);
+    // the package row, a local package's versions, or an upstream one's kept row, in one round trip (Store.pageRead)
+    const row = yield* (yield* Store).pageRead({ name, at: yield* (yield* Clock).now, scores: false });
 
-    if (pkg) return { kind: "ok", source: "local", distTags: pkg.distTags, versions: yield* store.listVersions(name) } satisfies Catalog<Listed>;
+    if (row.kind === "local") return { kind: "ok", source: "local", distTags: row.pkg.distTags, versions: row.versions } satisfies Catalog<Listed>;
     const upstream = yield* Effect.serviceOption(Upstream);
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog<Listed>;
 
-    return upstreamCatalog(yield* pageListing({ upstream: upstream.value, name, need: { kind: "spec", spec }, lease: yield* RequestMemory }));
+    return upstreamCatalog(yield* pageListing({ upstream: upstream.value, name, need: { kind: "spec", spec }, lease: yield* RequestMemory, first: { kind: "read", kept: row.kept, analyses: row.analyses } }));
   });
 
 type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string };

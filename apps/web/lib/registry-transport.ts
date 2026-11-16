@@ -24,6 +24,19 @@ function binding(): RegistryBinding | null {
   return registry !== undefined && ServiceBinding.safeParse(registry).success ? registry : null;
 }
 
+/**
+ * An object that lives exactly as long as this request inside the website Worker (OpenNext's per-request context),
+ * else null. Only for keeping a read within one request: it is never shared with another.
+ */
+export function requestScope(): object | null {
+  try {
+    return getCloudflareContext();
+  } catch {
+    // not on Cloudflare: no request context
+    return null;
+  }
+}
+
 /** fetch() for registry URLs. The URL's path and query reach the registry Worker unchanged either way. */
 export function registryFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
   const service = binding();

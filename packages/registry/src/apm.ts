@@ -231,19 +231,24 @@ const briefly = <A, E, R>(use: (lease: Lease) => Effect.Effect<A, E, R>) =>
  * A package's catalog for a page's read of `need`, here or upstream. An upstream one comes from its kept summary when
  * that answers `need` (kept-package.ts), else from npm's packument, read under `lease` (memory.ts) and held until it
  * closes; null when npm has no such package or could not be asked. A package published on apm is read from its rows.
+ * `maintainers` is who the page names: the owners of a package published here, npm's maintainers of one upstream.
+ *
+ * The package row, a local package's versions and owners, and an upstream package's kept row and scores come in one
+ * round trip (Store.pageRead) instead of four in a row, and each version's state is the one at the registry's time now.
  */
 const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
   Effect.gen(function* () {
-    const pkg = yield* (yield* Store).getPackage(name);
+    const at = yield* now;
+    const row = yield* (yield* Store).pageRead({ name, at, scores: true });
 
-    if (pkg) return localSource(pkg, yield* versionsOf(name));
+    if (row.kind === "local") return { src: localSource(row.pkg, row.versions.map((v) => atTime(v, at))), maintainers: row.owners };
 
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* pageProbe({ upstream, name, need, lease });
+    const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses } });
 
-    return probe.kind === "found" ? upstreamSource(probe.pkg) : null;
+    return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
   });
 
 /** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
@@ -1342,12 +1347,12 @@ const pageRefused = (name: string): Response =>
  */
 const packageResponse = (name: string) =>
   Effect.gen(function* () {
-    const store = yield* Store;
     const at = yield* now;
     const lease = yield* RequestMemory;
-    const src = yield* pageLookup(name, lease, { kind: "page" });
+    const found = yield* pageLookup(name, lease, { kind: "page" });
 
-    if (!src) return fail(404, "Not found");
+    if (!found) return fail(404, "Not found");
+    const { src, maintainers } = found;
 
     // the sorted copy of the version list and the rows shown, charged before they are made
     if (!lease.take(src.versions.length * PAGE_LISTED_WEIGHT + Math.min(PAGE_VERSIONS, src.versions.length) * PAGE_SHOWN_WEIGHT)) return pageRefused(name);
@@ -1368,7 +1373,7 @@ const packageResponse = (name: string) =>
       repository: repositoryOf(latest0),
       ...linksOf(latest0),
       distTags: src.distTags,
-      maintainers: src.kind === "local" ? yield* store.owners(name) : src.pkg.maintainers,
+      maintainers,
       createdAt: local ? new Date(local.created_at).toISOString() : null,
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
@@ -1440,7 +1445,7 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = yield* pageLookup(name, yield* RequestMemory, { kind: "version", version });
+    const src = (yield* pageLookup(name, yield* RequestMemory, { kind: "version", version }))?.src;
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
@@ -3667,7 +3672,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(`/${rest.slice("score/".length)}`);
 
       if (!sp) return fail(404, "Not found");
-      const src = yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] });
+      const src = (yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] }))?.src;
 
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];

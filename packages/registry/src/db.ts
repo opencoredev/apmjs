@@ -306,6 +306,24 @@ export type AnalysisStart = ({ kind: "started" } & RunHistory) | { kind: "runnin
 /** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
 export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, Unscorable> };
 
+/** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
+const AnalysesColumns = {
+  analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
+  dismissals: z.array(DismissalRow),
+  unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
+};
+
+const AnalysesRow = z.object(AnalysesColumns);
+
+/** Store.pageRead's one row: the local columns, empty unless `pkg` is there, and the upstream ones, empty unless it is not. */
+const PageReadRow = z.object({ pkg: PackageOut.nullable(), versions: z.array(VersionRow), owners: z.array(z.string()), kept: KeptPackageRow.nullable(), ...AnalysesColumns });
+
+/**
+ * What Store.pageRead found: a package published here with its versions (each with its dismissals left out, as
+ * listVersions has them) and owners, or an upstream package's kept summary (null when none is kept) and its scores.
+ */
+export type PageRow = { kind: "local"; pkg: PackageRecord; versions: VersionRecord[]; owners: string[] } | { kind: "upstream"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses };
+
 export type Advisory = z.infer<typeof AdvisoryRow>;
 
 export type StagedRecord = z.infer<typeof StagedRow>;
@@ -525,6 +543,12 @@ export type StoreApi = {
    */
   readonly keptPackage: (input: { name: string; at: number }) => Effect.Effect<KeptPackageRow | null, StoreError>;
   /**
+   * What a package page's read starts from, in one round trip: getPackage, then for a package published here
+   * listVersions and owners, else keptPackage (marking it asked about the same way) and, when `scores`, upstreamAnalyses
+   * (none otherwise). One statement, so one snapshot: nothing it returns is older than the statement.
+   */
+  readonly pageRead: (input: { name: string; at: number; scores: boolean }) => Effect.Effect<PageRow, StoreError>;
+  /**
    * Keeps a summary worked out at `at` for a name asked about at `at`. A kept one is replaced; a new row is added only
    * while the table holds fewer than `capacity`. Which names may have a row is the caller's call (kept-package.ts).
    */
@@ -536,8 +560,11 @@ export type StoreApi = {
    * `claimedBefore`. The summary's npm ETag when this caller should refresh it; null when it should not.
    */
   readonly claimKeptRefresh: (input: { name: string; at: number; computedBefore: number; claimedBefore: number }) => Effect.Effect<{ etag: string | null } | null, StoreError>;
-  /** Marks a kept summary worked out at `at` as it is: npm still sends the packument it was cut from. */
-  readonly touchKeptPackage: (input: { name: string; at: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * Marks a kept summary worked out at `at` as it is: npm still sends the packument it was cut from, the one with
+   * `etag`. Only that summary, and only forward: a summary replaced since, or one worked out later, is left alone.
+   */
+  readonly touchKeptPackage: (input: { name: string; at: number; etag: string }) => Effect.Effect<void, StoreError>;
   /**
    * Kept summaries asked about at or after `askedSince`, worked out before `computedBefore` and due again at `at` (no
    * failed refresh holds them back), oldest first.
@@ -759,13 +786,19 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       ? Effect.succeed([])
       : run("dismissalsOf", sql`SELECT * FROM evidence_dismissals WHERE package = ANY(${names}) AND restored_at IS NULL ORDER BY dismissed_at, id`, all(DismissalRow));
 
+  /** `rows` as they are scored, given the live dismissals of their packages: what was dismissed for exactly these bytes is left out. */
+  const dismissedFrom = (rows: VersionRecord[], ds: readonly DismissalRecord[]): VersionRecord[] =>
+    ds.length === 0 ? rows : rows.map((v) => ({ ...v, score: withList(v.score, dismissalsFor(ds.filter((d) => d.package === v.package), v.version, versionDigest(v))) }));
+
   /** Versions as they are scored: what an apm reviewer dismissed for exactly these bytes is left out. */
   const withDismissals = (rows: VersionRecord[]): Effect.Effect<VersionRecord[], StoreError> =>
-    rows.length === 0
-      ? Effect.succeed(rows)
-      : Effect.map(dismissalsOf([...new Set(rows.map((v) => v.package))]), (ds) =>
-          ds.length === 0 ? rows : rows.map((v) => ({ ...v, score: withList(v.score, dismissalsFor(ds.filter((d) => d.package === v.package), v.version, versionDigest(v))) })),
-        );
+    rows.length === 0 ? Effect.succeed(rows) : Effect.map(dismissalsOf([...new Set(rows.map((v) => v.package))]), (ds) => dismissedFrom(rows, ds));
+
+  /** An upstream package's scores keyed by "<version> <digest>", each with its dismissed evidence left out, and what it cannot score. */
+  const analysesOf = (analyses: z.output<typeof AnalysesRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof AnalysesRow>["unscorable"]): UpstreamAnalyses => ({
+    scores: new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))])),
+    unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "" }] as const)),
+  });
 
   const insertStaged = (s: NewStaged) =>
     run(
@@ -1147,22 +1180,44 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
                    FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
                 (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
                    FROM analysis_outcomes o WHERE o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS unscorable`,
-          one(
-            z.object({
-              analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
-              dismissals: z.array(DismissalRow),
-              unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
-            }),
-          ),
+          one(AnalysesRow),
         );
 
-        const analyses = row?.analyses ?? [];
-        const dismissals = row?.dismissals ?? [];
+        return analysesOf(row?.analyses ?? [], row?.dismissals ?? [], row?.unscorable ?? []);
+      }),
+    // getPackage, listVersions and owners, or keptPackage and upstreamAnalyses, as one statement: a package page's
+    // answer waited on four round trips in a row before (each about 75 ms from production's Workers to Neon). The
+    // local columns are read only when the package row is there, the upstream ones only when it is not, and the kept
+    // row's asked-about mark is written as keptPackage writes it. Rows travel as jsonb (to_jsonb keeps every column;
+    // an int8 arrives as a JSON number, which Int reads as the driver's bigint).
+    pageRead: ({ name, at, scores }) =>
+      Effect.gen(function* () {
+        const row = yield* run(
+          "pageRead",
+          sql`WITH asked AS (
+                UPDATE kept_packages SET asked_at = ${at} WHERE package = ${name} AND asked_at < ${at - LATEST_SCORE_ASKED_MARK_MS}
+              ),
+              p AS (SELECT * FROM packages WHERE name = ${name})
+              SELECT
+                (SELECT to_jsonb(p) FROM p) AS pkg,
+                (SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY v.published_at, v.seq), '[]'::jsonb)
+                   FROM versions v WHERE v.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS versions,
+                (SELECT coalesce(jsonb_agg(o."user" ORDER BY o."user"), '[]'::jsonb)
+                   FROM owners o WHERE o.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS owners,
+                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
+                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
+                (SELECT jsonb_build_object('summary', k.summary, 'computed_at', k.computed_at)
+                   FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE ${scores} AND u.package = ${name} AND u.scorer = ${SCORER} AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE ${scores} AND o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable`,
+          z.tuple([PageReadRow]).transform(([r]) => r),
+        );
 
-        return {
-          scores: new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))])),
-          unscorable: new Map((row?.unscorable ?? []).map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "" }] as const)),
-        };
+        if (row.pkg !== null) return { kind: "local", pkg: row.pkg, versions: dismissedFrom(row.versions, row.dismissals), owners: row.owners } satisfies PageRow;
+
+        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable) } satisfies PageRow;
       }),
     latestScores: ({ names, at }) =>
       run(
@@ -1270,8 +1325,13 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
             RETURNING summary->>'etag' AS etag`,
         one(z.object({ etag: z.string().nullable() })),
       ),
-    touchKeptPackage: ({ name, at }) =>
-      run("touchKeptPackage", sql`UPDATE kept_packages SET computed_at = ${at}, failures = 0, next_attempt_at = NULL WHERE package = ${name}`, none),
+    touchKeptPackage: ({ name, at, etag }) =>
+      run(
+        "touchKeptPackage",
+        sql`UPDATE kept_packages SET computed_at = ${at}, failures = 0, next_attempt_at = NULL
+             WHERE package = ${name} AND summary->>'etag' = ${etag} AND computed_at < ${at}`,
+        none,
+      ),
     failKeptRefresh: ({ name, at, retryMs, maxRetryMs }) =>
       run(
         "failKeptRefresh",

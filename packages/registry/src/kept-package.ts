@@ -14,6 +14,9 @@
 //    GET with If-None-Match, the one validation resolve's kept choices use too: Upstream.listingIfChanged) and used
 //    only when npm still sends the packument it was cut from. When it changed, npm's answer to that same request is
 //    the packument, and the read is answered from it: npm is asked once, not for an ETag and then for the packument.
+//    When it did not, the summary is marked worked out now after the response (KeptRefresh.touch), so the answer
+//    does not also wait on that write.
+//  - A page's read gets its kept row with the package row and the scores, in one statement (Store.pageRead, PageFirst).
 //  - Every read that shows a version's source or offers it (its score's evidence, its files and readme, the review)
 //    first asks npm for that version's document (a few KiB, kept for the TTL) and goes on from the summary only when
 //    npm still lists the version with the same checksums. A version npm removed is never shown from a summary.
@@ -29,7 +32,7 @@ import { Cause, Context, Effect, Exit, Option } from "effect";
 import semver from "semver";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
-import { Store, type VersionRecord } from "./db.ts";
+import { Store, type KeptPackageRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import { digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
@@ -251,13 +254,27 @@ export function covers(kept: KeptPackage, need: PageNeed): boolean {
 }
 
 /** A kept row as a summary; null when there is none, or what is stored does not parse (it is then worked out again). */
-const keptRow = (name: string, at: number) =>
-  Effect.map(Effect.flatMap(Store, (s) => s.keptPackage({ name, at })), (row) => {
-    if (row === null) return null;
-    const parsed = KeptPackage.safeParse(row.summary);
+function parseKept(name: string, row: KeptPackageRow | null): Kept | null {
+  if (row === null) return null;
+  const parsed = KeptPackage.safeParse(row.summary);
 
-    return parsed.success && parsed.data.name === name ? { kept: parsed.data, computedAt: row.computedAt } : null;
-  });
+  return parsed.success && parsed.data.name === name ? { kept: parsed.data, computedAt: row.computedAt } : null;
+}
+
+/** keptPackage's row for `name`, as a summary (parseKept). */
+const keptRow = (name: string, at: number) => Effect.map(Effect.flatMap(Store, (s) => s.keptPackage({ name, at })), (row) => parseKept(name, row));
+
+/**
+ * What a page read has of an upstream package before it looks at its summary: "read" when its kept row (null: none)
+ * and its scores came with the package row (Store.pageRead, one round trip), "unread" when this file reads them.
+ */
+export type PageFirst = { kind: "read"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses } | { kind: "unread" };
+
+/** The kept row `first` brought, or keptRow's. */
+const firstRow = (name: string, at: number, first: PageFirst) => (first.kind === "read" ? Effect.succeed(parseKept(name, first.kept)) : keptRow(name, at));
+
+/** The scores `first` brought, or upstreamAnalyses'. */
+const firstAnalyses = (name: string, first: PageFirst) => (first.kind === "read" ? Effect.succeed(first.analyses) : Effect.flatMap(Store, (s) => s.upstreamAnalyses(name)));
 
 /** What a request holds of an expanded summary: each version's record and its scored copy. */
 const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECORD_WEIGHT + SCORED_WEIGHT);
@@ -276,11 +293,32 @@ const keepScored = (pkg: SummarySource, scored: boolean, at: number) =>
 
 type Kept = { kept: KeptPackage; computedAt: number };
 
+/** What marks a summary worked out at `at`: npm said the packument with this ETag is still the one it was cut from. */
+export type KeptTouch = { name: string; at: number; etag: string };
+
 /**
- * Works a kept summary out again after the response, on its own connection and memory lease (worker.ts). Absent
- * outside a Worker request (the sweep, the queue, unit tests): their summaries wait for the sweep.
+ * Work on kept summaries after the response, on its own connection and memory lease (worker.ts): `later` works one out
+ * again, `touch` marks one worked out now (Store.touchKeptPackage) once npm said it had not changed, so the answer
+ * that asked npm does not also wait on that write. Absent outside a Worker request (the sweep, the queue, unit
+ * tests): their summaries wait for the sweep, and a touch is written in place.
  */
-export class KeptRefresh extends Context.Service<KeptRefresh, { readonly later: (name: string) => Effect.Effect<void> }>()("@apm/registry/KeptRefresh") {}
+export class KeptRefresh extends Context.Service<
+  KeptRefresh,
+  { readonly later: (name: string) => Effect.Effect<void>; readonly touch: (input: KeptTouch) => Effect.Effect<void> }
+>()("@apm/registry/KeptRefresh") {}
+
+/**
+ * Marks a summary worked out now, after the response when a request can (KeptRefresh), else in place. A later write is
+ * harmless: until it lands, another view checks npm again, and the write only moves that summary's time forward.
+ */
+const touchSoon = (input: KeptTouch) =>
+  Effect.gen(function* () {
+    const refresh = yield* Effect.serviceOption(KeptRefresh);
+
+    if (Option.isSome(refresh)) return yield* refresh.value.touch(input);
+
+    yield* (yield* Store).touchKeptPackage(input);
+  });
 
 /** When this isolate last handed each name to KeptRefresh, so a burst of views of one package starts one refresh. */
 const handedOff = new Map<string, number>();
@@ -319,11 +357,11 @@ type Fetched = UpstreamListing;
  */
 type Current = { kind: "current"; row: Kept } | { kind: "stale"; fetched: Fetched | null } | { kind: "none" };
 
-const currentRow = (input: { upstream: UpstreamApi; name: string; at: number; lease: Lease }) =>
+const currentRow = (input: { upstream: UpstreamApi; name: string; at: number; lease: Lease; first: PageFirst }) =>
   Effect.gen(function* () {
     const { upstream, name, at } = input;
     const store = yield* Store;
-    const row = yield* keptRow(name, at);
+    const row = yield* firstRow(name, at, input.first);
 
     if (row === null) return { kind: "none" } satisfies Current;
 
@@ -347,7 +385,8 @@ const currentRow = (input: { upstream: UpstreamApi; name: string; at: number; le
     // as unchanged without asking npm, so a package page's npm metadata may be up to the isolate cache's TTL (60 s)
     // older than KEPT_PACKAGE_FRESH_MS; every read that shows a version's source still confirms it (stillListed).
     if (same) {
-      yield* store.touchKeptPackage({ name, at });
+      // npm's metadata only: apm's scores, dismissals and version states are read live either way
+      yield* touchSoon({ name, at, etag });
 
       return { kind: "current", row: { kept: row.kept, computedAt: at } } satisfies Current;
     }
@@ -405,10 +444,11 @@ type KeptAnswer = { kept: KeptPackage | null; hadRow: boolean; fetched: Fetched 
  * naming the exact versions it would show, and with npm still listing each of them as the summary has it. A null
  * summary sends the read to npm's packument.
  */
-const keptFor = (upstream: UpstreamApi, name: string, need: PageNeed, lease: Lease) =>
+const keptFor = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease; first: PageFirst }) =>
   Effect.gen(function* () {
+    const { upstream, name, need, lease, first } = input;
     const at = yield* (yield* Clock).now;
-    const current = yield* currentRow({ upstream, name, at, lease });
+    const current = yield* currentRow({ upstream, name, at, lease, first });
 
     if (current.kind === "none") return { kept: null, hadRow: false, fetched: null } satisfies KeptAnswer;
 
@@ -440,19 +480,22 @@ const refreshFrom = (pkg: SummarySource) =>
  * An upstream package for a page's read, with its scores: from the kept summary when keptFor allows it, else from
  * npm (Upstream.probe) as before summaries were kept, whose answer is then kept.
  */
-export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease }): Effect.Effect<Probe, StoreError, Store | Clock> =>
+export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease; first: PageFirst }): Effect.Effect<Probe, StoreError, Store | Clock> =>
   Effect.gen(function* () {
-    const { upstream, name, need, lease } = input;
+    const { upstream, name, lease, first } = input;
     const store = yield* Store;
-    const { kept, fetched } = yield* keptFor(upstream, name, need, lease);
+    const { kept, fetched } = yield* keptFor(input);
 
+    // the scores read with the row (pageRead) or now: either way after the request began, so a score or a dismissal
+    // committed before it is in them
     if (kept !== null) {
       if (!lease.take(expandWeight(kept))) return { kind: "unknown" } satisfies Probe;
 
-      return scoredPackage(expand(kept), yield* store.upstreamAnalyses(name));
+      return scoredPackage(expand(kept), yield* firstAnalyses(name, first));
     }
 
-    // what the row's check already read from npm is the answer: npm is not asked again
+    // npm's packument was read instead, which can take seconds: the scores are read again after it, as before
+    // summaries were kept. What the row's check already read from npm is the answer: npm is not asked again
     const probe: Probe = fetched === null ? yield* upstream.probe(name, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* store.upstreamAnalyses(name)) : fetched;
 
     // a kept row is replaced with what npm sent (keepScored replaces as well as adds)
@@ -464,14 +507,14 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
   });
 
 /** Like pageProbe, without the scores (the review answer reads none): the kept summary, else Upstream.listing. */
-export const pageListing = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease }): Effect.Effect<UpstreamListing, StoreError, Store | Clock> =>
+export const pageListing = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease; first: PageFirst }): Effect.Effect<UpstreamListing, StoreError, Store | Clock> =>
   Effect.gen(function* () {
-    const { upstream, name, need, lease } = input;
-    const { kept, hadRow, fetched } = yield* keptFor(upstream, name, need, lease);
+    const { name, lease } = input;
+    const { kept, hadRow, fetched } = yield* keptFor(input);
 
     if (kept !== null) return lease.take(expandWeight(kept)) ? { kind: "found", pkg: expand(kept) } : { kind: "unknown" };
     // what the row's check already read from npm is the answer: npm is not asked again
-    const listed: UpstreamListing = fetched ?? (yield* upstream.listing(name, lease));
+    const listed: UpstreamListing = fetched ?? (yield* input.upstream.listing(name, lease));
 
     yield* afterListing(name, listed, hadRow);
 
@@ -503,7 +546,7 @@ export const pageExists = (input: { upstream: UpstreamApi; name: string; lease: 
     const { upstream, name, lease } = input;
     const at = yield* (yield* Clock).now;
 
-    const current = yield* currentRow({ upstream, name, at, lease });
+    const current = yield* currentRow({ upstream, name, at, lease, first: { kind: "unread" } });
 
     if (current.kind === "current") return "found";
     const listed: UpstreamListing = (current.kind === "stale" ? current.fetched : null) ?? (yield* upstream.listing(name, lease));
@@ -544,9 +587,10 @@ export const refreshKeptPackage = (name: string): Effect.Effect<boolean, StoreEr
       Effect.map((l) => {
         switch (l.kind) {
           case "not-modified":
-            return { kind: "same" as const };
+            // npm answers 304 only to the ETag it was sent, so there is one here
+            return etag === null ? { kind: "unknown" as const } : { kind: "same" as const, etag };
           case "found":
-            return etag !== null && l.pkg.etag === etag ? { kind: "same" as const } : { kind: "found" as const, summary: summarize(l.pkg) };
+            return etag !== null && l.pkg.etag === etag ? { kind: "same" as const, etag } : { kind: "found" as const, summary: summarize(l.pkg) };
           case "over-budget":
             return { kind: "unknown" as const };
           case "absent":
@@ -564,7 +608,7 @@ export const refreshKeptPackage = (name: string): Effect.Effect<boolean, StoreEr
 
     switch (listed.kind) {
       case "same":
-        yield* store.touchKeptPackage({ name, at });
+        yield* store.touchKeptPackage({ name, at, etag: listed.etag });
 
         return true;
       case "found":

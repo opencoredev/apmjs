@@ -90,7 +90,7 @@ const findVersion = (name: string, version: string) =>
 
     if (Option.isNone(upstream)) return null;
     // the kept summary names the version's tarball and checksum when it holds the version (kept-package.ts)
-    const probe = yield* pageProbe({ upstream: upstream.value, name, need: { kind: "version", version }, lease: yield* RequestMemory });
+    const probe = yield* pageProbe({ upstream: upstream.value, name, need: { kind: "version", version }, lease: yield* RequestMemory, first: { kind: "unread" } });
 
     switch (probe.kind) {
       case "found": {

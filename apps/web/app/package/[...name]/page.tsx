@@ -1,4 +1,5 @@
 import { notFound } from "next/navigation";
+import { connection } from "next/server";
 import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -504,24 +505,74 @@ export async function generateMetadata({ params }: Pick<PageProps, "params">): P
   return packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
 }
 
+/** The page's columns while the package answer is read: the install box, the score and the facts. */
+function BodySkeleton() {
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-12 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div className="flex flex-col gap-10">
+        <Skeleton className="h-28 w-full rounded-xl" />
+        <Skeleton className="h-72 w-full rounded-2xl" />
+      </div>
+      <Skeleton className="h-80 w-full rounded-xl" />
+    </div>
+  );
+}
+
+/** The package name as the page's heading: the loading state and the page show the same one. */
+function PackageName({ name }: { name: string }) {
+  return <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{name}</h1>;
+}
+
+/**
+ * The page while the package answer is read, once the URL has said which package it is: its name, which needs no
+ * read, and the rest as placeholders. Nothing here comes from the registry, so nothing here can be stale.
+ */
+function PackageLoading({ name }: { name: string }) {
+  return (
+    <div className="flex flex-col gap-10 sm:gap-12" aria-busy="true" aria-label={`Loading ${name}`}>
+      <header className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <PackageName name={name} />
+          <Skeleton className="h-8 w-20 rounded-full" />
+          <Skeleton className="h-8 w-16 rounded-full" />
+        </div>
+        <Skeleton className="h-6 w-[28rem] max-w-full" />
+      </header>
+      <BodySkeleton />
+    </div>
+  );
+}
+
 export default function PackagePage({ params, searchParams }: PageProps) {
   return (
+    // the prerendered shell: the URL is not known yet
     <Suspense
       fallback={
         <div className="flex flex-col gap-4" aria-busy="true" aria-label="Loading package">
           <Skeleton className="h-10 w-72 max-w-full" />
           <Skeleton className="h-5 w-[28rem] max-w-full" />
-          <div className="mt-8 grid grid-cols-[minmax(0,1fr)] gap-12 lg:grid-cols-[minmax(0,1fr)_320px]">
-            <div className="flex flex-col gap-10">
-              <Skeleton className="h-28 w-full rounded-xl" />
-              <Skeleton className="h-72 w-full rounded-2xl" />
-            </div>
-            <Skeleton className="h-80 w-full rounded-xl" />
+          <div className="mt-8">
+            <BodySkeleton />
           </div>
         </div>
       }
     >
-      <PackageContent params={params} searchParams={searchParams} />
+      <PackageRoute params={params} searchParams={searchParams} />
+    </Suspense>
+  );
+}
+
+/** The package or file the URL names. A package shows its name at once and its content once the registry answers. */
+async function PackageRoute({ params, searchParams }: PageProps) {
+  const route = parsePackageRoute((await params).name);
+
+  if (!route) notFound();
+
+  if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
+
+  return (
+    <Suspense fallback={<PackageLoading name={route.name} />}>
+      <PackageContent name={route.name} searchParams={searchParams} />
     </Suspense>
   );
 }
@@ -631,14 +682,12 @@ async function PublicLog({ events }: { events: Promise<Fetched<PackageEvent[]>> 
   );
 }
 
-async function PackageContent({ params, searchParams }: PageProps) {
-  const route = parsePackageRoute((await params).name);
-
-  if (!route) notFound();
-
-  if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
-  const name = route.name;
+async function PackageContent({ name, searchParams }: { name: string; searchParams: PageProps["searchParams"] }) {
   const query = await searchParams;
+  // The reads below run at request time only: the edge cache and the version list read the clock (Date.now), which
+  // Cache Components refuses before the request's dynamic stage. Without this, every view hit that refusal, rendered
+  // the page twice (each registry read made twice) and streamed nothing until the slowest read, the AI review, was in.
+  await connection();
   const asked = askedVersion(query.v);
   // started together, before the package answer says which version is shown (lib/package-reads.ts)
   const reads = startPackageReads({ name, asked });
@@ -693,7 +742,7 @@ async function PackageContent({ params, searchParams }: PageProps) {
       <JsonLd data={structured} />
       <header className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <h1 className="font-mono text-[28px] leading-tight font-medium tracking-tight break-all sm:text-4xl">{pkg.name}</h1>
+          <PackageName name={pkg.name} />
           {version && <span className="inline-flex h-8 items-center rounded-full bg-surface px-3 font-mono text-sm text-muted-foreground">{version}</span>}
           <ScoreBadge score={score?.score} grade={score?.grade} unscorable={unscorable} className="h-8" />
           <Suspense fallback={null}>

@@ -6,6 +6,7 @@ import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath,
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
 import { fetchCachedJson, fetchJson, FILE_TIMEOUT_MS, logUnavailable, type Fetched, type FetchJsonOptions } from "./registry-fetch";
+import { requestScope } from "./registry-transport";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
 import { RepositoryField } from "./repository";
@@ -161,11 +162,26 @@ async function getJson<T>(
   return result;
 }
 
+/** The package answers this request read, by name (requestScope): React's cache is not shared between a page and its metadata. */
+const packageReads = new WeakMap<object, Map<string, Promise<Fetched<PackageInfo>>>>();
+
 /**
  * A package's answer, with its readme and its latest score's evidence: read from the registry on every view, and
- * shared within one request only (React cache), so the page and its metadata read it once.
+ * shared within one request only, so the page and its metadata read it once. In the website Worker the request's own
+ * context holds it (Next.js renders generateMetadata apart from the page, so React's cache alone read it twice); under
+ * `next dev` and in tests, React's cache does.
  */
-export const getPackage = cache((name: string): Promise<Fetched<PackageInfo>> => getJson(packageApiPath(name), PackageInfo));
+export const getPackage = cache((name: string): Promise<Fetched<PackageInfo>> => {
+  const scope = requestScope();
+
+  if (scope === null) return getJson(packageApiPath(name), PackageInfo);
+  const reads = packageReads.get(scope) ?? new Map<string, Promise<Fetched<PackageInfo>>>();
+  packageReads.set(scope, reads);
+  const read = reads.get(name) ?? getJson(packageApiPath(name), PackageInfo);
+  reads.set(name, read);
+
+  return read;
+});
 
 export async function getEvents(name: string): Promise<Fetched<PackageEvent[]>> {
   const r = await getJson(`-/apm/v1/packages/${encodeName(name)}/events`, Events, { cache: { policy: POLICIES.events, keep: () => true } });

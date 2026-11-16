@@ -246,6 +246,15 @@ function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
             }),
           ),
         ),
+      // one UPDATE on a connection of its own: the answer npm's 304 let through does not wait on it
+      touch: (input) =>
+        Effect.sync(() =>
+          background(
+            Effect.runPromiseExit(Effect.flatMap(Store, (s) => s.touchKeptPackage(input)).pipe(Effect.provide(Store.postgres(env.HYPERDRIVE.connectionString)), Effect.scoped)).then((exit) => {
+              if (Exit.isFailure(exit)) logFailure("kept-package-touch", { name: input.name }, Cause.pretty(exit.cause));
+            }),
+          ),
+        ),
     }),
   );
 }
