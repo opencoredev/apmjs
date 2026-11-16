@@ -85,6 +85,7 @@ import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
+import type { Choice, Chosen } from "./kept-choices.ts";
 import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
 import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
@@ -398,24 +399,33 @@ function settleLocal(input: { pkg: PackageTags; picked: readonly string[]; rows:
 const localWithin = (pkg: PackageTags, lease: Lease, select: Select) => Effect.map(localsWithin([{ name: pkg.name, select }], lease), (m) => m.get(pkg.name) ?? null);
 
 /**
- * A package summarized (walk-catalog.ts), keeping only the versions `select` picks from it: its packument is held
- * only while it is read, and the summary stays taken from `lease`. A local package's picked versions are read whole
- * and charged the same way (localWithin). "over-budget" when it did not fit `lease`.
+ * Which versions a reader keeps of a package, named: `key` says everything `select` reads beside the package (a root's
+ * range and page, a version asked for), so npm's choice can be kept for the packument it was made of (kept-choices.ts).
  */
-const catalogWithin = (name: string, lease: Lease, select: Select) =>
+type KeyedSelect = { key: string; select: Select };
+
+/**
+ * A package summarized (walk-catalog.ts), keeping only the versions `select` picks from it: its packument is held
+ * only while it is read, and the summary stays taken from `lease`. An upstream package's pick is kept under its key
+ * and answered from there while npm says the packument has not changed (Upstream.chosen). A local package's picked
+ * versions are read whole and charged the same way (localWithin). "over-budget" when it did not fit `lease`.
+ */
+const catalogWithin = (name: string, lease: Lease, choice: KeyedSelect) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
-    if (pkg) return (yield* localWithin(pkg, lease, select)) ?? ("over-budget" as const);
+    if (pkg) return (yield* localWithin(pkg, lease, choice.select)) ?? ("over-budget" as const);
 
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
+    const choices: readonly Choice[] = [{ key: choice.key, choose: (up) => choice.select({ distTags: up.distTags, versions: [...up.versions] }) }];
 
-    const got = yield* upstream.summaries([name], lease, (up, reserve) => {
-      const full = upstreamSource(up);
-
-      return keptSummary({ kind: full.kind, name: full.name, distTags: full.distTags, versions: select(full) }, reserve);
+    const got = yield* upstream.chosen({
+      names: [name],
+      lease,
+      choices: () => choices,
+      keep: (c, reserve) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(choice.key) ?? [])] }, reserve),
     });
 
     return lookupOf(got.get(name));
@@ -611,24 +621,42 @@ const localPicks = (input: { byName: ReadonlyMap<string, readonly RegistryDepend
   });
 
 /**
- * Each pick of `deps` (all of one package) from npm's catalog, keeping of it only the version each picks: none of it
- * refers to `full`, so the packument it came from can be let go. Each kept version is reserved from `reserve` before
- * it is cut down (walk-catalog.ts, keptVersion), and what stays taken is the summary's weight. null, with nothing
- * taken, when they do not fit.
+ * The key a dependency's pick is kept under (kept-choices.ts): its range or tag, which is all pickVersion reads beside
+ * the package. `keep` is not in it: every upstream version is active (cachedPackage), so the walk's `keep`, which lets
+ * through active versions and the project's pins, never changes an upstream pick.
  */
-function upstreamPicks(full: Catalog, deps: readonly RegistryDependency[], keep: (v: Keepable) => boolean, reserve: Reserve): Summary<Map<string, Picked>> | null {
+const choiceKey = (dep: RegistryDependency): string => (dep.kind === "tag" ? `tag ${dep.tag}` : `range ${dep.range}`);
+
+/** The choice of a dependency's version upstream: the newest in its range or tag that `keep` allows, or none. */
+const dependencyChoice = (dep: RegistryDependency, keep: (v: Keepable) => boolean): Choice => ({
+  key: choiceKey(dep),
+  choose: (pkg) => {
+    const v = pickVersion({ distTags: pkg.distTags, versions: pkg.versions, dep, keep });
+
+    return v ? [v] : [];
+  },
+});
+
+/**
+ * Each pick of `deps` (all of one package) from what npm's catalog chose for them (dependencyChoice), keeping only
+ * the version each picks: none of it refers to the package, so the packument it came from can be let go. Each kept
+ * version is reserved from `reserve` before it is cut down (walk-catalog.ts, keptVersion), and what stays taken is the
+ * summary's weight. null, with nothing taken, when they do not fit.
+ */
+function upstreamPicks(c: Chosen, deps: readonly RegistryDependency[], reserve: Reserve): Summary<Map<string, Picked>> | null {
   const picks = new Map<string, Picked>();
+  const full: Catalog = { kind: "upstream", name: c.name, distTags: c.distTags, versions: [] };
   let weight = 0;
 
   for (const dep of deps) {
-    const p = pickFrom(full, dep, keep);
+    const v = c.versions.get(choiceKey(dep))?.[0];
 
-    if (p.kind !== "found") {
-      picks.set(pickKey(dep), p);
+    if (v === undefined) {
+      picks.set(pickKey(dep), missing(`no installable version matches ${describeDependency(dep)}`));
       continue;
     }
 
-    const one = keptVersion(p.v, reserve);
+    const one = keptVersion(v, reserve);
 
     if (one === null) {
       reserve.give(weight);
@@ -674,7 +702,10 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean) {
       const upstream = yield* upstreamOrNull;
 
       if (rest.length === 0) return;
-      const got = upstream ? yield* upstream.summaries<Map<string, Picked>>(rest, lease, (up, reserve) => upstreamPicks(upstreamSource(up), byName.get(up.name) ?? [], keep, reserve)) : null;
+
+      const got = upstream
+        ? yield* upstream.chosen<Map<string, Picked>>({ names: rest, lease, choices: (name) => (byName.get(name) ?? []).map((d) => dependencyChoice(d, keep)), keep: (c, reserve) => upstreamPicks(c, byName.get(c.name) ?? [], reserve) })
+        : null;
 
       for (const name of rest) {
         const answer = got === null ? { kind: "absent" as const } : got.get(name);
@@ -2665,6 +2696,9 @@ function inRange<V extends VersionHead>(src: Choosable<V>, range: string): V[] {
   return src.versions.filter((v) => (tagged ? inChannel(v.version, tagged) : v.version === range || satisfies(v.version, range))).sort((a, b) => newestFirst(a.version, b.version));
 }
 
+/** The key a root's page is kept under (kept-choices.ts): rootPage reads only these beside the package. */
+const rootKey = (range: string, offset: number): string => `root ${offset} ${range}`;
+
 /**
  * One page of a resolve's root, newest first: from the `offset`th candidate on, ROOT_PAGE candidates and one more that
  * says another page follows. A withheld version (revoked, revocation pending, yanked) is never a candidate: it is
@@ -2945,9 +2979,9 @@ export const resolveResponse = (url: URL) =>
     let rootLease = lease.child();
     // one variable holds the root, so a catalog its lease gave back is never still reachable; a root that did not fit
     // could not be looked up, as before
-    const candidates: Select = (full) => rootPage(full, range, 0);
+    const candidates: KeyedSelect = { key: rootKey(range, 0), select: (full) => rootPage(full, range, 0) };
     // a later page of the root's candidates, when the first is all skipped (review of 2fbf383, finding 4)
-    const page: PageRead = (offset, under) => catalogWithin(name, under, (full) => rootPage(full, range, offset));
+    const page: PageRead = (offset, under) => catalogWithin(name, under, { key: rootKey(range, offset), select: (full) => rootPage(full, range, offset) });
     const first = yield* catalogWithin(name, rootLease, candidates);
     let src: Catalog | null | "unknown" = first === "over-budget" ? "unknown" : first;
 
@@ -3100,7 +3134,7 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     });
 
     // only the version asked about is kept of its package
-    const src = yield* catalogWithin(p.name, lease, (full) => full.versions.filter((v) => v.version === p.version));
+    const src = yield* catalogWithin(p.name, lease, { key: `version ${p.version}`, select: (full) => full.versions.filter((v) => v.version === p.version) });
 
     if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 

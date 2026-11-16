@@ -11,7 +11,9 @@
 //
 // How old a summary may be, and when npm is asked:
 //  - A summary younger than KEPT_PACKAGE_FRESH_MS is used as it is; one older is first checked against npm's ETag (a
-//    HEAD, no body) and used only when npm still sends the packument it was cut from.
+//    GET with If-None-Match, the one validation resolve's kept choices use too: Upstream.listingIfChanged) and used
+//    only when npm still sends the packument it was cut from. When it changed, npm's answer to that same request is
+//    the packument, and the read is answered from it: npm is asked once, not for an ETag and then for the packument.
 //  - Every read that shows a version's source or offers it (its score's evidence, its files and readme, the review)
 //    first asks npm for that version's document (a few KiB, kept for the TTL) and goes on from the summary only when
 //    npm still lists the version with the same checksums. A version npm removed is never shown from a summary.
@@ -19,7 +21,7 @@
 //    were kept, so it answers as it did then.
 //  - A summary older than KEPT_PACKAGE_REFRESH_MS that a view used is worked out again after the response
 //    (KeptRefresh), one refresh per package at a time, and the cron's sweep refreshes the ones asked about in the last
-//    day. A refresh asks for the ETag first and reads the packument only when it changed.
+//    day. A refresh is the same conditional read: a 304 only marks the summary worked out now.
 //
 // Only a package apm stored an analysis of gets a row, one is at most KEPT_PACKAGE_MAX_BYTES of JSON, and the table
 // holds at most KEPT_PACKAGE_CAPACITY.
@@ -102,8 +104,11 @@ export const KeptPackage = z.object({
 
 export type KeptPackage = z.infer<typeof KeptPackage>;
 
+/** What a summary is cut from: a package as npm lists it, with or without when it was fetched (a summary never reads that). */
+type SummarySource = Omit<CachedPackage, "fetchedAt">;
+
 /** The summary of a package as npm lists it now; null when its JSON is more than KEPT_PACKAGE_MAX_BYTES as UTF-8. */
-export function summarize(pkg: CachedPackage): KeptPackage | null {
+export function summarize(pkg: SummarySource): KeptPackage | null {
   // pkg.versions is in publish order
   const all = pkg.versions;
   const cut = all.length > KEPT_VERSIONS ? (all[all.length - KEPT_VERSIONS]?.published_at ?? null) : null;
@@ -179,6 +184,8 @@ export function expand(kept: KeptPackage): CachedPackage {
     tarballs: new Map(kept.versions.filter((v) => v.tarball !== "").map((v) => [v.version, v.tarball])),
     serveCost: { versionDocs: 0, maxPieceChars: 0 },
     etag: kept.etag,
+    // not a fetch from npm: a resolve's kept choice is never made young from a summary (kept-choices.ts)
+    fetchedAt: Number.NEGATIVE_INFINITY,
   };
 }
 
@@ -259,7 +266,7 @@ const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECO
  * Keeps `pkg`'s summary when apm stored an analysis of any of its versions: the admission rule, so names nobody scored
  * cost no row. Its summary is replaced when it is kept already.
  */
-const keepScored = (pkg: CachedPackage, scored: boolean, at: number) =>
+const keepScored = (pkg: SummarySource, scored: boolean, at: number) =>
   Effect.gen(function* () {
     if (!scored) return;
     const summary = summarize(pkg);
@@ -293,15 +300,28 @@ const refreshIfOld = (name: string, row: Kept, at: number) =>
   });
 
 /**
- * The kept row for `name` while npm still sends the packument it was cut from: as it is when younger than
- * KEPT_PACKAGE_FRESH_MS, else once npm's ETag says the packument did not change (the row is then marked worked out
- * now). "stale" when a row is there but npm changed the packument, has no such package (the row is then dropped) or
- * could not be asked; "none" when there is no row.
+ * What a stale row's check got from npm when npm sent more than a 304: the package as npm lists it now (held under a
+ * child of the read's lease), that npm has no such package, or that npm could not be asked, after the check already
+ * read the packument whole as its fallback (Upstream.listingIfChanged). The caller answers from it instead of asking
+ * npm again: on an outage, one conditional read and one whole read, then one whole read while the package's failure
+ * mark lasts, as with the HEAD before (combined review of 67d8658, finding 2).
  */
-type Current = { kind: "current"; row: Kept } | { kind: "stale" } | { kind: "none" };
+type Fetched = UpstreamListing;
 
-const currentRow = (upstream: UpstreamApi, name: string, at: number) =>
+/**
+ * The kept row for `name` while npm still sends the packument it was cut from: as it is when younger than
+ * KEPT_PACKAGE_FRESH_MS, else once npm says the packument did not change (the row is then marked worked out now).
+ * That check is one conditional read (Upstream.listingIfChanged): npm's 304, or the packument itself when it changed,
+ * which comes back as `fetched`. "stale" when a row is there but npm changed the packument, has no such package (the
+ * row is then dropped) or could not be asked (`fetched` says so: the check already tried the whole packument); a row
+ * with no ETag can never be checked, so npm is not asked for it and `fetched` is null: the caller reads npm as before
+ * summaries were kept. "none" when there is no row.
+ */
+type Current = { kind: "current"; row: Kept } | { kind: "stale"; fetched: Fetched | null } | { kind: "none" };
+
+const currentRow = (input: { upstream: UpstreamApi; name: string; at: number; lease: Lease }) =>
   Effect.gen(function* () {
+    const { upstream, name, at } = input;
     const store = yield* Store;
     const row = yield* keptRow(name, at);
 
@@ -313,14 +333,42 @@ const currentRow = (upstream: UpstreamApi, name: string, at: number) =>
       return { kind: "current", row } satisfies Current;
     }
 
-    const now = yield* upstream.etagOf(name);
+    const etag = row.kept.etag;
 
-    if (now.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
+    if (etag === null) return { kind: "stale", fetched: null } satisfies Current;
+    // a child, given back unless what npm sent is the answer
+    const read = input.lease.child();
+    const now = yield* upstream.listingIfChanged(name, read, etag);
+    const same = now.kind === "not-modified" || (now.kind === "found" && now.pkg.etag === etag);
 
-    if (now.kind !== "found" || now.etag === null || now.etag !== row.kept.etag) return { kind: "stale" } satisfies Current;
-    yield* store.touchKeptPackage({ name, at });
+    if (same || now.kind !== "found") read.release();
 
-    return { kind: "current", row: { kept: row.kept, computedAt: at } } satisfies Current;
+    // Accepted (combined review of 67d8658): a package the isolate cache already holds with the summary's ETag counts
+    // as unchanged without asking npm, so a package page's npm metadata may be up to the isolate cache's TTL (60 s)
+    // older than KEPT_PACKAGE_FRESH_MS; every read that shows a version's source still confirms it (stillListed).
+    if (same) {
+      yield* store.touchKeptPackage({ name, at });
+
+      return { kind: "current", row: { kept: row.kept, computedAt: at } } satisfies Current;
+    }
+
+    switch (now.kind) {
+      case "found":
+        return { kind: "stale", fetched: now } satisfies Current;
+      case "absent":
+        yield* store.dropKeptPackages({ kind: "name", name });
+
+        return { kind: "stale", fetched: now } satisfies Current;
+      case "unknown":
+      case "over-budget":
+        // npm was asked (and the packument read whole as the fallback) or the request had no room: not asked again
+        return { kind: "stale", fetched: { kind: "unknown" } } satisfies Current;
+      default: {
+        const _exhaustive: never = now;
+
+        return _exhaustive;
+      }
+    }
   });
 
 /**
@@ -350,33 +398,35 @@ function versionsShown(kept: KeptPackage, need: PageNeed): KeptVersion[] | null 
 }
 
 /** What keptFor found: a summary to answer from, or none, and whether a row was there (one a fallback should refresh). */
-type KeptAnswer = { kept: KeptPackage | null; hadRow: boolean };
+type KeptAnswer = { kept: KeptPackage | null; hadRow: boolean; fetched: Fetched | null };
 
 /**
  * The kept summary a page's read of `need` may be answered from: current (currentRow), holding what `need` asks for,
  * naming the exact versions it would show, and with npm still listing each of them as the summary has it. A null
  * summary sends the read to npm's packument.
  */
-const keptFor = (upstream: UpstreamApi, name: string, need: PageNeed) =>
+const keptFor = (upstream: UpstreamApi, name: string, need: PageNeed, lease: Lease) =>
   Effect.gen(function* () {
     const at = yield* (yield* Clock).now;
-    const current = yield* currentRow(upstream, name, at);
+    const current = yield* currentRow({ upstream, name, at, lease });
 
-    if (current.kind !== "current") return { kept: null, hadRow: current.kind === "stale" } satisfies KeptAnswer;
+    if (current.kind === "none") return { kept: null, hadRow: false, fetched: null } satisfies KeptAnswer;
+
+    if (current.kind === "stale") return { kept: null, hadRow: true, fetched: current.fetched } satisfies KeptAnswer;
     const { row } = current;
     const shown = covers(row.kept, need) ? versionsShown(row.kept, need) : null;
 
-    if (shown === null) return { kept: null, hadRow: true } satisfies KeptAnswer;
+    if (shown === null) return { kept: null, hadRow: true, fetched: null } satisfies KeptAnswer;
     const listed = yield* Effect.forEach(shown, (v) => stillListed(upstream, name, v), { concurrency: "unbounded" });
 
-    return { kept: listed.every(Boolean) ? row.kept : null, hadRow: true } satisfies KeptAnswer;
+    return { kept: listed.every(Boolean) ? row.kept : null, hadRow: true, fetched: null } satisfies KeptAnswer;
   });
 
 /**
  * Replaces a kept row with the summary of `pkg`, read from npm after the row could not answer: the next read uses it.
  * Only a row already kept is replaced, so admission and the table's capacity hold; one too large is dropped.
  */
-const refreshFrom = (pkg: CachedPackage) =>
+const refreshFrom = (pkg: SummarySource) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* (yield* Clock).now;
@@ -394,7 +444,7 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
   Effect.gen(function* () {
     const { upstream, name, need, lease } = input;
     const store = yield* Store;
-    const { kept } = yield* keptFor(upstream, name, need);
+    const { kept, fetched } = yield* keptFor(upstream, name, need, lease);
 
     if (kept !== null) {
       if (!lease.take(expandWeight(kept))) return { kind: "unknown" } satisfies Probe;
@@ -402,7 +452,8 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
       return scoredPackage(expand(kept), yield* store.upstreamAnalyses(name));
     }
 
-    const probe = yield* upstream.probe(name, lease);
+    // what the row's check already read from npm is the answer: npm is not asked again
+    const probe: Probe = fetched === null ? yield* upstream.probe(name, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* store.upstreamAnalyses(name)) : fetched;
 
     // a kept row is replaced with what npm sent (keepScored replaces as well as adds)
     if (probe.kind === "found") yield* keepScored(probe.pkg, probe.pkg.versions.some((v) => v.score !== null), yield* (yield* Clock).now);
@@ -416,10 +467,11 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
 export const pageListing = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease }): Effect.Effect<UpstreamListing, StoreError, Store | Clock> =>
   Effect.gen(function* () {
     const { upstream, name, need, lease } = input;
-    const { kept, hadRow } = yield* keptFor(upstream, name, need);
+    const { kept, hadRow, fetched } = yield* keptFor(upstream, name, need, lease);
 
     if (kept !== null) return lease.take(expandWeight(kept)) ? { kind: "found", pkg: expand(kept) } : { kind: "unknown" };
-    const listed = yield* upstream.listing(name, lease);
+    // what the row's check already read from npm is the answer: npm is not asked again
+    const listed: UpstreamListing = fetched ?? (yield* upstream.listing(name, lease));
 
     yield* afterListing(name, listed, hadRow);
 
@@ -451,10 +503,10 @@ export const pageExists = (input: { upstream: UpstreamApi; name: string; lease: 
     const { upstream, name, lease } = input;
     const at = yield* (yield* Clock).now;
 
-    const current = yield* currentRow(upstream, name, at);
+    const current = yield* currentRow({ upstream, name, at, lease });
 
     if (current.kind === "current") return "found";
-    const listed = yield* upstream.listing(name, lease);
+    const listed: UpstreamListing = (current.kind === "stale" ? current.fetched : null) ?? (yield* upstream.listing(name, lease));
 
     yield* afterListing(name, listed, current.kind === "stale");
 
@@ -483,24 +535,38 @@ export const refreshKeptPackage = (name: string): Effect.Effect<boolean, StoreEr
     const claim = yield* store.claimKeptRefresh({ name, at, computedBefore: at - KEPT_PACKAGE_REFRESH_MS, claimedBefore: at - KEPT_PACKAGE_CLAIM_MS });
 
     if (claim === null) return false;
-    // npm's ETag first: an unchanged packument needs no read
-    const now = yield* found.value.etagOf(name);
-
-    if (now.kind === "found" && now.etag !== null && now.etag === claim.etag) {
-      yield* store.touchKeptPackage({ name, at });
-
-      return true;
-    }
-
-    // under a child lease, given back once the summary is cut from the package
+    // under a child lease, given back once the summary is cut from the package. One conditional read: npm's 304 when
+    // the packument is still the one the summary was cut from, else that packument from the same answer
     const lease = (yield* RequestMemory).child();
+    const etag = claim.etag;
 
-    const listed = yield* found.value.listing(name, lease).pipe(
-      Effect.map((l) => (l.kind === "found" ? { kind: "found" as const, summary: summarize(l.pkg) } : l)),
+    const listed = yield* found.value.listingIfChanged(name, lease, etag).pipe(
+      Effect.map((l) => {
+        switch (l.kind) {
+          case "not-modified":
+            return { kind: "same" as const };
+          case "found":
+            return etag !== null && l.pkg.etag === etag ? { kind: "same" as const } : { kind: "found" as const, summary: summarize(l.pkg) };
+          case "over-budget":
+            return { kind: "unknown" as const };
+          case "absent":
+          case "unknown":
+            return l;
+          default: {
+            const _exhaustive: never = l;
+
+            return _exhaustive;
+          }
+        }
+      }),
       Effect.ensuring(Effect.sync(() => lease.release())),
     );
 
     switch (listed.kind) {
+      case "same":
+        yield* store.touchKeptPackage({ name, at });
+
+        return true;
       case "found":
         if (listed.summary === null) yield* store.dropKeptPackages({ kind: "name", name });
         else yield* store.refreshKeptPackage({ name, summary: listed.summary, at });

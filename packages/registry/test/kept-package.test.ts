@@ -45,6 +45,7 @@ function cached(versions: readonly string[], tags: Record<string, string>, readm
     tarballs: new Map(versions.map((v) => [v, `https://npm.invalid/big/-/big-${v}.tgz`])),
     serveCost: { versionDocs: 0, maxPieceChars: 0 },
     etag: null,
+    fetchedAt: Number.NEGATIVE_INFINITY,
   };
 }
 

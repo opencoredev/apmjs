@@ -390,6 +390,7 @@ function recording(npm: string, reads: LeasedRead[]) {
         probeWithin: (n, lease) => Effect.suspend(() => (note("probeWithin", lease), u.probeWithin(n, lease))),
         probeMany: (ns, lease) => Effect.suspend(() => (note("probeMany", lease), u.probeMany(ns, lease))),
         summaries: (ns, lease, keep) => Effect.suspend(() => (note("summaries", lease), u.summaries(ns, lease, keep))),
+        chosen: (input) => Effect.suspend(() => (note("chosen", input.lease), u.chosen(input))),
         listing: (n, lease) => Effect.suspend(() => (note("listing", lease), u.listing(n, lease))),
         get: (n, lease) => Effect.suspend(() => (note("get", lease), u.get(n, lease))),
         devDependencies: (n, lease) => Effect.suspend(() => (note("devDependencies", lease), u.devDependencies(n, lease))),
@@ -444,7 +445,8 @@ describe("every packument a request reads is under the request's lease", () => {
       // on 6862fc7 the root was read with probe() and get() under no budget
       expect(leased.reads.length).toBeGreaterThan(1);
       expect(leased.reads.every((x) => x.lease.root === leased.request)).toBe(true);
-      expect(leased.reads.map((x) => x.method)).toContain("summaries");
+      // the summarized, budgeted read (summaries; for the walk and its root, chosen)
+      expect(leased.reads.map((x) => x.method)).toContain("chosen");
       expect(leased.request.peakTaken).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
       // the big root's 10 MiB leaves the walk room for about five fewer; on 6862fc7 both walks checked as many
       expect(bigChecked).toBeGreaterThanOrEqual(1);

@@ -139,6 +139,13 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
 
           return [n, p ? (kept ? { kind: "found" as const, summary: kept.summary } : { kind: "over-budget" as const }) : { kind: "absent" as const }];
         }))),
+      chosen: ({ names, lease, choices, keep }) =>
+        Effect.succeed(new Map(names.map((n) => {
+          const p = pkgOf(n);
+          const kept = p ? keep({ name: n, distTags: p.distTags, versions: new Map(choices(n).map((c) => [c.key, c.choose(p)] as const)) }, lease) : null;
+
+          return [n, p ? (kept ? { kind: "found" as const, summary: kept.summary } : { kind: "over-budget" as const }) : { kind: "absent" as const }];
+        }))),
       listing: () => Effect.succeed({ kind: "unknown" }),
       get: (name) => Effect.succeed(pkgOf(name)),
       tarball: (pkg) =>
@@ -152,7 +159,7 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       // no tarball route runs in this file
       serve: () => Effect.succeed({ kind: "absent" }),
       advisories: () => Effect.succeed({ kind: "unavailable" }),
-      etagOf: () => Effect.succeed({ kind: "unknown" }),
+      listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
       versionOf: () => Effect.succeed({ kind: "unknown" }),
     }),
   );

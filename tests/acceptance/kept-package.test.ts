@@ -328,8 +328,9 @@ describe("kept package summaries", () => {
     const [h0, r0] = [heads(), reads()];
 
     for (let i = 0; i < 5; i++) expect((await fetch(`${reg.url}-/apm/v1/packages/kp-heads`, { method: "HEAD" })).status).toBe(200);
-    // the first finds the ETag changed and reads the packument, which replaces the summary; the other four use it
-    expect([heads() - h0, reads() - r0]).toEqual([1, 1]);
+    // the first asks npm once, with the summary's ETag, and npm's answer is the changed packument, which replaces the
+    // summary (before resolve's kept choices joined it: a HEAD, then the packument); the other four use it
+    expect([heads() - h0, reads() - r0]).toEqual([0, 1]);
     expect(z.object({ distTags: z.object({ latest: z.string() }) }).parse((await keptRow("kp-heads"))?.summary).distTags.latest).toBe("1.2.0");
   });
 

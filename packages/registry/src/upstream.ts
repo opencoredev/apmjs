@@ -4,14 +4,16 @@ import { Context, Effect, Layer, Option } from "effect";
 import { z } from "zod";
 import { Blobs } from "./blobs.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
-import { Store, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
+import { Store, type KeptChoicesRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { readCapped, streamedJson, streamWeight } from "./http.ts";
-import { CACHE_WEIGHT, type Block, type Lease, type MemoryPool } from "./memory.ts";
+import { CACHE_WEIGHT, RequestMemory, type Block, type Lease, type MemoryPool } from "./memory.ts";
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { verifiedStream } from "./verified-stream.ts";
+import { ChoicesWriter, choiceHolds, isStrongEtag, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
+import { Clock } from "./clock.ts";
 import { reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
@@ -162,8 +164,12 @@ const NPM_ORIGIN = "https://registry.npmjs.org";
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 const MAX_HOPS = 5;
 
-/** The parsed packument without apm's scores; scores are attached per request from the store. */
-export type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[] };
+/**
+ * The parsed packument without apm's scores; scores are attached per request from the store. `etag`: npm's ETag for
+ * it, when npm sent one and answered directly, which a kept row of its choices is kept for (kept-choices.ts).
+ * `fetchedAt`: when npm sent it (wall-clock ms; a shared copy's own time), which a choice made of it is as old as.
+ */
+export type CachedPackage = Omit<UpstreamPackage, "versions"> & { versions: Omit<VersionRecord, "score">[]; fetchedAt: number };
 
 type CachedProbe = { kind: "found"; pkg: CachedPackage } | { kind: "absent" };
 
@@ -174,7 +180,7 @@ export type UpstreamListing = CachedProbe | { kind: "unknown" };
  * The package apm caches, read from the packument readPackument kept: each version npm lists with a valid document,
  * in publish order. Null when the packument is not one.
  */
-export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost, etag: string | null): CachedPackage | null {
+export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost, etag: string | null, fetchedAt: number = Number.NEGATIVE_INFINITY): CachedPackage | null {
   const parsed = UpPackument.safeParse(body);
 
   if (!parsed.success) return null;
@@ -224,7 +230,16 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
     tarballs,
     serveCost,
     etag,
+    fetchedAt,
   };
+}
+
+/**
+ * A kept row's records as a cached package (kept-choices.ts): only the versions its choices took, with what a choice
+ * and a summary read of them, so a reader can be handed them as it is handed a package npm sent.
+ */
+export function keptPackage(name: string, row: KeptChoicesRow): CachedPackage {
+  return { name, distTags: row.kept.distTags, description: "", readme: "", maintainers: [], versions: Object.values(row.kept.records), tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: row.etag, fetchedAt: Number.NEGATIVE_INFINITY };
 }
 
 /**
@@ -386,23 +401,24 @@ type Caches = {
   /** Version documents by "<name>@<version>": what versionOf answered, found or absent. */
   versions: IsolateCache<Exclude<UpstreamVersion, { kind: "unknown" }>>;
   /**
-   * Packages npm just failed a small read for (a version document or a packument HEAD: an error status, a body apm
-   * cannot read, a timeout), kept for NPM_FAILURE_MS: neither is asked for again meanwhile, so each read goes straight
-   * to the packument as it did before summaries were kept, instead of waiting on npm once more first.
+   * Packages npm just failed a small read for (a version document, or a packument's conditional read: an error status,
+   * a body apm cannot read, a timeout), kept for NPM_FAILURE_MS: neither is asked for again meanwhile, so each read
+   * goes straight to the packument as it did before summaries were kept, instead of waiting on npm once more first.
    */
   failures: IsolateCache<true>;
 };
 
 /**
- * How long a failed version document or packument HEAD is remembered (at most the upstream TTL): a short outage costs
- * each package one failed request per isolate in this window, not one on every read.
+ * How long a failed version document or conditional packument read is remembered (at most the upstream TTL): a short
+ * outage costs each package one failed request per isolate in this window, not one on every read.
  */
 export const NPM_FAILURE_MS = 30_000;
 
 /**
- * The longest a version document or a packument HEAD may take. Both are a few KiB or no body: npm answered a version
- * document in 0.15 s warm and 1.1 s from a cold edge when checked, so 2 s leaves room for that, and a stalled npm adds
- * at most 2 s to one read per package per NPM_FAILURE_MS (the rest go straight to the packument).
+ * The longest a version document may take, and a packument's conditional read may take to start answering. Both are
+ * a few KiB or no body: npm answered a version document in 0.15 s warm and 1.1 s from a cold edge when checked, so 2 s
+ * leaves room for that, and a stalled npm adds at most 2 s to one read per package per NPM_FAILURE_MS (the rest go
+ * straight to the packument).
  */
 export const NPM_SMALL_READ_TIMEOUT_MS = 2_000;
 
@@ -451,9 +467,6 @@ export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 /** npm's ETag for a shared packument, so a copy read from the data center's cache can be revalidated as npm's own. */
 const ETAG_HEADER = "x-apm-npm-etag";
 
-/** What npm says of a package's packument now, without its body: its ETag (null when it sends none). */
-export type UpstreamEtag = { kind: "found"; etag: string | null } | { kind: "absent" } | { kind: "unknown" };
-
 /** What npm says of one version now, from its version document: its tarball's URL and the checksums npm publishes for it ("" when absent). */
 export type UpstreamVersion = { kind: "found"; tarball: string; integrity: string; shasum: string } | { kind: "absent" } | { kind: "unknown" };
 
@@ -477,10 +490,11 @@ export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Reque
  * lease it was read under; `fresh` when npm sent it now, so the data center's cache may be given a copy (shareCopy)
  * once the caller has made room for converting it. "status": npm answered something other than a 200 with a body.
  * "refused": npm answered, but readPackument refused it (too large, not JSON), so it is an answer apm cannot use.
- * "over-budget": the lease had no room for it.
+ * "over-budget": the lease had no room for it. "not-modified": npm's 304 for the ETag it was asked with.
  */
 type PackumentAnswer =
-  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean; etag: string | null }
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean; etag: string | null; conditional: boolean }
+  | { kind: "not-modified"; fetchedAt: number }
   | { kind: "status"; status: number; fetchedAt: number }
   | { kind: "refused"; fetchedAt: number }
   | { kind: "over-budget" };
@@ -504,8 +518,13 @@ export type UpstreamApi = {
   readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
-  /** npm's ETag for the package's packument now, from a HEAD: whether a packument read earlier is still current. */
-  readonly etagOf: (name: string) => Effect.Effect<UpstreamEtag>;
+  /**
+   * The package as npm lists it, unless its packument is still the one `etag` names: then "not-modified" (npm's 304,
+   * no body read). Otherwise as `listing` reads it, from the isolate cache or from npm's answer to that same request,
+   * so checking a kept summary or a kept row and the read it leads to are one request (fetchPackument). A package
+   * that did not fit `lease` is "over-budget"; with a null `etag` this is listing.
+   */
+  readonly listingIfChanged: (name: string, lease: Lease, etag: string | null) => Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }>;
   /** One version's document (a few KiB): whether npm still lists the version, and its checksums. Kept for the TTL. */
   readonly versionOf: (name: string, version: string) => Effect.Effect<UpstreamVersion>;
   /**
@@ -525,6 +544,12 @@ export type UpstreamApi = {
    * nothing that refers to the package, or that memory would be held with nothing counting it.
    */
   readonly summaries: <S>(names: readonly string[], lease: Lease, keep: (pkg: UpstreamPackage, reserve: Reserve) => Summary<S> | null) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
+  /**
+   * summaries for a reader that makes named choices of each package's versions (kept-choices.ts): `keep` is handed
+   * only the versions each choice took. What it chose is kept with npm's ETag, and answered from there while npm says
+   * the packument has not changed (304), without reading it.
+   */
+  readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null }) => Effect.Effect<Map<string, Summarized<S>>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
@@ -731,6 +756,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           });
 
         const now = Effect.sync(() => Date.now());
+        // kept choices are aged by the registry's clock (tests move it), the isolate caches by the wall's
+        const clock = yield* Effect.serviceOption(Clock);
+        const keptNow = Option.isSome(clock) ? clock.value.now : now;
 
         const fetchJson = (url: string, timeoutMs: number, init: RequestInit = {}) =>
           Effect.tryPromise({
@@ -771,10 +799,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           );
 
         /** A packument read as an answer. One it refused is logged; one past the request's lease is not an error. */
-        const answerOf = (input: { url: string; read: PackumentRead; fetchedAt: number; fresh: boolean; etag: string | null }): PackumentAnswer => {
+        const answerOf = (input: { url: string; read: PackumentRead; fetchedAt: number; fresh: boolean; etag: string | null; conditional?: boolean }): PackumentAnswer => {
           const { url, read, fetchedAt, fresh, etag } = input;
 
-          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh, etag };
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh, etag, conditional: input.conditional === true };
 
           if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
@@ -789,12 +817,84 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * `fetchedAt` is when npm sent it: `now` for a fresh fetch, the copy's own time for a shared one. The body is
          * streamed through readPackument, never held whole, and what it keeps is taken from `lease`. No copy is shared
          * here: the caller starts one (shareCopy) once converting the read has fit.
+         *
+         * With `etag` (a kept row's or a kept summary's), npm is first asked whether the packument changed: one GET with
+         * If-None-Match, the one validation both resolve's kept choices and package pages' kept summaries use. It is a
+         * small read as package pages' are: skipped while `name` has a failure mark (NPM_FAILURE_MS), and given
+         * NPM_SMALL_READ_TIMEOUT_MS for npm's answer to start; a failure marks `name` and the packument is read whole as
+         * if no ETag had been given. Its 304 is "not-modified" (timed as npm-head: no body was read); a 200 is the
+         * packument, read from that same answer; it follows no redirect, and a redirect is a whole read of the
+         * document it leads to (re-check of 3366a36, finding 4). A read that answered through a redirect keeps no ETag.
          */
-        const fetchPackument = (input: { url: string; now: number; profile: KeepProfile; lease: Lease }): Effect.Effect<PackumentAnswer, unknown> =>
+        const fetchPackument = (input: { name: string; url: string; now: number; profile: KeepProfile; lease: Lease; etag?: string | null }): Effect.Effect<PackumentAnswer, unknown> =>
           // an interrupted read (a sibling of a parallel lookup failed, the request ended) cancels its stream and gives
           // its charge back before the fiber ends, so the lease is never released under it
           joinedPromise(async (interrupted): Promise<PackumentAnswer> => {
-            const { url, now, profile, lease } = input;
+            const { name, url, now, profile, lease } = input;
+            const etag = input.etag ?? null;
+            const signal = AbortSignal.any([interrupted, AbortSignal.timeout(10_000)]);
+
+            if (etag !== null && caches.failures.get(name, now) === undefined) {
+              const askStart = performance.now();
+              // the deadline is for npm's answer to start; a 200's body then reads under the packument's own
+              const started = new AbortController();
+              const timer = setTimeout(() => started.abort(new Error("npm did not answer the conditional read in time")), NPM_SMALL_READ_TIMEOUT_MS);
+              let asked: Response | null = null;
+
+              try {
+                asked = await fetch(url, { headers: { accept: "application/json", "if-none-match": etag }, signal: AbortSignal.any([signal, started.signal]), redirect: "manual" });
+              } catch {
+                asked = null;
+              } finally {
+                clearTimeout(timer);
+              }
+
+              if (asked?.status === 304) {
+                await asked.body?.cancel();
+                timing?.add("npm-head", performance.now() - askStart);
+
+                return { kind: "not-modified", fetchedAt: now };
+              }
+
+              if (asked?.status === 200 && asked.body) {
+                // npm failing this read in any way (a body apm cannot read, one cut off or too slow) marks the package as
+                // a failed small read does; a refusal for the request's budget, or the caller stopping it, does not
+                // (combined review of 67d8658, finding 3)
+                const fail = (): void => {
+                  if (!interrupted.aborted) caches.failures.set(name, true, now);
+                };
+
+                let read: PackumentRead;
+
+                try {
+                  read = await readPackument(asked.body, { profile, lease, signal });
+                } catch (e) {
+                  fail();
+                  throw e;
+                } finally {
+                  timing?.add("npm", performance.now() - askStart);
+                }
+
+                if (read.kind !== "ok" && !(read.kind === "too-large" && read.over === "budget")) fail();
+
+                return answerOf({ url, read, fetchedAt: now, fresh: true, etag: asked.headers.get("etag"), conditional: true });
+              }
+
+              if (asked?.status === 404) {
+                await asked.body?.cancel();
+                timing?.add("npm-head", performance.now() - askStart);
+
+                return { kind: "status", status: 404, fetchedAt: now };
+              }
+
+              await asked?.body?.cancel();
+              timing?.add("npm-head", performance.now() - askStart);
+
+              // anything but a redirect is npm failing a small read: marked, so the next reads go straight to the whole
+              // packument; a redirect is no failure, just a document that is read whole
+              if (!interrupted.aborted && (asked === null || !REDIRECTS.has(asked.status))) caches.failures.set(name, true, now);
+            }
+
             const key = packumentKey(url, profile);
             const shared = sharing ? workerCache() : null;
             const cacheStart = performance.now();
@@ -811,7 +911,6 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             await hit?.body?.cancel();
             const npmStart = performance.now();
-            const signal = AbortSignal.any([interrupted, AbortSignal.timeout(10_000)]);
             const res = await fetch(url, { headers: { accept: "application/json" }, signal });
 
             if (res.status !== 200 || !res.body) {
@@ -824,7 +923,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const read = await readPackument(res.body, { profile, lease, signal });
             timing?.add("npm", performance.now() - npmStart);
 
-            return answerOf({ url, read, fetchedAt: now, fresh: true, etag: res.headers.get("etag") });
+            // a document that answered through a redirect keeps no ETag: a row or a summary is kept only for one that
+            // answered directly (re-check of 3366a36, finding 4)
+            return answerOf({ url, read, fetchedAt: now, fresh: true, etag: res.redirected ? null : res.headers.get("etag") });
           });
 
         /**
@@ -896,7 +997,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * or a fresh read, the moment converting it takes (packageMoment), and its scored copy. A fresh package becomes
          * a block the lease holds, which the isolate cache and a shared-cache write may hold too.
          */
-        const listed = (name: string, lease: Lease): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
+        const listedOrSame = (name: string, lease: Lease, etag: string | null): Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }> =>
           Effect.gen(function* () {
             const t = yield* now;
             const probes = probeCacheFor(lease.pool, baseUrl, ttlMs);
@@ -915,9 +1016,11 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             if (lease.exhausted) return { kind: "over-budget" as const };
             const url = `${baseUrl}${encodeName(name)}`;
 
-            const answer = yield* fetchPackument({ url, now: t, profile: TRIMMED, lease }).pipe(Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })));
+            const answer = yield* fetchPackument({ name, url, now: t, profile: TRIMMED, lease, etag }).pipe(Effect.orElseSucceed((): PackumentAnswer => ({ kind: "status", status: 0, fetchedAt: t })));
 
             if (answer.kind === "over-budget") return answer;
+
+            if (answer.kind === "not-modified") return { kind: "not-modified" as const };
 
             if (answer.kind !== "ok") {
               const gone = packageOf(answer);
@@ -938,12 +1041,16 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return { kind: "over-budget" as const };
             }
 
-            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars }, answer.etag);
+            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars }, answer.etag, answer.fetchedAt);
             lease.give(moment);
 
             if (!pkg) {
               // nothing of it is held
               lease.give(read.weight + held);
+
+              // a conditional read's 200 that is not a packument is npm failing a small read: marked as its other
+              // failures are (re-check of 51fc813); a read refused for room, above, is not
+              if (answer.conditional) caches.failures.set(name, true, t);
 
               return { kind: "unknown" as const };
             }
@@ -959,6 +1066,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             return fresh;
           });
+
+        /** listedOrSame with no ETag, so never "not-modified". */
+        const listed = (name: string, lease: Lease): Effect.Effect<UpstreamListing | { kind: "over-budget" }> =>
+          Effect.map(listedOrSame(name, lease, null), (l) => (l.kind === "not-modified" ? { kind: "unknown" as const } : l));
 
         /** The packument as npm lists it, from the isolate cache or npm, without its analyses. */
         const listing = (name: string, lease: Lease): Effect.Effect<UpstreamListing> =>
@@ -1068,6 +1179,237 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           });
 
         /**
+         * summaries for a reader that makes named choices of each package's versions (Choice): each package's choices
+         * are made of the packument when it is read, and kept (upstream_choices, migration 0021) with npm's strong ETag
+         * for it, under the document it was asked for at (this upstream's URL for the package, answered directly). The
+         * next read sends that ETag; npm's 304 means the packument is the same, so the same choices hold, and they are
+         * answered from the kept row without reading the packument. A package the isolate cache has is chosen from as
+         * before. Any other answer is what a read without a row comes to (an outage stays unknown, and never touches
+         * the row); a 200 rewrites the row. A row is used only when every choice asked for is in it and younger than
+         * KEPT_CHOICES_MAX_AGE_MS (choiceHolds), its age counted from the fetch of the packument it was made of.
+         *
+         * Keeping is strictly second (re-check of 3366a36, finding 1): the rows read and the rows planned are held on
+         * a side lease of the pool (KeptSide), never `lease`, taken only from room the pool has free and given up
+         * first under pressure; a row given up while npm was asked means a whole read. Once every package of the batch
+         * has its answer, the planned rows are written one at a time, each under a short reservation of `lease` given
+         * back before the next (keepPlans). A write that fails is logged and the answer stands.
+         */
+        const chosen = <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null }): Effect.Effect<Map<string, Summarized<S>>, StoreError> =>
+          Effect.gen(function* () {
+            const { lease, choices, keep } = input;
+            const wanted = [...new Set(input.names)];
+            const analyses = yield* store.upstreamAnalysesOf(wanted);
+            const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
+            const t = yield* keptNow;
+            const wall = yield* now;
+            const documentOf = (name: string): string => `${baseUrl}${encodeName(name)}`;
+            const side = KeptSide.open(lease.pool);
+            // the side is closed when the batch ends, unless its plans were handed to the writer, which closes it once
+            // they are written
+            let handedOff = false;
+
+            const batch = Effect.gen(function* () {
+              const read = yield* keptRowsWithin({ store, documents: wanted.map(documentOf), side, at: t });
+              /** Each name's row, held on the side until the batch ends, or until the pool needs the room. */
+              const rows = new Map<string, { row: HeldRow; holding: ReturnType<KeptSide["hold"]> }>();
+
+              for (const name of wanted) {
+                const r = read.get(documentOf(name));
+
+                if (r === undefined) continue;
+
+                // a row is used only for a strong validator (finding 3)
+                if (!isStrongEtag(r.etag)) {
+                  side.give(r.weight);
+                  continue;
+                }
+
+                rows.set(name, { row: r, holding: side.hold(r.weight, () => rows.delete(name)) });
+              }
+
+              // the rows now live only in `rows`, so one the pool takes back is no longer referenced (combined review of
+              // 67d8658, finding 1)
+              read.clear();
+              const plans: PlanHandle[] = [];
+
+              /** Whether every choice asked of `name` holds in `row` now. */
+              const holds = (name: string, row: KeptChoicesRow): boolean => choices(name).every((c) => choiceHolds(row.kept, c.key, t));
+
+              /** keep, handed the versions each of `name`'s choices takes of `pkg` (scored here), with the scored copy charged unless the read charged it. */
+              const keptOf = (name: string, pkg: CachedPackage, copyCharged: boolean, take: (scored: UpstreamPackage) => ReadonlyMap<string, readonly VersionRecord[]> | null): Summarized<S> => {
+                const copy = copyCharged ? 0 : pkg.versions.length * SCORED_WEIGHT;
+
+                if (!lease.take(copy)) return { kind: "over-budget" };
+                const scored = scoredPackage(pkg, analyses.get(name) ?? none);
+
+                if (scored.kind !== "found") {
+                  lease.give(copy);
+
+                  return { kind: "unknown" };
+                }
+
+                const versions = take(scored.pkg);
+
+                if (versions === null) {
+                  lease.give(copy);
+
+                  return { kind: "unknown" };
+                }
+
+                const before = lease.taken;
+                const made = keep({ name, distTags: scored.pkg.distTags, versions }, lease);
+                lease.give(copy);
+
+                if (made === null) return { kind: "over-budget" };
+                const short = made.weight - (lease.taken + copy - before);
+
+                if (short > 0 && !lease.take(short)) {
+                  lease.give(made.weight - short);
+
+                  return { kind: "over-budget" };
+                }
+
+                return { kind: "found", summary: made.summary };
+              };
+
+              /**
+               * From a whole package: its choices made of it, and, once its answer is kept, a row planned on the side
+               * (one string: keptPlan) when npm gave it a strong ETag and the row is missing, for another packument, or
+               * lacks one of these choices or holds it past its age. Each choice is as old as the fetch of `pkg`'s
+               * packument (finding 2).
+               */
+              const fromPackage = (name: string, pkg: CachedPackage, copyCharged: boolean): Summarized<S> => {
+                let made: { versions: ReadonlyMap<string, readonly VersionRecord[]>; distTags: Record<string, string> } | null = null;
+
+                const answer = keptOf(name, pkg, copyCharged, (scored) => {
+                  const versions = new Map(choices(name).map((c) => [c.key, c.choose(scored)] as const));
+                  made = { versions, distTags: scored.distTags };
+
+                  return versions;
+                });
+
+                const held = rows.get(name);
+                const etag = pkg.etag;
+
+                if (answer.kind === "found" && made !== null && isStrongEtag(etag) && (held === undefined || held.row.etag !== etag || !holds(name, held.row))) {
+                  const { versions, distTags } = made;
+                  const at = t - Math.max(0, wall - pkg.fetchedAt);
+
+                  // only this read's choices, as one string; the database merges the older ones kept for the same ETag
+                  const plan = keptPlan({ document: documentOf(name), etag, distTags, versions, reserve: side, at });
+
+                  if (plan !== null) plans.push(side.holdPlan(plan));
+                }
+
+                return answer;
+              };
+
+              /** From a kept row npm said still holds: each choice's versions, from the row's records, scored now. */
+              const fromRow = (name: string, entry: { row: HeldRow; holding: ReturnType<KeptSide["hold"]> }): Summarized<S> => {
+                const { row } = entry;
+                entry.holding.inUse = true;
+
+                try {
+                  return keptOf(name, keptPackage(name, row), false, (scored) => {
+                    const byVersion = new Map(scored.versions.map((v) => [v.version, v] as const));
+                    const versions = new Map<string, readonly VersionRecord[]>();
+
+                    for (const c of choices(name)) {
+                      const list = row.kept.lists[c.key]?.versions ?? [];
+                      const records = list.flatMap((v) => byVersion.get(v) ?? []);
+
+                      if (records.length !== list.length) return null;
+                      versions.set(c.key, records);
+                    }
+
+                    return versions;
+                  });
+                } finally {
+                  entry.holding.inUse = false;
+                }
+              };
+
+              /** One read of `name` from npm (with `etag`, a conditional one), answered while what it read is held. */
+              const readOnce = (name: string, etag: string | null): Effect.Effect<Summarized<S> | "row-gone"> =>
+                Effect.suspend(() => {
+                  const readLease = lease.child();
+
+                  return Effect.map(listedOrSame(name, readLease, etag), (l): Summarized<S> | "row-gone" => {
+                    if (l.kind === "not-modified") {
+                      const entry = rows.get(name);
+
+                      return entry === undefined ? "row-gone" : fromRow(name, entry);
+                    }
+
+                    return l.kind === "found" ? fromPackage(name, l.pkg, true) : l;
+                  }).pipe(Effect.ensuring(Effect.sync(() => readLease.release())));
+                });
+
+              const one = (name: string): Effect.Effect<Summarized<S>> =>
+                Effect.gen(function* () {
+                  const cached = probeCacheFor(lease.pool, baseUrl, ttlMs).entry(name, yield* now);
+
+                  if (cached !== undefined) {
+                    if (cached.value.kind !== "found") return cached.value;
+                    const pin = lease.pool.backgroundLease();
+
+                    if (cached.block !== null) pin.hold(cached.block);
+
+                    try {
+                      return fromPackage(name, cached.value.pkg, false);
+                    } finally {
+                      pin.release();
+                    }
+                  }
+
+                  const entry = rows.get(name);
+                  const got = yield* readOnce(name, entry !== undefined && holds(name, entry.row) ? entry.row.etag : null);
+
+                  // the row was given up to the pool while npm was asked: the packument is read whole
+                  if (got !== "row-gone") return got;
+                  const again = yield* readOnce(name, null);
+
+                  return again === "row-gone" ? { kind: "unknown" as const } : again;
+                });
+
+              const first = yield* Effect.forEach(wanted, (name) => Effect.map(one(name), (s) => [name, s] as const), { concurrency: PROBE_CONCURRENCY });
+              const out = new Map<string, Summarized<S>>(first);
+
+              // a package that did not fit beside the others is read again alone: nothing keeping holds is in its way
+              for (const [name, s] of first) if (s.kind === "over-budget") out.set(name, yield* one(name));
+
+              // every package has its answer: no row is needed any more
+              for (const entry of rows.values()) side.letGo(entry.holding);
+              rows.clear();
+
+              if (plans.length === 0) return out;
+              const writer = yield* Effect.serviceOption(ChoicesWriter);
+
+              // the planned rows are written after the response, on a connection and a lease of their own, the side
+              // holding them until then (combined review of 67d8658, finding 4); without a writer (no Worker request),
+              // now, each under a short reservation of `lease`
+              if (Option.isSome(writer)) {
+                handedOff = true;
+                yield* writer.value.later(
+                  Effect.gen(function* () {
+                    yield* keepPlans({ store: yield* Store, plans, at: t, lease: yield* RequestMemory });
+                  }).pipe(Effect.ensuring(Effect.sync(() => side.close()))),
+                );
+              } else yield* keepPlans({ store, plans, at: t, lease });
+
+              return out;
+            });
+
+            return yield* batch.pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (!handedOff) side.close();
+                }),
+              ),
+            );
+          });
+
+        /**
          * Each version's devDependencies as npm lists them, read apart (DEV_DEPENDENCIES) and never kept in the isolate.
          * Converting them is charged (packageMoment) before it is done, and stays charged with the read while the
          * request holds the answer.
@@ -1076,7 +1418,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           Effect.gen(function* () {
             const t = yield* now;
             const url = `${baseUrl}${encodeName(name)}`;
-            const answer = yield* fetchPackument({ url, now: t, profile: DEV_DEPENDENCIES, lease }).pipe(Effect.orElseSucceed(() => null));
+            const answer = yield* fetchPackument({ name, url, now: t, profile: DEV_DEPENDENCIES, lease }).pipe(Effect.orElseSucceed(() => null));
 
             if (answer?.kind !== "ok") return null;
             const { read } = answer;
@@ -1155,35 +1497,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           probe,
           probeWithin,
           listing,
-          etagOf: (name) =>
-            Effect.gen(function* () {
-              const t = yield* now;
-
-              // npm just failed a small read for this package: no HEAD now, the caller reads the packument
-              if (caches.failures.get(name, t) !== undefined) return { kind: "unknown" } satisfies UpstreamEtag;
-
-              const got = yield* Effect.promise(async (): Promise<UpstreamEtag> => {
-                const start = performance.now();
-
-                try {
-                  const res = await fetch(`${baseUrl}${encodeName(name)}`, { method: "HEAD", headers: { accept: "application/json" }, signal: AbortSignal.timeout(NPM_SMALL_READ_TIMEOUT_MS) });
-
-                  await res.body?.cancel();
-
-                  if (res.status === 404) return { kind: "absent" };
-
-                  return res.status === 200 ? { kind: "found", etag: res.headers.get("etag") } : { kind: "unknown" };
-                } catch {
-                  return { kind: "unknown" };
-                } finally {
-                  timing?.add("npm-head", performance.now() - start);
-                }
-              });
-
-              if (got.kind === "unknown") caches.failures.set(name, true, t);
-
-              return got;
-            }),
+          listingIfChanged: listedOrSame,
           versionOf: (name, version) =>
             Effect.gen(function* () {
               const key = `${name}@${version}`;
@@ -1228,6 +1542,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }),
           probeMany,
           summaries,
+          chosen,
           devDependencies,
           get: (name, lease) => Effect.map(probe(name, lease), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>

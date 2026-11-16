@@ -15,6 +15,7 @@ import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { Store, type StoreFault } from "./db.ts";
 import type { HttpFailure, InfraError } from "./errors.ts";
 import { fail, failureResponse, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
+import { ChoicesWriter, dropStaleChoices } from "./kept-choices.ts";
 import { route } from "./router.ts";
 import { ISOLATE_POOL, RequestMemory } from "./memory.ts";
 import { legacyAuthRefusal } from "./startup.ts";
@@ -206,7 +207,7 @@ export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis 
 export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, faults: ReadonlySet<StoreFault> = new Set()) {
   const run = runServices(env, settings, clock, background, faults);
 
-  return background === null || settings.upstreamUrl === null ? run : Layer.merge(run, keptRefresh(env, settings, clock, background));
+  return background === null || settings.upstreamUrl === null ? run : Layer.mergeAll(run, keptRefresh(env, settings, clock, background), choicesWriter(env, settings, clock, background));
 }
 
 /** servicesFor without KeptRefresh: what a refresh after the response runs on. */
@@ -242,6 +243,26 @@ function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
             // it does after a view that read it; without KeptRefresh, so a refresh starts no other
             Effect.runPromiseExit(runRefresh(name).pipe(Effect.provide(runServices(env, settings, clock, background, new Set())), Effect.scoped)).then((exit) => {
               if (Exit.isFailure(exit)) logFailure("kept-package-refresh", { name }, Cause.pretty(exit.cause));
+            }),
+          ),
+        ),
+    }),
+  );
+}
+
+/**
+ * A resolve's kept choices written after the response (kept-choices.ts), on services of its own: the request's
+ * connection and memory lease close with the request, and the answer never waits on the write.
+ */
+function choicesWriter(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void) {
+  return Layer.succeed(
+    ChoicesWriter,
+    ChoicesWriter.of({
+      later: (write) =>
+        Effect.sync(() =>
+          background(
+            Effect.runPromiseExit(write.pipe(Effect.provide(runServices(env, settings, clock, background, new Set())), Effect.scoped)).then((exit) => {
+              if (Exit.isFailure(exit)) logFailure("kept-choices-write", {}, Cause.pretty(exit.cause));
             }),
           ),
         ),
@@ -375,13 +396,13 @@ const refreshPopular = refreshLatestScores.pipe(
   Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "latest-score-refresh", refreshed: n }))) : Effect.void)),
 );
 
-/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations. Requeues analyses the platform stopped, then refreshes popular-scores' kept answers. */
+/** Writes down what time already decided: pending revokes past 24h, staged versions past their deadline, and drops spent factor challenges and confirmations and kept upstream choices nobody asked about for a week. Requeues analyses the platform stopped, then refreshes popular-scores' kept answers. */
 export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.system): Promise<void> {
   const env = parseEnv(rawEnv);
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

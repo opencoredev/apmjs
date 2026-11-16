@@ -121,6 +121,34 @@ const TextSize = z.object({ octets: z.number().int().min(0), separators: z.numbe
 
 export type TextSize = z.infer<typeof TextSize>;
 
+/** A version's record as upstream_choices keeps it (migration 0021): its manifest summarized, and no score. */
+const KeptRecord = VersionRow.omit({ score: true });
+
+/**
+ * What upstream_choices keeps of an upstream package (upstream.ts, chosen): its dist-tags, the versions each choice took,
+ * newest first, by the choice's key, with when that choice was made (`at`, ms), and the record of every one of them.
+ */
+export const KeptChoices = z.object({
+  distTags: z.record(z.string(), z.string()),
+  lists: z.record(z.string(), z.object({ at: z.number(), versions: z.array(z.string()) })),
+  records: z.record(z.string(), KeptRecord),
+});
+
+export type KeptChoices = z.infer<typeof KeptChoices>;
+
+/**
+ * A kept row as read: the document it was kept for (the URL the packument was asked for at), the ETag of the
+ * packument its choices were made from, when it was last written (`fetchedAt`), and the size of its text as sent.
+ */
+export type KeptChoicesRow = { document: string; etag: string; fetchedAt: number; kept: KeptChoices; size: TextSize };
+
+/** What a read of kept rows is charged per octet, per separator and per object of their text (textReadWeight). */
+export type TextCoefficients = { octet: number; node: number; object: number };
+
+const KeptChoicesOut = z
+  .object({ document: z.string(), etag: z.string(), fetched_at: Int, kept: KeptChoices, octets: Int, separators: Int, objects: Int })
+  .transform((r): KeptChoicesRow => ({ document: r.document, etag: r.etag, fetchedAt: r.fetched_at, kept: r.kept, size: { octets: r.octets, separators: r.separators, objects: r.objects } }));
+
 const VersionSizeRow = z
   .object({
     package: z.string(),
@@ -324,6 +352,12 @@ const LATEST_SCORE_INSERT_LOCK = 0x617_06d_4c53;
 // Serializes new kept_packages rows the same way (a package's first view after apm scored it).
 const KEPT_PACKAGE_INSERT_LOCK = 0x617_06d_4b50;
 
+/** The advisory lock writers of upstream_choices take (writeChoices): one writer at a time, and a busy lock skips the write. */
+export const KEPT_CHOICES_INSERT_LOCK = 0x617_06d_4b43;
+
+/** How often a read marks a kept row asked: the cron drops rows by it, a week at a time. */
+const KEPT_CHOICES_ASKED_MARK_MS = 60 * 60_000;
+
 // The first key of the two-key advisory locks on blob keys ("blob"); the second is the key's hash. Two-key
 // advisory locks never conflict with one-key ones such as STAGED_INSERT_LOCK.
 const BLOB_LOCK_CLASS = 0x626c_6f62;
@@ -516,6 +550,30 @@ export type StoreApi = {
   readonly failKeptRefresh: (input: { name: string; at: number; retryMs: number; maxRetryMs: number }) => Effect.Effect<void, StoreError>;
   /** Drops kept summaries last asked about before `askedBefore`, or the one for `name`. */
   readonly dropKeptPackages: (input: { kind: "asked-before"; askedBefore: number } | { kind: "name"; name: string }) => Effect.Effect<void, StoreError>;
+  /**
+   * The kept choices of each of `documents` (migration 0021), in one statement, each sent only while what the rows sent
+   * so far hold once read (textReadWeight, by `weights`) stays within `allowance`; a row past it is left out. Each one
+   * sent is marked asked at `at` (at most once an hour), so the cron keeps it.
+   */
+  readonly keptChoicesOf: (input: { documents: readonly string[]; allowance: number; weights: TextCoefficients; at: number }) => Effect.Effect<KeptChoicesRow[], StoreError>;
+  /**
+   * Keeps each row (its JSON text, as `text`) at most `maxBytes` as Postgres stores it, in one statement with each value
+   * its own parameter: a document that has one is replaced; a new one is added only while the table holds fewer than
+   * `capacity`. Writers queue behind each other, so two cannot both take the last place. The rows name distinct documents.
+   */
+  readonly keepChoices: (input: { rows: readonly { document: string; etag: string; text: string }[]; at: number; capacity: number; maxBytes: number; maxChoices: number; maxAgeMs: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * keepChoices a row at a time: `write` is run inside one transaction that holds the writers' lock, and each `put`
+   * keeps one row (at most `maxBytes` as stored; a new one only while the table holds fewer than `capacity`), so the
+   * caller can build each row's text just before it is put and let it go just after (kept-choices.ts, keepPlans).
+   * Keeping is optional: when another writer holds the lock, nothing is written and `write` is not run, rather than
+   * waiting on it (combined review of 67d8658, finding 4). Each `put` is merged into the row kept for the same
+   * document and ETag here, in the database: its choices that hold (younger than `maxAgeMs`) and fit beside the new
+   * ones (`maxChoices`, `maxBytes`) stay; the Worker never reads them back to merge (re-check of 51fc813).
+   */
+  readonly writeChoices: <E, R>(input: { at: number; capacity: number; maxBytes: number; maxChoices: number; maxAgeMs: number }, write: (put: (row: { document: string; etag: string; text: string }) => Effect.Effect<void, StoreError>) => Effect.Effect<void, E, R>) => Effect.Effect<void, E | StoreError, R>;
+  /** Drops kept choices nobody asked about since `askedBefore`. */
+  readonly dropKeptChoices: (input: { askedBefore: number }) => Effect.Effect<void, StoreError>;
   /**
    * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
    * keyed `"<name> <version>"`, in one query however many versions are asked for.
@@ -1235,6 +1293,87 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         ? run("dropKeptPackages", sql`DELETE FROM kept_packages WHERE package = ${which.name}`, none)
         : run("dropKeptPackages", sql`DELETE FROM kept_packages WHERE asked_at < ${which.askedBefore}`, none),
 
+    keptChoicesOf: ({ documents, allowance, weights, at }) =>
+      documents.length === 0
+        ? Effect.succeed([])
+        : run(
+            "keptChoicesOf",
+            // the CTE's update runs whether or not the select reads it; the select sees the rows as they were
+            sql`WITH asked AS (
+                  UPDATE upstream_choices SET asked_at = ${at} WHERE document = ANY(${[...documents]}) AND asked_at < ${at - KEPT_CHOICES_ASKED_MARK_MS}
+                ),
+                sized AS (
+                  SELECT document, etag, fetched_at, kept,
+                         octet_length(t)::int AS octets,
+                         (octet_length(t) - octet_length(translate(t, ':,[', '')))::int AS separators,
+                         (octet_length(t) - octet_length(replace(t, '{', '')))::int AS objects
+                  FROM (SELECT document, etag, fetched_at, kept, kept::text AS t FROM upstream_choices WHERE document = ANY(${[...documents]})) AS c
+                ),
+                weighed AS (
+                  SELECT *, sum(${weights.octet}::bigint * octets + ${weights.node}::bigint * (1 + separators) + ${weights.object}::bigint * objects) OVER (ORDER BY document) AS running FROM sized
+                )
+                SELECT document, etag, fetched_at, kept, octets, separators, objects FROM weighed WHERE running <= ${allowance}`,
+            all(KeptChoicesOut),
+          ),
+    writeChoices: ({ at, capacity, maxBytes, maxChoices, maxAgeMs }, write) =>
+      // anyone can name any package: a new row only while there is room, one writer at a time (a busy lock skips
+      // the write, never waits); a row past maxBytes as stored is never kept (review of 3aacc2a, finding 6)
+      api.tx(
+        Effect.gen(function* () {
+          const got = yield* run("keepChoices: lock", sql`SELECT pg_try_advisory_xact_lock(${KEPT_CHOICES_INSERT_LOCK}) AS got`, one(z.object({ got: z.boolean() })));
+
+          if (got?.got !== true) return;
+
+          // the merge (re-check of 51fc813): a row kept for the same document and the same strong ETag (non-empty, not
+          // W/) keeps its choices this write does not make while each holds (younger than maxAgeMs, every version's
+          // record there), newest first, up to maxChoices in all with this write's, with their records; this write's
+          // choices and records win. Merged past maxBytes, only this write's choices are kept. Another ETag, or a weak
+          // or empty one: the row is replaced.
+          yield* write((r) =>
+            run(
+              "keepChoices: upsert",
+              sql`WITH incoming AS (SELECT ${r.text}::jsonb AS kept),
+                  -- merged only under a strong, non-empty ETag (RFC 9110, 8.8.1): a weak or empty one replaces the row, whatever
+                  -- the Worker checked (review of acdb8eb, finding 3)
+                  old AS (SELECT u.kept FROM upstream_choices u WHERE u.document = ${r.document} AND u.etag = ${r.etag} AND ${r.etag} <> '' AND left(${r.etag}, 2) <> 'W/'),
+                  older AS (
+                    SELECT l.key, l.value
+                      FROM old, jsonb_each(old.kept->'lists') AS l, incoming
+                     WHERE NOT (incoming.kept->'lists' ? l.key)
+                       AND (l.value->>'at')::bigint > ${at - maxAgeMs}
+                       AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(l.value->'versions') AS v(version) WHERE NOT (old.kept->'records' ? v.version))
+                     ORDER BY (l.value->>'at')::bigint DESC, l.key
+                     LIMIT greatest(0, ${maxChoices} - (SELECT count(*) FROM incoming, jsonb_object_keys(incoming.kept->'lists')))
+                  ),
+                  older_records AS (
+                    SELECT DISTINCT v.version, old.kept->'records'->v.version AS record
+                      FROM older, old, jsonb_array_elements_text(older.value->'versions') AS v(version)
+                  ),
+                  merged AS (
+                    SELECT jsonb_build_object(
+                             'distTags', incoming.kept->'distTags',
+                             'lists', coalesce((SELECT jsonb_object_agg(key, value) FROM older), '{}'::jsonb) || (incoming.kept->'lists'),
+                             'records', coalesce((SELECT jsonb_object_agg(version, record) FROM older_records), '{}'::jsonb) || (incoming.kept->'records')
+                           ) AS kept
+                      FROM incoming
+                  ),
+                  kept AS (
+                    SELECT CASE WHEN octet_length(merged.kept::text) <= ${maxBytes} THEN merged.kept ELSE incoming.kept END AS kept FROM merged, incoming
+                  )
+                  INSERT INTO upstream_choices (document, etag, kept, fetched_at, asked_at)
+                  SELECT ${r.document}, ${r.etag}, kept.kept, ${at}, ${at}
+                    FROM kept
+                   WHERE octet_length(kept.kept::text) <= ${maxBytes}
+                     AND (EXISTS (SELECT 1 FROM upstream_choices WHERE document = ${r.document}) OR (SELECT count(*) FROM upstream_choices) < ${capacity})
+                  ON CONFLICT (document) DO UPDATE SET etag = EXCLUDED.etag, kept = EXCLUDED.kept, fetched_at = EXCLUDED.fetched_at, asked_at = EXCLUDED.asked_at`,
+              none,
+            ),
+          );
+        }),
+      ),
+    keepChoices: ({ rows, at, capacity, maxBytes, maxChoices, maxAgeMs }) => api.writeChoices({ at, capacity, maxBytes, maxChoices, maxAgeMs }, (put) => Effect.forEach(rows, put, { discard: true })),
+    dropKeptChoices: ({ askedBefore }) => run("dropKeptChoices", sql`DELETE FROM upstream_choices WHERE asked_at < ${askedBefore}`, none),
+
     upstreamAnalysesOf: (names) =>
       Effect.gen(function* () {
         const out = new Map<string, UpstreamAnalyses>();
@@ -1250,19 +1389,29 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           return got;
         };
 
-        const rows = yield* run(
+        // the analyses, the decided outcomes and the live dismissals in one round trip, as upstreamAnalyses reads them
+        // for one package: the walk reads them once a level
+        const row = yield* run(
           "upstreamAnalysesOf",
-          sql`SELECT package, version, digest, analysis FROM upstream_analysis WHERE package = ANY(${wanted}) AND scorer = ${SCORER}`,
-          all(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
+          sql`SELECT
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND u.scorer = ${SCORER}) AS analyses,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS decided,
+                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
+                   FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL) AS dismissals`,
+          one(
+            z.object({
+              analyses: z.array(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
+              decided: z.array(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
+              dismissals: z.array(DismissalRow),
+            }),
+          ),
         );
 
-        const decided = yield* run(
-          "upstreamOutcomesOf",
-          sql`SELECT package, version, outcome, detail FROM analysis_outcomes WHERE package = ANY(${wanted}) AND scorer = ${SCORER} AND outcome IS NOT NULL`,
-          all(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
-        );
-
-        const dismissals = yield* dismissalsOf([...new Set(rows.map((r) => r.package))]);
+        const rows = row?.analyses ?? [];
+        const decided = row?.decided ?? [];
+        const dismissals = row?.dismissals ?? [];
 
         for (const r of rows) of(r.package).scores.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
 

@@ -342,9 +342,18 @@ export class MemoryPool {
     return made;
   }
 
-  /** `reclaim` is asked for room before a take is refused. */
-  onPressure(reclaim: Reclaimer): void {
-    this.reclaimers.push(reclaim);
+  /**
+   * `reclaim` is asked for room before a take is refused. With `first`, it is asked before every other: for holders
+   * whose room is worth least (upstream.ts, kept choices: a cache of a cache, never worth an answer).
+   */
+  onPressure(reclaim: Reclaimer, order: { first: boolean } = { first: false }): void {
+    if (order.first) this.reclaimers.unshift(reclaim);
+    else this.reclaimers.push(reclaim);
+  }
+
+  /** The room left before a take would have to ask a holder to give some back. */
+  get unused(): number {
+    return Math.max(0, this.limit - this.used);
   }
 
   /** @internal */

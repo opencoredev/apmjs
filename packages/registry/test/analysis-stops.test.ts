@@ -111,13 +111,24 @@ const STUB: UpstreamApi = {
           }),
         ),
       ),
+    chosen: ({ names, lease, choices, keep }) =>
+      Effect.succeed(
+        new Map(
+          names.map((n) => {
+            const p = pkg();
+            const kept = keep({ name: n, distTags: p.distTags, versions: new Map(choices(n).map((c) => [c.key, c.choose(p)] as const)) }, lease);
+
+            return [n, kept ? { kind: "found" as const, summary: kept.summary } : { kind: "over-budget" as const }];
+          }),
+        ),
+      ),
     listing: () => Effect.succeed({ kind: "unknown" }),
     get: () => Effect.succeed(pkg()),
     tarball: () => Effect.succeed({ kind: "ok", bytes: BYTES, digest: { algo: "sha512", hex: createHash("sha512").update(BYTES).digest("hex") } }),
     // no tarball route runs in this file
     serve: () => Effect.succeed({ kind: "absent" }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
-    etagOf: () => Effect.succeed({ kind: "unknown" }),
+    listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
     versionOf: () => Effect.succeed({ kind: "unknown" }),
 };
 
