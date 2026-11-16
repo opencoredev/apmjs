@@ -26,43 +26,45 @@ export function AgentSetup() {
   const setup = SETUPS[key];
 
   return (
-    <section aria-labelledby="agent-setup" className="grid gap-y-4 lg:grid-cols-4 lg:gap-x-2">
-      <div className="flex flex-col gap-3 lg:col-span-2 lg:pr-10">
-        <h2 id="agent-setup" className="text-[15px] font-medium">
-          Set up your coding agent
-        </h2>
-        <p className="text-sm leading-6 text-pretty text-muted-foreground">
-          apm&apos;s MCP server lets Claude Code, Codex or Cursor check a package before adding it: the score, the 24-hour cooldown and the dependency tree. It is read-only and
-          needs no account.
-        </p>
-      </div>
-      <div className="flex min-w-0 flex-col items-start gap-3 lg:col-span-2 lg:pt-8">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <Button variant="secondary" onClick={() => prompt.copy(setupPrompt())}>
-            {prompt.state === "copied" ? <CopyGlyph copied /> : <BotIcon aria-hidden />}
-            {prompt.state === "copied" ? "Prompt copied" : "Copy setup prompt"}
-          </Button>
-          <span className="text-[13px] leading-5 text-muted-foreground">Paste it into your agent. It connects apm and adds a rule to your agent&apos;s instructions.</span>
+    <section aria-labelledby="agent-setup" className="overflow-hidden rounded-xl border">
+      <div className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between sm:gap-6 sm:p-5">
+        <div className="flex min-w-0 gap-3.5">
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-surface text-muted-foreground" aria-hidden>
+            <BotIcon className="size-[18px]" />
+          </span>
+          <div className="flex min-w-0 flex-col gap-1">
+            <h2 id="agent-setup" className="text-[15px] leading-6 font-medium">
+              Set up your coding agent
+            </h2>
+            <p className="max-w-[60ch] text-[13px] leading-5 text-pretty text-muted-foreground">
+              Paste one prompt into Claude Code, Codex or Cursor, and your agent checks a package&apos;s score, 24-hour cooldown and dependencies before adding it.{" "}
+              <span className="whitespace-nowrap">Read-only, no account needed.</span>
+            </p>
+          </div>
         </div>
-        <CopyStatus state={prompt.state} manual="Couldn't copy automatically. Open “Set up by hand” and copy the setting instead." />
-        <div className="flex items-center gap-4 text-sm">
-          <button
-            type="button"
-            aria-expanded={manual}
-            aria-controls="agent-setup-manual"
-            onClick={() => setManual((v) => !v)}
-            className="inline-flex items-center gap-1 text-muted-foreground transition-colors hover:text-foreground"
-          >
-            Set up by hand
-            <ChevronDownIcon className={cn("size-3.5 transition-transform duration-150", manual && "rotate-180")} aria-hidden />
-          </button>
-          <Link href="/docs#agents" className="inline-flex items-center gap-1 font-medium underline-offset-4 hover:underline">
-            Agent guide
-            <ArrowRightIcon className="size-3.5" aria-hidden />
-          </Link>
-        </div>
+        <Button size="lg" className="w-full sm:w-auto" onClick={() => prompt.copy(setupPrompt(), () => setManual(true))}>
+          <CopyGlyph copied={prompt.state === "copied"} className="[&_svg]:text-current" />
+          {prompt.state === "copied" ? "Prompt copied" : "Copy setup prompt"}
+        </Button>
       </div>
-      <div id="agent-setup-manual" hidden={!manual} className="mt-2 min-w-0 flex-col gap-4 lg:col-span-4 [&:not([hidden])]:flex">
+      <CopyStatus state={prompt.state} className="px-4 pb-3 sm:px-5" manual="Couldn't copy automatically. Copy the setting below instead." />
+      <div className="flex items-center justify-between gap-4 border-t bg-surface/40 px-4 py-2.5 text-[13px] sm:px-5">
+        <button
+          type="button"
+          aria-expanded={manual}
+          aria-controls="agent-setup-manual"
+          onClick={() => setManual((v) => !v)}
+          className="-mx-1 inline-flex h-7 items-center gap-1 rounded-md px-1 text-muted-foreground transition-colors hover:text-foreground"
+        >
+          Set up by hand
+          <ChevronDownIcon className={cn("size-3.5 transition-transform duration-150", manual && "rotate-180")} aria-hidden />
+        </button>
+        <Link href="/docs#agents" className="-mx-1 inline-flex h-7 items-center gap-1 rounded-md px-1 text-muted-foreground transition-colors hover:text-foreground">
+          Agent guide
+          <ArrowRightIcon className="size-3.5" aria-hidden />
+        </Link>
+      </div>
+      <div id="agent-setup-manual" hidden={!manual} className="min-w-0 flex-col gap-4 border-t p-4 sm:p-5 [&:not([hidden])]:flex">
         <Tabs
           value={key}
           onValueChange={(v) => {
