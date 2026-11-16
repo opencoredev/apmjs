@@ -1,7 +1,7 @@
 "use client";
 
-// The home page's agent setup: a prompt that has a coding agent connect apm's MCP server itself, or the one
-// setting per agent to add by hand, plus the line that tells the agent when to call it. Static: no data reads.
+// The home page's agent setup: a prompt that has a coding agent save the line that tells it to check packages with
+// apm (over plain HTTP, so any agent can), or that line to add by hand, with apm's MCP server as an option. Static.
 import Link from "next/link";
 import { useState } from "react";
 import { cn } from "cn";
@@ -37,7 +37,7 @@ export function AgentSetup() {
               Set up your coding agent
             </h2>
             <p className="max-w-[60ch] text-[13px] leading-5 text-pretty text-muted-foreground">
-              Paste one prompt into Claude Code, Codex or Cursor, and your agent checks a package&apos;s score, 24-hour cooldown and dependencies before adding it.{" "}
+              Paste one prompt into Claude Code, Codex, Cursor or any other coding agent, and it checks a package&apos;s score, 24-hour cooldown and dependencies before adding it.{" "}
               <span className="whitespace-nowrap">Read-only, no account needed.</span>
             </p>
           </div>
@@ -64,24 +64,27 @@ export function AgentSetup() {
           <ArrowRightIcon className="size-3.5" aria-hidden />
         </Link>
       </div>
-      <div id="agent-setup-manual" hidden={!manual} className="min-w-0 flex-col gap-4 border-t p-4 sm:p-5 [&:not([hidden])]:flex">
-        <Tabs
-          value={key}
-          onValueChange={(v) => {
-            if (isKey(v)) setKey(v);
-          }}
-        >
-          <TabsList aria-label="Agent" className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
-            {KEYS.map((k) => (
-              <TabsTrigger key={k} value={k} className="h-7 rounded-md px-2.5 text-[13px] data-active:bg-background data-active:shadow-xs dark:data-active:bg-input">
-                {SETUPS[k].agent}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
-        <CopyBlock key={key} text={setup.text} label={`Copy the ${setup.agent} setting`} caption={setup.kind === "command" ? `${setup.where}:` : `In ${setup.where}:`} />
-        <CopyBlock wrap text={INSTRUCTIONS_LINE} label="Copy the instructions line" caption="Then add this line to AGENTS.md, CLAUDE.md or a Cursor rule:" />
-        <p className="text-[13px] leading-5 text-muted-foreground">Start a new agent session afterwards: the server loads when a session starts.</p>
+      <div id="agent-setup-manual" hidden={!manual} className="min-w-0 flex-col gap-6 border-t p-4 sm:p-5 [&:not([hidden])]:flex">
+        <CopyBlock wrap text={INSTRUCTIONS_LINE} label="Copy the instructions line" caption="Add this line to AGENTS.md, CLAUDE.md or a Cursor rule. Any agent that can fetch a URL can follow it." />
+        <div className="flex min-w-0 flex-col gap-3">
+          <p className="text-[13px] text-muted-foreground">Optional: connect apm&apos;s MCP server, so the agent gets the verdict as a tool call.</p>
+          <Tabs
+            value={key}
+            onValueChange={(v) => {
+              if (isKey(v)) setKey(v);
+            }}
+          >
+            <TabsList aria-label="Agent" className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
+              {KEYS.map((k) => (
+                <TabsTrigger key={k} value={k} className="h-7 rounded-md px-2.5 text-[13px] data-active:bg-background data-active:shadow-xs dark:data-active:bg-input">
+                  {SETUPS[k].agent}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          <CopyBlock key={key} text={setup.text} label={`Copy the ${setup.agent} setting`} caption={setup.kind === "command" ? `${setup.where}:` : `In ${setup.where}:`} />
+          <p className="text-[13px] leading-5 text-muted-foreground">Start a new agent session afterwards: the server loads when a session starts.</p>
+        </div>
       </div>
     </section>
   );
