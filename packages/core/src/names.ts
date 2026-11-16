@@ -7,6 +7,21 @@ export function isValidPackageName(name: string): boolean {
   return name.length > 0 && name.length <= 214 && NAME_RE.test(name);
 }
 
+/**
+ * Whether npm could hold a package of this name, old names included (validate-npm-package-name's rules for old
+ * packages: uppercase and URL-safe punctuation pass): an optional `@scope/` and a name, each URL-safe as written, not
+ * starting with "." or "_", no surrounding spaces. Anything else npm refuses itself (a 405 for an encoded slash), so
+ * there is nothing to ask it about.
+ */
+export function isPossibleNpmName(name: string): boolean {
+  const m = /^(?:@([^/]+)\/)?([^/]+)$/.exec(name);
+
+  if (!m || name.startsWith(".") || name.startsWith("_") || name.trim() !== name) return false;
+  const [, scope, base] = m;
+
+  return [scope, base].every((part) => part === undefined || encodeURIComponent(part) === part);
+}
+
 export function isScoped(name: string): boolean {
   return name.startsWith("@");
 }

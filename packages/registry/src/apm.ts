@@ -30,6 +30,7 @@ import {
   typoConflicts,
   editDistance,
   isValidPackageName,
+  isPossibleNpmName,
   isValidVersion,
   dependencyNames,
   missingEntries,
@@ -3531,7 +3532,9 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     if (p.startsWith("/-/")) return null;
     const sp = splitPath(p);
 
-    if (!sp || (yield* (yield* Store).getPackage(sp.name))) return null;
+    // a name npm cannot have (a scanner's /backend%2f.env) is not found here either: asking npm gets a 405, which
+    // would read as the upstream failing
+    if (!sp || !isPossibleNpmName(sp.name) || (yield* (yield* Store).getPackage(sp.name))) return null;
     // the packument and the devDependencies the full one adds back are held together under the request's lease until
     // the answer is sent
     const lease = yield* RequestMemory;

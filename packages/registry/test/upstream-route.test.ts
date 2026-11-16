@@ -6,6 +6,9 @@
 //   npm reports as a package that does not exist. It is now a 503 with Retry-After.
 // - review of f0e533a, finding 1: the full packument's devDependencies were read with no budget beside the packument
 //   the request already held. Both now share the request's budget (REQUEST_METADATA_WEIGHT).
+// - sweep of 2026-11-16: a path that names no possible npm package (/backend%2f.env, a scanner's) was sent to npm,
+//   which answers 405, and that became the 503 "could not be read", so a probe for a secret file looked like an outage.
+//   A name npm cannot have now gets the protocol route's 404 without asking npm.
 // npm is a local stand-in on 127.0.0.1; no real host is contacted.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -62,13 +65,22 @@ const HEAVY = JSON.stringify({
   ),
 });
 
-/** npm, standing in: `viewed`; `heavy`; `down`, which fails with a 500; `broken`, whose packument is not JSON; nothing else. */
+/**
+ * npm, standing in: `viewed`; `heavy`; `down`, which fails with a 500; `broken`, whose packument is not JSON; a 405 for
+ * an unscoped name with an encoded slash, as npm answers one; nothing else. `asked` lists every path it was sent.
+ */
 function fakeNpm() {
+  const asked: string[] = [];
+
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     fetch(req) {
       const path = new URL(req.url).pathname;
+
+      asked.push(path);
+
+      if (!path.startsWith("/@") && /%2f/i.test(path)) return Response.json({ error: "Method not allowed" }, { status: 405 });
 
       if (path === "/viewed") return Response.json(VIEWED);
 
@@ -83,7 +95,7 @@ function fakeNpm() {
     },
   });
 
-  return { url: server.url.href, stop: () => server.stop(true) };
+  return { url: server.url.href, asked, stop: () => server.stop(true) };
 }
 
 let db: Awaited<ReturnType<typeof freshDatabase>>;
@@ -172,5 +184,24 @@ describe("the npm packument route", () => {
   test("a package npm does not have is still not found", async () => {
     // the route leaves it to the protocol route, which answers 404
     expect(await get("/nobody-has-this")).toBeNull();
+  });
+
+  test("a path that names no possible npm package is not found, and npm is not asked", async () => {
+    for (const path of ["/backend%2f.env", "/backend%2F.env", "/.env", "/_private", "/@scope%2fname%2fextra"]) {
+      npm.asked.length = 0;
+
+      // on a7d36f6 npm was asked, answered 405 for the first two, and the route said 503 "could not be read"
+      expect(await get(path)).toBeNull();
+      expect(npm.asked).toEqual([]);
+    }
+  });
+
+  test("old npm names, scoped names and URL-safe punctuation still reach npm", async () => {
+    for (const [path, name] of [["/JSONStream", "JSONStream"], ["/@scope%2fname", "@scope/name"], ["/left-pad", "left-pad"], ["/a~b", "a~b"]] as const) {
+      npm.asked.length = 0;
+      await get(path);
+
+      expect(npm.asked.length, name).toBeGreaterThan(0);
+    }
   });
 });
