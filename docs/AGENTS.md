@@ -57,7 +57,7 @@ In `.cursor/mcp.json` (one project) or `~/.cursor/mcp.json` (every project):
 A line for the agent's instructions file (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules`):
 
 ```md
-Before adding a dependency, call the apm MCP tool explain_install for it and follow the verdict. On review-first, show me the reasons before installing.
+Before adding a dependency, call the apm MCP tool explain_install for it and follow the verdict. On review-first, show me the reasons and install only after I approve. On do-not-install, not-found or unknown, do not install; tell me why. If the apm CLI is installed, install with apm add <name>@<version> --strict, using the version the verdict names; if it is not, ask me before using a plain package manager command.
 ```
 
 ## HTTP, without MCP

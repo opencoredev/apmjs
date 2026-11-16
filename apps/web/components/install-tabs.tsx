@@ -2,43 +2,14 @@
 
 import Link from "next/link";
 import { useRef, useState } from "react";
-import { ArrowRightIcon, CopyIcon, CheckIcon } from "lucide-react";
+import { ArrowRightIcon, BotIcon, ChevronRightIcon } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
+import { CopyBlock, CopyGlyph, CopyStatus, useCopy } from "@/components/copy-button";
 import { INSTALL_CLIENTS, InstallClient, installCommand, installNote, type InstallNote } from "@/lib/install-note";
+import { packagePrompt } from "@/lib/agent-prompt";
 
 const isClient = (v: unknown): v is InstallClient => InstallClient.safeParse(v).success;
-
-/** Clipboard API needs a secure context (HTTPS); fall back to a hidden textarea on plain HTTP. */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard) {
-      await navigator.clipboard.writeText(text);
-
-      return true;
-    }
-  } catch {
-    // fall through to the textarea route
-  }
-
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.setAttribute("readonly", "");
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  let ok = false;
-
-  try {
-    ok = document.execCommand("copy");
-  } catch {
-    ok = false;
-  }
-
-  ta.remove();
-
-  return ok;
-}
 
 function DocsLink({ href }: { href: string }) {
   return (
@@ -49,80 +20,178 @@ function DocsLink({ href }: { href: string }) {
   );
 }
 
+/** Note text with each command-line flag (--strict) set in mono, so the sans face can't join its dashes into a dash. */
+function WithFlags({ text }: { text: string }) {
+  return text.split(/(--[a-z][a-z-]*)/).map((part, i) =>
+    i % 2 === 1 ? (
+      <code key={i} className="font-mono text-[13px] whitespace-nowrap text-foreground">
+        {part}
+      </code>
+    ) : (
+      part
+    ),
+  );
+}
+
 /** What the selected client's command does and does not check, with the setting a stock client needs. */
 function Note({ note }: { note: InstallNote }) {
   if (note.kind === "checked") {
     return (
-      <p className="px-2.5 pt-2.5 pb-1 text-[13px] leading-5 text-pretty text-muted-foreground">
-        {note.text} <DocsLink href={note.docs} />
-      </p>
+      <div className="flex flex-col gap-1 text-sm leading-6 text-pretty text-muted-foreground">
+        <p>
+          {note.text} <DocsLink href={note.docs} />
+        </p>
+        <details className="group">
+          <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-[13px] transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+            <ChevronRightIcon className="size-3.5 transition-transform duration-150 group-open:rotate-90" aria-hidden />
+            What it refuses and warns about
+          </summary>
+          <p className="mt-1">
+            <WithFlags text={note.detail} />
+          </p>
+        </details>
+      </div>
     );
   }
 
   return (
-    <div className="flex flex-col gap-2 px-2.5 pt-2.5 pb-1 text-[13px] leading-5 text-pretty text-muted-foreground">
-      <p className="text-foreground">{note.lead}</p>
-      <figure className="overflow-hidden rounded-lg bg-background ring-1 ring-border">
-        <figcaption className="sr-only">{note.file}</figcaption>
-        <pre className="px-3 py-2 font-mono text-[12.5px] leading-5 whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">{note.config}</pre>
-      </figure>
+    <div className="flex flex-col gap-3 text-sm leading-6 text-pretty text-muted-foreground">
+      <p>{note.lead}</p>
+      <CopyBlock oneLine={!note.config.includes("\n")} text={note.config} label={`Copy the ${note.file} setting`} />
       <p>
-        {note.checks} <DocsLink href={note.docs} />
+        <WithFlags text={note.effect} /> <DocsLink href={note.docs} />
       </p>
+    </div>
+  );
+}
+
+/** A list line's marker (its indent and "1." or "-", or an indent alone) and its text, so wrapped text hangs under the text. */
+const LIST_LINE = /^(\s*(?:\d+\.|-)\s|\s+)(.*)$/;
+
+/** The prompt as it is copied, with each list item's wrapped lines indented under its text. */
+function PromptView({ prompt }: { prompt: string }) {
+  return (
+    <div className="font-mono text-[12.5px] leading-5 text-muted-foreground">
+      {prompt.split("\n").map((line, i) => {
+        const m = LIST_LINE.exec(line);
+
+        if (line === "") return <div key={i} className="h-3" aria-hidden />;
+
+        if (!m) return <p key={i} className="whitespace-pre-wrap [overflow-wrap:anywhere]">{line}</p>;
+
+        return (
+          <p key={i} className="grid grid-cols-[auto_minmax(0,1fr)]">
+            <span className="whitespace-pre">{m[1]}</span>
+            <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{m[2]}</span>
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One click copies a prompt that has a coding agent add the package only after apm's verdict. */
+function AgentPrompt({ name }: { name: string }) {
+  const prompt = packagePrompt({ name });
+  const { state, copy } = useCopy();
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const preRef = useRef<HTMLDivElement>(null);
+
+  return (
+    <div className="flex flex-col gap-2 border-t pt-4">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <Button
+          variant="secondary"
+          onClick={() =>
+            copy(prompt, () => {
+              if (detailsRef.current) detailsRef.current.open = true;
+
+              if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+            })
+          }
+        >
+          {state === "copied" ? <CopyGlyph copied /> : <BotIcon aria-hidden />}
+          {state === "copied" ? "Prompt copied" : "Copy prompt for your agent"}
+        </Button>
+        <span className="text-[13px] leading-5 text-muted-foreground">Paste it into Claude Code, Codex or Cursor. Your agent checks {name} with apm before adding it.</span>
+      </div>
+      <CopyStatus state={state} manual="Couldn't copy automatically. The prompt is selected below: press Ctrl+C or ⌘C." />
+      <details ref={detailsRef} className="group">
+        <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-[13px] text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+          <ChevronRightIcon className="size-3.5 transition-transform duration-150 group-open:rotate-90" aria-hidden />
+          Read the prompt
+        </summary>
+        <div className="relative mt-2 overflow-hidden rounded-xl ring-1 ring-border">
+          <div ref={preRef} className="max-h-80 overflow-auto pt-3 pr-12 pb-8 pl-4">
+            <PromptView prompt={prompt} />
+          </div>
+          <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-linear-to-t from-background to-transparent" />
+          <button
+            type="button"
+            aria-label={state === "copied" ? "Copied" : "Copy the prompt"}
+            className="absolute top-1.5 right-1.5 grid size-9 place-items-center rounded-lg bg-background text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-surface hover:text-foreground active:scale-[0.96]"
+            onClick={() =>
+              copy(prompt, () => {
+                if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+              })
+            }
+          >
+            <CopyGlyph copied={state === "copied"} />
+          </button>
+        </div>
+      </details>
     </div>
   );
 }
 
 export function InstallTabs({ name, version, registry }: { name: string; version: string | null; registry: string }) {
   const [client, setClient] = useState<InstallClient>("apm");
-  const [copied, setCopied] = useState<"yes" | "manual" | false>(false);
+  const { state, copy } = useCopy();
   const codeRef = useRef<HTMLElement>(null);
   const command = installCommand({ client, name, version });
 
   return (
-    <div className="rounded-xl bg-surface p-1.5">
-      <div className="flex items-center justify-between gap-2 px-1.5 pt-0.5 pb-1.5">
-        <span className="text-sm text-muted-foreground">Install</span>
+    <section data-install aria-labelledby="install" className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 id="install" className="scroll-mt-24 text-xl font-medium tracking-tight">
+          Install
+        </h2>
         <Tabs
           value={client}
           onValueChange={(v) => {
             if (isClient(v)) setClient(v);
           }}
         >
-          <TabsList className="h-8 rounded-full bg-transparent p-0">
+          <TabsList className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
             {INSTALL_CLIENTS.map((c) => (
-              <TabsTrigger key={c} value={c} className="h-7 rounded-full px-3 font-mono text-xs data-active:bg-background data-active:shadow-xs">
+              <TabsTrigger key={c} value={c} className="h-7 rounded-md px-2.5 font-mono text-xs data-active:bg-background data-active:shadow-xs dark:data-active:bg-input">
                 {c}
               </TabsTrigger>
             ))}
           </TabsList>
         </Tabs>
       </div>
-      <div className="flex items-center gap-2 rounded-lg bg-background py-1.5 pr-1.5 pl-4 ring-1 ring-border">
+      <div className="flex items-center gap-2 rounded-xl bg-surface py-1.5 pr-1.5 pl-3 sm:pl-4">
         <code ref={codeRef} className="min-w-0 flex-1 truncate font-mono text-[15px]">
           <span className="text-faint select-none">$ </span>
           {command}
         </code>
         <button
           type="button"
-          aria-label={copied === "yes" ? "Copied" : "Copy install command"}
-          className="grid size-9 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-surface hover:text-foreground active:scale-95"
-          onClick={() => {
-            void copyText(command).then((ok) => {
-              setCopied(ok ? "yes" : "manual");
-
-              if (!ok && codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
-              setTimeout(() => setCopied(false), ok ? 1200 : 3000);
-            });
-          }}
+          aria-label={state === "copied" ? "Copied" : "Copy install command"}
+          className="grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-background hover:text-foreground active:scale-[0.96]"
+          onClick={() =>
+            copy(command, () => {
+              if (codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
+            })
+          }
         >
-          {copied === "yes" ? <CheckIcon className="size-4 text-ok" /> : <CopyIcon className="size-4" />}
+          <CopyGlyph copied={state === "copied"} />
         </button>
       </div>
-      <p role="status" aria-live="polite" className={copied === "manual" ? "px-2.5 pt-2 text-[13px] leading-5 text-warn" : "sr-only"}>
-        {copied === "manual" ? "Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." : copied === "yes" ? "Copied" : ""}
-      </p>
+      <CopyStatus state={state} manual="Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." />
       <Note note={installNote({ client, registry })} />
-    </div>
+      <AgentPrompt name={name} />
+    </section>
   );
 }

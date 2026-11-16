@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import { SearchHome } from "@/components/search-home";
 import { RecentActivity, RecentActivitySkeleton } from "@/components/recent-activity";
 import { PopularPackages } from "@/components/popular-packages";
+import { AgentSetup } from "@/components/agent-setup";
 import { JsonLd } from "@/components/json-ld";
 import { pageMetadata, SITE_DESCRIPTION, SITE_TITLE, websiteJsonLd } from "@/lib/agent/seo";
 
@@ -19,6 +20,7 @@ export default function Home() {
         recent={
           <div className="flex flex-col gap-10">
             <PopularPackages />
+            <AgentSetup />
             <Suspense fallback={<RecentActivitySkeleton />}>
               <RecentActivity />
             </Suspense>

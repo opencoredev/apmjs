@@ -11,13 +11,16 @@ export type InstallClient = z.infer<typeof InstallClient>;
 
 export const BUN_SCANNER = "@apm/bun-scanner";
 
-const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your config, and warns about a low score or a version published in the last 24 hours (--strict refuses both).";
+const APM_ADD_CHECKS = "apm add checks the score, cooldown and dependency tree without changing your registry settings, and warns about a score under 40 or a version published in the last 24 hours (--strict refuses both).";
 
 export type InstallNote =
   /** apm add: the checks run before the package manager does. */
-  | { kind: "checked"; text: string; docs: string }
-  /** A stock client: what it skips, the setting that turns the checks on, and what that setting checks. */
-  | { kind: "needs-setup"; lead: string; file: string; config: string; checks: string; docs: string };
+  | { kind: "checked"; text: string; detail: string; docs: string }
+  /**
+   * A stock client: what it skips, the setting that turns the checks on, what that setting does (`effect`), and
+   * `checks`: the effect followed by what apm add checks, for the Markdown view.
+   */
+  | { kind: "needs-setup"; lead: string; file: string; config: string; effect: string; checks: string; docs: string };
 
 /** A registry base URL that ends in "/". */
 function base(registry: string): string {
@@ -51,28 +54,39 @@ export function installNote({ client, registry }: { client: InstallClient; regis
     case "apm":
       return {
         kind: "checked",
-        text: "Checks the score, the 24-hour cooldown and the dependency tree first, then runs your project’s own package manager with the exact version.",
+        text: "With bun, npm or pnpm, apm add checks every package in the dependency tree before anything installs.",
+        detail: "It refuses revoked, yanked and confirmed malicious versions, and warns about a score under 40 or a version under 24 hours old. Warnings still install; --strict refuses them too. With yarn 1, apm can only check after yarn installs.",
         docs: "/docs#cli",
       };
-    case "bun":
+    case "bun": {
+      const effect = "The scanner is not on a registry yet, so the setup guide installs it from a clone of apm. It refuses revoked and confirmed malicious versions and warns about packages scoring under 40 (APM_SCANNER_STRICT=1 refuses them).";
+
       return {
         kind: "needs-setup",
         lead: "Plain bun skips apm’s checks. Point it at apm and add the scanner in bunfig.toml:",
         file: "bunfig.toml",
         config: `[install]\nregistry = "${url}"\n\n[install.security]\nscanner = "${BUN_SCANNER}"`,
-        checks: `The scanner refuses revoked and confirmed-malicious versions and warns about packages scoring under 40 (APM_SCANNER_STRICT=1 refuses them). ${APM_ADD_CHECKS}`,
+        effect,
+        checks: `${effect} ${APM_ADD_CHECKS}`,
         docs: "/docs#bun",
       };
+    }
+
     case "npm":
-    case "pnpm":
+    case "pnpm": {
+      const effect = "~safe hides versions under 24 hours old and versions scoring under 40.";
+
       return {
         kind: "needs-setup",
         lead: `Plain ${client} skips apm’s checks. Set its registry to apm’s ~safe view in .npmrc:`,
         file: ".npmrc",
         config: `registry=${url}~safe/`,
-        checks: `~safe hides versions under 24 hours old and versions scoring under 40. ${APM_ADD_CHECKS}`,
+        effect,
+        checks: `${effect} ${APM_ADD_CHECKS}`,
         docs: "/docs#npm",
       };
+    }
+
     default: {
       const _exhaustive: never = client;
 

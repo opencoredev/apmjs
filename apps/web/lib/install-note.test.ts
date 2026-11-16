@@ -6,14 +6,16 @@ import { BUN_SCANNER, INSTALL_CLIENTS, installCommand, installNote } from "./ins
 const registry = "https://registry.example.dev";
 
 describe("installNote", () => {
-  test("apm add names the score, cooldown and dependency tree and needs no setup", () => {
+  test("apm add names the dependency tree, then what it refuses and warns about, and needs no setup", () => {
     const note = installNote({ client: "apm", registry });
 
     expect(note.kind).toBe("checked");
 
     if (note.kind !== "checked") return;
-    expect(note.text).toContain("score");
-    expect(note.text).toContain("cooldown");
+    expect(note.text).toContain("dependency tree");
+    expect(note.detail).toContain("score under 40");
+    expect(note.detail).toContain("24 hours");
+    expect(note.detail).toContain("--strict");
     expect(note.text).toContain("dependency tree");
     expect(note.docs).toBe("/docs#cli");
   });
@@ -30,6 +32,9 @@ describe("installNote", () => {
     expect(note.config).toContain(`scanner = "${BUN_SCANNER}"`);
     expect(note.lead).toContain("skips apm’s checks");
     expect(note.checks).toContain("apm add checks the score, cooldown and dependency tree");
+    expect(note.checks.startsWith(note.effect)).toBe(true);
+    expect(note.effect).toContain("It refuses revoked");
+    expect(note.effect).toContain("not on a registry yet");
     expect(note.docs).toBe("/docs#bun");
   });
 
@@ -43,6 +48,8 @@ describe("installNote", () => {
     expect(note.config).toBe(`registry=${registry}/~safe/`);
     expect(note.lead).toBe(`Plain ${client} skips apm’s checks. Set its registry to apm’s ~safe view in .npmrc:`);
     expect(note.checks).toContain("apm add checks the score, cooldown and dependency tree");
+    expect(note.checks.startsWith(note.effect)).toBe(true);
+    expect(note.effect).toBe("~safe hides versions under 24 hours old and versions scoring under 40.");
     expect(note.docs).toBe("/docs#npm");
   });
 
