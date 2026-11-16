@@ -5,7 +5,7 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
 import { z } from "zod";
-import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
+import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, PREVIOUS_SCORER, reusableAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
 import { digestLabel, digestOf } from "./digest.ts";
 import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
@@ -540,8 +540,8 @@ export type StoreApi = {
   readonly keepLatestScore: (input: { score: LatestScore; at: number; capacity: number }) => Effect.Effect<void, StoreError>;
   /** Replaces a kept answer with one the sweep worked out at `at`; when it was asked about stays as it was. */
   readonly refreshLatestScore: (input: { score: LatestScore; at: number }) => Effect.Effect<void, StoreError>;
-  /** Kept answers asked about at or after `askedSince` and worked out before `computedBefore`, oldest first. */
-  readonly latestScoresToRefresh: (input: { askedSince: number; computedBefore: number; limit: number }) => Effect.Effect<string[], StoreError>;
+  /** Kept answers asked about at or after `askedSince` and worked out before `computedBefore`, oldest first, as kept. */
+  readonly latestScoresToRefresh: (input: { askedSince: number; computedBefore: number; limit: number }) => Effect.Effect<KeptLatestScore[], StoreError>;
   /** Drops kept answers last asked about before `askedBefore`, or the one for `name`. */
   readonly dropLatestScores: (input: { kind: "asked-before"; askedBefore: number } | { kind: "name"; name: string }) => Effect.Effect<void, StoreError>;
   /**
@@ -794,6 +794,22 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
 
   const getPackage = (name: string) => run("getPackage", sql`SELECT * FROM packages WHERE name = ${name}`, one(PackageOut));
 
+  /**
+   * A stored upstream analysis as the current scorer reads it (reusableAnalysis: its own, or an apm-score-v10 one it would
+   * store the same), with what was dismissed for its bytes left out; none when the current scorer would not take it.
+   * Whether it is reusable is decided on the analysis as stored, before any dismissal.
+   */
+  const currentScore = (stored: VersionRecord["score"], list: readonly EvidenceDismissal[]): VersionRecord["score"][] => {
+    // the query chose the row (apm_v10_reusable); one that does not parse is passed on as stored, as before, and reads
+    // as not scored; one that parses and is not reusable is left out
+    const parsed = parseAnalysis(stored);
+
+    if (parsed === null) return [withList(stored, list)];
+    const current = reusableAnalysis(parsed);
+
+    return current === null ? [] : [withList(current, list)];
+  };
+
   /** A stored score as stored, or, with dismissals for its bytes, the analysis without them. */
   const withList = (stored: VersionRecord["score"], list: readonly EvidenceDismissal[]): VersionRecord["score"] =>
     list.length === 0 ? stored : (dismissedAnalysis(parseAnalysis(stored), list) ?? stored);
@@ -813,7 +829,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
 
   /** An upstream package's scores keyed by "<version> <digest>", each with its dismissed evidence left out, and what it cannot score. */
   const analysesOf = (analyses: z.output<typeof AnalysesRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof AnalysesRow>["unscorable"]): UpstreamAnalyses => ({
-    scores: new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))])),
+    // rows come oldest scorer first, so the current scorer's analysis of the same bytes replaces a reused v10 one
+    scores: new Map(analyses.flatMap((a) => currentScore(a.analysis, dismissalsFor(dismissals, a.version, a.digest)).map((score) => [`${a.version} ${a.digest}`, score] as const))),
     unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "", digest: u.digest }] as const)),
   });
 
@@ -1192,12 +1209,12 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         const row = yield* run(
           "upstreamAnalyses",
           sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ${name} AND u.scorer = ${SCORER}) AS analyses,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
                    FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS unscorable`,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS unscorable`,
           one(AnalysesRow),
         );
 
@@ -1226,10 +1243,10 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
                    FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
                 (SELECT jsonb_build_object('summary', k.summary, 'computed_at', k.computed_at)
                    FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE ${scores} AND u.package = ${name} AND u.scorer = ${SCORER} AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE ${scores} AND o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable`,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE ${scores} AND u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE ${scores} AND o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable`,
           z.tuple([PageReadRow]).transform(([r]) => r),
         );
 
@@ -1284,8 +1301,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     latestScoresToRefresh: ({ askedSince, computedBefore, limit }) =>
       run(
         "latestScoresToRefresh",
-        sql`SELECT package FROM latest_scores WHERE asked_at >= ${askedSince} AND computed_at < ${computedBefore} ORDER BY computed_at, package LIMIT ${limit}`,
-        all(z.object({ package: z.string() }).transform((r) => r.package)),
+        sql`SELECT package, version, score, grade, computed_at FROM latest_scores WHERE asked_at >= ${askedSince} AND computed_at < ${computedBefore} ORDER BY computed_at, package LIMIT ${limit}`,
+        all(KeptLatestScoreRow),
       ),
     dropLatestScores: (which) =>
       which.kind === "name"
@@ -1472,10 +1489,10 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         const row = yield* run(
           "upstreamAnalysesOf",
           sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND u.scorer = ${SCORER}) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS decided,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
+                   FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
+                   FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS decided,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
                    FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL) AS dismissals`,
           one(
@@ -1491,7 +1508,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         const decided = row?.decided ?? [];
         const dismissals = row?.dismissals ?? [];
 
-        for (const r of rows) of(r.package).scores.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
+        for (const r of rows) for (const score of currentScore(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest))) of(r.package).scores.set(`${r.version} ${r.digest}`, score);
 
         for (const d of decided) of(d.package).unscorable.set(d.version, { reason: d.outcome, detail: d.detail ?? "", digest: d.digest });
 
@@ -1509,16 +1526,14 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
           sql`SELECT DISTINCT ON (u.package, u.version) u.package, u.version, u.digest, u.analysis
               FROM upstream_analysis u
               JOIN unnest(${names}::text[], ${numbers}::text[]) AS wanted(package, version) ON u.package = wanted.package AND u.version = wanted.version
-              WHERE u.scorer = ${SCORER}
-              ORDER BY u.package, u.version, u.analyzed_at DESC`,
+              WHERE (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+              ORDER BY u.package, u.version, u.scorer = ${SCORER} DESC, u.analyzed_at DESC`,
           all(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
         );
 
         const dismissals = yield* dismissalsOf([...new Set(rows.map((r) => r.package))]);
 
-        return new Map(
-          rows.map((r) => [`${r.package} ${r.version}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest))]),
-        );
+        return new Map(rows.flatMap((r) => currentScore(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)).map((score) => [`${r.package} ${r.version}`, score] as const)));
       }),
     setUpstreamAnalysis: (input) =>
       run(
@@ -1531,8 +1546,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     claimAnalysisJob: (name, version, now, staleMs) =>
       run(
         "claimAnalysisJob",
-        sql`INSERT INTO analysis_jobs (package, version, queued_at) VALUES (${name}, ${version}, ${now})
-            ON CONFLICT (package, version) DO UPDATE SET queued_at = EXCLUDED.queued_at
+        sql`INSERT INTO analysis_jobs (package, version, queued_at, scorer) VALUES (${name}, ${version}, ${now}, ${SCORER})
+            ON CONFLICT (package, version) DO UPDATE SET queued_at = EXCLUDED.queued_at, scorer = EXCLUDED.scorer
             WHERE analysis_jobs.queued_at <= ${now - staleMs}
             RETURNING package`,
         changed,
@@ -1552,7 +1567,11 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
       Effect.gen(function* () {
         const started = yield* run(
           "startAnalysis",
-          sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES (${name}, ${version}, ${SCORER}, 1, ${now})
+          // nothing is started for a version whose apm-score-v10 result the current scorer takes as its own
+          sql`INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at)
+              SELECT ${name}, ${version}, ${SCORER}, 1, ${now}
+              WHERE NOT EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = ${name} AND u.version = ${version} AND u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))
+                AND NOT EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = ${name} AND o.version = ${version} AND o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))
               ON CONFLICT (package, version, scorer) DO UPDATE SET starts = analysis_outcomes.starts + 1, started_at = EXCLUDED.started_at
               WHERE analysis_outcomes.outcome IS NULL AND (analysis_outcomes.started_at IS NULL OR analysis_outcomes.started_at <= ${now - runMs})
               RETURNING starts, fetch_failures, fetch_failed_since, failures, reported_start`,
@@ -1570,10 +1589,13 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
           } satisfies AnalysisStart;
         }
 
-        // not started: an outcome decided it, or a run began inside the window
+        // not started: an outcome decided it (the current scorer's, or a v10 one it keeps), the current scorer reads
+        // a v10 analysis as its own, or a run began inside the window
         const decided = yield* run(
           "startAnalysisOutcome",
-          sql`SELECT 1 AS decided FROM analysis_outcomes WHERE package = ${name} AND version = ${version} AND scorer = ${SCORER} AND outcome IS NOT NULL`,
+          sql`SELECT 1 AS decided
+              WHERE EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = ${name} AND o.version = ${version} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = ${name} AND u.version = ${version} AND u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))`,
           one(z.object({ decided: Int })),
         );
 
@@ -1613,8 +1635,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
             "decidedAnalyses",
             sql`WITH wanted AS (SELECT * FROM unnest(${versions.map((v) => v.name)}::text[], ${versions.map((v) => v.version)}::text[]) AS w(package, version))
                 SELECT w.package, w.version FROM wanted w
-                WHERE EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = w.package AND a.version = w.version AND a.scorer = ${SCORER})
-                   OR EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = w.package AND o.version = w.version AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL)`,
+                WHERE EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = w.package AND u.version = w.version AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))))
+                   OR EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = w.package AND o.version = w.version AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL)`,
             all(z.object({ package: z.string(), version: z.string() })),
           ).pipe(Effect.map((rows) => new Set(rows.map((r) => `${r.package} ${r.version}`)))),
     unfinishedAnalyses: ({ before, limit, now }) =>
@@ -1623,7 +1645,7 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         sql`WITH picked AS (
               SELECT o.package, o.version FROM analysis_outcomes o
               WHERE o.scorer = ${SCORER} AND o.outcome IS NULL AND o.started_at IS NOT NULL AND o.started_at <= ${before}
-                AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = o.package AND a.version = o.version AND a.scorer = ${SCORER})
+                AND NOT EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = o.package AND u.version = o.version AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))))
               ORDER BY o.swept_at NULLS FIRST, o.started_at LIMIT ${limit}
               FOR UPDATE SKIP LOCKED
             )
@@ -1636,11 +1658,17 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     acceptedAnalyses: ({ before, limit }) =>
       run(
         "acceptedAnalyses",
+        // a reservation made for the current scorer, or one from before the scorer was recorded (an older Worker's) for
+        // a version that never got a result or began a run under any scorer: genuinely pending, not one already analysed
         sql`SELECT j.package AS name, j.version FROM analysis_jobs j
             WHERE j.queued_at <= ${before}
-              AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = j.package AND a.version = j.version AND a.scorer = ${SCORER})
-              AND NOT EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = j.package AND o.version = j.version AND o.scorer = ${SCORER}
-                                AND (o.outcome IS NOT NULL OR o.started_at IS NOT NULL))
+              AND (j.scorer = ${SCORER}
+                   OR (j.scorer IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM upstream_analysis a WHERE a.package = j.package AND a.version = j.version)
+                       AND NOT EXISTS (SELECT 1 FROM analysis_outcomes p WHERE p.package = j.package AND p.version = j.version AND (p.outcome IS NOT NULL OR p.started_at IS NOT NULL))))
+              AND NOT EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = j.package AND u.version = j.version AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))))
+              AND NOT EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = j.package AND o.version = j.version
+                                AND ((o.scorer = ${SCORER} AND (o.outcome IS NOT NULL OR o.started_at IS NOT NULL)) OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))))
             ORDER BY j.queued_at LIMIT ${limit}`,
         all(z.object({ name: z.string(), version: z.string() })),
       ),

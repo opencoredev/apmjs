@@ -16,6 +16,15 @@ export const CapabilitySchema = z.object({
   outside: z.array(z.string()).optional(),
 });
 
+/**
+ * How much of the version apm read (apm-score-v11; registries and scorers before it send none). Files left unread for
+ * their size or the byte budget cost no points, so a partial reading can score well and still is not a pass.
+ */
+export const CoverageSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("complete") }),
+  z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.string()), notes: z.array(z.string()).default([]) }),
+]);
+
 export const ReportSchema = z.object({
   score: z.number(),
   grade: z.string(),
@@ -23,6 +32,7 @@ export const ReportSchema = z.object({
   capabilities: z.array(CapabilitySchema).default([]),
   notChecked: z.array(z.string()).optional(),
   facts: z.record(z.string(), z.unknown()).optional(),
+  coverage: CoverageSchema.nullish(),
 });
 
 export type Capability = z.infer<typeof CapabilitySchema>;

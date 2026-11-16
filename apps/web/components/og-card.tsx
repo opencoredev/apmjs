@@ -2,7 +2,7 @@
 // score and grade). 1200×630, for ImageResponse (Satori).
 /* oxlint-disable shadcn/no-inline-styles -- ImageResponse (Satori) renders inline styles only: no stylesheet, no Tailwind, no theme tokens */
 import { MARK_INK, MARK_PULLED, WORD } from "@/components/logo";
-import { toneOf, type Tone } from "@/components/score-badge";
+import { toneOf, type Tone, PARTIAL_GRADE } from "@/components/score-badge";
 import type { PackageInfo } from "@/lib/registry";
 
 export const OG_SIZE = { width: 1200, height: 630 };
@@ -64,7 +64,7 @@ export function packageCardInput(input: { name: string; pkg: PackageInfo | null 
 }
 
 export function packageCard(input: PackageCardInput) {
-  const tone = TONE[toneOf(input.score)];
+  const tone = TONE[toneOf(input.score, input.grade)];
   const nameSize = input.name.length > 28 ? 56 : input.name.length > 18 ? 72 : 88;
 
   return (
@@ -83,8 +83,8 @@ export function packageCard(input: PackageCardInput) {
             <div style={{ fontSize: 44, fontWeight: 600 }}>not scored</div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-              <div style={{ fontSize: 120, fontWeight: 700, lineHeight: 1 }}>{String(input.score)}</div>
-              <div style={{ fontSize: 32, marginTop: 12 }}>{`grade ${input.grade ?? "?"} · of 100`}</div>
+              <div style={{ fontSize: input.grade === PARTIAL_GRADE ? 64 : 120, fontWeight: 700, lineHeight: 1 }}>{input.grade === PARTIAL_GRADE ? "partial" : String(input.score)}</div>
+              <div style={{ fontSize: 32, marginTop: 12 }}>{input.grade === PARTIAL_GRADE ? `${input.score}/100 on what apm read` : `grade ${input.grade ?? "?"} · of 100`}</div>
             </div>
           )}
         </div>

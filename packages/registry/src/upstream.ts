@@ -105,8 +105,8 @@ function matches(bytes: Uint8Array, d: Digest): boolean {
 }
 
 /**
- * The largest upstream tarball apm downloads. A Worker has 128 MB of memory, and analysis inflates the
- * tarball next to it; larger packages are reported as unavailable to score, never as clean.
+ * The largest upstream tarball apm downloads whole. A Worker has 128 MB of memory, and analysis inflates the tarball
+ * next to it; a larger one is served as a stream (verified-stream.ts) and analysed as one (streamed-analysis.ts).
  */
 export const MAX_UPSTREAM_TARBALL_BYTES = 32 * 1024 * 1024;
 
@@ -136,6 +136,13 @@ export function tooLargeText(bytes: number | null): string {
 export type ServedTarball =
   | Extract<UpstreamTarball, { kind: "ok" | "absent" | "unavailable" }>
   | { kind: "stream"; body: ReadableStream<Uint8Array>; length: number | null; digest: Digest };
+
+/**
+ * A tarball opened for a streamed analysis (streamed-analysis.ts), one too large to hold: its bytes as they arrive, not
+ * checked yet (the reader hashes every byte against `digest` before it trusts any), and the length its source
+ * declared, null when it declared none. Each call opens it again, from the blob store's copy when there is one.
+ */
+export type OpenedTarball = { kind: "stream"; body: ReadableStream<Uint8Array>; length: number | null; digest: Digest } | Extract<UpstreamTarball, { kind: "absent" | "unavailable" }>;
 
 /** How long a tarball download may take, and how long a streamed one may take to start. */
 const TARBALL_TIMEOUT_MS = 30_000;
@@ -704,6 +711,11 @@ export type UpstreamApi = {
    * answer, checked against the published checksum on the way (verifiedStream). Never "too-large".
    */
   readonly serve: (pkg: UpstreamPackage, version: string) => Effect.Effect<ServedTarball, BlobError>;
+  /**
+   * The tarball of a version the upstream lists right now, opened as a stream for an analysis of one too large to
+   * hold. Not checked here: the reader checks it (OpenedTarball).
+   */
+  readonly openTarball: (pkg: UpstreamPackage, version: string) => Effect.Effect<OpenedTarball, BlobError>;
   /** Forwards an advisory bulk request. A failure is "unavailable", never an empty (clean) answer. */
   readonly advisories: (body: unknown) => Effect.Effect<UpstreamAdvisories>;
 };
@@ -1858,6 +1870,22 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               opened.release();
 
               return streamed(opened.res, at.digest, declared);
+            }),
+          openTarball: (pkg, version) =>
+            Effect.gen(function* () {
+              const at = locate(pkg, version);
+
+              if (at.kind !== "found") return at;
+              const cached = yield* blobs.stream(upstreamBlobKey(at.digest));
+
+              if (Option.isSome(cached)) return { kind: "stream", body: cached.value.body, length: cached.value.size, digest: at.digest } as const;
+              const opened = yield* Effect.promise(() => open(at.url));
+
+              if (opened.kind !== "ok") return opened;
+              // the reader keeps its own deadlines: tens of megabytes may take longer than a download's 30 s
+              opened.release();
+
+              return { kind: "stream", body: opened.res.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() }), length: declaredLength(opened.res), digest: at.digest } as const;
             }),
           advisories: (body) =>
             fetchJson(`${baseUrl}-/npm/v1/security/advisories/bulk`, 10_000, {

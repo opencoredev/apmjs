@@ -360,7 +360,7 @@ export type RawManifest = {
   types?: string;
 };
 
-function tarHeader(path: string, size: number): Uint8Array {
+export function tarHeader(path: string, size: number): Uint8Array {
   const h = new Uint8Array(512);
   const put = (s: string, off: number, len: number): void => h.set(new TextEncoder().encode(s).subarray(0, len), off);
   put(path, 0, 100);

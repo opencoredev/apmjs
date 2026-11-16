@@ -158,6 +158,7 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
         }),
       // no tarball route runs in this file
       serve: () => Effect.succeed({ kind: "absent" }),
+      openTarball: () => Effect.succeed({ kind: "absent" }),
       advisories: () => Effect.succeed({ kind: "unavailable" }),
       listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
       installCopy: () => Effect.succeed({ kind: "read", listing: { kind: "unknown" } }),

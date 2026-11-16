@@ -1477,6 +1477,52 @@
       }
     },
     {
+      "name": "a partial reading (files past apm's byte budget) scores well and still installs only with a warning that says how much apm did not read (apm-score-v11)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "partial": {
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961
+        },
+        "lost": [
+          {
+            "label": "Data that looks encoded",
+            "points": -2
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Installs, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read. It scores 98/100 on the code it read. Review it before installing.",
+        "reasons": [
+          "2,656 files (74.0 MB) not read: past the size apm reads of one file, or the bytes one analysis reads."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        }
+      }
+    },
+    {
       "name": "a version apm cannot score installs with a warning naming why",
       "resolve": {
         "kind": "ok",

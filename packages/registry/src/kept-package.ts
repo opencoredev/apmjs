@@ -288,11 +288,16 @@ const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECO
 export type KeptEligible = { kind: "exact"; name: string } | { kind: "prefix"; prefix: string };
 
 /**
- * Packages kept with no score, once apm recorded it can never score one of their versions: popular, too large to
- * analyze, and chosen here, by whoever deploys, so a visitor cannot fill the table by naming packages apm will find
- * unscorable. next and its native binaries (@next/swc-linux-x64-gnu is 35 MB). Chosen over a weekly-downloads floor
- * read from npm: that is one more request to npm on the read that admits, a failure mode of its own, and a number
- * paid download traffic can move; this list needs none of them, and the one package measured slow is on it.
+ * Packages kept with no score, once apm recorded it can never score one of their versions: popular, large, and chosen
+ * here, by whoever deploys, so a visitor cannot fill the table by naming packages apm will find unscorable. next and its
+ * native binaries (next 16.4.6 is 43.7 MB, @next/swc-linux-x64-gnu 35 MB). apm-score-v11 reads tarballs past what a
+ * Worker holds as a stream and scores them, so these are admitted by their scores like any package; the list is the
+ * fallback for a version v11 still cannot score (a tarball past what it streams, one it cannot read, or a run past the
+ * registry's limits). An apm-score-v10 too-large outcome no longer counts: v11 reads that version again (db.ts,
+ * apm_v10_outcome_reusable), and until it has, such a package is admitted only by another outcome or a score. Chosen
+ * over a weekly-downloads floor read from npm: that is one more request to npm on the read that admits, a failure mode
+ * of its own, and a number paid download traffic can move; this list needs none of them, and the one package measured
+ * slow is on it.
  */
 export const KEPT_WITHOUT_SCORE: readonly KeptEligible[] = [
   { kind: "exact", name: "next" },

@@ -98,10 +98,20 @@ export type WorkerdHeap = {
 };
 
 /**
+ * More for the worker: service bindings beside HEAP (each a function answering the worker's fetches), V8 flags besides
+ * --expose-gc (--trace-gc, say), and a listener for each line workerd writes to stdout.
+ */
+export type WorkerdOptions = {
+  readonly serviceBindings?: Record<string, (req: Request) => Promise<Response>>;
+  readonly v8Flags?: readonly string[];
+  readonly onStdout?: (line: string) => void;
+};
+
+/**
  * Starts workerd with `entry` (module source; it may import repository files by absolute path) bundled as its only
  * module. Its fetch handler gets `env.HEAP`, a service whose fetch answers the isolate's memory in use, in bytes.
  */
-export async function startWorkerdHeap(entry: string): Promise<WorkerdHeap> {
+export async function startWorkerdHeap(entry: string, options: WorkerdOptions = {}): Promise<WorkerdHeap> {
   const dir = mkdtempSync(join(tmpdir(), "apm-workerd-heap-"));
   const entryPath = join(dir, "entry.js");
 
@@ -116,7 +126,8 @@ export async function startWorkerdHeap(entry: string): Promise<WorkerdHeap> {
   let inspector: Inspector | null = null;
   // Miniflare reads workerd's V8 flags from the environment when it starts workerd
   const flags = process.env.MINIFLARE_WORKERD_V8_FLAGS;
-  process.env.MINIFLARE_WORKERD_V8_FLAGS = "--expose-gc";
+  process.env.MINIFLARE_WORKERD_V8_FLAGS = ["--expose-gc", ...(options.v8Flags ?? [])].join(" ");
+  const onStdout = options.onStdout ?? (() => undefined);
 
   const mf = new Miniflare({
     modulesRoot: dir,
@@ -124,7 +135,19 @@ export async function startWorkerdHeap(entry: string): Promise<WorkerdHeap> {
     compatibilityDate: COMPATIBILITY_DATE,
     compatibilityFlags: [...COMPATIBILITY_FLAGS],
     inspectorPort: port,
+    // each line workerd writes to stdout, to the listener (none: dropped, as Miniflare drops what nobody asks for)
+    handleRuntimeStdio: (stdout: NodeJS.ReadableStream) => {
+      let rest = "";
+
+      stdout.on("data", (chunk: Buffer | string) => {
+        const lines = (rest + String(chunk)).split("\n");
+        rest = lines.pop() ?? "";
+
+        for (const line of lines) onStdout(line);
+      });
+    },
     serviceBindings: {
+      ...options.serviceBindings,
       HEAP: async () => {
         if (!inspector) throw new Error("the inspector is not connected");
 

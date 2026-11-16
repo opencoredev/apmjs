@@ -127,6 +127,7 @@ const STUB: UpstreamApi = {
     tarball: () => Effect.succeed({ kind: "ok", bytes: BYTES, digest: { algo: "sha512", hex: createHash("sha512").update(BYTES).digest("hex") } }),
     // no tarball route runs in this file
     serve: () => Effect.succeed({ kind: "absent" }),
+    openTarball: () => Effect.succeed({ kind: "absent" }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
     listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
     installCopy: () => Effect.succeed({ kind: "read", listing: { kind: "unknown" } }),

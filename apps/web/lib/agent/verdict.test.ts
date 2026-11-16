@@ -20,6 +20,8 @@ const Case = z.object({
       kind: z.literal("ok"),
       version: z.string(),
       score: z.number().nullable(),
+      // a partial reading (apm-score-v11): how much the registry's score did not read
+      partial: z.object({ omittedFiles: z.number(), omittedBytes: z.number() }).optional(),
       // `id` and `evidence` for a signal the verdict reads by id (incomplete); the rest are s0, s1, …
       lost: z.array(z.object({ label: z.string(), points: z.number(), id: z.string().optional(), evidence: z.array(z.string()).default([]) })),
       skipped: z.array(z.object({ version: z.string(), reason: z.string() })),
@@ -79,7 +81,7 @@ function resolveOf(c: z.infer<typeof Case>["resolve"]): ResolveOutcome {
         kind: "ok",
         version: c.version,
         source: "upstream",
-        report: c.score === null ? null : { score: c.score, grade: grade(c.score), signals: c.lost.map((l, i) => signal({ id: l.id ?? `s${i}`, label: l.label, points: l.points, evidence: l.evidence })), notChecked: [] },
+        report: c.score === null ? null : { score: c.score, grade: c.partial ? "P" : grade(c.score), signals: c.lost.map((l, i) => signal({ id: l.id ?? `s${i}`, label: l.label, points: l.points, evidence: l.evidence })), notChecked: [], coverage: c.partial ? { kind: "partial", omittedFiles: c.partial.omittedFiles, omittedBytes: c.partial.omittedBytes, reasons: ["over-budget"], notes: [] } : { kind: "complete" } },
         skipped: c.skipped,
         deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews, warnings: c.warnings },
       };

@@ -26,9 +26,13 @@ const ScoreAnswer = z.object({
   publishedAt: z.string(),
   publishedBy: z.string(),
   score: z.number().min(0).max(100),
-  grade: z.enum(["A", "B", "C", "D", "F"]),
+  grade: z.enum(["A", "B", "C", "D", "F", "P"]).describe("A to F by score; P for a partial reading (apm-score-v11), whatever its score"),
   signals: z.array(Signal),
   notChecked: z.array(z.string()).describe("What this score did not check"),
+  coverage: z
+    .discriminatedUnion("kind", [z.object({ kind: z.literal("complete") }), z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.enum(["too-large", "over-budget", "stopped"])), notes: z.array(z.string()) })])
+    .nullish()
+    .describe("How much of the version apm read (apm-score-v11). A partial reading scores only what was read: check it apart from the score; strict installs refuse it"),
   scorer: z.string(),
   digest: z.string().nullable(),
   dismissed: z.array(Dismissed),

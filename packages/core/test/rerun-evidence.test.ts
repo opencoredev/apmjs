@@ -30,9 +30,11 @@ test("the reason a run read less is the first incomplete evidence, ahead of 6 pa
   const incomplete = a.signals.find((s) => s.id === "incomplete");
   const all = [...(incomplete?.evidence ?? []), ...(incomplete?.more ?? [])];
 
-  // the fixture really has what pushed the reason out: 6 parser-limit warnings and skipped files
+  // the fixture really has what pushed the reason out: 6 parser-limit warnings; the files past the budget are its
+  // coverage since apm-score-v11, not incomplete evidence
   expect(all.filter((e) => e.includes("ran out of stack")).length).toBe(6);
-  expect(all.some((e) => e.startsWith("not analyzed: plugins/"))).toBe(true);
+  expect(a.skipped.some((s) => s.path.startsWith("plugins/"))).toBe(true);
+  expect(a.coverage).toMatchObject({ kind: "partial", reasons: ["over-budget"] });
   expect(incomplete?.evidence.length).toBe(5);
   // on 3549541 the reason came after the skipped files, and here after all six parser warnings: not shown at all
   expect(incomplete?.evidence[0]).toBe(BECAUSE);

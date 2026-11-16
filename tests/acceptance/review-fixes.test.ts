@@ -286,21 +286,26 @@ describe("an analysis that could not read everything is not a pass", () => {
     await reg?.stop();
   });
 
-  test("malicious code padded past the per-file limit scores below the floor and lists the skipped file", async () => {
+  test("malicious code padded past the per-file limit is a partial reading, never a pass, and lists the skipped file", async () => {
     const padded = `${EXFIL}/*${" ".repeat(34 * 1024 * 1024)}*/\n`;
     await publishSimple(reg, alice, "padded-evil", "1.0.0", {}, { "index.js": padded });
     clock += 2 * DAY;
     const s = await getJson(`${reg.url}-/apm/v1/score/padded-evil/1.0.0`);
     expect(s.status).toBe(200);
-    expect(Number(dig(s.body, "score"))).toBeLessThan(40);
-    expect(JSON.stringify(dig(s.body, "signals"))).toContain("incomplete");
+    // apm-score-v11: a file unread for its size costs no points; it makes the reading partial, graded P
+    expect(dig(s.body, "grade")).toBe("P");
+    expect(dig(s.body, "coverage", "kind")).toBe("partial");
     expect(JSON.stringify(dig(s.body, "skipped"))).toContain("index.js");
-    // incomplete: a warning by default, refused in strict mode
+    // checked apart from the score: a warning by default, refused in strict mode and by the ~safe view
     const r = await getJson(`${reg.url}-/apm/v1/resolve?name=padded-evil&strict=1`);
     expect(r.status).toBe(422);
     const warned = await getJson(`${reg.url}-/apm/v1/resolve?name=padded-evil`);
     expect(warned.status).toBe(200);
     expect(dig(warned.body, "warnings", 0, "kind")).toBe("incomplete");
+    expect(String(dig(warned.body, "warnings", 0, "text"))).toContain("apm read only part of it: 1 file");
+    const safe = await fetch(`${reg.url}~safe/padded-evil/-/padded-evil-1.0.0.tgz`);
+    expect(safe.status).toBe(404);
+    expect(await safe.text()).toContain("is not in this view");
   });
 
   test("a file too large for the secret scan is named in a publish warning", async () => {

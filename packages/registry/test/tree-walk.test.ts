@@ -8,7 +8,7 @@ import { Effect, Layer, Option } from "effect";
 import * as Statement from "effect/sql/Statement";
 import { Client } from "pg";
 import { z } from "zod";
-import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
+import { analyze, PREVIOUS_SCORER, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
 import { Auth } from "../src/auth.ts";
@@ -536,4 +536,69 @@ describe("every packument a request reads is under the request's lease", () => {
       expect(r.request.taken).toBe(0);
     }).finally(() => npm.stop());
   });
+});
+
+// apm-score-v11 reads a clean apm-score-v10 analysis as its own (db.ts, apm_v10_reusable). A walk that runs out of
+// time must still report what it did not reach as not checked, whatever is stored for it: a reusable analysis of a
+// dependency the walk never read is not a check of that dependency.
+describe("the walk's time budget and apm-score-v10 analyses apm-score-v11 reuses", () => {
+  test("a dependency the walk did not reach in time is unchecked though a reusable v10 analysis of it is stored", () => {
+    const slowMs = 3_000;
+
+    const npm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req): Promise<Response> {
+        const name = decodeURIComponent(new URL(req.url).pathname.slice(1));
+
+        if (name !== "quick" && name !== "slow") return Response.json({ error: "Not found" }, { status: 404 });
+
+        if (name === "slow") await Bun.sleep(slowMs);
+        const dist = { tarball: `https://npm.invalid/${name}/-/${name}-1.0.0.tgz`, shasum: "1".repeat(40), integrity: integrityOf(name) };
+        const packument: FakePackument = { name, "dist-tags": { latest: "1.0.0" }, versions: { "1.0.0": { ...manifestOf({ name }), dist } }, time: { "1.0.0": new Date(NOW - 10 * DAY).toISOString() } };
+
+        return Response.json(packument, { headers: { etag: `"${name}-1"` } });
+      },
+    });
+
+    const root = { name: "root", dependencies: { quick: "^1.0.0", slow: "^1.0.0" } };
+
+    return withDatabase({ local: [root] }, async (url) => {
+      const c = new Client({ connectionString: url });
+      await c.connect();
+
+      try {
+        // what apm-score-v10 stored for both: clean, with no coverage, under v10's name
+        for (const name of ["quick", "slow"]) {
+          const { coverage: _coverage, ...v10 } = analysisOf({ name });
+
+          await c.query("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, '1.0.0', $2, $3, $4::jsonb, 0)", [name, digestOfName(name), PREVIOUS_SCORER, JSON.stringify({ ...v10, scorer: PREVIOUS_SCORER })]);
+        }
+      } finally {
+        await c.end();
+      }
+
+      const cut = await resolve({ url, name: "root", npm: npm.url.href, walkMs: 500 });
+
+      expect(cut.status).toBe(200);
+      // quick, read in time, is checked by its reused analysis: no warning for it
+      expect(cut.body.tree.packages).toEqual([{ name: "quick", version: "1.0.0" }]);
+      // slow is unchecked for the time, not scored by the analysis stored for it
+      expect(cut.body.tree.uncheckedDeps).toEqual([{ dependency: "slow@^1.0.0", reason: outOfTimeText(500) }]);
+      expect(cut.body.warnings?.map((w) => [w.name, w.kind])).toEqual([["slow", "unchecked"]]);
+      expect((await resolve({ url, name: "root", npm: npm.url.href, walkMs: 500, strict: true })).status).toBe(422);
+
+      // with time to read both, the same stored analysis checks slow too: the cut, not the analysis, left it unchecked
+      const whole = await resolve({ url, name: "root", npm: npm.url.href, walkMs: 20_000 });
+
+      expect(whole.status).toBe(200);
+      // in the order the walk read them, which kept choices change: quick's was kept by the walk before
+      expect(whole.body.tree.packages.toSorted((a, b) => a.name.localeCompare(b.name))).toEqual([
+        { name: "quick", version: "1.0.0" },
+        { name: "slow", version: "1.0.0" },
+      ]);
+      expect(whole.body.tree.unchecked).toBe(0);
+      expect(whole.body.warnings ?? []).toEqual([]);
+    }).finally(() => npm.stop(true));
+  }, 60_000);
 });

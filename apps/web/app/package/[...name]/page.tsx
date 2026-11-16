@@ -20,6 +20,7 @@ import { citedLine } from "@/lib/file-excerpt";
 import { limitationCount, sortLimitations, splitPossible, splitTestFile, summarizeLimitations, type ReadingLimit } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
 import { ScoreBadge, toneOf, type Tone } from "@/components/score-badge";
+import { ScoreHeadline } from "@/components/score-headline";
 import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
@@ -241,9 +242,18 @@ function NoteEvidence(props: { signal: string; evidence: string; name: string; v
   );
 }
 
+/** Whether a scorer lists capabilities (apm-score-v10 and later), so an empty list means it found none. */
+function listsCapabilities(scorer: string | null | undefined): boolean {
+  const n = /^apm-score-v(\d+)$/.exec(scorer ?? "")?.[1];
+
+  return n !== undefined && Number(n) >= 10;
+}
+
 /** The page's one dark panel: score, meter, and every signal with its file:line evidence. */
 function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["score"]>; name: string; version: string | null }) {
-  const tone = INVERSE_TONE[toneOf(score.score)];
+  const tone = INVERSE_TONE[toneOf(score.score, score.grade)];
+  // a partial reading (apm-score-v11) leads with what apm did not read; its number is only what the code it read scored
+  const partial = score.coverage?.kind === "partial";
   const key: ItemKey | null = version && score.digest && score.scorer ? { name, version, digest: score.digest, scorer: score.scorer } : null;
   const dismissedOf = (signal: string) => score.dismissed.filter((d) => d.signal === signal);
   const restoreItem = (d: Dismissed): EvidenceItem | null => (key ? { ...key, signal: d.signal, file: d.file, line: d.line } : null);
@@ -257,20 +267,14 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
   return (
     <div className="overflow-hidden rounded-2xl bg-inverse text-inverse-foreground">
       <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-5 px-5 pt-5 pb-6 sm:px-6">
-        <div>
-          <div className="text-sm text-inverse-muted">{version ? `Version ${version}` : "Latest version"}</div>
-          <div className="mt-2 flex items-baseline gap-2 tabular-nums">
-            <span className={`text-6xl leading-none font-medium tracking-tight ${tone.text}`}>{score.score}</span>
-            <span className="text-xl text-inverse-muted">/100</span>
-          </div>
-        </div>
+        <ScoreHeadline score={score.score} coverage={score.coverage} tone={tone} version={version} />
         <div className="flex flex-col items-end gap-1.5 text-right">
-          <span className={`font-mono text-3xl leading-none font-semibold ${tone.text}`}>{score.grade}</span>
+          {!partial && <span className={`font-mono text-3xl leading-none font-semibold ${tone.text}`}>{score.grade}</span>}
           <span className="text-sm text-inverse-muted">
             {lost.length === 0 ? "no points lost" : `${lost.length} signal${lost.length === 1 ? "" : "s"}, ${pointsLost} points lost`}
           </span>
         </div>
-        <div
+        {!partial && (<div
           className="h-1.5 w-full overflow-hidden rounded-full bg-inverse-raised"
           role="meter"
           aria-valuemin={0}
@@ -279,7 +283,7 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
           aria-label="Score out of 100"
         >
           <div className={`h-full rounded-full ${tone.bar}`} style={{ width: `${Math.max(2, score.score)}%` }} />
-        </div>
+        </div>)}
         {notChecked.length > 0 && <LimitationsLine notChecked={notChecked} />}
         {score.redacted && <p className="w-full text-sm text-inverse-muted">This version was revoked, so its evidence lines are not shown.</p>}
       </div>
@@ -796,7 +800,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             )}
           </section>
 
-          {score && (score.capabilities.length > 0 || score.scorer === "apm-score-v10") && (
+          {score && (score.capabilities.length > 0 || listsCapabilities(score.scorer)) && (
             <section aria-labelledby="capabilities" className="order-5 lg:order-none">
               <SectionTitle id="capabilities" aside={<span className="text-sm text-muted-foreground">not scored</span>}>
                 Capabilities

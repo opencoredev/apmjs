@@ -19,6 +19,8 @@ type Served = { bytes: Uint8Array; publishedAt: number; requests: number; listed
 
 const ErrorAnswer = z.object({ error: z.string() });
 
+const FileAnswer = z.object({ path: z.string(), size: z.number(), kind: z.string(), text: z.string().optional() });
+
 const sha512 = (b: Uint8Array): string => createHash("sha512").update(b).digest("hex");
 
 describe("upstream tarballs over the analysis cap", () => {
@@ -166,7 +168,8 @@ describe("upstream tarballs over the analysis cap", () => {
   }, 240_000);
 
   test("~safe still refuses a 40 MB version it cannot score, and one inside the cooldown, before sending a byte", async () => {
-    // big: over the analysis cap, so recorded too large and never scored; ~safe serves only scored versions
+    // big: never scored here (no job ran for it; a streamed run would find its 40 MB blob.bin over the 32 MiB a file
+    // may be and store an incomplete score under the floor); ~safe serves only versions that pass
     const unscored = await tarball("~safe/", "big");
 
     // on 1627c5e: 502 for both, the size refused before the policy was asked
@@ -205,6 +208,28 @@ describe("upstream tarballs over the analysis cap", () => {
     expect(errored).toBe(true);
     expect(received).toBeLessThan(want.length);
   }, 120_000);
+
+  test("the file view opens a file of a 40 MB tarball, read as a stream and checked against its sha512", async () => {
+    // on ee221e2: 502 "the tarball (40.0 MB) is larger than the 32 MiB apm downloads" for every path
+    const file = await getJson(`${reg.url}-/apm/v1/file/big/1.0.0?path=index.js`);
+
+    expect(file.status, JSON.stringify(file.body)).toBe(200);
+    expect(FileAnswer.parse(file.body)).toMatchObject({ path: "index.js", kind: "text", text: "module.exports = 1;\n" });
+    const excerpt = await getJson(`${reg.url}-/apm/v1/file/big/1.0.0?path=index.js&line=1&context=2`);
+
+    expect(excerpt.status, JSON.stringify(excerpt.body)).toBe(200);
+    // the 40 MB blob: listed with its size (over the 1 MB a whole file is sent), and past what a streamed read holds
+    // of one file, so its lines are refused, never read from its first bytes
+    const blob = await getJson(`${reg.url}-/apm/v1/file/big/1.0.0?path=blob.bin`);
+
+    expect(FileAnswer.parse(blob.body)).toMatchObject({ path: "blob.bin", size: filler.length, kind: "too-large" });
+    expect((await getJson(`${reg.url}-/apm/v1/file/big/1.0.0?path=blob.bin&line=1`)).status).toBe(413);
+    // bytes that do not match their sha512 are never shown
+    const tampered = await getJson(`${reg.url}-/apm/v1/file/big-tampered/1.0.0?path=index.js`);
+
+    expect(tampered.status).toBe(502);
+    expect(ErrorAnswer.parse(tampered.body).error).toContain("failed its integrity check");
+  }, 240_000);
 
   test("once confirmed malicious, a big version is 410 and its bytes are not fetched again", async () => {
     // served first (on 1627c5e: 502)

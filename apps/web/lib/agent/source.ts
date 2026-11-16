@@ -30,7 +30,14 @@ export type NameReport = ExactPart & Omit<LookalikePart, "query" | "valid"> & Om
 
 const SignalWire = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
 const Skipped = z.array(z.object({ version: z.string(), reason: z.string() }));
-const ReportWire = z.object({ score: z.number(), grade: z.string(), signals: z.array(SignalWire), notChecked: z.array(z.string()).optional() }).loose();
+/** How much apm read (apm-score-v11; earlier registries send none): a partial reading can score well and still is not a pass. */
+
+const CoverageWire = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("complete") }),
+  z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.string()), notes: z.array(z.string()).default([]) }),
+]);
+
+const ReportWire = z.object({ score: z.number(), grade: z.string(), signals: z.array(SignalWire), notChecked: z.array(z.string()).optional(), coverage: CoverageWire.nullish() }).loose();
 
 const DepRefWire = z.object({ name: z.string(), version: z.string() });
 
@@ -107,7 +114,7 @@ export const ResolveRefusedWire = z.object({
  * score floor of 40 as warnings) says about a range.
  */
 export type ResolveOutcome =
-  | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[] } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
+  | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[]; coverage?: z.infer<typeof CoverageWire> | null } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
   | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable" };
@@ -126,7 +133,7 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
       kind: "ok",
       version: ok.data.version,
       source: ok.data.source ?? "local",
-      report: r ? { score: r.score, grade: r.grade, signals: r.signals, notChecked: r.notChecked ?? [] } : null,
+      report: r ? { score: r.score, grade: r.grade, signals: r.signals, notChecked: r.notChecked ?? [], coverage: r.coverage ?? null } : null,
       skipped: ok.data.skipped,
       deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" }, warnings: ok.data.warnings },
     };

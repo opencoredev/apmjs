@@ -35,6 +35,9 @@ import {
   dependencyNames,
   missingEntries,
   COOLDOWN_MS,
+  coverageText,
+  partialCoverage,
+  storedAnalysis,
   SCORE_FLOOR,
   POPULAR_NAMES,
   ambiguousPaths,
@@ -115,7 +118,9 @@ const now = Effect.flatMap(Clock, (c) => c.now);
 
 // ---------- scoring helpers ----------
 export function reportFor(v: VersionRecord, at: number, opts: { ignoreRecent?: boolean } = {}): ScoreReport | null {
-  const analysis = parseAnalysis(v.score);
+  // an upstream version's score comes from the store already as the current scorer reads it; a local one's is the
+  // analysis made at its publish, which storedAnalysis reads as the current scorer would where it can (core: score.ts)
+  const analysis = storedAnalysis(parseAnalysis(v.score));
 
   if (!analysis) return null;
 
@@ -168,6 +173,8 @@ function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
     // a capability's evidence, variable names and declared text quote the package; a withheld version keeps only kinds
     capabilities: withheld ? r.capabilities.map(withheldCapability) : r.capabilities,
     declaration: r.declaration ? (withheld ? { kind: r.declaration.kind, notes: [] } : r.declaration) : null,
+    // how much apm read (apm-score-v11): counts, reasons and apm's own words, nothing of the package's
+    coverage: r.coverage ?? null,
   };
 }
 
@@ -463,7 +470,11 @@ const lookupOrUnknown = (name: string, lease: Lease) =>
     return upstreamSource(up);
   });
 
-/** Makes sure an upstream version has a stored analysis (now, or queued); returns the version with it. */
+/**
+ * Makes sure an upstream version has a stored analysis (now, or queued); returns the version with it. A version
+ * published on apm is analysed at its publish and never again: it keeps that analysis whatever scorer made it, read
+ * through storedAnalysis (reportFor), so a scorer change re-queues nothing published here.
+ */
 const ensureAnalyzed = (src: Catalog, v: VersionRecord) =>
   src.kind === "local" || parseAnalysis(v.score) ? Effect.succeed(v) : Effect.flatMap(Analysis, (a) => a.ensure({ name: src.name }, v));
 
@@ -1413,7 +1424,7 @@ const packageResponse = (name: string) =>
       facts: latestFree?.facts ?? null,
       score:
         latest && latestReport && latestFree
-          ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, capabilities: latestFree.capabilities, declaration: latestFree.declaration, ...reviewable(latest, latestReport) }
+          ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, capabilities: latestFree.capabilities, declaration: latestFree.declaration, coverage: latestFree.coverage, ...reviewable(latest, latestReport) }
           : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
@@ -1499,7 +1510,7 @@ const versionResponse = (name: string, version: string) =>
         publishedAt: new Date(v.published_at).toISOString(),
         publishedBy: v.published_by,
         facts: free?.facts ?? null,
-        score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, ...reviewable(v, report) } : null,
+        score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, coverage: free.coverage, ...reviewable(v, report) } : null,
         // this version's own outcome when apm decided it can never score it: the package answer's list holds only the
         // newest 200 versions, so a view of an older one reads it here
         unscorable: !report && v.unscorable && !isWithheld(v.status) ? { reason: v.unscorable.reason, text: notScored(src, v).text } : null,
@@ -1543,14 +1554,33 @@ export const LATEST_SCORE_CAPACITY = 1_000;
 type WorkedOut =
   | { kind: "local"; score: LatestScore }
   | { kind: "unanalysed"; score: LatestScore }
-  | { kind: "upstream"; score: LatestScore }
+  // `waiting`: the latest version, when the current scorer has no result for it yet (the queue may score it)
+  | { kind: "upstream"; score: LatestScore; waiting: string | null }
   | { kind: "unavailable" };
+
+/**
+ * Popular latest versions one sweep queues for the current scorer (refreshLatestScores): the home page's dozen, after a
+ * scorer change, without waiting for someone to open each page. The queue runs one analysis at a time, so the sweep
+ * sends a few and the next sweeps send the rest.
+ */
+export const LATEST_SCORE_SEED_PER_SWEEP = 12;
+
+/**
+ * What a kept latest score becomes when it is worked out again: the new one, except that a latest version the current
+ * scorer has not scored yet keeps the score kept for that same version (an earlier scorer's), so the home page never
+ * goes blank while the queue scores it again. A newer latest version, or one with a result, replaces it.
+ */
+export function keptLatestScore(kept: LatestScore | null, worked: LatestScore, waiting: string | null): LatestScore {
+  if (worked.score !== null || waiting === null || kept === null || kept.score === null || kept.version !== waiting) return worked;
+
+  return kept;
+}
 
 /**
  * Reads the package's metadata (the whole upstream packument: seconds for next or react) and its latest version's
  * stored analysis. Never starts an analysis: a latest version with none stored yet is nulls.
  */
-const workOutLatestScore = (name: string) =>
+const workOutLatestScore = (name: string, known: boolean) =>
   briefly((lease) =>
     Effect.gen(function* () {
       const at = yield* now;
@@ -1559,8 +1589,9 @@ const workOutLatestScore = (name: string) =>
       const local = (yield* store.getPackage(name)) !== null;
       const kind = local ? "local" : "upstream";
 
-      // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream
-      if (!local && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind: "unanalysed", score: none } satisfies WorkedOut;
+      // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream. One
+      // with a kept score (`known`) is read through: its analyses may only be waiting for the current scorer
+      if (!local && !known && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind: "unanalysed", score: none } satisfies WorkedOut;
       const src = yield* lookupWithin(name, lease);
 
       if (src === "unknown" || src === "over-budget") return { kind: "unavailable" } satisfies WorkedOut;
@@ -1569,7 +1600,9 @@ const workOutLatestScore = (name: string) =>
       const r = latest ? reportFor(latest, at) : null;
       const score: LatestScore = latest && r ? { name, version: latest.version, score: r.score, grade: r.grade } : none;
 
-      return { kind, score } satisfies WorkedOut;
+      if (kind === "local") return { kind, score } satisfies WorkedOut;
+
+      return { kind, score, waiting: latest && !r && !latest.unscorable ? latest.version : null } satisfies WorkedOut;
     }),
   );
 
@@ -1602,13 +1635,17 @@ const popularScoresResponse = (url: URL) =>
 
         if (hit && at - hit.computedAt < LATEST_SCORE_MAX_AGE_MS) return Effect.succeed(hit.score);
 
-        return Effect.flatMap(workOutLatestScore(name), (w): Effect.Effect<LatestScore, StoreError> => {
+        return Effect.flatMap(workOutLatestScore(name, (hit?.score.score ?? null) !== null), (w): Effect.Effect<LatestScore, StoreError> => {
           switch (w.kind) {
             case "local":
             case "unanalysed":
               return Effect.succeed(w.score);
-            case "upstream":
-              return Effect.as(store.keepLatestScore({ score: w.score, at, capacity: LATEST_SCORE_CAPACITY }), w.score);
+            case "upstream": {
+              const score = keptLatestScore(hit?.score ?? null, w.score, w.waiting);
+
+              return Effect.as(store.keepLatestScore({ score, at, capacity: LATEST_SCORE_CAPACITY }), score);
+            }
+
             case "unavailable":
               return Effect.succeed(hit?.score ?? { name, version: null, score: null, grade: null });
             default: {
@@ -1634,21 +1671,31 @@ const popularScoresResponse = (url: URL) =>
 export const refreshLatestScores = Effect.gen(function* () {
   const at = yield* now;
   const store = yield* Store;
+  const analysis = yield* Analysis;
 
   yield* store.dropLatestScores({ kind: "asked-before", askedBefore: at - LATEST_SCORE_DROP_MS });
-  const names = yield* store.latestScoresToRefresh({ askedSince: at - LATEST_SCORE_ASKED_WINDOW_MS, computedBefore: at - LATEST_SCORE_REFRESH_MS, limit: LATEST_SCORE_REFRESH_LIMIT });
+  const kept = yield* store.latestScoresToRefresh({ askedSince: at - LATEST_SCORE_ASKED_WINDOW_MS, computedBefore: at - LATEST_SCORE_REFRESH_MS, limit: LATEST_SCORE_REFRESH_LIMIT });
+  // latest versions the current scorer has no result for, queued a few a sweep (LATEST_SCORE_SEED_PER_SWEEP)
+  let seeded = 0;
 
   const refreshed = yield* Effect.forEach(
-    names,
-    (name) =>
-      workOutLatestScore(name).pipe(
+    kept,
+    ({ score: before }) =>
+      workOutLatestScore(before.name, before.score !== null).pipe(
         Effect.flatMap((w): Effect.Effect<number, StoreError> => {
           switch (w.kind) {
             case "local":
-              return Effect.as(store.dropLatestScores({ kind: "name", name }), 1);
+              return Effect.as(store.dropLatestScores({ kind: "name", name: before.name }), 1);
             case "unanalysed":
-            case "upstream":
               return Effect.as(store.refreshLatestScore({ score: w.score, at }), 1);
+            case "upstream": {
+              const seed = w.waiting !== null && seeded < LATEST_SCORE_SEED_PER_SWEEP ? w.waiting : null;
+
+              if (seed !== null) seeded++;
+
+              return Effect.andThen(seed === null ? Effect.void : analysis.enqueue(before.name, seed), Effect.as(store.refreshLatestScore({ score: keptLatestScore(before, w.score, w.waiting), at }), 1));
+            }
+
             case "unavailable":
               return Effect.succeed(0);
             default: {
@@ -1660,7 +1707,7 @@ export const refreshLatestScores = Effect.gen(function* () {
         }),
         Effect.catch((e) =>
           Effect.sync(() => {
-            console.error(JSON.stringify({ level: "error", event: "latest-score-refresh", name, tag: e._tag, error: String(e) }));
+            console.error(JSON.stringify({ level: "error", event: "latest-score-refresh", name: before.name, tag: e._tag, error: String(e) }));
 
             return 0;
           }),
@@ -2003,6 +2050,11 @@ export function policyBlock(v: VersionRecord, policy: Policy, at: number): strin
   const r = reportFor(v, at, { ignoreRecent: true });
 
   if (!r) return v.unscorable ? notScored({ kind: "upstream" }, v).text : "not scored yet";
+  const partial = partialCoverage(r);
+
+  // checked apart from the score: a partial reading costs no points (apm-score-v11), so it can score well, and it is
+  // still not a version apm cleared
+  if (partial !== null) return `apm read only part of it: ${coverageText(partial)}`;
 
   if (r.score < policy.floor) {
     return `score ${r.score}/100 is below ${policy.floor} (${r.signals

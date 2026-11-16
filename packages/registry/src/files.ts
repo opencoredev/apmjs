@@ -4,7 +4,10 @@
 // GET /-/apm/v1/readme/<name>/<version>                                       the README npm would pick
 //
 // The bytes come from the same verified tarball the install routes serve: a local version's blob is checked
-// against its sha512 integrity, an upstream one is fetched and checked by Upstream.tarball. The path is looked up
+// against its sha512 integrity, an upstream one is fetched and checked by Upstream.tarball. An upstream tarball too
+// large to hold (over 32 MiB to download or 48 MiB to unpack, next's) is read as a stream that holds only the file
+// asked for, up to MAX_STREAMED_FILE_BYTES, and checked byte for byte against its sha512 before any of it is used
+// (streamed-analysis.ts, readOneFile). The path is looked up
 // in the parsed entry list, never joined onto anything, so "../" and friends can only name an entry that exists.
 // Answers are cached in the blob store under the tarball's digest: one index of paths and sizes, and one
 // object per path read, so a repeat costs one or two small reads instead of inflating the tarball again.
@@ -12,7 +15,7 @@ import { pageProbe } from "./kept-package.ts";
 import { RequestMemory } from "./memory.ts";
 import { Effect, Option } from "effect";
 import { z } from "zod";
-import { readTarball, type TarEntry } from "@apm/core";
+import { ArchiveError, readTarball, type TarEntry } from "@apm/core";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
 import { Store, type VersionRecord } from "./db.ts";
@@ -21,8 +24,10 @@ import { sha256Hex, sha512 } from "./hash.ts";
 import { json } from "./http.ts";
 import { countLines, ExcerptLine, isUtf8, pickReadme, sliceLines } from "./file-text.ts";
 import { splitPath, versionOf } from "./server.ts";
-import { digestLabel, digestOf, tooLargeText, Upstream, type UpstreamPackage } from "./upstream.ts";
+import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { isWithheld } from "./withheld.ts";
+import { MAX_STREAMED_FILE_BYTES, readOneFile } from "./streamed-analysis.ts";
+import { escapedLength } from "./walk-catalog.ts";
 
 /** The largest file the view returns. Larger files are reported with their size, not sent. */
 export const MAX_FILE_VIEW_BYTES = 1024 * 1024;
@@ -111,8 +116,32 @@ const findVersion = (name: string, version: string) =>
     }
   });
 
-/** The version's tarball, checked against its checksum, parsed into entries. */
-const entriesOf = (found: Found) =>
+/** A version's entries: whole for a tarball held whole; for one read as a stream, only `want` held (`notHeld` the rest). */
+type Entries = { files: TarEntry[]; notHeld: ReadonlySet<TarEntry> };
+
+/** An upstream tarball too large to hold, read as a stream that holds only `want`, verified against its sha512. */
+const streamedEntries = (found: Extract<Found, { kind: "upstream" }>, want: string | null) =>
+  Effect.gen(function* () {
+    const digest = digestOf(found.v);
+
+    if (!digest) return yield* Effect.fail(refuse(422, "This version has no checksum, so its tarball cannot be verified."));
+    // charged to the request's own lease, which stays open until the answer is built and handed to the response: the
+    // entries are read again for the index, the body and their cached copies after the read ends (review of e8616ca,
+    // finding 3: a child lease released here left a 625 KB index built and written with nothing charged for it)
+    const memory = yield* RequestMemory;
+
+    const open = () =>
+      Effect.runPromise(found.upstream.openTarball(found.pkg, found.v.version).pipe(Effect.catchTag("BlobError", () => Effect.succeed({ kind: "unavailable", reason: "the blob store could not be read", retryable: true } as const))));
+
+    const read = yield* Effect.promise(() => readOneFile({ open, digest, want, memory }));
+
+    if (read.kind === "failed") return yield* Effect.fail(refuse(read.status, read.status === 502 ? `Upstream tarball unavailable: ${read.reason}.` : `${read.reason}.`));
+
+    return { files: read.tarball.files, notHeld: read.tarball.notHeld } satisfies Entries;
+  });
+
+/** The version's tarball, checked against its checksum, parsed into entries; `want` is the one file the caller reads. */
+const entriesOf = (found: Found, want: string | null) =>
   Effect.gen(function* () {
     let bytes: Uint8Array;
 
@@ -132,7 +161,7 @@ const entriesOf = (found: Found) =>
         case "unavailable":
           return yield* Effect.fail(refuse(502, `Upstream tarball unavailable: ${got.reason}.`));
         case "too-large":
-          return yield* Effect.fail(refuse(502, `Upstream tarball unavailable: ${tooLargeText(got.bytes)}.`));
+          return yield* streamedEntries(found, want);
         case "ok":
           bytes = got.bytes;
           break;
@@ -145,8 +174,11 @@ const entriesOf = (found: Found) =>
     }
 
     try {
-      return readTarball(bytes, WORKER_MAX_UNPACKED_BYTES);
-    } catch {
+      return { files: readTarball(bytes, WORKER_MAX_UNPACKED_BYTES), notHeld: new Set() } satisfies Entries;
+    } catch (e) {
+      // an upstream tarball under the download cap that unpacks past what is held whole: read as a stream too
+      if (found.kind === "upstream" && e instanceof ArchiveError && e.kind === "too-large") return yield* streamedEntries(found, want);
+
       return yield* Effect.fail(refuse(422, "apm can't read this version's tarball."));
     }
   });
@@ -158,12 +190,107 @@ type FileAnswer = { name: string; version: string; path: string; size: number } 
 type Opened = {
   label: string;
   index: FileIndex;
-  /** The parsed entries; inflates the tarball on first use (the index may have come from the cache). */
-  entries: ReturnType<typeof entriesOf>;
+  /**
+   * The parsed entries with `want` held; inflates the tarball on first use (the index may have come from the cache).
+   * A tarball held whole is read once per request; one read as a stream once per file asked for.
+   */
+  entries: (want: string | null) => ReturnType<typeof entriesOf>;
 };
 
+/**
+ * Charges `bytes` to the request's lease before what they stand for is built (an index, a file body, their JSON),
+ * or answers 503 when the registry has no room for them: they stay charged until the request ends.
+ */
+const charged = (bytes: number, what: string) =>
+  Effect.gen(function* () {
+    if (!(yield* RequestMemory).take(bytes)) return yield* Effect.fail(refuse(503, `The registry has no memory to spare for this ${what} now; try again shortly.`));
+  });
+
+/**
+ * An upper bound on JSON text before it is written: its UTF-16 units, the UTF-8 bytes they encode to, and whether a
+ * unit may be past 0xFF (V8 then holds the whole text at two bytes a unit, else one).
+ */
+type JsonText = { units: number; utf8: number; wide: boolean };
+
+/** What writing the text holds at once: the JSON string and its encoded copy (writeCached). */
+const textBytes = (t: JsonText): number => (t.wide ? 2 : 1) * t.units + t.utf8;
+
+/** `s` as a JSON string: its quotes, and each unit as JSON escapes it (escapedLength: six for a control or surrogate). */
+function addString(t: JsonText, s: string): void {
+  t.units += 2;
+  t.utf8 += 2;
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    const e = escapedLength(c);
+
+    t.units += e;
+    // an escape is ASCII; a unit written as itself takes one to three bytes (a surrogate pair four, under its 12)
+    t.utf8 += e > 1 || c < 0x80 ? e : c < 0x800 ? 2 : 3;
+
+    if (c > 0xff) t.wide = true;
+  }
+}
+
+/**
+ * The UTF-8 text `data` holds, as a JSON string, without decoding it: an ASCII byte is one unit as JSON escapes it,
+ * and every other byte at most one unit and one byte (valid UTF-8 has no lone surrogate, so none is escaped).
+ */
+function addUtf8(t: JsonText, data: Uint8Array): void {
+  t.units += 2;
+  t.utf8 += 2;
+
+  for (const b of data) {
+    if (b < 0x80) {
+      const e = escapedLength(b);
+
+      t.units += e;
+      t.utf8 += e;
+    } else {
+      t.units += 1;
+      t.utf8 += 1;
+      t.wide = true;
+    }
+  }
+}
+
+/** Each entry of an index: its object and array slot (the path is the entry's own string), and `{"path":,"size":}` with the longest size. */
+const INDEX_ENTRY_BYTES = 96;
+
+const INDEX_ENTRY_TEXT = 40;
+
+/**
+ * What the index of `paths` holds while it is built and written: its entries, and its JSON text and encoded copy
+ * with every path as JSON escapes it (review of 8249989: four bytes a character undercounted a path of controls,
+ * which JSON writes six characters for one).
+ */
+function indexBytes(paths: readonly string[]): number {
+  const t: JsonText = { units: 16, utf8: 16, wide: false };
+
+  for (const p of paths) {
+    addString(t, p);
+    t.units += INDEX_ENTRY_TEXT;
+    t.utf8 += INDEX_ENTRY_TEXT;
+  }
+
+  return paths.length * INDEX_ENTRY_BYTES + textBytes(t);
+}
+
+/**
+ * What a file body of `data` holds while it is built and written: its decoded text (a unit for each byte at most),
+ * and the body's JSON text and encoded copy with the text as JSON escapes it.
+ */
+function bodyBytes(data: Uint8Array): number {
+  const t: JsonText = { units: 32, utf8: 32, wide: false };
+
+  addUtf8(t, data);
+
+  return (t.wide ? 2 : 1) * data.length + 64 + textBytes(t);
+}
+
 /** Refuses a revoked version, checks it has a checksum, and reads (or builds and caches) its index of paths. */
-const open = (input: { found: Found; name: string }) =>
+/** `want`: the one file the request reads, so a tarball read as a stream holds it while it builds the index. */
+const open = (input: { found: Found; name: string; want?: string | null }) =>
   Effect.gen(function* () {
     const { found, name } = input;
     const v = found.v;
@@ -173,18 +300,26 @@ const open = (input: { found: Found; name: string }) =>
 
     if (!digest) return yield* Effect.fail(refuse(422, "This version has no checksum, so its tarball cannot be verified."));
     const label = digestLabel(digest);
-    let inflated: TarEntry[] | null = null;
+    let inflated: Entries | null = null;
 
-    const entries = Effect.gen(function* () {
-      inflated ??= yield* entriesOf(found);
+    const entries = (want: string | null) =>
+      Effect.gen(function* () {
+        // a whole read serves every path; a streamed one only the path it held
+        if (inflated !== null && (inflated.notHeld.size === 0 || inflated.files.some((f) => f.path === want && !inflated?.notHeld.has(f)))) return inflated;
+        inflated = yield* entriesOf(found, want);
 
-      return inflated;
-    });
+        return inflated;
+      });
 
     let index = yield* readCached(indexKey(label), FileIndex);
 
     if (!index) {
-      index = { entries: (yield* entries).map((e) => ({ path: e.path, size: e.data.length })) };
+      const read = yield* entries(input.want ?? null);
+
+      // the index and its JSON, charged before they are built
+      yield* charged(indexBytes(read.files.map((e) => e.path)), "file index");
+      // each entry's size, which a streamed read keeps for the files it did not hold
+      index = { entries: read.files.map((e) => ({ path: e.path, size: e.size })) };
       yield* writeCached(indexKey(label), index);
     }
 
@@ -207,9 +342,13 @@ const entryAt = (input: { opened: Opened; name: string; version: string; path: s
 /** The inflated bytes of the entry named `path` (already known to be in the index exactly once). */
 const bytesAt = (input: { opened: Opened; name: string; version: string; path: string }) =>
   Effect.gen(function* () {
-    const entry = (yield* input.opened.entries).find((e) => e.path === input.path);
+    const read = yield* input.opened.entries(input.path);
+    const entry = read.files.find((e) => e.path === input.path);
 
     if (!entry) return yield* Effect.fail(refuse(404, `${input.name}@${input.version} has no file ${input.path}.`));
+
+    // a file over what a streamed read holds of one file is said to be, never shown from its first bytes
+    if (read.notHeld.has(entry)) return yield* Effect.fail(refuse(413, `${input.path} is ${(entry.size / 1_000_000).toFixed(1)} MB; from a tarball this large apm reads at most ${MAX_STREAMED_FILE_BYTES / (1024 * 1024)} MiB of one file.`));
 
     return entry.data;
   });
@@ -224,7 +363,11 @@ const wholeFile = (input: { opened: Opened; name: string; version: string; path:
     let body = yield* readCached(bodyKey(opened.label, path), FileBody);
 
     if (!body) {
-      body = fileBody(yield* bytesAt(input));
+      const data = yield* bytesAt(input);
+
+      // the decoded text, its JSON and that JSON's encoded copy, charged before any is built
+      yield* charged(bodyBytes(data), "file");
+      body = fileBody(data);
       yield* writeCached(bodyKey(opened.label, path), body);
     }
 
@@ -233,7 +376,7 @@ const wholeFile = (input: { opened: Opened; name: string; version: string; path:
 
 const answerFor = (input: { found: Found; name: string; path: string }) =>
   Effect.gen(function* () {
-    const opened = yield* open(input);
+    const opened = yield* open({ ...input, want: input.path });
 
     return yield* wholeFile({ opened, name: input.name, version: input.found.v.version, path: input.path });
   });
@@ -278,7 +421,7 @@ const excerptFor = (input: { found: Found; name: string; path: string; line: num
   Effect.gen(function* () {
     const { name, path, line, context } = input;
     const version = input.found.v.version;
-    const opened = yield* open(input);
+    const opened = yield* open({ ...input, want: input.path });
     const hit = yield* entryAt({ opened, name, version, path });
     const head = { name, version, path, size: hit.size };
     let count: LineCount | null = yield* readCached(countKey(opened.label, path), LineCount);

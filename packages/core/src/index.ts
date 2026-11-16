@@ -20,6 +20,6 @@ export { READING_LIMITS } from "./js.ts";
 
 export { expandHooks, gypCommands, LIFECYCLE, type ExpandedHook, type HookKind } from "./scripts.ts";
 
-export { MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, PHASES, type Phase } from "./meter.ts";
+export { MAX_ANALYSIS_WORK, Meter, MeterExhausted, metered, PHASE_NAMES, PHASES, type Phase } from "./meter.ts";
 
 export * from "./sri.ts";

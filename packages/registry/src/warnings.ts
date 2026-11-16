@@ -6,7 +6,7 @@
 // installs is still the one checked, and strict mode and the ~safe view refuse it.
 // What still refuses in every mode is not a score: a revoked or yanked version, and one an apm reviewer confirmed
 // malicious. Pure, so resolve, scan and their tests build the same warning from the same facts.
-import type { ScoreReport } from "@apm/core";
+import { coverageText, partialCoverage, type ScoreReport } from "@apm/core";
 
 /**
  * What a warning is about. `unchecked`: the dependency walk stopped at one of its limits before this part of the tree.
@@ -54,17 +54,24 @@ export function topReasons(r: Pick<ScoreReport, "signals">): string[] {
     .map((s) => (s.evidence[0] ? `${s.label}: ${s.evidence[0]}` : s.label));
 }
 
-/** A scored version's warning: incomplete whatever its score, or a score under `floor`; null when neither. */
+/**
+ * A scored version's warning: incomplete whatever its score (an `incomplete` signal, or since apm-score-v11 a partial
+ * reading, which costs no points and so can score well), or a score under `floor`; null when none. Strict mode and the
+ * ~safe view refuse what this warns about.
+ */
 export function scoreWarning(input: { name: string; version: string; report: ScoreReport; floor: number; url: string; via: string[] }): InstallWarning | null {
   const { report } = input;
   const incomplete = report.signals.some((s) => s.id === "incomplete");
+  const partial = partialCoverage(report);
 
-  if (!incomplete && report.score >= input.floor) return null;
+  if (!incomplete && partial === null && report.score >= input.floor) return null;
   const base = { name: input.name, version: input.version, reasons: topReasons(report), url: input.url, via: input.via, score: report.score, grade: report.grade };
 
-  return incomplete
-    ? { ...base, kind: "incomplete", text: `apm could not fully analyse it (scores ${report.score}/100, ${report.grade})` }
-    : { ...base, kind: "low-score", text: `scores ${report.score}/100 (${report.grade}), under the floor of ${input.floor}` };
+  if (incomplete) return { ...base, kind: "incomplete", text: `apm could not fully analyse it (scores ${report.score}/100, ${report.grade})` };
+
+  if (partial !== null) return { ...base, kind: "incomplete", text: `apm read only part of it: ${coverageText(partial)} (scores ${report.score}/100 on what it read)` };
+
+  return { ...base, kind: "low-score", text: `scores ${report.score}/100 (${report.grade}), under the floor of ${input.floor}` };
 }
 
 /** A warning with no score: a version apm cannot score or has not scored yet, a lookup that failed, a walk cut short. */

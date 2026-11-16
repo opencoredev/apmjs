@@ -89,7 +89,7 @@ export function textReadWeight(size: TextSize): number {
 }
 
 /** What one UTF-16 unit takes in JSON text at most: a quote, a backslash and the short escapes 2, other controls and any surrogate 6. */
-function escapedLength(c: number): number {
+export function escapedLength(c: number): number {
   if (c === 0x22 || c === 0x5c || c === 0x08 || c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d) return 2;
 
   if (c < 0x20 || (c >= 0xd800 && c <= 0xdfff)) return 6;

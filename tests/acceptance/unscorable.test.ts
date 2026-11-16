@@ -1,7 +1,10 @@
 // Criterion 1 of apm-score-v10, the registry's half: a version that can never be scored says why on every surface
 // (score endpoint, package answer, resolve for apm add, scan for the Bun scanner) instead of answering 503 "queued, try
 // again in a minute" forever; installs warn about it, and strict mode refuses it. A run the platform stopped (CPU limit) stores nothing, so the
-// next run reads less and is incomplete, and the one after records that the version cannot be scored.
+// next run reads less and is incomplete, and the one after records that the version cannot be scored. A tarball over
+// the caps a tarball read whole must fit (32 MiB downloaded, 48 MiB unpacked) is no longer one of them: it is read as
+// a stream (streamed-analysis.ts) and scored; outcomes are per scorer, so what apm-score-v10 refused for those caps
+// decides nothing for apm-score-v11.
 // npm is a local recording stub; no real host is contacted.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
@@ -9,11 +12,46 @@ import { z } from "zod";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { apm, dig, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, writeConsumer, type Registry } from "./harness";
+import { createGzip } from "node:zlib";
+import { apm, dig, getJson, installedVersion, makeSandbox, pkgTgz, startRegistry, tarHeader, writeConsumer, type Registry } from "./harness";
 
 const clock = Date.parse("2026-11-01T00:00:00Z");
 
-type Served = { bytes: Uint8Array; downloads: number; checksum: boolean; dependencies?: Record<string, string> };
+/**
+ * A tarball that inflates past the 512 MiB apm-score-v11 reads as a stream (READ.maxUnpackedBytes), so it is still
+ * refused as too large: `files`, then `megabytes` MiB of zeros, gzipped a MiB at a time so this test never holds them.
+ */
+async function inflatesPast(name: string, files: Record<string, string>, megabytes: number): Promise<Uint8Array> {
+  const gz = createGzip();
+  const out: Buffer[] = [];
+
+  const done = new Promise<void>((resolve, reject) => {
+    gz.on("data", (c: Buffer) => out.push(c));
+    gz.on("end", resolve);
+    gz.on("error", reject);
+  });
+
+  const write = (b: Uint8Array) => (gz.write(b) ? Promise.resolve() : new Promise<void>((resolve) => gz.once("drain", resolve)));
+  const manifest = JSON.stringify({ name, version: "1.0.0", license: "MIT", main: "index.js" });
+
+  for (const [path, text] of [["package.json", manifest], ...Object.entries(files)] as const) {
+    const data = new TextEncoder().encode(text);
+    await write(Buffer.concat([tarHeader(`package/${path}`, data.length), data, new Uint8Array((512 - (data.length % 512)) % 512)]));
+  }
+
+  await write(tarHeader("package/data.bin", megabytes * 1024 * 1024));
+  const mib = new Uint8Array(1024 * 1024);
+
+  for (let i = 0; i < megabytes; i++) await write(mib);
+  await write(new Uint8Array(1024));
+  gz.end();
+  await done;
+
+  return Buffer.concat(out);
+}
+
+/** `listed`: the bytes the packument's checksums are of, when they are not the ones served (tampered on the way). */
+type Served = { bytes: Uint8Array; downloads: number; checksum: boolean; dependencies?: Record<string, string>; listed?: Uint8Array };
 
 /** One version of the npm stand-in's packument. */
 type ServedVersion = { name: string; version: string; main: string; dist: { tarball: string; shasum?: string; integrity?: string }; dependencies?: Record<string, string> };
@@ -40,11 +78,16 @@ describe("versions that can never be scored", () => {
   let npm: ReturnType<typeof Bun.serve>;
   let reg: Registry;
 
-  const tgzOf = (name: string, files: Record<string, string>): Uint8Array => pkgTgz({ name, version: "1.0.0", license: "MIT", main: "index.js" }, files);
+  const tgzOf = (name: string, files: Record<string, string | Uint8Array>): Uint8Array => pkgTgz({ name, version: "1.0.0", license: "MIT", main: "index.js" }, files);
 
   beforeAll(async () => {
-    // over the 32 MiB download cap: random bytes, which no gzip shrinks
-    tarballs.set("over-download", { bytes: new Uint8Array(randomBytes(33 * 1024 * 1024)), downloads: 0, checksum: true });
+    // over the 32 MiB download cap: a native binary of random bytes, which no gzip shrinks, beside a little code
+    const addon = new Uint8Array(randomBytes(33 * 1024 * 1024));
+    tarballs.set("over-download", { bytes: tgzOf("over-download", { "index.js": "module.exports = require('./lib.js');\n", "lib.js": "module.exports = 2;\n", "prebuilt/addon.node": addon }), downloads: 0, checksum: true });
+    // the same size, but npm's checksum names other bytes
+    tarballs.set("over-download-tampered", { bytes: tgzOf("over-download-tampered", { "index.js": "module.exports = 1;\n", "prebuilt/addon.node": addon }), downloads: 0, checksum: true, listed: new Uint8Array([1, 2, 3]) });
+    // refused by a registry from before streamed reads, for the download cap
+    tarballs.set("old-refusal", { bytes: tgzOf("old-refusal", { "index.js": "module.exports = 1;\n" }), downloads: 0, checksum: true });
     // 60 KB compressed, more than 48 MiB once unpacked
     tarballs.set("over-unpack", { bytes: tgzOf("over-unpack", { "index.js": "module.exports = 1;\n", "data.txt": "0".repeat(50 * 1024 * 1024) }), downloads: 0, checksum: true });
     // npm lists no checksum: apm can never check the bytes it would score
@@ -77,8 +120,10 @@ describe("versions that can never be scored", () => {
         const name = decodeURIComponent(u.pathname.slice(1));
         const tarball = `${npm.url.toString()}${name}/-/${name}-1.0.0.tgz`;
 
+        const listed = served.listed ?? served.bytes;
+
         const dist = served.checksum
-          ? { tarball, shasum: createHash("sha1").update(served.bytes).digest("hex"), integrity: `sha512-${createHash("sha512").update(served.bytes).digest("base64")}` }
+          ? { tarball, shasum: createHash("sha1").update(listed).digest("hex"), integrity: `sha512-${createHash("sha512").update(listed).digest("base64")}` }
           : { tarball };
 
         const version: ServedVersion = { name, version: "1.0.0", main: "index.js", dist };
@@ -146,26 +191,66 @@ describe("versions that can never be scored", () => {
     }
   }
 
-  test("a tarball over the 32 MiB download cap is recorded too large, once, and every surface says so", async () => {
+  /** The stored score of one version: its answer, which must be 200. */
+  async function scoreOf(name: string): Promise<z.infer<typeof Signals>> {
+    const score = await getJson(`${reg.url}-/apm/v1/score/${name}/1.0.0`);
+
+    expect(score.status, JSON.stringify(score.body)).toBe(200);
+
+    return Signals.parse(score.body);
+  }
+
+  test("a tarball over the 32 MiB download cap is read as a stream and scored in full; its native binary is listed, not read", async () => {
+    // on 98decb3: recorded too large ("larger than the 32 MiB apm downloads") and never scored
+    expect(tarballs.get("over-download")?.bytes.length ?? 0).toBeGreaterThan(32 * 1024 * 1024);
     expect(await reg.analysisJob({ name: "over-download", version: "1.0.0" })).toBe("ack");
-    await expectUnscorable("over-download", "too-large", "larger than the 32 MiB apm downloads");
+    const s = await scoreOf("over-download");
 
-    // decided: the queue does not fetch it again
-    const before = tarballs.get("over-download")?.downloads;
+    expect(s.signals.find((x) => x.id === "incomplete")).toBeUndefined();
+    expect(s.score).toBeGreaterThanOrEqual(75);
+    // the download's refusal of the size, then one streamed pass: the code fit beside package.json
+    expect(tarballs.get("over-download")?.downloads).toBe(2);
 
-    expect(await reg.analysisJob({ name: "over-download", version: "1.0.0" })).toBe("ack");
-    expect(tarballs.get("over-download")?.downloads).toBe(before);
-  }, 60_000);
+    // scored: another delivery fetches nothing (on this test clock it is still inside the run's window, so it is busy)
+    await reg.analysisJob({ name: "over-download", version: "1.0.0" });
+    expect(tarballs.get("over-download")?.downloads).toBe(2);
+  }, 120_000);
 
-  test("a tarball over the 48 MiB unpack cap is recorded on the request that first reads it", async () => {
-    // the queue's run finds out, as it does for every version (no request analyses inline)
+  test("a tarball over the 48 MiB unpack cap is read as a stream from the registry's own copy and scored", async () => {
+    // on 98decb3: recorded too large ("inflates to more than 48 MB"); its 50 MB data.txt is no code, so nothing is left unread
     expect(await reg.analysisJob({ name: "over-unpack", version: "1.0.0" })).toBe("ack");
-    await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB");
-  }, 60_000);
+    const s = await scoreOf("over-unpack");
+
+    expect(s.signals.find((x) => x.id === "incomplete")).toBeUndefined();
+    // downloaded once, checked and kept; the stream read that copy
+    expect(tarballs.get("over-unpack")?.downloads).toBe(1);
+  }, 120_000);
+
+  test("a streamed tarball that fails its checksum stores nothing and is handed back to retry", async () => {
+    expect(await reg.analysisJob({ name: "over-download-tampered", version: "1.0.0" })).toBe("retry");
+    const score = await getJson(`${reg.url}-/apm/v1/score/over-download-tampered/1.0.0`);
+
+    // not scored and not refused: queued, as before a run
+    expect(score.status).toBe(503);
+    expect(ScoreAnswer.parse(score.body).unscorable).toBeUndefined();
+    expect(await reg.query("SELECT 1 FROM upstream_analysis WHERE package = 'over-download-tampered'")).toEqual([]);
+    expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'over-download-tampered'"))).toEqual([{ starts: 1, outcome: null }]);
+  }, 120_000);
+
+  test("a version a registry before apm-score-v11 refused as too large is scored by this scorer's run", async () => {
+    // what the old caps wrote (an old Worker may still write it during a deploy): an outcome under apm-score-v10
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ('old-refusal', '1.0.0', 'apm-score-v10', 'too-large', 'the tarball (43.7 MB) is larger than the 32 MiB apm downloads', $1)", [clock]);
+
+    // outcomes are per scorer, so it decides nothing for apm-score-v11: the run reads the tarball and scores it
+    expect(await reg.analysisJob({ name: "old-refusal", version: "1.0.0" })).toBe("ack");
+    expect((await scoreOf("old-refusal")).signals.find((x) => x.id === "incomplete")).toBeUndefined();
+  }, 120_000);
 
   test("the outcome is bound to the tarball it was decided for: once npm serves other bytes, the website reads the readme again (review of e4f97b2)", async () => {
     const name = "bound-outcome";
-    const big = tgzOf(name, { "index.js": "module.exports = 1;\n", "README.md": "# Readable now\n", "data.txt": "0".repeat(50 * 1024 * 1024) });
+    // past what apm-score-v11 reads as a stream: a tarball over the 48 MiB a tarball read whole may inflate to is scored
+    // now (above), so this one inflates past 512 MiB
+    const big = await inflatesPast(name, { "index.js": "module.exports = 1;\n", "README.md": "# Readable now\n" }, 513);
 
     tarballs.set(name, { bytes: big, downloads: 0, checksum: true });
     expect(await reg.analysisJob({ name, version: "1.0.0" })).toBe("ack");
@@ -194,7 +279,7 @@ describe("versions that can never be scored", () => {
   test("a run the platform stopped is run again in full, and stores a complete score", async () => {
     // what a stopped run leaves: its start counted, nothing stored, and longer ago than any run can take. Production,
     // 13 Nov: express 5.3.0's first run shared its isolate with six others, and the memory limit ended them all
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-once', '1.0.0', 'apm-score-v10', 1, $1)", [clock - 60 * 60_000]);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-once', '1.0.0', 'apm-score-v11', 1, $1)", [clock - 60 * 60_000]);
     expect(await reg.analysisJob({ name: "stopped-once", version: "1.0.0" })).toBe("ack");
     const score = await getJson(`${reg.url}-/apm/v1/score/stopped-once/1.0.0`);
 
@@ -203,7 +288,7 @@ describe("versions that can never be scored", () => {
   }, 60_000);
 
   test("after two stopped runs the next is a smaller run that is incomplete, never clean, and says why first", async () => {
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-twice', '1.0.0', 'apm-score-v10', 2, $1)", [clock - 60 * 60_000]);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-twice', '1.0.0', 'apm-score-v11', 2, $1)", [clock - 60 * 60_000]);
     expect(await reg.analysisJob({ name: "stopped-twice", version: "1.0.0" })).toBe("ack");
     const score = await getJson(`${reg.url}-/apm/v1/score/stopped-twice/1.0.0`);
 
@@ -215,7 +300,7 @@ describe("versions that can never be scored", () => {
   }, 60_000);
 
   test("after three stopped runs the next records that the version cannot be scored, without analysing", async () => {
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-thrice', '1.0.0', 'apm-score-v10', 3, $1)", [clock - 60 * 60_000]);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('stopped-thrice', '1.0.0', 'apm-score-v11', 3, $1)", [clock - 60 * 60_000]);
     expect(await reg.analysisJob({ name: "stopped-thrice", version: "1.0.0" })).toBe("ack");
     await expectUnscorable("stopped-thrice", "analysis-limit", "3 analyses of it were stopped by the platform before they finished");
     expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'stopped-thrice'"))).toEqual([{ starts: 4, outcome: "analysis-limit" }]);
@@ -223,7 +308,7 @@ describe("versions that can never be scored", () => {
 
   test("a run that began a minute ago may still be going: the job comes back later, and nothing is decided", async () => {
     // the queue consumer runs on the system clock (worker.ts), not the test clock
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('still-running', '1.0.0', 'apm-score-v10', 1, $1)", [Date.now() - 60_000]);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ('still-running', '1.0.0', 'apm-score-v11', 1, $1)", [Date.now() - 60_000]);
     expect(await reg.analysisJob({ name: "still-running", version: "1.0.0" })).toBe("retry");
     expect(Starts.parse(await reg.query("SELECT starts, outcome FROM analysis_outcomes WHERE package = 'still-running'"))).toEqual([{ starts: 1, outcome: null }]);
 
@@ -237,7 +322,7 @@ describe("versions that can never be scored", () => {
   test("apm add and apm x warn about a dependency apm can never score, naming why, and install; --strict refuses", async () => {
     // the root is scored clean by the queue; its dependency is decided analysis-limit
     expect(await reg.analysisJob({ name: "needs-limit-dep", version: "1.0.0" })).toBe("ack");
-    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ('limit-dep', '1.0.0', 'apm-score-v10', 'analysis-limit', 'two analyses of it were stopped', $1)", [clock]);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ('limit-dep', '1.0.0', 'apm-score-v11', 'analysis-limit', 'two analyses of it were stopped', $1)", [clock]);
     const sb = makeSandbox(reg);
     const app = writeConsumer(mkdtempSync(join(tmpdir(), "apm-unscorable-")), reg, undefined, {});
     const env = { ...sb.env, APM_PENDING_WAIT_MS: "0" };

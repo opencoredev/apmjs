@@ -2,6 +2,7 @@
 import "server-only";
 import { cache } from "react";
 import { z } from "zod";
+import { Coverage } from "./coverage";
 import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
@@ -63,8 +64,9 @@ const Facts = z.object({
 
 export type Facts = z.infer<typeof Facts>;
 
+
 /** A version's full score as the package answer (latest) and the versions route (any version) carry it. */
-const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable, ...CapabilityFields });
+const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
 
 const PackageInfo = z.object({
   name: z.string(),
@@ -214,7 +216,7 @@ const VersionInfo = z.object({
 /** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
 export const getVersionInfo = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> => getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo);
 
-const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), ...Reviewable, ...CapabilityFields });
+const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
 
 export type VersionScore = z.infer<typeof VersionScore>;
 

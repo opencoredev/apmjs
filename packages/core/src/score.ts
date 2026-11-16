@@ -5,14 +5,14 @@
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
-import { boundedManifest, measureManifest } from "./manifest.ts";
-import { describeSkip, MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
+import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts";
+import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { typoConflicts } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
-import { ambiguousPaths, type TarEntry } from "./tarball.ts";
+import { ambiguousPaths, MemoryRefused, type HoldRule, type LookAt, type StreamMemory, type TarEntry } from "./tarball.ts";
 import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
 import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
 import { boundOf, PRECISION_BOUNDS, type Bound, type Exports, type Label, type Sink } from "./flow.ts";
@@ -78,8 +78,13 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * native code, install scripts) is listed as a capability for nothing, each with v9's evidence, and points go to what
  * malware does (install-time network and processes, credential files read, the environment sent out, capture
  * endpoints, remote shells, obfuscation, look-alike names) and to capabilities a package's own declaration leaves out.
+ * v11 separates what apm read from what it found: files left unread only for their size or the byte budget cost no
+ * points (they cost -61 as `incomplete` and -20 as `unanalyzed-files` before) and are stated as the analysis's
+ * `coverage`; a partial reading is graded "P", never a letter that reads as a pass. Every other reason an analysis is
+ * `incomplete` (the work meter, a parser limit, code run from strings past what apm follows, a re-run that read less
+ * after the platform stopped the runs before it) costs what it did.
  */
-export const SCORER = "apm-score-v10";
+export const SCORER = "apm-score-v11";
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -125,6 +130,25 @@ const FactsSchema = z.object({
 const SkippedSchema = z.object({ path: z.string(), size: z.number(), reason: z.enum(SKIP_REASONS) });
 
 /**
+ * Why files went unread, for `coverage`: "too-large", one over the size a file may be (MAX_ANALYZED_FILE_BYTES);
+ * "over-budget", past the bytes one analysis reads (a tarball read as a stream holds only its budget of them);
+ * "stopped", the analysis stopped before it read what it had (the work meter, a package.json past what apm reads, a
+ * run that failed), so nothing it holds was read.
+ */
+export const COVERAGE_REASONS = ["too-large", "over-budget", "stopped"] as const;
+
+/**
+ * How much of the version apm read (apm-score-v11). Complete: every file the analysis would read was read. Partial:
+ * `omittedFiles` files of `omittedBytes` were not, for `reasons`; `notes` say what else limited the reading (the import
+ * graph of a tarball read as a stream). A partial reading is not a finding: size and budget omissions cost no points,
+ * and installs check coverage apart from the score (registry warnings.ts, apm.ts policyBlock).
+ */
+const CoverageSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("complete") }),
+  z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.enum(COVERAGE_REASONS)), notes: z.array(z.string()).default([]) }),
+]);
+
+/**
  * A capability (apm-score-v10): something the package can do, shown with its evidence and never scored on its own.
  * `status` compares it with the package's declaration: `declared` and `undeclared` when the package declares
  * capabilities, `not-declared` when it declares none, `unused` for a declared capability apm saw no use of. `basis`
@@ -162,7 +186,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", "apm-score-v9", SCORER]),
+  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", "apm-score-v9", "apm-score-v10", SCORER]),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -173,6 +197,8 @@ const AnalysisSchema = z.object({
   capabilities: z.array(CapabilitySchema).default([]),
   /** Whether the package declares its capabilities, and what apm could not use in the declaration. */
   declaration: z.object({ kind: z.enum(["none", "declared"]), notes: z.array(z.string()) }).optional(),
+  /** How much of the version apm read (apm-score-v11); absent from analyses earlier scorers stored. */
+  coverage: CoverageSchema.optional(),
 });
 
 export type Signal = z.infer<typeof SignalSchema>;
@@ -183,11 +209,27 @@ export type ModuleFormat = Facts["moduleFormat"];
 
 export type Analysis = z.infer<typeof AnalysisSchema>;
 
+export type Coverage = z.infer<typeof CoverageSchema>;
+
+/** The partial coverage of an analysis, or null when it read everything it would (or an earlier scorer stored none). */
+export function partialCoverage(a: Pick<Analysis, "coverage">): Extract<Coverage, { kind: "partial" }> | null {
+  return a.coverage?.kind === "partial" ? a.coverage : null;
+}
+
+/** "2,656 files (74.0 MB) not read", the words every surface uses for a partial reading. */
+export function coverageText(c: Extract<Coverage, { kind: "partial" }>): string {
+  // an analysis that stopped left nothing it can count: it read no file it could vouch for
+  if (c.reasons.includes("stopped")) return "its analysis stopped before it finished, so nothing in it was cleared";
+
+  return `${c.omittedFiles.toLocaleString("en-US")} file${c.omittedFiles === 1 ? "" : "s"} (${(c.omittedBytes / 1_000_000).toFixed(1)} MB) not read`;
+}
+
 export type DismissedEvidence = z.infer<typeof DismissedSchema>;
 
 export type Capability = z.infer<typeof CapabilitySchema>;
 
-export type Grade = "A" | "B" | "C" | "D" | "F";
+/** A to F by score; "P" for a partial reading (apm-score-v11), whatever its score: a partial reading is not graded. */
+export type Grade = "A" | "B" | "C" | "D" | "F" | "P";
 
 export type ScoreReport = Analysis & { score: number; grade: Grade };
 
@@ -663,6 +705,14 @@ export type AnalyzeInput = {
    * analysis the platform stopped on a smaller budget, and says so, since the reading it can afford is not the whole.
    */
   incompleteBecause?: readonly string[];
+  /**
+   * Entries of `files` whose `data` is only their first bytes (tarball.ts's HEAD_BYTES): a tarball too large to hold,
+   * read as a stream that kept these out (planReading). A walk that reaches one reports it skipped, as it reports a file
+   * past the byte budget, and never reads the head as if it were the file. Empty, or left out, for a tarball read whole.
+   */
+  notHeld?: ReadonlySet<TarEntry>;
+  /** What else limited the reading, said in `coverage` when it is partial (a streamed read's cut import graph). */
+  coverageNotes?: readonly string[];
 };
 
 /** What each dependency installs: the registry name behind an npm: alias, the key for anything else. */
@@ -829,7 +879,245 @@ type V3Walk = {
   add: Found["add"];
   /** Called with the text of each file this walk reads that the first walk did not. */
   read: (f: TarEntry, text: string) => void;
+  notHeld: ReadonlySet<TarEntry>;
 };
+
+/**
+ * A file a streamed read did not hold, reached by a walk: skipped as the walk skips a file it has no room for. One over
+ * MAX_ANALYZED_FILE_BYTES is too large, as it would be read whole; any other is past the budget, which for a streamed
+ * read is what it held (planReading). Its size is the entry's, since its `data` is only its first bytes.
+ */
+function skipNotHeld(f: TarEntry, reached: boolean, skipped: SkippedFile[], unanalyzed: SkippedFile[]): void {
+  if (f.size > MAX_ANALYZED_FILE_BYTES) skipped.push({ path: f.path, size: f.size, reason: "too-large" });
+  else (reached ? skipped : unanalyzed).push({ path: f.path, size: f.size, reason: "over-budget" });
+}
+
+/** What coverage says when a streamed read could not read the tarball's own package.json. */
+export const MANIFEST_NOT_READ = "the tarball's own package.json was not read, so the registry's copy of its manifest was used in its place";
+
+/** Files the analysis reads whole by name, outside its walks, when they are there: they are always held first. */
+const READ_BY_NAME = ["package.json", "binding.gyp", "Makefile", "makefile", "GNUmakefile", "CMakeLists.txt"] as const;
+
+/**
+ * The relative paths a file loads by apm-score-v3's import pattern: what the analysis's walk follows from a file it
+ * reaches (with the parser's own imports, which find the same literal paths), for a reading plan made before the file
+ * is held. Charges the installed meter for the text pass.
+ */
+export function importPaths(bytes: Uint8Array): string[] {
+  chargeText("text", bytes.length, 3);
+
+  return importsOf(joinStrings(new TextDecoder().decode(bytes)).text).paths;
+}
+
+/**
+ * What a streamed read's first pass may hold (the files read by name and the code it holds while it has room, together),
+ * may gather to look at (one file, and every file it looks at), may keep of the import graph (characters of paths, and
+ * paths), and the memory it charges what it keeps to.
+ */
+export type FirstPassLimits = { holdBytes: number; lookFileBytes: number; lookTotalBytes: number; importBytes?: number; importEdges?: number; memory?: StreamMemory };
+
+/** Characters of import paths the first pass keeps, all files together: next 16.4.6's 80 MB of code import 0.4 million. */
+export const IMPORT_GRAPH_BYTES = 4 * 1024 * 1024;
+
+/** Import paths the first pass keeps, all files together: next 16.4.6's are 9,340. */
+export const IMPORT_GRAPH_EDGES = 200_000;
+
+/** Of `holdBytes`, what code the first pass holds leaves free for the files read by name, which may come after it. */
+export const NAMED_HEADROOM = 1024 * 1024;
+
+/** Bytes charged for each kept import path beside its characters, and for each file's list. */
+const IMPORT_PATH_BYTES = 32;
+const IMPORT_LIST_BYTES = 64;
+
+/**
+ * The first pass's rule and its look, the import paths of each file it looked at (which fill as it reads), and whether
+ * it stopped keeping them at its allowance: a plan made from a cut graph may miss what the rest load.
+ */
+export type FirstPass = { hold: HoldRule; look: LookAt; imports: Map<string, readonly string[]>; readonly importsCut: boolean };
+
+/**
+ * The first pass of a streamed read. It holds package.json whenever apm reads a manifest that large at all (4 MB of
+ * text, MANIFEST_LIMITS), whatever `holdBytes` is: the plan and the analysis need the tarball's own. It holds the other
+ * files the analysis reads by name (binding.gyp, the Makefiles) and, while it has room, code files, all within one
+ * `holdBytes`: code leaves NAMED_HEADROOM of it free, so
+ * code that came first does not crowd out a package.json that comes last. It looks at every file the analysis's walk
+ * could follow imports from (not a doc, type, map or data file, not a native binary by name) for the paths it imports,
+ * one file at a time, each let go once read, until it has looked at `lookTotalBytes` or kept `importBytes` characters
+ * or `importEdges` paths of the graph; past that it keeps none (`importsCut`). Every path it keeps, and the text it
+ * decodes while it reads one, is charged to `memory` first (MemoryRefused when it has no room). When the plan made from
+ * it (planReading) wants only files this pass holds, no second pass is needed. A file whose imports it did not keep has
+ * none in the plan, so the plan may miss what it loads; `analyze` then reports that as not read.
+ */
+export function firstPass(limits: FirstPassLimits): FirstPass {
+  const imports = new Map<string, readonly string[]>();
+  const named = new Set<string>(READ_BY_NAME);
+  const memory = limits.memory ?? { take: () => true, give: () => undefined };
+  const maxChars = limits.importBytes ?? IMPORT_GRAPH_BYTES;
+  const maxEdges = limits.importEdges ?? IMPORT_GRAPH_EDGES;
+  const codeRoom = limits.holdBytes - Math.min(NAMED_HEADROOM, limits.holdBytes / 4);
+  let looked = 0;
+  let heldBytes = 0;
+  let chars = 0;
+  let edges = 0;
+  let cut = false;
+
+  const hold: HoldRule = ({ path, size }) => {
+    // the manifest the analysis and the plan read: held whenever apm would read it at all, outside the file budget (a
+    // budget of one byte still reads the tarball's own package.json, never the registry's copy in its place)
+    if (path === "package.json" && size <= MANIFEST_LIMITS.chars) return "hold";
+
+    if (named.has(path) && heldBytes + size <= limits.holdBytes) {
+      heldBytes += size;
+
+      return "hold";
+    }
+
+    if (NOT_CODE.test(path) || NEVER_RUN.test(path) || /\.(?:node|exe|dll|so|dylib)$/.test(path) || size > limits.lookFileBytes) return "head";
+
+    if (heldBytes + size <= codeRoom) {
+      heldBytes += size;
+      looked += size;
+
+      return "hold";
+    }
+
+    if (cut || looked + size > limits.lookTotalBytes) return "head";
+    looked += size;
+
+    return "look";
+  };
+
+  const look: LookAt = (file, bytes) => {
+    if (cut || NOT_CODE.test(file.path) || NEVER_RUN.test(file.path) || isBinary({ ...file, data: bytes }) || isBinaryData({ ...file, data: bytes })) return;
+    // the decoded text and the joined text it is read from, two bytes a character at most, while it is read
+    const reading = 4 * bytes.length;
+
+    if (!memory.take(reading)) throw new MemoryRefused(`no memory to read ${file.path}'s imports`);
+    let paths: string[];
+
+    try {
+      // a path is copied out of the text it was matched in: V8 keeps a whole file's text alive behind a slice of it
+      paths = importPaths(bytes).map((p) => decoder.decode(encoder.encode(p)));
+    } finally {
+      memory.give(reading);
+    }
+
+    if (paths.length === 0) return;
+    const more = paths.reduce((n, p) => n + p.length, 0);
+
+    if (chars + more > maxChars || edges + paths.length > maxEdges) {
+      cut = true;
+
+      return;
+    }
+
+    if (!memory.take(IMPORT_LIST_BYTES + paths.length * IMPORT_PATH_BYTES + 2 * more)) throw new MemoryRefused(`no memory to keep ${file.path}'s imports`);
+    chars += more;
+    edges += paths.length;
+    imports.set(file.path, paths);
+  };
+
+  return {
+    hold,
+    look,
+    imports,
+    get importsCut() {
+      return cut;
+    },
+  };
+}
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/**
+ * Which files of a tarball too large to hold a streamed read keeps whole, at most `budget` bytes of them: the files
+ * `analyze` would read first, in its order. That is the files it reads by name, then what install hooks run,
+ * binding.gyp and the declared entries, then every file those reach through `imports` (the paths each file loads, as
+ * importPaths reads them), then every other file that could be code, code extensions first. A file that does not fit
+ * is passed over for the next, as `analyze` passes it over. Files `analyze` never reads (native binaries, images and
+ * the like, known by their first bytes; one over MAX_ANALYZED_FILE_BYTES) are never held. `files` may hold only each
+ * file's first bytes: only paths, sizes and those are read. `analyze` reports any file it reaches that is not held as
+ * skipped, so a plan that guessed wrong costs completeness, never a clean reading of what was not read.
+ */
+export function planReading(input: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; imports: ReadonlyMap<string, readonly string[]>; budget: number }): Set<string> {
+  const { files, imports, budget } = input;
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  const held = new Set<string>();
+  let total = 0;
+
+  charge("score", files.length * 4);
+
+  const take = (f: TarEntry): void => {
+    if (held.has(f.path) || isBinary(f) || isBinaryData(f) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
+    held.add(f.path);
+    total += f.size;
+  };
+
+  for (const name of READ_BY_NAME) {
+    const f = byPath.get(name);
+
+    if (f) take(f);
+  }
+
+  // a manifest past what apm reads is not read here either: `analyze` reads nothing of the version then
+  if (measureManifest(input.manifest).kind !== "ok") return held;
+  const manifest = input.manifest;
+  const first: string[] = [];
+
+  for (const h of expandHooks(manifest)) {
+    if (h.kind === "publish") continue;
+
+    for (const c of h.commands) {
+      for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+        const f = resolveIn(byPath, w);
+
+        if (f && f.path !== "package.json") first.push(f.path);
+      }
+    }
+  }
+
+  if (byPath.has("binding.gyp")) first.push("binding.gyp");
+  const entries = declaredEntries(manifest, files.map((f) => f.path));
+
+  for (const p of entries.paths) {
+    const f = resolveIn(byPath, p);
+
+    if (f && !/\.d\.[cm]?ts$/.test(f.path)) first.push(f.path);
+  }
+
+  for (const p of entries.files) if (!NEVER_RUN.test(p)) first.push(p);
+
+  const seen = new Set<string>();
+  const reachable = new Set<string>(first);
+  const queue = [...reachable];
+
+  // the walk: each file it reaches, then what that file loads; files read outside it load nothing it follows
+  for (let qi = 0; qi < queue.length; qi++) {
+    const path = queue[qi] ?? "";
+    const f = byPath.get(path);
+
+    if (!f || seen.has(path)) continue;
+    seen.add(path);
+    take(f);
+
+    for (const spec of imports.get(path) ?? []) {
+      charge("score", 1);
+      const target = resolveIn(byPath, joinPath(dirOf(path), spec));
+
+      if (target && !seen.has(target.path) && !reachable.has(target.path)) {
+        reachable.add(target.path);
+        queue.push(target.path);
+      }
+    }
+  }
+
+  const rest = files.filter((f) => !seen.has(f.path) && !NOT_CODE.test(f.path)).sort((a, b) => Number(!CODE_EXT.test(a.path)) - Number(!CODE_EXT.test(b.path)));
+
+  for (const f of rest) take(f);
+
+  return held;
+}
 
 /** What the v3 walk could not read: run code too large or past the budget, and other files past the budget. */
 type V3Skips = { skipped: SkippedFile[]; unanalyzed: SkippedFile[] };
@@ -889,6 +1177,12 @@ function readLikeV3(w: V3Walk): V3Skips {
     }
 
     if (isBinaryData(f)) return;
+
+    if (w.notHeld.has(f)) {
+      skipNotHeld(f, reached, skipped, unanalyzed);
+
+      return;
+    }
 
     if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
       skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
@@ -1053,6 +1347,8 @@ function incompleteAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: read
     skipped: [],
     capabilities: [],
     declaration: { kind: "none", notes: [] },
+    // nothing it holds was read: the reading stopped, which `incomplete` costs as before
+    coverage: { kind: "partial", omittedFiles: u.files.length, omittedBytes: u.files.reduce((n, f) => n + f.size, 0), reasons: ["stopped"], notes: [] },
   };
 }
 
@@ -1080,6 +1376,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   for (const why of input.incompleteBecause ?? []) add("incomplete", why);
 
   const byPath = new Map(files.map((f) => [f.path, f]));
+  const notHeld: ReadonlySet<TarEntry> = input.notHeld ?? new Set();
   const hooks = expandHooks(manifest);
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
@@ -1092,9 +1389,23 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");
 
-  if (gyp) {
-    add("install-script", "binding.gyp: node-gyp build runs at install");
+  if (gyp) add("install-script", "binding.gyp: node-gyp build runs at install");
 
+  // the commands node-gyp runs are in the file: one a streamed read did not hold is code that runs and was not read
+  // files left unread for their size or the budget: the analysis's coverage, not a finding (apm-score-v11)
+  const omittedByName: SkippedFile[] = [];
+  const pj = byPath.get("package.json");
+  const notes = [...(input.coverageNotes ?? [])];
+
+  // a tarball's package.json a streamed read did not hold: the manifest read is the registry's copy, so the
+  // tarball's own was not read, and the coverage says so
+  if (pj && notHeld.has(pj)) {
+    omittedByName.push({ path: pj.path, size: pj.size, reason: pj.size > MANIFEST_LIMITS.chars ? "too-large" : "over-budget" });
+    notes.push(MANIFEST_NOT_READ);
+  }
+
+  if (gyp && notHeld.has(gyp)) omittedByName.push({ path: gyp.path, size: gyp.size, reason: gyp.size > MAX_ANALYZED_FILE_BYTES ? "too-large" : "over-budget" });
+  else if (gyp) {
     for (const cmd of gypCommands(new TextDecoder().decode(gyp.data))) {
       if (isInlineDownload(cmd)) add("install-download", `binding.gyp: ${cmd.slice(0, 80)}`);
 
@@ -1110,7 +1421,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     for (const name of ["Makefile", "makefile", "GNUmakefile", "CMakeLists.txt"]) {
       const f = byPath.get(name);
 
-      if (f && isInlineDownload(new TextDecoder().decode(f.data))) add("install-download", `${name}: built by an install script and downloads code`);
+      if (f && notHeld.has(f)) omittedByName.push({ path: f.path, size: f.size, reason: f.size > MAX_ANALYZED_FILE_BYTES ? "too-large" : "over-budget" });
+      else if (f && isInlineDownload(new TextDecoder().decode(f.data))) add("install-download", `${name}: built by an install script and downloads code`);
     }
   }
 
@@ -1226,6 +1538,12 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     }
 
     if (isBinaryData(f)) return;
+
+    if (notHeld.has(f)) {
+      skipNotHeld(f, reached, skipped, unanalyzed);
+
+      return;
+    }
 
     if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
       skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
@@ -1354,7 +1672,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     rawFiles.add(f.path);
   };
 
-  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw });
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld });
 
   const { cross, cut } = inPhase("cross-file", () => addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps));
 
@@ -1362,17 +1680,22 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   if (cross.exhausted) add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
 
-  for (const s of [...skipped, ...v3.skipped]) add("incomplete", `not analyzed: ${describeSkip(s)}`);
+  // Files left unread for their size or the byte budget, reached or not, are what the analysis did not read, not
+  // something it found: they make its coverage partial and cost no points (apm-score-v11; before, -61 as `incomplete`
+  // and -20 as `unanalyzed-files`). Installs check coverage apart from the score, so a partial reading still warns,
+  // and strict mode and ~safe refuse it. Each file is counted once, whichever walk skipped it.
+  const omitted = new Map([...omittedByName, ...skipped, ...unanalyzed, ...v3.skipped, ...v3.unanalyzed].map((s) => [s.path, s]));
 
-  for (const list of [unanalyzed, v3.unanalyzed]) {
-    if (list.length === 0) continue;
-    const bytes = list.reduce((n, s) => n + s.size, 0);
-
-    add("unanalyzed-files", `${list.length} file(s), ${(bytes / (1024 * 1024)).toFixed(1)} MB, past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
-    // a file no entry point reaches can still be loaded by its path or run by a command: left unread, it leaves the
-    // analysis incomplete, not clean (the full budget is the most a tarball unpacks to, so only a smaller one gets here)
-    add("incomplete", `not analyzed: ${list.length} file(s) past the ${(budget / (1024 * 1024)).toFixed(1)} MB analysis budget (first: ${list[0]?.path ?? ""})`);
-  }
+  const coverage: Coverage =
+    omitted.size === 0
+      ? { kind: "complete" }
+      : {
+          kind: "partial",
+          omittedFiles: omitted.size,
+          omittedBytes: [...omitted.values()].reduce((n, s) => n + s.size, 0),
+          reasons: COVERAGE_REASONS.filter((r) => [...omitted.values()].some((s) => s.reason === r)),
+          notes,
+        };
 
   for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
 
@@ -1424,7 +1747,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   ];
 
   // both walks can skip the same file
-  const skippedOnce = new Map([...skipped, ...unanalyzed, ...v3.skipped, ...v3.unanalyzed].map((s) => [`${s.reason}:${s.path}`, s]));
+  // what coverage counts, each file once: the files left unread by name too (package.json, binding.gyp, the Makefiles)
+  const skippedOnce = new Map([...omittedByName, ...skipped, ...unanalyzed, ...v3.skipped, ...v3.unanalyzed].map((s) => [`${s.reason}:${s.path}`, s]));
 
   return {
     scorer: SCORER,
@@ -1434,6 +1758,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     skipped: [...skippedOnce.values()],
     capabilities: assessed.capabilities,
     declaration: assessed.declaration,
+    coverage,
   };
 }
 
@@ -2004,7 +2329,7 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   const raw = 100 + signals.reduce((n, s) => n + s.points, 0);
   const score = Math.max(0, Math.min(100, raw));
 
-  return { ...analysis, signals, score, grade: gradeOf(score) };
+  return { ...analysis, signals, score, grade: partialCoverage(analysis) ? "P" : gradeOf(score) };
 }
 
 /** One evidence item an apm reviewer dismissed: the scorer that cited it, the signal, and the file and line it cites. */
@@ -2119,6 +2444,41 @@ export function parseAnalysis(v: unknown): Analysis | null {
   const r = AnalysisSchema.safeParse(v);
 
   return r.success ? r.data : null;
+}
+
+/** The scorer before SCORER, some of whose stored analyses the current one takes as its own (reusableAnalysis). */
+export const PREVIOUS_SCORER = "apm-score-v10";
+
+/**
+ * Whether an apm-score-v10 analysis is what apm-score-v11 would store for the same bytes: v11 changed only what files
+ * left unread for their size or the byte budget cost, so a v10 analysis that left nothing unread and stopped nowhere
+ * (no skipped file, no `unanalyzed-files`, no `incomplete`, no partial coverage) is the same reading. The registry's
+ * SQL function apm_v10_reusable (migration 0023) is this test; packages/registry/test/scorer-rollout.test.ts holds the
+ * two to each other. Checked on the analysis as stored, before any dismissal is applied.
+ */
+function isReusablePrevious(a: Analysis): boolean {
+  return a.scorer === PREVIOUS_SCORER && a.skipped.length === 0 && a.coverage?.kind !== "partial" && !a.signals.some((s) => s.id === "incomplete" || s.id === "unanalyzed-files");
+}
+
+/**
+ * A stored upstream analysis (parsed: parseAnalysis) as the current scorer reads it: one of its own, or an
+ * apm-score-v10 one it would score the same (isReusablePrevious), given `coverage: complete` and kept under its v10 name, so evidence dismissed against v10
+ * still applies to it. Null for anything else: the queue analyses that version again.
+ */
+export function reusableAnalysis(a: Analysis): Analysis | null {
+  if (a.scorer === SCORER) return a;
+
+  return isReusablePrevious(a) ? { ...a, coverage: { kind: "complete" } } : null;
+}
+
+/**
+ * A stored analysis (parsed: parseAnalysis) as a score is worked out from it, whatever its scorer: one the current scorer would store the same
+ * (reusableAnalysis) with its coverage stated, any other as it was stored. A package published on apm keeps the
+ * analysis made at its publish (nothing analyses it again), so an apm-score-v10 analysis that was `incomplete` for a
+ * file's size keeps v10's -61: stricter than v11, it never reads as a pass.
+ */
+export function storedAnalysis(a: Analysis | null): Analysis | null {
+  return a === null ? null : (reusableAnalysis(a) ?? a);
 }
 
 /** Human-readable diff of signals between two versions. */

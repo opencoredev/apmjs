@@ -10,6 +10,12 @@
 // confirmed malicious, the version or anything in its tree.
 import type { Report } from "./api.ts";
 
+/** "2,656 files (74.0 MB) not read": how much of a version a partial reading left out. */
+function notReadText(c: { omittedFiles: number; omittedBytes: number }): string {
+  return `${c.omittedFiles.toLocaleString("en-US")} file${c.omittedFiles === 1 ? "" : "s"} (${(c.omittedBytes / 1_000_000).toFixed(1)} MB) not read`;
+}
+
+
 export const VERDICTS = ["install", "review-first", "do-not-install", "not-found", "unknown"] as const;
 
 export type VerdictKind = (typeof VERDICTS)[number];
@@ -527,6 +533,16 @@ function decide(input: { name: string; range: string | null; resolved: ResolvedI
     reasons.unshift(...incomplete.evidence.slice(0, SHOWN).map((e) => `apm did not read: ${quoted(e)}`));
 
     return { ...known, verdict: "review-first", summary: `Installs, but apm could not fully analyse ${id}: it ${scoreText}, and the reasons say what apm did not read. Review it before installing.${note}`, reasons, commands: run };
+  }
+
+  // a partial reading (apm-score-v11): files left unread for their size or the byte budget cost no points, so it may
+  // score well; it still installs only with a warning, as an incomplete analysis does
+  const partial = report.coverage?.kind === "partial" ? report.coverage : null;
+
+  if (partial) {
+    reasons.unshift(`${notReadText(partial)}: past the size apm reads of one file, or the bytes one analysis reads.`);
+
+    return { ...known, verdict: "review-first", summary: `Installs, but apm read only part of ${id}: ${notReadText(partial)}. It scores ${report.score}/100 on the code it read. Review it before installing.${note}`, reasons, commands: run };
   }
 
   if (report.score < SCORE_FLOOR) return { ...known, verdict: "review-first", summary: `Installs, but ${id} ${scoreText}: it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}. Review it before installing.${note}`, reasons, commands: run };

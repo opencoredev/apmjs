@@ -45,6 +45,8 @@ function expectSignal(a: Analysis, id: SignalId, confidence: "confirmed" | "poss
   else expect(s?.points, id).toBe(confidence === "confirmed" ? POINTS[scored.id] : possiblePoints.get(scored.id));
 }
 
+const STATE = { publishedAt: 0, now: 1e13, deprecated: null, status: "active" as const, statusReason: null };
+
 function scoreOf(a: Analysis): number {
   return finalize(a, { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null }).score;
 }
@@ -74,14 +76,20 @@ describe("2. what is analyzed first, and what a cap does", () => {
     const files = { "index.js": "module.exports = 1;\n", "setup.js": FETCH, ...filler };
     const a = analyzePkg({ manifest: { scripts: { postinstall: "node setup.js" } }, files, maxScannedBytes: 2_000 });
     expectSignal(a, "network");
-    expect(ids(a)).toContain("unanalyzed-files");
+    // apm-score-v11: what the budget left unread is the analysis's coverage, not a signal
+    expect(a.coverage).toMatchObject({ kind: "partial", reasons: ["over-budget"] });
     expect(a.notChecked.join(" ")).toContain("not analyzed");
   });
 
-  test("code that runs but did not fit the byte budget makes the analysis incomplete", () => {
+  test("code that runs but did not fit the byte budget makes coverage partial, costs no points, and is graded P", () => {
     const a = analyzePkg({ files: { "index.js": `require('./big.js');\n`, "big.js": `module.exports = ${"1".repeat(5_000)};\n` }, maxScannedBytes: 2_000 });
-    expect(ids(a)).toContain("incomplete");
-    expect(scoreOf(a)).toBeLessThan(SCORE_FLOOR);
+
+    // before apm-score-v11: incomplete, under the floor
+    expect(ids(a)).not.toContain("incomplete");
+    expect(a.skipped.map((s) => s.path)).toEqual(["big.js"]);
+    expect(a.coverage).toMatchObject({ kind: "partial", omittedFiles: 1, reasons: ["over-budget"] });
+    expect(scoreOf(a)).toBe(100);
+    expect(finalize(a, STATE).grade).toBe("P");
   });
 });
 

@@ -21,14 +21,20 @@
 // its start and counts a fetch failure, and after MAX_FETCH_FAILURES of them the version is settled as unavailable, as
 // is one the upstream no longer lists. A version is never left looking queued forever, and never scored clean on a
 // reading that stopped short.
+//
+// A tarball too large to download or unpack whole (MAX_UPSTREAM_TARBALL_BYTES, WORKER_MAX_UNPACKED_BYTES) is read as a
+// stream in the same run (streamed-analysis.ts), which checks every byte against the version's sha512 before it uses
+// any. What a registry before apm-score-v11 refused for those caps decides nothing for this scorer: outcomes, like
+// analyses, are kept per scorer.
 import { RequestMemory } from "./memory.ts";
 import { Context, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type AnalysisStart, type RunHistory, type Unscorable, type VersionRecord } from "./db.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
-import { digestLabel, digestOf, tooLargeText, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
+import { digestLabel, digestOf, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
+import { analyzeStreamedTarball, type StreamedAnalysis } from "./streamed-analysis.ts";
 import { WORKER_CPU_MS } from "../scripts/compat.ts";
 
 export type AnalysisJob = { readonly name: string; readonly version: string };
@@ -49,9 +55,9 @@ export type JobOutcome = "stored" | "unscorable" | "missing" | "retry" | "busy";
 type Stored = { kind: "stored" | "unscorable" | "retry"; v: VersionRecord };
 
 /**
- * The most a tarball may inflate to on a Worker. A Worker has 128 MB, and the parser keeps the inflated archive
- * and each entry's bytes, so this stays well under half of it. Larger archives are refused (publish) or recorded as
- * unscorable (upstream), never passed.
+ * The most a tarball may inflate to when it is read whole on a Worker. A Worker has 128 MB, and the parser keeps the
+ * inflated archive and each entry's bytes, so this stays well under half of it. Larger archives are refused (publish)
+ * or read as a stream (upstream, streamed-analysis.ts), never passed.
  */
 export const WORKER_MAX_UNPACKED_BYTES = 48 * 1024 * 1024;
 
@@ -148,8 +154,12 @@ const GONE: Record<"package" | "version" | "tarball", Unscorable> = {
   tarball: { reason: "unavailable", detail: "the upstream registry no longer serves this version's tarball" },
 };
 
-/** What one run came to. `scored` with `spent` when the meter ran out, the unpack or the analysis: the analysis is then `incomplete`, naming the phase. */
-export type TarballAnalysis = { kind: "scored"; analysis: Scored; spent: boolean } | { kind: "unscorable"; unscorable: Unscorable } | { kind: "failed"; errorClass: string };
+/**
+ * What one run came to. `scored` with `spent` when the meter ran out, the unpack or the analysis: the analysis is then
+ * `incomplete`, naming the phase. `stream`: the tarball inflates past WORKER_MAX_UNPACKED_BYTES, so it is read again as
+ * a stream (streamed-analysis.ts) instead of whole.
+ */
+export type TarballAnalysis = { kind: "scored"; analysis: Scored; spent: boolean } | { kind: "unscorable"; unscorable: Unscorable } | { kind: "failed"; errorClass: string } | { kind: "stream" };
 
 /**
  * Runs the scorer over an upstream tarball under one meter, unpack included, or says why these bytes can never be
@@ -175,7 +185,8 @@ function analyzeOrThrow(pkg: UpstreamPackage, v: VersionRecord, bytes: Uint8Arra
       return { kind: "scored", analysis: unfinishedAnalysis({ name: pkg.name, manifest: v.manifest, files: [], phase: e.phase, limit: e.limit, because: plan.incompleteBecause }), spent: true };
     }
 
-    if (e instanceof ArchiveError && e.kind === "too-large") return { kind: "unscorable", unscorable: { reason: "too-large", detail: `the tarball ${e.message}, the most apm unpacks` } };
+    // too large to unpack whole (the gzip trailer says so before anything is inflated): read as a stream instead
+    if (e instanceof ArchiveError && e.kind === "too-large") return { kind: "stream" };
 
     return { kind: "unscorable", unscorable: { reason: "unreadable", detail: `the tarball is not one apm can read (${e instanceof Error ? e.message : String(e)})` } };
   }
@@ -283,14 +294,12 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         const durable = <A>(write: Effect.Effect<A, StoreError>): Effect.Effect<A, StoreError> => write.pipe(Effect.retry({ times: STORE_RETRIES }));
 
         /**
-         * Analyzes bytes and stores what it came to. A run that fails with an error keeps its start counted
-         * (failAnalysis); after MAX_FAILED_RUNS failed runs the version is stored as incomplete, naming the error's class.
-         * A run that fails in a way it cannot report (a store error, a platform stop) leaves its start for the sweep.
+         * Stores what an analysis came to. A run that fails with an error keeps its start counted (failAnalysis); after
+         * MAX_FAILED_RUNS failed runs the version is stored as incomplete, naming the error's class. A run that fails in
+         * a way it cannot report (a store error, a platform stop) leaves its start for the sweep.
          */
-        const analyzeAndStore = (pkg: UpstreamPackage, v: VersionRecord, got: { bytes: Uint8Array; digest: Digest }, plan: RunPlan): Effect.Effect<Stored, StoreError> =>
-          timeAnalysis(Effect.gen(function* (): Effect.fn.Return<Stored, StoreError> {
-            const result = analyzeUpstreamTarball(pkg, v, got.bytes, plan);
-
+        const storeResult = (pkg: UpstreamPackage, v: VersionRecord, digest: Digest, result: Exclude<TarballAnalysis, { kind: "stream" }>): Effect.Effect<Stored, StoreError> =>
+          Effect.gen(function* (): Effect.fn.Return<Stored, StoreError> {
             switch (result.kind) {
               case "unscorable":
                 return { kind: "unscorable", v: yield* markUnscorable(pkg, v, result.unscorable) };
@@ -303,7 +312,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                   // nothing of the version is read again, its manifest included: reading it may be what failed
                   const analysis = failedAnalysis({ manifest: {}, files: [], errorClass: result.errorClass, attempts: failures });
 
-                  yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis, at: yield* clock.now }));
+                  yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(digest), analysis, at: yield* clock.now }));
                   v.score = analysis;
 
                   return { kind: "stored", v };
@@ -314,7 +323,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
 
               case "scored":
-                yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(got.digest), analysis: result.analysis, at: yield* clock.now }));
+                yield* durable(store.setUpstreamAnalysis({ name: pkg.name, version: v.version, digest: digestLabel(digest), analysis: result.analysis, at: yield* clock.now }));
                 v.score = result.analysis;
 
                 return { kind: "stored", v };
@@ -324,11 +333,67 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                 return _exhaustive;
               }
             }
+          });
+
+        /**
+         * Analyzes a tarball's bytes and stores what that came to, or says it is to be read as a stream. The bytes live
+         * only as long as this does, so a streamed read that follows never holds them beside its own.
+         */
+        const analyzeAndStore = (pkg: UpstreamPackage, v: VersionRecord, got: { bytes: Uint8Array; digest: Digest }, plan: RunPlan): Effect.Effect<Stored | { kind: "stream" }, StoreError> =>
+          timeAnalysis(Effect.gen(function* (): Effect.fn.Return<Stored | { kind: "stream" }, StoreError> {
+            const result = analyzeUpstreamTarball(pkg, v, got.bytes, plan);
+
+            if (result.kind === "stream") return result;
+
+            return yield* storeResult(pkg, v, got.digest, result);
           }));
 
         /** What a tarball the upstream will never serve in a checkable form, or one too large to fetch, is: recorded. */
-        const refused = (got: { kind: "too-large"; bytes: number | null } | { kind: "unavailable"; reason: string }): Unscorable =>
-          got.kind === "too-large" ? { reason: "too-large", detail: tooLargeText(got.bytes) } : { reason: "unavailable", detail: got.reason };
+        const refused = (got: { kind: "unavailable"; reason: string }): Unscorable => ({ reason: "unavailable", detail: got.reason });
+
+        /**
+         * A tarball too large to hold, read as a stream (streamed-analysis.ts): each pass opens it again, and nothing it
+         * read is used unless every byte matched the version's sha512. A read that could not get or check the bytes, or
+         * found no room in the run's memory lease, counts a fetch failure and is handed back, as a download that failed
+         * its checksum is. What it keeps is charged to a child of the run's lease (RequestMemory), given back when it ends.
+         */
+        const streamAndStore = (pkg: UpstreamPackage, v: VersionRecord, plan: RunPlan, fetchFailed: (errorClass: string) => Effect.Effect<JobOutcome, StoreError>): Effect.Effect<JobOutcome, StoreError, RequestMemory> =>
+          timeAnalysis(Effect.gen(function* (): Effect.fn.Return<JobOutcome, StoreError, RequestMemory> {
+            const digest = digestOf(v);
+
+            if (!digest) {
+              yield* markUnscorable(pkg, v, { reason: "unavailable", detail: "the upstream publishes no checksum for this version" });
+
+              return "unscorable";
+            }
+
+            const open = () =>
+              Effect.runPromise(upstream.openTarball(pkg, v.version).pipe(Effect.catchTag("BlobError", () => Effect.succeed({ kind: "unavailable", reason: "the blob store could not be read", retryable: true } as const))));
+
+            const memory = (yield* RequestMemory).child();
+            const result: StreamedAnalysis = yield* Effect.promise(() => analyzeStreamedTarball({ pkg, v, digest, open, plan, memory })).pipe(Effect.ensuring(Effect.sync(() => memory.release())));
+
+            switch (result.kind) {
+              case "absent":
+                yield* settleGone({ name: pkg.name, version: v.version }, GONE.tarball);
+
+                return "missing";
+              case "fetch-failed":
+                if (result.retryable) return yield* fetchFailed(result.reason);
+                yield* markUnscorable(pkg, v, { reason: "unavailable", detail: result.reason });
+
+                return "unscorable";
+              case "scored":
+              case "unscorable":
+              case "failed":
+                return (yield* storeResult(pkg, v, digest, result)).kind;
+              default: {
+                const _exhaustive: never = result;
+
+                return _exhaustive;
+              }
+            }
+          }));
 
         /** A queued version the upstream no longer serves: settled, so neither the queue nor the sweep tries it again. */
         const settleGone = (job: AnalysisJob, unscorable: Unscorable): Effect.Effect<void, StoreError> =>
@@ -430,6 +495,18 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             if (parseAnalysis(v.score)) return "stored";
 
             if (v.unscorable) return "unscorable";
+            const held = yield* fetchAndStore(job, pkg, v, next.plan, fetchFailed);
+
+            // too large to download (MAX_UPSTREAM_TARBALL_BYTES) or to unpack whole: read as a stream
+            return held === "stream" ? yield* streamAndStore(pkg, v, next.plan, fetchFailed) : held;
+          });
+
+        /**
+         * Downloads a tarball up to MAX_UPSTREAM_TARBALL_BYTES, analyzes it whole and stores what that came to; "stream"
+         * when it is too large to download or to unpack whole. Its bytes are let go when this ends.
+         */
+        const fetchAndStore = (job: AnalysisJob, pkg: UpstreamPackage, v: VersionRecord, plan: RunPlan, fetchFailed: (errorClass: string) => Effect.Effect<JobOutcome, StoreError>): Effect.Effect<JobOutcome | "stream", StoreError | BlobError> =>
+          Effect.gen(function* (): Effect.fn.Return<JobOutcome | "stream", StoreError | BlobError> {
             const got = yield* upstream.tarball(pkg, v.version);
 
             switch (got.kind) {
@@ -438,9 +515,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
 
                 return "missing";
               case "too-large":
-                yield* markUnscorable(pkg, v, refused(got));
-
-                return "unscorable";
+                return "stream";
               case "unavailable":
                 if (got.retryable) return yield* fetchFailed("upstream tarball unavailable");
                 yield* markUnscorable(pkg, v, refused(got));
@@ -455,9 +530,9 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               }
             }
 
-            const stored = yield* analyzeAndStore(pkg, v, got, next.plan);
+            const stored = yield* analyzeAndStore(pkg, v, got, plan);
 
-            return stored.kind;
+            return stored.kind === "stream" ? "stream" : stored.kind;
           });
 
         const api: AnalysisApi = {
