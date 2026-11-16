@@ -9,6 +9,9 @@ import { migrate } from "../../packages/registry/scripts/migrate.ts";
 
 type Postgres = { adminUrl: (db: string) => string; stop: () => void };
 
+/** How many ports a cluster tries before it gives up: each failed start whose log says the port was taken is one. */
+const START_ATTEMPTS = 5;
+
 let postgres: Promise<Postgres> | null = null;
 let template: Promise<string> | null = null;
 let counter = 0;
@@ -44,6 +47,29 @@ async function startPostgres(): Promise<Postgres> {
     };
   }
 
+  return startLocalCluster({ pickPort: freePort });
+}
+
+/**
+ * A port nothing listens on right now, from the kernel (port 0). Another process can still take it before Postgres
+ * binds it, so startLocalCluster tries again on a new one when that happens.
+ */
+export async function freePort(): Promise<number> {
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(null, { status: 204 }) });
+  const port = Number(server.url.port);
+
+  await server.stop(true);
+
+  if (!Number.isInteger(port) || port <= 0) throw new Error(`the kernel gave no TCP port (${server.url.href})`);
+
+  return port;
+}
+
+/** Whether a failed start's log says its port was taken (Postgres: "could not bind ... Address already in use"). */
+const portTaken = (log: string): boolean => /could not bind|address already in use/i.test(log);
+
+/** A throwaway cluster made with initdb, started on a port from `pickPort`; a port taken by then is replaced. */
+export async function startLocalCluster(input: { pickPort: () => Promise<number> }): Promise<Postgres> {
   const initdb = findInitdb();
 
   if (!initdb) throw new Error("The acceptance suite needs Postgres: install it (initdb on PATH or under /usr/lib/postgresql), or set APM_TEST_DATABASE_URL.");
@@ -53,12 +79,21 @@ async function startPostgres(): Promise<Postgres> {
   const init = spawnSync(initdb, ["-D", data, "-U", "postgres", "--auth=trust", "-E", "UTF8", "--no-sync"], { encoding: "utf8" });
 
   if (init.status !== 0) throw new Error(`initdb failed: ${init.stderr}`);
-  const port = 20000 + Math.floor(Math.random() * 20000);
-  // TCP only: a Unix socket under a nested TMPDIR (scripts/score.ts, the hygiene test) can pass the 107-byte path limit
-  const opts = `-p ${port} -c unix_socket_directories='' -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=400`;
-  const start = spawnSync(join(bin, "pg_ctl"), ["-D", data, "-o", opts, "-l", join(dir, "log"), "-w", "start"], { encoding: "utf8" });
+  let port = 0;
 
-  if (start.status !== 0) throw new Error(`pg_ctl start failed: ${start.stderr}${start.stdout}`);
+  for (let attempt = 1; ; attempt++) {
+    port = await input.pickPort();
+    const log = join(dir, `log-${attempt}`);
+    // TCP only: a Unix socket under a nested TMPDIR (scripts/score.ts, the hygiene test) can pass the 107-byte path limit
+    const opts = `-p ${port} -c unix_socket_directories='' -c listen_addresses=127.0.0.1 -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=400`;
+    const start = spawnSync(join(bin, "pg_ctl"), ["-D", data, "-o", opts, "-l", log, "-w", "start"], { encoding: "utf8" });
+
+    if (start.status === 0) break;
+    const said = existsSync(log) ? readFileSync(log, "utf8") : "";
+
+    if (!portTaken(said) || attempt >= START_ATTEMPTS) throw new Error(`pg_ctl start failed on port ${port} (attempt ${attempt}): ${start.stderr}${start.stdout}${said.slice(-500)}`);
+  }
+
   // The server is stopped by PID: the test harness may delete this directory (it lives under the run's TMPDIR)
   // before anything here gets to run pg_ctl against it.
   const pid = Number(readFileSync(join(data, "postmaster.pid"), "utf8").split("\n")[0]);
