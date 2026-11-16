@@ -7,9 +7,9 @@ import { Client } from "pg";
 import { z } from "zod";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
-import { covers, expand, KEPT_PACKAGE_MAX_BYTES, KEPT_VERSIONS, summarize } from "../src/kept-package.ts";
+import { admitted, covers, expand, KEPT_PACKAGE_MAX_BYTES, KEPT_VERSIONS, keptWithoutScore, summarize } from "../src/kept-package.ts";
 import { newestFirst } from "../src/semver.ts";
-import type { CachedPackage } from "../src/upstream.ts";
+import type { CachedPackage, UpstreamPackage } from "../src/upstream.ts";
 
 const DAY = 24 * 60 * 60_000;
 
@@ -138,6 +138,42 @@ describe("a package summary", () => {
 });
 
 const Count = z.array(z.object({ count: z.union([z.string(), z.number()]).transform(Number) }));
+
+describe("which packages get a summary", () => {
+  const TOO_LARGE = { reason: "too-large" as const, detail: "the tarball (43.7 MB) is larger than the 32 MiB apm downloads", digest: null };
+
+  /** `name` as npm lists it with two versions, the newest scored, recorded unscorable, or neither. */
+  const analysed = (name: string, latest: "scored" | "unscorable" | "none"): UpstreamPackage => {
+    const c = cached(["1.0.0", "2.0.0"], { latest: "2.0.0" });
+
+    const versions = c.versions.map((v): VersionRecord => {
+      if (v.version !== "2.0.0" || latest === "none") return { ...v, package: name, score: null };
+
+      return latest === "scored" ? { ...v, package: name, score: { score: 80 } } : { ...v, package: name, score: null, unscorable: TOO_LARGE };
+    });
+
+    return { ...c, name, versions };
+  };
+
+  test("a scored package does; an unscorable one only when the operator listed it (review of e4f97b2)", () => {
+    expect(admitted(analysed("anything", "scored"))).toBe(true);
+    expect(admitted(analysed("anything", "none"))).toBe(false);
+    // anyone can have apm record any package unscorable: that alone must not take a row
+    expect(admitted(analysed("made-to-be-too-large", "unscorable"))).toBe(false);
+    expect(admitted(analysed("next", "unscorable"))).toBe(true);
+    expect(admitted(analysed("@next/swc-linux-x64-gnu", "unscorable"))).toBe(true);
+    // listed, but nothing recorded: not analysed, no row
+    expect(admitted(analysed("next", "none"))).toBe(false);
+  });
+
+  test("the list matches exact names and prefixes, nothing near them", () => {
+    expect(keptWithoutScore("next")).toBe(true);
+    expect(keptWithoutScore("@next/swc-win32-arm64-msvc")).toBe(true);
+
+    for (const near of ["next-auth", "nextjs", "@next/env", "@next/swc", "@nextx/swc-linux", "Next"]) expect(keptWithoutScore(near)).toBe(false);
+    expect(keptWithoutScore("x", [{ kind: "exact", name: "x" }])).toBe(true);
+  });
+});
 
 describe("keepPackage", () => {
   test("adds no row past the capacity, and replaces a kept one", async () => {

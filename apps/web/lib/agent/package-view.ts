@@ -24,7 +24,7 @@ export async function loadPackageView(input: { name: string; version: string | n
   const pkg = found.value;
   const version = input.version ?? pkg.latest;
 
-  if (version === null) return { kind: "ok", view: { pkg, version: null, status: null, facts: null, score: null, review: { kind: "missing" }, registry: input.registry } };
+  if (version === null) return { kind: "ok", view: { pkg, version: null, status: null, facts: null, score: null, unscorable: null, review: { kind: "missing" }, registry: input.registry } };
 
   const read = () => Promise.all([source.version({ name, version }), source.review({ name, version })]);
   const first = await read();
@@ -41,7 +41,7 @@ export async function loadPackageView(input: { name: string; version: string | n
   // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
     kind: "ok",
-    view: withholdSource({ pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, review, registry: input.registry }),
+    view: withholdSource({ pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, unscorable: v.unscorable, review, registry: input.registry }),
   };
 }
 

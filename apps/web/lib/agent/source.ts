@@ -21,6 +21,8 @@ export type VersionInfo = {
   deprecated: string | null;
   facts: Facts | null;
   score: ScoreReport | null;
+  /** Why apm can never score this version (the registry's reason and sentence); null when it has a score or may get one. */
+  unscorable: { reason: string; text: string } | null;
 };
 
 /** The whole name check (GET /-/apm/v1/names without `part`): the three parts in one answer. */

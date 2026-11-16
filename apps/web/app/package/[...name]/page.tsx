@@ -7,7 +7,7 @@ import Link from "next/link";
 import { getPackage, getTarballReadme, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
-import { needsTarballReadme, readmeSource, type ReadmeSource, type TarballReadme } from "@/lib/readme-source";
+import { needsTarballReadme, readmeSource, tarballTooLarge, type ReadmeSource, type TarballRead } from "@/lib/readme-source";
 import { packageLinks, type PackageLink } from "@/lib/package-links";
 import { PackageLinks } from "@/components/package-links";
 import { headerNotice, type ReviewAnswer } from "@/lib/review-schema";
@@ -417,6 +417,8 @@ function noReadmeCopy({ name, source, hasLinks }: { name: string; source: NoRead
       return { title: "No readme published", body: `${name} has no readme in its registry entry or its tarball.${hasLinks ? " Its own links may have documentation:" : " It names no homepage or repository either."}` };
     case "unknown":
       return { title: "Readme not loaded", body: `The registry did not answer when apm looked for a README in the tarball. Reload to try again.${hasLinks ? " Meanwhile:" : ""}` };
+    case "not-opened":
+      return { title: "Readme not shown", body: `npm's entry for ${name} has no readme, and this version's tarball is too large for apm to open (see the score above), so apm can't show the README inside it.${hasLinks ? " Its own links may have documentation:" : ""}` };
     case "unreadable":
       return { title: "Readme not shown", body: <UnreadableReadme name={name} source={source} /> };
     default: {
@@ -641,7 +643,7 @@ function AiReviewLoading({ version }: { version: string }) {
 }
 
 /** The readme from npm's packument, or, when it has none, from the shown version's tarball. */
-async function ReadmeSlot(props: { name: string; pkg: PackageInfo; version: string | null; tarball: Promise<Fetched<TarballReadme> | null>; links: readonly PackageLink[]; unscorable: boolean }) {
+async function ReadmeSlot(props: { name: string; pkg: PackageInfo; version: string | null; tarball: Promise<TarballRead | null>; links: readonly PackageLink[]; unscorable: boolean }) {
   const readme = readmeSource({ packument: props.pkg.readme, version: props.version, tarball: await props.tarball });
 
   return readme.kind === "packument" || readme.kind === "tarball" ? (
@@ -709,8 +711,12 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // answer or a fresh read of that version
   const shown = version ? shownOf(pkg.versions, version, isLatest && pkg.score?.redacted === true) : null;
   const review = shown ? reads.review(shown) : Promise.resolve<Fetched<ReviewAnswer>>(none);
-  // only when npm's packument has no readme (react's has none): the README in the shown version's tarball
-  const tarballReadme = version && needsTarballReadme(pkg.readme) ? getTarballReadme({ name, version }) : Promise.resolve<Fetched<TarballReadme> | null>(null);
+
+  // only when npm's packument has no readme (react's has none): the README in the shown version's tarball, unless that
+  // tarball is too large for the registry to open (next's), which it could only refuse
+  const tarballReadme: Promise<TarballRead | null> =
+    version && needsTarballReadme(pkg.readme) ? (tarballTooLarge({ pkg, version }) ? Promise.resolve({ kind: "not-opened" }) : getTarballReadme({ name, version })) : Promise.resolve(null);
+
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
   const versionScore = shown && !isLatest ? await reads.score(shown) : none;
 

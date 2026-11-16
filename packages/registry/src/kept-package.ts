@@ -26,8 +26,11 @@
 //    (KeptRefresh), one refresh per package at a time, and the cron's sweep refreshes the ones asked about in the last
 //    day. A refresh is the same conditional read: a 304 only marks the summary worked out now.
 //
-// Only a package apm stored an analysis of gets a row, one is at most KEPT_PACKAGE_MAX_BYTES of JSON, and the table
-// holds at most KEPT_PACKAGE_CAPACITY.
+// Only a package apm stored a score of gets a row, and one of the few the operator lists in KEPT_WITHOUT_SCORE once apm
+// recorded it can never score a version of it (next: every recent tarball is over the 32 MiB analysis cap, so it has
+// no score at all, and its packument is the largest a page reads, 31.5 MB). An outcome alone is not enough: anyone can
+// have apm analyze any package, and a package made to be unscorable is easy to publish (review of e4f97b2). A row is
+// at most KEPT_PACKAGE_MAX_BYTES of JSON, and the table holds at most KEPT_PACKAGE_CAPACITY.
 import { Cause, Context, Effect, Exit, Option } from "effect";
 import semver from "semver";
 import { z } from "zod";
@@ -37,7 +40,7 @@ import { digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
 import { newestFirst } from "./semver.ts";
-import { scoredPackage, Upstream, upstreamBlobKey, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing } from "./upstream.ts";
+import { scoredPackage, Upstream, upstreamBlobKey, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage } from "./upstream.ts";
 
 /** Versions a summary keeps by version number, and again by publish time: the package answer lists the newest 200. */
 export const KEPT_VERSIONS = 200;
@@ -279,13 +282,49 @@ const firstAnalyses = (name: string, first: PageFirst) => (first.kind === "read"
 /** What a request holds of an expanded summary: each version's record and its scored copy. */
 const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECORD_WEIGHT + SCORED_WEIGHT);
 
+/** A name the operator lets in without a score: exactly this name, or every name that starts with this prefix. */
+export type KeptEligible = { kind: "exact"; name: string } | { kind: "prefix"; prefix: string };
+
 /**
- * Keeps `pkg`'s summary when apm stored an analysis of any of its versions: the admission rule, so names nobody scored
- * cost no row. Its summary is replaced when it is kept already.
+ * Packages kept with no score, once apm recorded it can never score one of their versions: popular, too large to
+ * analyze, and chosen here, by whoever deploys, so a visitor cannot fill the table by naming packages apm will find
+ * unscorable. next and its native binaries (@next/swc-linux-x64-gnu is 35 MB). Chosen over a weekly-downloads floor
+ * read from npm: that is one more request to npm on the read that admits, a failure mode of its own, and a number
+ * paid download traffic can move; this list needs none of them, and the one package measured slow is on it.
  */
-const keepScored = (pkg: SummarySource, scored: boolean, at: number) =>
+export const KEPT_WITHOUT_SCORE: readonly KeptEligible[] = [
+  { kind: "exact", name: "next" },
+  { kind: "prefix", prefix: "@next/swc-" },
+];
+
+/** Whether `name` is on `list` (KEPT_WITHOUT_SCORE). */
+export function keptWithoutScore(name: string, list: readonly KeptEligible[] = KEPT_WITHOUT_SCORE): boolean {
+  return list.some((e) => {
+    switch (e.kind) {
+      case "exact":
+        return name === e.name;
+      case "prefix":
+        return name.startsWith(e.prefix);
+      default: {
+        const _exhaustive: never = e;
+
+        return _exhaustive;
+      }
+    }
+  });
+}
+
+/**
+ * The admission rule: apm stored a score of one of `pkg`'s versions, or `pkg` is on KEPT_WITHOUT_SCORE and apm recorded
+ * it can never score one. Names apm never scored, and unscorable ones nobody chose, cost no row.
+ */
+export const admitted = (pkg: UpstreamPackage): boolean =>
+  pkg.versions.some((v) => v.score !== null) || (keptWithoutScore(pkg.name) && pkg.versions.some((v) => v.unscorable !== undefined));
+
+/** Keeps `pkg`'s summary when it is admitted (admitted). Its summary is replaced when it is kept already. */
+const keepAnalyzed = (pkg: SummarySource, admit: boolean, at: number) =>
   Effect.gen(function* () {
-    if (!scored) return;
+    if (!admit) return;
     const summary = summarize(pkg);
 
     if (summary !== null) yield* (yield* Store).keepPackage({ name: pkg.name, summary, at, capacity: KEPT_PACKAGE_CAPACITY });
@@ -498,8 +537,8 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
     // summaries were kept. What the row's check already read from npm is the answer: npm is not asked again
     const probe: Probe = fetched === null ? yield* upstream.probe(name, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* store.upstreamAnalyses(name)) : fetched;
 
-    // a kept row is replaced with what npm sent (keepScored replaces as well as adds)
-    if (probe.kind === "found") yield* keepScored(probe.pkg, probe.pkg.versions.some((v) => v.score !== null), yield* (yield* Clock).now);
+    // a kept row is replaced with what npm sent (keepAnalyzed replaces as well as adds)
+    if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, admitted(probe.pkg), yield* (yield* Clock).now);
 
     if (probe.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
 

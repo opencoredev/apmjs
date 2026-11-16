@@ -27,7 +27,7 @@ import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WOR
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type AnalysisStart, type RunHistory, type Unscorable, type VersionRecord } from "./db.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
-import { digestLabel, tooLargeText, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
+import { digestLabel, digestOf, tooLargeText, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
 import { WORKER_CPU_MS } from "../scripts/compat.ts";
 
@@ -264,10 +264,14 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             );
           });
 
+        // bound to the tarball the packument names for the version: the bytes this run fetched, or would have
         const markUnscorable = (pkg: UpstreamPackage, v: VersionRecord, unscorable: Unscorable): Effect.Effect<VersionRecord, StoreError> =>
           Effect.gen(function* () {
-            yield* store.setUnscorable({ name: pkg.name, version: v.version, unscorable, at: yield* clock.now });
-            v.unscorable = unscorable;
+            const d = digestOf(v);
+            const digest = d ? digestLabel(d) : null;
+
+            yield* store.setUnscorable({ name: pkg.name, version: v.version, unscorable, digest, at: yield* clock.now });
+            v.unscorable = { ...unscorable, digest };
 
             return v;
           });
@@ -329,7 +333,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         /** A queued version the upstream no longer serves: settled, so neither the queue nor the sweep tries it again. */
         const settleGone = (job: AnalysisJob, unscorable: Unscorable): Effect.Effect<void, StoreError> =>
           Effect.gen(function* () {
-            yield* store.setUnscorable({ name: job.name, version: job.version, unscorable, at: yield* clock.now });
+            // decided for no tarball: npm no longer lists one
+            yield* store.setUnscorable({ name: job.name, version: job.version, unscorable, digest: null, at: yield* clock.now });
           });
 
         /**

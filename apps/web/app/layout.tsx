@@ -58,6 +58,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <Link href="/docs" className="hover:text-foreground">
                 How it works
               </Link>
+              <a href="https://status.apmjs.dev" className="hover:text-foreground">
+                Status
+              </a>
             </span>
           </div>
         </footer>

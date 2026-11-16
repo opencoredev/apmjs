@@ -15,11 +15,18 @@ const TOO_LARGE = "apm cannot score this version: it is too large for apm to ana
 
 describe("unscoredNotice", () => {
   test("the latest version that can never be scored gives the registry's reason, and that installs warn about it", () => {
-    const n = unscoredNotice({ pkg: { latest: "16.4.6", unscored: { kind: "unscorable", reason: "too-large", text: TOO_LARGE }, versions: [row("16.4.6", TOO_LARGE)] }, version: "16.4.6" });
+    const n = unscoredNotice({ pkg: { latest: "16.4.6", unscored: { kind: "unscorable", reason: "too-large", text: TOO_LARGE, sameTarball: true }, versions: [row("16.4.6", TOO_LARGE)] }, version: "16.4.6" });
 
     expect(n.kind).toBe("unscorable");
-    expect(n.text).toBe(`${TOO_LARGE}. Installs through apm refuse it.`);
+    expect(n.text).toBe(`${TOO_LARGE}. Installs through apm still work, and apm add warns about it; strict mode and the ~safe view refuse it.`);
     expect(n.text).not.toContain("queued");
+  });
+
+  test("never says installs through apm refuse a version they serve", () => {
+    const n = unscoredNotice({ pkg: { latest: "2.0.0", unscored: null, versions: [row("2.0.0"), row("1.0.0", TOO_LARGE)] }, version: "1.0.0" });
+
+    expect(n.text).not.toContain("Installs through apm refuse");
+    expect(n.text).toContain("strict mode and the ~safe view refuse it");
   });
 
   test("an older version reads its own row", () => {

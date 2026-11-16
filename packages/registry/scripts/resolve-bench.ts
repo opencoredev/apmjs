@@ -384,7 +384,7 @@ async function seed(dbUrl: string): Promise<void> {
     const store = yield* Store;
 
     for (const s of seeded) {
-      if (s.kind === "too-large") yield* store.setUnscorable({ name: s.name, version: s.version, unscorable: { reason: "too-large", detail: "tarball over the limit" }, at: 1 });
+      if (s.kind === "too-large") yield* store.setUnscorable({ name: s.name, version: s.version, unscorable: { reason: "too-large", detail: "tarball over the limit" }, digest: null, at: 1 });
       else if (s.digest !== null) {
         const manifest = { name: s.name, version: s.version, main: "index.js", license: "MIT" };
         const file = (path: string, text: string) => ({ path, size: text.length, mode: 0o644, data: encoder.encode(text) });

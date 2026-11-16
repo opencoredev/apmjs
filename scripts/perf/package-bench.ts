@@ -5,6 +5,12 @@
 // tarballs after a delay.
 //
 //   bun scripts/perf/package-bench.ts     # the per-step table on stderr; the score (median ms to content) last
+//   APM_PERF_FIXTURE=~/.cache/apm-perf-fixtures/next.json APM_PERF_LATEST=unscorable bun scripts/perf/package-bench.ts
+//
+// The npm package is named as the fixture names it. APM_PERF_LATEST=unscorable makes it next as production has it:
+// its latest version recorded too large to analyze instead of scored, so no version of it has a score, its packument
+// carries no readme (the page then asks for the tarball's), and its latest tarball is served over the 32 MiB cap. A
+// fixture with its own readme keeps it; one without gets APM_PERF_README in the scored mode.
 //
 // Each step loads a page's document and reads it to its last byte, noting its first byte (`ttfb`), when the name's <h1>
 // streamed in (`h1`), when
@@ -20,7 +26,7 @@
 //
 // Latencies (ms): PG_RTT per query round trip (production's registry in Miami reaches Neon in us-east-2 in about 75:
 // a HEAD of a package, two queries, answers in about 210 against a 53 ms ping), PG_CONNECT per new connection, NPM_MS
-// per npm read (npm is behind Cloudflare too).
+// per npm read (npm is behind Cloudflare too). BENCH_UPSTREAM_TTL_MS sets the registry's APM_UPSTREAM_TTL_MS.
 import { createHash, randomBytes } from "node:crypto";
 import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -32,6 +38,7 @@ import { buildWorker } from "../../packages/registry/scripts/build.ts";
 import * as webBuild from "../../packages/infra/web-build.ts";
 import { freshDatabase } from "../../tests/acceptance/postgres.ts";
 import { pkgTgz } from "../../tests/acceptance/harness.ts";
+import { SCORER } from "../../packages/core/src/score.ts";
 
 const ROOT = join(import.meta.dir, "../..");
 const WEB = join(ROOT, "apps/web");
@@ -40,9 +47,16 @@ const PG_CONNECT = Number(process.env.PG_CONNECT ?? 10);
 const NPM_MS = Number(process.env.NPM_MS ?? 40);
 const WARM_RUNS = Number(process.env.WARM_RUNS ?? 5);
 const COLD_RUNS = Number(process.env.COLD_RUNS ?? 3);
+
+// 0: no isolate or shared copy of npm's answers, as on production when a view lands on an isolate that has not read
+// the package in the last minute. The default is the registry's own (DEFAULT_TTL_MS in upstream.ts)
+const UPSTREAM_TTL_MS = process.env.BENCH_UPSTREAM_TTL_MS ?? "60000";
 const FIXTURE = process.env.APM_PERF_FIXTURE ?? join(homedir(), ".cache", "apm-perf-fixtures", "react.json");
 
-// the readme npm sends in the packument (react's has none): a long one, so the page renders one as zod's or ajv's does
+const UNSCORABLE = z.enum(["scored", "unscorable"]).parse(process.env.APM_PERF_LATEST ?? "scored") === "unscorable";
+
+// the readme npm sends in the packument when the fixture has none (react's): a long one, so the page renders one as
+// zod's or ajv's does
 const README = readFileSync(process.env.APM_PERF_README ?? join(homedir(), ".cache", "apm-perf-fixtures", "readme.md"), "utf8");
 
 const MINUTE = 60_000;
@@ -52,16 +66,17 @@ const log = (s: string) => process.stderr.write(`${s}\n`);
 const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] ?? 0;
 
 // ---------- fake npm, serving the recorded packument as UPSTREAM ----------
-const UPSTREAM = "react";
 const LOCAL = "@bench/local";
 
 const Recorded = z.looseObject({
   name: z.string(),
+  readme: z.string().optional(),
   "dist-tags": z.record(z.string(), z.string()),
   versions: z.record(z.string(), z.looseObject({ dist: z.looseObject({}) })),
 });
 
 const recorded = Recorded.parse(JSON.parse(readFileSync(FIXTURE, "utf8")));
+const UPSTREAM = recorded.name;
 const latest = recorded["dist-tags"].latest;
 
 if (latest === undefined) throw new Error(`${FIXTURE} has no latest tag`);
@@ -69,6 +84,9 @@ if (latest === undefined) throw new Error(`${FIXTURE} has no latest tag`);
 const tarball = pkgTgz({ name: UPSTREAM, version: latest, main: "index.js", license: "MIT" }, { "index.js": "module.exports = 1;\n", "README.md": `# ${UPSTREAM}\n\nA stand-in readme.\n` });
 const integrity = `sha512-${createHash("sha512").update(tarball).digest("base64")}`;
 const shasum = createHash("sha1").update(tarball).digest("hex");
+
+// next 16.4.6's tarball is 43.7 MB: the registry refuses to download it for a readme once it sees the length
+const OVER_CAP = UNSCORABLE ? new Uint8Array(43_700_000) : null;
 let npmReads = 0;
 
 const npm = Bun.serve({
@@ -79,7 +97,7 @@ const npm = Bun.serve({
     await wait(NPM_MS);
     const path = decodeURIComponent(new URL(req.url).pathname.slice(1));
 
-    if (path.endsWith(".tgz")) return new Response(tarball, { headers: { "content-type": "application/octet-stream" } });
+    if (path.endsWith(".tgz")) return new Response(OVER_CAP !== null && path.endsWith(`-${latest}.tgz`) ? OVER_CAP : tarball, { headers: { "content-type": "application/octet-stream" } });
     const [name, ...rest] = path.split("/");
 
     if (name !== UPSTREAM) return Response.json({ error: "Not found" }, { status: 404 });
@@ -101,7 +119,8 @@ const versions = Object.fromEntries(
   Object.entries(recorded.versions).map(([v, doc]) => [v, { ...doc, name: UPSTREAM, dist: { ...doc.dist, tarball: `${npm.url.href}${UPSTREAM}/-/${UPSTREAM}-${v}.tgz`, integrity, shasum, signatures: undefined } }]),
 );
 
-const packument = JSON.stringify({ ...recorded, _id: UPSTREAM, name: UPSTREAM, readme: README, versions });
+const readme = UNSCORABLE ? (recorded.readme ?? "") : recorded.readme || README;
+const packument = JSON.stringify({ ...recorded, _id: UPSTREAM, name: UPSTREAM, readme, versions });
 const versionDocs = new Map(Object.entries(versions).map(([v, doc]) => [v, JSON.stringify(doc)]));
 
 // ---------- Postgres, seeded, behind a latency proxy ----------
@@ -337,6 +356,7 @@ const options = () => ({
         APM_REVIEW_TOKEN_HASH: createHash("sha256").update("package-bench-service").digest("hex"),
         APM_ADMINS: "",
         TEST_CONTROL_SECRET: CONTROL,
+        APM_UPSTREAM_TTL_MS: UPSTREAM_TTL_MS,
       },
       r2Buckets: ["BLOBS"],
       hyperdrives: { HYPERDRIVE: proxied.toString() },
@@ -422,7 +442,11 @@ function expectPage(v: View, name: string, checks: readonly string[]): void {
 
 const upstreamPath = `/package/${UPSTREAM}`;
 const localPath = `/package/${LOCAL}`;
-const upstreamChecks = [`>${latest}<`, "/100<", "Proxied from the public npm registry", "Show readme"];
+
+const upstreamChecks = UNSCORABLE
+  ? [`>${latest}<`, "apm cannot score this version", "Proxied from the public npm registry", "Readme not shown"]
+  : [`>${latest}<`, "/100<", "Proxied from the public npm registry", "Show readme"];
+
 const localChecks = [">1.0.9<", "a package published here"];
 
 // ---------- the run ----------
@@ -434,17 +458,29 @@ const answers: { label: string; ms: number; db: number; npm: number; trips: numb
 
 const ageKept = () => sql("UPDATE kept_packages SET computed_at = computed_at - $1", [6 * MINUTE]);
 
-/** Scores the npm package and lets its first view keep its summary. */
+const TOO_LARGE_DETAIL = "the tarball (43.7 MB) is larger than the 32 MiB apm downloads";
+
+/**
+ * Scores the npm package (or records its latest unscorable, as the analysis does for next) and lets its next view
+ * keep its summary. BENCH_ALLOW_UNKEPT=1 goes on when none was kept, to measure code from before such a package got one.
+ */
 async function prepare(): Promise<void> {
   const mf = new Miniflare(options());
   const base = await mf.ready;
   await view(base, upstreamPath);
-  await control(mf, "__test/analysis-job", { name: UPSTREAM, version: latest });
+
+  if (UNSCORABLE) {
+    // with no digest, as production's rows for next were recorded before migration 0022: the page then asks the
+    // registry for the readme (it cannot tell the outcome is about today's tarball) and the registry refuses it
+    await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ($1, $2, $3, 'too-large', $4, $5)", [UPSTREAM, latest, SCORER, TOO_LARGE_DETAIL, Date.now()]);
+  } else await control(mf, "__test/analysis-job", { name: UPSTREAM, version: latest });
   await view(base, upstreamPath);
   await wait(500);
   const kept = await sql("SELECT package FROM kept_packages");
 
-  if (kept.length !== 1) throw new Error(`expected one kept summary, found ${kept.length}`);
+  log(`kept summaries: ${kept.length}`);
+
+  if (kept.length !== 1 && !process.env.BENCH_ALLOW_UNKEPT) throw new Error(`expected one kept summary, found ${kept.length}`);
   await mf.dispose();
 }
 
@@ -539,6 +575,17 @@ for (const [label, path, name, checks] of [
 
     if (!after.text.includes("1.0.9 (revoked)")) throw new Error("the revoke did not show on the next view");
     await sql("UPDATE versions SET status = 'active', status_reason = NULL, status_at = NULL WHERE package = $1 AND version = '1.0.9'", [LOCAL]);
+  } else if (UNSCORABLE) {
+    // the recorded outcome hidden under another scorer's name, then given back: each must show on the next view
+    await sql("UPDATE analysis_outcomes SET scorer = scorer || '-hidden' WHERE package = $1 AND outcome IS NOT NULL", [UPSTREAM]);
+    const after = await view(base, path);
+
+    if (after.text.includes("apm cannot score this version")) throw new Error("the hidden outcome still showed on the next view");
+    await sql("DELETE FROM analysis_outcomes WHERE package = $1 AND scorer = $2", [UPSTREAM, SCORER]);
+    await sql("UPDATE analysis_outcomes SET scorer = left(scorer, -7) WHERE package = $1", [UPSTREAM]);
+    const back = await view(base, path);
+
+    if (!back.text.includes("apm cannot score this version")) throw new Error("the restored outcome did not show on the next view");
   } else {
     // the stored score hidden under another scorer's name, then given back: each must show on the next view
     await sql("UPDATE upstream_analysis SET scorer = scorer || '-hidden' WHERE package = $1", [UPSTREAM]);
@@ -557,7 +604,7 @@ for (const [label, path, name, checks] of [
 const ms = (n: number) => (Number.isNaN(n) ? "    -" : n.toFixed(0).padStart(5));
 
 
-log(`pg rtt ${PG_RTT}ms connect ${PG_CONNECT}ms, npm ${NPM_MS}ms; ${COLD_RUNS} cold, ${WARM_RUNS} warm runs`);
+log(`${UPSTREAM}${UNSCORABLE ? " (latest unscorable)" : ""}: pg rtt ${PG_RTT}ms connect ${PG_CONNECT}ms, npm ${NPM_MS}ms, upstream ttl ${UPSTREAM_TTL_MS}ms; ${COLD_RUNS} cold, ${WARM_RUNS} warm runs`);
 
 log(`${"step".padEnd(42)}  ttfb    h1 content  done`);
 

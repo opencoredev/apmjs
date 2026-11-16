@@ -48,7 +48,8 @@ export const REVIEW_CLEAN: ReviewAnswer = {
 export type Fake = Partial<{
   packages: Record<string, PackageInfo>;
   /** Answers of the versions route, by name@version; a version not here falls back to the package answer's list. */
-  versions: Record<string, VersionInfo>;
+  /** A version's own answer; one given without `unscorable` has none (null), as most versions do. */
+  versions: Record<string, Omit<VersionInfo, "unscorable"> & Partial<Pick<VersionInfo, "unscorable">>>;
   reviews: Record<string, ReviewAnswer>;
   resolve: (name: string, range: string) => ResolveOutcome;
   search: SearchAnswer | null;
@@ -78,14 +79,15 @@ export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
       if (f.down) return down;
       const v = f.versions?.[`${name}@${version}`];
 
-      if (v) return { kind: "ok", value: v };
+      if (v) return { kind: "ok", value: { unscorable: null, ...v } };
       // like the registry: latest's facts and score are the package answer's; any other version must be given above
       const p = f.packages?.[name];
       const listed = p?.versions.find((x) => x.version === version);
 
       if (!p || !listed) return { kind: "missing" };
 
-      return { kind: "ok", value: { version, status: listed.status, statusReason: listed.statusReason, deprecated: listed.deprecated, facts: version === p.latest ? p.facts : null, score: version === p.latest ? p.score : null } };
+      // an outcome only when one is given above
+      return { kind: "ok", value: { version, status: listed.status, statusReason: listed.statusReason, deprecated: listed.deprecated, facts: version === p.latest ? p.facts : null, score: version === p.latest ? p.score : null, unscorable: null } };
     },
     async review({ name, version }) {
       calls.push(`review ${name}@${version}`);

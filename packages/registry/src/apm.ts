@@ -1262,8 +1262,9 @@ const scoreResponse = (src: Source, v0: VersionRecord) =>
         case "queued":
           return fail(503, "This version is not scored yet: its tarball is queued for analysis. Try again in a minute.", { pending: true });
         case "unscorable":
-          // decided, not waiting: asking again gives the same answer, and installs stay refused
-          return fail(422, `${why.text}. It is not installed through apm.`, { unscorable: { reason: why.reason, text: why.text } });
+          // decided, not waiting: asking again gives the same answer. Installs still serve it, with a warning; only strict
+          // mode and the ~safe view refuse it (resolve, scan)
+          return fail(422, `${why.text}. Installs through apm still work, and apm add warns about it; strict mode and the ~safe view refuse it.`, { unscorable: { reason: why.reason, text: why.text } });
         case "unreadable":
           return fail(404, "No score for this version (the tarball could not be read).");
         default: {
@@ -1377,8 +1378,10 @@ const packageResponse = (name: string) =>
       createdAt: local ? new Date(local.created_at).toISOString() : null,
       modifiedAt: local ? new Date(local.modified_at).toISOString() : null,
       latest: latest?.version ?? null,
-      // why the latest version has no score, when it has none: queued, or decided never (with the reason)
-      unscored: latest && !latestReport ? notScored(src, latest) : null,
+      // why the latest version has no score, when it has none: queued, or decided never (with the reason, and whether
+      // that was decided for the tarball latest names now: npm's current packument, or a summary whose latest npm's
+      // version document just confirmed, kept-package.ts)
+      unscored: latest && !latestReport ? unscoredOf(src, latest) : null,
       facts: latestFree?.facts ?? null,
       score:
         latest && latestReport && latestFree
@@ -1469,6 +1472,9 @@ const versionResponse = (name: string, version: string) =>
         publishedBy: v.published_by,
         facts: free?.facts ?? null,
         score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, ...reviewable(v, report) } : null,
+        // this version's own outcome when apm decided it can never score it: the package answer's list holds only the
+        // newest 200 versions, so a view of an older one reads it here
+        unscorable: !report && v.unscorable && !isWithheld(v.status) ? { reason: v.unscorable.reason, text: notScored(src, v).text } : null,
       },
       200,
       // its score quotes the version's source, so no shared cache may keep it
@@ -1937,6 +1943,20 @@ export function notScored(src: Pick<Source, "kind">, v: VersionRecord): NotScore
   if (src.kind === "upstream") return { kind: "queued", text: "not scored yet: queued for analysis" };
 
   return { kind: "unreadable", text: "could not be analyzed" };
+}
+
+/**
+ * notScored for the package answer: an unscorable outcome also says whether it was decided for the tarball `v` names
+ * (`sameTarball`). An outcome recorded for other bytes (npm moved the version to another tarball) or for none (before
+ * migration 0022) is false, so nothing that depends on the bytes (the website's readme skip) trusts it.
+ */
+export function unscoredOf(src: Pick<Source, "kind">, v: VersionRecord): NotScored | (Extract<NotScored, { kind: "unscorable" }> & { sameTarball: boolean }) {
+  const why = notScored(src, v);
+
+  if (why.kind !== "unscorable") return why;
+  const d = digestOf(v);
+
+  return { ...why, sameTarball: d !== null && v.unscorable?.digest === digestLabel(d) };
 }
 
 // ---------- policy: ~safe view, resolve, scan ----------

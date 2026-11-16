@@ -119,7 +119,7 @@ describe("pageRead", () => {
       expect([...row.analyses.scores]).toEqual([...analyses.scores]);
       expect([...row.analyses.unscorable]).toEqual([...analyses.unscorable]);
       expect(row.analyses.scores.size).toBe(1);
-      expect(row.analyses.unscorable.get("0.9.0")).toEqual({ reason: "too-large", detail: "over the cap" });
+      expect(row.analyses.unscorable.get("0.9.0")).toEqual({ reason: "too-large", detail: "over the cap", digest: null });
 
       // the review answer's read: the same row, no scores
       const listing = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: false })));

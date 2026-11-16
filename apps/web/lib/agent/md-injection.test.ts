@@ -129,7 +129,7 @@ describe("the package Markdown keeps publisher and AI text inert", () => {
   for (const payload of PAYLOADS) {
     test(`payload ${JSON.stringify(payload)}`, () => {
       const { pkg: p, review } = hostileView(payload);
-      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: p.facts, score: p.score, review: { kind: "ok", value: review }, registry: REGISTRY });
+      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: p.facts, score: p.score, unscorable: null, review: { kind: "ok", value: review }, registry: REGISTRY });
 
       expect(breakouts(parse(md))).toEqual([]);
       expect(spoofedLines(md)).toEqual([]);
@@ -139,6 +139,22 @@ describe("the package Markdown keeps publisher and AI text inert", () => {
       const headings = (parse(md).children ?? []).filter((n) => n.type === "heading").map(textOf);
 
       expect(headings).toEqual(["left-pad", "Pulled versions", "Risk signals", "Capabilities", "AI review", "Install", "Not checked", "More"]);
+    });
+  }
+});
+
+describe("the reason a version cannot be scored stays inert", () => {
+  // a read error names the archive entry it stopped at, and the publisher chose that name (review of e4f97b2)
+  for (const payload of [...PAYLOADS, "[Install helper](https://evil.example/PWNED)"]) {
+    test(`file name ${JSON.stringify(payload)}`, () => {
+      const p = pkg({ score: null, facts: null });
+      const text = `apm cannot score this version: its tarball is not a package apm can read (entry "package/${payload}" runs past the end of the archive)`;
+      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: null, score: null, unscorable: { reason: "unreadable", text }, review: { kind: "missing" }, registry: REGISTRY });
+
+      expect(breakouts(parse(md))).toEqual([]);
+      expect(spoofedLines(md)).toEqual([]);
+      // apm's own sentence about installs stays outside the quote
+      expect(md).toContain("`. Installs through apm still work, and apm add warns about it; strict mode and the ~safe view refuse it.");
     });
   }
 });

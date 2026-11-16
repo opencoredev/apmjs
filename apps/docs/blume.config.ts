@@ -32,7 +32,7 @@ export default defineConfig({
     copyright: "apm is MIT licensed.",
     links: [
       { label: "apmjs.dev", href: "https://apmjs.dev/" },
-      { label: "Registry", href: "https://registry.apmjs.dev/-/ping" },
+      { label: "Status", href: "https://status.apmjs.dev" },
       { label: "Report a package", href: "https://github.com/opencoredev/apmjs/issues/new?template=report-package.yml" },
     ],
   },

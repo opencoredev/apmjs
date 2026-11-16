@@ -4,11 +4,12 @@ import { citeEvidence, namesFile } from "../evidence";
 import { installCommand, installNote, INSTALL_CLIENTS } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
+import { UNSCORABLE_INSTALLS } from "../unscored";
 import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
 import { canonicalPackagePath, siteUrl } from "./site";
-import type { ScoreReport } from "./source";
+import type { ScoreReport, VersionInfo } from "./source";
 import { codeBlock, inlineCode, linkUrl, oneLine, points, UNTRUSTED_NOTE } from "./text";
 
 export type PackageView = {
@@ -21,6 +22,8 @@ export type PackageView = {
   facts: Facts | null;
   /** That version's score; null when it is not scored yet. */
   score: ScoreReport | null;
+  /** Why apm can never score that version, from its own version answer (not the package answer's newest 200). */
+  unscorable: VersionInfo["unscorable"];
   review: Fetched<ReviewAnswer>;
   /** The registry URL install config points at, ending in "/". */
   registry: string;
@@ -62,7 +65,8 @@ export function withholdSource(view: PackageView): PackageView {
   const review: PackageView["review"] =
     r.kind === "ok" ? { kind: "ok", value: { ...r.value, review: r.value.review ? { ...r.value.review, findings: r.value.review.findings.map((f) => ({ ...f, excerpt: "" })) } : null, private: null } } : r;
 
-  return { ...view, status, score, review };
+  // the registry sends none for a withheld version; its reason can name a file of the tarball
+  return { ...view, status, score, review, unscorable: null };
 }
 
 /** Evidence lines listed per signal; the HTML page has the rest. */
@@ -146,6 +150,19 @@ function statusLine(status: NonNullable<PackageView["status"]>): string {
   return status.status === "active" ? "- Status: active" : `- Status: ${wordText(status.status)}${reason}. New installs skip it.`;
 }
 
+/** Why apm can never score the shown version: null when it has a score or may still get one. */
+export function unscorableOf(view: Pick<PackageView, "score" | "unscorable">): VersionInfo["unscorable"] {
+  return view.score ? null : view.unscorable;
+}
+
+/**
+ * The risk-signals line for a version apm can never score. The registry's reason is quoted: it can carry text from the
+ * tarball (a file name in a read error). What installs do with the version is apm's fixed sentence, outside the quote.
+ */
+export function unscorableLine(unscorable: NonNullable<VersionInfo["unscorable"]>): string {
+  return `apm cannot score this version. The registry's reason: ${inlineCode(oneLine(unscorable.text))}. ${UNSCORABLE_INSTALLS}`;
+}
+
 /** The whole Markdown document for one package version. */
 export function packageMarkdown(input: PackageView): string {
   const view = withholdSource(input);
@@ -153,6 +170,7 @@ export function packageMarkdown(input: PackageView): string {
   const withheld = sourceWithheld(view);
   const url = siteUrl(canonicalPackagePath(pkg.name));
   const older = version !== null && version !== pkg.latest;
+  const unscorable = unscorableOf(view);
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
 
   out.push(
@@ -162,7 +180,7 @@ export function packageMarkdown(input: PackageView): string {
     ...(view.status?.deprecated ? [`- Deprecated: ${inlineCode(view.status.deprecated)}`] : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
-    `- Score: ${score ? `${score.score}/100, grade ${oneLine(score.grade)}` : "not scored yet"}`,
+    `- Score: ${score ? `${score.score}/100, grade ${oneLine(score.grade)}` : unscorable !== null ? "none: apm cannot score this version" : "not scored yet"}`,
     `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : ""}`,
     `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
     "",
@@ -176,7 +194,7 @@ export function packageMarkdown(input: PackageView): string {
 
   out.push("## Risk signals", "");
 
-  if (!score) out.push("Not scored yet. apm scores a version when it first reads its tarball; ask again in a minute.", "");
+  if (!score) out.push(unscorable !== null ? unscorableLine(unscorable) : "Not scored yet. apm scores a version when it first reads its tarball; ask again in a minute.", "");
   else {
     const lost = score.signals.filter((s) => s.points < 0);
     const notes = score.signals.filter((s) => s.points >= 0);
@@ -199,12 +217,14 @@ export function packageMarkdown(input: PackageView): string {
   out.push("## Capabilities", "");
   const caps = capabilitiesOf(score?.signals ?? null);
 
+  const unknownUntil = unscorable !== null ? "unknown: apm cannot score this version" : "unknown until the version is scored";
+
   if (caps) out.push(...caps.map((c) => `- ${c.label}: ${c.state}`));
-  else out.push("- Code capabilities: unknown until the version is scored");
+  else out.push(`- Code capabilities: ${unknownUntil}`);
 
   // the shown version's own facts; the license is the publisher's text
   if (view.facts) out.push(...factLines(view.facts).map((f) => `- ${f.label}: ${f.label === "License" && view.facts?.license ? inlineCode(f.value) : f.value}`));
-  else out.push("- Install scripts, license and size: unknown until the version is scored");
+  else out.push(`- Install scripts, license and size: ${unknownUntil}`);
   out.push("", "## AI review", "", ...reviewSection(view.review), "");
 
   const shown = version === null ? null : oneLine(version);

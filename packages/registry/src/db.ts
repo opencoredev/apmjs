@@ -288,8 +288,15 @@ export const UnscorableReason = z.enum(["too-large", "unavailable", "unreadable"
 
 export type Unscorable = { readonly reason: z.infer<typeof UnscorableReason>; readonly detail: string };
 
+/**
+ * An outcome as recorded: the decision and the checksum label (digestLabel) of the tarball it was decided for. Null
+ * when it was decided for no tarball (npm no longer lists the version) or recorded before migration 0022: it then
+ * names no bytes, and nothing that depends on which bytes they were (the website's readme skip) may trust it.
+ */
+export type RecordedUnscorable = Unscorable & { readonly digest: string | null };
+
 /** A version as stored; an upstream one also carries why it can never be scored, when that is decided. */
-export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: Unscorable };
+export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: RecordedUnscorable };
 
 /**
  * The runs of a version so far, the one starting included, as Store.startAnalysis finds them. `starts` counts every
@@ -304,13 +311,13 @@ export type RunHistory = { starts: number; fetchFailures: number; fetchFailedSin
 export type AnalysisStart = ({ kind: "started" } & RunHistory) | { kind: "running" } | { kind: "decided" };
 
 /** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
-export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, Unscorable> };
+export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, RecordedUnscorable> };
 
 /** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
 const AnalysesColumns = {
   analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
   dismissals: z.array(DismissalRow),
-  unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
+  unscorable: z.array(z.object({ version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
 };
 
 const AnalysesRow = z.object(AnalysesColumns);
@@ -612,7 +619,8 @@ export type StoreApi = {
   /** Drops the reservation claimAnalysisJob made at `claimedAt` (when the queue refused the job); a newer claim stays. */
   readonly releaseAnalysisJob: (name: string, version: string, claimedAt: number) => Effect.Effect<void, StoreError>;
   /** Records that the current scorer will never score this version, and why. */
-  readonly setUnscorable: (input: { name: string; version: string; unscorable: Unscorable; at: number }) => Effect.Effect<void, StoreError>;
+  /** `digest`: the checksum label of the tarball the outcome was decided for, null when there is none (RecordedUnscorable). */
+  readonly setUnscorable: (input: { name: string; version: string; unscorable: Unscorable; digest: string | null; at: number }) => Effect.Effect<void, StoreError>;
   /**
    * Counts a run of this version as begun, before it does anything, and says how many have begun (this one included)
    * and how many of those ended unable to fetch the version (`fetchFailures`). "running" when another run began less
@@ -797,7 +805,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
   /** An upstream package's scores keyed by "<version> <digest>", each with its dismissed evidence left out, and what it cannot score. */
   const analysesOf = (analyses: z.output<typeof AnalysesRow>["analyses"], dismissals: readonly DismissalRecord[], unscorable: z.output<typeof AnalysesRow>["unscorable"]): UpstreamAnalyses => ({
     scores: new Map(analyses.map((a) => [`${a.version} ${a.digest}`, withList(a.analysis, dismissalsFor(dismissals, a.version, a.digest))])),
-    unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "" }] as const)),
+    unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "", digest: u.digest }] as const)),
   });
 
   const insertStaged = (s: NewStaged) =>
@@ -1178,7 +1186,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
                    FROM upstream_analysis u WHERE u.package = ${name} AND u.scorer = ${SCORER}) AS analyses,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
                    FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
                    FROM analysis_outcomes o WHERE o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS unscorable`,
           one(AnalysesRow),
         );
@@ -1210,7 +1218,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
                    FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
                 (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
                    FROM upstream_analysis u WHERE ${scores} AND u.package = ${name} AND u.scorer = ${SCORER} AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
                    FROM analysis_outcomes o WHERE ${scores} AND o.package = ${name} AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable`,
           z.tuple([PageReadRow]).transform(([r]) => r),
         );
@@ -1442,7 +1450,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
         const wanted = [...new Set(names)];
 
         const of = (name: string): UpstreamAnalyses => {
-          const got = out.get(name) ?? { scores: new Map<string, unknown>(), unscorable: new Map<string, Unscorable>() };
+          const got = out.get(name) ?? { scores: new Map<string, unknown>(), unscorable: new Map<string, RecordedUnscorable>() };
 
           out.set(name, got);
 
@@ -1456,14 +1464,14 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
           sql`SELECT
                 (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis)), '[]'::jsonb)
                    FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND u.scorer = ${SCORER}) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail)), '[]'::jsonb)
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest)), '[]'::jsonb)
                    FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND o.scorer = ${SCORER} AND o.outcome IS NOT NULL) AS decided,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
                    FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL) AS dismissals`,
           one(
             z.object({
               analyses: z.array(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
-              decided: z.array(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable() })),
+              decided: z.array(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
               dismissals: z.array(DismissalRow),
             }),
           ),
@@ -1475,7 +1483,7 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
 
         for (const r of rows) of(r.package).scores.set(`${r.version} ${r.digest}`, withList(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest)));
 
-        for (const d of decided) of(d.package).unscorable.set(d.version, { reason: d.outcome, detail: d.detail ?? "" });
+        for (const d of decided) of(d.package).unscorable.set(d.version, { reason: d.outcome, detail: d.detail ?? "", digest: d.digest });
 
         return out;
       }),
@@ -1523,11 +1531,11 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
     releaseAnalysisJob: (name, version, claimedAt) =>
       run("releaseAnalysisJob", sql`DELETE FROM analysis_jobs WHERE package = ${name} AND version = ${version} AND queued_at = ${claimedAt}`, none),
 
-    setUnscorable: ({ name, version, unscorable, at }) =>
+    setUnscorable: ({ name, version, unscorable, digest, at }) =>
       run(
         "setUnscorable",
-        sql`INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES (${name}, ${version}, ${SCORER}, ${unscorable.reason}, ${unscorable.detail}, ${at})
-            ON CONFLICT (package, version, scorer) DO UPDATE SET outcome = EXCLUDED.outcome, detail = EXCLUDED.detail, decided_at = EXCLUDED.decided_at`,
+        sql`INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES (${name}, ${version}, ${SCORER}, ${unscorable.reason}, ${unscorable.detail}, ${digest}, ${at})
+            ON CONFLICT (package, version, scorer) DO UPDATE SET outcome = EXCLUDED.outcome, detail = EXCLUDED.detail, digest = EXCLUDED.digest, decided_at = EXCLUDED.decided_at`,
         none,
       ),
     startAnalysis: ({ name, version, now, runMs }) =>

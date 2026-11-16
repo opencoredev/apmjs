@@ -1,6 +1,6 @@
 // Criterion 1 of apm-score-v10, the registry's half: a version that can never be scored says why on every surface
 // (score endpoint, package answer, resolve for apm add, scan for the Bun scanner) instead of answering 503 "queued, try
-// again in a minute" forever, and installs stay refused. A run the platform stopped (CPU limit) stores nothing, so the
+// again in a minute" forever; installs warn about it, and strict mode refuses it. A run the platform stopped (CPU limit) stores nothing, so the
 // next run reads less and is incomplete, and the one after records that the version cannot be scored.
 // npm is a local recording stub; no real host is contacted.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -161,6 +161,29 @@ describe("versions that can never be scored", () => {
     // the queue's run finds out, as it does for every version (no request analyses inline)
     expect(await reg.analysisJob({ name: "over-unpack", version: "1.0.0" })).toBe("ack");
     await expectUnscorable("over-unpack", "too-large", "inflates to more than 48 MB");
+  }, 60_000);
+
+  test("the outcome is bound to the tarball it was decided for: once npm serves other bytes, the website reads the readme again (review of e4f97b2)", async () => {
+    const name = "bound-outcome";
+    const big = tgzOf(name, { "index.js": "module.exports = 1;\n", "README.md": "# Readable now\n", "data.txt": "0".repeat(50 * 1024 * 1024) });
+
+    tarballs.set(name, { bytes: big, downloads: 0, checksum: true });
+    expect(await reg.analysisJob({ name, version: "1.0.0" })).toBe("ack");
+    const label = `sha512-${createHash("sha512").update(big).digest("hex")}`;
+    const Outcome = z.array(z.object({ outcome: z.string(), digest: z.string().nullable() }));
+
+    expect(Outcome.parse(await reg.query("SELECT outcome, digest FROM analysis_outcomes WHERE package = $1", [name]))).toEqual([{ outcome: "too-large", digest: label }]);
+    const Same = z.object({ unscored: z.object({ kind: z.literal("unscorable"), sameTarball: z.boolean() }) });
+
+    expect(Same.parse((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).body).unscored.sameTarball).toBe(true);
+    // npm moves 1.0.0 to a smaller tarball: the outcome names other bytes, so the website may not skip the readme,
+    // which the registry now serves
+    tarballs.set(name, { bytes: tgzOf(name, { "index.js": "module.exports = 1;\n", "README.md": "# Readable now\n" }), downloads: 0, checksum: true });
+    expect(Same.parse((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).body).unscored.sameTarball).toBe(false);
+    const readme = await getJson(`${reg.url}-/apm/v1/readme/${name}/1.0.0`);
+
+    expect(readme.status).toBe(200);
+    expect(JSON.stringify(readme.body)).toContain("Readable now");
   }, 60_000);
 
   test("a version the upstream lists without a checksum is recorded unavailable", async () => {

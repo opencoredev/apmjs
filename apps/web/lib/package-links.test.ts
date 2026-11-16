@@ -5,7 +5,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { PackageLinks } from "../components/package-links";
 import { packageLinks, repositoryUrl, safeHttpUrl } from "./package-links";
-import { readmeSource } from "./readme-source";
+import { readmeSource, tarballTooLarge } from "./readme-source";
 
 describe("link sanitizing", () => {
   test("keeps http and https URLs", () => {
@@ -79,6 +79,25 @@ describe("readme fallback order", () => {
     expect(readmeSource({ packument: "", version: null, tarball: null })).toEqual({ kind: "none" });
     expect(readmeSource({ packument: "", version: "1.0.0", tarball: { kind: "ok", value: { kind: "text", path: "README", size: 2, text: " \n" } } })).toEqual({ kind: "none" });
     expect(readmeSource({ packument: "", version: "1.0.0", tarball: { kind: "unavailable", reason: { kind: "timeout" } } })).toEqual({ kind: "unknown" });
+  });
+
+  test("latest recorded too large to analyze is not asked about, and says why there is no readme", () => {
+    const unscored = { kind: "unscorable" as const, reason: "too-large", text: "apm cannot score this version: it is too large for apm to analyze (43.7 MB)", sameTarball: true };
+
+    expect(tarballTooLarge({ pkg: { latest: "16.4.6", unscored }, version: "16.4.6" })).toBe(true);
+    // decided for other bytes (npm moved the version to a smaller tarball) or for none: the readme is asked for
+    expect(tarballTooLarge({ pkg: { latest: "16.4.6", unscored: { ...unscored, sameTarball: false } }, version: "16.4.6" })).toBe(false);
+    // an older version's row carries no reason: it is asked about
+    expect(tarballTooLarge({ pkg: { latest: "16.4.6", unscored }, version: "16.4.5" })).toBe(false);
+    // any other reason, or a queued or scored latest, is asked about
+    expect(tarballTooLarge({ pkg: { latest: "1.0.0", unscored: { ...unscored, reason: "analysis-limit" } }, version: "1.0.0" })).toBe(false);
+    expect(tarballTooLarge({ pkg: { latest: "1.0.0", unscored: { kind: "queued", text: "queued" } }, version: "1.0.0" })).toBe(false);
+    expect(tarballTooLarge({ pkg: { latest: "1.0.0", unscored: null }, version: "1.0.0" })).toBe(false);
+    expect(tarballTooLarge({ pkg: { latest: null, unscored }, version: null })).toBe(false);
+
+    expect(readmeSource({ packument: "", version: "16.4.6", tarball: { kind: "not-opened" } })).toEqual({ kind: "not-opened", version: "16.4.6" });
+    // the packument's readme still wins
+    expect(readmeSource({ packument: "# next", version: "16.4.6", tarball: { kind: "not-opened" } })).toEqual({ kind: "packument", text: "# next" });
   });
 
   test("a README too large or not text is named, not rendered", () => {

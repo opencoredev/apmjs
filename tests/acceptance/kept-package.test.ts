@@ -2,11 +2,13 @@
 // packument. Every read a summary answers must come out byte for byte as npm's packument would answer it, past the
 // summary's version window too. A summary must never offer or show the source of a version npm no longer lists, must answer as the code
 // did before summaries were kept whenever npm cannot confirm it, must be checked against npm once it is five minutes
-// old (the HEAD answer too), and must never answer for a package published on apm. A package apm never scored gets
-// none. Runs the bundled Worker against a local npm that answers as registry.npmjs.org does (ETags, HEAD, 304, version
+// old (the HEAD answer too), and must never answer for a package published on apm. A package apm never analyzed gets
+// none, and so does one apm only recorded it can never score, unless the operator listed it (next: every recent
+// tarball over the analysis cap), which gets one. Runs the bundled Worker against a local npm that answers as registry.npmjs.org does (ETags, HEAD, 304, version
 // documents).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { SCORER } from "../../packages/core/src/score.ts";
 import { z } from "zod";
 import { getJson, pkgTgz, putPublish, startRegistry, type Registry } from "./harness";
 
@@ -176,6 +178,56 @@ describe("kept package summaries", () => {
 
     expect((await getJson(`${reg.url}-/apm/v1/packages/kp-unscored`)).status).toBe(200);
     expect(await keptRow("kp-unscored")).toBeNull();
+  });
+
+  test("a package whose only analysis says it can never be scored gets no summary unless the operator listed it (review of e4f97b2)", async () => {
+    // anyone can have apm analyze any package, and make one unscorable: that alone must not take a row
+    const name = "kp-too-large";
+
+    listed.set(name, { versions: ["1.0.0"], latest: "1.0.0" });
+    expect((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).status).toBe(200);
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ($1, '1.0.0', $2, 'too-large', 'over the cap', $3)", [name, SCORER, clock]);
+    expect((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).status).toBe(200);
+    expect(await keptRow(name)).toBeNull();
+  });
+
+  test("next, listed, gets a summary once apm recorded it can never be scored, and its page reads stop reading the packument", async () => {
+    const name = "next";
+
+    listed.set(name, { versions: ["1.0.0", "2.0.0"], latest: "2.0.0" });
+    expect((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).status).toBe(200);
+    expect(await keptRow(name)).toBeNull();
+
+    // what the analysis records for next 16.4.6: no score, a reason
+    await reg.query("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, decided_at) VALUES ($1, '2.0.0', $2, 'too-large', $3, $4)", [name, SCORER, "the tarball (43.7 MB) is larger than the 32 MiB apm downloads", clock]);
+    const viewed = await getJson(`${reg.url}-/apm/v1/packages/${name}`);
+
+    expect(viewed.status).toBe(200);
+    expect(await keptRow(name)).not.toBeNull();
+    const Unscored = z.object({ unscored: z.object({ kind: z.literal("unscorable"), reason: z.literal("too-large") }) });
+
+    expect(Unscored.safeParse(viewed.body).success).toBe(true);
+
+    // from the summary now: the package answer, its HEAD, the version and score answers and the readme lookup read no
+    // packument, and say what they said when it was read whole
+    const paths = [`-/apm/v1/packages/${name}`, `-/apm/v1/packages/${name}/versions/2.0.0`, `-/apm/v1/score/${name}`, `-/apm/v1/readme/${name}/2.0.0`];
+
+    packumentReads.delete(name);
+    const fromSummary = await answers(paths);
+
+    expect(packumentReads.get(name) ?? 0).toBe(0);
+    expect((await fetch(`${reg.url}-/apm/v1/packages/${name}`, { method: "HEAD" })).status).toBe(200);
+    expect(packumentReads.get(name) ?? 0).toBe(0);
+    await dropRow(name);
+    const whole = await answers(paths);
+
+    expect(fromSummary).toEqual(whole);
+    expect(packumentReads.get(name) ?? 0).toBeGreaterThan(0);
+    // the outcome is apm's and read live: hidden, the very next answer no longer says it can never be scored
+    await reg.query("UPDATE analysis_outcomes SET scorer = scorer || '-hidden' WHERE package = $1", [name]);
+    const hidden = z.object({ unscored: z.object({ kind: z.string() }).nullable() }).parse((await getJson(`${reg.url}-/apm/v1/packages/${name}`)).body);
+
+    expect(hidden.unscored?.kind).not.toBe("unscorable");
   });
 
   test("past the version window, a kept summary answers every page read byte for byte as npm's packument does", async () => {
@@ -455,7 +507,13 @@ describe("kept package summaries", () => {
     clock += 60 * MINUTE;
     expect((await getJson(`${reg.url}-/apm/v1/packages/kp-same`)).status).toBe(200);
     expect(packumentReads.get("kp-same") ?? 0).toBe(before);
-    expect((await keptRow("kp-same"))?.computed_at).toBe(clock);
+    // npm's 304 is written down after the response (KeptRefresh.touch), so the row may lag the answer by a moment
+    const deadline = Date.now() + 10_000;
+
+    while ((await keptRow("kp-same"))?.computed_at !== clock) {
+      if (Date.now() > deadline) throw new Error("the unchanged summary was never marked current");
+      await Bun.sleep(50);
+    }
   });
 
   test("a release on npm shows once the summary is refreshed", async () => {

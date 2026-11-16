@@ -5,7 +5,7 @@ import { z } from "zod";
 import { packagePath } from "../package-route";
 import { looksLikePackageName } from "../search-schema";
 import { capabilitiesOf } from "./capabilities";
-import { packageMarkdown } from "./package-md";
+import { packageMarkdown, unscorableOf } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { REGISTRY } from "../registry-url";
 import { siteUrl } from "./site";
@@ -132,6 +132,8 @@ const checkPackage: Tool<typeof CheckPackageInput> = {
       // the shown version's own state and facts, read without a cache
       status,
       score: score ? { score: score.score, grade: score.grade } : null,
+      // why apm can never score the shown version ({ reason, text }, the registry's words); null when it has a score or may get one
+      unscorable: unscorableOf(loaded.view),
       signals: score?.signals ?? [],
       capabilities: capabilitiesOf(score?.signals ?? null),
       facts,

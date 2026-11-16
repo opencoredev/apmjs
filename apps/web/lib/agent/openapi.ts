@@ -188,7 +188,7 @@ export function openApiDocument() {
         parameters: [nameParam, versionParam],
         responses: {
           200: {
-            description: "The version's status (active, yanked, revoke-pending, revoked) with its reason, its own facts, and its score; facts and score are null until it is scored. Never cached.",
+            description: "The version's status (active, yanked, revoke-pending, revoked) with its reason, its own facts, and its score; facts and score are null until it is scored. `unscorable` ({ reason, text }) says why apm can never score it, and is null otherwise and for a withheld version. Never cached.",
             content: { "application/json": { schema: { type: "object", required: ["name", "version", "status", "statusReason", "facts", "score"], additionalProperties: true } } },
           },
           404: err("No such package or version"),

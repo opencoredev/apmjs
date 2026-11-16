@@ -85,7 +85,8 @@ const PackageInfo = z.object({
   // why the latest version has no score; added with the analysis outcomes, an older registry leaves it out
   unscored: z
     .discriminatedUnion("kind", [
-      z.object({ kind: z.literal("unscorable"), reason: z.string(), text: z.string() }),
+      // sameTarball: the outcome was decided for the tarball latest names now; an older registry sends none (false)
+      z.object({ kind: z.literal("unscorable"), reason: z.string(), text: z.string(), sameTarball: z.boolean().default(false) }),
       z.object({ kind: z.literal("queued"), text: z.string() }),
       z.object({ kind: z.literal("unreadable"), text: z.string() }),
     ])
@@ -197,7 +198,18 @@ const reviewPath = (name: string, version: string): string => `-/apm/v1/review/$
  */
 export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
 
-const VersionInfo = z.object({ version: z.string(), status: z.string(), statusReason: z.string().nullable(), deprecated: z.string().nullable(), facts: Facts.nullable(), score: PackageScore.nullable() });
+/** Why apm can never score a version, as the version answer gives it; an older registry sends none (null). */
+const VersionUnscorable = z.object({ reason: z.string(), text: z.string() });
+
+const VersionInfo = z.object({
+  version: z.string(),
+  status: z.string(),
+  statusReason: z.string().nullable(),
+  deprecated: z.string().nullable(),
+  facts: Facts.nullable(),
+  score: PackageScore.nullable(),
+  unscorable: VersionUnscorable.nullable().default(null),
+});
 
 /** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
 export const getVersionInfo = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> => getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo);
