@@ -62,6 +62,9 @@ export default Alchemy.Stack(
       compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
       // the queue consumer's CPU limit per analysis (compat.ts, WORKER_CPU_MS): the default 30 s until a raise is approved
       limits: { cpuMs: WORKER_CPU_MS },
+      // Smart Placement runs the registry near what it calls most (Neon through Hyperdrive, in us-east-2) instead of
+      // near each visitor: a package answer makes database round trips of about 75 ms each from a far colo.
+      placement: { mode: "smart" },
       env: {
         HYPERDRIVE: postgres,
         BLOBS: blobs,
