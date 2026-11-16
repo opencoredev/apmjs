@@ -8,6 +8,7 @@
 // in the parsed entry list, never joined onto anything, so "../" and friends can only name an entry that exists.
 // Answers are cached in the blob store under the tarball's digest: one index of paths and sizes, and one
 // object per path read, so a repeat costs one or two small reads instead of inflating the tarball again.
+import { pageProbe } from "./kept-package.ts";
 import { RequestMemory } from "./memory.ts";
 import { Effect, Option } from "effect";
 import { z } from "zod";
@@ -88,7 +89,8 @@ const findVersion = (name: string, version: string) =>
     const upstream = yield* Effect.serviceOption(Upstream);
 
     if (Option.isNone(upstream)) return null;
-    const probe = yield* upstream.value.probe(name, yield* RequestMemory);
+    // the kept summary names the version's tarball and checksum when it holds the version (kept-package.ts)
+    const probe = yield* pageProbe({ upstream: upstream.value, name, need: { kind: "version", version }, lease: yield* RequestMemory });
 
     switch (probe.kind) {
       case "found": {

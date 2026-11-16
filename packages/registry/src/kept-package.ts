@@ -1,0 +1,552 @@
+// What a package page needs of an upstream package, kept in Postgres (migration 0020) so a view reads one row instead of
+// npm's whole packument (next: 26 MiB parsed, seconds). A summary holds npm's own data only: the dist-tags, the
+// description, the readme, the maintainers, latest's repository and links, the newest versions with their checksums,
+// and npm's ETag for the packument it was cut from. Scores, dismissals, reviews and a version's state are apm's and
+// are read live on every view, so a new score or a dismissal shows at once. A package published on apm is never kept:
+// its page reads its rows, so a revoke shows at once.
+//
+// A summary holds the newest KEPT_VERSIONS versions by version number (the package answer's list), the newest
+// KEPT_VERSIONS by publish time and every dist-tag's target. A read it cannot answer exactly (an older version, the
+// version before one past its publish-time window) reads npm as before.
+//
+// How old a summary may be, and when npm is asked:
+//  - A summary younger than KEPT_PACKAGE_FRESH_MS is used as it is; one older is first checked against npm's ETag (a
+//    HEAD, no body) and used only when npm still sends the packument it was cut from.
+//  - Every read that shows a version's source or offers it (its score's evidence, its files and readme, the review)
+//    first asks npm for that version's document (a few KiB, kept for the TTL) and goes on from the summary only when
+//    npm still lists the version with the same checksums. A version npm removed is never shown from a summary.
+//  - When npm cannot be asked, or says anything else, the read goes to npm's packument as it did before summaries
+//    were kept, so it answers as it did then.
+//  - A summary older than KEPT_PACKAGE_REFRESH_MS that a view used is worked out again after the response
+//    (KeptRefresh), one refresh per package at a time, and the cron's sweep refreshes the ones asked about in the last
+//    day. A refresh asks for the ETag first and reads the packument only when it changed.
+//
+// Only a package apm stored an analysis of gets a row, one is at most KEPT_PACKAGE_MAX_BYTES of JSON, and the table
+// holds at most KEPT_PACKAGE_CAPACITY.
+import { Cause, Context, Effect, Exit, Option } from "effect";
+import semver from "semver";
+import { z } from "zod";
+import { Clock } from "./clock.ts";
+import { Store, type VersionRecord } from "./db.ts";
+import { digestOf } from "./digest.ts";
+import type { StoreError } from "./errors.ts";
+import { RequestMemory, type Lease } from "./memory.ts";
+import { newestFirst } from "./semver.ts";
+import { scoredPackage, Upstream, upstreamBlobKey, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing } from "./upstream.ts";
+
+/** Versions a summary keeps by version number, and again by publish time: the package answer lists the newest 200. */
+export const KEPT_VERSIONS = 200;
+
+/**
+ * The most JSON one summary may be; a package whose summary is larger (a huge readme) is not kept. next's is 77 KiB and
+ * react's 121 KiB, so a full table is about 100 MB and at most 256 MB.
+ */
+export const KEPT_PACKAGE_MAX_BYTES = 256 * 1024;
+
+/** Rows kept_packages holds at most: anyone can name any package, so this bounds the table however many are asked about. */
+export const KEPT_PACKAGE_CAPACITY = 1_000;
+
+/** A summary younger than this is used without asking npm whether its packument changed; an older one is checked first. */
+export const KEPT_PACKAGE_FRESH_MS = 5 * 60_000;
+
+/** A summary this old is worked out again: after a view that used it, or by the sweep. */
+export const KEPT_PACKAGE_REFRESH_MS = 3 * 60_000;
+
+/**
+ * How long the sweep waits after a refresh npm did not answer, doubled for each failure in a row, at most
+ * KEPT_PACKAGE_RETRY_MAX_MS: longer than the sweep's 10 minutes, so a failed one sits out the next sweep at least.
+ */
+export const KEPT_PACKAGE_RETRY_MS = 15 * 60_000;
+
+export const KEPT_PACKAGE_RETRY_MAX_MS = 6 * 60 * 60_000;
+
+/** A refresh claimed this long ago that wrote nothing (the platform stopped it) may be claimed again. */
+export const KEPT_PACKAGE_CLAIM_MS = 2 * 60_000;
+
+/** The sweep refreshes the summaries asked about in this window and drops the ones nobody asked about for KEPT_PACKAGE_DROP_MS. */
+export const KEPT_PACKAGE_ASKED_WINDOW_MS = 24 * 60 * 60_000;
+
+export const KEPT_PACKAGE_DROP_MS = 7 * 24 * 60 * 60_000;
+
+/** Summaries one sweep works out at most, one packument at a time. */
+export const KEPT_PACKAGE_REFRESH_LIMIT = 24;
+
+const KeptVersion = z.object({
+  version: z.string(),
+  seq: z.number().int(),
+  publishedAt: z.number(),
+  publishedBy: z.string(),
+  deprecated: z.string().nullable(),
+  integrity: z.string(),
+  shasum: z.string(),
+  tarball: z.string(),
+});
+
+/** latest's manifest fields the package answer reads (repositoryOf, linksOf), as npm wrote them. */
+const LatestLinks = z.object({ repository: z.unknown().optional(), homepage: z.unknown().optional(), bugs: z.unknown().optional() });
+
+export const KeptPackage = z.object({
+  name: z.string(),
+  distTags: z.record(z.string(), z.string()),
+  description: z.string(),
+  readme: z.string(),
+  maintainers: z.array(z.string()),
+  latest: LatestLinks,
+  /** Every version npm lists published at or after this is kept; null when every version is. */
+  completeSince: z.number().nullable(),
+  /** npm's ETag for the packument this was cut from; null when npm sent none, so it can never be revalidated. */
+  etag: z.string().nullable(),
+  /** In publish order. */
+  versions: z.array(KeptVersion),
+});
+
+export type KeptPackage = z.infer<typeof KeptPackage>;
+
+/** The summary of a package as npm lists it now; null when its JSON is more than KEPT_PACKAGE_MAX_BYTES as UTF-8. */
+export function summarize(pkg: CachedPackage): KeptPackage | null {
+  // pkg.versions is in publish order
+  const all = pkg.versions;
+  const cut = all.length > KEPT_VERSIONS ? (all[all.length - KEPT_VERSIONS]?.published_at ?? null) : null;
+  const byNumber = new Set(all.map((v) => v.version).toSorted(newestFirst).slice(0, KEPT_VERSIONS));
+  const tagged = new Set(Object.values(pkg.distTags));
+  const kept = all.filter((v) => cut === null || v.published_at >= cut || byNumber.has(v.version) || tagged.has(v.version));
+  const latest = all.find((v) => v.version === pkg.distTags.latest);
+
+  const summary: KeptPackage = {
+    name: pkg.name,
+    distTags: pkg.distTags,
+    description: pkg.description,
+    readme: pkg.readme,
+    maintainers: pkg.maintainers,
+    latest: latest ? { repository: latest.manifest.repository, homepage: latest.manifest.homepage, bugs: latest.manifest.bugs } : {},
+    completeSince: cut,
+    etag: pkg.etag,
+    versions: kept.map((v) => ({
+      version: v.version,
+      seq: v.seq,
+      publishedAt: v.published_at,
+      publishedBy: v.published_by,
+      deprecated: v.deprecated,
+      integrity: v.integrity,
+      shasum: v.shasum,
+      tarball: pkg.tarballs.get(v.version) ?? "",
+    })),
+  };
+
+  // bytes, not string length: a character outside ASCII is up to 3 bytes in UTF-8, and Postgres stores bytes
+  return new TextEncoder().encode(JSON.stringify(summary)).byteLength > KEPT_PACKAGE_MAX_BYTES ? null : summary;
+}
+
+/** latest's manifest as the summary has it: only the fields it kept, and only those npm set. */
+function latestManifest(links: z.infer<typeof LatestLinks>): VersionRecord["manifest"] {
+  return Object.fromEntries(Object.entries(links).filter(([, v]) => v !== undefined));
+}
+
+/**
+ * The summary as a cached package: only the versions it kept, each with no manifest but latest's links. Never served
+ * as a packument (installs read every version from npm); only the page reads in this file use it.
+ */
+export function expand(kept: KeptPackage): CachedPackage {
+  const versions = kept.versions.map((v): Omit<VersionRecord, "score"> => {
+    const digest = digestOf(v);
+
+    return {
+      package: kept.name,
+      version: v.version,
+      manifest: v.version === kept.distTags.latest ? latestManifest(kept.latest) : {},
+      shasum: v.shasum,
+      integrity: v.integrity,
+      size: 0,
+      tarball_key: digest ? upstreamBlobKey(digest) : "",
+      published_at: v.publishedAt,
+      seq: v.seq,
+      published_by: v.publishedBy,
+      deprecated: v.deprecated,
+      status: "active",
+      status_reason: null,
+      status_at: null,
+      status_by: null,
+    };
+  });
+
+  return {
+    name: kept.name,
+    distTags: kept.distTags,
+    description: kept.description,
+    readme: kept.readme,
+    maintainers: kept.maintainers,
+    versions,
+    tarballs: new Map(kept.versions.filter((v) => v.tarball !== "").map((v) => [v.version, v.tarball])),
+    serveCost: { versionDocs: 0, maxPieceChars: 0 },
+    etag: kept.etag,
+  };
+}
+
+/**
+ * What a page read needs of the package. "page": the package answer (latest and the newest versions). "version": one
+ * version, named exactly. "spec": a version or a dist-tag, an exact version first (the review answer). "history": the
+ * version a dist-tag names, else the version named (latest when none is), and the one published before it (the score
+ * answer's previous version).
+ */
+export type PageNeed = { kind: "page" } | { kind: "version"; version: string } | { kind: "spec"; spec: string } | { kind: "history"; spec: string | undefined };
+
+type KeptVersion = z.infer<typeof KeptVersion>;
+
+/** The dist-tag's target, own keys only. */
+const tagOf = (kept: KeptPackage, tag: string): string | undefined => (Object.hasOwn(kept.distTags, tag) ? kept.distTags[tag] : undefined);
+
+/**
+ * The version `need` names in `kept`, resolved as its route resolves it: latest for the package answer, an exact version
+ * first for the review answer, a dist-tag first for the score answer. Undefined when the summary does not hold it.
+ */
+function versionAsked(kept: KeptPackage, need: PageNeed): KeptVersion | undefined {
+  const has = (version: string | undefined) => (version === undefined ? undefined : kept.versions.find((v) => v.version === version));
+
+  switch (need.kind) {
+    case "page":
+      return has(tagOf(kept, "latest"));
+    case "version":
+      return has(need.version);
+    case "spec":
+      // npm's versions are all valid semver and its tags never are, so a spec that is not a version is a tag
+      return has(need.spec) ?? (semver.valid(need.spec) === null ? has(tagOf(kept, need.spec)) : undefined);
+    case "history":
+      return has(need.spec === undefined ? tagOf(kept, "latest") : (tagOf(kept, need.spec) ?? need.spec));
+    default: {
+      const _exhaustive: never = need;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** Whether `kept` answers `need` exactly as the whole packument would. */
+export function covers(kept: KeptPackage, need: PageNeed): boolean {
+  const v = versionAsked(kept, need);
+
+  switch (need.kind) {
+    case "page":
+      return true;
+    case "version":
+      return v !== undefined;
+    case "spec":
+      // a spec the summary does not hold is one only npm's packument can say anything about, unless it holds every version
+      return v !== undefined || kept.completeSince === null;
+    case "history":
+      // every version published at or after completeSince is kept, so the one before a later one is kept too
+      return v !== undefined && (kept.completeSince === null || v.publishedAt > kept.completeSince);
+    default: {
+      const _exhaustive: never = need;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** A kept row as a summary; null when there is none, or what is stored does not parse (it is then worked out again). */
+const keptRow = (name: string, at: number) =>
+  Effect.map(Effect.flatMap(Store, (s) => s.keptPackage({ name, at })), (row) => {
+    if (row === null) return null;
+    const parsed = KeptPackage.safeParse(row.summary);
+
+    return parsed.success && parsed.data.name === name ? { kept: parsed.data, computedAt: row.computedAt } : null;
+  });
+
+/** What a request holds of an expanded summary: each version's record and its scored copy. */
+const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECORD_WEIGHT + SCORED_WEIGHT);
+
+/**
+ * Keeps `pkg`'s summary when apm stored an analysis of any of its versions: the admission rule, so names nobody scored
+ * cost no row. Its summary is replaced when it is kept already.
+ */
+const keepScored = (pkg: CachedPackage, scored: boolean, at: number) =>
+  Effect.gen(function* () {
+    if (!scored) return;
+    const summary = summarize(pkg);
+
+    if (summary !== null) yield* (yield* Store).keepPackage({ name: pkg.name, summary, at, capacity: KEPT_PACKAGE_CAPACITY });
+  });
+
+type Kept = { kept: KeptPackage; computedAt: number };
+
+/**
+ * Works a kept summary out again after the response, on its own connection and memory lease (worker.ts). Absent
+ * outside a Worker request (the sweep, the queue, unit tests): their summaries wait for the sweep.
+ */
+export class KeptRefresh extends Context.Service<KeptRefresh, { readonly later: (name: string) => Effect.Effect<void> }>()("@apm/registry/KeptRefresh") {}
+
+/** When this isolate last handed each name to KeptRefresh, so a burst of views of one package starts one refresh. */
+const handedOff = new Map<string, number>();
+
+/** A refresh after the response when the summary a view used is older than KEPT_PACKAGE_REFRESH_MS. */
+const refreshIfOld = (name: string, row: Kept, at: number) =>
+  Effect.gen(function* () {
+    if (at - row.computedAt < KEPT_PACKAGE_REFRESH_MS) return;
+    const refresh = yield* Effect.serviceOption(KeptRefresh);
+    const wall = Date.now();
+
+    if (Option.isNone(refresh) || wall - (handedOff.get(name) ?? Number.NEGATIVE_INFINITY) < KEPT_PACKAGE_CLAIM_MS) return;
+
+    if (handedOff.size >= KEPT_PACKAGE_CAPACITY) handedOff.clear();
+    handedOff.set(name, wall);
+    yield* refresh.value.later(name);
+  });
+
+/**
+ * The kept row for `name` while npm still sends the packument it was cut from: as it is when younger than
+ * KEPT_PACKAGE_FRESH_MS, else once npm's ETag says the packument did not change (the row is then marked worked out
+ * now). "stale" when a row is there but npm changed the packument, has no such package (the row is then dropped) or
+ * could not be asked; "none" when there is no row.
+ */
+type Current = { kind: "current"; row: Kept } | { kind: "stale" } | { kind: "none" };
+
+const currentRow = (upstream: UpstreamApi, name: string, at: number) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const row = yield* keptRow(name, at);
+
+    if (row === null) return { kind: "none" } satisfies Current;
+
+    if (at - row.computedAt < KEPT_PACKAGE_FRESH_MS) {
+      yield* refreshIfOld(name, row, at);
+
+      return { kind: "current", row } satisfies Current;
+    }
+
+    const now = yield* upstream.etagOf(name);
+
+    if (now.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
+
+    if (now.kind !== "found" || now.etag === null || now.etag !== row.kept.etag) return { kind: "stale" } satisfies Current;
+    yield* store.touchKeptPackage({ name, at });
+
+    return { kind: "current", row: { kept: row.kept, computedAt: at } } satisfies Current;
+  });
+
+/**
+ * Whether npm still lists `v` exactly as the summary has it: the same tarball URL, integrity and shasum in its version
+ * document (not its packument). Any difference, a missing field included, is a no.
+ */
+const stillListed = (upstream: UpstreamApi, name: string, v: KeptVersion) =>
+  Effect.map(upstream.versionOf(name, v.version), (now) => now.kind === "found" && now.tarball === v.tarball && now.integrity === v.integrity && now.shasum === v.shasum);
+
+/** The version published before `v` as previousOf in apm.ts picks it from the summary: the last at or before it in publish order. */
+function previousKept(kept: KeptPackage, v: KeptVersion): KeptVersion | undefined {
+  return kept.versions.filter((x) => x.version !== v.version && x.publishedAt <= v.publishedAt).at(-1);
+}
+
+/**
+ * Every version a read of `need` would show or offer from `kept`: the one it names, and for the score answer the
+ * previous version it compares with. Null when the read cannot name the exact version (no latest tag, a version the
+ * summary does not hold): such a read is never answered from a summary.
+ */
+function versionsShown(kept: KeptPackage, need: PageNeed): KeptVersion[] | null {
+  const v = versionAsked(kept, need);
+
+  if (v === undefined) return null;
+  const prev = need.kind === "history" ? previousKept(kept, v) : undefined;
+
+  return prev === undefined ? [v] : [v, prev];
+}
+
+/** What keptFor found: a summary to answer from, or none, and whether a row was there (one a fallback should refresh). */
+type KeptAnswer = { kept: KeptPackage | null; hadRow: boolean };
+
+/**
+ * The kept summary a page's read of `need` may be answered from: current (currentRow), holding what `need` asks for,
+ * naming the exact versions it would show, and with npm still listing each of them as the summary has it. A null
+ * summary sends the read to npm's packument.
+ */
+const keptFor = (upstream: UpstreamApi, name: string, need: PageNeed) =>
+  Effect.gen(function* () {
+    const at = yield* (yield* Clock).now;
+    const current = yield* currentRow(upstream, name, at);
+
+    if (current.kind !== "current") return { kept: null, hadRow: current.kind === "stale" } satisfies KeptAnswer;
+    const { row } = current;
+    const shown = covers(row.kept, need) ? versionsShown(row.kept, need) : null;
+
+    if (shown === null) return { kept: null, hadRow: true } satisfies KeptAnswer;
+    const listed = yield* Effect.forEach(shown, (v) => stillListed(upstream, name, v), { concurrency: "unbounded" });
+
+    return { kept: listed.every(Boolean) ? row.kept : null, hadRow: true } satisfies KeptAnswer;
+  });
+
+/**
+ * Replaces a kept row with the summary of `pkg`, read from npm after the row could not answer: the next read uses it.
+ * Only a row already kept is replaced, so admission and the table's capacity hold; one too large is dropped.
+ */
+const refreshFrom = (pkg: CachedPackage) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const at = yield* (yield* Clock).now;
+    const summary = summarize(pkg);
+
+    if (summary === null) yield* store.dropKeptPackages({ kind: "name", name: pkg.name });
+    else yield* store.refreshKeptPackage({ name: pkg.name, summary, at });
+  });
+
+/**
+ * An upstream package for a page's read, with its scores: from the kept summary when keptFor allows it, else from
+ * npm (Upstream.probe) as before summaries were kept, whose answer is then kept.
+ */
+export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease }): Effect.Effect<Probe, StoreError, Store | Clock> =>
+  Effect.gen(function* () {
+    const { upstream, name, need, lease } = input;
+    const store = yield* Store;
+    const { kept } = yield* keptFor(upstream, name, need);
+
+    if (kept !== null) {
+      if (!lease.take(expandWeight(kept))) return { kind: "unknown" } satisfies Probe;
+
+      return scoredPackage(expand(kept), yield* store.upstreamAnalyses(name));
+    }
+
+    const probe = yield* upstream.probe(name, lease);
+
+    // a kept row is replaced with what npm sent (keepScored replaces as well as adds)
+    if (probe.kind === "found") yield* keepScored(probe.pkg, probe.pkg.versions.some((v) => v.score !== null), yield* (yield* Clock).now);
+
+    if (probe.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
+
+    return probe;
+  });
+
+/** Like pageProbe, without the scores (the review answer reads none): the kept summary, else Upstream.listing. */
+export const pageListing = (input: { upstream: UpstreamApi; name: string; need: PageNeed; lease: Lease }): Effect.Effect<UpstreamListing, StoreError, Store | Clock> =>
+  Effect.gen(function* () {
+    const { upstream, name, need, lease } = input;
+    const { kept, hadRow } = yield* keptFor(upstream, name, need);
+
+    if (kept !== null) return lease.take(expandWeight(kept)) ? { kind: "found", pkg: expand(kept) } : { kind: "unknown" };
+    const listed = yield* upstream.listing(name, lease);
+
+    yield* afterListing(name, listed, hadRow);
+
+    return listed;
+  });
+
+/** After a read went to npm because a kept row could not answer: the row is replaced with what npm sent, or dropped. */
+const afterListing = (name: string, listed: UpstreamListing, hadRow: boolean) =>
+  Effect.gen(function* () {
+    if (!hadRow) return;
+
+    if (listed.kind === "found") yield* refreshFrom(listed.pkg);
+
+    if (listed.kind === "absent") yield* (yield* Store).dropKeptPackages({ kind: "name", name });
+  });
+
+/**
+ * HEAD /-/apm/v1/packages/<name> for an upstream package: whether npm has it, from a current kept row (currentRow),
+ * else from npm's listing as before summaries were kept. A row that could not answer is replaced with that listing (or
+ * dropped when npm has no such package), so the next HEAD is answered from the row again instead of asking npm.
+ *
+ * Accepted (re-check of 1cbdc6c, finding 4): a row younger than KEPT_PACKAGE_FRESH_MS answers yes without asking npm,
+ * so for up to five minutes after npm removes the whole package this says it exists. It only decides whether the page
+ * renders: the page's version list may be five minutes stale anyway, and every read that shows or offers a version's
+ * source confirms that version with npm first (keptFor), so nothing of the removed package is shown.
+ */
+export const pageExists = (input: { upstream: UpstreamApi; name: string; lease: Lease }): Effect.Effect<UpstreamListing["kind"], StoreError, Store | Clock> =>
+  Effect.gen(function* () {
+    const { upstream, name, lease } = input;
+    const at = yield* (yield* Clock).now;
+
+    const current = yield* currentRow(upstream, name, at);
+
+    if (current.kind === "current") return "found";
+    const listed = yield* upstream.listing(name, lease);
+
+    yield* afterListing(name, listed, current.kind === "stale");
+
+    return listed.kind;
+  });
+
+/**
+ * Works one kept summary out again from npm when it is older than KEPT_PACKAGE_REFRESH_MS and no other refresh claimed
+ * it: the sweep's and a view's refresh. When npm's ETag is the summary's, it is only marked worked out now. A name now published on apm, or one npm no longer has, is dropped; one npm did
+ * not answer for keeps its summary. True when it was refreshed or dropped.
+ */
+export const refreshKeptPackage = (name: string): Effect.Effect<boolean, StoreError, Store | Clock | RequestMemory> =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const found = yield* Effect.serviceOption(Upstream);
+    const at = yield* (yield* Clock).now;
+
+    if (Option.isNone(found)) return false;
+
+    if (yield* store.getPackage(name)) {
+      yield* store.dropKeptPackages({ kind: "name", name });
+
+      return true;
+    }
+
+    const claim = yield* store.claimKeptRefresh({ name, at, computedBefore: at - KEPT_PACKAGE_REFRESH_MS, claimedBefore: at - KEPT_PACKAGE_CLAIM_MS });
+
+    if (claim === null) return false;
+    // npm's ETag first: an unchanged packument needs no read
+    const now = yield* found.value.etagOf(name);
+
+    if (now.kind === "found" && now.etag !== null && now.etag === claim.etag) {
+      yield* store.touchKeptPackage({ name, at });
+
+      return true;
+    }
+
+    // under a child lease, given back once the summary is cut from the package
+    const lease = (yield* RequestMemory).child();
+
+    const listed = yield* found.value.listing(name, lease).pipe(
+      Effect.map((l) => (l.kind === "found" ? { kind: "found" as const, summary: summarize(l.pkg) } : l)),
+      Effect.ensuring(Effect.sync(() => lease.release())),
+    );
+
+    switch (listed.kind) {
+      case "found":
+        if (listed.summary === null) yield* store.dropKeptPackages({ kind: "name", name });
+        else yield* store.refreshKeptPackage({ name, summary: listed.summary, at });
+
+        return true;
+      case "absent":
+        yield* store.dropKeptPackages({ kind: "name", name });
+
+        return true;
+      case "unknown":
+        // the sweep moves on to other summaries until this one is due again
+        yield* store.failKeptRefresh({ name, at, retryMs: KEPT_PACKAGE_RETRY_MS, maxRetryMs: KEPT_PACKAGE_RETRY_MAX_MS });
+
+        return false;
+      default: {
+        const _exhaustive: never = listed;
+
+        return _exhaustive;
+      }
+    }
+  });
+
+/** refreshKeptPackage, with a failure logged instead of failing. */
+export const runRefresh = (name: string): Effect.Effect<boolean, never, Store | Clock | RequestMemory> =>
+  refreshKeptPackage(name).pipe(
+    Effect.exit,
+    Effect.map((exit) => {
+      if (Exit.isSuccess(exit)) return exit.value;
+      console.error(JSON.stringify({ level: "error", event: "kept-package-refresh", name, error: Cause.pretty(exit.cause) }));
+
+      return false;
+    }),
+  );
+
+/**
+ * The cron's part: drops summaries nobody asked about for a week, then works out again the ones asked about in the last
+ * day that are older than KEPT_PACKAGE_REFRESH_MS, oldest first and one at a time, skipping ones whose last refresh
+ * failed until their retry is due. Returns how many it refreshed.
+ */
+export const refreshKeptPackages = Effect.gen(function* () {
+  const store = yield* Store;
+  const at = yield* (yield* Clock).now;
+
+  yield* store.dropKeptPackages({ kind: "asked-before", askedBefore: at - KEPT_PACKAGE_DROP_MS });
+  const names = yield* store.keptPackagesToRefresh({ askedSince: at - KEPT_PACKAGE_ASKED_WINDOW_MS, computedBefore: at - KEPT_PACKAGE_REFRESH_MS, at, limit: KEPT_PACKAGE_REFRESH_LIMIT });
+  const refreshed = yield* Effect.forEach(names, (name) => runRefresh(name), { concurrency: 1 });
+
+  return refreshed.filter(Boolean).length;
+});

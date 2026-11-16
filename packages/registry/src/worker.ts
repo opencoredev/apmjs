@@ -6,6 +6,7 @@ import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
 import { matureRevocations, refreshLatestScores } from "./apm.ts";
+import { KeptRefresh, refreshKeptPackages, runRefresh } from "./kept-package.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
@@ -203,6 +204,13 @@ export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis 
  * (memory.ts) live as long as the request.
  */
 export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, faults: ReadonlySet<StoreFault> = new Set()) {
+  const run = runServices(env, settings, clock, background, faults);
+
+  return background === null || settings.upstreamUrl === null ? run : Layer.merge(run, keptRefresh(env, settings, clock, background));
+}
+
+/** servicesFor without KeptRefresh: what a refresh after the response runs on. */
+function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, faults: ReadonlySet<StoreFault>) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
   const core = Layer.mergeAll(Store.postgres(databaseUrl, faults), Blobs.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
@@ -217,6 +225,28 @@ export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: L
   // one lease of the isolate's memory pool for the run (a request, a queue job, the sweep): every read of npm's
   // package metadata it makes takes from it, and a streamed answer keeps it until the last byte is sent
   return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl }), withScoring), RequestMemory.layer(ISOLATE_POOL));
+}
+
+/**
+ * A kept package summary worked out again after the response (kept-package.ts), on services of its own: the request's
+ * connection and memory lease close with the request.
+ */
+function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void) {
+  return Layer.succeed(
+    KeptRefresh,
+    KeptRefresh.of({
+      later: (name) =>
+        Effect.sync(() =>
+          background(
+            // with the request's background, so the AI review still looks at the packument npm sent (reviewHooks), as
+            // it does after a view that read it; without KeptRefresh, so a refresh starts no other
+            Effect.runPromiseExit(runRefresh(name).pipe(Effect.provide(runServices(env, settings, clock, background, new Set())), Effect.scoped)).then((exit) => {
+              if (Exit.isFailure(exit)) logFailure("kept-package-refresh", { name }, Cause.pretty(exit.cause));
+            }),
+          ),
+        ),
+    }),
+  );
 }
 
 type LogFields = Readonly<Record<string, string | number | boolean | null>>;
@@ -332,7 +362,15 @@ const recoverAnalyses = Effect.flatMap(Analysis, (a) => a.recover).pipe(
   Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "analysis-recover", requeued: n }))) : Effect.void)),
 );
 
-/** Works the kept popular-scores answers out again (apm.ts), last: it reads whole packuments, the slowest part. */
+/** Works the kept package summaries out again (kept-package.ts): it reads whole packuments, so it runs late. */
+const refreshPages = refreshKeptPackages.pipe(
+  Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "kept-package-refresh", refreshed: n }))) : Effect.void)),
+);
+
+/**
+ * Works the kept popular-scores answers out again (apm.ts), last: it reads whole packuments, the slowest part. A
+ * package refreshPages just read is in the isolate's cache.
+ */
 const refreshPopular = refreshLatestScores.pipe(
   Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "latest-score-refresh", refreshed: n }))) : Effect.void)),
 );
@@ -343,7 +381,7 @@ export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.sy
   const settings = settingsOf(env, env.APM_REGISTRY_URL ?? "http://localhost/");
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([matureRevocations, sweepStaged, sweepConfirmations, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

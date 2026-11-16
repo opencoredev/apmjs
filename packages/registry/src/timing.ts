@@ -1,8 +1,9 @@
 // Where one request's time went, sent as a Server-Timing header on the read answers the website's package page makes
 // (worker.ts). Each metric adds up the time its operations took and counts them: "db" is every Postgres query (the
 // first one includes connecting through Hyperdrive), "npm" a packument fetched from npm, "npm-cache" one read from the
-// data center's cache, "analysis" an upstream version scored on read. A Worker's clock moves only on I/O, so these are
-// waits, and CPU work (parsing a packument, scoring) shows only as the gap before `total`. Optional everywhere: tests
+// data center's cache, "npm-head" a packument's ETag asked for with no body, "npm-version" one version's document
+// (a few KiB), "analysis" an upstream version scored on read. A Worker's clock moves only on I/O, so these are waits,
+// and CPU work (parsing a packument, scoring) shows only as the gap before `total`. Optional everywhere: tests
 // and the queue consumer run without it.
 //
 // Only a request whose x-apm-debug header is the operator's debug token (worker.ts, APM_DEBUG_TOKEN_HASH) gets the
@@ -10,7 +11,7 @@
 // which tells what others asked for.
 import { Context, Effect, Option } from "effect";
 
-export type TimingMetric = "db" | "npm" | "npm-cache" | "analysis";
+export type TimingMetric = "db" | "npm" | "npm-cache" | "npm-head" | "npm-version" | "analysis";
 
 /** "none": no header. "full": every metric with its count. */
 export type TimingDetail = "none" | "full";

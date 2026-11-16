@@ -83,6 +83,7 @@ import {
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM } from "./resolve-wait.ts";
 import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
+import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import { Upstream, type Summarized, type UpstreamPackage } from "./upstream.ts";
 import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
@@ -199,22 +200,6 @@ type Source =
 const localSource = (pkg: PackageRecord, versions: VersionRecord[]): Source => ({ kind: "local", name: pkg.name, distTags: pkg.distTags, versions, pkg });
 const upstreamSource = (pkg: UpstreamPackage): Source => ({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions, pkg });
 
-/** A package's catalog, here or upstream; an upstream one is read under `lease` (memory.ts) and held until it closes. */
-const lookup = (name: string, lease: Lease) =>
-  Effect.gen(function* () {
-    const pkg = yield* (yield* Store).getPackage(name);
-
-    if (pkg) return localSource(pkg, yield* versionsOf(name));
-    const upstream = yield* upstreamOrNull;
-
-    if (!upstream) return null;
-    const up = yield* upstream.get(name, lease);
-
-    if (!up) return null;
-
-    return upstreamSource(up);
-  });
-
 /**
  * The package metadata one request holds at most (a resolve walk, a scan, or the packument route's two reads), as
  * weight: an upper bound on its heap (packument-read.ts, WEIGHTS), every read in flight and each parse's moment
@@ -239,6 +224,25 @@ const briefly = <A, E, R>(use: (lease: Lease) => Effect.Effect<A, E, R>) =>
     const child = (yield* RequestMemory).child();
 
     return yield* use(child).pipe(Effect.ensuring(Effect.sync(() => child.release())));
+  });
+
+/**
+ * A package's catalog for a page's read of `need`, here or upstream. An upstream one comes from its kept summary when
+ * that answers `need` (kept-package.ts), else from npm's packument, read under `lease` (memory.ts) and held until it
+ * closes; null when npm has no such package or could not be asked. A package published on apm is read from its rows.
+ */
+const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
+  Effect.gen(function* () {
+    const pkg = yield* (yield* Store).getPackage(name);
+
+    if (pkg) return localSource(pkg, yield* versionsOf(name));
+
+    const upstream = yield* upstreamOrNull;
+
+    if (!upstream) return null;
+    const probe = yield* pageProbe({ upstream, name, need, lease });
+
+    return probe.kind === "found" ? upstreamSource(probe.pkg) : null;
   });
 
 /** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
@@ -1310,7 +1314,7 @@ const packageResponse = (name: string) =>
     const store = yield* Store;
     const at = yield* now;
     const lease = yield* RequestMemory;
-    const src = yield* lookup(name, lease);
+    const src = yield* pageLookup(name, lease, { kind: "page" });
 
     if (!src) return fail(404, "Not found");
 
@@ -1373,8 +1377,9 @@ const packageResponse = (name: string) =>
 
 /**
  * HEAD /-/apm/v1/packages/<name>: whether the registry knows the package, here or upstream, with no body. The website
- * asks before a package page renders. It reads the package row or npm's packument and nothing else: no answer is
- * built, no version is analysed and no score is read. 503 when npm could not be asked.
+ * asks before a package page renders. It reads the package row, the package's kept summary (kept-package.ts) or npm's
+ * packument and nothing else: no answer is built, no version is analysed and no score is read. 503 when npm could not
+ * be asked.
  */
 const packageExists = (path: string) =>
   Effect.gen(function* () {
@@ -1386,12 +1391,14 @@ const packageExists = (path: string) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return new Response(null, { status: 404 });
-    // the listing alone: whether npm has the name needs neither apm's scores nor its dismissals
-    const listed = yield* upstream.listing(sp.name, yield* RequestMemory);
 
-    if (listed.kind === "unknown") return new Response(null, { status: 503 });
+    // a current kept summary, else the listing alone: whether npm has the name needs neither apm's scores nor its
+    // dismissals (kept-package.ts)
+    const listed = yield* pageExists({ upstream, name: sp.name, lease: yield* RequestMemory });
 
-    return new Response(null, { status: listed.kind === "absent" ? 404 : 200 });
+    if (listed === "unknown") return new Response(null, { status: 503 });
+
+    return new Response(null, { status: listed === "absent" ? 404 : 200 });
   });
 
 /**
@@ -1402,7 +1409,7 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = yield* lookup(name, yield* RequestMemory);
+    const src = yield* pageLookup(name, yield* RequestMemory, { kind: "version", version });
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
@@ -3626,7 +3633,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(`/${rest.slice("score/".length)}`);
 
       if (!sp) return fail(404, "Not found");
-      const src = yield* lookup(sp.name, yield* RequestMemory);
+      const src = yield* pageLookup(sp.name, yield* RequestMemory, { kind: "history", spec: sp.rest[0] });
 
       if (!src) return fail(404, "Not found");
       const spec = sp.rest[0];

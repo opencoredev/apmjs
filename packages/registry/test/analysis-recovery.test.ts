@@ -113,7 +113,7 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
 
     if (failing.includes(name)) v.manifest = throwingManifest(name);
 
-    return { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
+    return { name, distTags: { latest: "1.0.0" }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: null };
   };
 
   const probeOf = (name: string): Probe => {
@@ -152,6 +152,8 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       // no tarball route runs in this file
       serve: () => Effect.succeed({ kind: "absent" }),
       advisories: () => Effect.succeed({ kind: "unavailable" }),
+      etagOf: () => Effect.succeed({ kind: "unknown" }),
+      versionOf: () => Effect.succeed({ kind: "unknown" }),
     }),
   );
 

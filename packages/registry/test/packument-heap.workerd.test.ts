@@ -143,7 +143,7 @@ export default {
         yield '},"time":{' + Array.from({ length: count }, (_, i) => '"1.0.' + i + '":"2020-01-01T00:00:00.000Z"').join(",") + "}}";
       }, 65536), { lease: free() });
       const body = await measure(env);
-      let pkg = cachedPackage("p", r.body, { versionDocs: r.versionDocs, maxPieceChars: r.maxPieceChars });
+      let pkg = cachedPackage("p", r.body, { versionDocs: r.versionDocs, maxPieceChars: r.maxPieceChars }, null);
       const both = await measure(env);
       const read = { weight: r.weight, versionCount: r.versionCount, versionDocs: r.versionDocs };
       r = null;

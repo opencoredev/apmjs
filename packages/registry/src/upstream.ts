@@ -56,6 +56,8 @@ export type UpstreamPackage = {
   /** original tarball URL per version */
   tarballs: Map<string, string>;
   serveCost: ServeCost;
+  /** npm's ETag for the packument this was read from; null when npm sent none, or it was not read from npm. */
+  etag: string | null;
 };
 
 /** "unknown" means the upstream could not be asked; it is never treated as "absent". */
@@ -172,7 +174,7 @@ export type UpstreamListing = CachedProbe | { kind: "unknown" };
  * The package apm caches, read from the packument readPackument kept: each version npm lists with a valid document,
  * in publish order. Null when the packument is not one.
  */
-export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost): CachedPackage | null {
+export function cachedPackage(name: string, body: KeptPackument, serveCost: ServeCost, etag: string | null): CachedPackage | null {
   const parsed = UpPackument.safeParse(body);
 
   if (!parsed.success) return null;
@@ -221,6 +223,7 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
     versions: ordered,
     tarballs,
     serveCost,
+    etag,
   };
 }
 
@@ -380,7 +383,28 @@ export class IsolateCache<V> {
 type Caches = {
   searches: IsolateCache<Extract<UpstreamSearch, { kind: "ok" }>>;
   scopes: IsolateCache<"found" | "absent">;
+  /** Version documents by "<name>@<version>": what versionOf answered, found or absent. */
+  versions: IsolateCache<Exclude<UpstreamVersion, { kind: "unknown" }>>;
+  /**
+   * Packages npm just failed a small read for (a version document or a packument HEAD: an error status, a body apm
+   * cannot read, a timeout), kept for NPM_FAILURE_MS: neither is asked for again meanwhile, so each read goes straight
+   * to the packument as it did before summaries were kept, instead of waiting on npm once more first.
+   */
+  failures: IsolateCache<true>;
 };
+
+/**
+ * How long a failed version document or packument HEAD is remembered (at most the upstream TTL): a short outage costs
+ * each package one failed request per isolate in this window, not one on every read.
+ */
+export const NPM_FAILURE_MS = 30_000;
+
+/**
+ * The longest a version document or a packument HEAD may take. Both are a few KiB or no body: npm answered a version
+ * document in 0.15 s warm and 1.1 s from a cold edge when checked, so 2 s leaves room for that, and a stalled npm adds
+ * at most 2 s to one read per package per NPM_FAILURE_MS (the rest go straight to the packument).
+ */
+export const NPM_SMALL_READ_TIMEOUT_MS = 2_000;
 
 const isolateCaches = new Map<string, Caches>();
 
@@ -389,7 +413,7 @@ function cachesFor(baseUrl: string, ttlMs: number): Caches {
   const known = isolateCaches.get(key);
 
   if (known) return known;
-  const made: Caches = { searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs) };
+  const made: Caches = { searches: new IsolateCache(ttlMs), scopes: new IsolateCache(ttlMs), versions: new IsolateCache(ttlMs), failures: new IsolateCache(Math.min(ttlMs, NPM_FAILURE_MS)) };
   isolateCaches.set(key, made);
 
   return made;
@@ -424,6 +448,20 @@ const SHARED_MIN_TTL_MS = 1_000;
 /** When npm sent a shared packument (ms since the epoch): its TTL counts from then, in every isolate that reads it. */
 export const FETCHED_AT_HEADER = "x-apm-fetched-at";
 
+/** npm's ETag for a shared packument, so a copy read from the data center's cache can be revalidated as npm's own. */
+const ETAG_HEADER = "x-apm-npm-etag";
+
+/** What npm says of a package's packument now, without its body: its ETag (null when it sends none). */
+export type UpstreamEtag = { kind: "found"; etag: string | null } | { kind: "absent" } | { kind: "unknown" };
+
+/** What npm says of one version now, from its version document: its tarball's URL and the checksums npm publishes for it ("" when absent). */
+export type UpstreamVersion = { kind: "found"; tarball: string; integrity: string; shasum: string } | { kind: "absent" } | { kind: "unknown" };
+
+/** A version document is a few KiB; one past this is not read. */
+const MAX_VERSION_DOC_BYTES = 1024 * 1024;
+
+const VersionDist = z.object({ dist: z.object({ tarball: z.string().optional(), integrity: z.string().optional(), shasum: z.string().optional() }).loose() }).loose();
+
 /** The data center's cache. Call it only inside a Worker request: Bun (the unit tests) has no `caches`. */
 const workerCache = (): Cache => caches.default;
 
@@ -442,7 +480,7 @@ export const packumentKey = (url: string, profile: KeepProfile = TRIMMED): Reque
  * "over-budget": the lease had no room for it.
  */
 type PackumentAnswer =
-  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean }
+  | { kind: "ok"; body: KeptPackument; fetchedAt: number; read: Extract<PackumentRead, { kind: "ok" }>; fresh: boolean; etag: string | null }
   | { kind: "status"; status: number; fetchedAt: number }
   | { kind: "refused"; fetchedAt: number }
   | { kind: "over-budget" };
@@ -466,6 +504,10 @@ export type UpstreamApi = {
   readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
+  /** npm's ETag for the package's packument now, from a HEAD: whether a packument read earlier is still current. */
+  readonly etagOf: (name: string) => Effect.Effect<UpstreamEtag>;
+  /** One version's document (a few KiB): whether npm still lists the version, and its checksums. Kept for the TTL. */
+  readonly versionOf: (name: string, version: string) => Effect.Effect<UpstreamVersion>;
   /**
    * probe for several names: their packuments (from cache or npm, a few at once) and one read of their analyses. Every
    * packument kept counts against `lease`, cached ones included, and a name past it is "over-budget".
@@ -729,8 +771,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           );
 
         /** A packument read as an answer. One it refused is logged; one past the request's lease is not an error. */
-        const answerOf = (url: string, read: PackumentRead, fetchedAt: number, fresh: boolean): PackumentAnswer => {
-          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh };
+        const answerOf = (input: { url: string; read: PackumentRead; fetchedAt: number; fresh: boolean; etag: string | null }): PackumentAnswer => {
+          const { url, read, fetchedAt, fresh, etag } = input;
+
+          if (read.kind === "ok") return { kind: "ok", body: read.body, fetchedAt, read, fresh, etag };
 
           if (read.kind === "too-large" && read.over === "budget") return { kind: "over-budget" };
           const detail = read.kind === "too-large" ? { over: read.over, bytes: read.bytes, limit: read.limit } : { reason: read.reason };
@@ -762,7 +806,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const read = await readPackument(hit.body, { profile, lease, signal: interrupted });
               timing?.add("npm-cache", performance.now() - cacheStart);
 
-              return answerOf(url, read, sentAt, false);
+              return answerOf({ url, read, fetchedAt: sentAt, fresh: false, etag: hit.headers.get(ETAG_HEADER) });
             }
 
             await hit?.body?.cancel();
@@ -780,7 +824,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const read = await readPackument(res.body, { profile, lease, signal });
             timing?.add("npm", performance.now() - npmStart);
 
-            return answerOf(url, read, now, true);
+            return answerOf({ url, read, fetchedAt: now, fresh: true, etag: res.headers.get("etag") });
           });
 
         /**
@@ -790,7 +834,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * settles or is stopped (SHARE_TIMEOUT_MS, or its lease's deadline). Nothing is written when that does not
          * fit (review of 6862fc7, finding 3).
          */
-        const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool }): void => {
+        const shareCopy = (input: { url: string; profile: KeepProfile; fetchedAt: number; body: KeptPackument; maxPieceChars: number; block: Block; pool: MemoryPool; etag: string | null }): void => {
           if (!sharing || background === null) return;
           const work = input.pool.backgroundLease();
 
@@ -801,7 +845,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           }
 
           const done = (): void => work.release();
-          const headers = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt) };
+          const base = { "content-type": "application/json", "cache-control": `public, max-age=${Math.floor(ttlMs / 1000)}`, [FETCHED_AT_HEADER]: String(input.fetchedAt) };
+          const headers = input.etag === null ? base : { ...base, [ETAG_HEADER]: input.etag };
           // stopped at SHARE_TIMEOUT_MS, or at the lease's deadline: the stream then drops the package, and only that
           // lets the lease go before the put settles
           const signal = AbortSignal.any([work.signal, AbortSignal.timeout(SHARE_TIMEOUT_MS)]);
@@ -893,7 +938,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return { kind: "over-budget" as const };
             }
 
-            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars });
+            const pkg = cachedPackage(name, answer.body, { versionDocs: read.versionDocs, maxPieceChars: read.maxPieceChars }, answer.etag);
             lease.give(moment);
 
             if (!pkg) {
@@ -905,7 +950,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             const block = lease.seal(packageWeight(read));
 
-            if (answer.fresh) shareCopy({ url, profile: TRIMMED, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool });
+            if (answer.fresh) shareCopy({ url, profile: TRIMMED, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
             const fresh: CachedProbe = { kind: "found", pkg };
             // the TTL counts from when npm answered, which for a shared copy is before this request; a big packument
             // takes room from older ones (PROBE_CACHE_WEIGHT)
@@ -1061,7 +1106,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             if (answer.fresh) {
               const block = lease.seal(read.weight + moment);
-              shareCopy({ url, profile: DEV_DEPENDENCIES, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool });
+              shareCopy({ url, profile: DEV_DEPENDENCIES, fetchedAt: answer.fetchedAt, body: answer.body, maxPieceChars: read.maxPieceChars, block, pool: lease.pool, etag: answer.etag });
             }
 
             return { byVersion, maxPieceChars: read.maxPieceChars };
@@ -1110,6 +1155,77 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           probe,
           probeWithin,
           listing,
+          etagOf: (name) =>
+            Effect.gen(function* () {
+              const t = yield* now;
+
+              // npm just failed a small read for this package: no HEAD now, the caller reads the packument
+              if (caches.failures.get(name, t) !== undefined) return { kind: "unknown" } satisfies UpstreamEtag;
+
+              const got = yield* Effect.promise(async (): Promise<UpstreamEtag> => {
+                const start = performance.now();
+
+                try {
+                  const res = await fetch(`${baseUrl}${encodeName(name)}`, { method: "HEAD", headers: { accept: "application/json" }, signal: AbortSignal.timeout(NPM_SMALL_READ_TIMEOUT_MS) });
+
+                  await res.body?.cancel();
+
+                  if (res.status === 404) return { kind: "absent" };
+
+                  return res.status === 200 ? { kind: "found", etag: res.headers.get("etag") } : { kind: "unknown" };
+                } catch {
+                  return { kind: "unknown" };
+                } finally {
+                  timing?.add("npm-head", performance.now() - start);
+                }
+              });
+
+              if (got.kind === "unknown") caches.failures.set(name, true, t);
+
+              return got;
+            }),
+          versionOf: (name, version) =>
+            Effect.gen(function* () {
+              const key = `${name}@${version}`;
+              const t = yield* now;
+              const hit = caches.versions.get(key, t);
+
+              if (hit !== undefined) return hit;
+
+              // npm just failed a small read for this package: not asked again, the caller reads the packument
+              if (caches.failures.get(name, t) !== undefined) return { kind: "unknown" } satisfies UpstreamVersion;
+
+              const got = yield* Effect.promise(async (): Promise<UpstreamVersion> => {
+                const start = performance.now();
+
+                try {
+                  const res = await fetch(`${baseUrl}${encodeName(name)}/${encodeURIComponent(version)}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(NPM_SMALL_READ_TIMEOUT_MS) });
+
+                  if (res.status !== 200) {
+                    await res.body?.cancel();
+
+                    return res.status === 404 ? { kind: "absent" } : { kind: "unknown" };
+                  }
+
+                  const bytes = await readCapped(res, MAX_VERSION_DOC_BYTES);
+                  const doc = bytes === null ? null : VersionDist.safeParse(JSON.parse(new TextDecoder().decode(bytes)));
+
+                  if (!doc?.success) return { kind: "unknown" };
+                  const { dist } = doc.data;
+
+                  return { kind: "found", tarball: dist.tarball ?? "", integrity: dist.integrity ?? "", shasum: dist.shasum ?? "" };
+                } catch {
+                  return { kind: "unknown" };
+                } finally {
+                  timing?.add("npm-version", performance.now() - start);
+                }
+              });
+
+              if (got.kind === "unknown") caches.failures.set(name, true, t);
+              else caches.versions.set(key, got, t);
+
+              return got;
+            }),
           probeMany,
           summaries,
           devDependencies,

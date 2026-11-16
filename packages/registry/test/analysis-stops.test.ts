@@ -90,7 +90,7 @@ function pkg(): UpstreamPackage {
     score: null,
   };
 
-  return { name: JOB.name, distTags: { latest: JOB.version }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
+  return { name: JOB.name, distTags: { latest: JOB.version }, description: "", readme: "", maintainers: [], versions: [v], tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: null };
 }
 
 const STUB: UpstreamApi = {
@@ -117,6 +117,8 @@ const STUB: UpstreamApi = {
     // no tarball route runs in this file
     serve: () => Effect.succeed({ kind: "absent" }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
+    etagOf: () => Effect.succeed({ kind: "unknown" }),
+    versionOf: () => Effect.succeed({ kind: "unknown" }),
 };
 
 const upstream = Layer.succeed(Upstream, Upstream.of(STUB));

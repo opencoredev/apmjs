@@ -361,7 +361,7 @@ export function reviewSummary(pkg: Pick<UpstreamPackage, "name" | "distTags"> & 
   const versions = keptVersions(pkg.versions, head.weight, reserve, (v) => reserved(reserve, versionAllowance(v, REVIEW_MANIFEST_FIELDS), () => summaryVersion({ ...v, score: null }, REVIEW_MANIFEST_FIELDS)));
 
   if (versions === null) return null;
-  const summary: UpstreamPackage = { name: pkg.name, distTags: pkg.distTags, description: "", readme: "", maintainers: [], versions: versions.summary, tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 } };
+  const summary: UpstreamPackage = { name: pkg.name, distTags: pkg.distTags, description: "", readme: "", maintainers: [], versions: versions.summary, tarballs: new Map(), serveCost: { versionDocs: 0, maxPieceChars: 0 }, etag: null };
 
   return { summary, weight: versions.weight };
 }

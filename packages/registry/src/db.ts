@@ -39,6 +39,11 @@ const KeptLatestScoreRow = z
     computedAt: r.computed_at,
   }));
 
+/** A kept_packages row: the summary as stored (kept-package.ts parses it) and when it was worked out. */
+const KeptPackageRow = z.object({ summary: z.unknown(), computed_at: Int }).transform((r) => ({ summary: r.summary, computedAt: r.computed_at }));
+
+export type KeptPackageRow = z.output<typeof KeptPackageRow>;
+
 /** A kept answer is marked asked about at most this often, so a busy home page writes once an hour per name. */
 const LATEST_SCORE_ASKED_MARK_MS = 60 * 60_000;
 const JsonObject = z.record(z.string(), z.unknown());
@@ -316,6 +321,9 @@ const STAGED_INSERT_LOCK = 0x617_06d_5747;
 // Serializes new latest_scores rows so two at once cannot both pass the capacity check (new rows are rare: a package's first ask).
 const LATEST_SCORE_INSERT_LOCK = 0x617_06d_4c53;
 
+// Serializes new kept_packages rows the same way (a package's first view after apm scored it).
+const KEPT_PACKAGE_INSERT_LOCK = 0x617_06d_4b50;
+
 // The first key of the two-key advisory locks on blob keys ("blob"); the second is the key's hash. Two-key
 // advisory locks never conflict with one-key ones such as STAGED_INSERT_LOCK.
 const BLOB_LOCK_CLASS = 0x626c_6f62;
@@ -476,6 +484,38 @@ export type StoreApi = {
   readonly latestScoresToRefresh: (input: { askedSince: number; computedBefore: number; limit: number }) => Effect.Effect<string[], StoreError>;
   /** Drops kept answers last asked about before `askedBefore`, or the one for `name`. */
   readonly dropLatestScores: (input: { kind: "asked-before"; askedBefore: number } | { kind: "name"; name: string }) => Effect.Effect<void, StoreError>;
+  /**
+   * The kept page summary of an upstream package (migration 0020) and when it was worked out, never one for a package
+   * published on apm. Marks it asked about at `at`, at most once an hour, so the sweep keeps refreshing it. The summary
+   * is as stored: kept-package.ts parses it.
+   */
+  readonly keptPackage: (input: { name: string; at: number }) => Effect.Effect<KeptPackageRow | null, StoreError>;
+  /**
+   * Keeps a summary worked out at `at` for a name asked about at `at`. A kept one is replaced; a new row is added only
+   * while the table holds fewer than `capacity`. Which names may have a row is the caller's call (kept-package.ts).
+   */
+  readonly keepPackage: (input: { name: string; summary: unknown; at: number; capacity: number }) => Effect.Effect<void, StoreError>;
+  /** Replaces a kept summary with one the sweep worked out at `at`; when it was asked about stays as it was. */
+  readonly refreshKeptPackage: (input: { name: string; summary: unknown; at: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * Claims the refresh of a kept summary worked out before `computedBefore` that no refresh claimed since
+   * `claimedBefore`. The summary's npm ETag when this caller should refresh it; null when it should not.
+   */
+  readonly claimKeptRefresh: (input: { name: string; at: number; computedBefore: number; claimedBefore: number }) => Effect.Effect<{ etag: string | null } | null, StoreError>;
+  /** Marks a kept summary worked out at `at` as it is: npm still sends the packument it was cut from. */
+  readonly touchKeptPackage: (input: { name: string; at: number }) => Effect.Effect<void, StoreError>;
+  /**
+   * Kept summaries asked about at or after `askedSince`, worked out before `computedBefore` and due again at `at` (no
+   * failed refresh holds them back), oldest first.
+   */
+  readonly keptPackagesToRefresh: (input: { askedSince: number; computedBefore: number; at: number; limit: number }) => Effect.Effect<string[], StoreError>;
+  /**
+   * Records a refresh npm did not answer: the next waits `retryMs` doubled for each failure in a row before it, at most
+   * `maxRetryMs`. A refresh that succeeds clears it.
+   */
+  readonly failKeptRefresh: (input: { name: string; at: number; retryMs: number; maxRetryMs: number }) => Effect.Effect<void, StoreError>;
+  /** Drops kept summaries last asked about before `askedBefore`, or the one for `name`. */
+  readonly dropKeptPackages: (input: { kind: "asked-before"; askedBefore: number } | { kind: "name"; name: string }) => Effect.Effect<void, StoreError>;
   /**
    * For display where the tarball digest is not known (search hits): each version's newest current-scorer analysis,
    * keyed `"<name> <version>"`, in one query however many versions are asked for.
@@ -1120,6 +1160,80 @@ const make = (faults: ReadonlySet<StoreFault>) => Effect.gen(function* () {
       which.kind === "name"
         ? run("dropLatestScores", sql`DELETE FROM latest_scores WHERE package = ${which.name}`, none)
         : run("dropLatestScores", sql`DELETE FROM latest_scores WHERE asked_at < ${which.askedBefore}`, none),
+    keptPackage: ({ name, at }) =>
+      run(
+        "keptPackage",
+        // the CTE's update runs whether or not the select reads it; the select sees the row as it was
+        sql`WITH asked AS (
+              UPDATE kept_packages SET asked_at = ${at} WHERE package = ${name} AND asked_at < ${at - LATEST_SCORE_ASKED_MARK_MS}
+            )
+            SELECT k.summary, k.computed_at FROM kept_packages k
+             WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM packages p WHERE p.name = k.package)`,
+        one(KeptPackageRow),
+      ),
+    keepPackage: ({ name, summary, at, capacity }) =>
+      Effect.gen(function* () {
+        const json = storableJson(JSON.stringify(summary));
+
+        const replaced = yield* run(
+          "keepPackage: replace",
+          sql`UPDATE kept_packages SET summary = ${json}::jsonb, computed_at = ${at}, asked_at = ${at}, failures = 0, next_attempt_at = NULL WHERE package = ${name} RETURNING 1`,
+          changed,
+        );
+
+        // anyone can name any package: a new row only while there is room, one new row at a time (as keepLatestScore)
+        if (replaced) return;
+
+        yield* api.tx(
+          Effect.gen(function* () {
+            yield* run("keepPackage: lock", sql`SELECT pg_advisory_xact_lock(${KEPT_PACKAGE_INSERT_LOCK})`, none);
+            yield* run(
+              "keepPackage: add",
+              sql`INSERT INTO kept_packages (package, summary, computed_at, asked_at)
+                  SELECT ${name}, ${json}::jsonb, ${at}, ${at}
+                   WHERE (SELECT count(*) FROM kept_packages) < ${capacity}
+                  ON CONFLICT (package) DO NOTHING`,
+              none,
+            );
+          }),
+        );
+      }),
+    refreshKeptPackage: ({ name, summary, at }) =>
+      run(
+        "refreshKeptPackage",
+        sql`UPDATE kept_packages SET summary = ${storableJson(JSON.stringify(summary))}::jsonb, computed_at = ${at}, failures = 0, next_attempt_at = NULL WHERE package = ${name}`,
+        none,
+      ),
+    claimKeptRefresh: ({ name, at, computedBefore, claimedBefore }) =>
+      run(
+        "claimKeptRefresh",
+        sql`UPDATE kept_packages SET claimed_at = ${at}
+             WHERE package = ${name} AND computed_at < ${computedBefore} AND (claimed_at IS NULL OR claimed_at < ${claimedBefore})
+            RETURNING summary->>'etag' AS etag`,
+        one(z.object({ etag: z.string().nullable() })),
+      ),
+    touchKeptPackage: ({ name, at }) =>
+      run("touchKeptPackage", sql`UPDATE kept_packages SET computed_at = ${at}, failures = 0, next_attempt_at = NULL WHERE package = ${name}`, none),
+    failKeptRefresh: ({ name, at, retryMs, maxRetryMs }) =>
+      run(
+        "failKeptRefresh",
+        sql`UPDATE kept_packages
+               SET next_attempt_at = ${at} + LEAST(${retryMs}::bigint * (1::bigint << LEAST(failures, 20)), ${maxRetryMs}::bigint), failures = failures + 1
+             WHERE package = ${name}`,
+        none,
+      ),
+    keptPackagesToRefresh: ({ askedSince, computedBefore, at, limit }) =>
+      run(
+        "keptPackagesToRefresh",
+        sql`SELECT package FROM kept_packages
+             WHERE asked_at >= ${askedSince} AND computed_at < ${computedBefore} AND (next_attempt_at IS NULL OR next_attempt_at <= ${at})
+             ORDER BY computed_at, package LIMIT ${limit}`,
+        all(z.object({ package: z.string() }).transform((r) => r.package)),
+      ),
+    dropKeptPackages: (which) =>
+      which.kind === "name"
+        ? run("dropKeptPackages", sql`DELETE FROM kept_packages WHERE package = ${which.name}`, none)
+        : run("dropKeptPackages", sql`DELETE FROM kept_packages WHERE asked_at < ${which.askedBefore}`, none),
 
     upstreamAnalysesOf: (names) =>
       Effect.gen(function* () {

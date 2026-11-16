@@ -2,6 +2,7 @@
 // results, the public and maintainer views, "Request AI review", and the owner-only queue where a
 // person confirms or dismisses a flag. The model never runs here: a separate reviewer process
 // (apps/reviewer) leases jobs over HTTP and posts results back. See docs/AI-REVIEW.md.
+import { pageListing } from "./kept-package.ts";
 import { RequestMemory } from "./memory.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Context, Effect, Option } from "effect";
@@ -372,10 +373,11 @@ const catalog = (name: string) =>
   });
 
 /**
- * A package's versions, statuses and checksums, for the review answer: an upstream package's come from the listing,
- * which reads no scores from the database. A local version's status is read from the database on every call.
+ * A package's versions, statuses and checksums, for the review answer of `spec`: an upstream package's come from its
+ * kept summary when it holds `spec` (kept-package.ts), else from the listing; neither reads scores. A local version's
+ * status is read from the database on every call.
  */
-const catalogListing = (name: string) =>
+const catalogListing = (name: string, spec: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const pkg = yield* store.getPackage(name);
@@ -385,7 +387,7 @@ const catalogListing = (name: string) =>
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog<Listed>;
 
-    return upstreamCatalog(yield* upstream.value.listing(name, yield* RequestMemory));
+    return upstreamCatalog(yield* pageListing({ upstream: upstream.value, name, need: { kind: "spec", spec }, lease: yield* RequestMemory }));
   });
 
 type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | { kind: "later"; why: string };
@@ -756,7 +758,7 @@ export const resolveVersion = (name: string, version: string | undefined) =>
 const resolveListed = (name: string, spec: string | undefined) =>
   Effect.gen(function* () {
     if (!spec) return yield* Effect.fail(refuse(404, "Name a version."));
-    const cat = yield* catalogListing(name);
+    const cat = yield* catalogListing(name, spec);
     const exact = cat.kind === "ok" && cat.versions.some((v) => v.version === spec);
 
     return yield* pickVersion(cat, cat.kind === "ok" && !exact ? (tagTarget(cat.distTags, spec) ?? spec) : spec);
