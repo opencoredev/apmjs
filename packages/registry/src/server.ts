@@ -5,9 +5,9 @@ import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
 import { isValidTagName, isValidVersion, servableManifest } from "@apm/core";
-import { hashPassword } from "better-auth/crypto";
 import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CAPABILITIES, type AccessServices, type Refusal as AccessRefusal, type TokenScope } from "./access.ts";
 import type { Analysis } from "./analysis.ts";
+import { loadAuthEngine } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { blockBeforeCommit } from "./blocklist.ts";
 import { Clock } from "./clock.ts";
@@ -876,7 +876,7 @@ const handleAddUser = (req: Request, rawName: string) =>
     }
 
     if (body.password.length < 8) return fail(400, "Password must be at least 8 characters.");
-    const hash = yield* Effect.promise(() => hashPassword(body.password));
+    const hash = yield* Effect.flatMap(loadAuthEngine, (engine) => Effect.promise(() => engine.hashPassword(body.password)));
     const created = yield* store.createUser({ name, password_hash: hash, email: body.email ?? "", created_at: yield* (yield* Clock).now });
 
     if (!created) return fail(409, "That name was just taken.");

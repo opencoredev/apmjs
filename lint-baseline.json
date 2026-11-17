@@ -81,8 +81,10 @@
       "anti-slop/no-unknown-parameters": 2,
       "anti-slop/no-unsafe-dictionary-type": 11
     },
+    "packages/registry/src/auth-engine.ts": {
+      "anti-slop/no-conditional-empty-object-spread": 2
+    },
     "packages/registry/src/auth.ts": {
-      "anti-slop/no-conditional-empty-object-spread": 2,
       "anti-slop/no-shape-in-symbol-names": 8
     },
     "packages/registry/src/server.ts": {

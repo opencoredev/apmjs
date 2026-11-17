@@ -7,12 +7,8 @@
 // passkey check answers a challenge made for one named action, so a passkey sign-in never confirms anything.
 import { timingSafeEqual } from "node:crypto";
 import { Context, Duration, Effect, Layer, Result, Scope } from "effect";
-import { betterAuth } from "better-auth";
-import { genericOAuth, twoFactor, deviceAuthorization } from "better-auth/plugins";
-import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
-import { passkey } from "@better-auth/passkey";
-import { generateAuthenticationOptions, verifyAuthenticationResponse, type PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/server";
-import { Pool } from "pg";
+import type { PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/server";
+import type { BetterAuthInstance } from "./auth-engine.ts";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type Linked, type User } from "./db.ts";
@@ -32,17 +28,15 @@ export type AuthOptions = {
   vercel?: { clientId: string; clientSecret: string };
 };
 
-const GITHUB: GitHubEndpoints = {
-  authorize: "https://github.com/login/oauth/authorize",
-  token: "https://github.com/login/oauth/access_token",
-  user: "https://api.github.com/user",
-  emails: "https://api.github.com/user/emails",
-};
 
 const CLI_CLIENT_ID = "apm-cli";
 
-const GitHubUser = z.object({ id: z.number(), login: z.string(), name: z.string().nullish(), email: z.string().nullish(), avatar_url: z.string().nullish() });
-const GitHubEmails = z.array(z.object({ email: z.string(), primary: z.boolean(), verified: z.boolean() }));
+/**
+ * Better Auth and the libraries only sign-in and second factors use (auth-engine.ts), loaded on first use: about half
+ * the Worker's code, which a cold isolate serving installs never parses or runs.
+ */
+export const loadAuthEngine = Effect.promise(() => import("./auth-engine.ts"));
+
 const SessionShape = z.object({ session: z.object({ token: z.string(), userId: z.string(), createdAt: z.coerce.date() }), user: z.object({ id: z.string() }).loose() });
 const DeviceStartShape = z.object({ device_code: z.string(), user_code: z.string(), expires_in: z.number(), interval: z.number() });
 const DeviceTokenShape = z.object({ access_token: z.string() });
@@ -184,84 +178,6 @@ function refusal(check: Exclude<ProofCheck, { kind: "ok" }>): Response {
   }
 }
 
-function buildBetterAuth(input: { pool: Pool; options: AuthOptions; baseURL: string; store: Store["Service"]; now: () => number }) {
-  const { pool, options, store, now } = input;
-  const baseURL = input.baseURL.replace(/\/$/, "");
-  const web = new URL(baseURL);
-  const gh = options.github ? { ...options.github, endpoints: options.github.endpoints ?? GITHUB } : null;
-  const record = (effect: Effect.Effect<void, StoreError>): Promise<void> => Effect.runPromise(effect);
-
-  return betterAuth({
-    appName: "apm",
-    database: pool,
-    baseURL,
-    basePath: "/api/auth",
-    secret: options.secret,
-    trustedOrigins: [web.origin],
-    telemetry: { enabled: false },
-    account: { accountLinking: { enabled: true, trustedProviders: ["github", "vercel"], allowDifferentEmails: true } },
-    ...(options.vercel ? { socialProviders: { vercel: { clientId: options.vercel.clientId, clientSecret: options.vercel.clientSecret } } } : {}),
-    plugins: [
-      ...(gh
-        ? [
-            genericOAuth({
-              config: [
-                {
-                  providerId: "github",
-                  clientId: gh.clientId,
-                  clientSecret: gh.clientSecret,
-                  authorizationUrl: gh.endpoints.authorize,
-                  tokenUrl: gh.endpoints.token,
-                  scopes: ["read:user", "user:email"],
-                  getUserInfo: async (tokens) => {
-                    const headers = { authorization: `Bearer ${tokens.accessToken}`, accept: "application/vnd.github+json", "user-agent": "apm-registry" };
-                    const res = await fetch(gh.endpoints.user, { headers, signal: AbortSignal.timeout(10_000) });
-
-                    if (!res.ok) return null;
-                    const profile = GitHubUser.safeParse(await res.json());
-
-                    if (!profile.success) return null;
-                    const p = profile.data;
-                    await record(store.setGitHubProfile(String(p.id), p.login, now()));
-                    let email = p.email ?? null;
-                    let verified = false;
-                    const er = await fetch(gh.endpoints.emails, { headers, signal: AbortSignal.timeout(10_000) }).catch(() => null);
-                    const emails = er?.ok ? GitHubEmails.safeParse(await er.json()) : null;
-
-                    if (emails?.success) {
-                      const primary = emails.data.find((e) => e.primary && e.verified) ?? emails.data.find((e) => e.verified);
-
-                      if (primary) {
-                        email = primary.email;
-                        verified = true;
-                      }
-                    }
-
-                    return {
-                      id: String(p.id),
-                      name: p.name || p.login,
-                      // GitHub accounts can hide every address; the noreply form keeps one per account.
-                      email: email ?? `${p.id}+${p.login}@users.noreply.github.com`,
-                      emailVerified: verified,
-                      ...(p.avatar_url ? { image: p.avatar_url } : {}),
-                    };
-                  },
-                },
-              ],
-            }),
-          ]
-        : []),
-      // Accounts come from GitHub or Vercel and have no password. The route gates ask for the existing factor
-      // instead, and apm checks TOTP codes itself (one budget, each step once).
-      twoFactor({ issuer: "apm", allowPasswordless: true }),
-      passkey({ rpID: web.hostname, rpName: "apm", origin: web.origin }),
-      deviceAuthorization({ expiresIn: "15m", interval: "1s", validateClient: (id) => id === CLI_CLIENT_ID }),
-    ],
-    // A passkey sign-in makes a session and nothing else: a second factor for an action answers a challenge the
-    // registry made for that action (Auth.passkeyChallenge), never this route's.
-  });
-}
-
 export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth") {
   /**
    * Better Auth over the same Postgres. The instance (and its connection) is made on first use in a request,
@@ -279,11 +195,11 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
 
         const instance = yield* Effect.cached(
           Effect.acquireRelease(
-            Effect.sync(() => {
+            Effect.map(loadAuthEngine, (engine) => {
               // sign-in waits on Postgres no longer than the Store does (db-health.ts)
-              const pool = new Pool({ connectionString: input.databaseUrl, max: 1, connectionTimeoutMillis: Duration.toMillis(CONNECT_TIMEOUT), query_timeout: STATEMENT_TIMEOUT_MS });
+              const pool = new engine.Pool({ connectionString: input.databaseUrl, max: 1, connectionTimeoutMillis: Duration.toMillis(CONNECT_TIMEOUT), query_timeout: STATEMENT_TIMEOUT_MS });
 
-              return { pool, auth: buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs }) };
+              return { pool, auth: engine.buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs, cliClientId: CLI_CLIENT_ID }) };
             }),
             ({ pool }) => Effect.promise(() => pool.end()).pipe(Effect.ignore),
           ).pipe(
@@ -292,7 +208,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
           ),
         );
 
-        const call = <A>(operation: string, run: (auth: ReturnType<typeof buildBetterAuth>) => Promise<A>): Effect.Effect<A, AuthError> =>
+        const call = <A>(operation: string, run: (auth: BetterAuthInstance) => Promise<A>): Effect.Effect<A, AuthError> =>
           Effect.flatMap(instance, (auth) => Effect.tryPromise({ try: () => run(auth), catch: (cause) => new AuthError({ operation, cause }) }));
 
         const secretKey = Effect.flatMap(instance, (auth) =>
@@ -300,10 +216,10 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
         );
 
         const decrypt = (data: string) =>
-          Effect.flatMap(secretKey, (key) => Effect.tryPromise({ try: () => symmetricDecrypt({ key, data }), catch: (cause) => new AuthError({ operation: "decrypt", cause }) }));
+          Effect.flatMap(Effect.all([secretKey, loadAuthEngine]), ([key, engine]) => Effect.tryPromise({ try: () => engine.symmetricDecrypt({ key, data }), catch: (cause) => new AuthError({ operation: "decrypt", cause }) }));
 
         const encrypt = (data: string) =>
-          Effect.flatMap(secretKey, (key) => Effect.tryPromise({ try: () => symmetricEncrypt({ key, data }), catch: (cause) => new AuthError({ operation: "encrypt", cause }) }));
+          Effect.flatMap(Effect.all([secretKey, loadAuthEngine]), ([key, engine]) => Effect.tryPromise({ try: () => engine.symmetricEncrypt({ key, data }), catch: (cause) => new AuthError({ operation: "encrypt", cause }) }));
 
         const gitHubLoginOf = (authUserId: string) =>
           Effect.gen(function* () {
@@ -439,8 +355,10 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
           Effect.gen(function* () {
             const keys = yield* store.passkeysOf(input.session.authUserId);
 
+            const engine = yield* loadAuthEngine;
+
             const options = yield* Effect.tryPromise({
-              try: () => generateAuthenticationOptions({ rpID: web.hostname, userVerification: "preferred", allowCredentials: keys.map((k) => ({ id: k.credentialID })) }),
+              try: () => engine.generateAuthenticationOptions({ rpID: web.hostname, userVerification: "preferred", allowCredentials: keys.map((k) => ({ id: k.credentialID })) }),
               catch: (cause) => new AuthError({ operation: "passkeyChallenge", cause }),
             });
 
@@ -474,8 +392,10 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
 
             if (!key) return { kind: "bad" } satisfies ProofCheck;
 
+            const engine = yield* loadAuthEngine;
+
             const verified = yield* Effect.promise(() =>
-              verifyAuthenticationResponse({
+              engine.verifyAuthenticationResponse({
                 response: { ...input.response, clientExtensionResults: {} },
                 expectedChallenge: challenge,
                 expectedOrigin: web.origin,

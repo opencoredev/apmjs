@@ -35,7 +35,7 @@ import { dirname, join } from "node:path";
 import { Miniflare } from "miniflare";
 import { Client } from "pg";
 import { z } from "zod";
-import { buildWorker } from "../../packages/registry/scripts/build.ts";
+import { buildWorker, workerModules } from "../../packages/registry/scripts/build.ts";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/compat.ts";
 import { freshDatabase } from "../../tests/acceptance/postgres.ts";
 
@@ -205,7 +205,7 @@ const recorder = Bun.serve({
 const base = `http://127.0.0.1:${recorder.port}/`;
 
 const mf = new Miniflare({
-  modules: [{ type: "ESModule", path: script }],
+  modules: workerModules(script),
   modulesRoot: dirname(script),
   compatibilityDate: COMPATIBILITY_DATE,
   compatibilityFlags: [...COMPATIBILITY_FLAGS],

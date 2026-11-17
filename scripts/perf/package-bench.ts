@@ -34,7 +34,7 @@ import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { Client } from "pg";
 import { z } from "zod";
-import { buildWorker } from "../../packages/registry/scripts/build.ts";
+import { buildWorker, workerModules } from "../../packages/registry/scripts/build.ts";
 import * as webBuild from "../../packages/infra/web-build.ts";
 import { freshDatabase } from "../../tests/acceptance/postgres.ts";
 import { pkgTgz } from "../../tests/acceptance/harness.ts";
@@ -342,7 +342,7 @@ const options = () => ({
     { name: "calls", modules: true, script: CALLS, compatibilityDate: "2026-07-30", serviceBindings: { REAL: "registry" }, bindings: { SLOW_MATCH: slow.match, SLOW_MS: String(slow.ms) } },
     {
       name: "registry",
-      modules: [{ type: "ESModule" as const, path: registryScript }],
+      modules: workerModules(registryScript),
       modulesRoot: join(registryScript, ".."),
       compatibilityDate: "2026-07-30",
       compatibilityFlags: ["nodejs_compat"],

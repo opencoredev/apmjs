@@ -8,7 +8,7 @@ import { randomBytes } from "node:crypto";
 import { Miniflare } from "miniflare";
 import { Client } from "pg";
 import { z } from "zod";
-import { buildWorker } from "../../packages/registry/scripts/build.ts";
+import { buildWorker, workerModules } from "../../packages/registry/scripts/build.ts";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/compat.ts";
 import { startDatabaseLink, type DatabaseLink } from "./db-link.ts";
 import { freshDatabase } from "./postgres.ts";
@@ -117,7 +117,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
   }
 
   const mf = new Miniflare({
-    modules: [{ type: "ESModule", path: script }],
+    modules: workerModules(script),
     modulesRoot: dirname(script),
     compatibilityDate: COMPATIBILITY_DATE,
     compatibilityFlags: [...COMPATIBILITY_FLAGS],

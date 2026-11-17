@@ -287,6 +287,17 @@ const DeviceStart = z.object({ deviceCode: z.string(), userCode: z.string() });
 const DeviceToken = z.object({ token: z.string(), username: z.string() });
 const AccountView = z.object({ security: z.object({ totp: z.boolean() }) });
 
+/**
+ * The sign-in code is loaded only when a request needs it (registry auth-engine.ts, its own module beside the entry):
+ * a deploy missing it still answers installs, so a signed-out session read, which loads it, is checked on every stage.
+ */
+async function signInLoads(): Promise<void> {
+  const res = await fetch(`${web}api/auth/get-session`, { headers: { accept: "application/json", "cache-control": "no-cache" } });
+  const text = await res.text();
+
+  record(res.status === 200 && text.trim() === "null", "the sign-in code loads: a signed-out session read answers null", `HTTP ${res.status}, ${text.trim().slice(0, 40)}`);
+}
+
 async function stagedPublish(): Promise<void> {
   if (stage !== "staging") {
     record(true, "staged publish and approval", "skipped: runs only on staging, where it may create a check identity");
@@ -354,6 +365,8 @@ await docsSite();
 await stockClients();
 
 await apmWarning();
+
+await signInLoads();
 
 await stagedPublish();
 

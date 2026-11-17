@@ -2,7 +2,7 @@
 // per account in Postgres, so neither a restart nor another Worker isolate resets them. Hashes are scrypt, in
 // Better Auth's format.
 import { Effect } from "effect";
-import { verifyPassword } from "better-auth/crypto";
+import { loadAuthEngine } from "./auth.ts";
 import { Store } from "./db.ts";
 import type { StoreError } from "./errors.ts";
 
@@ -22,7 +22,7 @@ export const checkPassword = (input: { user: string; password: string; hash: str
     const { user, now } = input;
 
     if ((yield* store.reservePasswordAttempt({ user, now, max: MAX_PASSWORD_FAILURES, windowMs: PASSWORD_WINDOW_MS })) === "locked") return "locked";
-    const ok = input.hash !== "" && (yield* Effect.promise(() => verifyPassword({ hash: input.hash, password: input.password }).catch(() => false)));
+    const ok = input.hash !== "" && (yield* Effect.flatMap(loadAuthEngine, (engine) => Effect.promise(() => engine.verifyPassword({ hash: input.hash, password: input.password }).catch(() => false))));
 
     if (ok) yield* store.setPasswordFailures(user, null);
 
