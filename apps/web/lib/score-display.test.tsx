@@ -12,7 +12,7 @@ const PARTIAL = Coverage.parse({ kind: "partial", omittedFiles: 2656, omittedByt
 
 describe("a partial reading on the site", () => {
   test("the score panel leads with Partial analysis, and gives the number only for the code apm read", () => {
-    const html = renderToStaticMarkup(<ScoreHeadline score={98} coverage={PARTIAL} tone={TONE} version="16.4.6" />);
+    const html = renderToStaticMarkup(<ScoreHeadline score={98} grade="P" coverage={PARTIAL} tone={TONE} version="16.4.6" />);
 
     expect(html).toContain("Partial analysis");
     expect(html).toContain("98/100 on the code apm read; 2,656 files not read");
@@ -21,7 +21,7 @@ describe("a partial reading on the site", () => {
   });
 
   test("a complete reading leads with its score, as before", () => {
-    const html = renderToStaticMarkup(<ScoreHeadline score={98} coverage={{ kind: "complete" }} tone={TONE} version="1.0.0" />);
+    const html = renderToStaticMarkup(<ScoreHeadline score={98} grade="A" coverage={{ kind: "complete" }} tone={TONE} version="1.0.0" />);
 
     expect(html).not.toContain("Partial analysis");
     expect(html).toContain("text-inverse-ok");
@@ -43,12 +43,23 @@ describe("a partial reading on the site", () => {
 describe("an analysis that stopped before it finished", () => {
   test("says it did not finish, with no count of files not read", () => {
     const stopped = Coverage.parse({ kind: "partial", omittedFiles: 0, omittedBytes: 0, reasons: ["stopped"], notes: [] });
-    const html = renderToStaticMarkup(<ScoreHeadline score={39} coverage={stopped} tone={TONE} version="1.0.0" />);
+    const html = renderToStaticMarkup(<ScoreHeadline score={39} grade="F" coverage={stopped} tone={TONE} version="1.0.0" />);
 
     // on e8616ca: "39/100 on the code apm read; 0 files not read", and that they were left unread for their size
     expect(html).toContain("Analysis did not finish");
     expect(html).toContain("39/100: apm stopped before it finished reading this version");
     expect(html).not.toContain("files not read");
     expect(html).not.toContain("for their size");
+  });
+});
+
+// review of c456c92, finding 4: only a reading graded P (whole files left unread for their size, nothing else
+// unfinished) leads with "Partial analysis"; one incomplete for another reason shows its score and letter, as always
+describe("a partial coverage that is not graded P", () => {
+  test("an incomplete re-run that read at most 4 MB shows 39 and F, not Partial analysis", () => {
+    const html = renderToStaticMarkup(<ScoreHeadline score={39} grade="F" coverage={PARTIAL} tone={TONE} version="1.0.0" />);
+
+    expect(html).not.toContain("Partial analysis");
+    expect(html).toContain(">39<");
   });
 });

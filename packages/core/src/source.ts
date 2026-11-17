@@ -230,6 +230,8 @@ export type FileScan = {
   env?: EnvRead[];
   /** For a parsed file: code it runs that apm did not read, which makes the analysis incomplete. */
   unread?: Unread[];
+  /** For a parsed file: whether its flow reading stopped before it finished (js.ts JsScan's flowStopped). */
+  flowStopped?: boolean;
 };
 
 /** What left-out text every match in a file of this language sits in: all of a JSON file, all of a type declaration. */
@@ -253,7 +255,7 @@ export function scanFile(text: string, lang: Lang): FileScan {
     const js = scanJs(text, lang);
 
     if (js.kind === "parsed") {
-      return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env, unread: js.unread };
+      return { findings: js.findings, imports: js.imports, read: "parsed", rejected: false, notes: js.notes, hidden: js.hidden, commands: js.commands, flows: js.flows, exports: js.exports, executed: js.executed, env: js.env, unread: js.unread, flowStopped: js.flowStopped };
     }
 
     if (js.reason === "syntax") return { ...scanUnparsed(text), rejected: true };

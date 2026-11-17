@@ -2,13 +2,19 @@
 // The website's explain_install MCP tool and GET /api/explain use the same rules (apps/web/lib/agent/verdict.ts);
 // change both together: tests/fixtures/explain-verdicts.json holds the cases both must answer the same way.
 //
-// The rule: "install" only when apm knows the version and everything it brings in is fine. Anything apm could not
-// read is "unknown"; anything it read but has not finished checking is "review-first". Like the rest of apm it never
-// calls a version "safe". A score never makes it "do-not-install" (the owner's warn-not-block policy, 2026-11): a low
-// or incomplete score, no score, or a dependency apm flagged installs with a warning, so it is "review-first", and the
-// summary says it installs and why. "do-not-install" is only for a revoked or yanked version and one an apm reviewer
-// confirmed malicious, the version or anything in its tree.
-import type { Report } from "./api.ts";
+// The rule (the owner's agent-native policy, 2026-11; docs/AGENTS.md "The verdict"): "review-first" means a person
+// should look: a risk signal the scorer found (the RISK_SIGNALS list), a score under the floor, an AI review flag a
+// person has not decided, a dependency flagged the same way, a version (the one picked, or a dependency) published
+// inside the 24-hour cooldown that apm cannot clear, or an analysis apm could not finish. The last is fail-closed: an
+// analysis that did not read everything installs only when it positively records that the one gap is whole files left
+// unread for their size or the byte budget (readingOf); every other gap, or a record that does not say, holds. apm's
+// own work that has not started never interrupts anyone: an AI review not finished or not picked, a version still
+// queued or too large to score, a dependency not scored yet or not looked up installs, and the answer lists each in
+// `notes` for the agent to mention after installing. A version inside the cooldown is replaced by the newest one in range
+// past it (agent.ts), so only a range with no such version stays review-first for its age. Anything apm could not read
+// is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
+// the version or anything in its tree. Like the rest of apm it never calls a version "safe".
+import type { Report, ReportCoverage } from "./api.ts";
 
 /** "2,656 files (74.0 MB) not read": how much of a version a partial reading left out. */
 function notReadText(c: { omittedFiles: number; omittedBytes: number }): string {
@@ -20,11 +26,187 @@ export const VERDICTS = ["install", "review-first", "do-not-install", "not-found
 
 export type VerdictKind = (typeof VERDICTS)[number];
 
-/** Scores at or above this are clean (the site's green badge); below it the lost points are worth a look. */
+/** Scores at or above this are clean (the site's green badge); below it the lost points are a note. */
 export const CLEAN_SCORE = 75;
 
 /** The registry's score floor: below it `apm add` warns (and `--strict` refuses). */
 export const SCORE_FLOOR = 40;
+
+/**
+ * Scorer signals (packages/core SIGNAL_IDS) that make an install review-first wherever they cost points, in the version
+ * or in a dependency the registry flagged: what droppers and stealers do (a remote shell, a capture endpoint, secrets
+ * sent out, a credential file read, code run from decoded strings, obfuscator output, the pairings malware has),
+ * install hooks that reach the network or download, and a look-alike name. Picked against tools/score-eval: every one
+ * of the 40 and 113 malicious samples the old rule (under 75) sent to a person still goes there, and of the 70 popular
+ * tarballs only bun and esbuild (a binary downloaded at install) and @sentry/node (code kept in base64) do. Install
+ * scripts that only build, a new publisher, a new dependency and what an SDK names are notes, not holds.
+ */
+export const RISK_SIGNALS = ["remote-shell", "capture-endpoint", "exfiltration", "credential-read", "install-download", "install-network", "runs-decoded-code", "obfuscated", "suspicious-combination", "typosquat"] as const;
+
+/**
+ * Signals a scorer before CURRENT_SCORER gave a risk's meaning that it later split up: v9's credential-access is v10's
+ * credential-read and exfiltration. A stored analysis keeps its scorer's ids until it is analysed again, so in one from
+ * an earlier scorer, or one whose scorer the registry did not say, these are risks too. packages/core holds the list.
+ */
+export const LEGACY_RISK_SIGNALS = ["credential-access"] as const;
+
+/** Risk signals about the name rather than the code: they count unless the name is an established one. */
+export const NAME_RISK_SIGNALS = ["typosquat"] as const;
+
+/**
+ * Dependency names the look-alike rule flags that are long-established packages in their own right, each checked by
+ * hand: safer-buffer (express installs it; one edit from safe-buffer, published by a Node.js core contributor since
+ * 2018). Only as a dependency, never as the name an agent asks for, and only the name signal: any other risk counts.
+ * packages/core holds the list; add to it only with the package's own record checked.
+ */
+export const ESTABLISHED_DEPENDENCY_NAMES = ["safer-buffer"] as const;
+
+/** What the risk rules read: the version asked for, or a dependency it brings in, by name. */
+export type RiskOf = { kind: "version" } | { kind: "dependency"; name: string };
+
+export const AS_VERSION: RiskOf = { kind: "version" };
+
+/** Whether a name signal is set aside for `of`: a dependency whose name is an established one. */
+const nameExempt = (of: RiskOf): boolean => of.kind === "dependency" && ESTABLISHED_DEPENDENCY_NAMES.some((n) => n === of.name);
+
+/** The scorer whose signal ids RISK_SIGNALS names (packages/core SCORER). */
+export const CURRENT_SCORER = "apm-score-v11";
+
+/** The scorers whose signal ids are RISK_SIGNALS': apm-score-v10, which split v9's, and every one since. */
+const SPLIT_SCORERS: readonly string[] = ["apm-score-v10", CURRENT_SCORER];
+
+/** Signals that say apm did not read or finish everything: every analysis with one holds (packages/core GAP_SIGNALS). */
+export const GAP_SIGNALS = ["incomplete", "unanalyzed-files"] as const;
+
+/**
+ * The one gap a reading may have and still install: whole files left unread for their size or the bytes one analysis
+ * reads (packages/core BENIGN_OMISSIONS). Anything not on it holds.
+ */
+export const BENIGN_OMISSIONS = ["too-large", "over-budget"] as const;
+
+/** A scored signal as the risk rules read it: its id and what it cost. */
+export type ScoredSignal = { id: string; points: number };
+
+/** A score as the risk rules read it; `scorer` null when the registry did not say which scorer wrote it. */
+export type Scored = { score: number | null; signals: readonly ScoredSignal[]; scorer: string | null };
+
+const isGap = (id: string): boolean => GAP_SIGNALS.some((g) => g === id);
+
+/**
+ * The risk signals that cost points, heaviest first: RISK_SIGNALS (less NAME_RISK_SIGNALS for a dependency whose name
+ * is in ESTABLISHED_DEPENDENCY_NAMES), and LEGACY_RISK_SIGNALS unless `scorer` is apm-score-v10 or later.
+ */
+export function riskSignalsOf<S extends ScoredSignal>(signals: readonly S[], scorer: string | null, of: RiskOf): S[] {
+  const legacy = scorer === null || !SPLIT_SCORERS.includes(scorer);
+  const counts = (id: string): boolean => (RISK_SIGNALS.some((r) => r === id) && !(nameExempt(of) && NAME_RISK_SIGNALS.some((n) => n === id))) || (legacy && LEGACY_RISK_SIGNALS.some((r) => r === id));
+
+  return signals.filter((s) => s.points < 0 && counts(s.id)).toSorted((a, b) => a.points - b.points);
+}
+
+/** Whether a scored version carries a real risk: a risk signal, or a score under the floor. */
+export function isRisky(input: Scored, of: RiskOf): boolean {
+  return riskSignalsOf(input.signals, input.scorer, of).length > 0 || (input.score !== null && input.score < SCORE_FLOOR);
+}
+
+/**
+ * How much of a version apm read (packages/core readingOf, which grades only `partial` "P"), fail-closed:
+ * complete, nothing left unread and no GAP_SIGNALS (an earlier scorer, which stored no coverage, counted every file it
+ * left unread as one); partial, the current scorer recorded whole files left unread, every reason on BENIGN_OMISSIONS,
+ * and nothing else unfinished; incomplete, anything else: a gap signal, a stop, an empty, unknown or unreadable list of
+ * reasons, an earlier scorer's partial reading, or the current scorer's analysis with no coverage at all.
+ */
+export type Reading = { kind: "complete" } | { kind: "partial"; omittedFiles: number; omittedBytes: number } | { kind: "incomplete" };
+
+export function readingOf(input: { scorer: string | null; signals: readonly { id: string }[]; coverage: ReportCoverage | null }): Reading {
+  if (input.signals.some((s) => isGap(s.id))) return { kind: "incomplete" };
+  const c = input.coverage;
+
+  if (c === null) return input.scorer === CURRENT_SCORER ? { kind: "incomplete" } : { kind: "complete" };
+
+  switch (c.kind) {
+    case "complete":
+      return c;
+    case "partial": {
+      const benign = c.reasons.length > 0 && c.reasons.every((r) => BENIGN_OMISSIONS.some((b) => b === r));
+
+      return input.scorer === CURRENT_SCORER && benign ? { kind: "partial", omittedFiles: c.omittedFiles, omittedBytes: c.omittedBytes } : { kind: "incomplete" };
+    }
+
+    case "unreadable":
+      return { kind: "incomplete" };
+    default: {
+      const _exhaustive: never = c;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Older versions `apm explain` asks for when the one picked is inside the cooldown, before it gives up: each is a
+ * resolve of its own, so a burst of releases costs at most this many more.
+ */
+export const MAX_OLDER_LOOKUPS = 2;
+
+/** A dist-tag (latest, next, beta) rather than a semver range: a name, not a version, `x` or a `v1`. */
+const TAG = /^(?!v?\d)(?![xX]$)[A-Za-z][\w.-]*$/;
+
+/** A hyphen range, `1.0.0 - 2.0.0`, as one comparator set: node-semver takes it only when it is the whole set. */
+const HYPHEN = /^(\S+)\s+-\s+(\S+)$/;
+
+/**
+ * One `||` alternative as a comparator set another comparator can be added to: a hyphen range becomes `>=low <=high`,
+ * which node-semver reads the same way for full and partial versions (`<=2.3` is `<2.4.0-0`, as `- 2.3` is).
+ */
+function comparatorSet(part: string): string {
+  const hyphen = HYPHEN.exec(part);
+
+  return hyphen ? `>=${hyphen[1] ?? ""} <=${hyphen[2] ?? ""}` : part;
+}
+
+/**
+ * The range `range` less `version` and everything newer: a tag keeps its channel under `<version` (as the registry
+ * reads a tag: in-channel versions up to its target, prereleases only of the target's own release), a range gets
+ * `<version` added to each of its `||` alternatives, each made a plain comparator set first (a hyphen range is not).
+ */
+export function olderRange(range: string, version: string): string {
+  if (TAG.test(range.trim())) return `<${version}`;
+
+  return range
+    .split("||")
+    .map((part) => `${comparatorSet(part.trim())} <${version}`.trim())
+    .join(" || ");
+}
+
+/**
+ * The resolve the verdict rests on: the registry's pick for `range`, or, when that version is inside the cooldown, the
+ * newest older one in range past it (asked as `olderRange`, at most MAX_OLDER_LOOKUPS times). An older lookup the
+ * registry does not answer makes the whole answer unavailable; no older version in range, or only fresh ones, keeps
+ * the fresh pick, which the verdict sends to a person.
+ */
+export async function resolveForVerdict(input: { range: string; resolve: (range: string) => Promise<ResolvedInput> }): Promise<{ resolved: ResolvedInput; older: OlderSearch }> {
+  const first = await input.resolve(input.range);
+
+  if (first.kind !== "ok") return { resolved: first, older: { kind: "not-needed" } };
+  let current = first;
+  const passedOver: { version: string; text: string }[] = [];
+
+  for (let looked = 0; ; looked++) {
+    const fresh = current.deps.warnings.find((w) => w.via.length === 0 && w.kind === "cooldown");
+
+    if (fresh === undefined) return { resolved: current, older: passedOver.length > 0 ? { kind: "picked", passedOver } : { kind: "not-needed" } };
+
+    if (looked >= MAX_OLDER_LOOKUPS) return { resolved: first, older: { kind: "gave-up", looked: looked + 1 } };
+    const older = await input.resolve(olderRange(input.range, current.version));
+
+    // nothing older in range passes (or matches): the fresh version is all there is
+    if (older.kind === "refused" || older.kind === "missing") return { resolved: first, older: { kind: "none" } };
+
+    if (older.kind === "unavailable") return { resolved: older, older: { kind: "not-needed" } };
+    passedOver.push({ version: current.version, text: fresh.text });
+    current = older;
+  }
+}
 
 /** Exit codes, so a script can branch without parsing: 2 stays the CLI's usage error. */
 export const EXIT: Record<VerdictKind, number> = { install: 0, "do-not-install": 1, "not-found": 1, "review-first": 3, unknown: 4 };
@@ -48,13 +230,28 @@ export type WarningInput = {
   /** The package's or the version's page on the website. */
   url?: string;
   via: string[];
+  /**
+   * A scored version's score, and every signal that cost it points (id and points); the verdict reads them for a risk
+   * signal. Absent when the version has no score, and from registries before the agent-native verdict.
+   */
+  score?: number | null;
+  signals?: { id: string; points: number }[];
+  /** The scorer whose ids `signals` are. */
+  scorer?: string | null;
+  /** How much that score's analysis read, as stored: a partial reading installs only on this record (readingOf). */
+  coverage?: ReportCoverage | null;
+  /** For unscorable: why the registry decided the version will never be scored; older registries send none. */
+  unscorable?: string;
 };
+
+/** A dependency the registry scored with a risk signal, whatever the score (resolve's tree.risks); `scorer` null when unsaid. */
+export type RiskyDep = { name: string; version: string; via: string[]; scorer: string | null; score: number; signals: { id: string; points: number }[] };
 
 /**
  * The dependency walk: what apm could not score (the registry's total, and up to 50 named), the AI reviews, and the
  * registry's warnings on the install.
  */
-export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[] };
+export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[]; risks: RiskyDep[] };
 
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
@@ -104,6 +301,28 @@ export type DependencyCoverage = (typeof DEPENDENCY_COVERAGE)[number];
 /** What the verdict rests on, as data: a client can tell "install, with no AI review" from "install, reviewed". */
 export type Coverage = { aiReview: AiReviewCoverage; dependencies: DependencyCoverage };
 
+/**
+ * What a note is about. older-version: the version picked is not the newest in range, which is inside the cooldown.
+ * ai-review-pending, ai-review-no-answer, no-ai-review: the picked version's AI review is under way, ended without an
+ * answer, or was never run. dependency-ai-review: a dependency's is under way or ended without one. not-scored: apm has
+ * no score for the version yet (queued) or never will (too large to score). partial-analysis: apm left whole files
+ * unread for their size or the bytes one analysis reads, and recorded that this was all (readingOf). lost-points: it scores under 75 for signals that are not risks. dependency-gaps: dependencies apm could not score
+ * or look up. dependency-cooldown: dependencies published inside the cooldown that apm scored and found no risk in.
+ */
+export const NOTE_KINDS = ["older-version", "ai-review-pending", "ai-review-no-answer", "no-ai-review", "dependency-ai-review", "not-scored", "partial-analysis", "lost-points", "dependency-gaps", "dependency-cooldown"] as const;
+
+export type NoteKind = (typeof NOTE_KINDS)[number];
+
+/** Something apm did not finish or did differently: never a reason to stop, said so the agent can mention it. */
+export type Note = { kind: NoteKind; text: string };
+
+/**
+ * What explainFor did about a picked version inside the cooldown: nothing, as it is past the cooldown (not-needed);
+ * picked an older one (each newer version it passed over, newest first, with the registry's words); found none in
+ * range; or stopped after `looked` versions, each fresh.
+ */
+export type OlderSearch = { kind: "not-needed" } | { kind: "picked"; passedOver: { version: string; text: string }[] } | { kind: "none" } | { kind: "gave-up"; looked: number };
+
 export type Verdict = {
   verdict: VerdictKind;
   name: string;
@@ -121,6 +340,11 @@ export type Verdict = {
   evidence: string[];
   /** The version's page (or the package's) on the website, from the registry's warning; null when it sent none. */
   url: string | null;
+  /**
+   * What apm did not finish or did differently (an AI review not finished, a dependency not scored, an older version
+   * picked past the cooldown): never a reason to stop, for the agent to mention after installing. Empty when nothing.
+   */
+  notes: Note[];
 };
 
 const SHOWN = 3;
@@ -181,6 +405,8 @@ function commands(name: string, version: string): NonNullable<Verdict["commands"
 }
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+
+const scoreTextOf = (report: { score: number; grade: string }): string => `scores ${report.score}/100 (${oneLine(report.grade)})`;
 
 const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => quoted(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
 
@@ -280,7 +506,10 @@ function reviewReason(review: ReviewInput): string {
         case "no-answer":
           return "The AI review gave no usable answer for this version.";
         case "under-review":
-          return `The AI review flagged this version (${plural(review.findings, "finding", "findings")}); a person at apm is checking it.`;
+          // the registry withholds a flag's findings until a person at apm confirms them, so none is not "no finding"
+          return review.findings === 0
+            ? "The AI review flagged this version; its findings are withheld until a person at apm reviews them."
+            : `The AI review flagged this version (${plural(review.findings, "finding", "findings")}); a person at apm is checking it.`;
         case "confirmed":
           return "apm reviewers confirmed this version is malicious.";
         default: {
@@ -298,19 +527,20 @@ function reviewReason(review: ReviewInput): string {
   }
 }
 
-/** Why the picked version itself needs a look before an install, or null when its review is settled or absent. */
-function reviewHold(review: ReviewInput): string | null {
+/** The picked version's AI review as a note when it is under way, ended without an answer or never ran; null otherwise. */
+function reviewNote(review: ReviewInput): Note | null {
   switch (review.kind) {
     case "queued":
     case "leased":
-      return "its AI review has not finished";
+      return { kind: "ai-review-pending", text: reviewReason(review) };
     case "failed":
-      return "its AI review ended without an answer";
-    case "reviewed":
-      return review.state === "under-review" ? "the AI review flagged it and a person has not decided yet" : review.state === "no-answer" ? "its AI review ended without an answer" : null;
-    case "pulled":
+      return { kind: "ai-review-no-answer", text: reviewReason(review) };
     case "not-reviewed":
     case "off":
+      return { kind: "no-ai-review", text: reviewReason(review) };
+    case "reviewed":
+      return review.state === "no-answer" ? { kind: "ai-review-no-answer", text: reviewReason(review) } : null;
+    case "pulled":
     case "unreadable":
       return null;
     default: {
@@ -319,6 +549,103 @@ function reviewHold(review: ReviewInput): string | null {
       return _exhaustive;
     }
   }
+}
+
+/** The words a summary uses for a note, as the end of "but ...". */
+function noteWhy(note: Note, id: string): string {
+  switch (note.kind) {
+    case "older-version":
+      return "it is not the newest version: that one is inside apm's 24-hour cooldown";
+    case "ai-review-pending":
+      return "its AI review has not finished";
+    case "ai-review-no-answer":
+      return "its AI review ended without an answer";
+    case "no-ai-review":
+      return "it has no AI review";
+    case "dependency-ai-review":
+      return "the AI review of a dependency has not given an answer yet";
+    case "not-scored":
+      return `apm has no score for ${id}, so nothing has read its code`;
+    case "partial-analysis":
+      return `apm read only part of ${id}, leaving files unread for their size or its byte budget`;
+    case "lost-points":
+      return "it lost points for signals that are not risks";
+    case "dependency-gaps":
+      return "apm could not fully check some of its dependencies";
+    case "dependency-cooldown":
+      return "some of its dependencies were published inside apm's 24-hour cooldown";
+    default: {
+      const _exhaustive: never = note.kind;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * How the verdict reads one of the registry's warnings about a dependency. risk: a risk signal or a score under the
+ * floor (a low-score warning is one). unfinished: apm could not finish its analysis (any gap but whole files left unread
+ * for their size or the byte budget, on the warning's own record; a warning with no such record, from an older
+ * registry, is one) or decided it can never score it for a reason other than its size. fresh-unread: published inside
+ * the cooldown with no complete or partial reading apm could check. fresh-clear: inside the cooldown, read, no risk.
+ * gap: apm has not got to it (no score yet, too large to score, a lookup that failed, the walk's limit) or read only
+ * part of it for its size, with no risk in what it read.
+ */
+type DepClass = "risk" | "unfinished" | "fresh-unread" | "fresh-clear" | "gap";
+
+function classifyDep(w: WarningInput): DepClass {
+  const scored = w.signals === undefined ? null : { score: w.score ?? null, signals: w.signals, scorer: w.scorer ?? null };
+  const reading = scored === null ? null : readingOf({ ...scored, coverage: w.coverage ?? null });
+  const of: RiskOf = { kind: "dependency", name: w.name };
+
+  switch (w.kind) {
+    case "low-score":
+      return "risk";
+    case "incomplete":
+      // a risk signal in what apm read is a risk whatever else; a score under the floor is one only on a partial
+      // reading, which loses no points for what it did not read (an incomplete one's -61 is its gap, said as such)
+      if (scored !== null && riskSignalsOf(scored.signals, scored.scorer, of).length > 0) return "risk";
+
+      if (reading?.kind !== "partial") return "unfinished";
+
+      return scored !== null && isRisky(scored, of) ? "risk" : "gap";
+    case "cooldown":
+      if (scored === null || reading?.kind === "incomplete") return "fresh-unread";
+
+      return isRisky(scored, of) ? "risk" : "fresh-clear";
+    case "unscorable":
+      // only a size apm cannot read is apm's own gap; any other decision (the analysis limit, unreadable bytes) holds
+      return w.unscorable === "too-large" ? "gap" : "unfinished";
+    case "pending":
+    case "unavailable":
+    case "unchecked":
+      return "gap";
+    default: {
+      const _exhaustive: never = w.kind;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** Warnings as a list for a reason or a note: each `name@version: text` quoted, at most three. */
+const warningList = (ws: readonly Pick<WarningInput, "name" | "version" | "text">[]): string => `${ws
+  .slice(0, SHOWN)
+  .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))
+  .join(", ")}${ws.length > SHOWN ? ` and ${ws.length - SHOWN} more` : ""}`;
+
+/** One warning per name@version, the first kept. */
+function uniqueWarnings(ws: readonly WarningInput[]): WarningInput[] {
+  const seen = new Set<string>();
+
+  return ws.filter((w) => {
+    const key = `${w.name}@${w.version}`;
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+
+    return true;
+  });
 }
 
 /** A skip that is a version pulled from installs (revoked, being revoked, yanked) or confirmed malicious: not a score. */
@@ -334,14 +661,17 @@ export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean
  * warning reasons, at most three, else its heaviest signals' first evidence, each with its file and line) and the
  * link the registry's warning gives. Before this (review of a76b9fc, finding 4) a score of 30 with
  * `index.js:7: eval(body)` and a version page came back as review-first with only the score and the signal's label.
+ * `older` is what agent.ts did about a picked version inside the cooldown; absent, nothing was looked for.
  */
-export function explain(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Verdict {
+export function explain(input: ExplainInput): Verdict {
   // a review read that says the version is pulled (revoked, yanked or withheld) came after the resolve: the resolve's
   // evidence lines quote the package's source, which a withheld version no longer shows (review of b725ce9, finding 2)
   const shown = input.review.kind === "pulled" ? { evidence: [], url: null } : evidenceOf(input.resolved);
 
   return { ...decide(input), ...shown };
 }
+
+type ExplainInput = { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput; older?: OlderSearch };
 
 /** The page link the registry gave, when it is a web address; anything else is dropped rather than shown. */
 function pageUrl(raw: string | undefined): string | null {
@@ -356,7 +686,7 @@ function pageUrl(raw: string | undefined): string | null {
   }
 }
 
-function evidenceOf(resolve: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }["resolved"]): Pick<Verdict, "evidence" | "url"> {
+function evidenceOf(resolve: ResolvedInput): Pick<Verdict, "evidence" | "url"> {
   if (resolve.kind !== "ok") return { evidence: [], url: null };
 
   // the version's own score warning, not its cooldown one: the evidence is the score's
@@ -376,11 +706,12 @@ function evidenceOf(resolve: { name: string; range: string | null; resolved: Res
 /** A verdict before its evidence and link are added (explainInstall). */
 type Decided = Omit<Verdict, "evidence" | "url">;
 
-function decide(input: { name: string; range: string | null; resolved: ResolvedInput; review: ReviewInput }): Decided {
+function decide(input: ExplainInput): Decided {
   const { name, resolved, review } = input;
   const range = input.range ?? "latest";
   const asked = range === "latest" ? name : `${name}@${plain(range)}`;
-  const base = { name, range };
+  // every verdict that stops before the notes are worked out has none
+  const base = { name, range, notes: [] };
 
   // registry text can carry publisher text (a yank reason, an error): the summary is apm's words only, the reasons quote it
   switch (resolved.kind) {
@@ -459,50 +790,153 @@ function decide(input: { name: string; range: string | null; resolved: ResolvedI
     return { ...known, verdict: "unknown", summary: `apm could not read the AI reviews of ${id}'s dependencies, so it cannot say. Nothing was decided; try again.`, reasons: [], commands: null };
   }
 
-  // 3. what apm read but has not finished checking, most serious first
-  const lost = (report?.signals ?? []).filter((s) => s.points < 0).sort((a, b) => a.points - b.points);
-  const holds: { why: string; reason: string }[] = [];
-  const own = reviewHold(review);
-
-  if (own) holds.push({ why: own, reason: reviewReason(review) });
-  // a version published inside apm's cooldown installs with a warning (strict mode refuses it): a look first
+  // 3. a real risk in what would be installed: a person should look first (holds, most serious first). What apm did
+  // not finish is a note: the install goes ahead and the agent mentions it
+  const signals = report?.signals ?? [];
+  const lost = signals.filter((s) => s.points < 0).sort((a, b) => a.points - b.points);
+  const scorer = report?.scorer ?? null;
+  const risks = riskSignalsOf(signals, scorer, AS_VERSION);
+  // `scored`: the why already gives the score, so the summary does not repeat it
+  const holds: { why: string; reason: string; scored?: true }[] = [];
+  const depReviewNotes: Note[] = [];
+  const scoreText = report ? scoreTextOf(report) : null;
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
   const fresh = deps.warnings.find((w) => w.via.length === 0 && w.kind === "cooldown");
 
-  if (fresh) holds.push({ why: "it was published inside apm's 24-hour cooldown, so it has had little time to be looked at", reason: `The registry said: ${quoted(`${name}@${version}: ${fresh.text}`)}` });
+  if (review.kind === "reviewed" && review.state === "under-review") holds.push({ why: "the AI review flagged it and a person at apm has not decided yet", reason: reviewReason(review) });
+
+  if (risks[0]) {
+    const more = risks.length > 1 ? ` and ${plural(risks.length - 1, "more risk signal", "more risk signals")}` : "";
+
+    holds.push({ why: `apm found a risk signal in it: ${oneLine(risks[0].label)}${more}`, reason: "" });
+  }
+
+  // fail-closed: an analysis that did not read everything holds unless it records that its one gap is whole files left
+  // unread for their size or the byte budget
+  const reading = report ? readingOf({ scorer, signals, coverage: report.coverage ?? null }) : null;
+
+  if (reading?.kind === "incomplete") {
+    const unread = report?.signals.find((s) => isGap(s.id))?.evidence[0];
+
+    holds.push({ why: `apm could not fully analyse it (it ${scoreText ?? "has no score"})`, reason: unread === undefined ? "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size." : `apm could not fully analyse it: ${quoted(unread)}.`, scored: true });
+  }
+
+  // under the floor for what apm read: an incomplete analysis's -61 is said by its own hold above
+  if (report && report.score < SCORE_FLOOR && reading?.kind !== "incomplete") {
+    const label = oneLine(lost.find((s) => !isGap(s.id))?.label ?? "see the signals");
+
+    holds.push({ why: `it ${scoreText ?? ""}, under apm's floor of ${SCORE_FLOOR}, most of it for: ${label}`, reason: "", scored: true });
+  }
+
+  // no score: queued, or too large to score, is apm's own work not done; any other reason (the analysis limit, bytes
+  // apm cannot read, a registry that does not say) holds
+  const unscorable = report === null && ownWarning?.kind !== "pending" && !(ownWarning?.kind === "unscorable" && ownWarning.unscorable === "too-large");
+
+  if (unscorable) {
+    holds.push({ why: `apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} it, so nothing has read its code`, reason: ownWarning?.kind === "unscorable" ? `The registry said: ${quoted(ownWarning.text)}` : "" });
+  }
+
   const depReviews: DepReviews = deps.reviews;
 
   if (depReviews.kind === "on") {
     const { underReview, pending, noAnswer } = depReviews;
 
-    if (underReview.length > 0) holds.push({ why: "the AI review flagged a dependency and a person has not decided yet", reason: `The AI review flagged ${plural(underReview.length, "dependency", "dependencies")}; a person at apm is checking: ${listed(underReview)}.` });
+    if (underReview.length > 0) holds.push({ why: "the AI review flagged a dependency and a person at apm has not decided yet", reason: `The AI review flagged ${plural(underReview.length, "dependency", "dependencies")}; a person at apm is checking: ${listed(underReview)}.` });
 
-    if (pending.length > 0) holds.push({ why: "the AI review of a dependency has not finished", reason: `The AI review of ${plural(pending.length, "dependency", "dependencies")} has not finished: ${listed(pending)}.` });
+    if (pending.length > 0) depReviewNotes.push({ kind: "dependency-ai-review", text: `The AI review of ${plural(pending.length, "dependency", "dependencies")} has not finished: ${listed(pending)}.` });
 
-    if (noAnswer.length > 0) holds.push({ why: "the AI review of a dependency ended without an answer", reason: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
+    if (noAnswer.length > 0) depReviewNotes.push({ kind: "dependency-ai-review", text: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
   }
 
-  // what the registry warned about in the tree: it installs, but each was flagged
-  const flaggedDeps = deps.warnings.filter((w) => w.via.length > 0);
+  // what the registry warned about in the tree, each read for a real risk or a gap in apm's work
+  const flagged = deps.warnings.filter((w) => w.via.length > 0);
+  const byClass = (c: DepClass): WarningInput[] => uniqueWarnings(flagged.filter((w) => classifyDep(w) === c));
+  // a scored dependency the registry lists for a risk signal: over the floor it has no warning, and is still a risk
+  const listedRisks = deps.risks.filter((r) => isRisky(r, { kind: "dependency", name: r.name }) && !flagged.some((w) => w.name === r.name && w.version === r.version && classifyDep(w) === "risk"));
 
-  if (flaggedDeps.length > 0) {
+  const riskyDeps: Pick<WarningInput, "name" | "version" | "text">[] = [
+    ...byClass("risk"),
+    ...listedRisks.map((r) => ({ name: r.name, version: r.version, text: `scores ${r.score}/100, and apm found: ${riskSignalsOf(r.signals, r.scorer, { kind: "dependency", name: r.name }).map((x) => x.id).join(", ") || "a score under the floor for what it read"}` })),
+  ];
+
+  const unreadFresh = byClass("fresh-unread").filter((w) => !riskyDeps.some((r) => r.name === w.name && r.version === w.version));
+  const unfinished = byClass("unfinished").filter((w) => !riskyDeps.some((r) => r.name === w.name && r.version === w.version));
+
+  if (riskyDeps.length > 0) {
     holds.push({
-      why: `it brings in ${plural(flaggedDeps.length, "dependency", "dependencies")} apm flagged (published inside the cooldown, a score under ${SCORE_FLOOR}, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it)`,
-      reason: `apm flagged ${plural(flaggedDeps.length, "dependency", "dependencies")}: ${flaggedDeps
-        .slice(0, SHOWN)
-        .map((w) => quoted(`${w.name}@${w.version}: ${w.text}`))
-        .join(", ")}${flaggedDeps.length > SHOWN ? ` and ${flaggedDeps.length - SHOWN} more` : ""}.`,
+      why: `it brings in ${plural(riskyDeps.length, "dependency", "dependencies")} apm flagged for a risk signal or a score under ${SCORE_FLOOR}`,
+      reason: `apm flagged ${plural(riskyDeps.length, "dependency", "dependencies")} for a risk: ${warningList(riskyDeps)}.`,
     });
   }
 
-  if (report !== null && report.score < CLEAN_SCORE) holds.push({ why: `it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}`, reason: "" });
+  if (unfinished.length > 0) {
+    holds.push({
+      why: `it brings in ${plural(unfinished.length, "dependency", "dependencies")} apm could not fully analyse or score`,
+      reason: `apm could not fully analyse or score ${plural(unfinished.length, "dependency", "dependencies")}: ${warningList(unfinished)}.`,
+    });
+  }
+
+  // the cooldown is apm's main defence against a fresh malicious release: a version inside it that apm cannot clear
+  // stays with a person. explainFor already looked for an older version of the one picked
+  if (fresh) {
+    const older = input.older ?? { kind: "none" };
+    const why = older.kind === "gave-up" ? `it and the ${plural(older.looked - 1, "version", "versions")} before it in range were all published inside apm's 24-hour cooldown` : "it was published inside apm's 24-hour cooldown and no older version in range is past it";
+
+    holds.push({ why: `${why}, so it has had little time to be looked at`, reason: `The registry said: ${quoted(`${name}@${version}: ${fresh.text}`)}` });
+  }
+
+  if (unreadFresh.length > 0) {
+    holds.push({
+      why: `it brings in ${plural(unreadFresh.length, "dependency", "dependencies")} published inside apm's 24-hour cooldown with no score apm could check`,
+      reason: `Published inside the cooldown, with no score apm could check for a risk: ${warningList(unreadFresh)}.`,
+    });
+  }
+
+  // 4. the notes, in order: an older version picked, the version's AI review and score, then its dependencies
+  const notes: Note[] = [];
+
+  if (input.older?.kind === "picked") {
+    const passed = input.older.passedOver;
+
+    notes.push({ kind: "older-version", text: `apm picked ${id}, the newest version in range past its 24-hour cooldown. Newer, inside it: ${passed.slice(0, SHOWN).map((p) => quoted(`${name}@${p.version}: ${p.text}`)).join(", ")}.` });
+  }
+
+  const own = reviewNote(review);
+
+  if (own) notes.push(own);
+
+  if (report === null) {
+    // a reason that holds is said by its hold
+    if (!unscorable) {
+      const text =
+        ownWarning?.kind === "pending"
+          ? `apm is still analysing ${id}: it has no score yet, so nothing has read its code. Ask again in a minute for its score.`
+          : `apm cannot score ${id}, so nothing has read its code. The registry said: ${quoted(ownWarning?.text ?? "")}`;
+
+      notes.push({ kind: "not-scored", text });
+    }
+  } else {
+    // whole files left unread for their size or the byte budget, and recorded as the only gap: apm's own gap, not a
+    // risk, so the install goes ahead with what was not read said here
+    if (reading?.kind === "partial") notes.push({ kind: "partial-analysis", text: `apm read only part of ${id}: ${notReadText(reading)}, past the size apm reads of one file or the bytes one analysis reads. It ${scoreTextOf(report)} on the code it read.` });
+
+    if (reading?.kind !== "incomplete" && report.score < CLEAN_SCORE && holds.length === 0) notes.push({ kind: "lost-points", text: `${id} ${scoreTextOf(report)}, under the ${CLEAN_SCORE} the site shows as clean, for signals that are not risks; the reasons list them.` });
+  }
+
+  notes.push(...depReviewNotes);
+  const gaps = byClass("gap");
+
+  if (gaps.length > 0) notes.push({ kind: "dependency-gaps", text: `apm could not fully check ${plural(gaps.length, "dependency", "dependencies")}: ${warningList(gaps)}.` });
 
   if (deps.unchecked > 0) {
-    holds.push({
-      why: `apm could not score ${deps.unchecked} of its dependencies`,
-      reason: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => quoted(d.dependency)).join(", ")}.`,
-    });
+    notes.push({ kind: "dependency-gaps", text: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => quoted(d.dependency)).join(", ")}.` });
   }
 
+  const clearFresh = byClass("fresh-clear");
+
+  if (clearFresh.length > 0) notes.push({ kind: "dependency-cooldown", text: `${plural(clearFresh.length, "dependency was", "dependencies were")} published inside apm's 24-hour cooldown; apm scored ${clearFresh.length === 1 ? "it" : "them"} and found no risk: ${warningList(clearFresh)}.` });
+
+  // 5. the reasons: the first hold's, what the version lost points for, the other holds', then its review
   const reasons = holds.slice(0, 1).flatMap((h) => (h.reason ? [h.reason] : []));
 
   for (const s of lost.slice(0, SHOWN)) reasons.push(`${oneLine(s.label)} (${s.points} points${s.confidence === "possible" ? ", possible" : ""}).`);
@@ -511,52 +945,47 @@ function decide(input: { name: string; range: string | null; resolved: ResolvedI
 
   for (const h of holds.slice(1)) if (h.reason) reasons.push(h.reason);
 
-  if (!own) reasons.push(reviewReason(review));
+  if (!holds.some((h) => h.reason === reviewReason(review))) reasons.push(reviewReason(review));
 
   if (resolved.skipped.length > 0) reasons.push(`Newer versions were skipped: ${skippedText(resolved.skipped)}.`);
   const run = commands(name, version);
   const note = noReviewNote(aiReview);
-  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
-
-  // the version itself has no score: it installs, and nothing has read its code
-  if (report === null) {
-    if (ownWarning?.kind === "unscorable") reasons.unshift(`The registry said: ${quoted(ownWarning.text)}`);
-
-    return { ...known, verdict: "review-first", summary: ownWarning?.kind === "pending" ? `Installs, but ${id} is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute.${note}` : `Installs, but apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} ${id}${ownWarning?.kind === "unscorable" ? "" : " yet"}, so nothing has read its code. Review it before installing.${note}`, reasons, commands: run };
-  }
-
-  const scoreText = `scores ${report.score}/100 (${oneLine(report.grade)})`;
-  const incomplete = report.signals.find((s) => s.id === "incomplete");
-
-  // an analysis that did not read everything, or a score under the floor: it installs with a warning
-  if (incomplete) {
-    reasons.unshift(...incomplete.evidence.slice(0, SHOWN).map((e) => `apm did not read: ${quoted(e)}`));
-
-    return { ...known, verdict: "review-first", summary: `Installs, but apm could not fully analyse ${id}: it ${scoreText}, and the reasons say what apm did not read. Review it before installing.${note}`, reasons, commands: run };
-  }
-
-  // a partial reading (apm-score-v11): files left unread for their size or the byte budget cost no points, so it may
-  // score well; it still installs only with a warning, as an incomplete analysis does
-  const partial = report.coverage?.kind === "partial" ? report.coverage : null;
-
-  if (partial) {
-    reasons.unshift(`${notReadText(partial)}: past the size apm reads of one file, or the bytes one analysis reads.`);
-
-    return { ...known, verdict: "review-first", summary: `Installs, but apm read only part of ${id}: ${notReadText(partial)}. It scores ${report.score}/100 on the code it read. Review it before installing.${note}`, reasons, commands: run };
-  }
-
-  if (report.score < SCORE_FLOOR) return { ...known, verdict: "review-first", summary: `Installs, but ${id} ${scoreText}: it lost points: ${oneLine(lost[0]?.label ?? "see the signals")}. Review it before installing.${note}`, reasons, commands: run };
   const first = holds[0];
 
-  if (first) return { ...known, verdict: "review-first", summary: `Review ${id} before installing: it passes apm's install policy and ${scoreText}, but ${first.why}.${note}`, reasons, commands: run };
+  if (first) {
+    const standing = first.scored ? "It passes apm's install policy." : scoreText ? `It passes apm's install policy and ${scoreText}.` : "It passes apm's install policy and has no score yet.";
 
-  // a version apm never picked for AI review, or a registry that runs none, still installs on the static checks and a
-  // fully scored tree; the summary says so in its own words, and coverage says it as data
-  return {
-    ...known,
-    verdict: "install",
-    summary: `${id} passes apm's checks: it ${scoreText}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
-    reasons,
-    commands: run,
-  };
+    return { ...known, verdict: "review-first", summary: `Review ${id} before installing: ${first.why}. ${standing}${note}`, reasons, commands: run, notes };
+  }
+
+  // a version apm never picked for AI review, or a registry that runs none, still installs on the static checks; the
+  // summary says so in its own words, and coverage and the notes say it as data
+  const shown = notes.filter((n) => n.kind !== "no-ai-review");
+  const head = shown[0];
+
+  // nothing apm left unfinished (a version with no score always has a note)
+  if (head === undefined) {
+    return {
+      ...known,
+      verdict: "install",
+      summary: `${id} passes apm's checks: it ${scoreText ?? "has no score"}, is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.${note}`,
+      reasons,
+      commands: run,
+      notes,
+    };
+  }
+
+  const more = (n: number): string => (n > 0 ? `, and ${plural(n, "more note", "more notes")}` : "");
+
+  // no score: nothing has read the code, which the summary says first
+  if (report === null) {
+    const unread = ownWarning?.kind === "pending" ? "apm is still analysing it, so nothing has read its code yet" : "apm has no score for it, so nothing has read its code";
+
+    return { ...known, verdict: "install", summary: `Install ${id}: ${unread}, but nothing else apm checked needs a person to look first${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
+  }
+
+  // a partial reading says how much apm left unread
+  const why = head.kind === "partial-analysis" && reading?.kind === "partial" ? `apm read only part of ${id}: ${notReadText(reading)}, left unread for their size or its byte budget` : noteWhy(head, id);
+
+  return { ...known, verdict: "install", summary: `Install ${id}: it ${scoreTextOf(report)} and nothing apm found needs a person to look first, but ${why}${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
 }

@@ -25,6 +25,15 @@ export const CoverageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.string()), notes: z.array(z.string()).default([]) }),
 ]);
 
+/**
+ * A report's or a warning's coverage as the verdict reads it: null when none was sent (an earlier scorer or registry),
+ * `unreadable` when what was sent does not parse. The verdict lets a partial reading install only on a coverage it
+ * read (explain.ts readingOf), so an unreadable one holds like any other gap and never fails the whole answer.
+ */
+export type ReportCoverage = z.infer<typeof CoverageSchema> | { kind: "unreadable" };
+
+export const CoverageField = z.union([CoverageSchema, z.object({ kind: z.literal("unreadable") })]).nullable().catch({ kind: "unreadable" });
+
 export const ReportSchema = z.object({
   score: z.number(),
   grade: z.string(),
@@ -32,7 +41,9 @@ export const ReportSchema = z.object({
   capabilities: z.array(CapabilitySchema).default([]),
   notChecked: z.array(z.string()).optional(),
   facts: z.record(z.string(), z.unknown()).optional(),
-  coverage: CoverageSchema.nullish(),
+  coverage: CoverageField.optional(),
+  // the scorer that wrote the analysis: the verdict reads an earlier scorer's signal ids as it named them
+  scorer: z.string().nullish(),
 });
 
 export type Capability = z.infer<typeof CapabilitySchema>;
@@ -67,14 +78,22 @@ export const ProjectPeer = z.object({ dependency: z.string(), via: z.array(z.str
  * `projectPeers`: required peers the project provides (ProjectPeer).
  */
 export const Tree = z
-  .object({ unchecked: z.number(), uncheckedDeps: z.array(UncheckedDep).default([]), packages: z.array(CheckedPackage).default([]), projectPeers: z.array(ProjectPeer).default([]), reviews: TreeReviews.optional() })
+  .object({
+    unchecked: z.number(),
+    uncheckedDeps: z.array(UncheckedDep).default([]),
+    packages: z.array(CheckedPackage).default([]),
+    projectPeers: z.array(ProjectPeer).default([]),
+    reviews: TreeReviews.optional(),
+    // dependencies the registry scored with a risk signal, whatever the score (older registries send none)
+    risks: z.array(z.object({ name: z.string(), version: z.string(), via: z.array(z.string()), scorer: z.string().nullish(), score: z.number(), signals: z.array(z.object({ id: z.string(), points: z.number() })) })).default([]),
+  })
   .loose();
 
 /**
  * Why an install that goes ahead was flagged: a version published inside the cooldown, a score under the floor, an
  * incomplete analysis, a version apm cannot score or has not scored yet, a dependency the registry could not look up,
  * or a walk cut short (older registries send none, and refused these instead). `score` and `grade` only for a scored
- * version.
+ * version; `signals` for a scored one from a registry with the agent-native verdict.
  */
 export const InstallWarning = z.object({
   name: z.string(),
@@ -86,6 +105,14 @@ export const InstallWarning = z.object({
   reasons: z.array(z.string()),
   url: z.string(),
   via: z.array(z.string()),
+  // every signal that cost a scored version points (id and points), for the verdict's risk check; older registries
+  // send none
+  signals: z.array(z.object({ id: z.string(), points: z.number() })).optional(),
+  scorer: z.string().nullish(),
+  // how much that score's analysis read, as stored; a partial reading of a dependency installs only on this record
+  coverage: CoverageField.optional(),
+  // for unscorable: why the registry decided the version will never be scored (too-large, analysis-limit, ...)
+  unscorable: z.string().optional(),
 });
 
 export type InstallWarning = z.infer<typeof InstallWarning>;

@@ -14,9 +14,9 @@ const clean: ResolveOutcome = {
   kind: "ok",
   version: "1.3.0",
   source: "upstream",
-  report: { score: 92, grade: "A", signals: [], notChecked: [] },
+  report: { score: 92, grade: "A", signals: [], notChecked: [], scorer: "apm-score-v10" },
   skipped: [],
-  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
+  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [], risks: [] },
 };
 
 /** The longest a response may be stored, in seconds; 0 for no-store or no-cache. */

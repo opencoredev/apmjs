@@ -37,7 +37,24 @@ const CoverageWire = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("partial"), omittedFiles: z.number(), omittedBytes: z.number(), reasons: z.array(z.string()), notes: z.array(z.string()).default([]) }),
 ]);
 
-const ReportWire = z.object({ score: z.number(), grade: z.string(), signals: z.array(SignalWire), notChecked: z.array(z.string()).optional(), coverage: CoverageWire.nullish() }).loose();
+/**
+ * A report's or a warning's coverage as the verdict reads it: null when none was sent (an earlier scorer or registry),
+ * `unreadable` when what was sent does not parse. The verdict lets a partial reading install only on a coverage it
+ * read (verdict.ts readingOf), so an unreadable one holds like any other gap and never fails the whole answer.
+ */
+export type ReportCoverage = z.infer<typeof CoverageWire> | { kind: "unreadable" };
+
+export const CoverageField = z.union([CoverageWire, z.object({ kind: z.literal("unreadable") })]).nullable().catch({ kind: "unreadable" });
+
+const ReportWire = z.object({ score: z.number(), grade: z.string(), signals: z.array(SignalWire), notChecked: z.array(z.string()).optional(), coverage: CoverageField.optional(), scorer: z.string().optional() }).loose();
+
+const LostSignalWire = z.object({ id: z.string(), points: z.number() });
+
+/**
+ * A dependency the walk scored whose score carries a risk signal, whatever the score (the registry lists it even with
+ * no warning); a registry before the agent-native verdict sends none.
+ */
+const RiskyDepWire = z.object({ name: z.string(), version: z.string(), via: z.array(z.string()), scorer: z.string().nullish(), score: z.number(), signals: z.array(LostSignalWire) });
 
 const DepRefWire = z.object({ name: z.string(), version: z.string() });
 
@@ -62,10 +79,23 @@ const WarningWire = z
     // the package's or the version's page on the website
     url: z.string().optional(),
     via: z.array(z.string()),
+    // a scored version's score, and every signal that cost it points (id and points); the verdict reads them for a risk
+    // signal. Absent when the version has no score, and from registries before the agent-native verdict
+    score: z.number().nullish(),
+    signals: z.array(LostSignalWire).optional(),
+    // the scorer whose ids `signals` are
+    scorer: z.string().nullish(),
+    // how much that score's analysis read, as stored; a partial reading of a dependency installs only on this record
+    coverage: CoverageField.optional(),
+    // for unscorable: why the registry decided the version will never be scored (too-large, analysis-limit, ...)
+    unscorable: z.string().optional(),
   })
   .loose();
 
-export type WarningInput = Pick<z.infer<typeof WarningWire>, "name" | "version" | "kind" | "text" | "reasons" | "url" | "via">;
+export type WarningInput = Pick<z.infer<typeof WarningWire>, "name" | "version" | "kind" | "text" | "reasons" | "url" | "via" | "score" | "signals" | "scorer" | "unscorable"> & { coverage?: ReportCoverage | null };
+
+/** A dependency with a risk signal, as the verdict reads it: `scorer` null when the registry did not say. */
+export type RiskyDep = { name: string; version: string; via: string[]; scorer: string | null; score: number; signals: { id: string; points: number }[] };
 
 /** GET /-/apm/v1/resolve with a 200: the newest version in range that passes the policy, and its dependency walk. */
 export const ResolveOkWire = z.object({
@@ -80,6 +110,7 @@ export const ResolveOkWire = z.object({
       unchecked: z.number().int().min(0).optional(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })).default([]),
       reviews: TreeReviewsWire.optional(),
+      risks: z.array(RiskyDepWire).default([]),
     })
     .loose()
     .optional(),
@@ -95,7 +126,7 @@ export type DepReviews = z.infer<typeof TreeReviewsWire> | { kind: "unknown" };
  * The dependency walk as the verdict reads it: what apm could not score (the total and up to 50 named), the AI
  * reviews, and the registry's warnings on the install.
  */
-export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[] };
+export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string; reason: string }[]; reviews: DepReviews; warnings: WarningInput[]; risks: RiskyDep[] };
 
 /**
  * GET /-/apm/v1/resolve with a 422: nothing in range passes (revoked, yanked, confirmed malicious), or the newest that
@@ -114,7 +145,7 @@ export const ResolveRefusedWire = z.object({
  * score floor of 40 as warnings) says about a range.
  */
 export type ResolveOutcome =
-  | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[]; coverage?: z.infer<typeof CoverageWire> | null } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
+  | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[]; coverage?: ReportCoverage | null; scorer: string | null } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
   | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable" };
@@ -133,9 +164,15 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
       kind: "ok",
       version: ok.data.version,
       source: ok.data.source ?? "local",
-      report: r ? { score: r.score, grade: r.grade, signals: r.signals, notChecked: r.notChecked ?? [], coverage: r.coverage ?? null } : null,
+      report: r ? { score: r.score, grade: r.grade, signals: r.signals, notChecked: r.notChecked ?? [], coverage: r.coverage ?? null, scorer: r.scorer ?? null } : null,
       skipped: ok.data.skipped,
-      deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" }, warnings: ok.data.warnings },
+      deps: {
+        unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length),
+        uncheckedDeps,
+        reviews: tree?.reviews ?? { kind: "unknown" },
+        warnings: ok.data.warnings,
+        risks: (tree?.risks ?? []).map((d) => ({ ...d, scorer: d.scorer ?? null })),
+      },
     };
   }
 

@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "pg";
 import { z } from "zod";
-import { analyze, type Analysis as Scored } from "@apm/core";
+import { analyze, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
 import { MAX_ROOT_CANDIDATES, resolveResponse, scanResponse } from "../src/apm.ts";
@@ -43,6 +43,8 @@ type V = {
   cpu?: string[];
   /** Filler in the manifest, to make a row big. */
   pad?: string;
+  /** index.js, when it is not the clean default; the analysis stored is of this file. */
+  code?: string;
 };
 
 type P = { name: string; latest?: string; versions: V[] };
@@ -60,11 +62,11 @@ const v = (version: string, extra: Omit<V, "version"> = {}): V => ({ version, ..
 const pkg = (name: string, extra: Omit<V, "version"> = {}): P => ({ name, versions: [v("1.0.0", extra)] });
 
 /** A small clean package's stored analysis. */
-function analysisOf(name: string, version: string): Scored {
+function analysisOf(name: string, version: string, code = "module.exports = 1;\n"): Scored {
   const manifest = { name, version, main: "index.js", license: "MIT" };
   const file = (path: string, text: string) => ({ path, size: text.length, mode: 0o644, data: encoder.encode(text) });
 
-  return analyze({ name, manifest, files: [file("package.json", JSON.stringify(manifest)), file("index.js", "module.exports = 1;\n")], publisher: "u", previousPublishers: [] });
+  return analyze({ name, manifest, files: [file("package.json", JSON.stringify(manifest)), file("index.js", code)], publisher: "u", previousPublishers: [] });
 }
 
 async function seed(url: string, packages: readonly P[]): Promise<void> {
@@ -79,12 +81,12 @@ async function seed(url: string, packages: readonly P[]): Promise<void> {
       await c.query(`INSERT INTO packages (name, created_at, modified_at, dist_tags) VALUES ($1, 0, 0, $2::jsonb)`, [p.name, JSON.stringify({ latest })]);
 
       for (const x of p.versions) {
-        const { version, ageMs, status, statusReason, ...fields } = x;
+        const { version, ageMs, status, statusReason, code, ...fields } = x;
         const manifest = { name: p.name, version, main: "index.js", license: "MIT", ...fields };
         await c.query(
           `INSERT INTO versions (package, version, manifest, shasum, integrity, size, tarball_key, published_at, published_by, score, status, status_reason)
            VALUES ($1, $2, $3::jsonb, $4, 'sha1-x', 10, 'sha512/x', $5, 'u', $6::jsonb, $7, $8)`,
-          [p.name, version, JSON.stringify(manifest), "0".repeat(40), NOW - (ageMs ?? 10 * DAY), JSON.stringify(analysisOf(p.name, version)), status ?? "active", statusReason ?? null],
+          [p.name, version, JSON.stringify(manifest), "0".repeat(40), NOW - (ageMs ?? 10 * DAY), JSON.stringify(analysisOf(p.name, version, code)), status ?? "active", statusReason ?? null],
         );
       }
     }
@@ -115,6 +117,7 @@ const ResolveBody = z.object({
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
       packages: z.array(z.object({ name: z.string(), version: z.string() })),
       skippedForPlatform: z.array(z.object({ dependency: z.string(), version: z.string(), reason: z.string() })).default([]),
+      risks: z.array(z.object({ name: z.string(), version: z.string(), via: z.array(z.string()), scorer: z.string(), score: z.number(), signals: z.array(z.object({ id: z.string(), points: z.number() })) })).default([]),
     })
     .optional(),
 });
@@ -136,6 +139,9 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
     pkg("cool-app", { dependencies: { "fresh-dep": "^1.0.0" } }),
     { name: "fresh-root", versions: [v("1.0.0"), v("1.1.0", { ageMs: 5 * HOUR })] },
     { name: "only-fresh", versions: [v("1.0.0", { ageMs: 30 * 60_000 })] },
+    // review of abcbb18: a dependency that reads ~/.npmrc scores 70, over the floor, so it has no warning
+    pkg("npmrc-dep", { code: "const fs = require('fs');\nmodule.exports = () => fs.readFileSync(require('os').homedir() + '/.npmrc', 'utf8');\n" }),
+    pkg("npmrc-app", { dependencies: { "npmrc-dep": "^1.0.0" } }),
     // 2. peers
     pkg("peer-a"),
     pkg("needs-peer", { peerDependencies: { "peer-a": "^1.0.0" } }),
@@ -277,6 +283,24 @@ describe("the resolve walk and the scan, for the tree that installs", () => {
       expect(names(r)).toEqual(["fresh-dep@1.0.0"]);
       expect(r.body.tree?.blocks).toEqual([]);
       expect(r.body.warnings).toEqual([{ name: "fresh-dep", version: "1.0.0", kind: "cooldown", text: "published 2 hours ago, inside apm's 24-hour cooldown", via: ["cool-app@1.0.0"] }]);
+      // the agent-native verdict: a fresh dependency apm scored carries its lost signals (none here), so the verdict
+      // can tell it from one apm has not read
+      expect(z.object({ warnings: z.array(z.object({ signals: z.array(z.object({ id: z.string(), points: z.number() })).optional() })) }).parse(JSON.parse(r.raw)).warnings.map((w) => w.signals)).toEqual([[]]);
+    });
+
+    // review of abcbb18, P1: a dependency's risk signal was sent only with a warning, and a score of 40 or more has none
+    test("a dependency with a risk signal over the floor is listed in tree.risks, with its scorer and lost signals", async () => {
+      const r = await resolve("npmrc-app");
+
+      expect(r.status).toBe(200);
+      expect(r.body.warnings).toEqual([]);
+      const risk = r.body.tree?.risks ?? [];
+
+      expect(risk.map((d) => [d.name, d.version, d.via, d.scorer])).toEqual([["npmrc-dep", "1.0.0", ["npmrc-app@1.0.0"], SCORER]]);
+      expect(risk[0]?.score).toBeGreaterThanOrEqual(40);
+      expect(risk[0]?.signals.map((s) => s.id)).toContain("credential-read");
+      // a clean dependency is not listed
+      expect((await resolve("cool-app")).body.tree?.risks).toEqual([]);
     });
 
     test("strict mode refuses it, listing it as the block", async () => {

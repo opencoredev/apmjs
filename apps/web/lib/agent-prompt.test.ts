@@ -33,7 +33,9 @@ describe("packagePrompt", () => {
   test("installs with the verdict's own command, not a CLI the person may not have", () => {
     const p = packagePrompt({ name: "zod" });
 
-    expect(p).toContain("run the verdict's command for this project's package manager");
+    expect(p).toContain("run the verdict's command for this project's package manager, without asking me first.");
+    // the agent-native verdict: what apm did not finish comes back as notes, said after the install
+    expect(p).toContain("the verdict's summary and its notes, if any.");
     expect(p).not.toContain("apm add");
     expect(p).not.toContain("--strict");
   });
@@ -66,6 +68,7 @@ describe("setupPrompt", () => {
   });
 
   test("the saved rule waits for the person's approval on review-first, and both docs give the same line", () => {
+    expect(INSTRUCTIONS_LINE).toContain("On install, run the command it gives for this project's package manager, then tell me its notes, if any.");
     expect(INSTRUCTIONS_LINE).toContain("On review-first, show me the reasons and run that command only after I approve.");
     expect(INSTRUCTIONS_LINE).toContain("On anything else, or if it gives no command for this project's package manager, do not install; tell me why.");
     expect(readFileSync(join(import.meta.dir, "../../../docs/AGENTS.md"), "utf8")).toContain(INSTRUCTIONS_LINE);

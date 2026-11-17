@@ -6,7 +6,7 @@ import { ExcerptAnswer } from "../file-excerpt";
 import { ReviewAnswer } from "../review-schema";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
 import { PUBLIC_REGISTRY_URL, SITE_URL } from "./site";
-import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, VERDICTS } from "./verdict";
+import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, NOTE_KINDS, VERDICTS } from "./verdict";
 
 const Signal = z.object({
   id: z.string().describe("Stable signal id, such as install-script, network, shell-exec, eval, credential-access, obfuscated"),
@@ -65,6 +65,10 @@ const ResolveAnswer = z.object({
     unchecked: z.number(),
     uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string(), via: z.array(z.string()) })),
     skippedForPlatform: z.array(z.object({ dependency: z.string(), version: z.string(), reason: z.string(), via: z.array(z.string()) })).optional().describe("Optional packages built for another platform than os and cpu: not installed there, so not checked"),
+    risks: z
+      .array(z.object({ name: z.string(), version: z.string(), via: z.array(z.string()), scorer: z.string(), score: z.number(), signals: z.array(z.object({ id: z.string(), points: z.number() })) }))
+      .optional()
+      .describe("Dependencies the walk scored whose score carries a risk signal, whatever the score (at most 50): the install verdict sends them to a person. signals: every signal that cost points; scorer: the analysis's"),
     projectPeers: z
       .array(z.object({ dependency: z.string(), via: z.array(z.string()), kind: z.enum(["lockfile", "newest", "unknown"]), version: z.string().nullable() }))
       .optional()
@@ -90,6 +94,9 @@ const Verdict = z.object({
     .describe("What the verdict rests on"),
   evidence: z.array(z.string()).describe("What the version lost points for, at most three, each with the file and line it cites; publisher text, quoted in code spans"),
   url: z.string().nullable().describe("The version's page on the website, when the registry gave one"),
+  notes: z
+    .array(z.object({ kind: z.enum(NOTE_KINDS), text: z.string() }))
+    .describe("What apm did not finish or did differently (an AI review not finished, a dependency not scored, an older version picked past the 24-hour cooldown). Never a reason to stop: on install, install, then mention them"),
 });
 
 const RecentAnswer = z.object({

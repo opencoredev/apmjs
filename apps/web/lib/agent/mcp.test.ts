@@ -140,9 +140,9 @@ describe("tools", () => {
         kind: "ok",
         version: "1.3.0",
         source: "upstream",
-        report: { score: 92, grade: "A", signals: [], notChecked: [] },
+        report: { score: 92, grade: "A", signals: [], notChecked: [], scorer: "apm-score-v10" },
         skipped: [],
-        deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
+        deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [], risks: [] },
       }),
       reviews: { "left-pad@1.3.0": REVIEW_CLEAN },
     });

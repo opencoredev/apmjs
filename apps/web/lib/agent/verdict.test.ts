@@ -3,11 +3,17 @@
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 import cases from "../../../../tests/fixtures/explain-verdicts.json";
-import { explainFor, parsePackageSpec } from "./explain";
-import { parseResolve, type ResolveOutcome } from "./source";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { satisfies } from "../../../../packages/registry/src/semver";
+import { explainFor, MAX_OLDER_LOOKUPS, olderRange, parsePackageSpec } from "./explain";
+import { CoverageField, parseResolve, type ResolveOutcome } from "./source";
 import { fakeSource, NETWORK, REVIEW_CLEAN, signal } from "./testing";
 import { ReviewAnswer } from "../review-schema";
-import { AI_REVIEW_COVERAGE, DEPENDENCY_COVERAGE, explainInstall, reviewInput, VERDICTS, verdictText, type ReviewInput } from "./verdict";
+import { AI_REVIEW_COVERAGE, AS_VERSION, DEPENDENCY_COVERAGE, ESTABLISHED_DEPENDENCY_NAMES, explainInstall, GAP_SIGNALS, isRisky, LEGACY_RISK_SIGNALS, NOTE_KINDS, reviewInput, readingOf, RISK_SIGNALS, riskSignalsOf, VERDICTS, verdictText, type OlderSearch, type ReviewInput } from "./verdict";
+
+/** A coverage as the registry sends it, read through this copy's own parser: null when none was sent. */
+const readCoverage = CoverageField.optional().transform((c) => c ?? null);
 
 // ---------- the shared cases ----------
 
@@ -22,13 +28,22 @@ const Case = z.object({
       score: z.number().nullable(),
       // a partial reading (apm-score-v11): how much the registry's score did not read
       partial: z.object({ omittedFiles: z.number(), omittedBytes: z.number() }).optional(),
+      // the report's coverage exactly as the registry sends it, read through this copy's own parser (CoverageField);
+      // absent, it is built from `partial` (reasons over-budget) or is complete
+      coverage: z.unknown().optional(),
       // `id` and `evidence` for a signal the verdict reads by id (incomplete); the rest are s0, s1, …
       lost: z.array(z.object({ label: z.string(), points: z.number(), id: z.string().optional(), evidence: z.array(z.string()).default([]) })),
       skipped: z.array(z.object({ version: z.string(), reason: z.string() })),
       unchecked: z.number(),
       uncheckedDeps: z.array(z.object({ dependency: z.string(), reason: z.string() })),
       // the registry's warnings on the install (resolve's `warnings`): via empty for the version itself
-      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()) })).default([]),
+      warnings: z.array(z.object({ name: z.string(), version: z.string(), kind: z.enum(["low-score", "incomplete", "unscorable", "pending", "unavailable", "unchecked", "cooldown"]), text: z.string(), reasons: z.array(z.string()).optional(), url: z.string().optional(), via: z.array(z.string()), score: z.number().nullish(), signals: z.array(z.object({ id: z.string(), points: z.number() })).optional(), scorer: z.string().nullish(), coverage: z.unknown().optional(), unscorable: z.string().optional() })).default([]),
+      // the registry's tree.risks: dependencies it scored with a risk signal, whatever the score
+      risks: z.array(z.object({ name: z.string(), version: z.string(), via: z.array(z.string()), scorer: z.string().nullable(), score: z.number(), signals: z.array(z.object({ id: z.string(), points: z.number() })) })).default([]),
+      // the scorer that wrote the version's analysis; absent, the current one
+      scorer: z.string().nullable().default("apm-score-v11"),
+      // what the explain step did about a picked version inside the cooldown (passed in as `older`); absent, nothing
+      older: z.discriminatedUnion("kind", [z.object({ kind: z.literal("picked"), passedOver: z.array(z.object({ version: z.string(), text: z.string() })) }), z.object({ kind: z.literal("none") }), z.object({ kind: z.literal("gave-up"), looked: z.number() })]).optional(),
       depReviews: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("off") }),
         z.object({ kind: z.literal("unknown") }),
@@ -54,6 +69,8 @@ const Case = z.object({
     // the verdict's evidence lines and page link, exactly; a case that leaves them out does not check them
     evidence: z.array(z.string()).optional(),
     url: z.string().nullable().optional(),
+    // the verdict's notes, exactly; a case that leaves them out does not check them
+    notes: z.array(z.object({ kind: z.enum(NOTE_KINDS), text: z.string() })).optional(),
   }),
 });
 
@@ -81,9 +98,9 @@ function resolveOf(c: z.infer<typeof Case>["resolve"]): ResolveOutcome {
         kind: "ok",
         version: c.version,
         source: "upstream",
-        report: c.score === null ? null : { score: c.score, grade: c.partial ? "P" : grade(c.score), signals: c.lost.map((l, i) => signal({ id: l.id ?? `s${i}`, label: l.label, points: l.points, evidence: l.evidence })), notChecked: [], coverage: c.partial ? { kind: "partial", omittedFiles: c.partial.omittedFiles, omittedBytes: c.partial.omittedBytes, reasons: ["over-budget"], notes: [] } : { kind: "complete" } },
+        report: c.score === null ? null : { score: c.score, grade: c.partial ? "P" : grade(c.score), signals: c.lost.map((l, i) => signal({ id: l.id ?? `s${i}`, label: l.label, points: l.points, evidence: l.evidence })), notChecked: [], coverage: c.coverage !== undefined ? readCoverage.parse(c.coverage) : c.partial ? { kind: "partial", omittedFiles: c.partial.omittedFiles, omittedBytes: c.partial.omittedBytes, reasons: ["over-budget"], notes: [] } : { kind: "complete" }, scorer: c.scorer },
         skipped: c.skipped,
-        deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews, warnings: c.warnings },
+        deps: { unchecked: c.unchecked, uncheckedDeps: c.uncheckedDeps, reviews: c.depReviews, warnings: c.warnings.map((w) => ({ ...w, coverage: readCoverage.parse(w.coverage) })), risks: c.risks },
       };
     case "refused":
     case "missing":
@@ -97,11 +114,16 @@ function resolveOf(c: z.infer<typeof Case>["resolve"]): ResolveOutcome {
   }
 }
 
+/** A case's `older`, as the explain step would pass it. */
+function olderOf(c: z.infer<typeof Case>["resolve"]): OlderSearch {
+  return c.kind === "ok" && c.older !== undefined ? c.older : { kind: "not-needed" };
+}
+
 describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () => {
   for (const c of CASES) {
     test(c.name, () => {
       const review = reviewOf(c.review);
-      const v = explainInstall({ name: "x", range: null, resolve: resolveOf(c.resolve), review });
+      const v = explainInstall({ name: "x", range: null, resolve: resolveOf(c.resolve), review, older: olderOf(c.resolve) });
 
       expect(v.verdict).toBe(c.expect.verdict);
       expect(v.summary).toBe(c.expect.summary);
@@ -114,21 +136,58 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       if (c.expect.evidence !== undefined) expect(v.evidence).toEqual(c.expect.evidence);
 
       if (c.expect.url !== undefined) expect(v.url).toBe(c.expect.url);
+
+      if (c.expect.notes !== undefined) expect(v.notes).toEqual(c.expect.notes);
       expect(v.summary).not.toMatch(/\bsafe\b/);
     });
   }
 
-  test("only a version apm read in full, with nothing pending anywhere in its tree, gets install", () => {
-    const installs = CASES.filter((c) => c.expect.verdict === "install");
-
-    for (const c of installs) {
+  // the agent-native policy: review-first means a person should look, so an install never carries a real risk, and
+  // a real risk is never an install
+  test("no install carries a risk signal, an open AI flag, a risky dependency or a fresh version apm cannot clear", () => {
+    for (const c of CASES.filter((x) => x.expect.verdict === "install")) {
       expect(c.resolve.kind).toBe("ok");
 
       if (c.resolve.kind !== "ok") continue;
-      expect(c.resolve.unchecked).toBe(0);
-      expect(c.resolve.depReviews.kind === "unknown" || (c.resolve.depReviews.kind === "on" && c.resolve.depReviews.confirmed.length + c.resolve.depReviews.underReview.length + c.resolve.depReviews.pending.length + c.resolve.depReviews.noAnswer.length > 0)).toBe(false);
-      expect(["queued", "leased", "failed", "unreadable", "pulled"]).not.toContain(reviewOf(c.review).kind);
+      const signals = c.resolve.lost.map((l, i) => ({ id: l.id ?? `s${i}`, points: l.points }));
+
+      expect(riskSignalsOf(signals, c.resolve.scorer, AS_VERSION)).toEqual([]);
+      expect(c.resolve.score === null || !isRisky({ score: c.resolve.score, signals, scorer: c.resolve.scorer }, AS_VERSION)).toBe(true);
+      expect(c.resolve.risks.filter((r) => isRisky(r, { kind: "dependency", name: r.name }))).toEqual([]);
+      expect(c.resolve.depReviews.kind === "off" || (c.resolve.depReviews.kind === "on" && c.resolve.depReviews.underReview.length + c.resolve.depReviews.confirmed.length === 0)).toBe(true);
+      expect(c.resolve.warnings.some((w) => w.via.length === 0 && w.kind === "cooldown")).toBe(false);
+      expect(c.resolve.warnings.some((w) => w.via.length > 0 && w.kind === "cooldown" && w.signals === undefined)).toBe(false);
+
+      const review = reviewOf(c.review);
+
+      expect(["unreadable", "pulled"]).not.toContain(review.kind);
+      expect(review.kind === "reviewed" && (review.state === "under-review" || review.state === "confirmed")).toBe(false);
     }
+  });
+
+  test("every case with a risk signal in the version is review-first or worse, never install", () => {
+    const risky = CASES.filter((c) => c.resolve.kind === "ok" && riskSignalsOf(c.resolve.lost.map((l, i) => ({ id: l.id ?? `s${i}`, points: l.points })), c.resolve.scorer, AS_VERSION).length > 0);
+
+    expect(risky.length).toBeGreaterThan(2);
+
+    for (const c of risky) expect(c.expect.verdict).not.toBe("install");
+  });
+
+  test("an install with something apm did not finish says so in its notes", () => {
+    for (const c of CASES.filter((x) => x.expect.verdict === "install" && x.expect.summary.startsWith("Install "))) expect(c.expect.notes?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  test("the established-name exception is the same list in both copies", () => {
+    const cli = readFileSync(join(import.meta.dir, "../../../../packages/cli/src/explain.ts"), "utf8");
+
+    expect(cli).toContain(`export const ESTABLISHED_DEPENDENCY_NAMES = ${JSON.stringify(ESTABLISHED_DEPENDENCY_NAMES)} as const;`);
+  });
+
+  test("both copies read the same risk signals and gaps (packages/cli/src/explain.ts)", () => {
+    const cli = readFileSync(join(import.meta.dir, "../../../../packages/cli/src/explain.ts"), "utf8");
+
+    expect(cli).toContain(`export const RISK_SIGNALS = ${JSON.stringify(RISK_SIGNALS).replaceAll(",", ", ")} as const;`);
+    expect(cli).toContain(`export const GAP_SIGNALS = ${JSON.stringify(GAP_SIGNALS).replaceAll(",", ", ")} as const;`);
   });
 });
 
@@ -138,9 +197,9 @@ const ok = (score: number, over: Partial<Extract<ResolveOutcome, { kind: "ok" }>
   kind: "ok",
   version: "1.3.0",
   source: "upstream",
-  report: { score, grade: grade(score), signals: score < 100 ? [NETWORK] : [], notChecked: [] },
+  report: { score, grade: grade(score), signals: score < 100 ? [NETWORK] : [], notChecked: [], scorer: "apm-score-v10" },
   skipped: [],
-  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [] },
+  deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [], risks: [] },
   ...over,
 });
 
@@ -235,11 +294,172 @@ describe("explainFor reads the registry", () => {
     expect(v.commands).toBeNull();
   });
 
-  test("a queued review is review-first", async () => {
+  // the agent-native policy: apm's own unfinished review never interrupts anyone
+  test("a queued review installs, with a note", async () => {
     const source = fakeSource({ resolve: () => clean, reviews: { "zod@1.3.0": { ...REVIEW_CLEAN, status: "queued", job: "queued", review: null } } });
+    const v = await explainFor({ name: "zod", range: null, source });
 
-    expect((await explainFor({ name: "zod", range: null, source })).verdict).toBe("review-first");
+    expect(v.verdict).toBe("install");
+    expect(v.notes.map((n) => n.kind)).toEqual(["ai-review-pending"]);
   });
+});
+
+describe("the risk rules", () => {
+  test("readingOf: a partial reading installs only on the current scorer's record that its one gap is size or budget", () => {
+    const partial = (reasons: readonly string[] | string) => readCoverage.parse({ kind: "partial", omittedFiles: 2, omittedBytes: 9, reasons, notes: [] });
+
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: partial(["too-large", "over-budget"]) })).toEqual({ kind: "partial", omittedFiles: 2, omittedBytes: 9 });
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: { kind: "complete" } }).kind).toBe("complete");
+    // an earlier scorer stored no coverage, and counted every file it left unread as a gap signal
+    expect(readingOf({ scorer: "apm-score-v10", signals: [], coverage: null }).kind).toBe("complete");
+    // the rest hold: a gap signal, a stop, an empty, unknown or malformed list, no record from the current scorer, an
+    // earlier scorer's partial reading
+    expect(readingOf({ scorer: "apm-score-v11", signals: [{ id: "incomplete" }], coverage: partial(["over-budget"]) }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [{ id: "unanalyzed-files" }], coverage: { kind: "complete" } }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: partial(["stopped"]) }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: partial([]) }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: partial(["too-large", "new-reason"]) }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: partial("over-budget") }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: null }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: "apm-score-v10", signals: [], coverage: partial(["over-budget"]) }).kind).toBe("incomplete");
+    expect(readingOf({ scorer: null, signals: [], coverage: partial(["over-budget"]) }).kind).toBe("incomplete");
+  });
+
+  test("isRisky: any risk signal that cost points, or a score under the floor", () => {
+    for (const id of RISK_SIGNALS) expect(isRisky({ score: 95, signals: [{ id, points: -5 }], scorer: "apm-score-v10" }, AS_VERSION)).toBe(true);
+    // shown but not scored, or a capability: not a risk
+    expect(isRisky({ score: 100, signals: [{ id: "obfuscated", points: 0 }], scorer: "apm-score-v10" }, AS_VERSION)).toBe(false);
+
+    for (const id of ["install-script", "install-shell", "install-eval", "new-publisher", "new-dependency", "credential-mention", "encoded-data", "undeclared-capability", "deprecated"]) expect(isRisky({ score: 80, signals: [{ id, points: -15 }], scorer: "apm-score-v10" }, AS_VERSION)).toBe(false);
+    // no add-back for what apm could not read: an incomplete analysis holds on its own (readingOf), and its score counts
+    expect(isRisky({ score: 39, signals: [{ id: "incomplete", points: -61 }], scorer: "apm-score-v10" }, AS_VERSION)).toBe(true);
+    expect(isRisky({ score: 35, signals: [{ id: "risky-dependency", points: -30 }, { id: "new-publisher", points: -10 }, { id: "deprecated", points: -5 }, { id: "credential-mention", points: -10 }, { id: "new-dependency", points: -5 }, { id: "undeclared-capability", points: -5 }], scorer: "apm-score-v10" }, AS_VERSION)).toBe(true);
+  });
+
+  // review of 307521b, P2: the blanket dependency exemption let any look-alike dependency through; only an audited name
+  test("a look-alike name counts in a dependency too, except an established one (safer-buffer)", () => {
+    const signals = [{ id: "typosquat", points: -20 }];
+    const scored = { score: 80, signals, scorer: "apm-score-v10" };
+
+    expect(isRisky(scored, AS_VERSION)).toBe(true);
+    expect(isRisky(scored, { kind: "dependency", name: "safer-buffer" })).toBe(false);
+    expect(isRisky(scored, { kind: "dependency", name: "lodahs" })).toBe(true);
+    // asked for by name, safer-buffer's look-alike signal counts: the agent picked it
+    expect(isRisky({ ...scored, signals }, AS_VERSION)).toBe(true);
+    expect(isRisky({ score: 60, signals: [...signals, { id: "remote-shell", points: -50 }], scorer: "apm-score-v10" }, { kind: "dependency", name: "safer-buffer" })).toBe(true);
+  });
+
+  test("GAP_SIGNALS are apm's own gaps, never a risk signal", () => {
+    const risks: readonly string[] = [...RISK_SIGNALS, ...LEGACY_RISK_SIGNALS];
+
+    for (const id of GAP_SIGNALS) expect(risks.includes(id)).toBe(false);
+  });
+});
+
+describe("an older version past the cooldown", () => {
+  test("olderRange keeps a tag's channel and adds the bound to every alternative of a range", () => {
+    expect(olderRange("latest", "4.13.19")).toBe("<4.13.19");
+    expect(olderRange("next", "2.0.0-beta.3")).toBe("<2.0.0-beta.3");
+    expect(olderRange("^4", "4.2.0")).toBe("^4 <4.2.0");
+    expect(olderRange("^3 || ^4.1", "4.2.0")).toBe("^3 <4.2.0 || ^4.1 <4.2.0");
+    expect(olderRange("1.2.3", "1.2.3")).toBe("1.2.3 <1.2.3");
+    expect(olderRange("x", "1.0.0")).toBe("x <1.0.0");
+    expect(olderRange("v1", "1.4.0")).toBe("v1 <1.4.0");
+    expect(olderRange("*", "1.0.0")).toBe("* <1.0.0");
+  });
+
+  const fresh = (version: string): ResolveOutcome => ok(100, { version, deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] }, warnings: [{ name: "hono", version, kind: "cooldown", text: "published 2 hours ago, inside apm's 24-hour cooldown", via: [] }], risks: [] } });
+
+  // review of abcbb18, P2: "1.0.0 - 2.0.0 <2.0.0" is no range node-semver reads, so an older 1.9.0 was never found
+  test("a hyphen range becomes a comparator set before the bound is added, and the registry's semver reads it", () => {
+    expect(olderRange("1.0.0 - 2.0.0", "2.0.0")).toBe(">=1.0.0 <=2.0.0 <2.0.0");
+    expect(satisfies("1.9.0", olderRange("1.0.0 - 2.0.0", "2.0.0"))).toBe(true);
+    expect(satisfies("2.0.0", olderRange("1.0.0 - 2.0.0", "2.0.0"))).toBe(false);
+    expect(olderRange("^1 || 2.0.0 - 2.5.0", "2.5.0")).toBe("^1 <2.5.0 || >=2.0.0 <=2.5.0 <2.5.0");
+    expect(satisfies("2.4.0", olderRange("^1 || 2.0.0 - 2.5.0", "2.5.0"))).toBe(true);
+  });
+
+  test("a fresh pick in a hyphen range falls back to the older version the registry finds", async () => {
+    const versions = ["1.9.0", "2.0.0"];
+
+    const source = fakeSource({
+      resolve: (_n, range) => {
+        const v = versions.filter((x) => satisfies(x, range)).at(-1);
+
+        return v === "2.0.0" ? fresh("2.0.0") : v === undefined ? { kind: "refused", reason: "none", newest: null, skipped: [], confirmed: [] } : ok(100, { version: v });
+      },
+      reviews: { "hono@1.9.0": REVIEW_CLEAN },
+    });
+
+    const v = await explainFor({ name: "hono", range: "1.0.0 - 2.0.0", source });
+
+    expect(v.verdict).toBe("install");
+    expect(v.version).toBe("1.9.0");
+  });
+
+  test("a picked version inside the cooldown is swapped for the newest older one past it, which installs, and the review read is the older one's", async () => {
+    const source = fakeSource({ resolve: (_n, range) => (range === "latest" ? fresh("4.13.19") : range === "<4.13.19" ? ok(100, { version: "4.13.18" }) : { kind: "missing", reason: "no" }), reviews: { "hono@4.13.18": REVIEW_CLEAN } });
+    const v = await explainFor({ name: "hono", range: null, source });
+
+    expect(source.calls).toEqual(["resolve hono@latest", "resolve hono@<4.13.19", "review hono@4.13.18"]);
+    expect(v.verdict).toBe("install");
+    expect(v.version).toBe("4.13.18");
+    expect(v.commands?.npm).toBe("npm install hono@4.13.18");
+    expect(v.notes[0]?.kind).toBe("older-version");
+    expect(v.notes[0]?.text).toContain("`hono@4.13.19: published 2 hours ago, inside apm's 24-hour cooldown`");
+    expect(v.summary).toContain("it is not the newest version: that one is inside apm's 24-hour cooldown");
+  });
+
+  test("a range is narrowed, never widened: ^4 asks for ^4 below the fresh version", async () => {
+    const source = fakeSource({ resolve: (_n, range) => (range === "^4" ? fresh("4.2.0") : ok(100, { version: "4.1.9" })), reviews: { "hono@4.1.9": REVIEW_CLEAN } });
+    const v = await explainFor({ name: "hono", range: "^4", source });
+
+    expect(source.calls[1]).toBe("resolve hono@^4 <4.2.0");
+    expect(v.version).toBe("4.1.9");
+  });
+
+  test("no older version in range keeps the fresh one, review-first: the cooldown is the defence against a fresh release", async () => {
+    const source = fakeSource({ resolve: (_n, range) => (range === "latest" ? fresh("1.0.0") : { kind: "refused", reason: "No version of hono matching <1.0.0 passes the policy.", newest: null, skipped: [], confirmed: [] }), reviews: { "hono@1.0.0": REVIEW_CLEAN } });
+    const v = await explainFor({ name: "hono", range: null, source });
+
+    expect(v.verdict).toBe("review-first");
+    expect(v.version).toBe("1.0.0");
+    expect(v.summary).toContain("no older version in range is past it");
+  });
+
+  test("a burst of fresh releases: after MAX_OLDER_LOOKUPS more it gives up on the newest, review-first", async () => {
+    let n = 9;
+    const source = fakeSource({ resolve: () => fresh(`1.0.${n--}`), reviews: { "hono@1.0.9": REVIEW_CLEAN } });
+    const v = await explainFor({ name: "hono", range: null, source });
+
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toHaveLength(MAX_OLDER_LOOKUPS + 1);
+    expect(v.verdict).toBe("review-first");
+    expect(v.version).toBe("1.0.9");
+    expect(v.summary).toContain(`it and the ${MAX_OLDER_LOOKUPS} versions before it in range were all published inside apm's 24-hour cooldown`);
+  });
+
+  test("an older lookup the registry does not answer is unknown, never the fresh version as an install", async () => {
+    const source = fakeSource({ resolve: (_n, range) => (range === "latest" ? fresh("1.0.0") : { kind: "unavailable" }) });
+    const v = await explainFor({ name: "hono", range: null, source });
+
+    expect(v.verdict).toBe("unknown");
+    expect(v.commands).toBeNull();
+  });
+
+  test("a version past the cooldown is not looked at twice", async () => {
+    const source = fakeSource({ resolve: () => ok(100), reviews: { "zod@1.3.0": REVIEW_CLEAN } });
+
+    await explainFor({ name: "zod", range: null, source });
+    expect(source.calls).toEqual(["resolve zod@latest", "review zod@1.3.0"]);
+  });
+});
+
+test("the rendered verdict lists the notes and says the install goes ahead", () => {
+  const text = verdictText(explainInstall({ name: "zod", range: null, resolve: ok(92), review: { kind: "queued" } }));
+
+  expect(text).toContain("Verdict: install");
+  expect(text).toContain("Notes (install anyway, then tell the person):\n- The AI review of this version is queued and has not started.");
+  expect(text).toContain("Run: apm add zod@1.3.0");
 });
 
 describe("parsePackageSpec", () => {

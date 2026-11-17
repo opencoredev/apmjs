@@ -1,0 +1,59 @@
+{
+  "//": "What production (origin/main, 1cfc60a) parses in a stored analysis: its signal ids, coverage reasons, skip reasons, capability ids and current scorer. packages/core/test/production-parser.test.ts holds the branch to it, so a report this branch writes still parses after a rollback, and checks it against origin/main itself when that ref is present. Update it only when main ships a new list.",
+  "signalIds": [
+    "install-script",
+    "shell-exec",
+    "network",
+    "credential-access",
+    "eval",
+    "obfuscated",
+    "binary",
+    "new-publisher",
+    "no-license",
+    "typosquat",
+    "install-download",
+    "risky-dependency",
+    "new-dependency",
+    "incomplete",
+    "recent",
+    "deprecated",
+    "yanked",
+    "revoked",
+    "git-install-script",
+    "dynamic-require",
+    "unanalyzed-files",
+    "install-network",
+    "install-shell",
+    "install-eval",
+    "credential-read",
+    "credential-mention",
+    "encoded-data",
+    "exfiltration",
+    "capture-endpoint",
+    "remote-shell",
+    "runs-decoded-code",
+    "suspicious-combination",
+    "undeclared-capability"
+  ],
+  "coverageReasons": [
+    "too-large",
+    "over-budget",
+    "stopped"
+  ],
+  "skipReasons": [
+    "too-large",
+    "over-budget",
+    "compressed",
+    "over-time"
+  ],
+  "capabilityIds": [
+    "network",
+    "env",
+    "filesystem",
+    "shell",
+    "eval",
+    "native",
+    "install"
+  ],
+  "scorer": "apm-score-v11"
+}

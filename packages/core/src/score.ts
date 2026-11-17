@@ -82,7 +82,10 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * points (they cost -61 as `incomplete` and -20 as `unanalyzed-files` before) and are stated as the analysis's
  * `coverage`; a partial reading is graded "P", never a letter that reads as a pass. Every other reason an analysis is
  * `incomplete` (the work meter, a parser limit, code run from strings past what apm follows, a re-run that read less
- * after the platform stopped the runs before it) costs what it did.
+ * after the platform stopped the runs before it) costs what it did. A file's flow reading that stopped at its work
+ * allowance or its stack, in code that runs, or the cross-file reading at its budget, is `incomplete` (as it always
+ * was), whose evidence names the stop. No signal id is added past v11's list (SIGNAL_IDS), so a report this scorer
+ * writes parses under every apm-score-v11 parser.
  */
 export const SCORER = "apm-score-v11";
 
@@ -235,6 +238,88 @@ export type ScoreReport = Analysis & { score: number; grade: Grade };
 
 export const SCORE_FLOOR = 40;
 export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Signals that make an install verdict review-first wherever they cost points, whatever the score (docs/AGENTS.md,
+ * "Risk signals"). The website and the CLI each keep a copy (apps/web/lib/agent/verdict.ts, packages/cli/src/explain.ts)
+ * that their tests hold equal to this one; the registry reads it to list dependencies with a risk.
+ */
+export const RISK_SIGNALS = ["remote-shell", "capture-endpoint", "exfiltration", "credential-read", "install-download", "install-network", "runs-decoded-code", "obfuscated", "suspicious-combination", "typosquat"] as const;
+
+/**
+ * Signals scorers before apm-score-v10 gave a risk's meaning that v10 split up: v9's `credential-access` is v10's
+ * credential-read and exfiltration (and credential-mention, for a name alone). An analysis an earlier scorer stored
+ * keeps its ids until it is analysed again, so these count as risks in it. The other v9 code signals (shell-exec,
+ * network, eval, binary) are capabilities, as v10 reads them, and `obfuscated` is in RISK_SIGNALS already.
+ */
+export const LEGACY_RISK_SIGNALS = ["credential-access"] as const;
+
+/** Signals that say apm did not read or finish everything: an install verdict holds every analysis with one. */
+export const GAP_SIGNALS = ["incomplete", "unanalyzed-files"] as const;
+
+/** Risk signals about the name rather than the code: they count unless the name is an established one. */
+export const NAME_RISK_SIGNALS = ["typosquat"] as const;
+
+/**
+ * Dependency names the look-alike rule flags that are long-established packages in their own right, each checked by
+ * hand: safer-buffer (express installs it; one edit from safe-buffer, published by a Node.js core contributor since
+ * 2018). Only as a dependency, never as the name an install asks for, and only the name signal. Add to it only with
+ * the package's own record checked; the website's and the CLI's verdicts keep copies their tests hold equal.
+ */
+export const ESTABLISHED_DEPENDENCY_NAMES = ["safer-buffer"] as const;
+
+/**
+ * The risk signals in a report that cost points: RISK_SIGNALS (less NAME_RISK_SIGNALS for a dependency whose name is
+ * in ESTABLISHED_DEPENDENCY_NAMES), and LEGACY_RISK_SIGNALS in an earlier scorer's analysis.
+ */
+export function riskSignalsIn(report: { scorer?: string; signals: readonly { id: string; points: number }[] }, of: { kind: "version" } | { kind: "dependency"; name: string } = { kind: "version" }): { id: string; points: number }[] {
+  // apm-score-v10 split v9's credential-access, and every scorer since keeps v10's ids
+  const split: readonly string[] = [PREVIOUS_SCORER, SCORER];
+  const legacy = report.scorer === undefined || !split.includes(report.scorer);
+  const exempt = of.kind === "dependency" && ESTABLISHED_DEPENDENCY_NAMES.some((n) => n === of.name);
+  const counts = (id: string): boolean => (RISK_SIGNALS.some((r) => r === id) && !(exempt && NAME_RISK_SIGNALS.some((n) => n === id))) || (legacy && LEGACY_RISK_SIGNALS.some((r) => r === id));
+
+  return report.signals.filter((s) => s.points < 0 && counts(s.id));
+}
+
+/**
+ * The one reason a reading may leave something unread and still install (docs/AGENTS.md): whole files left unread for
+ * their size or the bytes one analysis reads (COVERAGE_REASONS less "stopped"). A short allowlist on purpose: anything
+ * not on it holds the install.
+ */
+export const BENIGN_OMISSIONS = ["too-large", "over-budget"] as const;
+
+/**
+ * How much of a version apm read, as the install verdict and the grade read it (fail-closed):
+ * - complete: the analysis left nothing unread and has no GAP_SIGNALS. An earlier scorer that stored no coverage
+ *   counted every file it left unread as a gap signal, so one with none read all of it; the current scorer always
+ *   states coverage, and an analysis of its own without it is incomplete.
+ * - partial: the current scorer recorded that it left whole files unread, every reason for which is on
+ *   BENIGN_OMISSIONS, and nothing else is unfinished (no GAP_SIGNALS). Graded "P"; installs with a note.
+ * - incomplete: anything else, an empty or unknown list of reasons included. The install verdict holds it. `why` says
+ *   which: `signal`, the analysis has `incomplete`; `legacy-gap`, an earlier scorer's `unanalyzed-files` (files it
+ *   left unread, which it counted as a gap); `no-coverage`, the current scorer's analysis with no coverage record;
+ *   `coverage`, partial coverage that is not the allowlisted kind (a reason off BENIGN_OMISSIONS, none at all, or
+ *   another scorer's).
+ */
+export type Reading =
+  | { kind: "complete" }
+  | { kind: "partial"; coverage: Extract<Coverage, { kind: "partial" }> }
+  | { kind: "incomplete"; why: "signal" | "legacy-gap" | "no-coverage" } | { kind: "incomplete"; why: "coverage"; coverage: Extract<Coverage, { kind: "partial" }> };
+
+export function readingOf(a: Pick<Analysis, "scorer" | "signals" | "coverage">): Reading {
+  if (a.signals.some((s) => s.id === "incomplete")) return { kind: "incomplete", why: "signal" };
+
+  if (a.signals.some((s) => GAP_SIGNALS.some((g) => g === s.id))) return { kind: "incomplete", why: "legacy-gap" };
+  const c = a.coverage;
+
+  if (c === undefined) return a.scorer === SCORER ? { kind: "incomplete", why: "no-coverage" } : { kind: "complete" };
+
+  if (c.kind === "complete") return c;
+  const benign = c.reasons.length > 0 && c.reasons.every((r) => BENIGN_OMISSIONS.some((b) => b === r));
+
+  return a.scorer === SCORER && benign ? { kind: "partial", coverage: c } : { kind: "incomplete", why: "coverage", coverage: c };
+}
 
 /**
  * What each signal costs (apm-score-v10). docs/SCORE.md gives the reason for each weight. The code signals v9 scored
@@ -1490,6 +1575,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   const heldBytes = new Map<string, number>();
   // files read with no tree: nothing there can show where a value goes, so v9's reading of them stands
   const rawFiles = new Set<string>();
+  // files whose flow reading stopped before it finished, in code that runs: each is incomplete, and its evidence says so
+  const flowStopped = new Set<string>();
 
   /**
    * Code a file holds as text (run from a string, recovered from its own comments or regexes, or held in a string that
@@ -1524,7 +1611,12 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     if (e.origin !== "data") for (const x of scan.flows ?? []) flows.flows.push({ ...x, line: e.line, snippet });
     fileFlows.set(path, flows);
 
-    if (e.origin === "run" || e.origin === "recovered") for (const u of scan.unread ?? []) add("incomplete", `${path}:${e.line}: ${e.snippet} (${u.why})`);
+    if (e.origin === "run" || e.origin === "recovered") {
+      for (const u of scan.unread ?? []) add("incomplete", `${path}:${e.line}: ${e.snippet} (${u.why})`);
+
+      // the stop is one of `unread`, so it is incomplete already; a string only held is not read for this, as before
+      if (scan.flowStopped === true) flowStopped.add(path);
+    }
 
     // code that code held as text runs or holds in turn, as sure as the outer one is to run
     for (const inner of scan.executed ?? []) readHeld(path, { ...inner, line: e.line, snippet: e.snippet, origin: e.origin === "run" ? inner.origin : e.origin }, depth + 1);
@@ -1595,6 +1687,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
       for (const e of scan.executed ?? []) readHeld(f.path, e, 1);
 
       for (const u of scan.unread ?? []) add("incomplete", `${f.path}:${u.line}: ${u.snippet} (${u.why})`);
+
+      if (scan.flowStopped === true) flowStopped.add(f.path);
     }
 
     // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does
@@ -1731,6 +1825,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     }),
     reached: reachable,
     rawFiles,
+    flowStopped,
+    crossStopped: cross.exhausted,
     hookEvidence,
     gyp: gyp !== undefined,
     binPaths: new Set(entryPoints(manifest).flatMap((e) => (e.field.startsWith("bin") ? [joinPath("", e.path)] : []))),
@@ -1921,6 +2017,10 @@ type AssessInput = {
   /** What package.json's `bin` names: programs the package ships on purpose. */
   binPaths: ReadonlySet<string>;
   declaration: Declaration;
+  /** Files whose flow reading stopped before it finished, in code that runs (each is incomplete for it too). */
+  flowStopped: ReadonlySet<string>;
+  /** Whether the reading of flows across files stopped at its work budget (CrossFile.exhausted). */
+  crossStopped: boolean;
 };
 
 type Assessed = { signals: Signal[]; capabilities: Capability[]; declaration: { kind: Declaration["kind"]; notes: string[] } };
@@ -2023,8 +2123,15 @@ function assess(input: AssessInput): Assessed {
     if (evidence.length > 0) risks.set(id, signal(id, evidence, confidence, fallback));
   };
 
+  // a whole-flow stop, which `incomplete` already holds for (its unread evidence and the cross-file line): named first
+  // among its evidence, so the reason a person should look is in what every surface shows. A test file's stop counts
+  const stops = [...[...input.flowStopped].sort().map((p) => `${p}: apm could not finish tracing where values go in this file`), ...(input.crossStopped ? ["flows across files: apm could not finish tracing where values go between the files"] : [])];
+  const unfinished = found.get("incomplete");
+
+  if (unfinished || stops.length > 0) put("incomplete", [...stops, ...(unfinished?.evidence ?? [])], unfinished?.confidence, unfinished?.possible);
+
   // v9's non-code signals keep their ids; their points are v10's
-  for (const id of ["incomplete", "install-download", "git-install-script", "risky-dependency", "typosquat", "install-script", "unanalyzed-files", "new-publisher", "new-dependency", "dynamic-require", "no-license"] as const) {
+  for (const id of ["install-download", "git-install-script", "risky-dependency", "typosquat", "install-script", "unanalyzed-files", "new-publisher", "new-dependency", "dynamic-require", "no-license"] as const) {
     const got = found.get(id);
 
     if (got) put(id, got.evidence, got.confidence, got.possible);
@@ -2329,7 +2436,9 @@ export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
   const raw = 100 + signals.reduce((n, s) => n + s.points, 0);
   const score = Math.max(0, Math.min(100, raw));
 
-  return { ...analysis, signals, score, grade: partialCoverage(analysis) ? "P" : gradeOf(score) };
+  // "P" only for a reading whose sole gap is whole files left unread for their size or the byte budget (readingOf):
+  // an analysis incomplete for any other reason gets the letter its score earns, as an incomplete one always did
+  return { ...analysis, signals, score, grade: readingOf(analysis).kind === "partial" ? "P" : gradeOf(score) };
 }
 
 /** One evidence item an apm reviewer dismissed: the scorer that cited it, the signal, and the file and line it cites. */

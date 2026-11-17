@@ -1,4 +1,5 @@
 import type { Coverage } from "@/lib/coverage";
+import { PARTIAL_GRADE } from "./score-badge";
 
 /** The score panel's tones on the inverse surface, by tone. */
 export type HeadlineTone = { text: string; bar: string };
@@ -9,17 +10,30 @@ function files(n: number): string {
 }
 
 /**
+ * What the score panel leads with: `stopped`, an analysis that stopped before it finished; `partial`, a reading graded
+ * "P" (only whole files left unread for their size or the byte budget, and nothing else unfinished: core readingOf);
+ * `score`, anything else, an analysis incomplete for another reason included, which shows its score and letter as an
+ * incomplete one always has. Neither of the first two shows a grade letter.
+ */
+export function headlineKind(grade: string, coverage: Coverage | null | undefined): "stopped" | "partial" | "score" {
+  if (coverage?.kind === "partial" && coverage.reasons.includes("stopped")) return "stopped";
+
+  return grade === PARTIAL_GRADE && coverage?.kind === "partial" ? "partial" : "score";
+}
+
+/**
  * The score panel's headline. A complete reading leads with its score; a partial one (apm-score-v11) leads with
  * "Partial analysis" and gives the score only as what the code apm read scored, beside how many files it did not read,
  * with no grade letter and no meter: a partial reading is never shown as a pass. One that stopped before it finished
  * says so, with no count of files not read.
  */
-export function ScoreHeadline({ score, coverage, tone, version }: { score: number; coverage: Coverage | null | undefined; tone: HeadlineTone; version: string | null }) {
+export function ScoreHeadline({ score, grade, coverage, tone, version }: { score: number; grade: string; coverage: Coverage | null | undefined; tone: HeadlineTone; version: string | null }) {
   const label = <div className="text-sm text-inverse-muted">{version ? `Version ${version}` : "Latest version"}</div>;
+  const kind = headlineKind(grade, coverage);
 
   // an analysis that stopped (its work limit, a manifest past what apm reads, runs that failed) read nothing it can
   // vouch for: it is said to have stopped, never given a count of files not read
-  if (coverage?.kind === "partial" && coverage.reasons.includes("stopped")) {
+  if (kind === "stopped") {
     return (
       <div>
         {label}
@@ -30,7 +44,7 @@ export function ScoreHeadline({ score, coverage, tone, version }: { score: numbe
     );
   }
 
-  if (coverage?.kind === "partial") {
+  if (kind === "partial" && coverage?.kind === "partial") {
     return (
       <div>
         {label}

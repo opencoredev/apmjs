@@ -2,7 +2,7 @@
 // --json each prints one document on stdout and everything else goes to stderr, like every apm command.
 import { z } from "zod";
 import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, type RawAnswer } from "./api.ts";
-import { EXIT, explain, type ResolvedInput, type ReviewInput } from "./explain.ts";
+import { EXIT, explain, resolveForVerdict, type ResolvedInput, type ReviewInput } from "./explain.ts";
 
 type Paint = (s: string) => string;
 
@@ -110,7 +110,13 @@ async function resolvedFor(input: { api: Api; name: string; range: string | null
       version: ok.data.version,
       report: ok.data.report,
       skipped: ok.data.skipped,
-      deps: { unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length), uncheckedDeps, reviews: tree?.reviews ?? { kind: "unknown" }, warnings: ok.data.warnings },
+      deps: {
+        unchecked: Math.max(tree?.unchecked ?? 0, uncheckedDeps.length),
+        uncheckedDeps,
+        reviews: tree?.reviews ?? { kind: "unknown" },
+        warnings: ok.data.warnings,
+        risks: (tree?.risks ?? []).map((d) => ({ ...d, scorer: d.scorer ?? null })),
+      },
     };
   }
 
@@ -136,11 +142,12 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
   }
 
   const { name, range } = parseSpec(spec);
-  const resolved = await resolvedFor({ api, name, range, strict: input.strict });
+  // a version inside the cooldown is swapped for the newest older one past it (strict mode's resolve already skips it)
+  const { resolved, older } = await resolveForVerdict({ range: range ?? "latest", resolve: (r) => resolvedFor({ api, name, range: r, strict: input.strict }) });
   // only an "ok" resolve reads the review; the other verdicts never look at it
   const unread: ReviewInput = { kind: "unreadable" };
   const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version) : unread;
-  const v = explain({ name, range, resolved, review });
+  const v = explain({ name, range, resolved, review, older });
   const code = EXIT[v.verdict];
 
   if (io.json) {
@@ -155,6 +162,10 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
   io.say(`${mark} ${bold(v.verdict)}  ${v.summary}`);
 
   for (const r of v.reasons) io.say(dim(`  - ${r}`));
+
+  if (v.notes.length > 0) io.say(dim(v.verdict === "install" ? "  notes (it installs; mention these):" : "  notes:"));
+
+  for (const n of v.notes) io.say(dim(`    ${n.text}`));
 
   if (v.evidence.length > 0) io.say(dim("  evidence:"));
 

@@ -74,7 +74,7 @@ const noBlobs = Layer.succeed(
   Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }),
 );
 
-const Warning = z.object({ name: z.string(), version: z.string(), kind: z.string(), score: z.number().nullable(), grade: z.string().nullable(), text: z.string(), reasons: z.array(z.string()), url: z.string(), via: z.array(z.string()) });
+const Warning = z.object({ name: z.string(), version: z.string(), kind: z.string(), score: z.number().nullable(), grade: z.string().nullable(), text: z.string(), reasons: z.array(z.string()), url: z.string(), via: z.array(z.string()), unscorable: z.string().optional() });
 
 const Body = z.object({
   error: z.string().optional(),
@@ -263,6 +263,21 @@ describe("strict: a version apm will never score blocks, never installs unchecke
       expect(r.status).toBe(422);
       expect(r.body.skipped?.[0]?.reason).toStartWith("apm cannot score this version: its analysis runs past the registry's limits");
     }));
+
+  // review of c456c92, finding 2: the install verdict holds a version apm will never score unless it is too large, so
+  // the warning names the reason the registry decided, for a dependency and for the version itself
+  for (const reason of UnscorableReason.options) {
+    test(`default: a dependency and a root decided ${reason} warn with the reason as data`, () =>
+      withRig(async ({ url, npm, sql }) => {
+        await storeOutcome(sql, "cold-evil", reason);
+        await storeOutcome(sql, "cold-root", reason);
+        const dep = await resolve({ url, npm, name: "root", wait: { maxMs: 0, pollMs: 1 } });
+        const root = await resolve({ url, npm, name: "cold-root", wait: { maxMs: 0, pollMs: 1 } });
+
+        expect(dep.body.warnings?.map((w) => [w.name, w.kind, w.unscorable])).toEqual([["cold-evil", "unscorable", reason]]);
+        expect(root.body.warnings?.map((w) => [w.name, w.kind, w.unscorable])).toEqual([["cold-root", "unscorable", reason]]);
+      }));
+  }
 
   test("a scan of a pending version still lists it as pending, not as an advisory", () =>
     withRig(async ({ url, npm }) => {

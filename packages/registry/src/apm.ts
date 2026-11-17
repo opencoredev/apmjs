@@ -37,6 +37,7 @@ import {
   COOLDOWN_MS,
   coverageText,
   partialCoverage,
+  readingOf,
   storedAnalysis,
   SCORE_FLOOR,
   POPULAR_NAMES,
@@ -50,6 +51,7 @@ import {
   compareIntegrity,
   sha1FromShasum,
   type IntegrityMatch,
+  riskSignalsIn,
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
@@ -87,7 +89,7 @@ import {
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
-import { cooldownWarning, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning } from "./warnings.ts";
+import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning, type WarningSignal } from "./warnings.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -2012,6 +2014,11 @@ const UNSCORABLE_LEAD: Record<Unscorable["reason"], string> = {
  */
 export type NotScored = { kind: "unscorable"; reason: Unscorable["reason"]; text: string } | { kind: "queued"; text: string } | { kind: "unreadable"; text: string };
 
+/** Why a version will never be scored, when the registry decided it: what a warning names as `unscorable`. */
+export function unscorableReason(why: NotScored): Unscorable["reason"] | undefined {
+  return why.kind === "unscorable" ? why.reason : undefined;
+}
+
 export function notScored(src: Pick<Source, "kind">, v: VersionRecord): NotScored {
   if (v.unscorable) return { kind: "unscorable", reason: v.unscorable.reason, text: `apm cannot score this version: ${UNSCORABLE_LEAD[v.unscorable.reason]} (${v.unscorable.detail})` };
 
@@ -2063,7 +2070,11 @@ export function policyBlock(v: VersionRecord, policy: Policy, at: number): strin
       .join(", ")})`;
   }
 
-  return null;
+  // what the install warning calls incomplete (core readingOf) and the two checks above did not refuse: an earlier
+  // scorer's unanalyzed-files at 80, or a current-scorer analysis with no coverage record
+  const reading = readingOf(r);
+
+  return reading.kind === "incomplete" ? incompleteText(reading) : null;
 }
 
 /**
@@ -2242,6 +2253,7 @@ type Tree = {
   withdrawn: TreeBlock[];
   packages: CheckedPackage[];
   digests: (string | null)[];
+  risks: RiskyDep[];
 };
 
 /**
@@ -2249,6 +2261,13 @@ type Tree = {
  * binary, which installs only there), so a client can group them.
  */
 type CheckedPackage = { name: string; version: string; platform?: { os: string[]; cpu: string[] } };
+
+/**
+ * A dependency the walk scored whose score carries a risk signal (RISK_SIGNALS, or an earlier scorer's
+ * LEGACY_RISK_SIGNALS), whatever the score: the install verdict sends it to a person even when it is over the floor
+ * and has no warning. `signals` is every signal that cost it points, id and points only; `scorer` the analysis's.
+ */
+type RiskyDep = { name: string; version: string; via: string[]; scorer: string; score: number; signals: WarningSignal[] };
 
 /**
  * A version in the tree with no score yet that the registry will score: an upstream version queued for analysis. Never
@@ -2364,6 +2383,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
     const { webUrl } = yield* RegistryConfig;
     const warnings: InstallWarning[] = [];
     const unscorable: Tree["unscorable"] = [];
+    const risks: RiskyDep[] = [];
     const unavailable: Tree["unavailable"] = [];
     let limited = false;
     let timedOut = false;
@@ -2632,11 +2652,12 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       }
 
       const url = versionUrl(webUrl, dep.name, v.version);
-      // the package manager installs this version whatever its age: a warning (strict: refused), and the version checked
-      const fresh = cooldownWarning({ name: dep.name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: item.via });
+      const r = reportFor(v, at, { ignoreRecent: true });
+      // the package manager installs this version whatever its age: a warning (strict: refused), and the version
+      // checked. It carries the score's lost signals, so a verdict can tell a fresh version apm read from one it has not
+      const fresh = cooldownWarning({ name: dep.name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: item.via, report: r });
 
       if (fresh) warnings.push(fresh);
-      const r = reportFor(v, at, { ignoreRecent: true });
 
       if (!r) {
         const why = notScored(picked.src, v);
@@ -2647,12 +2668,15 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         if (why.kind === "queued") pending.push({ name: dep.name, version: v.version, via: item.via });
         else {
           unscorable.push({ name: dep.name, version: v.version, reason: why.text, via: item.via });
-          warnings.push(stateWarning({ kind: "unscorable", name: dep.name, version: v.version, text: why.text, url, via: item.via }));
+          warnings.push(stateWarning({ kind: "unscorable", name: dep.name, version: v.version, text: why.text, url, via: item.via, unscorable: unscorableReason(why) }));
         }
       } else {
         const w = scoreWarning({ name: dep.name, version: v.version, report: r, floor: policy.floor, url, via: item.via });
 
         if (w) warnings.push(w);
+
+        // a risk signal is listed whatever the score: a credential read at 70 has no warning, and is still a risk
+        if (riskSignalsIn(r, { kind: "dependency", name: dep.name }).length > 0 && risks.length < MAX_UNCHECKED_LISTED) risks.push({ name: dep.name, version: v.version, via: item.via, scorer: r.scorer, score: r.score, signals: lostSignals(r) });
       }
 
       // every package is checked once (seen), every name and range looked up once (resolved), and the walk stops at
@@ -2666,7 +2690,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${unlisted} more ${unlisted === 1 ? "dependency was" : "dependencies were"} not checked (git or URL specs, missing packages or the walk's limits)`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     }
 
-    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, timedOut, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, withdrawn, packages, digests };
+    const tree: Tree = { warnings, unchecked, uncheckedDeps, pending, unscorable, unavailable, limited, timedOut, skippedForPlatform, platformSkips: platformSkipped.size, projectPeers, withdrawn, packages, digests, risks };
 
     return tree;
   });
@@ -2746,6 +2770,7 @@ const treeAnswer = (tree: Tree, reviews: TreeReviews) => ({
   platformSkips: tree.platformSkips,
   projectPeers: tree.projectPeers,
   packages: tree.packages,
+  risks: tree.risks,
   reviews,
 });
 
@@ -3032,10 +3057,10 @@ const rootAnswer = (input: {
 
     // what installs with a warning: the version itself (its age, then its score), then its tree, then what is pending
     const url = versionUrl(webUrl, name, v.version);
-    const fresh = cooldownWarning({ name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
     // judged as the floor judges it: a fresh publish's own signal is the cooldown's business, not the score's
     const judged = reportFor(v, at, { ignoreRecent: true });
-    const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [] }) : null;
+    const fresh = cooldownWarning({ name, version: v.version, ageMs: at - v.published_at, cooldownMs: policy.cooldownMs, url, via: [], report: judged });
+    const own = judged ? scoreWarning({ name, version: v.version, report: judged, floor: policy.floor, url, via: [] }) : unscored ? stateWarning({ kind: unscored.kind === "queued" ? "pending" : "unscorable", name, version: v.version, text: unscored.text, url, via: [], unscorable: unscorableReason(unscored) }) : null;
     // every dependency still pending warns, the root's own pending included (review of a76b9fc, finding 3)
     const stillPending = walked.pending.map((p) => stateWarning({ kind: "pending", name: p.name, version: p.version, text: "not scored yet: still being analysed after the registry's wait", url: versionUrl(webUrl, p.name, p.version), via: p.via }));
     const warnings = [...(fresh ? [fresh] : []), ...(own ? [own] : []), ...walked.warnings, ...stillPending];
@@ -3321,7 +3346,7 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
       if (why.kind === "queued") return [...findings, { kind: "pending", unchecked: { package: p.name, version: p.version, reason: why.text } }] satisfies ScanOne[];
 
       // decided, not waiting: no score will come
-      return [...findings, flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [] }), "unscorable")] satisfies ScanOne[];
+      return [...findings, flagged(stateWarning({ kind: "unscorable", name: p.name, version: p.version, text: why.text, url, via: [], unscorable: unscorableReason(why) }), "unscorable")] satisfies ScanOne[];
     }
 
     const w = scoreWarning({ name: p.name, version: p.version, report: r, floor: policy.floor, url, via: [] });

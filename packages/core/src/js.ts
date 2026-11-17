@@ -1164,6 +1164,8 @@ class Reader {
   readonly unread: { at: number; why: string }[] = [];
   /** Where values go (flow.ts); read for the outermost program only, since score.ts reads code held in strings itself. */
   flow: FlowRead = NO_FLOW;
+  /** Whether reading where values go stopped before it finished: its work budget, or a value chain too deep. */
+  flowStopped = false;
   private readonly scopes: Scopes;
   private readonly strCache = new Map<AnyNode, Str | null>();
   private readonly bindingCache = new Map<Binding, Ref[]>();
@@ -1224,6 +1226,7 @@ class Reader {
       // a value chain deep enough to exhaust the stack, or more work than the budget, is not followed: the text rules
       // still read the file, and the analysis says it did not follow where values go here
       if (!(e instanceof RangeError) && !(e instanceof FlowExhausted)) throw e;
+      this.flowStopped = true;
       this.budget.notes.add(LIMIT_NOTES.flow);
       this.unread.push({ at: 0, why: e instanceof FlowExhausted ? `apm stopped following where values go at its work budget (${MAX_FLOW_WORK / 1_000_000} million steps)` : "values nested too deep for apm to follow where they go" });
     }
@@ -3210,11 +3213,13 @@ export type JsScan =
       env: EnvRead[];
       /** Code the file runs that apm did not read, which makes the analysis incomplete. */
       unread: Unread[];
+      /** Whether reading where values go stopped before it finished; such a stop is also one of `unread`. */
+      flowStopped: boolean;
     }
   | { kind: "failed"; reason: Exclude<ParseOutcome, "parsed"> };
 
 /** What reading one program found, as plain data, so the tree it came from can be let go. */
-type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; executed: Executed[]; unread: { at: number; why: string }[] };
+type Read = { hits: Hit[]; leftOut: LeftOut; paths: string[]; loads: string[]; dynamic: number[]; awaitName: boolean; commands: { at: number; value: string }[]; flow: FlowRead; flowStopped: boolean; executed: Executed[]; unread: { at: number; why: string }[] };
 
 /** At most this many commands per program, each cut to this many characters: enough to read what a command does. */
 const MAX_COMMANDS = 200;
@@ -3298,7 +3303,7 @@ function readProgram(p: Parsed, depth: number, budget: Budget): Read | null {
 
     r.read();
 
-    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands, flow: r.flow, executed: r.executed, unread: r.unread };
+    return { hits: r.hits, leftOut: leftOutOf(p.program, p.comments), paths: [...r.paths], loads: [...r.loads], dynamic: r.dynamic, awaitName: r.sawAwaitName, commands: r.commands, flow: r.flow, flowStopped: r.flowStopped, executed: r.executed, unread: r.unread };
   } catch (e) {
     if (e instanceof RangeError) return null;
     throw e;
@@ -3392,7 +3397,7 @@ export function scanJs(text: string, dialect: Dialect): JsScan {
   }
 
 
-  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands, flows, exports, executed, env, unread };
+  return { kind: "parsed", findings, imports: { paths, loads, dynamic }, notes: [...budget.notes], hidden: hiddenOf(r.reads.map((x) => x.leftOut)), commands, flows, exports, executed, env, unread, flowStopped: r.reads.some((x) => x.flowStopped) };
 }
 
 /** How much of a file's own source one recovery is read as code, once runs of whitespace are squeezed to one. */
