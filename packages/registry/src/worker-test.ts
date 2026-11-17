@@ -7,7 +7,9 @@
 // the queue consumer on one job and says whether it acked the message or asked for a retry. x-apm-test-queue: fail
 // makes the analysis queue refuse every send for that request, and x-apm-test-fault: event-insert makes every
 // public-log insert fail inside Postgres for that request. All of it answers only to a caller holding
-// TEST_CONTROL_SECRET, a binding the deployed Worker does not have.
+// TEST_CONTROL_SECRET, a binding the deployed Worker does not have. TEST_R2_DELAY_MS (another binding only benches
+// set, "30" or "20-50") adds that many milliseconds, or a uniform draw in that range, before every call to the R2
+// bucket, as production's R2 round trip does.
 import { Effect } from "effect";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
@@ -32,8 +34,52 @@ function testClock(req: Request): ReturnType<typeof Clock.fixed> {
 
 const MintBody = z.object({ user: z.string().min(1), scope: z.enum(["publish", "stage"]) });
 
-/** The test Worker's env: the production bindings plus the control secret the harness holds. */
-type TestEnv = RawEnv & { readonly TEST_CONTROL_SECRET?: string };
+/** The test Worker's env: the production bindings plus the control secret the harness holds and the bench's R2 delay. */
+type TestEnv = RawEnv & { readonly TEST_CONTROL_SECRET?: string; readonly TEST_R2_DELAY_MS?: string };
+
+const R2Delay = z.object({
+  TEST_R2_DELAY_MS: z
+    .string()
+    .regex(/^\d+(-\d+)?$/)
+    .transform((v) => {
+      const [low = 0, high = low] = v.split("-").map(Number);
+
+      return { low, high: Math.max(low, high) };
+    }),
+});
+
+/** One delayed bucket per bucket, so what an isolate keeps per bucket (blocklist.ts, recentFrom) is kept here too. */
+const delayedBuckets = new WeakMap<TestEnv["BLOBS"], TestEnv["BLOBS"]>();
+
+/** The env with every R2 call made TEST_R2_DELAY_MS later (scripts/perf/npm-install-bench.ts); the env unchanged without it. */
+function withR2Delay(env: TestEnv): TestEnv {
+  const delay = R2Delay.safeParse(env);
+  const bucket = env.BLOBS;
+
+  if (!delay.success) return env;
+  const { low, high } = delay.data.TEST_R2_DELAY_MS;
+  const kept = delayedBuckets.get(bucket);
+
+  if (kept !== undefined) return { ...env, BLOBS: kept };
+
+  // every method of the binding, whatever its signature, is the same call made later: a Proxy is the one generic way
+  const delayed = new Proxy(bucket, {
+    get(target, prop, receiver) {
+      // oxlint-disable-next-line anti-slop/no-reflect-get -- a bench-only wrapper that forwards every property of an R2 binding unchanged
+      const value: unknown = Reflect.get(target, prop, receiver);
+
+      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- only the binding's methods are delayed; its other properties pass as they are
+      if (typeof value !== "function") return value;
+
+      // oxlint-disable-next-line anti-slop/no-reflect-apply -- forwards the call with the binding as `this`, after the delay
+      return (...args: unknown[]) => new Promise((resolve) => setTimeout(resolve, low + Math.random() * (high - low))).then(() => Reflect.apply(value, target, args));
+    },
+  });
+
+  delayedBuckets.set(bucket, delayed);
+
+  return { ...env, BLOBS: delayed };
+}
 
 const ControlSecret = z.object({ TEST_CONTROL_SECRET: z.string().min(16) });
 
@@ -164,7 +210,8 @@ function faultsFor(req: Request): ReadonlySet<StoreFault> {
 }
 
 export default {
-  async fetch(req: Request, env: TestEnv, ctx: ExecutionContext): Promise<Response> {
+  async fetch(req: Request, rawEnv: TestEnv, ctx: ExecutionContext): Promise<Response> {
+    const env = withR2Delay(rawEnv);
     const secret = controlSecret(env);
     const trusted = secret !== null && req.headers.get("x-apm-test-control") === secret;
     const clock = trusted ? testClock(req) : Clock.system;

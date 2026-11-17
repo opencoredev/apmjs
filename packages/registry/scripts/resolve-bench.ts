@@ -158,6 +158,8 @@ async function resolveOnce(input: { dbUrl: string; pool: MemoryPool; now: number
       entries.set(metric, { ms: e.ms + ms, count: e.count + 1 });
     },
     header: timing.header,
+    expose: timing.expose,
+    exposed: timing.exposed,
   };
 
   const base = Layer.mergeAll(

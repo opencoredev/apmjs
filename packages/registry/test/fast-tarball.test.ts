@@ -153,6 +153,7 @@ const blocklist = Layer.succeed(
   Blocklist,
   Blocklist.of({
     read: Effect.sync(() => (list === null ? { kind: "missing" as const } : { kind: "ok" as const, list, etag: "e" })),
+    recent: Effect.sync(() => (list === null ? { kind: "missing" as const } : { kind: "ok" as const, list, etag: "e" })),
     block: () => Effect.void,
     sync: () => Effect.die("not used"),
   }),
@@ -180,6 +181,8 @@ const analysis = Layer.succeed(
 );
 
 /** `failed`: the body ended in an error; `bytes` are the ones read before it. */
+const NPM_CLIENT = "npm/10.9.0 node/v24.11.0 linux x64 workspaces/false";
+
 type Got = { status: number; headers: Headers; bytes: Uint8Array; failed: boolean } | null;
 
 /** Reads a body chunk by chunk, keeping what arrived before any error. */
@@ -206,11 +209,12 @@ async function readAll(body: ReadableStream<Uint8Array> | null): Promise<{ bytes
  * One request through upstreamRoute; null when it does not answer (the protocol route does). The upstream TTL is an
  * hour, so npm's document for a version stays in this isolate between requests, as a hot one does in production.
  */
-async function get(path: string, options: { method?: string; headers?: Record<string, string>; safe?: boolean } = {}): Promise<Got> {
-  const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url, legacyAuth: false, namePolicy: "open", admins: [] } as const;
+async function get(path: string, options: { method?: string; headers?: Record<string, string>; safe?: boolean ; redirects?: "npm" | "upstream" } = {}): Promise<Got> {
+  const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url, legacyAuth: false, namePolicy: "open", admins: [], tarballRedirects: options.redirects ?? "upstream" } as const;
   const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), analysis, blobs, blocklist, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   const layers = Layer.provideMerge(Upstream.layer(npm.url, 3_600_000, null), base);
-  const req = new Request(`http://registry.test${path}`, { method: options.method ?? "GET", headers: options.headers ?? {} });
+  // npm's own client unless a test says otherwise: one of the clients that checks a tarball's integrity itself
+  const req = new Request(`http://registry.test${path}`, { method: options.method ?? "GET", headers: { "user-agent": NPM_CLIENT, ...options.headers } });
 
   const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), options.safe ?? false), (res) =>
     Effect.promise(async () => (res ? { status: res.status, headers: res.headers, ...(await readAll(res.body)) } : null)),
@@ -228,6 +232,9 @@ const confirm = (name: string, version: string, t: Tarball) =>
     [name, version, `sha512-${t.hex}`],
   );
 
+/** A request with credentials: answered with npm's bytes through the Worker, never sent to npm. */
+const AUTH = { headers: { authorization: "Bearer someone" } } as const;
+
 const dismiss = (name: string, version: string) => sql("UPDATE reviews SET human_state = 'dismissed' WHERE package = $1 AND version = $2", [name, version]);
 
 describe("versionOfFile", () => {
@@ -243,21 +250,34 @@ describe("versionOfFile", () => {
 });
 
 describe("the upstream tarball fast path", () => {
-  test("serves npm's bytes unchanged without reading the packument, and keeps no copy", async () => {
+  test("sends a request without credentials to npm's own tarball URL once nothing refuses it, and opens nothing itself", async () => {
     const got = await get("/fast/-/fast-1.0.0.tgz");
+
+    expect(got?.status).toBe(302);
+    expect(got?.headers.get("location")).toBe(`${npm.url}fast/-/fast-1.0.0.tgz`);
+    expect(got?.headers.get("cache-control")).toBe("no-store");
+    expect(got?.bytes.length).toBe(0);
+    expect(npm.asked).toContain("/fast/1.0.0");
+    expect(npm.asked.filter((p) => p.endsWith(".tgz"))).toEqual([]);
+    expect(npm.asked).not.toContain("/fast");
+    expect(stored).toEqual([]);
+  });
+
+  test("serves npm's bytes unchanged to a request with credentials, without reading the packument, and keeps no copy", async () => {
+    const got = await get("/fast/-/fast-1.0.0.tgz", AUTH);
 
     expect(got?.status).toBe(200);
     expect(got?.headers.get("content-type")).toBe("application/octet-stream");
     expect(got?.headers.get("content-length")).toBe(String(FAST.bytes.length));
     expect(sha512(got?.bytes ?? new Uint8Array())).toBe(FAST.integrity);
-    expect(npm.asked).toContain("/fast/1.0.0");
     expect(npm.asked).toContain("/fast/-/fast-1.0.0.tgz");
     expect(npm.asked).not.toContain("/fast");
     expect(stored).toEqual([]);
   });
 
   test("HEAD answers the length and sends no body", async () => {
-    const got = await get("/fast/-/fast-1.0.0.tgz", { method: "HEAD" });
+    expect((await get("/fast/-/fast-1.0.0.tgz", { method: "HEAD" }))?.status).toBe(302);
+    const got = await get("/fast/-/fast-1.0.0.tgz", { method: "HEAD", ...AUTH });
 
     expect(got?.status).toBe(200);
     expect(got?.headers.get("content-length")).toBe(String(FAST.bytes.length));
@@ -265,48 +285,60 @@ describe("the upstream tarball fast path", () => {
   });
 
   test("a version confirmed malicious is 410 on the very next request after it was served, and served again once dismissed", async () => {
-    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(200);
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
     await confirm("fast", "1.0.0", FAST);
     npm.asked.length = 0;
 
     try {
       const refused = await get("/fast/-/fast-1.0.0.tgz");
 
+      // refused before any byte is sent or anyone is sent to npm, and nothing was opened for it
       expect(refused?.status).toBe(410);
       expect(new TextDecoder().decode(refused?.bytes)).toContain("confirmed malicious");
-      // refused before its bytes are asked for
       expect(npm.asked.filter((p) => p.endsWith(".tgz"))).toEqual([]);
+
+      // with credentials too. Only the database knows here (review.ts puts a confirmation on the block list before it
+      // commits, and a version on the list is never asked for: the next test), so npm's tarball may have been opened
+      // while the statement ran, and is let go unread
+      const private410 = await get("/fast/-/fast-1.0.0.tgz", AUTH);
+
+      expect(private410?.status).toBe(410);
+      expect(private410?.headers.get("content-type")).not.toBe("application/octet-stream");
       // the other version is not touched
-      expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(200);
+      expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(302);
     } finally {
       await dismiss("fast", "1.0.0");
     }
 
-    const back = await get("/fast/-/fast-1.0.0.tgz");
+    const back = await get("/fast/-/fast-1.0.0.tgz", AUTH);
 
     expect(back?.status).toBe(200);
     expect(sha512(back?.bytes ?? new Uint8Array())).toBe(FAST.integrity);
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
   });
 
   test("a version on the install block list is 410 even when the database has no confirmation", async () => {
-    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(200);
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
     list = { format: 1, syncedAt: NOW, local: [], confirmed: [{ name: "fast", version: "1.0.0", digest: `sha512-${FAST.hex}`, addedAt: NOW }] };
 
     npm.asked.length = 0;
     expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(410);
     expect((await get("/fast/-/fast-1.0.0.tgz", { method: "HEAD" }))?.status).toBe(410);
+    // nor with credentials, whose tarball is opened early only when the block list does not refuse it
+    expect((await get("/fast/-/fast-1.0.0.tgz", AUTH))?.status).toBe(410);
     expect(npm.asked.filter((p) => p.endsWith(".tgz"))).toEqual([]);
-    expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(200);
+    expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(302);
   });
 
   test("a block list that was never written adds nothing; the database still refuses", async () => {
     list = null;
 
-    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(200);
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
     await confirm("fast", "1.0.0", FAST);
 
     try {
       expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(410);
+      expect((await get("/fast/-/fast-1.0.0.tgz", AUTH))?.status).toBe(410);
     } finally {
       await dismiss("fast", "1.0.0");
     }
@@ -318,6 +350,7 @@ describe("the upstream tarball fast path", () => {
     try {
       expect(await get("/mine/-/mine-1.0.0.tgz")).toBeNull();
       expect(await get("/mine/-/mine-1.0.0.tgz", { method: "HEAD" })).toBeNull();
+      expect(await get("/mine/-/mine-1.0.0.tgz", AUTH)).toBeNull();
     } finally {
       await sql("DELETE FROM packages WHERE name = 'mine'");
     }
@@ -349,7 +382,6 @@ describe("the upstream tarball fast path", () => {
     expect(got?.headers.get("cache-control")).toBe("private, no-store");
     expect(got?.headers.get("vary")).toBe("Authorization, Cookie");
     expect((await get("/fast/-/fast-1.0.0.tgz", { headers: { cookie: "s=1" } }))?.headers.get("cache-control")).toBe("private, no-store");
-    expect((await get("/fast/-/fast-1.0.0.tgz"))?.headers.get("cache-control")).toBeNull();
     expect(npm.asked).not.toContain("/fast");
     expect(stored).toEqual([]);
   });
@@ -389,8 +421,18 @@ describe("the upstream tarball fast path", () => {
     expect(stored).toEqual([`sha512/${FAST.hex}`]);
   });
 
-  test("a tarball npm links from another URL is fetched from there", async () => {
-    const got = await get("/moved/-/moved-1.0.0.tgz");
+  test("a tarball npm links from another URL is fetched from there and checked, never redirected to", async () => {
+    // only the upstream's own URL for exactly this version is redirected to: past it, the client follows any further
+    // hops with none of apm's checks
+    for (const options of [{}, AUTH]) {
+      const got = await get("/moved/-/moved-1.0.0.tgz", options);
+
+      expect(got?.status).toBe(200);
+      expect(got?.headers.get("location")).toBeNull();
+      expect(sha512(got?.bytes ?? new Uint8Array())).toBe(MOVED.integrity);
+    }
+
+    const got = await get("/moved/-/moved-1.0.0.tgz", AUTH);
 
     expect(got?.status).toBe(200);
     expect(sha512(got?.bytes ?? new Uint8Array())).toBe(MOVED.integrity);
@@ -399,7 +441,8 @@ describe("the upstream tarball fast path", () => {
   });
 
   test("scoped packages take the same path", async () => {
-    const got = await get("/@scope/pkg/-/pkg-1.0.0.tgz");
+    expect((await get("/@scope/pkg/-/pkg-1.0.0.tgz"))?.headers.get("location")).toBe(`${npm.url}@scope/pkg/-/pkg-1.0.0.tgz`);
+    const got = await get("/@scope/pkg/-/pkg-1.0.0.tgz", AUTH);
 
     expect(got?.status).toBe(200);
     expect(sha512(got?.bytes ?? new Uint8Array())).toBe(SCOPED.integrity);
@@ -408,7 +451,7 @@ describe("the upstream tarball fast path", () => {
   });
 
   test("bytes that do not match the version's checksum never reach the end of the answer", async () => {
-    const got = await get("/tampered/-/tampered-1.0.0.tgz");
+    const got = await get("/tampered/-/tampered-1.0.0.tgz", AUTH);
 
     // the answer errors, and the last bytes are held back, so the client never has the whole tampered body
     expect(got?.failed).toBe(true);
@@ -416,14 +459,14 @@ describe("the upstream tarball fast path", () => {
   });
 
   test("a tarball npm sends compressed is served decoded, with no Content-Length counting the compressed bytes", async () => {
-    const got = await get("/gz/-/gz-1.0.0.tgz");
+    const got = await get("/gz/-/gz-1.0.0.tgz", AUTH);
 
     expect(got?.status).toBe(200);
     expect(got?.failed).toBe(false);
     expect(sha512(got?.bytes ?? new Uint8Array())).toBe(GZ.integrity);
     expect(got?.headers.get("content-length")).toBeNull();
 
-    const head = await get("/gz/-/gz-1.0.0.tgz", { method: "HEAD" });
+    const head = await get("/gz/-/gz-1.0.0.tgz", { method: "HEAD", ...AUTH });
 
     expect(head?.status).toBe(200);
     expect(head?.headers.get("content-length")).toBeNull();
@@ -483,4 +526,29 @@ describe("compressed upstream answers on the older tarball paths", () => {
       expect(sha512(got.bytes?.bytes ?? new Uint8Array())).toBe(BIG_ZEROS.integrity);
     }, 60_000);
   }
+});
+
+describe("which requests are redirected to npm", () => {
+  const plain = async (headers: Record<string, string>, redirects: "npm" | "upstream" = "upstream") => {
+    const got = await get("/fast/-/fast-1.0.0.tgz", { headers, redirects });
+
+    return { status: got?.status, location: got?.headers.get("location") ?? null, intact: sha512(got?.bytes ?? new Uint8Array()) === FAST.integrity };
+  };
+
+  test("npm, pnpm, bun and yarn 1 are redirected: each checks the tarball against the install document's integrity", async () => {
+    for (const ua of [NPM_CLIENT, "pnpm/9.15.0 npm/? node/v22.11.0 linux x64", "Bun/1.4.4", "yarn/1.22.22 npm/? node/v22.11.0 linux x64"]) {
+      expect(await plain({ "user-agent": ua }), ua).toEqual({ status: 302, location: `${npm.url}fast/-/fast-1.0.0.tgz`, intact: false });
+    }
+  });
+
+  test("yarn 2 and later, and any client apm does not know, get npm's bytes checked here", async () => {
+    // Yarn Berry trusts its own cache checksum, which a first install does not have yet
+    for (const ua of ["yarn/4.6.0 npm/? node/v22.11.0 linux x64", "curl/8.5.0", ""]) {
+      expect(await plain({ "user-agent": ua }), ua).toEqual({ status: 200, location: null, intact: true });
+    }
+  });
+
+  test("by default only npm's own https URL is redirected to, so this stand-in's tarball is streamed", async () => {
+    expect(await plain({ "user-agent": NPM_CLIENT }, "npm")).toEqual({ status: 200, location: null, intact: true });
+  });
 });

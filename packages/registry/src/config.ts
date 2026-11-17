@@ -16,6 +16,12 @@ export type RegistrySettings = {
   readonly namePolicy: NamePolicy;
   /** GitHub logins (APM_ADMINS) of apm's reviewers: they decide AI review flags and dismiss score evidence. */
   readonly admins: readonly string[];
+  /**
+   * Where a tarball request that passed its checks may be redirected (fast-tarball.ts): "npm", only to npm's own
+   * https tarball URL (the default, and production); "upstream", to the configured upstream's URL for the version,
+   * which tests and the bench use for their stand-in npm. Unset means "npm".
+   */
+  readonly tarballRedirects?: "npm" | "upstream";
 };
 
 export class RegistryConfig extends Context.Service<RegistryConfig, RegistrySettings>()("@apm/registry/RegistryConfig") {}

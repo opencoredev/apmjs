@@ -98,6 +98,8 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     ["APM_REGISTRY_URL", url],
     ["APM_PUBLIC_URL", url],
     ["APM_UPSTREAM", opts.upstream ?? "off"],
+    // the stand-in npm is where a checked tarball request is redirected, as npm itself is in production
+    ["APM_TARBALL_REDIRECTS", "upstream"],
     ["APM_LEGACY_AUTH", opts.legacyAuth ? "1" : "0"],
     ["APM_NAME_POLICY", opts.namePolicy],
     ["APM_AUTH_SECRET", opts.authSecret],

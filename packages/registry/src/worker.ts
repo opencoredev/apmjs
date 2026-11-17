@@ -62,6 +62,8 @@ const WorkerEnv = z.object({
   APM_UPSTREAM: OptionalText,
   /** How long an upstream answer is trusted, in milliseconds. Default 60000. */
   APM_UPSTREAM_TTL_MS: z.coerce.number().int().min(0).optional(),
+  /** "upstream" lets a checked tarball request be redirected to the configured upstream (tests, the bench); default npm's own URL only. */
+  APM_TARBALL_REDIRECTS: z.enum(["npm", "upstream"]).optional(),
   APM_LEGACY_AUTH: Flag,
   /** Lets legacy password auth run on a public https address. Without it the registry refuses to serve. */
   APM_ALLOW_LEGACY_IN_PROD: OptionalText,
@@ -130,6 +132,7 @@ function settingsOf(env: WorkerEnv, requestUrl: string): RegistrySettings {
     legacyAuth: env.APM_LEGACY_AUTH,
     namePolicy: env.APM_NAME_POLICY ?? "scoped",
     admins: (env.APM_ADMINS ?? "").split(","),
+    tarballRedirects: env.APM_TARBALL_REDIRECTS ?? "npm",
   };
 }
 
@@ -316,8 +319,11 @@ export async function handle(
   const start = performance.now();
   const timing = Timing.make();
   const res = await respond({ req, rawEnv, clock, ctx, faults, timing });
+  // an answer a route marked public carries its phases to anyone (timing.ts); any other only to the debug token
+  const exposed = timing.exposed();
+  const detail: TimingDetail = exposed ? "full" : timingDetail(req, rawEnv);
 
-  return withBuild(req, withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail: timingDetail(req, rawEnv) })), rawEnv);
+  return withBuild(req, withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail }), exposed), rawEnv);
 }
 
 /** The header /-/ping carries this version's build id in (APM_BUILD), for the deploy's smoke check (packages/infra/smoke-identity.ts). */

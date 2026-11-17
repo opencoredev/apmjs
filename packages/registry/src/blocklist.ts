@@ -165,8 +165,51 @@ export async function rewrite(bucket: BlocklistBucket, change: (current: Blockli
   throw new Error(`the block list changed under ${WRITE_TRIES} writes in a row`);
 }
 
+/**
+ * How long an isolate uses its read of the list for the fast tarball path (fast-tarball.ts, Blocklist.recent). That
+ * path reads the database on the same request, which sees every committed block at once; the list adds only blocks
+ * whose transaction is still committing, which it was given before their commit, so a read this old misses nothing the
+ * database will not refuse a moment later. Every other reader (degraded.ts, the health check, the writes) reads R2.
+ */
+export const BLOCKLIST_RECENT_MS = 5_000;
+
+type RecentRead = { readonly at: number; readonly read: Promise<BlocklistRead> };
+
+/**
+ * Each bucket's latest read, in this isolate (one bucket per Worker; a WeakMap so a test's bucket goes with it). A read
+ * that failed is never kept, and a write by this isolate drops it.
+ */
+const recentReads = new WeakMap<BlocklistReader, RecentRead>();
+
+/**
+ * The list as read from `bucket` within BLOCKLIST_RECENT_MS of `at`: this isolate's last read while it is that young
+ * (one read in flight is shared by every request that asks meanwhile), else a new one. A read that throws is not kept,
+ * so the next request reads R2 again.
+ */
+export function recentFrom(bucket: BlocklistReader, at: number): Promise<BlocklistRead> {
+  const kept = recentReads.get(bucket);
+
+  if (kept !== undefined && at - kept.at >= 0 && at - kept.at < BLOCKLIST_RECENT_MS) return kept.read;
+  const read = readFrom(bucket);
+  const entry = { at, read };
+
+  recentReads.set(bucket, entry);
+  read.catch(() => {
+    if (recentReads.get(bucket) === entry) recentReads.delete(bucket);
+  });
+
+  return read;
+}
+
+/** Drops this isolate's recent read of `bucket`'s list: called on every write, so this isolate never reads around its own. */
+function forgetRecent(bucket: BlocklistReader): void {
+  recentReads.delete(bucket);
+}
+
 export type BlocklistApi = {
   readonly read: Effect.Effect<BlocklistRead, BlobError>;
+  /** The list as this isolate read it within BLOCKLIST_RECENT_MS: for the fast tarball path only, which reads the database too. */
+  readonly recent: Effect.Effect<BlocklistRead, BlobError>;
   /** Adds `blocks` to the list. Call it before the transaction that blocks them commits, and fail that transaction when this fails. */
   readonly block: (blocks: Blocks) => Effect.Effect<void, BlobError>;
   /** Rewrites the list from what the database holds (`reconciled`), and records that it did. */
@@ -174,7 +217,7 @@ export type BlocklistApi = {
 };
 
 export class Blocklist extends Context.Service<Blocklist, BlocklistApi>()("@apm/registry/Blocklist") {
-  static r2(bucket: R2Bucket, now: () => number = Date.now): Layer.Layer<Blocklist> {
+  static r2(bucket: BlocklistBucket, now: () => number = Date.now): Layer.Layer<Blocklist> {
     const attempt = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, BlobError> =>
       Effect.tryPromise({ try: run, catch: (cause) => new BlobError({ operation: `blocklist.${operation}`, key: BLOCKLIST_KEY, cause }) });
 
@@ -182,9 +225,12 @@ export class Blocklist extends Context.Service<Blocklist, BlocklistApi>()("@apm/
       Blocklist,
       Blocklist.of({
         read: attempt("read", () => readFrom(bucket)),
+        recent: attempt("recent", () => recentFrom(bucket, now())),
         block: (blocks) =>
-          (blocks.local ?? []).length === 0 && (blocks.confirmed ?? []).length === 0 ? Effect.void : Effect.asVoid(attempt("block", () => rewrite(bucket, (list) => withBlocks(list, blocks, now())))),
-        sync: (truth) => attempt("sync", () => rewrite(bucket, (list) => reconciled(list, truth, now()))),
+          (blocks.local ?? []).length === 0 && (blocks.confirmed ?? []).length === 0
+            ? Effect.void
+            : Effect.asVoid(attempt("block", () => rewrite(bucket, (list) => withBlocks(list, blocks, now())).finally(() => forgetRecent(bucket)))),
+        sync: (truth) => attempt("sync", () => rewrite(bucket, (list) => reconciled(list, truth, now())).finally(() => forgetRecent(bucket))),
       }),
     );
   }

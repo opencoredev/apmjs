@@ -91,6 +91,7 @@ import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning, type WarningSignal } from "./warnings.ts";
 import { fastTarball } from "./fast-tarball.ts";
+import { timingOrNull } from "./timing.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -3682,7 +3683,15 @@ const installPackument = (name: string, upstream: UpstreamApi) =>
       return yield* up;
     }
 
-    if (got.kind === "copy") return new Response(got.body, { headers: INSTALL_HEADERS });
+    // from here every answer is this public package's install document: its phases may go to anyone (timing.ts)
+    const timing = yield* timingOrNull;
+
+    if (got.kind === "copy") {
+      timing?.expose();
+
+      return new Response(got.body, { headers: INSTALL_HEADERS });
+    }
+
     const listing = got.listing;
 
     if (listing.kind === "absent") return null;
@@ -3721,6 +3730,8 @@ const installPackument = (name: string, upstream: UpstreamApi) =>
         },
       });
     }
+
+    timing?.expose();
 
     // the request's lease stays open until the last byte is sent: the stream refers to the package until then
     return streamedJson(make(), "versions", INSTALL_HEADERS, { onDone: lease.retain() });

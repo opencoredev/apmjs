@@ -1,38 +1,59 @@
 // The tarball of a package only npm has, served without reading its packument. A published npm tarball never changes
 // for a name and version, and every client checks it against the integrity in the packument it was given, so serving
-// one needs only what can refuse it, read fresh on every request before any byte goes out:
+// one needs only what can refuse it, read before any byte goes out:
 //
-// - the database, in one statement (Store.tarballRead): whether the name is published here (then server.ts answers
-//   it, as before), whether an apm reviewer confirmed this version's tarball malicious (410, as before), and whether it
-//   needs queueing for analysis;
+// - the database, in one statement (Store.tarballRead), read fresh on every request: whether the name is published
+//   here (then server.ts answers it, as before), whether an apm reviewer confirmed this version's tarball malicious
+//   (410, as before), and whether it needs queueing for analysis. This is the check that sees a block at once;
 // - the install block list in R2 (blocklist.ts), which is never less strict than the database: a version on it is
-//   refused here too (the packument route does not read it while the database answers, so this only adds refusals);
-// - npm's document for the one version (Upstream.versionOf, a few KiB, kept in the isolate for the upstream TTL like
-//   the packument it replaces here): the version exists upstream now, where its tarball is and what it must hash to.
+//   refused here too (the packument route does not read it while the database answers, so this only adds refusals).
+//   It is this isolate's read of it from the last BLOCKLIST_RECENT_MS (Blocklist.recent): every write that blocks
+//   something adds it to the list before its transaction commits, so what the list adds beyond the database read on
+//   this same request is only a block still committing, and a read seconds old is as good for that;
+// - npm's document for the one version (Upstream.versionOf, a few KiB, kept in the isolate for the upstream TTL; npm's
+//   own CDN keeps it too, so asking for it from a Worker is a cache hit in the same data center): the version exists
+//   upstream, where its tarball is and what it must hash to.
 //
-// The three run at once. The bytes then come straight from npm, passed on as they arrive and hashed on the way
-// against the version's checksum (verifiedStream): nothing is held, kept in R2 or shared between requests, so a
-// request with credentials is served the same way and no copy can outlive a block. Before this, every download read
-// and parsed the whole packument (tens of MB for next or typescript) and made about five database round trips, and a
-// tarball up to 32 MiB was downloaded whole before its first byte was sent (npm install of 81 packages: about 1.3 s a
-// tarball with production's 75 ms round trip; scripts/perf/npm-install-bench.ts).
+// The three run at once. Once nothing refuses the version:
+//
+// - a request without credentials is answered with a redirect to npm's own tarball URL (only on the upstream's or
+//   npm's origin), never kept by any cache. The client downloads npm's bytes from npm's CDN and checks them against the
+//   integrity apm's install document gave it, which is npm's own (upstreamPackument). npm, pnpm and bun follow the
+//   redirect and none of their lockfiles names npm's URL (npm's records apm's), so a later install from the lockfile
+//   comes back here and is checked again; scripts/perf/npm-install-bench.ts checks all three on every run (yarn is not
+//   checked there). Streaming the bytes through the Worker cost seconds on big tarballs (next's 43.7 MB took
+//   2.2 to 3.4 s through production against npm's 0.45 s) and Worker CPU on every download;
+// - a request with credentials is never sent elsewhere: some clients would send its Authorization along. It gets
+//   npm's bytes through the Worker, opened as soon as npm's document and the block list are known and the list does
+//   not refuse it, while the database statement is still running (the slowest of the three: about 60 ms against 30
+//   for opening npm's answer in the bench). Nothing is sent before the database has answered: a version it refuses
+//   gets its refusal and the opened answer is cancelled unread. So npm may be asked for the bytes of a version the
+//   database refuses, but only one the block list did not know of yet: one confirmed in the last few seconds, or
+//   published here in them. The bytes come straight from npm, passed on as they arrive and hashed on the way against
+//   the version's checksum (verifiedStream), with the last bytes held back: nothing is held, kept in R2 or shared
+//   between requests, and no copy can outlive a block.
+//
+// Before round one, every download read and parsed the whole packument (tens of MB for next or typescript) and made
+// about five database round trips, and a tarball up to 32 MiB was downloaded whole before its first byte was sent.
 //
 // A package published here goes to the protocol route (server.ts), as before. Anything else this path is not sure of
 // goes to the packument route it replaces, which answers it as it always has: `~safe` (its policy needs scores), a
 // file name that is not the one apm's packuments link (`<name>-<version>.tgz`), a version npm's document does not
 // confirm or could not be read for, one with no checksum, a block list that cannot be read or names the package as
 // published here, and an upstream tarball that could not be opened (that route may still have the bytes in R2).
-import { Effect, Option, Result } from "effect";
+import { Effect, Exit, Fiber, Option, Result } from "effect";
 import { isValidVersion } from "@apm/core";
 import { Analysis, REQUEUE_AFTER_MS } from "./analysis.ts";
 import { Blocklist, verdictFor, type BlocklistBody } from "./blocklist.ts";
 import { Clock } from "./clock.ts";
+import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { confirmedText } from "./confirmed.ts";
 import { Store } from "./db.ts";
-import { digestLabel, digestOf } from "./digest.ts";
+import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { fail } from "./http.ts";
 import { tarballBase } from "./server.ts";
-import { passTarball, type UpstreamApi } from "./upstream.ts";
+import { timed, timingOrNull, type TimingApi } from "./timing.ts";
+import { passTarball, type OpenedUpstream, type UpstreamApi, type UpstreamVersion } from "./upstream.ts";
 
 const TARBALL_HEADERS = { "content-type": "application/octet-stream" } as const;
 
@@ -56,7 +77,7 @@ const blockList = Effect.gen(function* () {
   const blocklist = yield* Effect.serviceOption(Blocklist);
 
   if (Option.isNone(blocklist)) return null;
-  const read = yield* Effect.result(blocklist.value.read);
+  const read = yield* Effect.result(blocklist.value.recent);
 
   if (Result.isFailure(read)) return null;
 
@@ -83,13 +104,46 @@ const EMPTY_LIST: BlocklistBody = { format: 1, syncedAt: null, local: [], confir
  */
 export type FastTarball = { kind: "answer"; response: Response } | { kind: "local" } | { kind: "packument" };
 
+/** Where npm itself serves tarballs: the only origin a client is redirected to. */
+const NPM_TARBALLS = "https://registry.npmjs.org/";
+
+/**
+ * Whether `url` is npm's own tarball URL for exactly `name@version`. A mirror's or any other link is streamed and
+ * checked here instead: after a redirect the client follows any further hops itself, with none of apm's checks.
+ */
+export function isNpmTarball(url: string, name: string, version: string, base: string = NPM_TARBALLS): boolean {
+  return url === `${base}${name}/-/${tarballBase(name)}-${version}.tgz`;
+}
+
+/** The base a checked tarball request may be redirected under: npm's, or the configured upstream's when set to. */
+function redirectBase(settings: RegistrySettings): string | null {
+  if (settings.tarballRedirects === "upstream") return settings.upstreamUrl;
+
+  return settings.upstreamUrl === NPM_TARBALLS ? NPM_TARBALLS : null;
+}
+
+/**
+ * Clients that check a downloaded tarball against the install document's dist.integrity or shasum on every install:
+ * npm, pnpm, bun and yarn 1. Yarn 2 and later trust their own cache checksum, which a first install has not got, so
+ * they and every unnamed client get npm's bytes checked here. A client that only claims to be one of these skips
+ * apm's check of bytes sent to itself, nothing more.
+ */
+const CHECKING_CLIENT = /^(?:npm\/|pnpm\/|bun\/|yarn\/1\.)/i;
+
+export function checksTarballs(req: Request): boolean {
+  return CHECKING_CLIENT.test(req.headers.get("user-agent") ?? "");
+}
+
 const PACKUMENT: FastTarball = { kind: "packument" };
 
 /**
  * The fast path's answer. The bytes are public, but an answer to a request with credentials, a refusal included, is
  * marked so no shared cache keeps it (withPrivacyHeaders leaves tarball paths alone).
  */
-function answered(req: Request, response: Response): FastTarball {
+function answered(req: Request, response: Response, timing: TimingApi | null): FastTarball {
+  // the answer of a package only npm has: its phases may go to anyone (timing.ts)
+  timing?.expose();
+
   if (!req.headers.has("authorization") && !req.headers.has("cookie")) return { kind: "answer", response };
   const headers = new Headers(response.headers);
 
@@ -98,6 +152,42 @@ function answered(req: Request, response: Response): FastTarball {
 
   return { kind: "answer", response: new Response(response.body, { status: response.status, statusText: response.statusText, headers }) };
 }
+
+/** What npm's document says this path may serve: the version's tarball URL and checksum, or null to leave it to the packument route. */
+type Servable = { tarball: string; digest: Digest } | null;
+
+function servableOf(npm: UpstreamVersion): Servable {
+  if (npm.kind !== "found") return null;
+  const digest = digestOf(npm);
+
+  return digest === null ? null : { tarball: npm.tarball, digest };
+}
+
+/** Whether the block list refuses this version here: confirmed malicious, or the name published on apm. */
+function listRefuses(list: BlocklistBody, name: string, version: string, digest: Digest): boolean {
+  const verdict = verdictFor(list, name);
+  const label = digestLabel(digest);
+
+  return verdict.kind === "local" || verdict.confirmed.some((e) => e.version === version && e.digest === label);
+}
+
+/**
+ * Lets go of an early open that is not served: the fiber is stopped (openTarballUrl cancels an answer that comes after
+ * that) and an answer it already had is cancelled unread, so no connection to npm is left open. The caller does not
+ * wait for any of it.
+ */
+const discard = (opening: Fiber.Fiber<OpenedUpstream | null>): Effect.Effect<void> =>
+  Effect.asVoid(
+    Effect.forkDetach(
+      Effect.gen(function* () {
+        yield* Fiber.interrupt(opening);
+        const done = opening.pollUnsafe();
+        const opened = done !== undefined && Exit.isSuccess(done) ? done.value : null;
+
+        if (opened?.kind === "open") yield* Effect.promise(() => opened.res.body?.cancel().catch(() => undefined) ?? Promise.resolve());
+      }),
+    ),
+  );
 
 /** A GET or HEAD of `/<name>/-/<file>` for a package npm has, answered from npm's tarball when nothing refuses it. */
 export const fastTarball = (input: { req: Request; name: string; file: string; upstream: UpstreamApi }) =>
@@ -108,42 +198,81 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     if (version === null) return PACKUMENT;
     const store = yield* Store;
     const at = yield* Effect.flatMap(Clock, (c) => c.now);
+    const timing = yield* timingOrNull;
+    const checksStart = performance.now();
+    // npm's document and the block list are read on fibers of their own, and npm's tarball is opened once both are
+    // known and the list does not refuse it, while the database statement below still runs; each is interrupted when
+    // this request ends, so a check that fails here stops them
+    const listing = yield* Effect.forkChild(timed(timing, "blocklist")(blockList));
+    const document = yield* Effect.forkChild(upstream.versionOf(name, version));
+    // a request without credentials is sent to npm's own URL once nothing refuses it, so nothing is opened for it here;
+    // one with credentials is never sent elsewhere (its Authorization would follow it there in some clients), and gets
+    // npm's bytes through this Worker, opened early
+    const credentialed = req.headers.has("authorization") || req.headers.has("cookie");
 
-    // npm's tarball is not asked for until these pass: a version refused here is never fetched (opening it while they
-    // ran saved about 30 ms a tarball in the bench, and asked npm for the bytes of versions apm refuses)
-    const [read, npm, list] = yield* Effect.all([store.tarballRead({ name, version, queuedSince: at - REQUEUE_AFTER_MS }), upstream.versionOf(name, version), blockList], {
-      concurrency: "unbounded",
-    });
+    const opening = credentialed
+      ? yield* Effect.forkChild(
+          Effect.gen(function* () {
+            const [list, npm] = [yield* Fiber.join(listing), servableOf(yield* Fiber.join(document))];
 
-    if (read.local) return { kind: "local" } satisfies FastTarball;
+            if (list === null || npm === null || listRefuses(list, name, version, npm.digest)) return null;
 
-    if (npm.kind !== "found" || list === null) return PACKUMENT;
-    const digest = digestOf(npm);
+            return yield* upstream.openTarballUrl(npm.tarball);
+          }),
+        )
+      : null;
 
-    if (digest === null) return PACKUMENT;
+    const letGo = opening === null ? Effect.void : discard(opening);
+    const read = yield* Effect.onError(store.tarballRead({ name, version, queuedSince: at - REQUEUE_AFTER_MS }), () => letGo);
+    const list = yield* Fiber.join(listing);
+    const npm = yield* Fiber.join(document);
+
+    timing?.add("checks", performance.now() - checksStart);
+
+    // what follows answers with npm's bytes only through `serve`; every other way out lets the early open go
+    const refuse = (outcome: FastTarball) => Effect.as(letGo, outcome);
+
+    if (read.local) return yield* refuse({ kind: "local" });
+    const servable = servableOf(npm);
+
+    if (servable === null || list === null) return yield* refuse(PACKUMENT);
+    const { digest } = servable;
     const label = digestLabel(digest);
     const verdict = verdictFor(list, name);
 
     // confirmed malicious by an apm reviewer, in the database or on the block list: gone like a revoked version, before
-    // anything is downloaded
+    // any byte is sent
     if (read.confirmed.includes(label) || (verdict.kind === "upstream" && verdict.confirmed.some((e) => e.version === version && e.digest === label))) {
-      return answered(req, fail(410, confirmedText(name, version), { confirmed: true }));
+      return yield* refuse(answered(req, fail(410, confirmedText(name, version), { confirmed: true }), timing));
     }
 
     // published here by the list (a publish whose transaction may still be committing): the packument route decides
-    if (verdict.kind === "local") return PACKUMENT;
+    if (verdict.kind === "local") return yield* refuse(PACKUMENT);
     // scoring a download happens off the request path, as before: queued unless it is scored, decided or queued already
     const queue = read.decided || read.queued ? Effect.void : Effect.flatMap(Analysis, (a) => a.enqueue(name, version));
-    const [opened, queued] = yield* Effect.all([upstream.openTarballUrl(npm.tarball), Effect.result(queue)], { concurrency: "unbounded" });
+
+    // sent to npm: the version passed every check above, and the client downloads npm's own bytes from npm's own URL,
+    // checking them against the integrity apm's install document carries, which is npm's (upstreamPackument). The
+    // redirect is never kept by a cache, so the next request is checked again
+    const base = redirectBase(yield* RegistryConfig);
+
+    if (opening === null && base !== null && checksTarballs(req) && isNpmTarball(servable.tarball, name, version, base)) {
+      yield* queue;
+
+      return answered(req, new Response(null, { status: 302, headers: { location: servable.tarball, "cache-control": "no-store" } }), timing);
+    }
+
+    const open = opening === null ? upstream.openTarballUrl(servable.tarball) : Fiber.join(opening);
+    const [opened, queued] = yield* Effect.all([open, Effect.result(queue)], { concurrency: "unbounded" });
 
     if (Result.isFailure(queued)) {
       // an answer left unread would hold its connection
-      if (opened.kind === "open") yield* Effect.promise(() => opened.res.body?.cancel() ?? Promise.resolve());
+      if (opened?.kind === "open") yield* Effect.promise(() => opened.res.body?.cancel() ?? Promise.resolve());
 
       return yield* Effect.fail(queued.failure);
     }
 
-    if (opened.kind !== "open") return PACKUMENT;
+    if (opened?.kind !== "open") return PACKUMENT;
     const served = passTarball(opened.res, digest);
     const headers = new Headers(TARBALL_HEADERS);
 
@@ -152,8 +281,8 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     if (req.method === "HEAD") {
       yield* Effect.promise(() => served.body.cancel());
 
-      return answered(req, new Response(null, { headers }));
+      return answered(req, new Response(null, { headers }), timing);
     }
 
-    return answered(req, new Response(served.body, { headers }));
+    return answered(req, new Response(served.body, { headers }), timing);
   });

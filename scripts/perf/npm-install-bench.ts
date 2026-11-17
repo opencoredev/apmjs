@@ -1,6 +1,9 @@
 // How long a fresh `npm install` takes through the registry: the Worker bundle in workerd against real npm
-// (registry.npmjs.org, read-only), Postgres behind a proxy that adds a round trip's latency to every query, and npm's
-// answers counted as they pass through workerd's outbound fetch. Everything runs one step at a time.
+// (registry.npmjs.org, read-only), Postgres behind a proxy that adds a round trip's latency to every query, R2 calls
+// made later by the same kind of delay (the test entry's TEST_R2_DELAY_MS), and npm's answers counted as they pass
+// through workerd's outbound fetch. npm talks to the registry through a recording proxy that reads each answer's
+// Server-Timing (with the bench's own debug token), so every install shows where the Worker's time went per request as
+// well as what npm saw. Everything runs one step at a time.
 //
 //   TMPDIR=<a scratch dir> bun scripts/perf/npm-install-bench.ts
 //
@@ -8,30 +11,36 @@
 // registry.npmjs.org with an empty cache and no lockfile, for reference (BENCH_NPM=0 skips it); `cold`, the same
 // install through a fresh registry; `warm`, again on the same registry with a new empty npm cache, as a second machine
 // in the same data center would make it; `later`, again once the upstream TTL (BENCH_UPSTREAM_TTL_MS, 10 s here, 60 s
-// in production) has passed, as an install minutes later makes it. For each: the wall time, the requests npm made by
-// kind (median, p90 and slowest, from npm's own http log), the database statements and the requests sent to npm. Then
-// single requests, three times each: the install document of express and react and four tarballs (react, lodash,
-// typescript, next's 43.7 MB). Numbers move by about half a second between runs with npm's own latency; compare runs.
+// in production) has passed, as an install minutes later makes it, or one served by an isolate that has not seen these
+// packages. For each: the wall time; the requests npm made by kind (median, p90 and slowest, from npm's own http log,
+// which counts from when npm queued the request, so it includes the wait for one of npm's 15 sockets); the same
+// requests as the Worker saw them (time to its answer's headers, and to its last byte), with the median and p90 of
+// each Server-Timing phase; the database statements and the requests sent to npm. Then single requests, three times
+// each: the install document of express and react and four tarballs (react, lodash, typescript, next's 43.7 MB).
+// Numbers move by about half a second between runs with npm's own latency; compare runs.
 //
 // Freshness is checked last, so no step wins by keeping an answer: lodash@4.17.21 is marked confirmed malicious by an
 // apm reviewer and its tarball must answer 410 on the very next request, then the mark is dismissed and it must answer
 // 200 with npm's bytes. The bench prints FAIL and exits 1 if either does not hold, or if an install through the
 // registry fails.
 //
-// PG_RTT (ms, default 75: production's Workers reach Neon in about that from Miami) is added to each statement,
-// PG_CONNECT (default 10) to each new connection. BENCH_SQL=1 prints the start of every statement sent;
-// BENCH_INSTALLS=0 skips the installs.
+// PG_RTT (ms, default 40: us-east-2 from a US colo through Hyperdrive) is added to each statement, PG_CONNECT
+// (default 10) to each new connection, R2_RTT (ms, "30" or a uniform range, default "20-50"; "0" for none) to each R2
+// call. BENCH_SQL=1 prints the start of every
+// statement sent; BENCH_INSTALLS=0 skips the installs.
 import { randomBytes, createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Miniflare } from "miniflare";
 import { Client } from "pg";
+import { z } from "zod";
 import { buildWorker } from "../../packages/registry/scripts/build.ts";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS } from "../../packages/registry/scripts/compat.ts";
 import { freshDatabase } from "../../tests/acceptance/postgres.ts";
 
-const PG_RTT = Number(process.env.PG_RTT ?? 75);
+const PG_RTT = Number(process.env.PG_RTT ?? 40);
+const R2_RTT = process.env.R2_RTT ?? "20-50";
 const PG_CONNECT = Number(process.env.PG_CONNECT ?? 10);
 const PACKAGES = ["react", "react-dom", "zod", "express", "lodash", "axios"];
 const ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
@@ -141,7 +150,59 @@ process.on("exit", () => rmSync(root, { recursive: true, force: true }));
 // the plain entry's non-handler exports
 const script = await buildWorker("worker-test", root);
 const port = 20_000 + Math.floor(Math.random() * 20_000);
-const base = `http://127.0.0.1:${port}/`;
+const worker = `http://127.0.0.1:${port}/`;
+
+// the bench's own debug token: every answer carries its full Server-Timing to the recording proxy
+const debugToken = randomBytes(24).toString("base64url");
+
+// ---------- npm's requests, as the Worker answered them ----------
+type Served = { path: string; status: number; headersMs: number; endMs: number; phases: Map<string, number> };
+
+let served: Served[] = [];
+
+/** Server-Timing's metrics, by name: "db;dur=41.2;desc=\"1\", total;dur=90.1" is db 41.2 and total 90.1. */
+function phasesOf(header: string | null): Map<string, number> {
+  const out = new Map<string, number>();
+
+  for (const part of (header ?? "").split(",")) {
+    const m = /^\s*([\w-]+);dur=([\d.]+)/.exec(part);
+
+    if (m?.[1] && m[2]) out.set(m[1], Number(m[2]));
+  }
+
+  return out;
+}
+
+const recorder = Bun.serve({
+  hostname: "127.0.0.1",
+  port: 0,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const headers = new Headers(req.headers);
+
+    headers.set("x-apm-debug", debugToken);
+    const start = performance.now();
+    const res = await fetch(`${worker}${url.pathname.slice(1)}${url.search}`, { method: req.method, headers, decompress: false, redirect: "manual" });
+    const headersMs = performance.now() - start;
+    const entry: Served = { path: url.pathname, status: res.status, headersMs, endMs: headersMs, phases: phasesOf(res.headers.get("server-timing")) };
+
+    served.push(entry);
+
+    if (!res.body) return new Response(null, { status: res.status, headers: res.headers });
+
+    const body = res.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        flush() {
+          entry.endMs = performance.now() - start;
+        },
+      }),
+    );
+
+    return new Response(body, { status: res.status, headers: res.headers });
+  },
+});
+
+const base = `http://127.0.0.1:${recorder.port}/`;
 
 const mf = new Miniflare({
   modules: [{ type: "ESModule", path: script }],
@@ -156,7 +217,9 @@ const mf = new Miniflare({
     APM_NAME_POLICY: "scoped",
     APM_AUTH_SECRET: randomBytes(32).toString("base64url"),
     APM_UPSTREAM_TTL_MS: String(UPSTREAM_TTL_MS),
+    APM_DEBUG_TOKEN_HASH: createHash("sha256").update(debugToken).digest("hex"),
     TEST_CONTROL_SECRET: randomBytes(32).toString("base64url"),
+    TEST_R2_DELAY_MS: R2_RTT,
   },
   r2Buckets: ["BLOBS"],
   queueProducers: { ANALYSIS_QUEUE: { queueName: "apm-analysis" } },
@@ -183,6 +246,17 @@ const summary = (fetches: readonly Fetch[], kind: Fetch["kind"]): string => {
   return `${kind}s ${ms.length}: median ${quantile(ms, 0.5)} p90 ${quantile(ms, 0.9)} max ${quantile(ms, 1)} ms`;
 };
 
+const spread = (ms: readonly number[]): string => `${Math.round(quantile(ms, 0.5))}/${Math.round(quantile(ms, 0.9))}`;
+
+/** What the Worker did for one kind of request: time to headers and to the last byte, then each phase, as median/p90 ms. */
+function servedSummary(rows: readonly Served[], kind: Fetch["kind"]): string {
+  const mine = rows.filter((r) => (kind === "tarball") === r.path.endsWith(".tgz"));
+  const names = [...new Set(mine.flatMap((r) => [...r.phases.keys()]))].filter((n) => n !== "total");
+  const phases = names.map((n) => `${n} ${spread(mine.flatMap((r) => (r.phases.has(n) ? [r.phases.get(n) ?? 0] : [])))}`);
+
+  return `  worker ${kind}s ${mine.length}: headers ${spread(mine.map((r) => r.headersMs))} end ${spread(mine.map((r) => r.endMs))} | ${phases.join(", ")} (median/p90 ms)`;
+}
+
 /**
  * npm install of PACKAGES in a new project with a new, empty cache. The child runs without blocking this process,
  * which serves workerd's outbound fetches and the database proxy.
@@ -193,6 +267,8 @@ async function install(label: string, registry = base): Promise<boolean> {
   writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "bench", version: "1.0.0", private: true }));
   const trips = pgTrips;
   const calls = npmCalls;
+
+  served = [];
   const start = performance.now();
 
   const child = Bun.spawn(
@@ -219,7 +295,64 @@ async function install(label: string, registry = base): Promise<boolean> {
 
   log(`${label.padEnd(5)} ${ok ? "ok" : "FAILED"} ${seconds.toFixed(2)} s  ${summary(fetches, "document")}; ${summary(fetches, "tarball")}; pg statements ${pgTrips - trips}, npm requests ${npmCalls - calls}`);
 
+  if (registry === base) {
+    log(servedSummary(served, "document"));
+    log(servedSummary(served, "tarball"));
+    const redirected = served.filter((r) => r.status === 302).length;
+    // every package-lock entry must name this registry: one that names npm would send later installs around apm
+    const lock = z.object({ packages: z.record(z.string(), z.object({ resolved: z.string().optional() })) }).safeParse(JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8")));
+    const resolved = lock.success ? Object.values(lock.data.packages).flatMap((p) => (p.resolved === undefined ? [] : [p.resolved])) : [];
+    const elsewhere = resolved.filter((r) => !r.startsWith(base));
+
+    log(`  redirects ${redirected}; package-lock resolved ${resolved.length}, naming another registry ${elsewhere.length}${elsewhere[0] ? ` (${elsewhere[0]})` : ""}`);
+
+    if (!lock.success || elsewhere.length > 0) lockfileOk = false;
+  }
+
   if (!ok) log(stderr.split("\n").filter((l) => !l.includes("http fetch")).slice(-8).join("\n"));
+
+  return ok;
+}
+
+/**
+ * Another client's install of PACKAGES through the registry, with a new, empty store: it must succeed, and its lockfile
+ * must not name npm's registry (a lockfile that did would send later installs around apm).
+ */
+async function otherClient(label: "pnpm" | "bun"): Promise<boolean> {
+  const dir = mkdtempSync(join(root, `${label}-`));
+
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "bench", version: "1.0.0", private: true }));
+  served = [];
+  const start = performance.now();
+
+  const cmd =
+    label === "pnpm"
+      ? ["pnpm", "add", `--registry=${base}`, `--store-dir=${join(dir, ".store")}`, `--cache-dir=${join(dir, ".cache")}`, "--ignore-scripts", ...PACKAGES]
+      : ["bun", "add", `--registry=${base}`, `--cache-dir=${join(dir, ".cache")}`, "--ignore-scripts", ...PACKAGES];
+
+  const child = Bun.spawn(cmd, { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, npm_config_userconfig: join(dir, ".npmrc-none"), BUN_INSTALL_CACHE_DIR: join(dir, ".cache") } });
+  const timer = setTimeout(() => child.kill(), INSTALL_TIMEOUT_MS);
+  const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  const code = await child.exited;
+
+  clearTimeout(timer);
+  const lockfile = label === "pnpm" ? "pnpm-lock.yaml" : "bun.lock";
+  let lock = "";
+
+  try {
+    lock = readFileSync(join(dir, lockfile), "utf8");
+  } catch {
+    lock = "";
+  }
+
+  const namesNpm = lock.includes("registry.npmjs.org");
+  const installed = PACKAGES.every((p) => existsSync(join(dir, "node_modules", p, "package.json")));
+  const ok = code === 0 && lock !== "" && !namesNpm && installed;
+
+  log(`${label.padEnd(5)} ${ok ? "ok" : "FAILED"} ${((performance.now() - start) / 1000).toFixed(2)} s  redirects ${served.filter((r) => r.status === 302).length}, ${lockfile} names npm ${String(namesNpm)}, packages installed ${String(installed)}`);
+  log(servedSummary(served, "tarball"));
+
+  if (!ok) log(`${out}\n${err}`.split("\n").slice(-10).join("\n"));
 
   return ok;
 }
@@ -233,9 +366,10 @@ async function timed(path: string, headers: Record<string, string> = {}): Promis
   return { status: res.status, ms: Math.round(performance.now() - start), bytes: body.length, sha512: createHash("sha512").update(body).digest("base64") };
 }
 
-log(`pg rtt ${PG_RTT} ms, connect ${PG_CONNECT} ms; real npm; ${new Date().toISOString()}`);
+log(`pg rtt ${PG_RTT} ms, connect ${PG_CONNECT} ms, r2 ${R2_RTT} ms; real npm; ${new Date().toISOString()}`);
 
 let failed = false;
+let lockfileOk = true;
 
 // BENCH_INSTALLS=0: the single requests and the freshness check only
 if (process.env.BENCH_INSTALLS !== "0") {
@@ -245,6 +379,12 @@ if (process.env.BENCH_INSTALLS !== "0") {
   // past the upstream TTL: the data center's copies are there, and npm is asked whether they are still current
   await wait(UPSTREAM_TTL_MS + 1_000);
   failed = !(await install("later")) || failed;
+
+  // BENCH_CLIENTS=0 skips them
+  if (process.env.BENCH_CLIENTS !== "0") {
+    failed = !(await otherClient("pnpm")) || failed;
+    failed = !(await otherClient("bun")) || failed;
+  }
 }
 
 for (const name of DOCUMENTS) {
@@ -306,9 +446,16 @@ await sql.end();
 
 await mf.dispose();
 
+await recorder.stop(true);
+
 proxy.stop(true);
 
 await database.drop();
+
+if (!lockfileOk) {
+  log("FAIL package-lock.json names a registry other than this one");
+  failed = true;
+}
 
 log(failed ? "FAIL" : "ok");
 

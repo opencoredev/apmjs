@@ -1717,7 +1717,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             // the copy and whether npm's packument is still the one it was made from, found while the database is read
             // (it does not need the stamp); a whole read, which runs the AI review's hook, waits for the database
             const look = Effect.gen(function* () {
+              const copyStart = performance.now();
               const hit = sharing ? yield* Effect.promise(() => workerCache().match(installKey({ upstream: baseUrl, served: input.served, name })).catch(() => undefined)) : undefined;
+
+              if (sharing) timing?.add("install-copy", performance.now() - copyStart);
 
               held = hit?.body ?? null;
               const etag = npmEtag(hit?.headers.get(ETAG_HEADER) ?? null);
@@ -1949,7 +1952,11 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }),
           openTarballUrl: (url) =>
             Effect.callback<OpenedUpstream>((resume) => {
+              const start = performance.now();
+
               const pending = open(url).then((opened): OpenedUpstream => {
+                timing?.add("npm-open", performance.now() - start);
+
                 if (opened.kind !== "ok") return opened;
                 // a stream's deadline ends once the answer has come: a client may take longer to read it
                 opened.release();
