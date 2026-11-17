@@ -54,6 +54,11 @@ export const Manifest = JsonObject;
 
 export type Manifest = z.infer<typeof Manifest>;
 
+/** What serving one upstream tarball reads (Store.tarballRead): `confirmed` holds digest labels of that version's tarball. */
+const TarballReadRow = z.object({ local: z.boolean(), confirmed: z.array(z.string()), decided: z.boolean(), queued: z.boolean() });
+
+export type TarballRead = z.infer<typeof TarballReadRow>;
+
 const UserRow = z.object({
   name: z.string(),
   password_hash: z.string(),
@@ -668,6 +673,13 @@ export type StoreApi = {
    * confirmedReviews reads them, in a stable order.
    */
   readonly installRead: (name: string) => Effect.Effect<{ local: boolean; confirmed: { version: string; digest: string }[] }, StoreError>;
+  /**
+   * What serving one upstream tarball needs from the database, in one round trip (fast-tarball.ts): whether the name
+   * is published here, the digests of `version`'s tarball an apm reviewer confirmed malicious (confirmedReviews,
+   * for that version), whether the current scorer has an analysis or a decided outcome for it (decidedAnalyses), and
+   * whether it was queued for analysis after `queuedSince` (claimAnalysisJob would not claim it again).
+   */
+  readonly tarballRead: (input: { name: string; version: string; queuedSince: number }) => Effect.Effect<TarballRead, StoreError>;
 
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
@@ -1628,6 +1640,19 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
                              FROM reviews WHERE package = ${name} AND human_state = 'confirmed'), '[]'::jsonb) AS confirmed`,
         one(z.object({ local: z.boolean(), confirmed: z.array(z.object({ version: z.string(), digest: z.string() })) })),
       ).pipe(Effect.map((row) => row ?? { local: false, confirmed: [] })),
+    tarballRead: ({ name, version, queuedSince }) =>
+      run(
+        "tarballRead",
+        sql`SELECT EXISTS (SELECT 1 FROM packages WHERE name = ${name}) AS local,
+                   coalesce((SELECT jsonb_agg(digest ORDER BY digest) FROM reviews
+                             WHERE package = ${name} AND version = ${version} AND human_state = 'confirmed'), '[]'::jsonb) AS confirmed,
+                   (EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = ${name} AND u.version = ${version}
+                              AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))))
+                    OR EXISTS (SELECT 1 FROM analysis_outcomes o WHERE o.package = ${name} AND o.version = ${version}
+                              AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL)) AS decided,
+                   EXISTS (SELECT 1 FROM analysis_jobs WHERE package = ${name} AND version = ${version} AND queued_at > ${queuedSince}) AS queued`,
+        one(TarballReadRow),
+      ).pipe(Effect.map((row): TarballRead => row ?? { local: false, confirmed: [], decided: false, queued: false })),
     decidedAnalyses: (versions) =>
       versions.length === 0
         ? Effect.succeed(new Set<string>())

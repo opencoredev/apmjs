@@ -128,9 +128,10 @@ const STUB: UpstreamApi = {
     // no tarball route runs in this file
     serve: () => Effect.succeed({ kind: "absent" }),
     openTarball: () => Effect.succeed({ kind: "absent" }),
+    openTarballUrl: () => Effect.succeed({ kind: "unavailable", reason: "stub", retryable: false }),
     advisories: () => Effect.succeed({ kind: "unavailable" }),
     listingIfChanged: () => Effect.succeed({ kind: "unknown" }),
-    installCopy: () => Effect.succeed({ kind: "read", listing: { kind: "unknown" } }),
+    installCopy: ({ read }) => Effect.map(read, (r) => ({ read: r, copy: { kind: "read", listing: { kind: "unknown" } } })),
     keepInstallCopy: ({ onDone }) => Effect.sync(onDone),
     versionOf: () => Effect.succeed({ kind: "unknown" }),
 };

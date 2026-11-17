@@ -139,7 +139,9 @@ const root = mkdtempSync(join(tmpdir(), "apm-install-bench-"));
 
 process.on("exit", () => rmSync(root, { recursive: true, force: true }));
 
-const script = await buildWorker("worker", root);
+// the test entry is the shipped Worker plus controls only a caller with TEST_CONTROL_SECRET can use; workerd refuses
+// the plain entry's non-handler exports
+const script = await buildWorker("worker-test", root);
 const port = 20_000 + Math.floor(Math.random() * 20_000);
 const base = `http://127.0.0.1:${port}/`;
 
@@ -156,6 +158,7 @@ const mf = new Miniflare({
     APM_NAME_POLICY: "scoped",
     APM_AUTH_SECRET: randomBytes(32).toString("base64url"),
     APM_UPSTREAM_TTL_MS: String(UPSTREAM_TTL_MS),
+    TEST_CONTROL_SECRET: randomBytes(32).toString("base64url"),
   },
   r2Buckets: ["BLOBS"],
   queueProducers: { ANALYSIS_QUEUE: { queueName: "apm-analysis" } },

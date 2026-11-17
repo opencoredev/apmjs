@@ -62,7 +62,8 @@ export function isValidName(name: string): boolean {
   return name.length > 0 && name.length <= 214 && NAME_RE.test(name);
 }
 
-function tarballBase(name: string): string {
+/** The file name part a package's tarball links start with: its name without the scope. */
+export function tarballBase(name: string): string {
   const i = name.lastIndexOf("/");
 
   return i >= 0 ? name.slice(i + 1) : name;

@@ -147,8 +147,13 @@ export type OpenedTarball = { kind: "stream"; body: ReadableStream<Uint8Array>; 
 /** How long a tarball download may take, and how long a streamed one may take to start. */
 const TARBALL_TIMEOUT_MS = 30_000;
 
-/** The Content-Length an answer declares, or null when it declares none (or one that is not a byte count). */
+/**
+ * The Content-Length an answer declares, or null when it declares none (or one that is not a byte count), or when the
+ * answer was compressed and so its length is not the length of the body fetch hands over.
+ */
 function declaredLength(res: Response): number | null {
+  // fetch hands over a compressed answer decoded, so its Content-Length counts bytes the body does not have
+  if (decodedByFetch(res)) return null;
   const raw = res.headers.get("content-length");
 
   if (raw === null || !/^\d+$/.test(raw)) return null;
@@ -156,7 +161,28 @@ function declaredLength(res: Response): number | null {
   return Number(raw);
 }
 
+/** Whether the answer was sent with a Content-Encoding (gzip, br, ...), which fetch decodes before the body is read. */
+function decodedByFetch(res: Response): boolean {
+  const encoding = (res.headers.get("content-encoding") ?? "").trim().toLowerCase();
+
+  return encoding !== "" && encoding !== "identity";
+}
+
 function streamed(res: Response, digest: Digest, length: number | null): ServedTarball {
+  const body = res.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() });
+
+  return { kind: "stream", body: verifiedStream({ source: body, digest, length, url: res.url }), length, digest };
+}
+
+/** A tarball answer opened for a client (Upstream.openTarballUrl): the upstream's 200, its body not read yet. */
+export type OpenedUpstream = { kind: "open"; res: Response } | Extract<UpstreamTarball, { kind: "unavailable" }>;
+
+/**
+ * An opened upstream answer as the client gets it: its bytes unchanged, passed on as they arrive and checked against
+ * `digest` on the way (verifiedStream), with the length the upstream declared.
+ */
+export function passTarball(res: Response, digest: Digest): Extract<ServedTarball, { kind: "stream" }> {
+  const length = declaredLength(res);
   const body = res.body ?? new ReadableStream<Uint8Array>({ start: (c) => c.close() });
 
   return { kind: "stream", body: verifiedStream({ source: body, digest, length, url: res.url }), length, digest };
@@ -597,7 +623,7 @@ export type UpstreamVersion = { kind: "found"; tarball: string; integrity: strin
 /** A version document is a few KiB; one past this is not read. */
 const MAX_VERSION_DOC_BYTES = 1024 * 1024;
 
-const VersionDist = z.object({ dist: z.object({ tarball: z.string().optional(), integrity: z.string().optional(), shasum: z.string().optional() }).loose() }).loose();
+const VersionDist = z.object({ version: z.string(), dist: z.object({ tarball: z.string().optional(), integrity: z.string().optional(), shasum: z.string().optional() }).loose() }).loose();
 
 /** The data center's cache. Call it only inside a Worker request: Bun (the unit tests) has no `caches`. */
 const workerCache = (): Cache => caches.default;
@@ -650,11 +676,15 @@ export type UpstreamApi = {
    */
   readonly listingIfChanged: (name: string, lease: Lease, etag: string | null) => Effect.Effect<UpstreamListing | { kind: "over-budget" } | { kind: "not-modified" }>;
   /**
-   * The install packument kept for `name` (INSTALL_COPY_FORMAT) when it was made for `served` and `stamp` and npm's
-   * packument is still the one it was made from; otherwise the package as `listingIfChanged` reads it, under `lease`
-   * (with the copy's ETag when there is one, so a 304 needs no read and a 200 is the new packument).
+   * The install packument kept for `name` (INSTALL_COPY_FORMAT) when it was made for `served` and for the stamp
+   * `stampOf` makes of what `read` read, and npm's packument is still the one it was made from; otherwise the package
+   * as `listingIfChanged` reads it, under `lease` (with the copy's ETag when there is one, so a 304 needs no read and a
+   * 200 is the new packument). `read` (the database's statement) runs while the copy is looked up and checked with
+   * npm, which needs no stamp; nothing is answered from the copy until the stamps match. A null stamp (the name is
+   * published here) answers no copy and reads nothing more. A whole read of npm's packument with no copy to check
+   * waits for `read`, as before.
    */
-  readonly installCopy: (input: { name: string; served: string; stamp: string; lease: Lease }) => Effect.Effect<InstallCopy>;
+  readonly installCopy: <A, E>(input: { name: string; served: string; lease: Lease; read: Effect.Effect<A, E>; stampOf: (read: A) => string | null }) => Effect.Effect<{ read: A; copy: InstallCopy | null }, E>;
   /**
    * Keeps the install packument made from `pkg` for `served` and `stamp`, after the response: `write` makes it as a
    * streamed answer with the headers and stream options it is given. `onDone` runs once the write settles or is stopped
@@ -711,6 +741,12 @@ export type UpstreamApi = {
    * answer, checked against the published checksum on the way (verifiedStream). Never "too-large".
    */
   readonly serve: (pkg: UpstreamPackage, version: string) => Effect.Effect<ServedTarball, BlobError>;
+  /**
+   * GETs a tarball URL for a client (fast-tarball.ts), from the upstream's origin (or npm's) only, every redirect hop
+   * checked: the 200 answer, its body not read yet. The caller either passes it on (passTarball) or cancels it; an
+   * interrupted open cancels its answer itself.
+   */
+  readonly openTarballUrl: (url: string) => Effect.Effect<OpenedUpstream>;
   /**
    * The tarball of a version the upstream lists right now, opened as a stream for an analysis of one too large to
    * hold. Not checked here: the reader checks it (OpenedTarball).
@@ -1657,13 +1693,10 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             return { byVersion, maxPieceChars: read.maxPieceChars };
           });
 
-        const installCopy = (input: { name: string; served: string; stamp: string; lease: Lease }): Effect.Effect<InstallCopy> =>
+        const installCopy = <A, E>(input: { name: string; served: string; lease: Lease; read: Effect.Effect<A, E>; stampOf: (read: A) => string | null }): Effect.Effect<{ read: A; copy: InstallCopy | null }, E> =>
           Effect.gen(function* () {
             const { name, lease } = input;
             const t = yield* now;
-            const hit = sharing ? yield* Effect.promise(() => workerCache().match(installKey({ upstream: baseUrl, served: input.served, name })).catch(() => undefined)) : undefined;
-            const etag = npmEtag(hit?.headers.get(ETAG_HEADER) ?? null);
-            const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
             // npm's packument must have been read whole since `since`, by the registry's clock (tests move it): the
             // copy, and any packument this path builds a copy from (the isolate's, a shared copy), counts from that
             // read, whatever the upstream TTL. Past it the packument is read whole from npm, which runs what a whole
@@ -1671,31 +1704,71 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             // makes anything younger, nor does making a copy again from what was read before
             const at = yield* keptNow;
             const since = at - KEPT_CHOICES_MAX_AGE_MS;
-            const readAt = readTime(hit?.headers.get(INSTALL_READ_AT_HEADER) ?? null);
-            const young = wholeReadCounts(readAt, since, at);
-            const usable = hit?.body && etag !== null && young && hit.headers.get(INSTALL_FORMAT_HEADER) === INSTALL_COPY_FORMAT && hit.headers.get(INSTALL_STAMP_HEADER) === input.stamp;
+            // the copy's body while this holds it unanswered: cancelled on every way out that does not hand it on
+            let held: ReadableStream<Uint8Array> | null = null;
 
-            if (!usable || !hit.body) {
-              yield* Effect.promise(() => hit?.body?.cancel() ?? Promise.resolve());
+            const drop = Effect.promise(async () => {
+              const body = held;
 
-              return { kind: "read", listing: yield* listedOrSame(name, lease, null, since).pipe(Effect.map((l) => (l.kind === "not-modified" ? { kind: "unknown" as const } : l))) };
+              held = null;
+              await body?.cancel().catch(() => undefined);
+            });
+
+            // the copy and whether npm's packument is still the one it was made from, found while the database is read
+            // (it does not need the stamp); a whole read, which runs the AI review's hook, waits for the database
+            const look = Effect.gen(function* () {
+              const hit = sharing ? yield* Effect.promise(() => workerCache().match(installKey({ upstream: baseUrl, served: input.served, name })).catch(() => undefined)) : undefined;
+
+              held = hit?.body ?? null;
+              const etag = npmEtag(hit?.headers.get(ETAG_HEADER) ?? null);
+              const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
+              const readAt = readTime(hit?.headers.get(INSTALL_READ_AT_HEADER) ?? null);
+              const stamp = hit?.headers.get(INSTALL_STAMP_HEADER) ?? null;
+
+              if (!hit?.body || etag === null || stamp === null || !wholeReadCounts(readAt, since, at) || hit.headers.get(INSTALL_FORMAT_HEADER) !== INSTALL_COPY_FORMAT) {
+                yield* drop;
+
+                return { kind: "none" } as const;
+              }
+
+              // npm sent it within the TTL, or said it is current within the TTL: no need to ask
+              if ((Number.isFinite(sentAt) && t - sentAt >= 0 && t - sentAt < ttlMs) || caches.validated.get(name, t) === etag) return { kind: "copy", stamp } as const;
+              const l = yield* listedOrSame(name, lease, etag, since);
+
+              if (l.kind === "not-modified" || (l.kind === "found" && l.pkg.etag === etag)) {
+                caches.validated.set(name, etag, t);
+
+                return { kind: "copy", stamp } as const;
+              }
+
+              yield* drop;
+
+              return { kind: "read", listing: l } as const;
+            });
+
+            const [read, found] = yield* Effect.all([input.read, look], { concurrency: "unbounded" }).pipe(Effect.onError(() => drop));
+            const stamp = input.stampOf(read);
+
+            if (stamp === null) {
+              yield* drop;
+
+              return { read, copy: null };
             }
 
-            const body = hit.body;
+            if (found.kind === "copy" && found.stamp === stamp && held !== null) {
+              const body: ReadableStream<Uint8Array> = held;
 
-            // npm sent it within the TTL, or said it is current within the TTL: no need to ask
-            if ((Number.isFinite(sentAt) && t - sentAt >= 0 && t - sentAt < ttlMs) || caches.validated.get(name, t) === etag) return { kind: "copy", body };
-            const l = yield* listedOrSame(name, lease, etag, since);
+              held = null;
 
-            if (l.kind === "not-modified" || (l.kind === "found" && l.pkg.etag === etag)) {
-              caches.validated.set(name, etag, t);
-
-              return { kind: "copy", body };
+              return { read, copy: { kind: "copy", body } };
             }
 
-            yield* Effect.promise(() => body.cancel().catch(() => undefined));
+            yield* drop;
 
-            return { kind: "read", listing: l };
+            if (found.kind === "read") return { read, copy: { kind: "read", listing: found.listing } };
+            const listing = yield* listedOrSame(name, lease, null, since).pipe(Effect.map((l) => (l.kind === "not-modified" ? { kind: "unknown" as const } : l)));
+
+            return { read, copy: { kind: "read", listing } };
           });
 
         const keepInstallCopy = (input: { name: string; served: string; stamp: string; pkg: CachedPackage; write: InstallWriter; ready: Effect.Effect<void, StoreError>; onDone: () => void }): Effect.Effect<void> =>
@@ -1806,6 +1879,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                   const doc = bytes === null ? null : VersionDist.safeParse(JSON.parse(new TextDecoder().decode(bytes)));
 
                   if (!doc?.success) return { kind: "unknown" };
+
+                  // npm answers a range or a dist-tag here with the version it resolves to: only the exact one is this version
+                  if (doc.data.version !== version) return { kind: "absent" };
                   const { dist } = doc.data;
 
                   return { kind: "found", tarball: dist.tarball ?? "", integrity: dist.integrity ?? "", shasum: dist.shasum ?? "" };
@@ -1870,6 +1946,22 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               opened.release();
 
               return streamed(opened.res, at.digest, declared);
+            }),
+          openTarballUrl: (url) =>
+            Effect.callback<OpenedUpstream>((resume) => {
+              const pending = open(url).then((opened): OpenedUpstream => {
+                if (opened.kind !== "ok") return opened;
+                // a stream's deadline ends once the answer has come: a client may take longer to read it
+                opened.release();
+
+                return { kind: "open", res: opened.res };
+              });
+
+              pending.then((opened) => resume(Effect.succeed(opened)));
+
+              // interrupted (a check failed while it was opening): its answer is cancelled once it comes, and the fiber
+              // ends after that, so no opened answer is left unread
+              return Effect.promise(() => pending.then((opened) => (opened.kind === "open" ? opened.res.body?.cancel() : undefined)));
             }),
           openTarball: (pkg, version) =>
             Effect.gen(function* () {

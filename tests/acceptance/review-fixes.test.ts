@@ -340,7 +340,10 @@ describe("upstream tarballs are checked on every read", () => {
     const first = await fetch(`${reg.url}cache-pkg/-/cache-pkg-1.0.0.tgz`);
     expect(first.status).toBe(200);
     expect(sha1(new Uint8Array(await first.arrayBuffer()))).toBe(shasum);
-    const cached = await reg.blobs.keys();
+    // a download passes npm's bytes through and keeps none (fast-tarball.ts); the file view keeps a verified copy in R2
+    expect(await reg.blobs.keys()).toEqual([]);
+    expect((await getJson(`${reg.url}-/apm/v1/file/cache-pkg/1.0.0?path=package.json`)).status).toBe(200);
+    const cached = (await reg.blobs.keys()).filter((key) => key.startsWith("sha"));
     expect(cached.length).toBeGreaterThan(0);
 
     for (const key of cached) await reg.blobs.put(key, "tampered bytes");
@@ -348,6 +351,9 @@ describe("upstream tarballs are checked on every read", () => {
 
     if (second.status === 200) expect(sha1(new Uint8Array(await second.arrayBuffer()))).toBe(shasum);
     else expect(second.status).toBeGreaterThanOrEqual(500);
+    // the file view checks the copy again: it drops the tampered one and reads npm's, or fails, never shows it
+    const view = await getJson(`${reg.url}-/apm/v1/file/cache-pkg/1.0.0?path=package.json`);
+    expect(view.status === 200 || view.status >= 500).toBe(true);
   });
 
   test("a version removed upstream stops being served from the cache", async () => {

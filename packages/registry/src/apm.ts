@@ -90,6 +90,7 @@ import {
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning, type WarningSignal } from "./warnings.ts";
+import { fastTarball } from "./fast-tarball.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -3657,13 +3658,16 @@ const INSTALL_HEADERS = { "content-type": "application/vnd.npm.install-v1+json; 
  */
 const installPackument = (name: string, upstream: UpstreamApi) =>
   Effect.gen(function* () {
-    const read = yield* (yield* Store).installRead(name);
-
-    if (read.local) return null;
-    const stamp = yield* Effect.promise(() => installStamp(read.confirmed));
     const { baseUrl } = yield* RegistryConfig;
     const lease = yield* RequestMemory;
-    const got = yield* upstream.installCopy({ name, served: baseUrl, stamp, lease });
+    // the statement and the copy's lookup (with npm's 304 when it is past the TTL) run at once; the copy answers only
+    // for the stamp of the confirmed set this statement read
+    const stamped = Effect.flatMap((yield* Store).installRead(name), (read) => Effect.map(read.local ? Effect.succeed(null) : Effect.promise(() => installStamp(read.confirmed)), (stamp) => ({ read, stamp })));
+    const { read: looked, copy } = yield* upstream.installCopy({ name, served: baseUrl, lease, read: stamped, stampOf: (r) => r.stamp });
+    const { read, stamp } = looked;
+
+    if (copy === null || stamp === null) return null;
+    const got = copy;
     // this request may have lost the database (a statement failed, or its connection closed: db-health.ts) while the
     // copy or npm was read: then the confirmed set read above is no longer the registry's word, and this request is
     // answered as every install is while the database is down (degraded.ts, from worker.ts), never from the copy, nor
@@ -3742,6 +3746,27 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const credentialed = req.headers.has("authorization") || req.headers.has("cookie");
 
     if (sp.rest.length === 0 && req.method === "GET" && !viaSafe && !credentialed && (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json")) return yield* installPackument(sp.name, upstream);
+
+    // a tarball: answered from npm without the packument (fast-tarball.ts), with or without credentials, since nothing
+    // it reads or serves is kept or shared; ~safe keeps its policy below
+    if (sp.rest[0] === "-" && sp.rest[1] && sp.rest.length === 2 && !viaSafe) {
+      const fast = yield* fastTarball({ req, name: sp.name, file: sp.rest[1], upstream });
+
+      switch (fast.kind) {
+        case "answer":
+          return fast.response;
+        // published here: the protocol route answers it, and the packument route's own lookup is not made again
+        case "local":
+          return null;
+        case "packument":
+          break;
+        default: {
+          const _exhaustive: never = fast;
+
+          return _exhaustive;
+        }
+      }
+    }
 
     if (yield* (yield* Store).getPackage(sp.name)) return null;
     // the packument and the devDependencies the full one adds back are held together under the request's lease until

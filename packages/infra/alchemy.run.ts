@@ -66,11 +66,12 @@ export default Alchemy.Stack(
       compatibility: { date: COMPATIBILITY_DATE, flags: [...COMPATIBILITY_FLAGS] },
       // the queue consumer's CPU limit per analysis (compat.ts, WORKER_CPU_MS): the default 30 s until a raise is approved
       limits: { cpuMs: WORKER_CPU_MS },
-      // Smart Placement may move fetch handling closer to what the registry calls most (Neon through Hyperdrive, in
-      // us-east-2) after Cloudflare's analysis: a package answer makes database round trips of about 75 ms each from a
-      // far colo. It covers tarball downloads too, so installs far from the chosen location are measured before
-      // production. Rolling a version back does not undo placement: remove this line and deploy to undo it.
-      placement: { mode: "smart" },
+      // No Smart Placement. It was on (`placement: { mode: "smart" }`) to bring the registry nearer Neon (us-east-2), and
+      // once Cloudflare's analysis applied it (status SUCCESS) it moved requests away from the colo the user reached,
+      // adding about 100 ms to every request, /-/ping included, and most of an install's time (measured from Miami,
+      // 2026-11-17). Install traffic is many small requests that each need one database round trip at most, so the
+      // user's own colo wins. Leaving the prop out turns placement off on the next full deploy; a gradual rollout
+      // (version traffic below 100) keeps the live setting.
       env: {
         HYPERDRIVE: postgres,
         BLOBS: blobs,
