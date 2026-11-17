@@ -467,11 +467,22 @@ export async function liveStillAsPlanned(cf: Cloudflare, step: Step, releases: r
   return unrecordedLive(step.script, live, releases);
 }
 
-/** The versions `live` routes traffic to that no line of the release record names as `script`. */
+/** The placeholder unrecordedVersions gives for a live deployment that routes traffic to no version. */
+export function noVersionLive(live: Deployment): string {
+  return `deployment ${live.id}, which routes traffic to no version`;
+}
+
+/**
+ * The versions `live` routes traffic to that no line of the release record names as `script`. A deployment that routes
+ * traffic to no version at all (an empty or all-0% list, which Cloudflare should never answer) names nothing the record
+ * could vouch for, so it is one unrecorded entry (noVersionLive), never an empty, vacuously recorded list.
+ */
 export function unrecordedVersions(script: string, live: Deployment, releases: readonly Release[]): string[] {
-  return receiving(live.versions)
-    .filter((v) => releaseOf(releases, script, v.version_id) === null)
-    .map((v) => v.version_id);
+  const shares = receiving(live.versions);
+
+  if (shares.length === 0) return [noVersionLive(live)];
+
+  return shares.filter((v) => releaseOf(releases, script, v.version_id) === null).map((v) => v.version_id);
 }
 
 /** What to run instead when a live version is one the record does not name. */
@@ -489,6 +500,8 @@ export function unrecordedLive(script: string, live: Deployment, releases: reado
 
   if (unknown.length === 0) return null;
   const stage = STAGES.find((s) => script.endsWith(`-${s}`)) ?? "production";
+
+  if (receiving(live.versions).length === 0) return `${script}'s live ${noVersionLive(live)}, so what runs there cannot be identified. rollback.ts does not replace what it cannot identify; ${fixForward(stage)}`;
 
   return `${script} runs ${unknown.join(", ")}, which no line of the release record names (an upload from a deploy that failed or was stopped before it recorded, or a change outside deploy.ts). rollback.ts does not replace a version it cannot identify; ${fixForward(stage)}`;
 }

@@ -128,7 +128,12 @@ export function releaseOf(releases: readonly Release[], script: string, versionI
   return releases.findLast((r) => names(r, script, versionId)) ?? null;
 }
 
-/** The newest line that names every one of `pairs` (script, version): one deploy's record of all of them; null when none does. */
+/**
+ * The newest line that names every one of `pairs` (script, version): one deploy's record of all of them; null when none
+ * does, and null for no pairs at all, since an empty set of live versions is nothing a line can vouch for.
+ */
 export function releaseNamingAll(releases: readonly Release[], pairs: readonly { script: string; versionId: string }[]): Release | null {
+  if (pairs.length === 0) return null;
+
   return releases.findLast((r) => pairs.every((p) => names(r, p.script, p.versionId))) ?? null;
 }

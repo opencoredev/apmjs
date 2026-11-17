@@ -16,7 +16,7 @@ import { emptyDatabase } from "../../../tests/acceptance/postgres.ts";
 import { migrationFiles } from "../../registry/scripts/migrate.ts";
 import { recordLiveRelease, type Recording } from "../deploy-record.ts";
 import { finishDeploy, recoveryAdvice, smokeCommand } from "../deploy-finish.ts";
-import { appendRelease, readReleases } from "../releases.ts";
+import { appendRelease, readReleases, releaseNamingAll } from "../releases.ts";
 import { halfAnswering } from "../../../tests/acceptance/half-answering.ts";
 import { CloudflareError, isRollbackSafe, ledgerOf, migrationCheck, previousOf, provenanceVars, unsafeMigrations, type Cloudflare, type Deployment, type WorkerKind } from "../rollback.ts";
 
@@ -341,6 +341,30 @@ describe("rollback.ts, the manual command", () => {
     expect(posted).toEqual([]);
   });
 
+  test("a live deployment that routes traffic to no version is never treated as recorded: nothing is replaced", async () => {
+    // an empty version list, or one whose only share is 0%: nothing the release record could name runs there
+    for (const versions of [[], [{ version_id: "wv2", percentage: 0 }]]) {
+      reset();
+      deployments.set("apmjs-web-production", [{ id: "w-none", created_on: "2026-11-16T12:00:00Z", source: "api", versions }, ...(deployments.get("apmjs-web-production") ?? [])]);
+      const r = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("apmjs-web-production's live deployment w-none, which routes traffic to no version");
+      expect(r.out).toContain("fix forward");
+      expect(posted).toEqual([]);
+    }
+  });
+
+  test("just before a change, a live deployment that now routes traffic to no version stops that Worker", async () => {
+    // the plan saw r3 running rv3; when the registry's step reads it again, the same deployment names no version
+    onList.set("apmjs-registry-production", { at: 2, change: () => deployments.set("apmjs-registry-production", [{ id: "r3", created_on: "2026-11-16T10:00:00Z", source: "api", versions: [] }, ...(deployments.get("apmjs-registry-production") ?? []).slice(1)]) });
+    const r = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("NOT rolling back apmjs-registry-production: apmjs-registry-production's live deployment r3, which routes traffic to no version");
+    expect(posted.map((p) => p.script)).toEqual(["apmjs-web-production"]);
+  });
+
   test("while someone else holds the release lock it changes nothing, and says so", async () => {
     // the incident helper's flock on the same file (APM_RELEASE_LOCK)
     const lock = join(secrets, "release.lock");
@@ -462,6 +486,13 @@ describe("the release record", () => {
 
     expect(readReleases("production", path).map((r) => r.build)).toEqual([B1, B3]);
     expect(readFileSync(path, "utf8").split("\n")[1]).toBe('{"build":"aaaa0002","sha":"cut');
+  });
+
+  test("no live versions at all is named by no line: an empty set never matches vacuously", () => {
+    const lines = [release(B2, ALL, { registry: "rv2", web: "wv1" })];
+
+    expect(releaseNamingAll(lines, [])).toBeNull();
+    expect(releaseNamingAll(lines, [{ script: "apmjs-registry-production", versionId: "rv2" }])?.build).toBe(B2);
   });
 
   test("a build id whose lines disagree is trusted nowhere; the same line twice counts once", () => {
@@ -683,6 +714,15 @@ describe("the recovery advice after a failed deploy", () => {
 
     expect(a).toContain("apmjs-docs-production dv9");
     expect(a).toContain(`bun packages/infra/rollback.ts to --stage production --build ${B4}`);
+  });
+
+  test("a live registry deployment that routes traffic to no version cannot be rolled back from: fix forward", async () => {
+    deployments.set("apmjs-registry-production", [{ id: "r-none", created_on: "2026-11-16T12:00:00Z", source: "api", versions: [] }, ...(deployments.get("apmjs-registry-production") ?? [])]);
+    const a = await advise();
+
+    expect(a).toContain("apmjs-registry-production deployment r-none, which routes traffic to no version");
+    expect(a).toContain("fix forward");
+    expect(a).not.toContain("rollback.ts to");
   });
 
   test("when what is live cannot be read, it says so and how to look", async () => {
