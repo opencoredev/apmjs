@@ -485,6 +485,8 @@ export type StoreApi = {
   ) => Effect.Effect<void, StoreError>;
   readonly setDistTags: (name: string, tags: Record<string, string>, at: number) => Effect.Effect<void, StoreError>;
   readonly owners: (name: string) => Effect.Effect<string[], StoreError>;
+  /** The names a user publishes: every package under their scope (`@user/`) and every one they own, by name, at most `limit`. */
+  readonly packagesOf: (input: { user: string; limit: number }) => Effect.Effect<string[], StoreError>;
   readonly ownersOf: (names: readonly string[]) => Effect.Effect<Map<string, string[]>, StoreError>;
   readonly addOwner: (name: string, user: string) => Effect.Effect<void, StoreError>;
   /** Removes an owner unless that would leave the package with none; the count is read under the package lock. */
@@ -1041,6 +1043,14 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
       ),
     setDistTags: (name, tags, at) => run("setDistTags", sql`UPDATE packages SET dist_tags = ${JSON.stringify(tags)}::jsonb, modified_at = ${at} WHERE name = ${name}`, none),
     owners: (name) => run("owners", sql`SELECT "user" FROM owners WHERE package = ${name} ORDER BY "user"`, all(z.object({ "user": z.string() }).transform((r) => r.user))),
+    packagesOf: ({ user, limit }) =>
+      run(
+        "packagesOf",
+        sql`SELECT name FROM packages WHERE starts_with(name, ${`@${user}/`})
+            UNION SELECT package AS name FROM owners WHERE "user" = ${user}
+            ORDER BY name LIMIT ${limit}`,
+        all(z.object({ name: z.string() }).transform((r) => r.name)),
+      ),
     ownersOf: (names) =>
       names.length === 0
         ? Effect.succeed(new Map<string, string[]>())

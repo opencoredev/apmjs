@@ -563,6 +563,7 @@ function probes(): Probe[] {
     // the account (account.ts)
     v1("auth/config", "auth config", 200),
     v1("account", "account", sessionOnly(200)),
+    v1("account/packages", "account packages", sessionOnly(200)),
     v1("staged", "staged list", sessionOnly(200)),
     v1("staged/no-such-id", "staged detail", sessionOnly(404)),
     v1("staged/no-such-id/file?path=index.js", "staged file", sessionOnly(404)),

@@ -21,6 +21,7 @@ import { typedConfirmationReason } from "./approval.ts";
 import { commitVersion, dropBlobIfUnused, fenceNewName, issueToken } from "./server.ts";
 import { ProofFields, refusedProof, secondFactor } from "./step-up.ts";
 import { isWithheld } from "./withheld.ts";
+import { packagesFor } from "./my-packages.ts";
 
 export { typedConfirmationReason } from "./approval.ts";
 
@@ -288,6 +289,15 @@ export const accountRoute = (req: Request, url: URL) =>
         tokens,
         pending,
       });
+    }
+
+    // The website's "Your packages": what this person publishes, with each latest version, score and waiting uploads.
+    if (rest === "account/packages" && req.method === "GET") {
+      const who = yield* signedIn(req);
+
+      if (!who.user) return json({ packages: [] });
+
+      return json({ packages: yield* packagesFor({ user: who.user.name, webUrl: web }) });
     }
 
     if (rest === "account/tokens/revoke" && req.method === "POST") {

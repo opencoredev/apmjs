@@ -78,9 +78,11 @@ The upload is staged, not live:
 
 Open the link. The approval page shows the files and the score evidence first, then the approve and reject controls. Approve with your passkey, or type a code from your authenticator app. The code or passkey check counts for that one upload only.
 
-Everything waiting for you is listed at `https://apmjs.dev/publish`. An upload nobody approves expires after 24 hours; publish again to get a new link.
+Everything waiting for you is listed at `https://apmjs.dev/publish`, and every package you publish, with its latest version, score and anything waiting, at `https://apmjs.dev/account/packages`. An upload nobody approves expires after 24 hours; publish again to get a new link.
 
 ## Publishing from an agent
+
+The quickest way: sign in at `https://apmjs.dev/publish`, copy the prompt there (it is filled in with your scope) and paste it into Claude Code, Codex, Cursor or any agent with a shell. No MCP server is needed. The agent gets the CLI, runs `apm login --no-browser` and shows you its link, names the package, uploads it and hands you the approval link.
 
 An agent publishes the same way you do. It runs `apm publish` with your login token, the version is staged, and the agent hands you the link. You approve on the website, from any device. Nothing the agent holds can make the version live.
 

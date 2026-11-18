@@ -71,6 +71,7 @@ const REGISTRY_ROUTES = [
   // the account (account.ts)
   { name: "auth config", pattern: path("/-/apm/v1/auth/config") },
   { name: "account", pattern: path("/-/apm/v1/account") },
+  { name: "account packages", pattern: path("/-/apm/v1/account/packages") },
   { name: "staged list", pattern: path("/-/apm/v1/staged") },
   { name: "staged detail", pattern: path("/-/apm/v1/staged/[A-Za-z0-9_-]+") },
   { name: "staged file", pattern: path("/-/apm/v1/staged/[A-Za-z0-9_-]+/file") },

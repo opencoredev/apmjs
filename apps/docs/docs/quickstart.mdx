@@ -51,14 +51,16 @@ For npm and pnpm, the plain registry URL (without `~safe/`) serves every version
 
 ## 2. Get the apm CLI
 
-`apm` is not on a registry yet. Run it from a clone. You need Bun 1.4 or newer.
+`apm` is not on a registry yet. Run it from a clone of the `main` branch. You need git and Bun 1.4 or newer.
 
 ```bash
-git clone https://github.com/opencoredev/apmjs.git
-cd apmjs && bun install
-alias apm="bun $PWD/packages/cli/src/main.ts"
+git clone --depth 1 --branch main https://github.com/opencoredev/apmjs.git ~/.apm-cli
+(cd ~/.apm-cli && bun install --filter @apm/cli)
+alias apm="bun ~/.apm-cli/packages/cli/src/main.ts"
 apm --version
 ```
+
+`--filter @apm/cli` installs only what the CLI needs (about 11 MB), not the whole repository's tools. To update later, run `git -C ~/.apm-cli pull`.
 
 `apm --version` prints `0.1.0`. Put the `alias` line in your shell profile to keep it.
 

@@ -73,11 +73,8 @@ describe("setupPrompt", () => {
     expect(INSTRUCTIONS_LINE).toContain("On anything else, or if it gives no command for this project's package manager, do not install; tell me why.");
     expect(readFileSync(join(import.meta.dir, "../../../docs/AGENTS.md"), "utf8")).toContain(INSTRUCTIONS_LINE);
 
-    const docsPage = readFileSync(join(import.meta.dir, "../app/docs/page.tsx"), "utf8")
-      .replace('${siteUrl("/api/explain?package=")}', "https://apmjs.dev/api/explain?package=")
-      .replace(/\s+/g, " ");
-
-    expect(docsPage).toContain(INSTRUCTIONS_LINE);
+    // the /docs page renders this same constant
+    expect(readFileSync(join(import.meta.dir, "../app/docs/page.tsx"), "utf8")).toContain("<Code wrap>{INSTRUCTIONS_LINE}</Code>");
   });
 
   test("needs no MCP server: the rule uses plain HTTP, and the prompt connects MCP only on request", () => {

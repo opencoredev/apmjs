@@ -249,8 +249,8 @@ export function packageMarkdown(input: PackageView): string {
     "## More",
     "",
     `- Should an agent install it? GET ${siteUrl(`/api/explain?package=${encodeURIComponent(pkg.name)}`)}`,
-    `- MCP server: ${siteUrl("/mcp")}`,
     `- API: ${siteUrl("/openapi.json")}`,
+    `- MCP server (optional, the same answers as tools): ${siteUrl("/mcp")}`,
   );
 
   return `${out.join("\n")}\n`;

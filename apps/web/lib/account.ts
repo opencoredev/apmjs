@@ -62,6 +62,27 @@ export const StagedSummary = z.object({
 
 export type StagedSummary = z.infer<typeof StagedSummary>;
 
+/** A version waiting for the signed-in person's approval, as "Your packages" lists it. */
+export const PendingVersion = z.object({ id: z.string(), version: z.string(), url: z.string(), expiresAt: z.string() });
+
+export type PendingVersion = z.infer<typeof PendingVersion>;
+
+/**
+ * One package the signed-in person publishes (GET /-/apm/v1/account/packages, packages/registry/src/my-packages.ts).
+ * `latest` and `lastPublishedAt` are null for a new name whose first version is still waiting.
+ */
+export const MyPackage = z.object({
+  name: z.string(),
+  latest: z.object({ version: z.string(), status: z.enum(["active", "yanked", "revoke-pending", "revoked"]), publishedAt: z.string() }).nullable(),
+  lastPublishedAt: z.string().nullable(),
+  score: z.object({ score: z.number(), grade: z.string() }).nullable(),
+  pending: z.array(PendingVersion),
+});
+
+export type MyPackage = z.infer<typeof MyPackage>;
+
+export const MyPackages = z.object({ packages: z.array(MyPackage) });
+
 // confidence arrived with apm-score-v4; older answers asserted every signal
 const Signal = z.object({ id: z.string(), label: z.string(), points: z.number(), evidence: z.array(z.string()), confidence: z.enum(["confirmed", "possible"]).default("confirmed") });
 

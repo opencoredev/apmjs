@@ -536,6 +536,10 @@ export function AccountView() {
             <p className="text-[15px] leading-7 text-muted-foreground">
               New packages you publish are named <code className="font-mono text-foreground">@{a.scope}/&lt;name&gt;</code>.{" "}
               {a.githubRenamed ? null : "Your scope is your GitHub login. "}
+              <Link href="/account/packages" className="text-foreground underline underline-offset-4">
+                Your packages
+              </Link>{" "}
+              ·{" "}
               <Link href="/publish" className="text-foreground underline underline-offset-4">
                 Publish a package
               </Link>

@@ -11,6 +11,7 @@ import { errorReporter, type ErrorCode, type ErrorReporter, type WaitUntil } fro
 export const WEB_ROUTES = {
   "/": "home",
   "/account": "account",
+  "/account/packages": "account packages",
   "/admin/reviews": "admin reviews",
   "/approve/[id]": "approve",
   "/compare": "compare",

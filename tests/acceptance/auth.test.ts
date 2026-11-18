@@ -330,3 +330,65 @@ describe("apm CLI", () => {
     expect((await packumentStatus("@octo-cat/via-apm")).status).toBe(404);
   });
 });
+
+describe("your packages", () => {
+  /** The signed-in person's packages as the website's "Your packages" page reads them, with the answer's headers. */
+  async function mine(b: Browser): Promise<{ status: number; headers: Headers; packages: unknown[] }> {
+    const res = await b.fetch("-/apm/v1/account/packages");
+    const body: unknown = await res.json();
+    const packages = dig(body, "packages");
+
+    return { status: res.status, headers: res.headers, packages: Array.isArray(packages) ? packages : [] };
+  }
+
+  const named = (list: unknown[], name: string) => list.find((p) => dig(p, "name") === name);
+
+  test("lists a new name while its first version waits, then its latest version once approved, only to its owner and never cached", async () => {
+    const id = await stage("@octo-cat/listed", "1.0.0");
+
+    const waiting = await mine(octo);
+    expect(waiting.status).toBe(200);
+    expect(waiting.headers.get("cache-control")).toBe("private, no-store");
+    expect(waiting.headers.get("vary") ?? "").toContain("Cookie");
+    const first = named(waiting.packages, "@octo-cat/listed");
+    expect(dig(first, "latest")).toBeNull();
+    expect(dig(first, "lastPublishedAt")).toBeNull();
+    expect(dig(first, "pending", "0", "version")).toBe("1.0.0");
+    expect(String(dig(first, "pending", "0", "url"))).toEndWith(`/approve/${id}`);
+    // a waiting version comes first
+    expect(dig(waiting.packages[0], "name")).toBe("@octo-cat/listed");
+
+    expect((await approve(octo, id, totp(octoSecret))).status).toBe(200);
+    const live = named((await mine(octo)).packages, "@octo-cat/listed");
+    expect(dig(live, "latest", "version")).toBe("1.0.0");
+    expect(dig(live, "latest", "status")).toBe("active");
+    expect(String(dig(live, "lastPublishedAt"))).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(dig(live, "pending")).toEqual([]);
+    expect(dig(live, "score", "grade")).toBeString();
+
+    // every package under the scope, the most recently published first
+    clock += MINUTE;
+    expect((await approve(octo, await stage("@octo-cat/listed-later", "1.0.0"), totp(octoSecret))).status).toBe(200);
+    const names = (await mine(octo)).packages.map((p) => dig(p, "name"));
+    expect(names.indexOf("@octo-cat/listed-later")).toBeLessThan(names.indexOf("@octo-cat/listed"));
+    expect(names.every((n) => String(n).startsWith("@octo-cat/"))).toBe(true);
+
+    const stranger = await signInWithGitHub(reg, gh, "stranger-two");
+    expect(named((await mine(stranger)).packages, "@octo-cat/listed")).toBeUndefined();
+    expect((await getJson(`${reg.url}-/apm/v1/account/packages`)).status).toBe(401);
+  });
+
+  test("a package someone added you to as an owner is listed too", async () => {
+    const mona = await signInWithGitHub(reg, gh, "mona-owner");
+    const monaSecret = await enableTotp(mona);
+    const monaToken = (await deviceLogin(mona)).token;
+    const r = await publishWith("bun", "@mona-owner/shared", "1.0.0", monaToken);
+    const id = approvalId(r.out) ?? "";
+    expect((await approve(mona, id, totp(monaSecret))).status).toBe(200);
+    expect(named((await mine(octo)).packages, "@mona-owner/shared")).toBeUndefined();
+
+    const add = await run(["npm", "owner", "add", "octo-cat", "@mona-owner/shared", `--otp=${totp(monaSecret)}`], { cwd: work, env: makeSandbox(reg, monaToken).env });
+    expect(add.code, add.out).toBe(0);
+    expect(dig(named((await mine(octo)).packages, "@mona-owner/shared"), "latest", "version")).toBe("1.0.0");
+  });
+});

@@ -33,7 +33,7 @@ How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## For agents
 
-apm runs a read-only remote MCP server at `https://apmjs.dev/mcp` (tools: `search_packages`, `check_package`, `check_name`, `explain_install`, `get_file_excerpt`). Claude Code: `claude mcp add --transport http apm https://apmjs.dev/mcp`. Without MCP: `GET /api/explain?package=<name>`, `/package/<name>.md`, `/openapi.json`, `/llms.txt`, and `apm explain <pkg> --json`. Setup for Codex and Cursor and the details: [docs/AGENTS.md](docs/AGENTS.md).
+An agent needs no MCP server and no account. Before adding a package it fetches `GET https://apmjs.dev/api/explain?package=<name>` and follows the verdict; one line in AGENTS.md or CLAUDE.md sets that up. The same answers: `/package/<name>.md`, `/openapi.json`, `/llms.txt` and `apm explain <pkg> --json`. To publish, sign in at https://apmjs.dev/publish and paste its prompt into your agent: it runs the apm CLI, and you approve each version with your passkey. An optional read-only MCP server is at `https://apmjs.dev/mcp`. Details: [docs/AGENTS.md](docs/AGENTS.md).
 
 ## Run it
 
