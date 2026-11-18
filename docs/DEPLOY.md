@@ -229,6 +229,7 @@ The registry Worker reads these (`packages/registry/src/worker.ts` parses them):
 | Variable | Meaning |
 | --- | --- |
 | `HYPERDRIVE`, `BLOBS`, `ANALYSIS_QUEUE` | The Hyperdrive, R2 and queue bindings. |
+| `RESOLVE_RATE_LIMIT` | Rate limiting binding: at most 60 `GET /-/apm/v1/resolve` a minute per `CF-Connecting-IP` in each Cloudflare location, then a 429 with `Retry-After: 60` (`packages/registry/src/resolve-limit.ts`, `packages/infra/registry-env.ts`). Requests without that header (the website's service binding) are not counted, and neither are callers apm verified (a live token, or a website session naming an apm account), so CI behind one NAT signs in; forged credentials count. The CLI asks again after a 429 as `Retry-After` says, at most 3 times and 60 s in all. Without the binding nothing is limited. |
 | `APM_REGISTRY_URL` | The registry's public URL (tarball links). |
 | `APM_PUBLIC_URL` | The website's URL: sign-in callbacks, approval links, the device page. |
 | `APM_UPSTREAM` | The registry to proxy, or `off`. |

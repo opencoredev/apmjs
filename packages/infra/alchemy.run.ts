@@ -10,6 +10,7 @@ import * as Redacted from "effect/Redacted";
 import { z } from "zod";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS, WORKER_CPU_MS } from "../registry/scripts/compat.ts";
 import { databuddyWorkerEnv } from "./analytics.ts";
+import { registryLimitEnv } from "./registry-env.ts";
 import { websiteAgentEnv } from "./web-env.ts";
 import { WEB_ASSETS, WEB_BUILD } from "./web-build.ts";
 
@@ -84,6 +85,8 @@ export default Alchemy.Stack(
         HYPERDRIVE: postgres,
         BLOBS: blobs,
         ANALYSIS_QUEUE: analysis,
+        // the per-address limit on GET /-/apm/v1/resolve (registry resolve-limit.ts)
+        ...registryLimitEnv(stage),
         APM_REGISTRY_URL: registryUrl,
         APM_PUBLIC_URL: webUrl,
         APM_UPSTREAM: "https://registry.npmjs.org/",

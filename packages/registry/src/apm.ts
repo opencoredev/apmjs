@@ -89,6 +89,8 @@ import {
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
+import { admitResolve, carriesCredentials, ResolveLimit } from "./resolve-limit.ts";
+import { getRouteOf } from "./routes.ts";
 import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning, type WarningSignal } from "./warnings.ts";
 import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
@@ -1786,8 +1788,9 @@ const exactPart = (query: string, valid: boolean) =>
     const unknown = found === "unknown";
     const src = found === "unknown" ? null : found;
     const conflicts = valid && !src ? typoConflicts(query) : [];
-    const latestRaw = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
-    const latest0 = src && latestRaw ? yield* ensureAnalyzed(src, latestRaw) : null;
+    // latest's stored score only: the home page asks at every pause in typing, so queueing here would analyse every
+    // prefix that happens to be an npm name ("rea", "reac"); the package page queues latest when someone opens it
+    const latest0 = src ? (src.versions.find((v) => v.version === src.distTags.latest) ?? null) : null;
     const latestReport = latest0 ? reportFor(latest0, at) : null;
 
     return {
@@ -1886,6 +1889,20 @@ export const nameReport = (q: string, user: string | null, part: NamePart | null
   });
 
 /** The apm account of a website session, when the request carries one; a request without cookies never builds Better Auth. */
+/**
+ * Records, for the resolve limit (resolve-limit.ts), what a credentialed resolve's credentials name, as soon as the
+ * router has the caller and before any handler can answer: a HEAD answered 405, or any other early answer, is then
+ * counted by what was verified, not by whether the GET handler ran (review of 0126b2b, finding 2). If checking fails
+ * (the session lookup's database is down), the standing stays "unknown", which counts.
+ */
+export const noteResolveCaller = (req: Request, caller: Caller) =>
+  Effect.gen(function* () {
+    const limit = Option.getOrNull(yield* Effect.serviceOption(ResolveLimit));
+
+    if (limit === null || !carriesCredentials(req) || getRouteOf(new URL(req.url).pathname) !== "resolve") return;
+    limit.request.caller = caller.kind === "user" || (yield* sessionUser(req)) !== null ? "verified" : "unverified";
+  });
+
 export const sessionUser = (req: Request) =>
   Effect.gen(function* () {
     if (!req.headers.has("cookie")) return null;
@@ -2298,6 +2315,50 @@ export type WalkLimits = { maxNodes: number; maxLookups: number; maxLevels: numb
 
 const WALK_LIMITS: WalkLimits = { maxNodes: 300, maxLookups: MAX_WALK_LOOKUPS, maxLevels: MAX_WALK_LEVELS, maxAnalyses: 40, maxWeight: REQUEST_METADATA_WEIGHT };
 
+/**
+ * Unscored dependencies one anonymous resolve may queue for analysis, nearest first (the walk goes a level at a time,
+ * in manifest order), beside one candidate for the root. The queue's consumer runs one analysis at a time: about 625
+ * an hour at its production peak (2026-11-18, about 6 s each), and a backlog of 400 took two hours to clear. A cold
+ * tree used to queue every unscored version in it, up to 300, close to half an hour of the consumer from one ask; the
+ * root and 8 is under a minute. Each later ask of the same tree queues the next ones once these are scored, since a
+ * scored version is not counted. A version left unqueued answers exactly as a queued one does ("not scored yet").
+ */
+export const ANONYMOUS_QUEUED_DEPENDENCIES = 8;
+
+/** What a resolve may queue: every unscored version (a token or a website session), or at most `dependencies` of them. */
+export type ResolveQueueing = { readonly kind: "all" } | { readonly kind: "capped"; readonly rootCandidates: number; readonly dependencies: number };
+
+const QUEUE_ALL: ResolveQueueing = { kind: "all" };
+
+const QUEUE_ANONYMOUS: ResolveQueueing = { kind: "capped", rootCandidates: 1, dependencies: ANONYMOUS_QUEUED_DEPENDENCIES };
+
+/**
+ * What one resolve may still queue, across every pass it makes (it walks again after its wait): a capped resolve spends
+ * each slot once per request, on a version it admits, and may ask about an admitted version again in a later pass.
+ */
+type QueueAllowance = { readonly kind: "all" } | { readonly kind: "capped"; roots: number; dependencies: number; readonly admitted: Set<string> };
+
+const ALLOW_ALL: QueueAllowance = { kind: "all" };
+
+/** A fresh allowance for one resolve request. */
+function allowanceOf(q: ResolveQueueing): QueueAllowance {
+  return q.kind === "all" ? ALLOW_ALL : { kind: "capped", roots: q.rootCandidates, dependencies: q.dependencies, admitted: new Set() };
+}
+
+/**
+ * Whether `key` (name@version) may be queued now: always when the resolve is not capped; when it is, if this request
+ * admitted it before, or if a `slot` is left, which this spends.
+ */
+function admit(a: QueueAllowance, slot: "roots" | "dependencies", key: string): boolean {
+  if (a.kind === "all" || a.admitted.has(key)) return true;
+
+  if (a[slot] <= 0) return false;
+  a[slot] -= 1;
+  a.admitted.add(key);
+
+  return true;
+}
+
 /** How long one walk may read for (WALK_BUDGET_MS when absent). Tests provide a shorter one. */
 export class WalkBudget extends Context.Service<WalkBudget, { readonly ms: number }>()("@apm/registry/WalkBudget") {}
 
@@ -2375,9 +2436,11 @@ type ProjectPeer = { dependency: string; via: string[]; kind: "lockfile" | "newe
  * Each name's catalog is read once per walk, a level's names in one batch, and each name and range is resolved once. Everything it could not score is counted and listed, never
  * dropped.
  */
-const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; project?: ProjectDeps; limits?: WalkLimits }) =>
+const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallTarget; lease: Lease; project?: ProjectDeps; limits?: WalkLimits; allowance?: QueueAllowance }) =>
   Effect.gen(function* () {
     const { root, policy, target, lease } = input;
+    // the request's allowance, shared with its other passes: a later walk does not get new slots
+    const allowance = input.allowance ?? ALLOW_ALL;
     const project: ProjectDeps = input.project ?? new Map();
     const projectPeers: ProjectPeer[] = [];
     const withdrawn: TreeBlock[] = [];
@@ -2648,11 +2711,17 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       digests.push(digest ? digestLabel(digest) : null);
       let v = picked.v;
 
-      if (!parseAnalysis(v.score)) {
+      // a capped resolve (anonymous) queues only what its allowance admits, nearest first; the rest answer as queued ones
+      // do, "not scored yet"
+      const unscored = !parseAnalysis(v.score);
+      const queueable = unscored && picked.src.kind === "upstream" && !v.unscorable;
+
+      // only a version that would be queued is asked about, and only that spends `analyses` (review of 0126b2b, finding 1)
+      if (queueable && admit(allowance, "dependencies", key)) {
         if (analyses < limits.maxAnalyses) {
           analyses++;
           v = yield* ensureAnalyzed(picked.src, v);
-        } else if (picked.src.kind === "upstream" && !v.unscorable) yield* Effect.flatMap(Analysis, (a) => a.enqueue(dep.name, v.version));
+        } else yield* Effect.flatMap(Analysis, (a) => a.enqueue(dep.name, v.version));
       }
 
       const url = versionUrl(webUrl, dep.name, v.version);
@@ -2817,7 +2886,7 @@ type ResolveMode = { strict: boolean; final: boolean };
 /** A later page of a resolve's root, read under `lease` (rootPage): the catalog, or why it could not be read. */
 type PageRead = (offset: number, lease: Lease) => ReturnType<typeof catalogWithin>;
 
-type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead };
+type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead; allowance: QueueAllowance };
 
 const resolvePass = (input: PassInput) =>
   Effect.suspend(() => {
@@ -2909,7 +2978,7 @@ type Skipped = { version: string; reason: string; revokeReason: string | null };
  */
 const resolveWalk = (input: PassInput) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, target, project, src, mode, lease } = input;
+    const { name, range, policy, treePolicy, target, project, src, mode, lease, allowance } = input;
     const at = yield* now;
     const { webUrl } = yield* RegistryConfig;
     const skipped: Skipped[] = [];
@@ -2944,18 +3013,29 @@ const resolveWalk = (input: PassInput) =>
         if (!current.includes(v0)) break;
         looked++;
         // analyze a bounded number of candidates; upstream analysis means downloading the tarball
-        const v = analyzedCount < 5 ? yield* ensureAnalyzed(page, v0) : v0;
-        analyzedCount++;
+        // a capped resolve (anonymous) spends its root slot only on a candidate a score could still let through: one
+        // apm has not scored or decided on, from npm, not confirmed malicious, and (strict) past the cooldown
+        // an analysis is attempted only for one apm has not scored or decided on, from npm, and not confirmed malicious
+        // (never installed); only an attempt spends a slot, so scored or confirmed newer versions cannot use them up
+        // (review of 0126b2b, finding 1)
+        const analysable = !parseAnalysis(v0.score) && page.kind === "upstream" && !v0.unscorable && !confirmed.has(v0.version);
+        const rootCanWait = analysable && (!mode.strict || cooldownBlock(v0, policy, at) === null);
+        const queueRoot = allowance.kind === "all" ? analysable && analyzedCount < 5 : rootCanWait && admit(allowance, "roots", `${name}@${v0.version}`);
+
+        if (queueRoot) analyzedCount++;
+        const v = queueRoot ? yield* ensureAnalyzed(page, v0) : v0;
         // strict skips a version under the floor, with no score or inside the cooldown; the default mode installs each
         // with a warning. A version an apm reviewer confirmed malicious is skipped in every mode, as a revoked one is
+        // confirmed malicious comes first: a confirmed version is never waited for, so strict mode's "not scored yet"
+        // cannot hold a resolve on one (review of 56229cf, finding 1)
         const policyWhy = mode.strict ? policyBlock(v, policy, at) : null;
-        const block = policyWhy === null && confirmed.has(v.version) ? CONFIRMED_SKIP : policyWhy;
+        const block = confirmed.has(v.version) ? CONFIRMED_SKIP : policyWhy;
         const report = reportFor(v, at);
         const unscored = report === null ? notScored(page, v) : null;
         // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
         const pendingRoot = (block === null || block === NOT_SCORED_YET) && unscored?.kind === "queued";
 
-        if (block === null || pendingRoot) return yield* rootAnswer({ name, range, policy, treePolicy, target, project, mode, lease, src: page, v, report, unscored, pendingRoot, skipped, at, webUrl });
+        if (block === null || pendingRoot) return yield* rootAnswer({ name, range, policy, treePolicy, target, project, mode, lease, src: page, v, report, unscored, pendingRoot, skipped, at, webUrl, allowance });
         skip({ version: v.version, reason: block, revokeReason: null });
       }
 
@@ -3007,11 +3087,12 @@ const rootAnswer = (input: {
   skipped: Skipped[];
   at: number;
   webUrl: string;
+  allowance: QueueAllowance;
 }) =>
   Effect.gen(function* () {
-    const { name, range, policy, treePolicy, target, project, mode, lease, src, v, report, unscored, pendingRoot, skipped, at, webUrl } = input;
+    const { name, range, policy, treePolicy, target, project, mode, lease, src, v, report, unscored, pendingRoot, skipped, at, webUrl, allowance } = input;
     // a pending root's tree is walked too, so its dependencies are queued while it is
-    const walked = yield* walkTree({ root: v, policy: treePolicy, target, lease, project });
+    const walked = yield* walkTree({ root: v, policy: treePolicy, target, lease, project, allowance });
     const tree = treeAnswer(walked, yield* treeReviews(walked));
     const newest = { version: v.version, report: embeddedReport(v, report) };
 
@@ -3097,7 +3178,7 @@ const strictParam = (v: string | null | undefined): boolean => v === "1" || v ==
  * then is a warning on a 200, like a low score or a dependency it could not look up; in strict mode (`strict=1`)
  * it is a 202 with the pending versions and Retry-After, a lookup that failed is a 503, and a low score a 422.
  */
-export const resolveResponse = (url: URL) =>
+export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL) =>
   Effect.gen(function* () {
     const name = url.searchParams.get("name") ?? "";
     const range = url.searchParams.get("range") || "latest";
@@ -3129,6 +3210,8 @@ export const resolveResponse = (url: URL) =>
     // the root is read under the request's lease, each read of it under a child given back when a newer read replaces
     // it, beside the walks (review of 6862fc7, finding 4). It is summarized as the walk's catalogs are: its packument
     // is held only while it is read, so the walk has the room the packument took
+    // what this request may queue, across all its passes (a capped one spends each slot once)
+    const allowance = allowanceOf(queueing);
     const lease = yield* RequestMemory;
     let rootLease = lease.child();
     // one variable holds the root, so a catalog its lease gave back is never still reachable; a root that did not fit
@@ -3161,7 +3244,7 @@ export const resolveResponse = (url: URL) =>
 
     for (;;) {
       if (!src) return fail(404, `No package named ${name}.`);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease, allowance });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -3179,7 +3262,7 @@ export const resolveResponse = (url: URL) =>
         src = yield* reload;
 
         if (!src) return fail(404, `No package named ${name}.`);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease });
+        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease, allowance });
 
         if (last.kind === "answer") return last.response;
       }
@@ -3899,9 +3982,10 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
 
     if (viaSafe) {
-      // score the newest cooled versions before answering; anything left unscored stays hidden
+      // score the newest cooled versions before answering; anything left unscored stays hidden. Only versions that still
+      // need an analysis take one of the five: scored ones used to fill them, so an older unscored one was never queued
       const cooled = src.versions
-        .filter((v) => at - v.published_at >= DEFAULT_POLICY.cooldownMs)
+        .filter((v) => at - v.published_at >= DEFAULT_POLICY.cooldownMs && !parseAnalysis(v.score) && !v.unscorable)
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 5);
 
@@ -3977,7 +4061,24 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
 
     if (rest === "popular-scores") return yield* popularScoresResponse(url);
 
-    if (rest === "resolve") return yield* resolveResponse(url);
+    if (rest === "resolve") {
+      const limit = Option.getOrNull(yield* Effect.serviceOption(ResolveLimit));
+      // a live token or a website session naming an apm account: not counted against the address, and not capped. The
+      // router already decided it for a credentialed request (noteResolveCaller), so a session is looked up once
+      const noted = limit?.request.caller ?? "unknown";
+      const verified = noted === "unknown" ? caller.kind === "user" || (yield* sessionUser(req)) !== null : noted === "verified";
+
+      // credentials that verify nobody are counted here; a request with none was counted before the router (worker.ts)
+      if (!verified && carriesCredentials(req) && limit !== null) {
+        limit.request.counted = true;
+        const refused = yield* Effect.promise(() => admitResolve({ req, limiter: limit.limiter }));
+
+        if (refused !== null) return refused;
+      }
+
+      // no token and no website session: what the resolve queues for analysis is capped (ANONYMOUS_QUEUED_DEPENDENCIES)
+      return yield* resolveResponse(url, verified ? QUEUE_ALL : QUEUE_ANONYMOUS);
+    }
 
     if (rest === "me") return caller.kind === "user" ? json({ username: caller.user }) : fail(401, "Not logged in");
 

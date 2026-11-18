@@ -24,6 +24,7 @@ import type { HttpFailure, InfraError, StoreError } from "./errors.ts";
 import { fail, failureResponse, routePath, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
 import { ChoicesWriter, dropStaleChoices } from "./kept-choices.ts";
 import { route } from "./router.ts";
+import { admitResolve, carriesCredentials, countsLate, ResolveLimit, type RateLimiter, type ResolveCount } from "./resolve-limit.ts";
 import { routeLabel, type RouteLabel } from "./routes.ts";
 import { ISOLATE_POOL, RequestMemory } from "./memory.ts";
 import { legacyAuthRefusal } from "./startup.ts";
@@ -58,6 +59,8 @@ const WorkerEnv = z.object({
   HYPERDRIVE: z.object({ connectionString: z.string().min(1) }, "HYPERDRIVE must be a Hyperdrive binding"),
   BLOBS: binding<R2Bucket>(["get", "put", "head", "delete", "list"], "BLOBS must be an R2 bucket binding"),
   ANALYSIS_QUEUE: binding<Queue<AnalysisJob>>(["send"], "ANALYSIS_QUEUE must be a Queue binding").optional(),
+  /** The per-address limit on GET /-/apm/v1/resolve (resolve-limit.ts). Without it nothing is limited. */
+  RESOLVE_RATE_LIMIT: binding<RateLimiter>(["limit"], "RESOLVE_RATE_LIMIT must be a rate limiting binding").optional(),
   /** The registry's public URL (tarball links). Defaults to the request's origin. */
   APM_REGISTRY_URL: OptionalText,
   /** The website's public URL (sign-in, approval links, the device page). Defaults to the registry URL. */
@@ -508,6 +511,14 @@ async function respond({ req, rawEnv, clock, ctx, controls, timing }: Respond): 
     return healthResponse(req, { databaseUrl: env.HYPERDRIVE.connectionString, bucket: env.BLOBS, queueBound: env.ANALYSIS_QUEUE !== undefined, upstreamUrl: settings.upstreamUrl });
   }
 
+  // a resolve with no credentials is anonymous for sure: counted before the router builds any service, so a refused one
+  // costs one rate limit check. One with credentials is counted by the router only if they verify nobody (resolve-limit.ts)
+  const refused = carriesCredentials(req) ? null : await admitResolve({ req, limiter: env.RESOLVE_RATE_LIMIT ?? null });
+
+  if (refused !== null) return refused;
+  // what the router decided about a credentialed resolve's caller (resolve-limit.ts)
+  const resolveCount: ResolveCount = { caller: "unknown", counted: false };
+
   const program = route(req).pipe(
     Effect.catchTag("HttpFailure", (f: HttpFailure) => Effect.succeed(failureResponse(f))),
     // an install read that could not use the database is answered without it, from npm and the block list
@@ -532,15 +543,28 @@ async function respond({ req, rawEnv, clock, ctx, controls, timing }: Respond): 
     Effect.scoped,
     // outside servicesFor, so the Store and Upstream layers find it while they are built
     Effect.provideService(Timing, timing),
+    Effect.provideService(ResolveLimit, { limiter: env.RESOLVE_RATE_LIMIT ?? null, request: resolveCount }),
   );
 
   const exit = await Effect.runPromiseExit(program);
+  let res: Response;
 
-  if (Exit.isSuccess(exit)) return exit.value;
-  logFailure("defect", { method: req.method, path }, Cause.pretty(exit.cause));
-  report({ kind: "defect", cause: exit.cause });
+  // a defect is logged and reported before anything else decides the answer (review of 0126b2b, finding 3)
+  if (Exit.isSuccess(exit)) res = exit.value;
+  else {
+    logFailure("defect", { method: req.method, path }, Cause.pretty(exit.cause));
+    report({ kind: "defect", cause: exit.cause });
+    res = fail(500, "Internal error");
+  }
 
-  return fail(500, "Internal error");
+  // a credentialed resolve the resolve handler did not count (a HEAD's 405, a database outage, an error) is counted now,
+  // as countsLate decides (resolve-limit.ts); over the limit, the 429 is the answer
+  const late = countsLate({ req, request: resolveCount, status: res.status }) ? await admitResolve({ req, limiter: env.RESOLVE_RATE_LIMIT ?? null }) : null;
+
+  if (late === null) return res;
+  await res.body?.cancel();
+
+  return late;
 }
 
 const Job = z.object({ name: z.string(), version: z.string() });

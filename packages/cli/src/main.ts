@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
@@ -291,12 +291,20 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * GET /resolve, asked again while the registry answers 202 (still analysing) until PENDING_WAIT_MS is over, with a
  * progress line each time. The last answer is returned: a 202 then still means pending, and is refused.
  */
-async function resolveWaiting(api: Api, name: string, params: URLSearchParams): Promise<{ status: number; body: unknown }> {
+async function resolveWaiting(api: Api, name: string, params: URLSearchParams): Promise<{ status: number; body: unknown; tries: number }> {
   const started = Date.now();
   const limit = pendingWaitMs();
 
   for (;;) {
-    const r = await api.raw(`-/apm/v1/resolve?${params}`);
+    // retries after a 429 stay inside this wait too (none past it), so the two waits do not add up
+    const left = Math.max(0, Math.min(RATE_LIMIT_RETRY.maxMs, limit - (Date.now() - started)));
+
+    const r = await api.rawRetryingRateLimit(
+      `-/apm/v1/resolve?${params}`,
+      (w) => say(dim(`apm: ${name}: the registry limits resolves from this address; asking again in ${Math.round(w.waitMs / 1000)}s (try ${w.next} of ${w.tries}). apm login lifts the limit`)),
+      { tries: RATE_LIMIT_RETRY.tries, maxMs: left },
+    );
+
     const pending = r.status === 202 ? ResolvePending.safeParse(r.body) : null;
     const elapsed = Date.now() - started;
 
@@ -465,6 +473,11 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
   if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
 
   if (r.status === 400) throw new ApiError(r.status, `resolve failed for ${name}: ${errorOf(r.body, r.status)}`, r.body);
+
+  if (r.status === 429) {
+    throw new ApiError(r.status, `resolve failed for ${name}: ${errorOf(r.body, r.status)} apm asked ${r.tries} ${r.tries === 1 ? "time" : "times"}; nothing was installed. Sign in (apm login) and resolves are not limited per address, or try again in a minute`, r.body);
+  }
+
   throw new ApiError(r.status, `resolve failed for ${name} (HTTP ${r.status})`, r.body);
 }
 

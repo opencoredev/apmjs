@@ -2,7 +2,7 @@
 // answered only on a path the GET table (routes.ts) lists.
 import { Effect } from "effect";
 import { accountRoute } from "./account.ts";
-import { apmExtensions, apmRoute, safeView, upstreamRoute } from "./apm.ts";
+import { apmExtensions, apmRoute, noteResolveCaller, safeView, upstreamRoute } from "./apm.ts";
 import { Auth } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { evidenceRoute } from "./evidence.ts";
@@ -24,6 +24,9 @@ export const route = (req: Request) =>
     if (isAuth) return yield* (yield* Auth).handler(req);
 
     const caller = yield* callerOf(req);
+
+    // the resolve limit counts by what the credentials came to, decided here, before any handler can answer
+    yield* noteResolveCaller(req, caller);
     let view: PackumentView | undefined;
 
     if (viaSafe) {

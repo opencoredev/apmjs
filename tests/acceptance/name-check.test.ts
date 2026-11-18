@@ -46,6 +46,28 @@ describe("name check against an upstream registry", () => {
     expect(typeof dig(p.body, "versions", "0.1.0", "deprecated")).not.toBe("string");
     expect(dig(p.body, "versions", "9.9.9")).toBeUndefined();
   });
+
+  // The home page asks for the exact part at every pause in typing, so each prefix that is a real npm name ("rea",
+  // "reac") would otherwise queue an analysis nobody asked for. The check shows a stored score and queues nothing;
+  // the package page still queues latest when someone opens it.
+  test("the exact part reads latest's stored score and queues no analysis; the package page still queues it", async () => {
+    const queued = async (): Promise<number> => (await reg.query("SELECT 1 FROM analysis_jobs WHERE package = 'odd-shapes'")).length;
+
+    for (const part of ["exact", "lookalike", "alternatives"]) {
+      const r = await getJson(`${reg.url}-/apm/v1/names?q=odd-shapes&part=${part}`);
+      expect(r.status).toBe(200);
+    }
+
+    const whole = await getJson(`${reg.url}-/apm/v1/names?q=odd-shapes`);
+    expect(dig(whole.body, "taken")).toBe(true);
+    expect(dig(whole.body, "latest", "version")).toBe("2.0.0");
+    expect(dig(whole.body, "latest", "score")).toBeNull();
+    expect(await queued()).toBe(0);
+
+    const page = await getJson(`${reg.url}-/apm/v1/packages/odd-shapes`);
+    expect(page.status).toBe(200);
+    expect(await queued()).toBe(1);
+  });
 });
 
 describe("name check when upstream is down", () => {

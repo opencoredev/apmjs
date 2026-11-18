@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { Miniflare } from "miniflare";
+import { Miniflare, type MiniflareOptions } from "miniflare";
 import { Client } from "pg";
 import { z } from "zod";
 import { buildWorker, workerModules } from "../../packages/registry/scripts/build.ts";
@@ -27,6 +27,8 @@ export type WorkerRegistryOptions = {
   env?: Readonly<Record<string, string>>;
   /** Puts a link the test can cut (db-link.ts) between the Worker's Hyperdrive and its database. */
   databaseLink?: boolean;
+  /** Binds RESOLVE_RATE_LIMIT to Miniflare's rate limiter with this limit, as the deploy binds Cloudflare's. */
+  resolveRateLimit?: { limit: number; period: 10 | 60 };
 };
 
 export type WorkerRegistry = {
@@ -116,7 +118,7 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     vars.set("APM_GITHUB_ENDPOINTS", JSON.stringify(opts.github.endpoints));
   }
 
-  const mf = new Miniflare({
+  const options: MiniflareOptions = {
     modules: workerModules(script),
     modulesRoot: dirname(script),
     compatibilityDate: COMPATIBILITY_DATE,
@@ -128,7 +130,10 @@ export async function startWorkerRegistry(opts: WorkerRegistryOptions): Promise<
     hyperdrives: { HYPERDRIVE: link?.url ?? database.url },
     host: "127.0.0.1",
     port: 0,
-  });
+  };
+
+  if (opts.resolveRateLimit) options.ratelimits = { RESOLVE_RATE_LIMIT: { namespace_id: "1", simple: opts.resolveRateLimit } };
+  const mf = new Miniflare(options);
 
   target = (await mf.ready).toString();
 

@@ -125,6 +125,8 @@ export type StartOptions = {
   env?: Readonly<Record<string, string>>;
   /** Puts a link the test can cut between the Worker and its database (db-link.ts). */
   databaseLink?: boolean;
+  /** Turns on the per-address resolve limit (packages/registry/src/resolve-limit.ts) with this limit. */
+  resolveRateLimit?: { limit: number; period: 10 | 60 };
 };
 
 export async function startRegistry(opts: StartOptions = {}): Promise<Registry> {
@@ -143,6 +145,8 @@ export async function startRegistry(opts: StartOptions = {}): Promise<Registry> 
   if (opts.upstreamTtlMs !== undefined) options.upstreamTtlMs = opts.upstreamTtlMs;
 
   if (opts.databaseLink) options.databaseLink = true;
+
+  if (opts.resolveRateLimit) options.resolveRateLimit = opts.resolveRateLimit;
 
   if (opts.github) options.github = { clientId: "fake-client-id", clientSecret: "fake-client-secret", endpoints: opts.github.endpoints };
 

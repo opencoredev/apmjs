@@ -183,6 +183,34 @@ function errorText(body: unknown, status: number): string {
 /** A registry answer before it is parsed: its HTTP status and its JSON body (null when it had none). */
 export type RawAnswer = { status: number; body: unknown };
 
+/**
+ * How long a CLI keeps asking after a 429 (the registry limits resolves per address for callers it cannot verify): at
+ * most `tries` asks in all, inside one deadline `maxMs` after the first ask began, which the asks and the waits
+ * between them (each the answer's Retry-After) both count against.
+ */
+export const RATE_LIMIT_RETRY = { tries: 3, maxMs: 60_000 } as const;
+
+export type RetryBudget = { readonly tries: number; readonly maxMs: number };
+
+/** One wait after a 429, before ask `next` of `tries`. */
+export type RateLimitWait = { readonly waitMs: number; readonly next: number; readonly tries: number };
+
+/** A 429's Retry-After in milliseconds: whole seconds or an HTTP date; null when absent or unreadable. */
+export function retryAfterMs(header: string | null, now = Date.now()): number | null {
+  if (header === null || header.trim() === "") return null;
+  const value = header.trim();
+
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const at = Date.parse(value);
+
+  return Number.isFinite(at) ? Math.max(0, at - now) : null;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** How long one request to the registry may take. */
+const REQUEST_TIMEOUT_MS = 60_000;
+
 export class Api {
   constructor(readonly cfg: Config) {}
 
@@ -195,11 +223,50 @@ export class Api {
   }
 
   async raw(path: string, init: { method?: string; body?: unknown } = {}): Promise<RawAnswer> {
+    const { status, body } = await this.answer(path, init);
+
+    return { status, body };
+  }
+
+  /**
+   * GET `path`, asked again after a 429 as its Retry-After says (5 s when it says nothing), within `budget`: one
+   * deadline from the first ask, so no wait ends and no retry starts past it, however long the asks took (review of
+   * 54a3b4f, finding 3), and a retry is stopped at the deadline if it is still running (review of 226c936, finding 4).
+   * The first ask has the usual 60 s. `onWait` hears each wait. The last answer is returned, a 429 included (the one
+   * before a retry the deadline stopped), with how many asks were made.
+   */
+  async rawRetryingRateLimit(path: string, onWait: (wait: RateLimitWait) => void, budget: RetryBudget = RATE_LIMIT_RETRY): Promise<RawAnswer & { tries: number }> {
+    const deadline = performance.now() + budget.maxMs;
+    let last = await this.answer(path, {});
+
+    for (let attempt = 1; ; attempt++) {
+      const waitMs = Math.max(1000, last.retryAfterMs ?? 5000);
+
+      if (last.status !== 429 || attempt >= budget.tries || performance.now() + waitMs > deadline) return { status: last.status, body: last.body, tries: attempt };
+      onWait({ waitMs, next: attempt + 1, tries: budget.tries });
+      await sleep(waitMs);
+      const left = deadline - performance.now();
+
+      // the wait fit, but a timer can run late: never start an ask past the deadline
+      if (left <= 0) return { status: last.status, body: last.body, tries: attempt };
+
+      try {
+        last = await this.answer(path, {}, Math.min(REQUEST_TIMEOUT_MS, left));
+      } catch (e) {
+        // the deadline stopped this retry: the answer before it stands
+        if (e instanceof DOMException && e.name === "TimeoutError") return { status: last.status, body: last.body, tries: attempt + 1 };
+
+        throw e;
+      }
+    }
+  }
+
+  private async answer(path: string, init: { method?: string; body?: unknown }, timeoutMs = REQUEST_TIMEOUT_MS): Promise<RawAnswer & { retryAfterMs: number | null }> {
     const res = await fetch(`${this.cfg.registry}${path}`, {
       method: init.method ?? "GET",
       headers: this.headers(init.body !== undefined),
       ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
     let body: unknown = text;
@@ -208,7 +275,7 @@ export class Api {
     } catch {
       // not JSON
     }
-    return { status: res.status, body };
+    return { status: res.status, body, retryAfterMs: retryAfterMs(res.headers.get("retry-after")) };
   }
 
   async get<T>(path: string, schema: z.ZodType<T>): Promise<T> {

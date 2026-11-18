@@ -81,16 +81,18 @@ async function reviewOf(api: Api, name: string, version: string): Promise<Review
  * would run in (`strict`, from --strict or APM_STRICT=1). No os or cpu, as apm add sends none: every platform's
  * optional packages are checked.
  */
-async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean }): Promise<ResolvedInput> {
+async function resolvedFor(input: { api: Api; name: string; range: string | null; strict: boolean; warn: (line: string) => void }): Promise<ResolvedInput> {
   const { api, name, range } = input;
-  let r: { status: number; body: unknown };
+  let r: { status: number; body: unknown; tries: number };
   const params = new URLSearchParams({ name, range: range ?? "latest" });
 
   // review of 93274c8, finding 6: apm explain --strict asked in the default mode
   if (input.strict) params.set("strict", "1");
 
   try {
-    r = await api.raw(`-/apm/v1/resolve?${params}`);
+    r = await api.rawRetryingRateLimit(`-/apm/v1/resolve?${params}`, (w) =>
+      input.warn(`apm: ${name}: the registry limits resolves from this address; asking again in ${Math.round(w.waitMs / 1000)}s (try ${w.next} of ${w.tries}). apm login lifts the limit`),
+    );
   } catch (e) {
     return { kind: "unavailable", reason: e instanceof Error ? e.message : "the registry did not answer" };
   }
@@ -128,6 +130,10 @@ async function resolvedFor(input: { api: Api; name: string; range: string | null
 
   if (r.status === 404) return { kind: "missing", reason: error.success ? error.data.error : `No package named ${name}.` };
 
+  if (r.status === 429) {
+    return { kind: "unavailable", reason: `the registry limits resolves from this address${error.success ? ` (${error.data.error})` : ""}; apm asked ${r.tries} ${r.tries === 1 ? "time" : "times"}. Sign in (apm login) and resolves are not limited per address, or try again in a minute` };
+  }
+
   return { kind: "unavailable", reason: `the registry answered HTTP ${r.status}${error.success ? `: ${error.data.error}` : ""}` };
 }
 
@@ -143,7 +149,7 @@ export async function explainCommand(input: { api: Api; spec: string | undefined
 
   const { name, range } = parseSpec(spec);
   // a version inside the cooldown is swapped for the newest older one past it (strict mode's resolve already skips it)
-  const { resolved, older } = await resolveForVerdict({ range: range ?? "latest", resolve: (r) => resolvedFor({ api, name, range: r, strict: input.strict }) });
+  const { resolved, older } = await resolveForVerdict({ range: range ?? "latest", resolve: (r) => resolvedFor({ api, name, range: r, strict: input.strict, warn: (line) => io.warn(io.paint.dim(line)) }) });
   // only an "ok" resolve reads the review; the other verdicts never look at it
   const unread: ReviewInput = { kind: "unreadable" };
   const review = resolved.kind === "ok" ? await reviewOf(api, name, resolved.version) : unread;
