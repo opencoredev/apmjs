@@ -45,12 +45,13 @@ describe("a retry queued after a review with no answer", () => {
 });
 
 describe("the model behind a review", () => {
-  test("shows a plain label, with the exact model ID in its tooltip and for screen readers", () => {
+  // review of b4b95b3: an ID only in a title attribute can't be reached by keyboard or touch, so it is visible text
+  test("shows a plain label and the exact model ID as visible text, with no tooltip", () => {
     const html = renderToStaticMarkup(<AiReviewSection initial={noAnswer} signInHref="/signin" />);
 
-    expect(html).toContain('title="Model: fake-flash"');
-    expect(html).toContain("AI model");
-    expect(html).toContain('<span class="sr-only">: fake-flash</span>');
+    expect(html).toMatch(/AI model <span class="[^"]*font-mono[^"]*">fake-flash<\/span>/);
+    expect(html).not.toContain('title="Model:');
+    expect(html).not.toContain("sr-only\">: fake-flash");
   });
 });
 
