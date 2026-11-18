@@ -140,7 +140,7 @@ async function queue(bucket: BlocklistReader, bound: boolean, now: number): Prom
     const obj = await bucket.get(QUEUE_PROBE_KEY);
 
     if (obj === null) return { status: "unknown", detail: "no probe consumed yet: the cron sends one every 10 minutes" };
-    const record = QueueProbeRecord.safeParse(JSON.parse(await new Response(obj.body).text()));
+    const record = QueueProbeRecord.safeParse(JSON.parse(await obj.text()));
 
     if (!record.success) return { status: "unknown", detail: "the last probe's record is unreadable" };
     lastConsumedAt = new Date(record.data.receivedAt).toISOString();

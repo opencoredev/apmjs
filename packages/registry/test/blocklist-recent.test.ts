@@ -25,7 +25,7 @@ function bucket(initial: BlocklistBody) {
 
       const body = text;
 
-      return Promise.resolve(key === BLOCKLIST_KEY ? { body: new Blob([body]).stream(), etag: String(etag) } : null);
+      return Promise.resolve(key === BLOCKLIST_KEY ? { text: () => Promise.resolve(body), etag: String(etag) } : null);
     },
     put: (_key, value) => {
       text = value;

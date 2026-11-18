@@ -8,7 +8,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { BLOCKLIST_KEY, type BlocklistBody, type BlocklistReader } from "../src/blocklist.ts";
-import { CACHE_IDLE_MS } from "../src/deadline.ts";
 import {
   EDGE_READ_DEADLINE_MS,
   EDGE_REFRESH_AFTER_MS,
@@ -83,7 +82,7 @@ function bucket(initial: BlocklistBody | null) {
 
       if (state.held !== null) await state.held;
 
-      return key === BLOCKLIST_KEY && body !== null ? { body: new Blob([body]).stream(), etag: String(state.reads) } : null;
+      return key === BLOCKLIST_KEY && body !== null ? { text: () => Promise.resolve(body), etag: String(state.reads) } : null;
     },
   };
 
@@ -951,31 +950,4 @@ describe("downloads answered from a view", () => {
     await Effect.runPromise(edge.declined);
     expect(reports.at(-1)).toMatchObject({ queueFailures: 1, queueTimeouts: 0 });
   });
-});
-
-describe("the data center's copy of the view, when its body never ends", () => {
-  test("is cancelled at CACHE_IDLE_MS, and the read goes on to R2", async () => {
-    const source = { cancelled: false };
-    const b = bucket(list({}));
-
-    const stuck: ColoCache = {
-      // a copy young enough to use, whose body never sends a byte
-      match: async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            cancel() {
-              source.cancelled = true;
-            },
-          }),
-          { headers: { "x-apm-edge-read-at": String(clock) } },
-        ),
-      put: async () => undefined,
-    };
-
-    await verdict(options(b.api, { cache: stuck, background: null }), "react");
-    await Bun.sleep(CACHE_IDLE_MS + 500);
-    // on 11cbf13 the body's text() was raced with a timer and left reading; here its reader is cancelled
-    expect(source.cancelled).toBe(true);
-    expect(b.state.reads).toBe(1);
-  }, 20_000);
 });

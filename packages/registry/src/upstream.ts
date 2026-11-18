@@ -2,10 +2,8 @@
 // and rewritten so tarballs flow through apm, where they are verified, cached in R2 and scored.
 import { Context, Duration, Effect, Exit, Layer, Option } from "effect";
 import { z } from "zod";
-import { Blobs, type BlobBody } from "./blobs.ts";
-import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
+import { Blobs } from "./blobs.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
-import { upstreamPuts, type PendingPuts } from "./pending-puts.ts";
 import { Store, type KeptChoicesRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
@@ -571,44 +569,14 @@ function wholeReadCounts(readAt: number, since: number, now: number): boolean {
 
 /**
  * The packages this isolate is reading whole from npm for a caller that needs a whole read (listedOrSame with
- * `wholeSince`), by upstream and name, with when that read began (wall clock): a second such request for one of them
- * waits for that read to land in the isolate cache instead of reading npm again. Per isolate only: two isolates, or two
- * data centers, may each read once. A mark older than SINGLE_FLIGHT_STALE_MS is no read under way: a leader whose
- * request ended without its cleanup running (the platform dropped it) must not make every later request wait.
+ * `wholeSince`), by upstream and name: a second such request for one of them waits for that read to land in the isolate
+ * cache instead of reading npm again. Per isolate only: two isolates, or two data centers, may each read once.
  */
-const refreshing = new Map<string, Flight>();
+const refreshing = new Set<string>();
 
-/**
- * One whole read under way: when it began, and whether the one extra read a waiter may make once its wait ran out
- * (SINGLE_FLIGHT_WAIT_MS) was taken. Every other waiter whose wait runs out while this read is out is answered "unknown"
- * (a 503 with Retry-After the client retries) instead of reading npm: a stuck leader costs npm two reads, not one per
- * request that came meanwhile.
- */
-type Flight = { readonly began: number; extraTaken: boolean };
-
-/**
- * How long a request waits for another's whole read before its wait runs out (then one waiter reads npm and the rest
- * are told to retry: Flight), and how often it looks. A whole read
- * usually lands in well under a second (bench: npm p90 160 ms); one still out after SINGLE_FLIGHT_WAIT_MS is slow or
- * stuck, and waiting longer on it is a stall shared between requests (the bench's 10.1 s install document on 8ea60e1).
- */
-const SINGLE_FLIGHT_WAIT_MS = 3_000;
+/** How long a request waits for another's whole read before it reads npm itself, and how often it looks. */
+const SINGLE_FLIGHT_WAIT_MS = 10_000;
 const SINGLE_FLIGHT_POLL_MS = 25;
-
-/** A whole read is over by then (npm's 10 s, the copy's lookup and first bytes): a mark this old is dropped. */
-const SINGLE_FLIGHT_STALE_MS = 15_000;
-
-/** The whole read of `flight` under way in this isolate at `now`, or null; a stale mark is dropped. */
-function underWay(flight: string, now: number): Flight | null {
-  const mark = refreshing.get(flight);
-
-  if (mark === undefined) return null;
-
-  if (now - mark.began < SINGLE_FLIGHT_STALE_MS && now >= mark.began) return mark;
-  refreshing.delete(flight);
-
-  return null;
-}
 
 /** A read time from a header (ms since the epoch on the registry's clock), or minus infinity when it is missing or not a number. */
 function readTime(header: string | null): number {
@@ -798,41 +766,6 @@ export type DevDependencyRead = { readonly byVersion: ReadonlyMap<string, unknow
 const SHARE_TIMEOUT_MS = 20_000;
 
 /**
- * How long a background put to the data center's cache is kept in the request's waitUntil: the write's own stream stops
- * at SHARE_TIMEOUT_MS, and a put that still has not settled a little after that is let go (the runtime would cancel it
- * at 30 s anyway). What the write holds is given back when its stream stops or the put settles, whichever is first.
- */
-const SHARE_WAIT_MS = SHARE_TIMEOUT_MS + 5_000;
-
-/** npm's whole packument, from the request to its last byte. */
-const NPM_READ_TIMEOUT_MS = 10_000;
-
-/**
- * A cached copy's body once its first bytes came (deadline.ts, firstChunkWithin), or null. Interrupted while it waits
- * (the request ended), the body it comes to is cancelled once it is known, so nothing holds the copy's stream.
- */
-const primedCopy = (source: ReadableStream<Uint8Array>, operation: string): Effect.Effect<ReadableStream<Uint8Array> | null> =>
-  Effect.callback<ReadableStream<Uint8Array> | null>((resume) => {
-    const pending = firstChunkWithin({ source, firstMs: CACHE_FIRST_BYTE_MS, idleMs: CACHE_IDLE_MS, operation });
-
-    pending.then((body) => resume(Effect.succeed(body)));
-
-    return Effect.promise(() => pending.then((body) => body?.cancel().catch(() => undefined)));
-  });
-
-/** `work` as a waiter keeps it: settled at the latest `ms` on, a later one logged as a stall. Never rejects. */
-const waitWithin = (work: Promise<unknown>, ms: number, operation: string): Promise<void> =>
-  within(work, ms).then((got) => {
-    if (got.kind === "late") logStall(operation, ms);
-  });
-
-/** A background put to the data center's cache as a request's waitUntil keeps it: SHARE_WAIT_MS at most. */
-const waitBounded = (put: Promise<unknown>, operation: string): Promise<void> => waitWithin(put, SHARE_WAIT_MS, operation);
-
-/** A blob store failure that is R2 not answering within its deadline (blobs.ts). */
-const isLate = (e: BlobError): boolean => e.cause instanceof DeadlinePassed;
-
-/**
  * Like Effect.tryPromise, but an interruption is joined: it aborts the signal `run` was given and waits for the
  * promise to settle before the interrupted fiber ends. A read (readPackument) stopped this way has canceled its stream
  * and given its charge back by then, so the scope that releases its lease runs after nothing refers to the read any
@@ -868,7 +801,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
    * The proxy of `baseUrl` (ending with "/"). `background` finishes work after the response (the shared packument
    * cache's writes); without it those writes are skipped.
    */
-  static layer(baseUrl: string, ttlMs: number = DEFAULT_TTL_MS, background: ((work: Promise<void>) => void) | null = null, puts: PendingPuts = upstreamPuts): Layer.Layer<Upstream, never, Store | Blobs> {
+  static layer(baseUrl: string, ttlMs: number = DEFAULT_TTL_MS, background: ((work: Promise<void>) => void) | null = null): Layer.Layer<Upstream, never, Store | Blobs> {
     return Layer.effect(
       Upstream,
       Effect.gen(function* () {
@@ -986,53 +919,21 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         const cachedCopy = (digest: Digest) =>
           Effect.gen(function* () {
             const key = upstreamBlobKey(digest);
-            // R2 past its deadline (blobs.ts) is a miss: npm is asked, as for a copy never kept
-            const cached = yield* Effect.catchIf(blobs.bytes(key), isLate, () => Effect.succeed(Option.none<Uint8Array>()));
+            const cached = yield* blobs.bytes(key);
 
             if (Option.isNone(cached)) return null;
 
             if (matches(cached.value, digest)) return cached.value;
-            // a disposable cache's delete (blobs.ts, "cache"): given up on at its deadline, never under the blob lock
-            yield* Effect.catchIf(blobs.remove(key, "cache"), isLate, () => Effect.void);
+            yield* blobs.remove(key);
 
             return null;
-          });
-
-        /**
-         * Keeps verified bytes in the blob store, a cache of npm's: in a request, after its answer (waitUntil), within
-         * R2_PUT_MS; without one (the queue's analysis), waited for within R2_PUT_MS. A put that fails or runs out of time
-         * is logged and costs only a later download from npm. The isolate's ledger (pending-puts.ts) starts one put per
-         * tarball and skips caching once its puts or bytes are full, counting each put until R2 settles it.
-         */
-        const keepBlob = (digest: Digest, bytes: Uint8Array): Effect.Effect<void> =>
-          Effect.suspend(() => {
-            const started = puts.start({
-              key: upstreamBlobKey(digest),
-              bytes: bytes.byteLength,
-              put: () =>
-                Effect.runPromiseExit(blobs.put(upstreamBlobKey(digest), bytes)).then((exit) => {
-                  if (Exit.isFailure(exit)) console.error(JSON.stringify({ level: "error", event: "upstream-blob-put", error: "put-failed" }));
-                }),
-            });
-
-            if (started.kind !== "started") {
-              if (started.kind === "full") console.warn(JSON.stringify({ level: "warn", event: "upstream-blob-put", skipped: "full", ...puts.load }));
-
-              return Effect.void;
-            }
-
-            const bounded = waitWithin(started.settled, R2_PUT_MS, "upstream-blob-put");
-
-            if (background !== null) return Effect.sync(() => background(bounded));
-
-            return Effect.promise(() => bounded);
           });
 
         /** Bytes that passed their checksum are kept in the blob store; others are "unavailable". */
         const verified = (bytes: Uint8Array, digest: Digest) =>
           Effect.gen(function* () {
             if (!matches(bytes, digest)) return { kind: "unavailable", reason: "the upstream tarball failed its integrity check", retryable: true } as const;
-            yield* keepBlob(digest, bytes);
+            yield* blobs.put(upstreamBlobKey(digest), bytes);
 
             return { kind: "ok", bytes, digest } as const;
           });
@@ -1114,7 +1015,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           joinedPromise(async (interrupted): Promise<PackumentAnswer> => {
             const { name, url, now, profile, lease } = input;
             const etag = input.etag ?? null;
-            const signal = AbortSignal.any([interrupted, AbortSignal.timeout(NPM_READ_TIMEOUT_MS)]);
+            const signal = AbortSignal.any([interrupted, AbortSignal.timeout(10_000)]);
 
             if (etag !== null && caches.failures.get(name, now) === undefined) {
               const askStart = performance.now();
@@ -1180,11 +1081,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }
 
             const key = packumentKey(url, profile);
+            const shared = sharing ? workerCache() : null;
             const cacheStart = performance.now();
-            // the data center's copy is looked up within CACHE_MATCH_MS and used only if its first bytes come within
-            // CACHE_FIRST_BYTE_MS; past either, or a copy that stalls or fails while it is read, npm is asked
-            const lookup = sharing ? await matchWithin({ cache: workerCache(), key, operation: "packument-copy" }) : null;
-            const hit = lookup?.kind === "hit" ? lookup.res : undefined;
+            const hit = shared ? await shared.match(key).catch(() => undefined) : undefined;
             // a copy with no time (written before copies carried one) or past its TTL is not used, nor, when the caller
             // needs a whole read of npm's packument since `wholeSince`, one whose read is older or not known
             const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
@@ -1192,25 +1091,15 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             const wholeSince = input.wholeSince ?? null;
 
             if (hit?.body && Number.isFinite(sentAt) && now - sentAt >= 0 && now - sentAt < ttlMs && (wholeSince === null || wholeReadCounts(sharedReadAt, wholeSince, input.readNow))) {
-              const body = await firstChunkWithin({ source: hit.body, firstMs: CACHE_FIRST_BYTE_MS, idleMs: CACHE_IDLE_MS, operation: "packument-copy-body" });
+              const read = await readPackument(hit.body, { profile, lease, signal: interrupted });
+              timing?.add("npm-cache", performance.now() - cacheStart);
 
-              if (body !== null) {
-                try {
-                  const read = await readPackument(body, { profile, lease, signal: interrupted });
-                  timing?.add("npm-cache", performance.now() - cacheStart);
+              return answerOf({ url, read, fetchedAt: sentAt, readAt: sharedReadAt, fresh: false, etag: hit.headers.get(ETAG_HEADER) });
+            }
 
-                  return answerOf({ url, read, fetchedAt: sentAt, readAt: sharedReadAt, fresh: false, etag: hit.headers.get(ETAG_HEADER) });
-                } catch (e) {
-                  // the caller stopped the read; anything else (the copy stalled or broke) is npm's to answer
-                  if (interrupted.aborted) throw e;
-                }
-              }
-            } else await hit?.body?.cancel();
-
+            await hit?.body?.cancel();
             const npmStart = performance.now();
-            // npm's whole read has its own 10 s from here, whatever the copy's lookup took
-            const npmSignal = AbortSignal.any([interrupted, AbortSignal.timeout(NPM_READ_TIMEOUT_MS)]);
-            const res = await fetch(url, { headers: { accept: "application/json" }, signal: npmSignal });
+            const res = await fetch(url, { headers: { accept: "application/json" }, signal });
 
             if (res.status !== 200 || !res.body) {
               await res.body?.cancel();
@@ -1219,7 +1108,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               return { kind: "status", status: res.status === 200 ? 502 : res.status, fetchedAt: now };
             }
 
-            const read = await readPackument(res.body, { profile, lease, signal: npmSignal });
+            const read = await readPackument(res.body, { profile, lease, signal });
             timing?.add("npm", performance.now() - npmStart);
 
             if (!res.redirected) noteEtagForm(res.headers.get("etag"));
@@ -1254,12 +1143,12 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           const signal = AbortSignal.any([work.signal, AbortSignal.timeout(SHARE_TIMEOUT_MS)]);
           const copy = streamedJson(input.body, "versions", headers, { signal, onDone: () => (signal.aborted ? done() : undefined) });
 
-          const put = workerCache()
-            .put(packumentKey(input.url, input.profile), copy)
-            .catch(() => undefined)
-            .finally(done);
-
-          background(waitBounded(put, "packument-copy-put"));
+          background(
+            workerCache()
+              .put(packumentKey(input.url, input.profile), copy)
+              .catch(() => undefined)
+              .finally(done),
+          );
         };
 
         /** An answer that is not a packument: absent when npm said 404, unknown otherwise. */
@@ -1323,38 +1212,19 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               // a whole read of this package is already under way in this isolate: wait for it to publish its result
               // in this isolate's cache, then use that, rather than read npm's packument once more (no promise is
               // shared between requests: each waiter looks again on its own timer)
-              const out = wholeSince === null ? null : underWay(flight, t);
-
-              if (out !== null) {
-                if (waited < SINGLE_FLIGHT_WAIT_MS) {
-                  yield* Effect.sleep(Duration.millis(SINGLE_FLIGHT_POLL_MS));
-                  waited += SINGLE_FLIGHT_POLL_MS;
-                  continue;
-                }
-
-                logStall("single-flight", SINGLE_FLIGHT_WAIT_MS);
-                timing?.add("flight-wait", waited);
-
-                // the leader is slow or stuck: one waiter reads npm itself, every later one is told to retry (a 503
-                // with Retry-After), so requests that pile up behind a stuck read never each read npm
-                if (out.extraTaken) return { kind: "unknown" as const };
-                out.extraTaken = true;
-
-                return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes });
+              if (wholeSince !== null && refreshing.has(flight) && waited < SINGLE_FLIGHT_WAIT_MS) {
+                yield* Effect.sleep(Duration.millis(SINGLE_FLIGHT_POLL_MS));
+                waited += SINGLE_FLIGHT_POLL_MS;
+                continue;
               }
-
-              if (waited > 0) timing?.add("flight-wait", waited);
 
               if (wholeSince === null) return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes });
               // this read leads: its result is in the isolate's cache before the mark goes (npmListing's probes.set)
-              const mark: Flight = { began: t, extraTaken: false };
+              const leads = !refreshing.has(flight);
 
-              refreshing.set(flight, mark);
+              if (leads) refreshing.add(flight);
 
-              // only its own mark: a stale one it replaced may still end later, and must not clear this read's
-              return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes }).pipe(
-                Effect.ensuring(Effect.sync(() => (refreshing.get(flight) === mark ? refreshing.delete(flight) : undefined))),
-              );
+              return yield* npmListing({ name, lease, etag, wholeSince, t, readNow, probes }).pipe(Effect.ensuring(Effect.sync(() => (leads ? refreshing.delete(flight) : undefined))));
             }
           });
 
@@ -1848,25 +1718,17 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             // (it does not need the stamp); a whole read, which runs the AI review's hook, waits for the database
             const look = Effect.gen(function* () {
               const copyStart = performance.now();
-              // the lookup within CACHE_MATCH_MS, and the copy used only if its first bytes come within
-              // CACHE_FIRST_BYTE_MS (then CACHE_IDLE_MS between chunks): past either it is no copy, and the document is
-              // made from npm's packument as for a miss
-              const lookup = sharing ? yield* Effect.promise(() => matchWithin({ cache: workerCache(), key: installKey({ upstream: baseUrl, served: input.served, name }), operation: "install-copy" })) : null;
-              const hit = lookup?.kind === "hit" ? lookup.res : undefined;
+              const hit = sharing ? yield* Effect.promise(() => workerCache().match(installKey({ upstream: baseUrl, served: input.served, name })).catch(() => undefined)) : undefined;
+
+              if (sharing) timing?.add("install-copy", performance.now() - copyStart);
+
               held = hit?.body ?? null;
               const etag = npmEtag(hit?.headers.get(ETAG_HEADER) ?? null);
               const sentAt = Number(hit?.headers.get(FETCHED_AT_HEADER) ?? Number.NaN);
               const readAt = readTime(hit?.headers.get(INSTALL_READ_AT_HEADER) ?? null);
               const stamp = hit?.headers.get(INSTALL_STAMP_HEADER) ?? null;
-              const usable = hit !== undefined && etag !== null && stamp !== null && wholeReadCounts(readAt, since, at) && hit.headers.get(INSTALL_FORMAT_HEADER) === INSTALL_COPY_FORMAT;
-              const source = held;
 
-              // the copy's first bytes, taken now: a copy whose body does not start is no copy
-              if (usable && source !== null) held = yield* primedCopy(source, "install-copy-body");
-
-              if (sharing) timing?.add("install-copy", performance.now() - copyStart);
-
-              if (!usable || held === null || etag === null || stamp === null) {
+              if (!hit?.body || etag === null || stamp === null || !wholeReadCounts(readAt, since, at) || hit.headers.get(INSTALL_FORMAT_HEADER) !== INSTALL_COPY_FORMAT) {
                 yield* drop;
 
                 return { kind: "none" } as const;
@@ -1939,12 +1801,12 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
             const copy = input.write(headers, { signal, onDone: () => (signal.aborted ? input.onDone() : undefined) });
 
-            const put = workerCache()
-              .put(installKey({ upstream: baseUrl, served: input.served, name: input.name }), copy)
-              .catch(() => undefined)
-              .finally(input.onDone);
-
-            background(waitBounded(put, "install-copy-put"));
+            background(
+              workerCache()
+                .put(installKey({ upstream: baseUrl, served: input.served, name: input.name }), copy)
+                .catch(() => undefined)
+                .finally(input.onDone),
+            );
           });
 
         const api: UpstreamApi = {
@@ -2113,8 +1975,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const at = locate(pkg, version);
 
               if (at.kind !== "found") return at;
-              // R2 past its deadline is a miss here too: npm's answer is opened instead
-              const cached = yield* Effect.catchIf(blobs.stream(upstreamBlobKey(at.digest)), isLate, () => Effect.succeed(Option.none<BlobBody>()));
+              const cached = yield* blobs.stream(upstreamBlobKey(at.digest));
 
               if (Option.isSome(cached)) return { kind: "stream", body: cached.value.body, length: cached.value.size, digest: at.digest } as const;
               const opened = yield* Effect.promise(() => open(at.url));

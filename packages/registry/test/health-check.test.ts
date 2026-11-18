@@ -26,7 +26,7 @@ function bucket(objects: Record<string, string>, fails = false): HealthEnv["buck
       if (fails) throw new Error("R2 is unavailable");
       const text = objects[key];
 
-      return text === undefined ? null : { body: new Blob([text]).stream(), etag: "e1" };
+      return text === undefined ? null : { text: async () => text, etag: "e1" };
     },
   };
 }

@@ -265,7 +265,7 @@ const edgeLayer = (edge: Edge) => {
       if (edge.list === "fail") throw new Error("R2 is down");
       const text = JSON.stringify(edge.list);
 
-      return key === BLOCKLIST_KEY && edge.list !== null ? { body: new Blob([text]).stream(), etag: "e" } : null;
+      return key === BLOCKLIST_KEY && edge.list !== null ? { text: () => Promise.resolve(text), etag: "e" } : null;
     },
   };
 

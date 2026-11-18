@@ -13,12 +13,7 @@ beforeAll(async () => {
   const raw = await mf.getR2Bucket("BLOBS");
 
   bucket = {
-    // workerd's object, its bytes handed on as a stream of this runtime's (the list reads only `body` and `etag`)
-    get: async (key) => {
-      const obj = await raw.get(key);
-
-      return obj === null ? null : { body: new Blob([new Uint8Array(await obj.arrayBuffer())]).stream(), etag: obj.etag };
-    },
+    get: async (key) => raw.get(key),
     put: async (key, value, options) => raw.put(key, value, options),
   };
 });
@@ -66,9 +61,7 @@ describe("creating the list", () => {
 
     expect(await bucket.put(BLOCKLIST_KEY, "first", createOnly)).not.toBeNull();
     expect(await bucket.put(BLOCKLIST_KEY, "second", createOnly)).toBeNull();
-    const kept = await bucket.get(BLOCKLIST_KEY);
-
-    expect(kept === null ? null : await new Response(kept.body).text()).toBe("first");
+    expect(await (await bucket.get(BLOCKLIST_KEY))?.text()).toBe("first");
   });
 
   test("a sync that found the object missing does not overwrite a first publish's block written in between", async () => {

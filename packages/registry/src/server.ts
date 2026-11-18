@@ -598,11 +598,6 @@ function matchesPublished(bytes: Uint8Array, v: Pick<VersionRecord, "integrity" 
 /**
  * Drops a tarball from the blob store once nothing points at it any more. The check and the delete hold the
  * blob's lock exclusively, so an upload of the same bytes waits, or is waited for and then counted.
- *
- * The lock is held until R2's delete settles: the delete has no local deadline (a "held" delete, blobs.ts) and is not
- * interruptible, so neither a timer nor a request that ended rolls the transaction back, releasing the lock, while the
- * delete is still in flight (a replacement upload would commit, and the late delete erase its object). Only the
- * transaction's own deadline (db-health.ts, 60 s) still closes its connection.
  */
 export const dropBlobIfUnused = (key: string): Effect.Effect<void, StoreError | BlobError, Store | Blobs> =>
   Effect.gen(function* () {
@@ -614,7 +609,7 @@ export const dropBlobIfUnused = (key: string): Effect.Effect<void, StoreError | 
         yield* store.lockBlob(key, "exclusive");
 
         if (yield* store.blobReferenced(key)) return;
-        yield* Effect.uninterruptible(blobs.remove(key, "held"));
+        yield* blobs.remove(key);
       }),
     );
   });
