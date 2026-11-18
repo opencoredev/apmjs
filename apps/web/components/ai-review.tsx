@@ -86,7 +86,10 @@ function Result({ r, name, version }: { r: PublicReview; name: string; version: 
           <p className="flex flex-wrap gap-x-2 text-sm leading-6 text-muted-foreground">
             <span>{coverageText(r.coverage)}</span>
             <span aria-hidden>·</span>
-            <span className="font-mono text-[13px]">{r.model}</span>
+            {/* a plain label; the exact model ID is in the tooltip, for screen readers, and in the Markdown view */}
+            <span title={`Model: ${r.model}`} className="cursor-help underline decoration-dotted decoration-from-font underline-offset-4">
+              AI model<span className="sr-only">: {r.model}</span>
+            </span>
             <span aria-hidden>·</span>
             <time dateTime={r.reviewedAt} title={new Date(r.reviewedAt).toUTCString()} suppressHydrationWarning>
               {ago(r.reviewedAt)}

@@ -91,7 +91,7 @@ const GROUPS: readonly Group[] = [
 ];
 
 const NPM_WINS = [
-  { title: "Scale and trust", body: "npm hosts every package and has served the ecosystem for years. apm is new, and serves npm’s packages through its proxy." },
+  { title: "Scale and trust", body: "npm is the established registry for the JavaScript ecosystem. apm is new, and serves npm’s packages through its proxy." },
   { title: "Trusted publishing and provenance", body: "npm has OIDC and provenance. apm has neither yet." },
   { title: "Account security", body: "Both have passkeys and 2FA. npm’s account system has years of use behind it; apm’s is new." },
   { title: "Hosting your code", body: "apm can’t take a name that already exists on npm." },

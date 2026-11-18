@@ -44,6 +44,16 @@ describe("a retry queued after a review with no answer", () => {
   });
 });
 
+describe("the model behind a review", () => {
+  test("shows a plain label, with the exact model ID in its tooltip and for screen readers", () => {
+    const html = renderToStaticMarkup(<AiReviewSection initial={noAnswer} signInHref="/signin" />);
+
+    expect(html).toContain('title="Model: fake-flash"');
+    expect(html).toContain("AI model");
+    expect(html).toContain('<span class="sr-only">: fake-flash</span>');
+  });
+});
+
 describe("the findings of a revoked version", () => {
   test("a finding without its line shows the file, line and sentence, and no empty code block", () => {
     const finding = { file: "index.js", line: 2, issue: "Posts process.env to a remote host.", severity: "high" } as const;

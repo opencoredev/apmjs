@@ -133,7 +133,7 @@ function reviewSection(review: Fetched<ReviewAnswer>): string[] {
   const why = explanation(r);
 
   if (why) lines.push(why);
-  lines.push(`${coverageText(r.coverage)}. Model: ${inlineCode(r.model)}. Reviewed ${inlineCode(r.reviewedAt)}.`);
+  lines.push(`${coverageText(r.coverage)}. Reviewed by an AI model (${inlineCode(r.model)}) at ${inlineCode(r.reviewedAt)}.`);
 
   // findings and the note are the AI's and a reviewer's words about publisher code: quoted, the excerpt as a block
   // a withheld version's findings are the registry's: a fixed sentence, a file reference and no excerpt

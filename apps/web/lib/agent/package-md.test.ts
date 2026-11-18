@@ -41,6 +41,8 @@ describe("packageMarkdown", () => {
     expect(md).toContain("## AI review");
     expect(md).toContain("Status: found-nothing. AI review found nothing in this version's files.");
     expect(md).toContain("Read 2 of 2 files.");
+    // the page shows a plain label; agents still get the exact model ID, in parentheses
+    expect(md).toContain("Reviewed by an AI model (`test-model`) at `2026-01-02T00:00:00.000Z`.");
   });
 
   test("has install commands for apm, bun, npm and pnpm, and the config that turns the checks on", () => {
