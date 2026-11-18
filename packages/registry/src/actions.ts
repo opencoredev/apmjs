@@ -144,6 +144,10 @@ export const SessionAction = z.discriminatedUnion("kind", [
   EvidenceKey.extend({ kind: z.literal("evidence-dismiss"), reason: DismissReason }),
   EvidenceKey.extend({ kind: z.literal("evidence-restore"), reason: RestoreReason }),
   z.object({ kind: z.literal("account"), change: z.enum(ACCOUNT_CHANGES) }),
+  /** Opening the review queue's decision window: one factor, then confirm and dismiss for a few minutes (review.ts). */
+  z.object({ kind: z.literal("review-unlock") }),
+  /** Turning "AI flags hold installs" on or off. Never covered by the decision window. */
+  z.object({ kind: z.literal("review-switch"), hold: z.boolean() }),
 ]);
 
 export type SessionAction = z.infer<typeof SessionAction>;
@@ -162,6 +166,10 @@ export function sessionActionKey(a: SessionAction): string {
       return JSON.stringify([a.kind, a.name, a.version, a.digest, a.scorer, a.signal, a.file, a.line, a.reason]);
     case "account":
       return JSON.stringify([a.kind, a.change]);
+    case "review-unlock":
+      return JSON.stringify([a.kind]);
+    case "review-switch":
+      return JSON.stringify([a.kind, a.hold]);
     default: {
       const _exhaustive: never = a;
 

@@ -1,9 +1,12 @@
 // The AI review answer (GET /-/apm/v1/review/:name/:version), parsed on both server and client, and
 // the sentences the page shows for it. The copy never calls a version "safe": a clean result is
 // described as what the model read and found nothing in.
+import { redactSecrets } from "@apm/core/redact";
 import { z } from "zod";
 
-export const Finding = z.object({ file: z.string(), line: z.number(), excerpt: z.string(), issue: z.string(), severity: z.enum(["high", "medium", "low"]) });
+// a public finding has no excerpt (the registry never sends the publisher's code to the public); the owner's and the
+// reviewers' views have one
+export const Finding = z.object({ file: z.string(), line: z.number(), excerpt: z.string().default(""), issue: z.string(), severity: z.enum(["high", "medium", "low"]), label: z.string().optional() });
 
 export type Finding = z.infer<typeof Finding>;
 
@@ -18,7 +21,8 @@ export const Coverage = z.object({ mode: z.enum(["diff", "files"]), previousVers
 
 export type Coverage = z.infer<typeof Coverage>;
 
-export const PUBLIC_STATES = ["found-nothing", "under-review", "no-answer", "confirmed", "cleared"] as const;
+/** flagged: an open AI flag while apm's "AI flags hold installs" switch is off; shown as a note, it holds nothing. */
+export const PUBLIC_STATES = ["found-nothing", "under-review", "flagged", "no-answer", "confirmed", "cleared"] as const;
 
 export type PublicState = (typeof PUBLIC_STATES)[number];
 
@@ -27,8 +31,11 @@ export const PublicReview = z.object({
   model: z.string(),
   reviewedAt: z.string(),
   coverage: Coverage,
-  read: z.array(z.string()),
-  notRead: z.array(NotRead),
+  // the paths are the publisher's text: the registry sends the public only counts (notReadCounts), and the paths to
+  // the package's owners and apm's reviewers in `private`. An older registry sent the paths here.
+  read: z.array(z.string()).default([]),
+  notRead: z.array(NotRead).default([]),
+  notReadCounts: z.object({ files: z.number(), dependencies: z.number() }).optional(),
   findings: z.array(Finding),
   decidedAt: z.string().nullable(),
   note: z.string().nullable(),
@@ -42,6 +49,8 @@ export const PrivateReview = z.object({
   reason: z.enum(["empty", "unsettled"]).nullable(),
   summary: z.string(),
   findings: z.array(Finding),
+  read: z.array(z.string()).default([]),
+  notRead: z.array(NotRead).default([]),
   humanState: z.enum(["none", "pending", "confirmed", "dismissed"]),
 });
 
@@ -91,7 +100,8 @@ const REASON: Record<Extract<NotRead, { kind: "file" }>["reason"], string> = {
 };
 
 export function notReadText(n: Extract<NotRead, { kind: "file" }>): string {
-  return `${n.path} (${REASON[n.reason]})`;
+  // a path is the publisher's text: masked here too, as the registry masks it (packages/core/src/redact.ts)
+  return `${redactSecrets(n.path)} (${REASON[n.reason]})`;
 }
 
 /** The one-line result. */
@@ -108,6 +118,8 @@ export function headline(r: PublicReview): string {
 
     case "under-review":
       return "Under review";
+    case "flagged":
+      return "Flagged by the AI review, not checked by a person yet";
     case "no-answer":
       return "AI review gave no answer";
     case "confirmed":
@@ -128,6 +140,8 @@ export function explanation(r: PublicReview): string | null {
       return null;
     case "under-review":
       return "The AI review raised a question about this version. A person at apm is checking it. Nothing has been confirmed.";
+    case "flagged":
+      return "An AI review flagged this version; a person has not looked yet. apm does not hold installs on these flags right now, and nothing has been confirmed.";
     case "no-answer":
       return "The model did not return a usable answer for this version. A person at apm will look at it.";
     case "confirmed":
@@ -153,6 +167,7 @@ export function headerNotice(r: PublicReview): { tone: "warn" | "bad"; text: str
     case "confirmed":
       return { tone: "bad", text: "Confirmed malicious by apm reviewers" };
     case "found-nothing":
+    case "flagged":
     case "no-answer":
     case "cleared":
       return null;

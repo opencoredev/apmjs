@@ -12,6 +12,7 @@ export function sitemapEntries(input: { recent: readonly { package: string; at: 
     { url: siteUrl("/"), lastModified: input.now, changeFrequency: "daily", priority: 1 },
     { url: siteUrl("/docs"), changeFrequency: "weekly", priority: 0.8 },
     { url: siteUrl("/compare"), changeFrequency: "monthly", priority: 0.6 },
+    { url: siteUrl("/reviews"), changeFrequency: "daily", priority: 0.5 },
   ];
 
   const seen = new Set<string>();

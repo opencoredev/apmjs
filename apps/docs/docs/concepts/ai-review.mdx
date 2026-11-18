@@ -45,16 +45,18 @@ Text inside a package is data to the model, not instructions. A comment that vou
 | State | Shown on the version page |
 | --- | --- |
 | Nothing found | "AI review found nothing in the change from 4.4.1", with how many files were read, the model and the date. |
-| Flagged, or unsettled | "Under review": a question was raised and a person at apm is checking it. Nothing is confirmed. |
+| Flagged, or unsettled | "Under review": a question was raised and a person at apm is checking it. Nothing is confirmed. While apm's reviewers have AI flags set not to hold installs, it reads "Flagged by the AI review, not checked by a person yet" instead. |
 | No answer | "AI review gave no answer." |
-| Confirmed by a person | "Confirmed malicious by apm reviewers", with each finding as `file:line`, the line, and one sentence. |
+| Confirmed by a person | "Confirmed malicious by apm reviewers", with each finding as `file:line`, its severity and a label such as "sends data out" or "install script", and the reviewer's note. The model's own words and the quoted code are never public. |
 | Dismissed by a person | "Checked by a person, no action needed." |
 
-The page never says "safe" and never shows the model's confidence number, which is not calibrated. The package's owners and apm's reviewers see the cited lines of an unconfirmed flag; the public sees only "Under review".
+The page never says "safe" and never shows the model's confidence number, which is not calibrated. For a package published on apm, its owners and apm's reviewers see the cited lines of an unconfirmed flag, on the version page and on "Your packages"; the public sees only "Under review". A package npm serves has no owner view on apm. Where the cited lines are shown, anything secret-shaped a model quoted (a key, a token, a password in a connection string) is masked to its first and last few characters and its length. [apmjs.dev/reviews](https://apmjs.dev/reviews) lists how many versions were reviewed, flagged and decided, and every version waiting for a person, with no findings.
 
 ## Who decides
 
-A model's flag is a question, not a verdict. Every flagged or unanswered review waits for a person on apm's review list, who confirms or dismisses it on the website with a fresh authenticator code or passkey. No token can open the queue or decide.
+A model's flag is a question, not a verdict. Every flagged or unanswered review waits for a person on apm's review list, who confirms or dismisses it on the website. One authenticator code or passkey check unlocks decisions for 10 minutes in that browser session. No token can open the queue or decide.
+
+Until a person decides, an open flag holds installs for agents (`review-first`) while the "AI flags hold installs" switch is on, which is the default. apm's reviewers can turn it off; then an open flag is a note and the version installs. The switch never touches a version a person confirmed malicious.
 
 A confirmed result is labelled in public, and it refuses installs: `apm add`, `apm x` and the registry's resolve skip a confirmed version and refuse a tree that would install one, the Bun scanner cancels the install in every mode, and the agent verdict is `do-not-install`. Unlike a score, it is not a warning. For a package on apm, the owner or apm also revokes the version.
 

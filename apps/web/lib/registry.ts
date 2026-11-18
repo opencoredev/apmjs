@@ -10,6 +10,7 @@ import { fetchCachedJson, fetchJson, FILE_TIMEOUT_MS, logUnavailable, type Fetch
 import { requestScope } from "./registry-transport";
 import { NAME_PART_SCHEMAS, type NamePart, type NamePartAnswer, type SearchAnswer, type SearchHit } from "./search-schema";
 import { ReviewAnswer } from "./review-schema";
+import { ReviewStatus } from "./review-status";
 import { RepositoryField } from "./repository";
 
 export type { Fetched } from "./registry-fetch";
@@ -199,6 +200,9 @@ const reviewPath = (name: string, version: string): string => `-/apm/v1/review/$
  * when the registry has AI review off or does not know the version.
  */
 export const getReview = (name: string, version: string): Promise<Fetched<ReviewAnswer>> => getJson(reviewPath(name, version), ReviewAnswer);
+
+/** The AI review's public status: counts and the versions waiting for a person, never what was found. */
+export const getReviewStatus = (): Promise<Fetched<ReviewStatus>> => getJson("-/apm/v1/reviews", ReviewStatus);
 
 /** Why apm can never score a version, as the version answer gives it; an older registry sends none (null). */
 const VersionUnscorable = z.object({ reason: z.string(), text: z.string() });

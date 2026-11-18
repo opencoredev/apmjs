@@ -104,6 +104,8 @@ export type ReviewOptions = {
   leaseMs?: number;
   requestsPerHour?: number;
   maxAttempts?: number;
+  /** APM_AI_FLAGS_HOLD: whether an open AI flag holds installs before a reviewer sets the switch. */
+  flagsHold?: "on" | "off";
 };
 
 export type StartOptions = {
@@ -172,6 +174,7 @@ function reviewEnv(r: ReviewOptions | undefined) {
     ["APM_REVIEW_LEASE_MS", r.leaseMs],
     ["APM_REVIEW_REQUESTS_PER_HOUR", r.requestsPerHour],
     ["APM_REVIEW_MAX_ATTEMPTS", r.maxAttempts],
+    ["APM_AI_FLAGS_HOLD", r.flagsHold],
   ] as const;
 
   return Object.fromEntries([

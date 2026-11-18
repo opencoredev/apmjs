@@ -10,8 +10,8 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { ReleaseBody, ResultBody, ReviewResult, type EnqueueReason, type ReviewJob, type WireFinding } from "@apm/ai-review";
-import { isValidPackageName } from "@apm/core";
-import { ReviewDecision } from "./actions.ts";
+import { isValidPackageName, redactSecrets } from "@apm/core";
+import { ReviewDecision, type SessionAction } from "./actions.ts";
 import { Auth, type SignedIn } from "./auth.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -22,12 +22,13 @@ import { fail, json, parseBody } from "./http.ts";
 import { requireSiteOrigin } from "./origin.ts";
 import { order } from "./semver.ts";
 import { splitPath, tagTarget, tarballUrl, type Caller } from "./server.ts";
-import { ProofFields, secondFactor } from "./step-up.ts";
+import { ProofFields, secondFactor, type ProofInput } from "./step-up.ts";
 import { digestLabel, digestOf, Upstream, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
 import { Guard } from "./db-health.ts";
 import { blockBeforeCommit } from "./blocklist.ts";
 import { fileReferences, INVALID_DEPENDENCY, isWithheld, WITHHELD_ISSUE } from "./withheld.ts";
+import { publicFindings } from "./public-finding.ts";
 
 export type ReviewSettings = {
   /** sha256 (hex) of the reviewer's service token. The token itself stays with the reviewer. */
@@ -44,6 +45,11 @@ export type ReviewSettings = {
   readonly requestsPerHour: number;
   /** Leases a job may take before it is marked failed. */
   readonly maxAttempts: number;
+  /**
+   * Whether an AI flag a person has not decided holds installs when no reviewer has set the switch yet
+   * (APM_AI_FLAGS_HOLD). The stored switch (review_switch) wins, read on every request.
+   */
+  readonly flagsHoldDefault: boolean;
 };
 
 export const REVIEW_DEFAULTS = {
@@ -52,6 +58,7 @@ export const REVIEW_DEFAULTS = {
   leaseMs: 15 * 60_000,
   requestsPerHour: 5,
   maxAttempts: 5,
+  flagsHoldDefault: true,
 } as const;
 
 /** The AI review is on when this service is provided (worker.ts does when the service token hash is set). */
@@ -98,20 +105,62 @@ const JobRow = z.object({
 
 type JobRow = z.infer<typeof JobRow>;
 
-const ReviewRow = z.object({
-  package: z.string(),
-  version: z.string(),
-  digest: z.string(),
-  outcome: z.enum(["benign", "flagged", "no-answer"]),
-  result: ReviewResult,
-  reviewed_at: Int,
-  human_state: z.enum(["none", "pending", "confirmed", "dismissed"]),
-  human_by: z.string().nullable(),
-  human_at: Int.nullable(),
-  human_note: z.string().nullable(),
-});
+// A model quotes what it read, and a package can ship a live key or a connection string with its password. Every review
+// row is redacted as it is parsed (redactSecrets, @apm/core: the secret scan's rules and a few more shapes), so no view
+// built in this module, public, maintainer's or reviewer's, can hand one out: only the first and last few characters
+// and the length stay. The stored result keeps the text as the reviewer sent it.
 
-type StoredReview = z.infer<typeof ReviewRow>;
+const redactFinding = (f: WireFinding): WireFinding => ({ ...f, file: redactSecrets(f.file), quote: redactSecrets(f.quote), excerpt: redactSecrets(f.excerpt), issue: redactSecrets(f.issue) });
+
+/**
+ * A review result with every string that came from the publisher or the model redacted: the summaries, every finding's
+ * file, quote, excerpt and sentence (the second opinion's too), the paths it read, the paths and dependency names it did
+ * not, and the previous version it diffed against (independent review of 17be3f6, finding 3: a key in a file name was
+ * handed out through `read`). Left as they are: the model and reviewer ids and every enum, number and time, which are
+ * apm's own.
+ */
+export function redactedResult(res: ReviewResult): ReviewResult {
+  const so = res.secondOpinion;
+
+  const shared = {
+    summary: redactSecrets(res.summary),
+    coverage: { ...res.coverage, previousVersion: res.coverage.previousVersion === null ? null : redactSecrets(res.coverage.previousVersion) },
+    read: res.read.map(redactSecrets),
+    notRead: res.notRead.map((n) => (n.kind === "file" ? { ...n, path: redactSecrets(n.path) } : { ...n, name: redactSecrets(n.name) })),
+    secondOpinion: so ? { ...so, summary: redactSecrets(so.summary), findings: so.findings.map(redactFinding) } : null,
+  };
+
+  switch (res.outcome) {
+    case "benign":
+      return { ...res, ...shared };
+    case "flagged":
+      return { ...res, ...shared, findings: res.findings.map(redactFinding) };
+    case "no-answer":
+      return { ...res, ...shared, findings: res.findings.map(redactFinding) };
+    default: {
+      const _exhaustive: never = res;
+
+      return _exhaustive;
+    }
+  }
+}
+
+export const ReviewRow = z
+  .object({
+    package: z.string(),
+    version: z.string(),
+    digest: z.string(),
+    outcome: z.enum(["benign", "flagged", "no-answer"]),
+    result: ReviewResult,
+    reviewed_at: Int,
+    human_state: z.enum(["none", "pending", "confirmed", "dismissed"]),
+    human_by: z.string().nullable(),
+    human_at: Int.nullable(),
+    human_note: z.string().nullable(),
+  })
+  .transform((r) => ({ ...r, result: redactedResult(r.result), human_note: r.human_note === null ? null : redactSecrets(r.human_note) }));
+
+export type StoredReview = z.infer<typeof ReviewRow>;
 
 const one = <S extends z.ZodType>(row: S) => z.array(row).transform((rows) => rows[0] ?? null);
 const all = <S extends z.ZodType>(row: S) => z.array(row);
@@ -246,7 +295,20 @@ export const reviewStandings = (items: readonly { name: string; version: string;
     // a stored result wins over its job's state, as on the review route
     for (const r of reviews) if (wanted.has(`${r.package}@${r.version}@${r.digest}`)) out.set(`${r.package}@${r.version}`, publicState(r));
 
-    return out;
+    return yield* withSwitch(out);
+  });
+
+/**
+ * Standings as the switch has them now: with "AI flags hold installs" off, an open flag is "flagged" (a note) instead
+ * of "under-review" (a hold). The switch is read only when some standing is an open flag.
+ */
+const withSwitch = (standings: Map<string, ReviewStanding>) =>
+  Effect.gen(function* () {
+    if (![...standings.values()].includes("under-review")) return standings;
+
+    if (yield* flagsHold) return standings;
+
+    return new Map([...standings].map(([key, s]) => [key, heldState(s, false)] as const));
   });
 
 /** Adds a job, or merges reasons into the waiting one. A finished job is reopened only for a request after no answer. */
@@ -593,8 +655,23 @@ function isAdmin(v: Viewer, settings: ReviewSettings): v is SessionViewer {
   return v.kind === "user" && v.via.kind === "session" && v.githubLogin !== null && adminsOf(settings).has(v.githubLogin);
 }
 
-const isMaintainer = (v: Viewer, name: string) =>
-  v.kind === "user" ? Effect.map(Store.use((store) => store.owners(name)), (owners) => owners.includes(v.user.name)) : Effect.succeed(false);
+/**
+ * Whether the viewer may see an unconfirmed flag's findings as the package's maintainer: only for a package published
+ * on apm (`source` "local", read from apm's packages table), and only for an owner of it in apm's records or the
+ * account whose apm scope it is under ("Your packages" lists the same). A package npm serves is nobody's here, whatever
+ * its scope: apm has no record of who owns it on npm, so an apm user named alice is not the owner of npm's @alice/x
+ * (independent review of 17be3f6, finding 1).
+ */
+const isMaintainer = (input: { viewer: Viewer; name: string; source: Source }) => {
+  const { viewer, name, source } = input;
+
+  if (viewer.kind !== "user" || source !== "local") return Effect.succeed(false);
+
+  return Effect.map(
+    Store.use((store) => Effect.all([store.getPackage(name), store.owners(name)])),
+    ([pkg, owners]) => pkg !== null && (name.startsWith(`@${viewer.user.name}/`) || owners.includes(viewer.user.name)),
+  );
+};
 
 /** Cookie-authenticated writes must come from the website (origin.ts); a token's requests are not a browser's. */
 export const checkOrigin = (req: Request, v: Viewer) => (v.kind === "user" && v.via.kind === "session" ? requireSiteOrigin(req) : Effect.void);
@@ -607,7 +684,16 @@ function isService(req: Request, settings: ReviewSettings): boolean {
 }
 
 // ---------- views ----------
-type PublicState = "found-nothing" | "under-review" | "no-answer" | "confirmed" | "cleared";
+/**
+ * under-review: an AI flag a person has not decided, while flags hold installs. flagged: the same flag while they do
+ * not (the switch is off): shown and told to agents as a note, never as a hold.
+ */
+type PublicState = "found-nothing" | "under-review" | "flagged" | "no-answer" | "confirmed" | "cleared";
+
+/** A state as the switch has it: an open flag reads "flagged" while flags do not hold installs. */
+function heldState<S extends ReviewStanding>(state: S, hold: boolean): S | "flagged" {
+  return state === "under-review" && !hold ? "flagged" : state;
+}
 
 function publicState(r: StoredReview): PublicState {
   switch (r.human_state) {
@@ -708,19 +794,27 @@ function findingsOf(r: ReviewResult): WireFinding[] {
   return r.outcome === "benign" ? [] : r.findings;
 }
 
-function publicView(r: StoredReview) {
-  const state = publicState(r);
+/**
+ * The review as anyone may see it: the state, the model, when, how many files it read and did not, and, once a person
+ * confirmed it, each finding as file, line, severity and a label apm chose (public-finding.ts) plus the person's note.
+ * Nothing the model or the publisher wrote freely: no sentence, summary, quoted line, excerpt or path list (independent
+ * re-checks of 7207ea0 and 70dc3df), so nothing public depends on masking. The owners' and the reviewers' views keep
+ * all of it, masked (privateView). Exported for test/public-review.test.ts, which builds it with masking stubbed out.
+ */
+export function publicView(r: StoredReview, hold: boolean) {
+  const state = heldState(publicState(r), hold);
+  const notRead = r.result.notRead;
 
   return {
     state,
     model: r.result.model,
     reviewedAt: r.result.reviewedAt,
     coverage: r.result.coverage,
-    read: r.result.read,
-    notRead: r.result.notRead,
-    // findings go public only after a person confirms them
-    findings: state === "confirmed" ? findingsOf(r.result) : [],
+    // counts only: a path is the publisher's text
+    notReadCounts: { files: notRead.filter((n) => n.kind === "file").length, dependencies: notRead.filter((n) => n.kind === "dependency").length },
+    findings: state === "confirmed" ? publicFindings(findingsOf(r.result)) : [],
     decidedAt: r.human_at === null ? null : iso(r.human_at),
+    // a person at apm wrote it, for the public
     note: state === "confirmed" || state === "cleared" ? r.human_note : null,
   };
 }
@@ -732,6 +826,9 @@ function privateView(r: StoredReview) {
     reason: r.result.outcome === "no-answer" ? r.result.reason : null,
     summary: r.result.summary,
     findings: findingsOf(r.result),
+    // the paths it read and did not: the publisher's text, masked, for the owners and the reviewers only
+    read: r.result.read,
+    notRead: r.result.notRead,
     attempts: r.result.attempts,
     secondOpinion: r.result.secondOpinion,
     humanState: r.human_state,
@@ -778,12 +875,14 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
     let role: "admin" | "maintainer" | "public" = "public";
 
     if (isAdmin(viewer, settings)) role = "admin";
-    else if (yield* isMaintainer(viewer, name)) role = "maintainer";
+    else if (yield* isMaintainer({ viewer, name, source: got.source })) role = "maintainer";
     const found = got.digest ? yield* reviewAndJob(name, v.version, got.digest) : null;
     const stored = found?.review ?? null;
     const redacted = isWithheld(v.status);
     const review = stored && redacted ? withheldReview(stored) : stored;
     const job = found?.job ?? null;
+    // the switch is read only for an open flag: every other answer is the same either way
+    const hold = review !== null && publicState(review) === "under-review" ? yield* flagsHold : true;
     let status: "reviewed" | "queued" | "failed" | "not-reviewed" = "not-reviewed";
 
     // a waiting job comes first: a retry after no answer is queued while the older result is still stored, and the
@@ -804,7 +903,7 @@ const reviewResponse = (req: Request, caller: Caller, name: string, version: str
         versionStatus: v.status,
         // `status` folds a leased job into "queued"; `job` keeps them apart for clients that act on the difference
         job: job?.state ?? null,
-        review: review ? publicView(review) : null,
+        review: review ? publicView(review, hold) : null,
         viewer: role,
         private: review && role !== "public" ? privateView(review) : null,
         canRequest: viewer.kind === "user" && got.digest !== null && status !== "queued" && (review === null || review.result.outcome === "no-answer"),
@@ -968,44 +1067,77 @@ const withheldOf = (rows: readonly StoredReview[]) =>
     return new Set(found.filter((v) => isWithheld(v.status)).map((v) => `${v.package}@${v.version}`));
   });
 
-const queueResponse = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient;
+/** One line for the triage list: the model's summary to its first sentence, or its first finding's, at most 160 characters. */
+export function summaryLine(r: ReviewResult): string {
+  const text = (r.summary.trim() || findingsOf(r)[0]?.issue.trim() || "").replace(/\s+/g, " ");
+  const first = /^(.+?[.!?])(?:\s|$)/.exec(text)?.[1] ?? text;
 
-  const pending = yield* query("queue: pending", sql`SELECT * FROM reviews WHERE human_state = 'pending' ORDER BY reviewed_at LIMIT 200`, all(ReviewRow));
+  return first.length > 160 ? `${first.slice(0, 159)}…` : first;
+}
 
-  const decided = yield* query(
-    "queue: decided",
-    sql`SELECT * FROM reviews WHERE human_state IN ('confirmed', 'dismissed') ORDER BY human_at DESC LIMIT 50`,
-    all(ReviewRow),
-  );
+const PendingRow = z.object({ review: ReviewRow, weekly: Int.nullable() });
 
-  // a withheld version's review is rebuilt before any view is: the admin sees where and what, not the source
-  const withheld = yield* withheldOf([...pending, ...decided]);
+const queueResponse = (viewer: SessionViewer, settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
 
-  const item = (stored: StoredReview) => {
-    const redacted = withheld.has(`${stored.package}@${stored.version}`);
-    const r = redacted ? withheldReview(stored) : stored;
+    // most downloaded first: a false hold on a popular package costs the most installs
+    const pending = yield* query(
+      "queue: pending",
+      sql`SELECT to_jsonb(r) AS review, d.weekly FROM reviews r LEFT JOIN review_downloads d ON d.package = r.package
+          WHERE r.human_state = 'pending' ORDER BY d.weekly DESC NULLS LAST, r.reviewed_at LIMIT 200`,
+      all(PendingRow),
+    );
 
-    return { name: r.package, version: r.version, digest: r.digest, reviewedAt: iso(r.reviewed_at), redacted, public: publicView(r), private: privateView(r), decidedBy: r.human_by };
-  };
+    const decided = yield* query(
+      "queue: decided",
+      sql`SELECT * FROM reviews WHERE human_state IN ('confirmed', 'dismissed') ORDER BY human_at DESC LIMIT 50`,
+      all(ReviewRow),
+    );
 
-  return json(
-    {
-      pending: pending.map(item),
-      decided: decided.map(item),
-      // the stronger-model step plugs in at the reviewer (apps/reviewer/src/second-stage.ts); none is configured
-      secondStage: null,
-    },
-    200,
-    { "cache-control": "no-store" },
-  );
-});
+    // a withheld version's review is rebuilt before any view is: the admin sees where and what, not the source
+    const withheld = yield* withheldOf([...pending.map((p) => p.review), ...decided]);
+    const hold = yield* flagsHold;
+    const until = yield* decisionWindow(viewer);
+
+    const item = (stored: StoredReview, weekly: number | null) => {
+      const redacted = withheld.has(`${stored.package}@${stored.version}`);
+      const r = redacted ? withheldReview(stored) : stored;
+
+      return {
+        name: r.package,
+        version: r.version,
+        digest: r.digest,
+        reviewedAt: iso(r.reviewed_at),
+        redacted,
+        weeklyDownloads: weekly,
+        summaryLine: summaryLine(r.result),
+        public: publicView(r, hold),
+        private: privateView(r),
+        decidedBy: r.human_by,
+      };
+    };
+
+    return json(
+      {
+        pending: pending.map((p) => item(p.review, p.weekly)),
+        decided: decided.map((d) => item(d, null)),
+        // the stronger-model step plugs in at the reviewer (apps/reviewer/src/second-stage.ts); none is configured
+        secondStage: null,
+        flagsHold: yield* switchState(settings),
+        unlockedUntil: until === null ? null : iso(until),
+        windowMs: DECISION_WINDOW_MS,
+      },
+      200,
+      { "cache-control": "no-store" },
+    );
+  });
 
 const decideResponse = (req: Request, viewer: SessionViewer) =>
   Effect.gen(function* () {
     const d = yield* parseBody(req, DecideBody, MAX_REVIEW_BODY_BYTES);
-    // a decision changes what the public sees: a fresh code or passkey check for exactly this one
-    yield* secondFactor({ session: viewer.via.session, body: d, action: { kind: "review-decision", name: d.name, version: d.version, digest: d.digest, decision: d.decision, note: d.note } });
+    // a decision changes what the public sees: a code or passkey check for exactly this one, or the window one opened
+    yield* decisionAllowed({ viewer, body: d, action: { kind: "review-decision", name: d.name, version: d.version, digest: d.digest, decision: d.decision, note: d.note } });
     const r = yield* reviewFor(d.name, d.version, d.digest);
 
     if (!r) return fail(404, "No such review.");
@@ -1034,6 +1166,249 @@ const decideResponse = (req: Request, viewer: SessionViewer) =>
     return json({ ok: true });
   });
 
+// ---------- a maintainer's flags ----------
+/**
+ * Every AI flag on `names` (a person's own packages, "Your packages"), newest first: the version, where it stands and
+ * the findings, redacted as every review row is. A withheld version's come rebuilt from allowed fields. Empty while
+ * the AI review is off.
+ */
+export const flagsForPackages = (names: readonly string[]) =>
+  Effect.gen(function* () {
+    const out = new Map<string, { version: string; state: PublicState; reviewedAt: string; verdict: "malicious" | "suspicious" | null; summary: string; findings: WireFinding[]; note: string | null }[]>();
+
+    if (names.length === 0 || Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return out;
+    const sql = yield* SqlClient.SqlClient;
+
+    const rows = yield* query(
+      "maintainer flags",
+      // apm's own packages only, as isMaintainer: a name npm serves is nobody's here
+      sql`SELECT r.* FROM reviews r JOIN packages p ON p.name = r.package
+          WHERE r.package = ANY(${[...names]}) AND r.human_state <> 'none' ORDER BY r.reviewed_at DESC LIMIT 200`,
+      all(ReviewRow),
+    );
+
+    const withheld = yield* withheldOf(rows);
+    const hold = rows.some((r) => publicState(r) === "under-review") ? yield* flagsHold : true;
+
+    for (const stored of rows) {
+      const r = withheld.has(`${stored.package}@${stored.version}`) ? withheldReview(stored) : stored;
+      const p = privateView(r);
+      const list = out.get(r.package) ?? [];
+
+      list.push({ version: r.version, state: heldState(publicState(r), hold), reviewedAt: iso(r.reviewed_at), verdict: p.verdict, summary: p.summary, findings: p.findings, note: r.human_note });
+      out.set(r.package, list);
+    }
+
+    return out;
+  });
+
+// ---------- the off switch ----------
+// "AI flags hold installs": on, an AI flag a person has not decided is review-first for agents (under-review); off, it
+// is a note (flagged). Stored in review_switch and read on every request that meets an open flag, so a change counts on
+// the next request, with no deploy. Confirmed-malicious decisions, the score and refusals do not read it.
+
+const SwitchRow = z.object({ value: z.boolean(), changed_by: z.string(), changed_at: Int });
+
+const switchRow = Effect.flatMap(SqlClient.SqlClient, (sql) => query("switch: read", sql`SELECT value, changed_by, changed_at FROM review_switch WHERE name = 'flags-hold'`, one(SwitchRow)));
+
+/**
+ * Whether an AI flag a person has not decided holds installs right now: the stored switch, else the deploy's default.
+ * A read that fails holds, as before the switch existed.
+ */
+export const flagsHold: Effect.Effect<boolean, never, SqlClient.SqlClient | Clock> = Effect.gen(function* () {
+  const found = yield* Effect.serviceOption(ReviewConfig);
+  const fallback = Option.isSome(found) ? found.value.flagsHoldDefault : true;
+  const row = yield* switchRow;
+
+  return row?.value ?? fallback;
+}).pipe(Effect.orElseSucceed(() => true));
+
+const SwitchBody = z.object({ hold: z.boolean(), ...ProofFields });
+
+/** Sets the switch with a fresh factor made for exactly this value; logs who and when beside the review decisions. */
+const switchResponse = (req: Request, viewer: SessionViewer) =>
+  Effect.gen(function* () {
+    const body = yield* parseBody(req, SwitchBody, 4096);
+    // never covered by the decision window: a factor for this change, this value, from this session
+    yield* secondFactor({ session: viewer.via.session, body, action: { kind: "review-switch", hold: body.hold } });
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
+    const at = yield* (yield* Clock).now;
+    const by = viewer.githubLogin ?? viewer.user.name;
+
+    yield* store.tx(
+      Effect.gen(function* () {
+        yield* query(
+          "switch: write",
+          sql`INSERT INTO review_switch (name, value, changed_by, changed_at) VALUES ('flags-hold', ${body.hold}, ${by}, ${at})
+              ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, changed_by = EXCLUDED.changed_by, changed_at = EXCLUDED.changed_at`,
+          none,
+        );
+        yield* query("switch: log", sql`INSERT INTO review_switch_log (name, value, changed_by, changed_at) VALUES ('flags-hold', ${body.hold}, ${by}, ${at})`, none);
+      }),
+    );
+
+    return json({ ok: true, hold: body.hold, changedBy: by, changedAt: iso(at) }, 200, { "cache-control": "no-store" });
+  });
+
+const SwitchLogRow = z.object({ value: z.boolean(), changed_by: z.string(), changed_at: Int });
+
+/** The switch as the queue shows it: its value, where it comes from, and its recent changes. */
+const switchState = (settings: ReviewSettings) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const row = yield* switchRow;
+    const log = yield* query("switch: history", sql`SELECT value, changed_by, changed_at FROM review_switch_log WHERE name = 'flags-hold' ORDER BY changed_at DESC, id DESC LIMIT 20`, all(SwitchLogRow));
+
+    return {
+      hold: row?.value ?? settings.flagsHoldDefault,
+      source: row ? ("set" as const) : ("default" as const),
+      defaultHold: settings.flagsHoldDefault,
+      changedBy: row?.changed_by ?? null,
+      changedAt: row ? iso(row.changed_at) : null,
+      history: log.map((l) => ({ hold: l.value, by: l.changed_by, at: iso(l.changed_at) })),
+    };
+  });
+
+// ---------- the decision window ----------
+// One factor (a code, or a passkey check made for "review-unlock") opens decisions for DECISION_WINDOW_MS, for this
+// session alone: the window is keyed by the session token's sha256, the account and its scope. Another session, another
+// account or another kind of change (the switch) finds no window. It ends when it expires or the reviewer locks it.
+
+/** How long one unlock lets a reviewer confirm and dismiss without another factor. */
+export const DECISION_WINDOW_MS = 10 * 60_000;
+
+const DECISION_SCOPE = "review-decisions";
+
+const sessionHash = (s: SignedIn): string => createHash("sha256").update(s.sessionToken).digest("hex");
+
+/** When this session's decision window ends, or null when none is open. */
+const decisionWindow = (viewer: SessionViewer) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const now = yield* (yield* Clock).now;
+
+    const row = yield* query(
+      "window: read",
+      sql`SELECT expires_at FROM step_up_windows
+          WHERE session_hash = ${sessionHash(viewer.via.session)} AND auth_user_id = ${viewer.via.session.authUserId} AND scope = ${DECISION_SCOPE}
+            AND opened_at <= ${now} AND expires_at > ${now}`,
+      one(z.object({ expires_at: Int })),
+    );
+
+    return row?.expires_at ?? null;
+  });
+
+const UnlockBody = z.object(ProofFields);
+
+const unlockResponse = (req: Request, viewer: SessionViewer) =>
+  Effect.gen(function* () {
+    const body = yield* parseBody(req, UnlockBody, 4096);
+    yield* secondFactor({ session: viewer.via.session, body, action: { kind: "review-unlock" } });
+    const sql = yield* SqlClient.SqlClient;
+    const at = yield* (yield* Clock).now;
+    const until = at + DECISION_WINDOW_MS;
+
+    yield* query("window: purge", sql`DELETE FROM step_up_windows WHERE expires_at <= ${at}`, none);
+    yield* query(
+      "window: open",
+      sql`INSERT INTO step_up_windows (session_hash, auth_user_id, scope, opened_at, expires_at)
+          VALUES (${sessionHash(viewer.via.session)}, ${viewer.via.session.authUserId}, ${DECISION_SCOPE}, ${at}, ${until})
+          ON CONFLICT (session_hash, scope) DO UPDATE SET auth_user_id = EXCLUDED.auth_user_id, opened_at = EXCLUDED.opened_at, expires_at = EXCLUDED.expires_at`,
+      none,
+    );
+
+    return json({ ok: true, until: iso(until) }, 200, { "cache-control": "no-store" });
+  });
+
+const lockResponse = (viewer: SessionViewer) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* query("window: close", sql`DELETE FROM step_up_windows WHERE session_hash = ${sessionHash(viewer.via.session)} AND scope = ${DECISION_SCOPE}`, none);
+
+    return json({ ok: true }, 200, { "cache-control": "no-store" });
+  });
+
+/** A decision goes ahead on a factor sent with it (as before the window) or on this session's open window. */
+const decisionAllowed = (input: { viewer: SessionViewer; body: ProofInput; action: SessionAction }) =>
+  Effect.gen(function* () {
+    if (input.body.code !== undefined || input.body.confirmation !== undefined) return yield* secondFactor({ session: input.viewer.via.session, body: input.body, action: input.action });
+
+    if ((yield* decisionWindow(input.viewer)) === null) return yield* Effect.fail(refuse(401, "Unlock decisions first: confirm it's you with your authenticator code or passkey."));
+  });
+
+// ---------- bulk dismiss ----------
+const BulkKey = z.object({ name: z.string().min(1).max(214), version: z.string().min(1).max(256), digest: z.string().min(1).max(200) });
+
+const BulkBody = z.object({ items: z.array(BulkKey).min(1).max(100), note: z.string().trim().max(2000).default("") });
+
+/** Dismisses many open flags at once, inside an open window only. A flag already decided is left as it is. */
+const bulkDismissResponse = (req: Request, viewer: SessionViewer) =>
+  Effect.gen(function* () {
+    const body = yield* parseBody(req, BulkBody, MAX_REVIEW_BODY_BYTES);
+
+    if ((yield* decisionWindow(viewer)) === null) return fail(401, "Unlock decisions first: confirm it's you with your authenticator code or passkey.");
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store;
+    const at = yield* (yield* Clock).now;
+    const note = body.note === "" ? null : body.note;
+    const by = viewer.githubLogin ?? viewer.user.name;
+
+    const dismissed = yield* store.tx(
+      Effect.forEach(body.items, (i) =>
+        query(
+          "bulk dismiss",
+          sql`UPDATE reviews SET human_state = 'dismissed', human_by = ${by}, human_at = ${at}, human_note = ${note}
+              WHERE package = ${i.name} AND version = ${i.version} AND digest = ${i.digest} AND human_state = 'pending' RETURNING package`,
+          z.array(z.unknown()).transform((rows) => rows.length),
+        ),
+      ),
+    );
+
+    return json({ ok: true, dismissed: dismissed.reduce((a, b) => a + b, 0) }, 200, { "cache-control": "no-store" });
+  });
+
+// ---------- the public status ----------
+const Counts = z.object({ reviewed: Int, flagged: Int, waiting: Int, dismissed: Int, confirmed: Int });
+
+const WaitingRow = z.object({ package: z.string(), version: z.string(), reviewed_at: Int, weekly: Int.nullable() });
+
+/**
+ * GET /-/apm/v1/reviews: what the AI review has done, in numbers, and which versions wait for a person. Names,
+ * versions and times only: no finding, quote, summary or note of an open flag.
+ */
+const statusResponse = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+
+  const counts = yield* query(
+    "status: counts",
+    sql`SELECT COUNT(*) AS reviewed,
+               COUNT(*) FILTER (WHERE human_state <> 'none') AS flagged,
+               COUNT(*) FILTER (WHERE human_state = 'pending') AS waiting,
+               COUNT(*) FILTER (WHERE human_state = 'dismissed') AS dismissed,
+               COUNT(*) FILTER (WHERE human_state = 'confirmed') AS confirmed
+          FROM reviews`,
+    one(Counts),
+  );
+
+  const waiting = yield* query(
+    "status: waiting",
+    sql`SELECT r.package, r.version, r.reviewed_at, d.weekly FROM reviews r LEFT JOIN review_downloads d ON d.package = r.package
+        WHERE r.human_state = 'pending' ORDER BY d.weekly DESC NULLS LAST, r.reviewed_at LIMIT 200`,
+    all(WaitingRow),
+  );
+
+  return json(
+    {
+      counts: counts ?? { reviewed: 0, flagged: 0, waiting: 0, dismissed: 0, confirmed: 0 },
+      flagsHold: yield* flagsHold,
+      waiting: waiting.map((w) => ({ name: w.package, version: w.version, since: iso(w.reviewed_at), weeklyDownloads: w.weekly })),
+    },
+    200,
+    { "cache-control": "public, max-age=30" },
+  );
+});
+
 // ---------- router ----------
 export const reviewRoute = (
   req: Request,
@@ -1042,13 +1417,17 @@ export const reviewRoute = (
 ): Effect.Effect<Response | null, HttpFailure | StoreError | AuthError, Store | SqlClient.SqlClient | Clock | RegistryConfig | Auth | RequestMemory> =>
   Effect.gen(function* () {
     const p = url.pathname;
-    const isReviewPath = p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/") || p.startsWith("/-/apm/v1/review-admin/") || p.startsWith("/-/apm/v1/review/");
+
+    const isReviewPath =
+      p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/") || p.startsWith("/-/apm/v1/review-admin/") || p.startsWith("/-/apm/v1/review/") || p === "/-/apm/v1/reviews";
 
     if (!isReviewPath) return null;
     const found = yield* Effect.serviceOption(ReviewConfig);
 
     if (Option.isNone(found)) return null;
     const settings = found.value;
+
+    if (p === "/-/apm/v1/reviews") return req.method === "GET" || req.method === "HEAD" ? yield* statusResponse : fail(405, "Method not allowed");
 
     if (p === "/-/apm/v1/review-jobs" || p.startsWith("/-/apm/v1/review-jobs/")) {
       if (!isService(req, settings)) return fail(401, "This route is for the AI reviewer's service token.");
@@ -1073,12 +1452,33 @@ export const reviewRoute = (
         );
       }
 
-      if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return yield* queueResponse;
+      if (p === "/-/apm/v1/review-admin/queue" && req.method === "GET") return yield* queueResponse(viewer, settings);
 
-      if (p === "/-/apm/v1/review-admin/decide" && req.method === "POST") {
-        yield* checkOrigin(req, viewer);
+      if (req.method === "POST" && p.startsWith("/-/apm/v1/review-admin/")) {
+        const action = p.slice("/-/apm/v1/review-admin/".length);
 
-        return yield* decideResponse(req, viewer);
+        if (action === "decide" || action === "dismiss" || action === "unlock" || action === "lock" || action === "switch") {
+          // cookie-authenticated writes come from the website only
+          yield* checkOrigin(req, viewer);
+
+          switch (action) {
+            case "decide":
+              return yield* decideResponse(req, viewer);
+            case "dismiss":
+              return yield* bulkDismissResponse(req, viewer);
+            case "unlock":
+              return yield* unlockResponse(req, viewer);
+            case "lock":
+              return yield* lockResponse(viewer);
+            case "switch":
+              return yield* switchResponse(req, viewer);
+            default: {
+              const _exhaustive: never = action;
+
+              return _exhaustive;
+            }
+          }
+        }
       }
 
       return fail(404, "Not found");

@@ -558,6 +558,8 @@ function probes(): Probe[] {
     ...specs.map((v) => v1(`review/${NAME}/${v}`, "review", 200)),
     ...Object.keys(STALE_TAGS).flatMap((t) => [v1(`review/${NAME}/${t}`, "review", staleStatus), v1(`score/${NAME}/${t}`, "score", staleStatus)]),
     v1("review-admin/queue", "review queue", (a) => (a.caller === "admin" ? 200 : a.caller === "anonymous" ? 401 : 403)),
+    // the public status names versions waiting for a person, never what was found in them
+    v1("reviews", "review status", 200),
     v1("review-jobs?max=5", "review lease", 401),
     v1("evidence-admin/me", "reviewer", 200),
     // the account (account.ts)

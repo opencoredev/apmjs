@@ -48,12 +48,14 @@ describe("llms-full.txt", () => {
 
 describe("sitemap", () => {
   const now = new Date("2026-11-12T00:00:00Z");
+  /** The site's own pages, before the packages. */
+  const PAGES = 4;
 
-  test("the home, docs and compare pages, then every popular package", () => {
+  test("the home, docs, compare and AI review pages, then every popular package", () => {
     const urls = sitemapEntries({ recent: [], now }).map((e) => e.url);
 
-    expect(urls.slice(0, 3)).toEqual(["https://apmjs.dev/", "https://apmjs.dev/docs", "https://apmjs.dev/compare"]);
-    expect(urls).toHaveLength(3 + POPULAR_PACKAGES.length);
+    expect(urls.slice(0, PAGES)).toEqual(["https://apmjs.dev/", "https://apmjs.dev/docs", "https://apmjs.dev/compare", "https://apmjs.dev/reviews"]);
+    expect(urls).toHaveLength(PAGES + POPULAR_PACKAGES.length);
     expect(urls).toContain("https://apmjs.dev/package/react");
   });
 
@@ -68,7 +70,7 @@ describe("sitemap", () => {
       now,
     });
 
-    const recent = entries.slice(3 + POPULAR_PACKAGES.length);
+    const recent = entries.slice(PAGES + POPULAR_PACKAGES.length);
 
     expect(recent.map((e) => e.url)).toEqual(["https://apmjs.dev/package/@acme/tool", "https://apmjs.dev/package/odd"]);
     expect(recent[0]?.lastModified).toEqual(new Date("2026-11-11T10:00:00Z"));
@@ -78,7 +80,7 @@ describe("sitemap", () => {
   test("at most MAX_RECENT recent packages", () => {
     const many = Array.from({ length: MAX_RECENT + 50 }, (_, i) => ({ package: `p${i}`, at: "2026-11-11T00:00:00Z" }));
 
-    expect(sitemapEntries({ recent: many, now })).toHaveLength(3 + POPULAR_PACKAGES.length + MAX_RECENT);
+    expect(sitemapEntries({ recent: many, now })).toHaveLength(PAGES + POPULAR_PACKAGES.length + MAX_RECENT);
   });
 });
 

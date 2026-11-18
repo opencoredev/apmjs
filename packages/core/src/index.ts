@@ -4,6 +4,8 @@ export * from "./names.ts";
 
 export * from "./secrets.ts";
 
+export { hasSecret, maskSecret, nameWords, namesSecret, redactSecrets } from "./redact.ts";
+
 export * from "./score.ts";
 
 export * from "./deps.ts";

@@ -640,7 +640,9 @@ describe("a revoked version", () => {
   });
 
   /** The views that quote a version's source while it may be shown. */
-  const QUOTING = ["package", "file", "excerpt", "tarballReadme", "review", "score", "apiReadme", "agentMarkdown", "checkPackage", "fileExcerpt"] as const;
+  // the views that quote the package before a revoke. The public review answer is not one: a confirmed finding is
+  // public without its quoted line (re-check of 7207ea0); it is still among the views checked after the revoke.
+  const QUOTING = ["package", "file", "excerpt", "tarballReadme", "score", "apiReadme", "agentMarkdown", "checkPackage", "fileExcerpt"] as const;
 
   /** Revokes `name@version` as its owner. */
   const revoke = (token: string, name: string, version = "1.0.0") =>
@@ -677,10 +679,12 @@ describe("a revoked version", () => {
       const decision = { name, version: "1.0.0", digest: queue.pending.find((p) => p.name === name)?.digest, decision: "confirm", note: "Checked by hand.", code: totp(adminSecret) };
 
       expect((await adminBrowser.json("-/apm/v1/review-admin/decide", { method: "POST", body: decision })).status).toBe(200);
-      // before the revoke, the confirmed finding, the score and the package page quote the package
+      // before the revoke, the score and the package page quote the package; the confirmed finding never does in
+      // public (its file, line and sentence only: no quoted line, re-check of 7207ea0)
       const before = await review(name, "1.0.0");
 
-      expect(JSON.stringify(before.body)).toContain(SOURCE);
+      expect(JSON.stringify(before.body)).not.toContain(SOURCE);
+      expect(dig(before.body, "review", "findings", 0, "line")).toBe(2);
       expect(dig(before.body, "redacted")).toBe(false);
       expect((await evidenceOf(name)).join("\n")).toContain(SOURCE);
       expect(JSON.stringify((await pkg(name)).body)).toContain(SOURCE);
@@ -710,7 +714,8 @@ describe("a revoked version", () => {
         expect(dig(after.body, "review", "findings", 0, "line")).toBe(2);
         expect(dig(after.body, "review", "findings", 0, "issue")).toBe(WITHHELD_ISSUE);
         expect(dig(after.body, "review", "findings", 0, "severity")).toBe("high");
-        expect(dig(after.body, "review", "findings", 0, "excerpt")).toBe("");
+        // a public finding has no quote, excerpt or model sentence, only apm's label (re-checks of 7207ea0 and 70dc3df)
+        expect(Object.keys(z.record(z.string(), z.unknown()).parse(dig(after.body, "review", "findings", 0))).sort()).toEqual(["file", "issue", "label", "line", "severity"]);
       }
 
       expect(dig((await review(name, "1.0.0", carol)).body, "private", "findings", 0, "line")).toBe(2);
@@ -891,7 +896,7 @@ describe("AI review standings for install decisions", () => {
       return { status: res.status, cache: res.headers.get("cache-control"), body: await res.json() };
     };
 
-    const empty = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
+    const empty = { kind: "on", confirmed: [], underReview: [], flagged: [], pending: [], noAnswer: [] };
     const dep = [{ name: DEP, version: "1.0.0" }];
     const mute = [{ name: MUTE, version: "1.0.0" }];
 

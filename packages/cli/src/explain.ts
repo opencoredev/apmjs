@@ -214,7 +214,7 @@ export const EXIT: Record<VerdictKind, number> = { install: 0, "do-not-install":
 export type DepRef = { name: string; version: string };
 
 /** How the AI reviews of the dependencies stand; "unknown" when the registry did not say. */
-export type DepReviews = { kind: "off" } | { kind: "unknown" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
+export type DepReviews = { kind: "off" } | { kind: "unknown" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; flagged?: DepRef[] | undefined; pending: DepRef[]; noAnswer: DepRef[] };
 
 /**
  * One of the registry's warnings on an install that goes ahead (resolve's `warnings`): `via` empty for the version
@@ -260,7 +260,8 @@ export type ResolvedInput =
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
-export type ReviewState = "found-nothing" | "under-review" | "no-answer" | "confirmed" | "cleared";
+/** flagged: an open AI flag while apm's "AI flags hold installs" switch is off, a note rather than a hold. */
+export type ReviewState = "found-nothing" | "under-review" | "flagged" | "no-answer" | "confirmed" | "cleared";
 
 /**
  * Why the registry no longer offers a version its install policy picked a moment before: it was yanked or revoked,
@@ -309,7 +310,7 @@ export type Coverage = { aiReview: AiReviewCoverage; dependencies: DependencyCov
  * unread for their size or the bytes one analysis reads, and recorded that this was all (readingOf). lost-points: it scores under 75 for signals that are not risks. dependency-gaps: dependencies apm could not score
  * or look up. dependency-cooldown: dependencies published inside the cooldown that apm scored and found no risk in.
  */
-export const NOTE_KINDS = ["older-version", "ai-review-pending", "ai-review-no-answer", "no-ai-review", "dependency-ai-review", "not-scored", "partial-analysis", "lost-points", "dependency-gaps", "dependency-cooldown"] as const;
+export const NOTE_KINDS = ["older-version", "ai-review-pending", "ai-review-no-answer", "ai-review-flagged", "no-ai-review", "dependency-ai-review", "not-scored", "partial-analysis", "lost-points", "dependency-gaps", "dependency-cooldown"] as const;
 
 export type NoteKind = (typeof NOTE_KINDS)[number];
 
@@ -505,6 +506,9 @@ function reviewReason(review: ReviewInput): string {
           return "The AI review flagged this version; a person at apm checked and dismissed the flag.";
         case "no-answer":
           return "The AI review gave no usable answer for this version.";
+        case "flagged":
+          // "AI flags hold installs" is off at apm: a flag nobody has looked at is a note, not a hold
+          return "An AI review flagged this version; a person at apm has not looked yet. apm does not hold installs on these flags right now.";
         case "under-review":
           // the registry withholds a flag's findings until a person at apm confirms them, so none is not "no finding"
           return review.findings === 0
@@ -539,6 +543,8 @@ function reviewNote(review: ReviewInput): Note | null {
     case "off":
       return { kind: "no-ai-review", text: reviewReason(review) };
     case "reviewed":
+      if (review.state === "flagged") return { kind: "ai-review-flagged", text: reviewReason(review) };
+
       return review.state === "no-answer" ? { kind: "ai-review-no-answer", text: reviewReason(review) } : null;
     case "pulled":
     case "unreadable":
@@ -560,6 +566,8 @@ function noteWhy(note: Note, id: string): string {
       return "its AI review has not finished";
     case "ai-review-no-answer":
       return "its AI review ended without an answer";
+    case "ai-review-flagged":
+      return "an AI review flagged it and a person at apm has not looked yet";
     case "no-ai-review":
       return "it has no AI review";
     case "dependency-ai-review":
@@ -840,12 +848,16 @@ function decide(input: ExplainInput): Decided {
 
   if (depReviews.kind === "on") {
     const { underReview, pending, noAnswer } = depReviews;
+    const flagged = depReviews.flagged ?? [];
 
     if (underReview.length > 0) holds.push({ why: "the AI review flagged a dependency and a person at apm has not decided yet", reason: `The AI review flagged ${plural(underReview.length, "dependency", "dependencies")}; a person at apm is checking: ${listed(underReview)}.` });
 
     if (pending.length > 0) depReviewNotes.push({ kind: "dependency-ai-review", text: `The AI review of ${plural(pending.length, "dependency", "dependencies")} has not finished: ${listed(pending)}.` });
 
     if (noAnswer.length > 0) depReviewNotes.push({ kind: "dependency-ai-review", text: `The AI review of ${plural(noAnswer.length, "dependency", "dependencies")} ended without an answer: ${listed(noAnswer)}.` });
+
+    // open flags while apm's "AI flags hold installs" switch is off: a note; a registry from before it sends none
+    if (flagged.length > 0) depReviewNotes.push({ kind: "dependency-ai-review", text: `An AI review flagged ${plural(flagged.length, "dependency", "dependencies")}; a person at apm has not looked yet: ${listed(flagged)}.` });
   }
 
   // what the registry warned about in the tree, each read for a real risk or a gap in apm's work

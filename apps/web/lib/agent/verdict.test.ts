@@ -462,7 +462,8 @@ describe("an older version past the cooldown", () => {
       reviews: { "ai@7.0.173": REVIEW_CLEAN },
     });
 
-    const v = await explainFor({ name: "ai", range: null, source });
+    // the test's own clock: the ages above are relative to NOW, not to when the suite runs
+    const v = await explainFor({ name: "ai", range: null, source, now: NOW });
 
     expect(source.calls).toEqual(["resolve ai@latest", "package ai", "resolve ai@<7.0.174", "review ai@7.0.173"]);
     expect(v.verdict).toBe("install");
@@ -490,7 +491,7 @@ describe("an older version past the cooldown", () => {
 
   test("an older lookup the registry does not answer is unknown, never the fresh version as an install", async () => {
     const source = fakeSource({ resolve: (_n, range) => (range === "latest" ? fresh("1.0.0") : { kind: "unavailable" }) });
-    const v = await explainFor({ name: "hono", range: null, source });
+    const v = await explainFor({ name: "hono", range: null, source, now: NOW });
 
     expect(v.verdict).toBe("unknown");
     expect(v.commands).toBeNull();

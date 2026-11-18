@@ -94,6 +94,11 @@ const WorkerEnv = z.object({
   APM_REVIEW_LEASE_MS: z.coerce.number().int().min(1).optional(),
   APM_REVIEW_REQUESTS_PER_HOUR: z.coerce.number().int().min(0).optional(),
   APM_REVIEW_MAX_ATTEMPTS: z.coerce.number().int().min(1).optional(),
+  /**
+   * Whether an AI review flag a person has not decided holds installs (review-first) before a reviewer sets the switch
+   * on /admin/reviews: "on" (the default) or "off". The switch, stored in the database, wins once it is set.
+   */
+  APM_AI_FLAGS_HOLD: z.enum(["on", "off"]).optional(),
   /** How long an isolate takes the database as down after it failed to answer (db-health.ts). For tests; production keeps the default. */
   /** sha256 (hex) of the operator's debug token: a request whose x-apm-debug header is that token gets the full Server-Timing (timing.ts). */
   APM_DEBUG_TOKEN_HASH: z
@@ -178,6 +183,7 @@ function reviewSettings(env: WorkerEnv): ReviewSettings | null {
     leaseMs: env.APM_REVIEW_LEASE_MS ?? REVIEW_DEFAULTS.leaseMs,
     requestsPerHour: env.APM_REVIEW_REQUESTS_PER_HOUR ?? REVIEW_DEFAULTS.requestsPerHour,
     maxAttempts: env.APM_REVIEW_MAX_ATTEMPTS ?? REVIEW_DEFAULTS.maxAttempts,
+    flagsHoldDefault: env.APM_AI_FLAGS_HOLD === undefined ? REVIEW_DEFAULTS.flagsHoldDefault : env.APM_AI_FLAGS_HOLD === "on",
   };
 }
 

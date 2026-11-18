@@ -7,6 +7,7 @@ import { passkeyClient } from "@better-auth/passkey/client";
 import { startAuthentication } from "@simplewebauthn/browser";
 import { z } from "zod";
 import "./zod-csp";
+import { Finding, PUBLIC_STATES } from "./review-schema";
 
 function makeClient() {
   return createAuthClient({ baseURL: window.location.origin, plugins: [passkeyClient()] });
@@ -67,6 +68,19 @@ export const PendingVersion = z.object({ id: z.string(), version: z.string(), ur
 
 export type PendingVersion = z.infer<typeof PendingVersion>;
 
+/** One AI review flag on a version of the person's own package, as "Your packages" shows it (findings redacted). */
+export const MaintainerFlag = z.object({
+  version: z.string(),
+  state: z.enum(PUBLIC_STATES),
+  reviewedAt: z.string(),
+  verdict: z.enum(["malicious", "suspicious"]).nullable(),
+  summary: z.string(),
+  findings: z.array(Finding),
+  note: z.string().nullable(),
+});
+
+export type MaintainerFlag = z.infer<typeof MaintainerFlag>;
+
 /**
  * One package the signed-in person publishes (GET /-/apm/v1/account/packages, packages/registry/src/my-packages.ts).
  * `latest` and `lastPublishedAt` are null for a new name whose first version is still waiting.
@@ -77,6 +91,8 @@ export const MyPackage = z.object({
   lastPublishedAt: z.string().nullable(),
   score: z.object({ score: z.number(), grade: z.string() }).nullable(),
   pending: z.array(PendingVersion),
+  /** AI review flags on this package's versions, with the findings (redacted); an older registry sends none. */
+  aiFlags: z.array(MaintainerFlag).default([]),
 });
 
 export type MyPackage = z.infer<typeof MyPackage>;
@@ -182,7 +198,9 @@ export type SessionAction =
   | { kind: "cli-confirm"; command: LiveAction }
   | { kind: "review-decision"; name: string; version: string; digest: string; decision: "confirm" | "dismiss"; note: string }
   | ({ kind: "evidence-dismiss" | "evidence-restore"; reason: string } & EvidenceKey)
-  | { kind: "account"; change: "link-social" | "two-factor/enable" | "two-factor/disable" | "passkey/verify-registration" };
+  | { kind: "account"; change: "link-social" | "two-factor/enable" | "two-factor/disable" | "passkey/verify-registration" }
+  | { kind: "review-unlock" }
+  | { kind: "review-switch"; hold: boolean };
 
 /** The WebAuthn request options the registry makes (PublicKeyCredentialRequestOptionsJSON), as the browser library takes them. */
 const RequestOptions = z.object({

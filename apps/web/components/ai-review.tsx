@@ -8,6 +8,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { ChevronDownIcon, FileSearchIcon, HourglassIcon, OctagonAlertIcon, UserCheckIcon } from "lucide-react";
 import { z } from "zod";
+import { redactSecrets } from "@apm/core/redact";
 import { Button } from "@/components/ui/button";
 import { call } from "@/lib/account";
 import { ago } from "@/lib/format";
@@ -19,17 +20,30 @@ import { FindingList } from "./finding-list";
 const ICON: Record<PublicState, typeof FileSearchIcon> = {
   "found-nothing": FileSearchIcon,
   "under-review": HourglassIcon,
+  flagged: FileSearchIcon,
   "no-answer": HourglassIcon,
   confirmed: OctagonAlertIcon,
   cleared: UserCheckIcon,
 };
 
-function Coverage({ r }: { r: PublicReview }) {
-  const files = r.notRead.filter((n): n is Extract<NotRead, { kind: "file" }> => n.kind === "file");
-  const deps = r.notRead.filter((n): n is Extract<NotRead, { kind: "dependency" }> => n.kind === "dependency");
+/** The paths the review read and did not, for the package's owners and apm's reviewers; the public gets counts only. */
+type Paths = { read: string[]; notRead: NotRead[] };
+
+function Coverage({ r, paths }: { r: PublicReview; paths: Paths | null }) {
+  const notRead = paths?.notRead ?? r.notRead;
+  const read = paths?.read ?? r.read;
+  const files = notRead.filter((n): n is Extract<NotRead, { kind: "file" }> => n.kind === "file");
+  const deps = notRead.filter((n): n is Extract<NotRead, { kind: "dependency" }> => n.kind === "dependency");
+  const counts = r.notReadCounts ?? { files: files.length, dependencies: deps.length };
 
   return (
     <div className="flex flex-col gap-3 border-t px-5 py-4 text-sm leading-6 text-muted-foreground sm:px-6">
+      {files.length === 0 && counts.files > 0 && (
+        <p className="text-pretty">
+          <span className="text-foreground">Not read: </span>
+          {counts.files === 1 ? "1 file" : `${counts.files} files`}.
+        </p>
+      )}
       {files.length > 0 && (
         <p className="text-pretty">
           <span className="text-foreground">Not read: </span>
@@ -41,26 +55,26 @@ function Coverage({ r }: { r: PublicReview }) {
       )}
       <p className="text-pretty">
         <span className="text-foreground">Dependencies are not read.</span>{" "}
-        {deps.length === 0 ? "This version has none." : `This version has ${deps.length}: `}
+        {counts.dependencies === 0 ? "This version has none." : `This version has ${counts.dependencies}${deps.length > 0 ? ": " : "."}`}
         {deps.length > 0 && (
           <span className="font-mono text-[13px] [overflow-wrap:anywhere]">
             {deps
               .slice(0, 12)
-              .map((d) => d.name)
+              .map((d) => redactSecrets(d.name))
               .join(", ")}
             {deps.length > 12 ? ", …" : ""}
           </span>
         )}
       </p>
-      {r.read.length > 0 && (
+      {read.length > 0 && (
         <details className="group">
           <summary className="flex w-fit cursor-pointer list-none items-center gap-1.5 select-none hover:text-foreground [&::-webkit-details-marker]:hidden">
-            Files read ({r.read.length})
+            Files read ({read.length})
             <ChevronDownIcon className="size-3.5 transition-transform group-open:rotate-180" aria-hidden />
           </summary>
           <ul className="mt-2 flex flex-col gap-0.5 font-mono text-[12.5px] [overflow-wrap:anywhere]">
-            {r.read.slice(0, 200).map((p) => (
-              <li key={p}>{p}</li>
+            {read.slice(0, 200).map((p, i) => (
+              <li key={`${i}:${p}`}>{redactSecrets(p)}</li>
             ))}
           </ul>
         </details>
@@ -69,7 +83,7 @@ function Coverage({ r }: { r: PublicReview }) {
   );
 }
 
-function Result({ r, name, version }: { r: PublicReview; name: string; version: string }) {
+function Result({ r, name, version, paths }: { r: PublicReview; name: string; version: string; paths: Paths | null }) {
   const Icon = ICON[r.state];
   const bad = r.state === "confirmed";
   const why = explanation(r);
@@ -83,6 +97,13 @@ function Result({ r, name, version }: { r: PublicReview; name: string; version: 
         <div className="flex min-w-0 flex-col gap-1">
           <p className={`text-[17px] leading-7 font-medium text-pretty ${bad ? "text-bad" : ""}`}>{headline(r)}</p>
           {why && <p className="text-[15px] leading-6 text-pretty text-muted-foreground">{why}</p>}
+          {(r.state === "under-review" || r.state === "flagged") && (
+            <p className="text-[15px] leading-6 text-pretty">
+              <Link href="/reviews" className="underline underline-offset-4">
+                How the AI review works, and every version waiting for a person
+              </Link>
+            </p>
+          )}
           <p className="flex flex-wrap gap-x-2 text-sm leading-6 text-muted-foreground">
             <span>{coverageText(r.coverage)}</span>
             <span aria-hidden>·</span>
@@ -103,7 +124,7 @@ function Result({ r, name, version }: { r: PublicReview; name: string; version: 
           {r.note && <p className="mt-4 text-sm text-muted-foreground">Reviewer note: {r.note}</p>}
         </div>
       )}
-      <Coverage r={r} />
+      <Coverage r={r} paths={paths} />
     </>
   );
 }
@@ -242,7 +263,11 @@ export function AiReviewSection({ initial, signInHref }: { initial: ReviewAnswer
   return (
     <div className="flex flex-col gap-3">
       <div className="overflow-hidden rounded-xl border" aria-live="polite">
-        {answer.review ? <Result r={answer.review} name={answer.name} version={answer.version} /> : <Pending status={answer.status} watch={watch} again={false} />}
+        {answer.review ? (
+          <Result r={answer.review} name={answer.name} version={answer.version} paths={answer.private ? { read: answer.private.read, notRead: answer.private.notRead } : null} />
+        ) : (
+          <Pending status={answer.status} watch={watch} again={false} />
+        )}
         {answer.review && answer.status === "queued" && (
           <div className="border-t">
             <Pending status="queued" watch={watch} again />

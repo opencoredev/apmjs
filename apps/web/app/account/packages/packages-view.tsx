@@ -8,7 +8,8 @@ import { ArrowRightIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScoreBadge, StatusBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
-import { call, MyPackages, timeLeft, type MyPackage, type PendingVersion } from "@/lib/account";
+import { FindingList } from "@/components/finding-list";
+import { call, MyPackages, timeLeft, type MaintainerFlag, type MyPackage, type PendingVersion } from "@/lib/account";
 import { ago } from "@/lib/format";
 
 type State = { kind: "loading" } | { kind: "signed-out" } | { kind: "error"; message: string } | { kind: "ok"; packages: MyPackage[] };
@@ -57,6 +58,84 @@ export function PackageRow({ pkg }: { pkg: MyPackage }) {
         {pkg.latest && <ScoreBadge score={pkg.score?.score} grade={pkg.score?.grade} />}
       </div>
     </li>
+  );
+}
+
+/** Where one flag stands, in the words the owner reads. */
+function flagStatus(f: MaintainerFlag): string {
+  switch (f.state) {
+    case "under-review":
+      return "Waiting for a person at apm · installs held for agents";
+    case "flagged":
+      return "Waiting for a person at apm · installs not held";
+    case "cleared":
+      return "A person at apm dismissed the flag";
+    case "confirmed":
+      return "Confirmed malicious by apm reviewers";
+    case "no-answer":
+      return "The model gave no usable answer · waiting for a person at apm";
+    case "found-nothing":
+      return "The AI review found nothing";
+    default: {
+      const _exhaustive: never = f.state;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * AI review flags on the person's own versions, with what the model found (secrets masked), so they can answer it.
+ * The public sees "Under review" and nothing else until a person at apm decides.
+ */
+function AiFlags({ packages }: { packages: MyPackage[] }) {
+  const flags = packages.flatMap((p) => p.aiFlags.map((f) => ({ name: p.name, flag: f })));
+
+  if (flags.length === 0) return null;
+
+  return (
+    <section aria-labelledby="ai-flags" className="flex flex-col gap-3">
+      <div className="flex flex-col gap-1">
+        <h2 id="ai-flags" className="text-xl font-medium tracking-tight">
+          AI review flags on your versions
+        </h2>
+        <p className="text-[15px] leading-6 text-pretty text-muted-foreground">
+          Only you and apm&apos;s reviewers see these findings. The public sees &ldquo;Under review&rdquo; until a person at apm decides.{" "}
+          <Link href="/reviews" className="text-foreground underline-offset-4 hover:underline">
+            How the AI review works
+          </Link>
+        </p>
+      </div>
+      <ul className="flex flex-col divide-y overflow-hidden rounded-xl border">
+        {flags.map(({ name, flag }) => (
+          <li key={`${name}@${flag.version}`}>
+            <details className="group">
+              <summary className="flex cursor-pointer list-none flex-wrap items-baseline justify-between gap-x-4 gap-y-1 px-4 py-3 hover:bg-muted/40 [&::-webkit-details-marker]:hidden">
+                <span className="font-mono text-[15px] font-medium [overflow-wrap:anywhere]">
+                  {name}@{flag.version}
+                </span>
+                <span className="text-[13px] text-muted-foreground">
+                  {flagStatus(flag)} · {ago(flag.reviewedAt)}
+                </span>
+              </summary>
+              <div className="flex flex-col gap-3 border-t bg-surface/40 px-4 py-4">
+                {flag.summary && (
+                  <p className="text-[15px] leading-6 text-pretty">
+                    <span className="text-muted-foreground">Model&apos;s summary: </span>
+                    {flag.summary}
+                  </p>
+                )}
+                {flag.findings.length > 0 && <FindingList findings={flag.findings} name={name} version={flag.version} />}
+                {flag.note && <p className="text-sm text-muted-foreground">Reviewer note: {flag.note}</p>}
+                <Link href={`/package/${name}?v=${encodeURIComponent(flag.version)}#ai-review`} className="text-sm underline underline-offset-4">
+                  Open the version page
+                </Link>
+              </div>
+            </details>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -120,6 +199,8 @@ export function PackagesView() {
           </Link>
         )}
       </header>
+
+      <AiFlags packages={packages} />
 
       {packages.length === 0 ? (
         <div className="flex flex-col items-start gap-4 rounded-xl border border-dashed px-5 py-8">

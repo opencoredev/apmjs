@@ -2772,15 +2772,17 @@ type DepRef = { name: string; version: string };
 
 /**
  * The AI review standing of every dependency the walk checked. "off" when this registry runs no AI review. A client
- * deciding on an install treats confirmed as do-not-install and the other lists as a reason to look first.
+ * deciding on an install treats confirmed as do-not-install and the other lists as a reason to look first. `flagged`
+ * holds the open flags while "AI flags hold installs" is off (review.ts): a note, not a hold. A client from before it
+ * ignores the list, so it installs, as the switch says.
  */
-type TreeReviews = { kind: "off" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
+type TreeReviews = { kind: "off" } | { kind: "on"; confirmed: DepRef[]; underReview: DepRef[]; flagged: DepRef[]; pending: DepRef[]; noAnswer: DepRef[] };
 
 const treeReviews = (tree: Tree) =>
   Effect.gen(function* () {
     if (Option.isNone(yield* Effect.serviceOption(ReviewConfig))) return { kind: "off" } satisfies TreeReviews;
     const standings = yield* reviewStandings(tree.packages.map((p, i) => ({ ...p, digest: tree.digests[i] ?? null })));
-    const out: Extract<TreeReviews, { kind: "on" }> = { kind: "on", confirmed: [], underReview: [], pending: [], noAnswer: [] };
+    const out: Extract<TreeReviews, { kind: "on" }> = { kind: "on", confirmed: [], underReview: [], flagged: [], pending: [], noAnswer: [] };
 
     for (const p of tree.packages) {
       const standing = standings.get(`${p.name}@${p.version}`) ?? "not-reviewed";
@@ -2791,6 +2793,9 @@ const treeReviews = (tree: Tree) =>
           break;
         case "under-review":
           out.underReview.push(p);
+          break;
+        case "flagged":
+          out.flagged.push(p);
           break;
         case "queued":
         case "leased":

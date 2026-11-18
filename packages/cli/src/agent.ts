@@ -22,7 +22,7 @@ const ReviewWire = z.object({
   // registry sends neither. A state this copy does not know makes the answer unreadable, never "active".
   versionStatus: z.enum(["active", "yanked", "revoke-pending", "revoked"]).optional(),
   redacted: z.boolean().optional(),
-  review: z.object({ state: z.enum(["found-nothing", "under-review", "no-answer", "confirmed", "cleared"]), findings: z.array(z.unknown()) }).nullable(),
+  review: z.object({ state: z.enum(["found-nothing", "under-review", "flagged", "no-answer", "confirmed", "cleared"]), findings: z.array(z.unknown()) }).nullable(),
 });
 
 const ErrorWire = z.object({ error: z.string() });

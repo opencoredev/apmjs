@@ -67,3 +67,16 @@ describe("the findings of a revoked version", () => {
     expect(shown).toContain("<pre");
   });
 });
+
+// re-check of ef953ed: a public finding names its file only as `file N`, which is no path, so it links nowhere
+describe("a public finding", () => {
+  test("is not linked to a file, while a private one is", () => {
+    const finding = { file: "file 1", line: 2, excerpt: "", issue: "network call", severity: "high" } as const;
+    const publicHtml = renderToStaticMarkup(<FindingList findings={[{ ...finding, label: "network call" }]} name="x" version="1.0.0" />);
+    const privateHtml = renderToStaticMarkup(<FindingList findings={[{ ...finding, file: "index.js" }]} name="x" version="1.0.0" />);
+
+    expect(publicHtml).toContain("file 1:2");
+    expect(publicHtml).not.toContain("<a ");
+    expect(privateHtml).toContain("<a ");
+  });
+});

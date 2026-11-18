@@ -19,6 +19,7 @@ export const WEB_ROUTES = {
   "/docs": "docs",
   "/package/[...name]": "package",
   "/publish": "publish",
+  "/reviews": "reviews",
   "/signin": "signin",
   "/_not-found": "not-found",
   "/_global-error": "global-error",

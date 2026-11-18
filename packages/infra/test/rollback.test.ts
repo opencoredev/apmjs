@@ -64,7 +64,9 @@ let releases: Release[];
 
 /** Every migration in the repository: what the live database's ledger holds. */
 const ALL = migrationFiles().map((m) => m.id);
-const NEWEST = ALL.at(-1) ?? "";
+
+/** The newest migration not marked rollback-safe: what a version built before it cannot be rolled back over. */
+const NEWEST = migrationFiles().filter((m) => !isRollbackSafe(m.sql)).at(-1)?.id ?? "";
 const [B1, B2, B3, B4, B5] = ["aaaa0001", "aaaa0002", "aaaa0003", "aaaa0004", "aaaa0005"] as const;
 
 function dep(id: string, version: string, at: string): Deployment {
@@ -97,7 +99,7 @@ function reset(): void {
   // one line per deploy run: rv2 and wv1 went out together, rv3 and wv2, rv4 and wv3; rv1 was built before the newest
   // migration existed
   releases = [
-    release(B1, ALL.slice(0, -1), { registry: "rv1", docs: "dv1" }),
+    release(B1, ALL.filter((id) => id !== NEWEST), { registry: "rv1", docs: "dv1" }),
     release(B2, ALL, { registry: "rv2", web: "wv1", docs: "dv0" }),
     { ...release(B3, ALL, { registry: "rv3", web: "wv2" }), installChecks: "edge" },
     release(B4, ALL, { registry: "rv4", web: "wv3" }),
@@ -203,9 +205,13 @@ describe("migration markers", () => {
   });
 
   test("an applied migration with no marker, or no file, is not safe", () => {
-    const ids = migrationFiles().map((m) => m.id);
+    const files = migrationFiles();
+    const ids = files.map((m) => m.id);
 
-    expect(unsafeMigrations(ids)).toEqual(ids);
+    expect(unsafeMigrations(ids)).toEqual(files.filter((m) => !isRollbackSafe(m.sql)).map((m) => m.id));
+    // the first migrations predate the marker and stay unsafe; a marked one (0028) is not
+    expect(unsafeMigrations(["0001_registry"])).toEqual(["0001_registry"]);
+    expect(unsafeMigrations(["0028_ai_review_switch"])).toEqual([]);
     expect(unsafeMigrations(["9999_unknown"])).toEqual(["9999_unknown"]);
   });
 });

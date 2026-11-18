@@ -1,6 +1,7 @@
 // Finds secrets that should never ship in a package tarball. Pure: file list in, findings out.
 import { MAX_ANALYZED_FILE_BYTES, type SkippedFile } from "./limits.ts";
 import { chargeText, metered, type Meter } from "./meter.ts";
+import { SECRET_CONTENT_RULES as CONTENT_RULES, SECRET_NPMRC_RULES as NPMRC_RULES } from "./redact.ts";
 
 export type FileLike = { path: string; data: Uint8Array };
 
@@ -13,30 +14,6 @@ const SAFE_ENV_SUFFIX = /\.(example|sample|template|defaults?|dist)$/i;
 
 // Key stores hold private keys in a binary format: the name is the finding, as with id_rsa.
 const KEY_STORE = /\.(?:p12|pfx|jks|keystore|kdbx|ppk)$/i;
-
-const CONTENT_RULES: { kind: string; re: RegExp }[] = [
-  // PEM ("-----BEGIN RSA PRIVATE KEY-----", "ENCRYPTED", "OPENSSH", "PGP ... BLOCK") and SSH2 ("---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----")
-  { kind: "private key", re: /-{4,5} ?BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)? ?-{4,5}/ },
-  { kind: "PuTTY private key", re: /PuTTY-User-Key-File-\d+:/ },
-  { kind: "AWS access key", re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
-  { kind: "npm token", re: /\bnpm_[A-Za-z0-9]{36}\b/ },
-  { kind: "GitHub token", re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/ },
-  { kind: "Stripe live key", re: /\b[sr]k_live_[0-9a-zA-Z]{20,}\b/ },
-  { kind: "Slack token", re: /\bxox[abprs]-[0-9A-Za-z-]{10,}\b/ },
-  { kind: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
-  { kind: "OpenAI key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b/ },
-  { kind: "Anthropic key", re: /\bsk-ant-[A-Za-z0-9_-]{32,}\b/ },
-  { kind: "registry auth token", re: /_authToken\s*=\s*[^\s$]{8,}/ },
-  // npm's basic auth: "//host/:_auth=base64(user:pass)" or ":_password=base64(pass)"
-  // the host is matched looking back from `:_`, so each start is tried once (a forward `//[^\s:]+` from every `//` of
-  // `////…` scanned to the end of the file from each)
-  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)\s*=\s*[^\s$]{4,}/ },
-  { kind: "Slack webhook", re: /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_/-]{20,}/ },
-  { kind: "Discord webhook", re: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]{20,}/ },
-];
-
-// In an .npmrc the auth keys need no registry prefix: "_auth=..." on its own line is a default credential.
-const NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)\s*=\s*[^\s$]{4,}/m }];
 
 // Magic bytes of archives whose contents the scan cannot read.
 const ARCHIVES: readonly (readonly number[])[] = [
@@ -112,3 +89,4 @@ function scanSecrets(files: readonly FileLike[]): SecretScan {
 
   return { findings: out, skipped };
 }
+

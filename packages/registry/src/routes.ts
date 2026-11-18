@@ -66,6 +66,7 @@ const REGISTRY_ROUTES = [
   // the AI review (review.ts) and evidence dismissals (evidence.ts)
   { name: "review", pattern: path(`/-/apm/v1/review/${NAME}/${SEG}`) },
   { name: "review queue", pattern: path("/-/apm/v1/review-admin/queue") },
+  { name: "review status", pattern: path("/-/apm/v1/reviews") },
   { name: "review lease", pattern: path("/-/apm/v1/review-jobs") },
   { name: "reviewer", pattern: path("/-/apm/v1/evidence-admin/me") },
   // the account (account.ts)
@@ -171,6 +172,10 @@ const REGISTRY_WRITES = [
   { name: "review result", methods: ["POST"], pattern: path(`/-/apm/v1/review-jobs/${ID}/result`) },
   { name: "review release", methods: ["POST"], pattern: path(`/-/apm/v1/review-jobs/${ID}/release`) },
   { name: "review decide", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/decide") },
+  { name: "review dismiss many", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/dismiss") },
+  { name: "review unlock", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/unlock") },
+  { name: "review lock", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/lock") },
+  { name: "review switch", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/switch") },
   { name: "review request", methods: ["POST"], pattern: path(`/-/apm/v1/review/${NAME}/${SEG}/request`) },
   { name: "evidence dismiss", methods: ["POST"], pattern: path("/-/apm/v1/evidence-admin/dismiss") },
   { name: "evidence restore", methods: ["POST"], pattern: path("/-/apm/v1/evidence-admin/restore") },

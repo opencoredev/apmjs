@@ -59,7 +59,8 @@ const DepRef = z.object({ name: z.string(), version: z.string() });
 /** The AI review standing of every dependency the walk checked (older registries send none). */
 export const TreeReviews = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("off") }),
-  z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
+  // flagged: open AI flags while apm does not hold installs on them (a note); a registry from before it sends none
+  z.object({ kind: z.literal("on"), confirmed: z.array(DepRef), underReview: z.array(DepRef), flagged: z.array(DepRef).optional(), pending: z.array(DepRef), noAnswer: z.array(DepRef) }),
 ]);
 
 /** A package the walk checked; `platform`, the os and cpu a platform binary is built for (older registries send none). */

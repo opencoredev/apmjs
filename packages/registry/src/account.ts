@@ -22,6 +22,7 @@ import { commitVersion, dropBlobIfUnused, fenceNewName, issueToken } from "./ser
 import { ProofFields, refusedProof, secondFactor } from "./step-up.ts";
 import { isWithheld } from "./withheld.ts";
 import { packagesFor } from "./my-packages.ts";
+import { flagsForPackages } from "./review.ts";
 
 export { typedConfirmationReason } from "./approval.ts";
 
@@ -297,7 +298,11 @@ export const accountRoute = (req: Request, url: URL) =>
 
       if (!who.user) return json({ packages: [] });
 
-      return json({ packages: yield* packagesFor({ user: who.user.name, webUrl: web }) });
+      const packages = yield* packagesFor({ user: who.user.name, webUrl: web });
+      // the AI flags on their own versions, with the findings (redacted), so they can answer them
+      const flags = yield* flagsForPackages(packages.map((p) => p.name));
+
+      return json({ packages: packages.map((p) => ({ ...p, aiFlags: flags.get(p.name) ?? [] })) });
     }
 
     if (rest === "account/tokens/revoke" && req.method === "POST") {

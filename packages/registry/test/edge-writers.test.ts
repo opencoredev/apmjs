@@ -85,6 +85,12 @@ const WRITERS: Writer[] = [
     covered: "resultResponse: the AI reviewer's result, stored as 'none' or 'pending', never 'confirmed' (a stored result can only unblock)",
     check: () => read("packages/registry/src/review.ts").includes('const human: HumanState = r.outcome === "benign" ? "none" : "pending";'),
   },
+  {
+    file: "packages/registry/src/review.ts",
+    statement: /UPDATE reviews SET human_state = 'dismissed', human_by = \$\{by\}/,
+    covered: "bulkDismissResponse: dismisses only, and only flags still pending, so it can only unblock",
+    check: () => /sql`UPDATE reviews SET human_state = 'dismissed'[^`]*AND human_state = 'pending' RETURNING package`/.test(read("packages/registry/src/review.ts")),
+  },
 ];
 
 describe("writes an edge view depends on", () => {

@@ -176,9 +176,12 @@ export async function resolveForVerdict(input: { name: string; range: string; so
   }
 }
 
-export async function explainFor(input: { name: string; range: string | null; source: AgentSource }): Promise<Verdict> {
+export async function explainFor(input: { name: string; range: string | null; source: AgentSource; now?: number }): Promise<Verdict> {
   const { name, range, source } = input;
-  const { resolve, older } = await resolveForVerdict({ name, range: range ?? "latest", source });
+  const ask: Parameters<typeof resolveForVerdict>[0] = { name, range: range ?? "latest", source };
+
+  if (input.now !== undefined) ask.now = input.now;
+  const { resolve, older } = await resolveForVerdict(ask);
   // only an "ok" resolve reads the review; the other verdicts never look at it
   const review = resolve.kind === "ok" ? reviewInput(await source.review({ name, version: resolve.version })) : ({ kind: "unreadable" } as const);
 

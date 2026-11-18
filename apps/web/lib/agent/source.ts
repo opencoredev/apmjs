@@ -61,7 +61,8 @@ const DepRefWire = z.object({ name: z.string(), version: z.string() });
 /** The AI review standing of every dependency the walk checked; a registry from before it sends none. */
 const TreeReviewsWire = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("off") }),
-  z.object({ kind: z.literal("on"), confirmed: z.array(DepRefWire), underReview: z.array(DepRefWire), pending: z.array(DepRefWire), noAnswer: z.array(DepRefWire) }),
+  // flagged: open AI flags while apm does not hold installs on them (a note); a registry from before it sends none
+  z.object({ kind: z.literal("on"), confirmed: z.array(DepRefWire), underReview: z.array(DepRefWire), flagged: z.array(DepRefWire).optional(), pending: z.array(DepRefWire), noAnswer: z.array(DepRefWire) }),
 ]);
 
 /**
