@@ -216,13 +216,27 @@ const VersionInfo = z.object({
 /** The per-version answer: one version's state, facts and score. */
 export type VersionDetails = z.infer<typeof VersionInfo>;
 
+/** The per-version answers this request read, by registry path (requestScope), as packageReads does for packages. */
+const versionReads = new WeakMap<object, Map<string, Promise<Fetched<VersionDetails>>>>();
+
 /**
- * One version's state, facts and score, whatever its age (the package answer lists the newest 200). Cached per request,
- * so the package page's metadata and its body read it once.
+ * One version's state, facts and score, whatever its age (the package answer lists the newest 200). Shared within one
+ * request, as getPackage is, so the package page's metadata and its body read it once: in the website Worker through
+ * the request's own context (React's cache is not shared between a page and its metadata there), under `next dev`
+ * and in tests through React's cache.
  */
-export const getVersionInfo = cache((name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> =>
-  getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo),
-);
+export const getVersionInfo = cache((name: string, version: string): Promise<Fetched<VersionDetails>> => {
+  const path = `-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`;
+  const scope = requestScope();
+
+  if (scope === null) return getJson(path, VersionInfo);
+  const reads = versionReads.get(scope) ?? new Map<string, Promise<Fetched<VersionDetails>>>();
+  versionReads.set(scope, reads);
+  const read = reads.get(path) ?? getJson(path, VersionInfo);
+  reads.set(path, read);
+
+  return read;
+});
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
 
