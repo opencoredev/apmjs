@@ -213,8 +213,16 @@ const VersionInfo = z.object({
   unscorable: VersionUnscorable.nullable().default(null),
 });
 
-/** One version's state, facts and score, whatever its age (the package answer lists the newest 200). */
-export const getVersionInfo = (name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> => getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo);
+/** The per-version answer: one version's state, facts and score. */
+export type VersionDetails = z.infer<typeof VersionInfo>;
+
+/**
+ * One version's state, facts and score, whatever its age (the package answer lists the newest 200). Cached per request,
+ * so the package page's metadata and its body read it once.
+ */
+export const getVersionInfo = cache((name: string, version: string): Promise<Fetched<z.infer<typeof VersionInfo>>> =>
+  getJson(`-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`, VersionInfo),
+);
 
 const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
 

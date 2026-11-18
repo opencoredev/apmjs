@@ -4,7 +4,7 @@ import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getPackage, getTarballReadme, getVersionInfo, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getPackage, getTarballReadme, getVersionInfo, type VersionDetails, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, tarballTooLarge, type ReadmeSource, type TarballRead } from "@/lib/readme-source";
@@ -492,7 +492,7 @@ function ScoreSummary({ score, unscorable, className }: { score: PackageInfo["sc
 type PageProps = { params: Promise<{ name: string[] }>; searchParams: Promise<{ v?: string | string[]; line?: string | string[] }> };
 
 /** Title, description, canonical URL and social cards. getPackage is cached per request, so the page reuses this read. */
-export async function generateMetadata({ params }: Pick<PageProps, "params">): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: PageProps): Promise<Metadata> {
   const route = parsePackageRoute((await params).name);
 
   if (!route) return {};
@@ -511,8 +511,11 @@ export async function generateMetadata({ params }: Pick<PageProps, "params">): P
 
   if (found.kind !== "ok") return pageMetadata({ title: `${route.name} · apm`, description: `The apm security score and install policy for ${route.name}.`, path: canonicalPackagePath(route.name) });
   const pkg = found.value;
+  const meta = packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
+  // a ?v= that names no version shows "No such version": keep it out of search indexes (the read is shared with the page)
+  const resolved = await resolveVersion({ pkg, asked: askedVersion((await searchParams).v) });
 
-  return packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
+  return resolved.kind === "no-such-version" ? { ...meta, robots: { index: false, follow: true } } : meta;
 }
 
 /** The page's columns while the package answer is read: the install box, the score and the facts. */
@@ -609,7 +612,7 @@ function SectionTitle({ id, children, aside }: { id: string; children: React.Rea
  * version the package answer does not list.
  */
 type Resolved =
-  | { kind: "shown"; version: string | null; extra: VersionState | null }
+  | { kind: "shown"; version: string | null; extra: VersionState | null; details: VersionDetails | null }
   | { kind: "no-such-version"; asked: string }
   | { kind: "unavailable"; version: string };
 
@@ -619,7 +622,7 @@ async function resolveVersion(input: { pkg: PackageInfo; asked: string | undefin
   switch (choice.kind) {
     case "latest":
     case "listed":
-      return { kind: "shown", version: choice.version, extra: null };
+      return { kind: "shown", version: choice.version, extra: null, details: null };
     case "invalid":
       return { kind: "no-such-version", asked: choice.asked };
     case "unlisted": {
@@ -627,7 +630,12 @@ async function resolveVersion(input: { pkg: PackageInfo; asked: string | undefin
 
       switch (info.kind) {
         case "ok":
-          return { kind: "shown", version: info.value.version, extra: { version: info.value.version, status: info.value.status, unscorable: info.value.unscorable?.text ?? null } };
+          return {
+            kind: "shown",
+            version: info.value.version,
+            extra: { version: info.value.version, status: info.value.status, unscorable: info.value.unscorable?.text ?? null },
+            details: info.value,
+          };
         case "missing":
           return { kind: "no-such-version", asked: choice.version };
         case "unavailable":
@@ -791,7 +799,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   if (resolved.kind === "no-such-version") return <NoSuchVersion pkg={pkg} asked={resolved.asked} />;
 
   if (resolved.kind === "unavailable") return <RegistryUnavailable what={`${name} ${resolved.version}`} retryHref={`${packagePath(name)}?v=${encodeURIComponent(resolved.version)}`} />;
-  const { version, extra } = resolved;
+  const { version, extra, details } = resolved;
   const rows = rowsWith(pkg.versions, extra);
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
@@ -808,8 +816,14 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const tarballReadme: Promise<TarballRead | null> =
     version && needsTarballReadme(pkg.readme) ? (tarballTooLarge({ pkg, version }) ? Promise.resolve({ kind: "not-opened" }) : getTarballReadme({ name, version })) : Promise.resolve(null);
 
+  // an older version's own facts, from the per-version answer (already read when the package answer doesn't list it)
+  const versionDetails: Promise<Fetched<VersionDetails>> = isLatest || version === null ? Promise.resolve(none) : details ? Promise.resolve({ kind: "ok", value: details }) : getVersionInfo(name, version);
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
-  const versionScore = shown && !isLatest ? await reads.score(shown) : none;
+  const [versionScore, detailsRead] = await Promise.all([shown && !isLatest ? reads.score(shown) : Promise.resolve(none), versionDetails]);
+
+  // the facts panel shows the shown version's facts; latest's, labelled as such, only if that version's could not be read
+  const glance: { facts: Facts | null; of: "shown" | "latest" } =
+    isLatest || version === null ? { facts: pkg.facts, of: "shown" } : detailsRead.kind === "ok" ? { facts: detailsRead.value.facts, of: "shown" } : { facts: pkg.facts, of: "latest" };
 
   const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
   const score = isLatest ? pkg.score : versionScore.kind === "ok" ? versionScore.value : null;
@@ -920,9 +934,20 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
         <div className="contents lg:flex lg:flex-col lg:gap-12">
           <ScoreSummary score={score} unscorable={unscorable} className="order-2 lg:hidden" />
           <section aria-labelledby="facts" className="order-3 lg:order-none">
-            <SectionTitle id="facts">At a glance</SectionTitle>
+            <SectionTitle
+              id="facts"
+              aside={
+                isLatest ? undefined : glance.of === "shown" ? (
+                  <span className="font-mono text-sm text-muted-foreground">{version}</span>
+                ) : (
+                  <span className="text-sm text-muted-foreground">latest version, {pkg.latest}</span>
+                )
+              }
+            >
+              At a glance
+            </SectionTitle>
             <div className="border-t">
-              <FactsPanel facts={pkg.facts} maintainers={pkg.maintainers} lastPublish={latest?.publishedAt ?? null} />
+              <FactsPanel facts={glance.facts} maintainers={pkg.maintainers} lastPublish={latest?.publishedAt ?? null} />
             </div>
           </section>
           <Suspense fallback={null}>
