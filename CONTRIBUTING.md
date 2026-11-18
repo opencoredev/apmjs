@@ -12,6 +12,12 @@ bun run lint                   # Oxlint, anti-slop and @shadcn/lint; see docs/LI
 cd apps/web && bunx tsc --noEmit
 ```
 
+After a change to the website's routes, its Open Graph images or its build, also run the built website in workerd. It builds the site the way the deploy does and needs the network for Google Fonts, so it is a local check, not part of CI:
+
+```sh
+cd apps/web && bun test ./test/
+```
+
 The acceptance tests in `tests/acceptance` drive the real `bun`, `npm` and `pnpm` clients against an in-process registry. A change to registry or CLI behavior needs a test there first.
 
 ## Pull requests

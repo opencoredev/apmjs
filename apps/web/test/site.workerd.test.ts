@@ -1,8 +1,9 @@
 // The built website Worker in workerd, through Miniflare: what only the real OpenNext bundle shows. It builds the site
-// the way the deploy does (packages/infra/build-web.ts), so it is slow, and lives here rather than in lib/ (CI runs it
-// as its own step). The registry is a stand-in Worker on the REGISTRY binding that knows a few packages.
+// the way the deploy does (packages/infra/build-web.ts), so it lives here rather than in lib/. It is a local check, not
+// a CI step: the build fetches the site's fonts from Google Fonts (next/font/google), so a cold build needs the
+// network. The registry is a stand-in Worker on the REGISTRY binding that knows a few packages.
 //
-//   cd apps/web && bun test test
+//   cd apps/web && bun test ./test/     (not `bun test test`, which matches every test file by name)
 //
 // Launch QA finding: Open Graph images failed with a 500 after 8 s on every request but an isolate's first. next/og
 // imports its renderer inside each render, Cache Components tracks that import() with a timer kept from an earlier
@@ -10,6 +11,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { inflateSync } from "node:zlib";
 import { Miniflare } from "miniflare";
 import { pkg } from "../lib/agent/testing";
 
@@ -49,14 +51,78 @@ function listFiles(dir: string): string[] {
 
 const moduleType = (file: string): "ESModule" | "CompiledWasm" | "Data" => (file.endsWith(".js") ? "ESModule" : file.endsWith(".wasm") ? "CompiledWasm" : "Data");
 
-/** A PNG's width and height from its IHDR chunk, or null when the bytes are not a PNG. */
+const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/** Bytes per pixel for an 8-bit PNG colour type (greyscale, RGB, greyscale+alpha, RGBA); null for palette or unknown. */
+function channelsOf(colour: number): number | null {
+  switch (colour) {
+    case 0:
+      return 1;
+    case 2:
+      return 3;
+    case 4:
+      return 2;
+    case 6:
+      return 4;
+    default:
+      return null;
+  }
+}
+
+/**
+ * A PNG's width and height, or null unless it decodes: the signature, then chunks whose lengths and CRCs check out,
+ * IHDR first, IDAT data that inflates to exactly one filtered row per line, and IEND as the last bytes. A truncated
+ * or padded response fails, however its header looks (review of 020c9e8: a 24-byte header alone used to pass).
+ */
 function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
-  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-
-  if (bytes.length < 24 || signature.some((b, i) => bytes[i] !== b)) return null;
+  if (bytes.length < SIGNATURE.length || SIGNATURE.some((b, i) => bytes[i] !== b)) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const idat: Uint8Array[] = [];
+  let header: { width: number; height: number; depth: number; colour: number; interlace: number } | null = null;
+  let at = SIGNATURE.length;
 
-  return { width: view.getUint32(16), height: view.getUint32(20) };
+  while (at + 12 <= bytes.length) {
+    const length = view.getUint32(at);
+    const end = at + 12 + length;
+
+    if (end > bytes.length) return null;
+    const type = new TextDecoder().decode(bytes.subarray(at + 4, at + 8));
+    const data = bytes.subarray(at + 8, at + 8 + length);
+
+    if (crc32(bytes.subarray(at + 4, at + 8 + length)) !== view.getUint32(at + 8 + length)) return null;
+
+    if (type === "IHDR") header = { width: view.getUint32(at + 8), height: view.getUint32(at + 12), depth: data[8] ?? 0, colour: data[9] ?? -1, interlace: data[12] ?? -1 };
+    else if (type === "IDAT") idat.push(data);
+    else if (type === "IEND") {
+      if (end !== bytes.length || header === null || idat.length === 0) return null;
+      const channels = channelsOf(header.colour);
+
+      if (header.depth !== 8 || header.interlace !== 0 || channels === null) return null;
+      const pixels = inflateSync(Buffer.concat(idat));
+
+      return pixels.length === header.height * (1 + header.width * channels) ? { width: header.width, height: header.height } : null;
+    }
+
+    at = end;
+  }
+
+  return null;
+}
+
+const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+
+  return c >>> 0;
+});
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+
+  for (const b of bytes) c = (CRC_TABLE[(c ^ b) & 0xff] ?? 0) ^ (c >>> 8);
+
+  return (c ^ 0xffffffff) >>> 0;
 }
 
 /** Asks for one image and reads it to the end, as an unfurler does. */
@@ -125,6 +191,18 @@ describe("Open Graph images from one isolate", () => {
     await res.arrayBuffer();
     expect(res.status).toBe(404);
   });
+});
+
+describe("the PNG check itself", () => {
+  test("a whole card decodes; its first 24 bytes, a truncated copy and one with bytes after IEND do not", async () => {
+    const bytes = new Uint8Array(await (await site().dispatchFetch("http://apm.test/og?check=1")).arrayBuffer());
+
+    expect(pngSize(bytes)).toEqual({ width: 1200, height: 630 });
+    expect(pngSize(bytes.slice(0, 24))).toBeNull();
+    expect(pngSize(bytes.slice(0, bytes.length - 100))).toBeNull();
+    expect(pngSize(bytes.slice(0, bytes.length - 12))).toBeNull();
+    expect(pngSize(new Uint8Array([...bytes, 0]))).toBeNull();
+  }, 60_000);
 });
 
 describe("routes", () => {

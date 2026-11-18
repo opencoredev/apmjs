@@ -46,9 +46,6 @@ jobs:
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web
-      - name: Website Worker in workerd (builds the site as the deploy does; OG images, /status, the 404 page)
-        run: bun test ./test/
-        working-directory: apps/web
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web
