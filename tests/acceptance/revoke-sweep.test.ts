@@ -753,9 +753,13 @@ describe("a revoked or revoke-pending version's text", () => {
     const seen = agentMarkers(await agentViews());
     const by = (view: string) => new Set(seen.filter((m) => m.view.startsWith(view)).map((m) => m.marker));
 
-    // the Markdown view and check_package quote the description, the deprecation, the AI finding and the cited code
+    // the Markdown view and check_package quote the description, the deprecation and the license. A confirmed AI
+    // finding is public only as file N, line, severity and a fixed label (packages/registry/src/public-finding.ts), so
+    // neither the model's sentence nor the cited code reaches them any more, before the revoke or after
     for (const view of ["markdown 1.1.0", 'check_package {"name":"sweep-fixture","version":"1.1.0"}']) {
-      for (const m of ["LEAKMARK-description", "LEAKMARK-deprecation", "LEAKMARK-review-issue", "LEAKMARK-js-string", "LEAKMARK-license"]) expect(by(view).has(m), `${view}: ${m}`).toBe(true);
+      for (const m of ["LEAKMARK-description", "LEAKMARK-deprecation", "LEAKMARK-license"]) expect(by(view).has(m), `${view}: ${m}`).toBe(true);
+
+      for (const m of ["LEAKMARK-review-issue"]) expect(by(view).has(m), `${view}: ${m}`).toBe(false);
     }
 
     expect(by("search_packages").has("LEAKMARK-description")).toBe(true);
