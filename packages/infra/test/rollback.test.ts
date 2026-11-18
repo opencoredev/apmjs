@@ -563,6 +563,13 @@ describe("the schema check", () => {
     expect(await check("rv-future")).toEqual({ kind: "not-applied", version: "rv-future", ids: ["9999_future"] });
   });
 
+  // review of 77f9798: a version built before a migration marked rollback-safe (0028) is allowed, naming it as extra
+  test("a version missing only a migration marked rollback-safe passes, naming it", async () => {
+    releases.push(release(B5, ALL.filter((id) => id !== "0028_ai_review_switch"), { registry: "rv-no28" }));
+
+    expect(await check("rv-no28")).toEqual({ kind: "ok", extra: ["0028_ai_review_switch"] });
+  });
+
   test("a version built with every applied migration passes; a ledger that cannot be read does not", async () => {
     expect(await check("rv3")).toEqual({ kind: "ok", extra: [] });
     expect(await check("rv3", async () => null)).toEqual({ kind: "unreadable" });
