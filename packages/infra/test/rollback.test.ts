@@ -18,7 +18,7 @@ import { recordLiveRelease, type Recording } from "../deploy-record.ts";
 import { finishDeploy, recoveryAdvice, smokeCommand } from "../deploy-finish.ts";
 import { appendRelease, readReleases, releaseNamingAll } from "../releases.ts";
 import { halfAnswering } from "../../../tests/acceptance/half-answering.ts";
-import { CloudflareError, isRollbackSafe, ledgerOf, migrationCheck, previousOf, provenanceVars, unsafeMigrations, type Cloudflare, type Deployment, type WorkerKind } from "../rollback.ts";
+import { CloudflareError, confirmLive, deploy, isRollbackSafe, ledgerOf, listDeployments, migrationCheck, previousOf, provenanceVars, rollBack, unsafeMigrations, versionVariables, type Cloudflare, type Deployment, type Step, type WorkerKind } from "../rollback.ts";
 
 const TOKEN = "fake-cloudflare-token-that-must-never-be-printed";
 const ACCOUNT = "0123456789abcdef0123456789abcdef";
@@ -32,6 +32,16 @@ let api: string;
 let deployments: Map<string, Deployment[]>;
 let posted: Posted[];
 let failPosts: boolean;
+
+/**
+ * How the stand-in answers a new deployment: the whole deployment (Cloudflare's old answer), its id alone (what it
+ * answers since 2026-11-18), success with no id, or HTTP 200 with `success: false`. `answerFor` limits it to one Worker.
+ */
+let answer: "full" | "id-only" | "no-id" | "success-false-200";
+let answerFor: string | null;
+
+/** When false, a new deployment is answered but never shows in the list: a change Cloudflare says it made and did not. */
+let applyPosts: boolean;
 
 /** Each version's plain-text variables, as Cloudflare's version settings give them; a version not here answers 404. */
 let versionVars: Map<string, Record<string, string>>;
@@ -74,6 +84,9 @@ function reset(): void {
   ]);
   posted = [];
   failPosts = false;
+  answer = "full";
+  answerFor = null;
+  applyPosts = true;
   versionVars = new Map();
   failLists = null;
   delayMs = 0;
@@ -127,10 +140,18 @@ beforeAll(() => {
       }
 
       if (failPosts) return Response.json({ success: false, errors: [{ code: 10021, message: "deployment refused" }] }, { status: 400 });
+      const mode = answerFor === null || answerFor === script ? answer : "full";
+
+      if (mode === "success-false-200") return Response.json({ success: false, errors: [{ code: 10021, message: "deployment refused" }], messages: [], result: null });
       const body = Post.parse(await req.json());
       posted.push({ script, force: url.searchParams.get("force"), versions: body.versions, message: body.annotations["workers/message"] });
       const made: Deployment = { id: `new-${posted.length}`, created_on: new Date(Date.parse("2026-11-16T12:00:00Z") + posted.length * 1000).toISOString(), source: "api", versions: body.versions };
-      deployments.set(script, [made, ...list]);
+
+      if (applyPosts) deployments.set(script, [made, ...list]);
+
+      if (mode === "id-only") return Response.json({ success: true, errors: [], messages: [], result: { id: made.id } });
+
+      if (mode === "no-id") return Response.json({ success: true, errors: [], messages: [], result: null });
 
       return Response.json({ success: true, result: made });
     },
@@ -367,6 +388,59 @@ describe("rollback.ts, the manual command", () => {
     expect(r.code).toBe(1);
     expect(r.out).toContain("NOT rolling back apmjs-registry-production: apmjs-registry-production's live deployment r3, which routes traffic to no version");
     expect(posted.map((p) => p.script)).toEqual(["apmjs-web-production"]);
+  });
+
+  test("Cloudflare answering a new deployment with its id alone is a success, confirmed by the deployment list", async () => {
+    answer = "id-only";
+    const r = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("rolled back apmjs-web-production: deployment w2 → version wv1 (build aaaa0002) (live deployment new-1, confirmed in the deployment list)");
+    expect(r.out).toContain("rolled back apmjs-registry-production: deployment r3 → version rv2 (build aaaa0002) (live deployment new-2, confirmed in the deployment list)");
+    expect(r.out).not.toContain("expected shape");
+    expect(r.out).not.toContain(TOKEN);
+    expect(deployments.get("apmjs-registry-production")?.[0]?.versions).toEqual([{ version_id: "rv2", percentage: 100 }]);
+  });
+
+  test("success: false (even with HTTP 200) stops it; it says which Worker is where, and the same command finishes the rest", async () => {
+    // today's incident, the other way round: the website goes back, the registry's change is refused
+    answer = "success-false-200";
+    answerFor = "apmjs-registry-production";
+    const r = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("rolled back apmjs-web-production: deployment w2 → version wv1");
+    expect(r.out).toContain("FAILED to roll back apmjs-registry-production: Cloudflare answered 200 (success: false) for POST /workers/scripts/apmjs-registry-production/deployments?force=true (10021: deployment refused)");
+    expect(r.out).toContain("Where each Worker is now:\n  apmjs-web-production: rolled back, at version wv1 (build aaaa0002) (live deployment new-1)\n  apmjs-registry-production: NOT rolled back, still at deployment r3, running rv3\n");
+    expect(r.out).toContain(`To finish: bun packages/infra/rollback.ts to --stage production --build ${B2} --skip-migration-check --yes (the same command: Workers already at the target are skipped)`);
+    expect(posted.map((p) => p.script)).toEqual(["apmjs-web-production"]);
+
+    // the same command again: the website already runs the target and is skipped; only the registry changes
+    answer = "id-only";
+    const again = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+    expect(again.code).toBe(0);
+    expect(again.out).toContain("apmjs-web-production: already runs version wv1 (build aaaa0002)");
+    expect(again.out).toContain("rolled back apmjs-registry-production: deployment r3 → version rv2");
+    expect(posted.map((p) => p.script)).toEqual(["apmjs-web-production", "apmjs-registry-production"]);
+
+    // and once more: nothing left to do, nothing changed
+    const done = await cli(["to", "--stage", "production", "--build", B2, "--skip-migration-check", "--yes"]);
+
+    expect(done.code).toBe(0);
+    expect(done.out).toContain("Every Worker named already runs its target. Nothing changed.");
+    expect(posted).toHaveLength(2);
+  });
+
+  test("after a partial `previous`, it says to finish with `to --build`, not `previous` again", async () => {
+    failPosts = true;
+    const r = await cli(["previous", "--stage", "production", "--skip-migration-check", "--yes"]);
+
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("FAILED to roll back apmjs-web-production: Cloudflare answered 400");
+    expect(r.out).toContain("not rolled back: apmjs-registry-production (stopped at the failure above)");
+    expect(r.out).toContain("apmjs-web-production: NOT rolled back, still at deployment w2, running wv2");
+    expect(r.out).toContain(`To finish: bun packages/infra/rollback.ts to --stage production --build ${B2} --skip-migration-check --yes (not \`previous\` again`);
   });
 
   test("while someone else holds the release lock it changes nothing, and says so", async () => {
@@ -764,5 +838,104 @@ describe("the recovery advice after a failed deploy", () => {
 
     expect(a).toContain("could not be read");
     expect(a).toContain("bun packages/infra/rollback.ts list --stage production");
+  });
+});
+
+describe("Cloudflare's answers", () => {
+  const web = (): Step => ({ kind: "web", script: "apmjs-web-production", from: dep("w2", "wv2", "2026-11-16T10:01:00Z"), to: [{ version_id: "wv1", percentage: 100 }], toLabel: "version wv1" });
+  const registry = (): Step => ({ kind: "registry", script: "apmjs-registry-production", from: dep("r3", "rv3", "2026-11-16T10:00:00Z"), to: [{ version_id: "rv2", percentage: 100 }], toLabel: "version rv2" });
+
+  test("a new deployment answered with its id alone is accepted; success: false is a failure", async () => {
+    answer = "id-only";
+    expect(await deploy(cf(), "apmjs-web-production", [{ version_id: "wv1", percentage: 100 }], "m")).toEqual({ kind: "accepted", id: "new-1" });
+    answer = "success-false-200";
+    await expect(deploy(cf(), "apmjs-web-production", [{ version_id: "wv1", percentage: 100 }], "m")).rejects.toBeInstanceOf(CloudflareError);
+  });
+
+  test("an answer with no id is unclear, and the deployment list decides: it shows the target, so the rollback counts", async () => {
+    answer = "no-id";
+    const lines: string[] = [];
+
+    expect(await rollBack(cf(), [registry(), web()], "m", (l) => lines.push(l), { confirm: { deadlineMs: 2_000, intervalMs: 50 } })).toBe(true);
+    expect(lines).toContain("apmjs-web-production: Cloudflare answered 200 with no failure but no deployment id; reading what is live to find out");
+    expect(lines.at(-1)).toBe("rolled back apmjs-registry-production: deployment r3 → version rv2 (live deployment new-2, confirmed in the deployment list)");
+  });
+
+  test("an accepted change the deployment list never shows is a failure, reported with where each Worker is", async () => {
+    answer = "id-only";
+    applyPosts = false;
+    const lines: string[] = [];
+    const started = Date.now();
+
+    expect(await rollBack(cf(), [registry(), web()], "m", (l) => lines.push(l), { confirm: { deadlineMs: 300, intervalMs: 50 }, resume: "the resume command" })).toBe(false);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(lines).toEqual([
+      "FAILED to roll back apmjs-web-production: Cloudflare accepted it as deployment new-1, but after 300 ms its deployment list still does not show version wv1 (its live deployment is w2, running wv2)",
+      "not rolled back: apmjs-registry-production (stopped at the failure above)",
+      "Where each Worker is now:",
+      "  apmjs-web-production: NOT rolled back, still at deployment w2, running wv2",
+      "  apmjs-registry-production: NOT rolled back, still at deployment r3, running rv3",
+      "To finish: the resume command",
+    ]);
+  });
+
+  test("confirmLive keeps reading while the list lags, and gives up at its deadline", async () => {
+    onList.set("apmjs-web-production", { at: 3, change: () => deployments.set("apmjs-web-production", [dep("late", "wv1", "2026-11-16T12:00:00Z"), ...(deployments.get("apmjs-web-production") ?? [])]) });
+    const seen = await confirmLive({ cf: cf(), script: "apmjs-web-production", versions: [{ version_id: "wv1", percentage: 100 }], deadlineMs: 2_000, intervalMs: 20 });
+
+    expect(seen.kind === "confirmed" ? seen.live.id : seen.why).toBe("late");
+    const never = await confirmLive({ cf: cf(), script: "apmjs-web-production", versions: [{ version_id: "nope", percentage: 100 }], deadlineMs: 100, intervalMs: 20 });
+
+    expect(never).toEqual({ kind: "not-confirmed", why: "its live deployment is late, running wv1" });
+  });
+
+  test("lists and settings with fields missing, null or new still parse; a list missing what rollback relies on does not", async () => {
+    const lists = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+
+        if (path.endsWith("/apmjs-registry-production/deployments")) return Response.json({ success: true, errors: [], messages: [], result: { deployments: [{ id: "c", versions: [] }] } });
+
+        if (path.endsWith("/deployments")) {
+          // the versions list answers errors and messages null; optional fields left out or null; fields added later
+          return Response.json({
+            success: true,
+            errors: null,
+            messages: null,
+            result_info: { page: 1 },
+            result: {
+              deployments: [
+                { id: "a", created_on: "2026-11-18T09:16:38Z", versions: [{ version_id: "v1", percentage: 100 }], strategy: "percentage", annotations: null, author_email: null, source: null, new_field: { x: 1 } },
+                { id: "b", created_on: "2026-11-18T09:10:44Z", versions: [{ version_id: "v0", percentage: 100 }], annotations: { "workers/triggered_by": "upload", "workers/other": 1 } },
+              ],
+            },
+          });
+        }
+
+        if (path.endsWith("/versions/no-bindings")) return Response.json({ success: true, errors: [], messages: [], result: { id: "no-bindings", resources: { script: {} } } });
+
+        if (path.endsWith("/versions/no-resources")) return Response.json({ success: true, errors: [], messages: [], result: { id: "no-resources" } });
+
+        if (path.endsWith("/versions/warned")) return Response.json({ success: true, errors: [{ code: 1 }], messages: [], result: { id: "warned" } });
+
+        return Response.json({ success: false, errors: [{ code: 10007, message: "not found" }] }, { status: 404 });
+      },
+    });
+
+    const other: Cloudflare = { apiBase: `http://127.0.0.1:${lists.port}/client/v4`, token: TOKEN, accountId: ACCOUNT };
+
+    try {
+      expect((await listDeployments(other, "apmjs-web-production"))?.map((d) => d.id)).toEqual(["a", "b"]);
+      expect(await versionVariables(other, "apmjs-docs-production", "no-bindings")).toEqual({});
+      expect(await versionVariables(other, "apmjs-docs-production", "no-resources")).toEqual({});
+      // any error in an answer is a failure, even one with no message
+      await expect(versionVariables(other, "apmjs-docs-production", "warned")).rejects.toThrow("Cloudflare answered 200 for GET /workers/scripts/apmjs-docs-production/versions/warned (1: no message)");
+      // a deployment with no created_on cannot be ordered, so the list is refused rather than guessed at
+      await expect(listDeployments(other, "apmjs-registry-production")).rejects.toThrow("not in the expected shape");
+    } finally {
+      await lists.stop(true);
+    }
   });
 });

@@ -21,7 +21,10 @@
 // stage's migration ledger (apm_migrations, read only, through ~/.config/apmjs/neon-url, within 15 s): every migration
 // in it applied, and every applied migration not in it marked `-- apm:rollback-safe`, wherever it sorts. Just before
 // each change, the Worker's live deployment is read again and must still be the one planned from, running versions the
-// record names. Variables on a version are never trusted. --skip-migration-check skips only the ledger comparison, for
+// record names. After each change, the live deployment is read again until it runs the target (within 30 s): that, not
+// Cloudflare's answer to the change (today just the new deployment's id), says it happened. A rollback that stops part
+// way says where each Worker is and the command that finishes it; `to` run again skips Workers already at the target.
+// Variables on a version are never trusted. --skip-migration-check skips only the ledger comparison, for
 // someone who has looked at the schema by hand. Every deploy and rollback runs on evo-1 (docs/DEPLOY.md, "Scope").
 //
 // A rollback (--yes) takes the release lock (release-lock.ts) before it reads anything and holds it until it exits:
@@ -92,18 +95,27 @@ const VersionShare = z.object({ version_id: z.string(), percentage: z.number() }
 
 export type VersionShare = z.infer<typeof VersionShare>;
 
+/**
+ * One deployment in a Worker's deployment list. What rollback.ts relies on is required (the id, when it was made and the
+ * versions it routes traffic to); the rest of what Cloudflare documents (source, strategy, author_email, annotations) may
+ * be missing or null, and fields it adds later are ignored.
+ */
 export const Deployment = z.object({
   id: z.string(),
   created_on: z.string(),
-  source: z.string().optional(),
-  author_email: z.string().optional(),
+  source: z.string().nullish(),
+  strategy: z.string().nullish(),
+  author_email: z.string().nullish(),
   versions: z.array(VersionShare),
-  annotations: z.object({ "workers/message": z.string().optional(), "workers/triggered_by": z.string().optional() }).loose().optional(),
+  annotations: z.object({ "workers/message": z.string().nullish(), "workers/triggered_by": z.string().nullish() }).loose().nullish(),
 });
 
 export type Deployment = z.infer<typeof Deployment>;
 
-const ApiErrors = z.object({ success: z.boolean().optional(), errors: z.array(z.object({ code: z.number().optional(), message: z.string() })).optional() }).loose();
+/** Cloudflare's envelope around every answer. `errors` and `messages` can be null (the versions list answers so). */
+const Envelope = z.object({ success: z.boolean().nullish(), errors: z.array(z.unknown()).nullish(), result: z.unknown() }).loose();
+
+const ApiMessage = z.object({ code: z.number().nullish(), message: z.string().nullish() }).loose();
 
 /** Thrown for an API answer that is not a success: its status and Cloudflare's messages, never the request's headers. */
 export class CloudflareError extends Error {
@@ -118,29 +130,55 @@ export class CloudflareError extends Error {
 /** How long one Cloudflare API request may take, unless its caller has less time left. */
 const REQUEST_TIMEOUT_MS = 30_000;
 
-async function call<S extends z.ZodType>(cf: Cloudflare, path: string, schema: S, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<z.output<S>> {
+function messagesOf(errors: readonly unknown[]): string {
+  return errors
+    .map((e) => {
+      const m = ApiMessage.safeParse(e);
+
+      return m.success ? `${m.data.code ?? "?"}: ${m.data.message ?? "no message"}` : String(JSON.stringify(e)).slice(0, 200);
+    })
+    .join("; ");
+}
+
+type Answer = { status: number; result: unknown; success: boolean | null };
+
+/**
+ * One request. A genuine failure throws CloudflareError: a status that is not 2xx, `success: false`, or any error in the
+ * answer. Anything else comes back with its result unparsed; a body that is not Cloudflare's envelope comes back with no
+ * result and `success` null.
+ */
+async function request(cf: Cloudflare, path: string, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<Answer> {
   const headers = new Headers({ authorization: `Bearer ${cf.token}` });
 
   if (init.body !== undefined) headers.set("content-type", "application/json");
+  const method = init.method ?? "GET";
 
   const res = await fetch(`${cf.apiBase}/accounts/${cf.accountId}${path}`, {
-    method: init.method ?? "GET",
+    method,
     headers,
     body: init.body === undefined ? undefined : JSON.stringify(init.body),
     signal: AbortSignal.timeout(Math.max(1, Math.min(REQUEST_TIMEOUT_MS, init.timeoutMs ?? REQUEST_TIMEOUT_MS))),
   });
 
-  // a body that is not JSON is reported below, by its status
-  const raw = await res.json().catch(() => null);
+  // a body that is not JSON is reported by its status
+  const parsed = Envelope.safeParse(await res.json().catch(() => null));
+  const envelope = parsed.success ? parsed.data : null;
+  const errors = envelope?.errors ?? [];
 
-  const errors = ApiErrors.safeParse(raw);
-  const messages = errors.success ? (errors.data.errors ?? []).map((e) => `${e.code ?? "?"}: ${e.message}`).join("; ") : "";
+  if (!res.ok || envelope?.success === false || errors.length > 0) {
+    const messages = messagesOf(errors);
 
-  if (!res.ok || (errors.success && errors.data.success === false)) throw new CloudflareError(res.status, `Cloudflare answered ${res.status} for ${init.method ?? "GET"} ${path}${messages === "" ? "" : ` (${messages})`}`);
-  const envelope = z.object({ result: z.unknown() }).safeParse(raw);
-  const parsed = schema.safeParse(envelope.success ? envelope.data.result : undefined);
+    throw new CloudflareError(res.status, `Cloudflare answered ${res.status}${envelope?.success === false ? " (success: false)" : ""} for ${method} ${path}${messages === "" ? "" : ` (${messages})`}`);
+  }
 
-  if (!parsed.success) throw new CloudflareError(res.status, `Cloudflare's answer to ${path} is not in the expected shape: ${parsed.error.message}`);
+  return { status: res.status, result: envelope?.result, success: envelope?.success ?? null };
+}
+
+async function call<S extends z.ZodType>(cf: Cloudflare, path: string, schema: S, init: { method?: string; body?: unknown; timeoutMs?: number } = {}): Promise<z.output<S>> {
+  const answer = await request(cf, path, init);
+  const parsed = schema.safeParse(answer.result);
+
+  if (!parsed.success) throw new CloudflareError(answer.status, `Cloudflare's answer to ${path} is not in the expected shape: ${parsed.error.message}`);
 
   return parsed.data;
 }
@@ -148,7 +186,7 @@ async function call<S extends z.ZodType>(cf: Cloudflare, path: string, schema: S
 /** The script's deployments, newest first; null when the account has no such Worker. `timeoutMs` bounds the request. */
 export async function listDeployments(cf: Cloudflare, script: string, timeoutMs?: number): Promise<Deployment[] | null> {
   try {
-    const result = await call(cf, `/workers/scripts/${encodeURIComponent(script)}/deployments`, z.object({ deployments: z.array(Deployment) }), { timeoutMs });
+    const result = await call(cf, `/workers/scripts/${encodeURIComponent(script)}/deployments`, z.object({ deployments: z.array(Deployment) }).loose(), { timeoutMs });
 
     return [...result.deployments].sort((a, b) => b.created_on.localeCompare(a.created_on));
   } catch (e) {
@@ -157,21 +195,81 @@ export async function listDeployments(cf: Cloudflare, script: string, timeoutMs?
   }
 }
 
-const VersionSettings = z.object({ resources: z.object({ bindings: z.array(z.object({ type: z.string(), name: z.string(), text: z.string().optional() }).loose()) }).loose() }).loose();
+/** A version's settings, as far as rollback.ts reads them: its bindings (none listed is none; an assets-only Worker has none). */
+const VersionSettings = z
+  .object({ resources: z.object({ bindings: z.array(z.object({ type: z.string(), name: z.string(), text: z.string().nullish() }).loose()).nullish() }).loose().nullish() })
+  .loose();
 
 /** A version's plain-text variables, from its settings (secrets carry no text and are left out). `timeoutMs` bounds the request. */
 export async function versionVariables(cf: Cloudflare, script: string, versionId: string, timeoutMs?: number): Promise<Record<string, string>> {
   const settings = await call(cf, `/workers/scripts/${encodeURIComponent(script)}/versions/${encodeURIComponent(versionId)}`, VersionSettings, { timeoutMs });
 
-  return Object.fromEntries(settings.resources.bindings.flatMap((b) => (b.type === "plain_text" && b.text !== undefined ? [[b.name, b.text]] : [])));
+  return Object.fromEntries((settings.resources?.bindings ?? []).flatMap((b) => (b.type === "plain_text" && b.text !== undefined && b.text !== null ? [[b.name, b.text]] : [])));
 }
 
+/**
+ * What Cloudflare said to a new deployment. `accepted`: success and the new deployment's id (all it answers today; any
+ * other field is ignored). `unclear`: no failure, but no id either, or the request did not complete, so the change may
+ * or may not have happened. Neither is proof: what is live afterwards is (confirmLive). A genuine failure throws.
+ */
+export type DeployAnswer = { kind: "accepted"; id: string } | { kind: "unclear"; why: string };
+
+const Created = z.object({ id: z.string().min(1) }).loose();
+
 /** Routes the script's traffic to `versions` as a new deployment (what wrangler rollback does, force included). */
-export function deploy(cf: Cloudflare, script: string, versions: readonly VersionShare[], message: string): Promise<Deployment> {
-  return call(cf, `/workers/scripts/${encodeURIComponent(script)}/deployments?force=true`, Deployment, {
-    method: "POST",
-    body: { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } },
-  });
+export async function deploy(cf: Cloudflare, script: string, versions: readonly VersionShare[], message: string): Promise<DeployAnswer> {
+  let answer: Answer;
+
+  try {
+    answer = await request(cf, `/workers/scripts/${encodeURIComponent(script)}/deployments?force=true`, {
+      method: "POST",
+      body: { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } },
+    });
+  } catch (e) {
+    if (e instanceof CloudflareError) throw e;
+
+    return { kind: "unclear", why: `the request did not complete (${e instanceof Error ? e.message : String(e)}), so it may or may not have taken effect` };
+  }
+
+  const created = Created.safeParse(answer.result);
+
+  if (answer.success === true && created.success) return { kind: "accepted", id: created.data.id };
+
+  return { kind: "unclear", why: `Cloudflare answered ${answer.status} with no failure but no deployment id` };
+}
+
+/** How long a rollback waits for the deployment list to show a change it made. */
+export const CONFIRM_DEADLINE_MS = 30_000;
+
+export type Confirmation = { kind: "confirmed"; live: Deployment } | { kind: "not-confirmed"; why: string };
+
+function versionsText(versions: readonly VersionShare[]): string {
+  return versions.length === 0 ? "no version" : versions.map((v) => `${v.version_id}${v.percentage === 100 ? "" : ` (${v.percentage}%)`}`).join(", ");
+}
+
+/**
+ * Whether `script`'s live deployment routes traffic to exactly `versions`: read again until it does or `deadlineMs`
+ * has passed, since the list can lag a change. This, not the change's answer, is what says a rollback happened.
+ */
+export async function confirmLive(input: { cf: Cloudflare; script: string; versions: readonly VersionShare[]; deadlineMs?: number; intervalMs?: number }): Promise<Confirmation> {
+  const end = Date.now() + (input.deadlineMs ?? CONFIRM_DEADLINE_MS);
+  let last = "nothing was read in time";
+
+  for (;;) {
+    try {
+      const live = (await listDeployments(input.cf, input.script, Math.max(1, end - Date.now())))?.[0];
+
+      if (live !== undefined && sameVersions(live.versions, input.versions)) return { kind: "confirmed", live };
+      last = live === undefined ? "it has no deployment" : `its live deployment is ${live.id}, running ${versionsText(live.versions)}`;
+    } catch (e) {
+      last = `its deployment list could not be read (${e instanceof Error ? e.message : String(e)})`;
+    }
+
+    const left = end - Date.now();
+
+    if (left <= 0) return { kind: "not-confirmed", why: last };
+    await Bun.sleep(Math.min(input.intervalMs ?? 2_000, left));
+  }
 }
 
 /** Whether two deployments route traffic to the same versions in the same shares. */
@@ -236,34 +334,82 @@ export type Step = { kind: WorkerKind; script: string; from: Deployment; to: rea
 
 export type Log = (line: string) => void;
 
+export type RollbackOptions = {
+  /** Runs just before each change, so what it checks is what is live at that moment: why not to go on, or null. */
+  verify?: (step: Step) => Promise<string | null>;
+  /** How long to wait for the deployment list to show each change. */
+  confirm?: { deadlineMs?: number; intervalMs?: number };
+  /** The command that finishes a rollback stopped part way, or null when there is none to give. */
+  resume?: string | null;
+};
+
+/** Where each of `steps`' Workers is now, read from Cloudflare: at its target, still where the plan found it, or neither. */
+export async function whereNow(cf: Cloudflare, steps: readonly Step[], log: Log): Promise<void> {
+  log("Where each Worker is now:");
+
+  for (const s of steps) {
+    try {
+      const live = (await listDeployments(cf, s.script))?.[0];
+
+      if (live === undefined) log(`  ${s.script}: no deployment`);
+      else if (sameVersions(live.versions, s.to)) log(`  ${s.script}: rolled back, at ${s.toLabel} (live deployment ${live.id})`);
+      else if (sameVersions(live.versions, s.from.versions)) log(`  ${s.script}: NOT rolled back, still at deployment ${live.id === s.from.id ? s.from.id : `${live.id} (the versions of ${s.from.id})`}, running ${versionsText(live.versions)}`);
+      else log(`  ${s.script}: runs ${versionsText(live.versions)} (deployment ${live.id}), neither where the plan found it nor its target`);
+    } catch (e) {
+      log(`  ${s.script}: could not be read (${e instanceof Error ? e.message : String(e)}); look with rollback.ts list`);
+    }
+  }
+}
+
 /**
- * Runs `steps` in WORKERS order; stops at the first that fails or that `verify` refuses (it runs just before each
- * change, so what it checks is what is live at that moment), and says which went back and which did not.
+ * Runs `steps` in WORKERS order. Each change counts only once the deployment list shows the Worker running its target
+ * (confirmLive): Cloudflare's answer to the change is read tolerantly, and only a genuine failure (not 2xx, success
+ * false, errors) or a list that never shows the target stops it. It stops at the first step that fails or that `verify`
+ * refuses, and then says where every Worker is and how to finish.
  */
-export async function rollBack(cf: Cloudflare, steps: readonly Step[], message: string, log: Log, verify: (step: Step) => Promise<string | null> = async () => null): Promise<boolean> {
+export async function rollBack(cf: Cloudflare, steps: readonly Step[], message: string, log: Log, options: RollbackOptions = {}): Promise<boolean> {
   const ordered = [...steps].sort((a, b) => WORKERS.indexOf(a.kind) - WORKERS.indexOf(b.kind));
+  const deadlineMs = options.confirm?.deadlineMs ?? CONFIRM_DEADLINE_MS;
+
+  const stopped = async (i: number, why: string): Promise<false> => {
+    for (const left of ordered.slice(i + 1)) log(`not rolled back: ${left.script} (${why})`);
+    await whereNow(cf, ordered, log);
+    log(options.resume === undefined || options.resume === null ? "To finish, look with rollback.ts list and roll back what is left with `to`." : `To finish: ${options.resume}`);
+
+    return false;
+  };
 
   for (const [i, s] of ordered.entries()) {
-    const why = await verify(s);
+    const why = (await options.verify?.(s)) ?? null;
 
     if (why !== null) {
       log(`NOT rolling back ${s.script}: ${why}`);
 
-      for (const left of ordered.slice(i + 1)) log(`not rolled back: ${left.script} (stopped above)`);
-
-      return false;
+      return stopped(i, "stopped above");
     }
 
+    let answer: DeployAnswer;
+
     try {
-      const d = await deploy(cf, s.script, s.to, message);
-      log(`rolled back ${s.script}: deployment ${s.from.id} → ${s.toLabel} (new deployment ${d.id})`);
+      answer = await deploy(cf, s.script, s.to, message);
     } catch (e) {
       log(`FAILED to roll back ${s.script}: ${e instanceof Error ? e.message : String(e)}`);
 
-      for (const left of ordered.slice(i + 1)) log(`not rolled back: ${left.script} (stopped at the failure above)`);
-
-      return false;
+      return stopped(i, "stopped at the failure above");
     }
+
+    if (answer.kind === "unclear") log(`${s.script}: ${answer.why}; reading what is live to find out`);
+    const seen = await confirmLive({ cf, script: s.script, versions: s.to, deadlineMs, intervalMs: options.confirm?.intervalMs });
+
+    if (seen.kind === "not-confirmed") {
+      const said = answer.kind === "accepted" ? `Cloudflare accepted it as deployment ${answer.id}` : "Cloudflare's answer was unclear";
+
+      log(`FAILED to roll back ${s.script}: ${said}, but after ${deadlineMs} ms its deployment list still does not show ${s.toLabel} (${seen.why})`);
+
+      return stopped(i, "stopped at the failure above");
+    }
+
+    log(`rolled back ${s.script}: deployment ${s.from.id} → ${s.toLabel} (live deployment ${seen.live.id}, confirmed in the deployment list)`);
   }
 
   return true;
@@ -508,7 +654,7 @@ export function unrecordedLive(script: string, live: Deployment, releases: reado
 
 function describe(d: Deployment): string {
   const versions = d.versions.map((v) => `${v.version_id}${v.percentage === 100 ? "" : ` (${v.percentage}%)`}`).join(", ");
-  const message = d.annotations?.["workers/message"];
+  const message = d.annotations?.["workers/message"] ?? null;
 
   return `${d.id}  ${d.created_on}  ${d.source ?? "?"}  versions ${versions}${message ? `  "${message}"` : ""}`;
 }
@@ -669,7 +815,11 @@ export async function main(argv: readonly string[], log: Log = (l) => process.st
     steps.push({ kind, script, from: live, to: target.versions, toLabel: target.label });
   }
 
-  if (steps.length === 0) return 0;
+  if (steps.length === 0) {
+    log("Every Worker named already runs its target. Nothing changed.");
+
+    return 0;
+  }
 
   // a live version the record does not name is never replaced: say so now, not after a plan that cannot run
   for (const s of steps) {
@@ -700,7 +850,35 @@ export async function main(argv: readonly string[], log: Log = (l) => process.st
     return 0;
   }
 
-  return (await rollBack(cf, steps, `rollback.ts ${args.action} by ${process.env.USER ?? "an operator"}`, log, (step) => liveStillAsPlanned(cf, step, releases))) ? 0 : 1;
+  const done = await rollBack(cf, steps, `rollback.ts ${args.action} by ${process.env.USER ?? "an operator"}`, log, {
+    verify: (step) => liveStillAsPlanned(cf, step, releases),
+    resume: resumeCommand({ action: args.action, stage: args.stage, argv, steps, releases }),
+  });
+
+  return done ? 0 : 1;
+}
+
+/**
+ * The command that finishes a rollback stopped part way. `to` names fixed targets, so the same command again skips the
+ * Workers already there. `previous` does not: after a partial rollback it would pick other deployments, so it becomes
+ * `to --build` for the build whose line names every target, when there is one.
+ */
+export function resumeCommand(input: { action: z.infer<typeof Args>["action"]; stage: Stage; argv: readonly string[]; steps: readonly Step[]; releases: readonly Release[] }): string | null {
+  const cli = "bun packages/infra/rollback.ts";
+
+  if (input.action === "to") return `${cli} ${input.argv.filter((a) => a !== "--yes").join(" ")} --yes (the same command: Workers already at the target are skipped)`;
+
+  const kinds = new Set(input.steps.map((s) => s.kind));
+  const whole = input.steps.every((s) => s.to.length === 1 && s.to[0]?.percentage === 100);
+
+  if (!whole || !kinds.has("web") || !kinds.has("registry")) return null;
+  const targets = input.steps.flatMap((s) => s.to.map((v) => ({ script: s.script, versionId: v.version_id })));
+  const line = releaseNamingAll(input.releases, targets);
+
+  if (line === null) return null;
+  const skip = input.argv.includes("--skip-migration-check") ? " --skip-migration-check" : "";
+
+  return `${cli} to --stage ${input.stage} --build ${line.build}${kinds.has("docs") ? " --worker docs" : ""}${skip} --yes (not \`previous\` again: after a partial rollback it would pick other deployments)`;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
