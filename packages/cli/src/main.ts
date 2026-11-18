@@ -21,8 +21,7 @@ import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts"
 import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
-
-const VERSION = "0.1.0";
+import { CLI_VERSION } from "./version.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2241,7 +2240,7 @@ async function cmdPublish(a: Args): Promise<number> {
 }
 
 // ---------- help / passthrough ----------
-const HELP = `apm ${VERSION}: checks before you install, run or publish; your package manager does the rest.
+const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; your package manager does the rest.
 
   apm add <pkg>[@range]...   resolve, warn on a version under 24h old or a score under 40, then <pm> add the exact version
   apm x <pkg> [args]         (also apm exec, apm dlx) show the risk card and any warning, then run it (bunx / npx).
@@ -2295,7 +2294,7 @@ async function main(a: Args): Promise<number> {
       return 0;
     case "--version":
     case "-v":
-      say(VERSION);
+      say(CLI_VERSION);
       return 0;
     case "add":
       return cmdAdd(a);

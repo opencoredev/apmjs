@@ -11,9 +11,13 @@
 //     the registry refuses on purpose (a revoked version's 410, a 422) goes on to the page, which says why.
 //     Both checks are HEAD requests the registry answers without building the package answer or reading the
 //     file, and a package or file known to exist is answered from the edge cache (lib/package-status.ts).
+// And the apm CLI's downloads: /install and /cli/*, streamed from the CLI bucket (lib/cli-download.ts).
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 import { NextResponse, type NextRequest } from "next/server";
+import { z } from "zod";
 import { markdownApiPath, markdownRoute } from "@/lib/agent/md-route";
 import { cachedAuthConfig } from "@/lib/auth-config";
+import { cliDownload, isCliRoute, type CliBucket } from "@/lib/cli-download";
 import { forwardingHeaders } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
 import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
@@ -36,9 +40,27 @@ function packageRoute(pathname: string): PackageRoute | null {
   return parsePackageRoute(segs);
 }
 
+const BucketBinding = z.object({ get: z.instanceof(Function), head: z.instanceof(Function) });
+
+/** The CLI bucket when this runs inside the website Worker and the deploy bound it, else null. */
+function cliBucket(): CliBucket | null {
+  let bucket: CliBucket | undefined;
+
+  try {
+    bucket = getCloudflareContext().env.CLI;
+  } catch {
+    // not on Cloudflare: no bindings
+    return null;
+  }
+
+  return bucket !== undefined && BucketBinding.safeParse(bucket).success ? bucket : null;
+}
+
 export async function proxy(request: NextRequest): Promise<Response> {
   const headers = forwardedHeaders(request);
   const { pathname } = request.nextUrl;
+
+  if (isCliRoute(pathname)) return cliDownload({ pathname, method: request.method, bucket: cliBucket() });
 
   if (isRegistryPath(pathname)) {
     const dev = process.env.NODE_ENV === "development";

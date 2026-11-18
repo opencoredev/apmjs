@@ -2,6 +2,8 @@
 interface CloudflareEnv {
   /** The registry Worker, as a service binding. */
   REGISTRY?: { fetch: (request: Request) => Promise<Response> };
+  /** The apm CLI's install script and binaries (R2); lib/cli-download.ts serves them at /install and /cli/*. */
+  CLI?: import("./lib/cli-download").CliBucket;
   /** The registry's public URL. */
   APM_REGISTRY?: string;
   /** The Workers rate limiting binding the agent routes (/mcp, /api/explain) share; see lib/agent/agent-limit.ts. */

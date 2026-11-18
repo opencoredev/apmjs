@@ -67,7 +67,7 @@ Each isolate in edge mode logs an `edge-checks` line once a minute in Workers Lo
 
 ## What the stack creates
 
-Per stage: the R2 bucket `apmjs-blobs-<stage>` (tarballs under `sha512/`, file views under `files/`, and under `state/` the install block list and the queue probe's last record), the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
+Per stage: the R2 bucket `apmjs-blobs-<stage>` (tarballs under `sha512/`, file views under `files/`, and under `state/` the install block list and the queue probe's last record), the R2 bucket `apmjs-cli-<stage>` (the CLI's binaries and install script, bound to the website as `CLI`; see [The apm CLI](#the-apm-cli)), the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
 
 ## State
 
@@ -161,6 +161,34 @@ With `--yes` it takes the release lock first (exit 6 while someone else holds it
 Workers it already changed stay changed, and it prints which went back and which did not. Read that output before running anything else.
 
 The database itself never rolls back.
+
+## The apm CLI
+
+`curl -fsSL https://apmjs.dev/install | sh` installs the CLI as one standalone binary (`bun build --compile`; no Bun or git needed to run it). The website serves, from the stage's `apmjs-cli-<stage>` bucket (`apps/web/lib/cli-download.ts`, answered in `proxy.ts` so a 100 MB binary streams straight from R2):
+
+| Path | What | Cache |
+| --- | --- | --- |
+| `/install` | the install script (`packages/infra/cli-install.ts`), with every released binary's SHA-256 written into it | 5 minutes |
+| `/cli/releases.txt` | every released binary: version, platform, SHA-256 | 5 minutes |
+| `/cli/<version>/apm-<target>` | a binary: `linux-x64`, `linux-arm64`, `linux-x64-musl`, `darwin-x64`, `darwin-arm64`; served only once `<version>/SHA256SUMS` exists, an uncached 404 before | a year, immutable |
+| `/cli/<version>/SHA256SUMS` | that version's checksums, as `sha256sum -c` reads them | a year, immutable |
+
+A release uploads files and deploys nothing:
+
+```sh
+bun packages/infra/release-cli.ts --stage staging
+bun packages/infra/release-cli.ts --stage production
+```
+
+It releases the version in `packages/cli/src/version.ts` (keep `packages/cli/package.json` the same; a test checks). It holds the release lock, builds the five binaries, checks this machine's own one runs without Bun on PATH and prints the version, uploads them, then writes `cli/<version>/SHA256SUMS`, which is what makes the version released. Then it rebuilds `cli/releases.txt` and the install script from every released version and publishes both, downloads every binary back through the site and hashes it, compares the script the site serves with the one it wrote, and runs the install command into a fresh HOME. Only then does it append a line to `~/.config/apmjs/cli-releases.jsonl` (`APM_CLI_RELEASES_LEDGER`), a separate file from `releases.jsonl`, which `rollback.ts` trusts. Production also refuses a tree with uncommitted changes.
+
+A released version never changes. A run that finds the version's `SHA256SUMS` builds nothing and uploads no binary; it only republishes the index and the script if they differ, and checks them. A run cut short before `SHA256SUMS` uploads the binaries again. So rerunning is always safe. To ship new CLI code, raise the version first.
+
+The website must be deployed with the bucket before the first release on a stage: `deploy.ts` creates the bucket and the binding, and the release fails its checks (and records nothing) until the site serves `/install` and `/cli/*`. The smoke check runs the install on every deploy; until a stage has a CLI release on record it passes as skipped, and after that `/install` must work.
+
+The darwin binaries are ad-hoc signed by `bun build --compile` (`codesign -dv` shows `Signature=adhoc`), which is enough for macOS to run a binary that curl downloaded. The musl build needs `libstdc++` and `libgcc`; the script says so when it does not run.
+
+To try a release on this machine: `bun packages/infra/release-cli.ts --stage local --serve` keeps the bucket in `~/.cache/apm-cli-local` and serves it on `http://127.0.0.1:8790` with the website's own handler in workerd. `--host <tailscale address>` serves it to other machines.
 
 ## Health checks
 

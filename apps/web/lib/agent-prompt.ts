@@ -2,7 +2,7 @@
 // checks) and one on the home page (connect apm's MCP server and say when to use it). Pure, so the tests read
 // the same text a person copies. Short on purpose, and each works in any agent: the verdict comes from plain HTTP
 // (GET /api/explain), with the MCP tool explain_install as an option, and the install is the command the verdict
-// gives. Neither depends on the apm CLI, which is not on a registry yet. The verdicts are in docs/AGENTS.md.
+// gives. Neither needs the apm CLI installed. The verdicts are in docs/AGENTS.md.
 import { MCP_URL, siteUrl } from "@/lib/agent/site";
 
 export const AGENTS = ["Claude Code", "Codex", "Cursor"] as const;

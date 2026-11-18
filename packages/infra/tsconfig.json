@@ -13,5 +13,5 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["alchemy.run.ts", "deploy.ts", "deploy-guard.ts", "install-checks.ts", "rollback.ts", "release-lock.ts", "stage.ts", "web-env.ts", "web-build.ts", "build-web.ts", "test/**/*.ts"]
+  "include": ["alchemy.run.ts", "release-cli.ts", "cli-*.ts", "smoke.ts", "deploy.ts", "deploy-guard.ts", "install-checks.ts", "rollback.ts", "release-lock.ts", "stage.ts", "web-env.ts", "web-build.ts", "build-web.ts", "test/**/*.ts"]
 }

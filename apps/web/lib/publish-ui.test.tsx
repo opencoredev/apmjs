@@ -19,26 +19,30 @@ describe("publishPrompt", () => {
     expect(p.toLowerCase()).not.toContain("mcp add");
   });
 
-  // the repository's default branch is not main, and a full install of the repository is over 2 GB
-  test("gets the CLI from main, installing only what it needs", () => {
-    expect(p).toContain("git clone --depth 1 --branch main https://github.com/opencoredev/apmjs.git <cli>");
-    expect(p).toContain("(cd <cli> && bun install --filter @apm/cli)");
-    expect(p).toContain("ask me before installing it");
+  // one prebuilt binary from the site, checked against the SHA-256 in the script: no git, no Bun, no clone. The script
+  // is saved outside the package, run only when it arrived whole, with the destination pinned (review of 1919be8,
+  // findings 1 and 2; packages/infra/test/publish-install.test.ts runs these lines)
+  test("installs the CLI with the site's install script, which checks the binary's SHA-256", () => {
+    expect(p).toContain(
+      `1. Install the apm CLI. Do this every time, even if apm is already installed, so you use a copy that was just checked. Run this as one shell command:\n   APM_DIR="$(mktemp -d)" && APM_SCRIPT="$APM_DIR/install.sh" && curl -fsSL https://apmjs.dev/install -o "$APM_SCRIPT" && tail -n 1 "$APM_SCRIPT" | grep -Fqx 'main "$@"' && APM_OUT="$(APM_INSTALL="$HOME/.apm" sh "$APM_SCRIPT")" && printf '%s\\n' "$APM_OUT" && printf '%s\\n' "$APM_OUT" | grep -q '^SHA-256 [0-9a-f]\\{64\\}, checked against this script$' && [ -x "$HOME/.apm/bin/apm" ]\n`,
+    );
+    expect(p).toContain("checks its SHA-256 against the checksum written into the script, and installs nothing if they differ");
+    expect(p).toContain("ask me before installing anything else");
+    expect(p).not.toContain("| sh");
+    expect(p).not.toContain("git clone");
+    expect(p).not.toContain("bun install");
   });
 
-  // an existing copy may be a fork, track another upstream, run git hooks or hold edited dependencies: never reused
-  test("always makes a fresh copy of the CLI and never reuses or updates an old one", () => {
-    expect(p).toContain('Run "mktemp -d"; below, <cli> is the folder it printed followed by "/apm", in quotes if it has spaces.');
-    expect(p).toContain("never reuse or update an existing copy (such as ~/.apm-cli)");
-    expect(p).not.toContain("pull");
-    expect(p).not.toContain("git -C");
-    expect(manualSteps(target).split("\n")[0]).toBe('APM_CLI="$(mktemp -d)/apm"');
-    expect(manualSteps(target)).not.toContain("pull");
+  // a copy installed earlier could have been changed: the installer runs every time and replaces it with a checked one
+  test("never runs an apm installed earlier without installing again", () => {
+    expect(p).toContain("Do this every time, even if apm is already installed");
+    expect(manualSteps(target).split("\n")[0]).toBe('apm() { echo "apm: the install did not succeed, so nothing was run" >&2; return 1; }');
+    expect(manualSteps(target)).not.toContain("git");
   });
 
   // a project or user .npmrc that names npm's registry would otherwise send the login and the upload there
   test("pins every apm command to apm's registry", () => {
-    expect(p).toContain('"apm" means: APM_REGISTRY=https://registry.apmjs.dev/ bun <cli>/packages/cli/src/main.ts');
+    expect(p).toContain('"apm" means: APM_REGISTRY=https://registry.apmjs.dev/ "$HOME/.apm/bin/apm"');
     expect(p).toContain("Publish only to https://registry.apmjs.dev/, never to npmjs.org.");
   });
 
@@ -65,7 +69,7 @@ describe("publishPrompt", () => {
   test("the manual steps are the same commands", () => {
     const m = manualSteps(target);
 
-    expect(m).toContain('apm() { APM_REGISTRY=https://registry.apmjs.dev/ bun "$APM_CLI"/packages/cli/src/main.ts "$@"; }');
+    expect(m).toContain(`[ -x "$HOME/.apm/bin/apm" ] && apm() { APM_REGISTRY=https://registry.apmjs.dev/ "$HOME/.apm/bin/apm" "$@"; }`);
     expect(m).toContain("apm login\n");
     expect(m).toContain('"name": "@alice/my-package"');
   });

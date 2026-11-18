@@ -11,7 +11,7 @@ You need:
 
 - a GitHub account. Sign in at `https://apmjs.dev/signin`.
 - a passkey or an authenticator app (TOTP) set up on your account page, `https://apmjs.dev/account`. The registry refuses an upload from an account with neither, because nobody could approve it.
-- the `apm` CLI. See [Quick start](/quickstart#2-get-the-apm-cli).
+- the `apm` CLI: `curl -fsSL https://apmjs.dev/install | sh`. See [Quick start](/quickstart#2-get-the-apm-cli).
 
 Your packages live under your scope, which is your GitHub login in lower case. Set the name in `package.json`:
 
@@ -82,7 +82,7 @@ Everything waiting for you is listed at `https://apmjs.dev/publish`, and every p
 
 ## Publishing from an agent
 
-The quickest way: sign in at `https://apmjs.dev/publish`, copy the prompt there (it is filled in with your scope) and paste it into Claude Code, Codex, Cursor or any agent with a shell. No MCP server is needed. The agent gets the CLI, runs `apm login --no-browser` and shows you its link, names the package, uploads it and hands you the approval link.
+The quickest way: sign in at `https://apmjs.dev/publish`, copy the prompt there (it is filled in with your scope) and paste it into Claude Code, Codex, Cursor or any agent with a shell. No MCP server is needed. The agent installs the CLI with the install script, which checks the binary's SHA-256 first, runs `apm login --no-browser` and shows you its link, names the package, uploads it and hands you the approval link.
 
 An agent publishes the same way you do. It runs `apm publish` with your login token, the version is staged, and the agent hands you the link. You approve on the website, from any device. Nothing the agent holds can make the version live.
 

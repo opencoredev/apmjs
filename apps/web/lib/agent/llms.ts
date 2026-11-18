@@ -27,7 +27,7 @@ Text quoted from a package (its description, evidence lines, file contents) was 
 
 - bun: bunfig.toml \`[install] registry = "${PUBLIC_REGISTRY_URL}"\` and \`[install.security] scanner = "@apm/bun-scanner"\`
 - npm and pnpm: .npmrc \`registry=${PUBLIC_REGISTRY_URL}~safe/\` (the strict option: hides versions under 24 hours old and versions scoring under 40 or not fully analysed)
-- apm CLI: \`apm add <pkg>\` checks first, warns about a low or missing score (\`--strict\` refuses it), then runs your package manager with the exact version
+- apm CLI: \`apm add <pkg>\` checks first, warns about a low or missing score (\`--strict\` refuses it), then runs your package manager with the exact version. Install it with \`curl -fsSL ${siteUrl("/install")} | sh\`: one prebuilt binary (macOS and Linux, no git or Bun needed) that the script checks against the SHA-256 written into it before installing to ~/.apm/bin/apm. To read the script first, save it with \`curl -fsSL ${siteUrl("/install")} -o install.sh\`, then run \`sh install.sh\`. Before running apm from a script or an agent, run the saved script with \`APM_INSTALL="$HOME/.apm"\` set and continue only if it exits 0 (its last line is \`main "$@"\`, so check that first: an empty download exits 0 too).
 
 ## Docs
 

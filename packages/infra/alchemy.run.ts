@@ -1,5 +1,5 @@
 // apm on Cloudflare, as one Alchemy stack: the registry Worker with its R2 bucket, analysis queue and Hyperdrive
-// in front of Neon, and the website Worker. Stages: "staging" serves on workers.dev; "production" on apmjs.dev.
+// in front of Neon, and the website Worker with the CLI's bucket. Stages: "staging" serves on workers.dev; "production" on apmjs.dev.
 // Secrets arrive as environment variables from deploy.ts, which reads them from ~/.config/apmjs.
 import { resolve } from "node:path";
 import * as Cloudflare from "@alchemy.run/cloudflare";
@@ -34,6 +34,9 @@ export default Alchemy.Stack(
 
     const blobs = yield* Cloudflare.R2.Bucket("Blobs", { name: `apmjs-blobs-${stage}` });
     const analysis = yield* Cloudflare.Queues.Queue("Analysis", { name: `apmjs-analysis-${stage}` });
+    // The apm CLI's install script and binaries (release-cli.ts uploads them; the website serves /install and /cli/*).
+    // Its own bucket, so nothing the registry writes or cleans up can touch a released binary.
+    const cli = yield* Cloudflare.R2.Bucket("Cli", { name: `apmjs-cli-${stage}` });
 
     const postgres = yield* Cloudflare.Hyperdrive.Connection("Postgres", {
       name: `apmjs-${stage}`,
@@ -124,7 +127,7 @@ export default Alchemy.Stack(
       rootDir: resolve(import.meta.dirname, "../../apps/web"),
       // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs. It also makes the
       // registry deploy first: Alchemy starts the website only once the registry has finished (deploy.ts, "Order")
-      env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage), ...databuddyWorkerEnv(stage), ...provenance },
+      env: { REGISTRY: registry, CLI: cli, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage), ...databuddyWorkerEnv(stage), ...provenance },
       openNext: WEB_BUILD,
       assets: { runWorkerFirst: WEB_ASSETS.runWorkerFirst === true ? true : [...WEB_ASSETS.runWorkerFirst] },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },

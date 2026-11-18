@@ -51,18 +51,65 @@ For npm and pnpm, the plain registry URL (without `~safe/`) serves every version
 
 ## 2. Get the apm CLI
 
-`apm` is not on a registry yet. Run it from a clone of the `main` branch. You need git and Bun 1.4 or newer.
+Install it with one command. It downloads one prebuilt binary for macOS or Linux (x64 or arm64, and musl systems such as Alpine on x64). Running it needs no git, Bun or Node.
 
 ```bash
-git clone --depth 1 --branch main https://github.com/opencoredev/apmjs.git ~/.apm-cli
-(cd ~/.apm-cli && bun install --filter @apm/cli)
-alias apm="bun ~/.apm-cli/packages/cli/src/main.ts"
+curl -fsSL https://apmjs.dev/install | sh
+```
+
+The script installs to `~/.apm/bin/apm`, never uses sudo and does not edit your shell profile. It prints the line to add to your PATH instead:
+
+```bash
+export PATH="$HOME/.apm/bin:$PATH"
 apm --version
 ```
 
-`--filter @apm/cli` installs only what the CLI needs (about 11 MB), not the whole repository's tools. To update later, run `git -C ~/.apm-cli pull`.
+`apm --version` prints `0.1.0`. To update, run the install command again. To uninstall, delete `~/.apm`.
 
-`apm --version` prints `0.1.0`. Put the `alias` line in your shell profile to keep it.
+### What the install script checks
+
+When a version is released, the SHA-256 of each of its binaries is written into the script. The script downloads the binary for your machine from `https://apmjs.dev/cli/<version>/`, compares its SHA-256 with that list, and installs nothing if they differ. It also runs the binary once and installs it only if it reports that version. It prints the fingerprint it checked:
+
+```
+apm 0.1.0 (darwin-arm64) installed to /Users/you/.apm/bin/apm
+SHA-256 69040289006fa1feea7eba4e7b5669ef2493e5fca7a5abdc6533e31b260b8a76, checked against this script
+```
+
+To read the script before it runs, save it first:
+
+```bash
+curl -fsSL https://apmjs.dev/install -o install.sh
+less install.sh
+sh install.sh
+```
+
+### In scripts and agents
+
+`curl | sh` suits a person who reads what it prints. A script or an agent that runs apm next must not carry on after a failed install with an apm left from before. Save the script to a temporary folder, run it only if it arrived whole, pin where it installs, and run apm only if the install succeeded:
+
+```bash
+APM_DIR="$(mktemp -d)" &&
+  APM_SCRIPT="$APM_DIR/install.sh" &&
+  curl -fsSL https://apmjs.dev/install -o "$APM_SCRIPT" &&
+  tail -n 1 "$APM_SCRIPT" | grep -Fqx 'main "$@"' &&
+  APM_OUT="$(APM_INSTALL="$HOME/.apm" sh "$APM_SCRIPT")" &&
+  printf '%s\n' "$APM_OUT" &&
+  printf '%s\n' "$APM_OUT" | grep -q '^SHA-256 [0-9a-f]\{64\}, checked against this script$' &&
+  "$HOME/.apm/bin/apm" --version
+```
+
+The script's last line is the call that runs it, so an empty or cut-off download fails the `tail` check instead of exiting 0 with nothing installed, and apm runs only when the install printed the SHA-256 it checked. This is what the prompt on `https://apmjs.dev/publish` gives agents.
+
+To check a binary by hand, compare its SHA-256 with the line for your platform in the script and in the version's published checksums:
+
+```bash
+curl -fsSL https://apmjs.dev/cli/0.1.0/SHA256SUMS
+shasum -a 256 ~/.apm/bin/apm     # sha256sum on Linux
+```
+
+The script, the checksums and the binaries all come from apmjs.dev. The check proves the binary is the one released with the script you read; it does not prove who released it.
+
+`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.0`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
 
 apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then falls back to bun when bun is installed and npm when it is not. Pass `--pm npm` to choose.
 

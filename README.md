@@ -23,7 +23,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 - `packages/registry`: the registry, a Cloudflare Worker (npm wire protocol, apm API, upstream proxy) written as Effect services over Postgres (Neon via Hyperdrive), R2 and a queue
 - `packages/infra`: the Alchemy stack that deploys the registry and the website, plus the deploy and smoke scripts
 - `packages/core`: score engine, secret scanner, typo distance, tarball reader
-- `packages/cli`: `apm`
+- `packages/cli`: `apm`, released as standalone binaries by `packages/infra/release-cli.ts`
 - `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and confirmed-malicious versions and warn about low-scoring ones (`APM_SCANNER_STRICT=1` refuses those too)
 - `apps/web`: Next.js + shadcn UI (search with name check, package pages), deployed as a Worker through OpenNext
 - `apps/docs`: the documentation site at https://docs.apmjs.dev, built with [Blume](https://useblume.dev) and served as static assets (`cd apps/docs && bun run dev`)
@@ -34,6 +34,14 @@ How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## For agents
 
 An agent needs no MCP server and no account. Before adding a package it fetches `GET https://apmjs.dev/api/explain?package=<name>` and follows the verdict; one line in AGENTS.md or CLAUDE.md sets that up. The same answers: `/package/<name>.md`, `/openapi.json`, `/llms.txt` and `apm explain <pkg> --json`. To publish, sign in at https://apmjs.dev/publish and paste its prompt into your agent: it runs the apm CLI, and you approve each version with your passkey. An optional read-only MCP server is at `https://apmjs.dev/mcp`. Details: [docs/AGENTS.md](docs/AGENTS.md).
+
+## Install the CLI
+
+```sh
+curl -fsSL https://apmjs.dev/install | sh
+```
+
+One prebuilt binary for macOS or Linux; it needs no git or Bun. The script checks the binary's SHA-256 against the checksum written into it at release and installs nothing if they differ, then installs to `~/.apm/bin/apm` and prints the PATH line to add. To read it first: `curl -fsSL https://apmjs.dev/install -o install.sh`, then `sh install.sh`. How it is built and released: `bun packages/infra/release-cli.ts` ([docs/DEPLOY.md](docs/DEPLOY.md#the-apm-cli)).
 
 ## Run it
 

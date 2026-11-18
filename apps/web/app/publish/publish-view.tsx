@@ -114,7 +114,7 @@ function ManualSteps({ target }: { target: PublishTarget }) {
         Publish from your own terminal instead
       </summary>
       <div className="mt-3 flex flex-col gap-3">
-        <CopyBlock text={manualSteps(target)} label="Copy the commands" caption="Needs git and Bun 1.4 or newer. apm login prints a link: approve it in your browser." />
+        <CopyBlock text={manualSteps(target)} label="Copy the commands" caption="The install script checks the binary's SHA-256 before it installs; read it first at /install. apm login prints a link: approve it in your browser." />
         <p className="text-[13px] leading-5 text-pretty text-muted-foreground">
           After apm login, <code className="font-mono text-foreground">npm publish</code> and <code className="font-mono text-foreground">bun publish</code> work too, with{" "}
           <code className="font-mono text-foreground">--registry {target.registry}</code>. They skip apm&apos;s local checks; the registry still runs its own.

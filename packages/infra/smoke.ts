@@ -1,7 +1,8 @@
 // Checks a deployed stage the way people use it: stock bun and npm install real npm packages through it, apm add
 // refuses a low-score package, a login token stages a publish that goes live only after a TOTP approval, and
-// bun audit reads advisories through it. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No install
-// it runs executes an install script, and the raw npm and bun installs install committed lockfiles (smoke-commands.ts,
+// bun audit reads advisories through it, and the stage's own CLI install script (/install) installs apm into a fresh
+// HOME after checking its SHA-256. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No package install
+// it runs executes a package's install script, and the raw npm and bun installs install committed lockfiles (smoke-commands.ts,
 // smoke-fixtures/): what a registry answers never runs code here and cannot add a dependency. That the registry
 // resolves versions is checked by reading its metadata, without installing.
 //
@@ -26,6 +27,8 @@ import { Client } from "pg";
 import { z } from "zod";
 import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
+import { installCheck } from "./cli-check.ts";
+import { readCliReleases } from "./cli-ledger.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
@@ -93,6 +96,28 @@ async function identity(when: "before" | "after"): Promise<void> {
 
     record(r.ok, `${name} answers with this run's build ${when} the checks`, r.detail);
   }
+}
+
+// ---------- the CLI's install ----------
+/**
+ * The documented install, `curl -fsSL <site>/install | sh`, into a fresh HOME (cli-check.ts): it must install, the
+ * installed apm must print the version, and the fingerprint the script printed must be the installed file's SHA-256 and
+ * the one the version's SHA256SUMS lists. A stage with no CLI release yet answers /install with 404 and a sentence
+ * saying so; that passes only while the CLI release record (cli-ledger.ts) has no release for the stage.
+ */
+async function cliInstall(): Promise<void> {
+  const site = web.replace(/\/$/, "");
+  const res = await fetch(`${site}/install`, { method: "HEAD" });
+
+  if (res.status === 404 && readCliReleases(stage).length === 0) {
+    record(true, "the CLI install script", `skipped: no CLI release on ${stage} yet (bun packages/infra/release-cli.ts --stage ${stage})`);
+
+    return;
+  }
+
+  const r = await installCheck(site);
+
+  record(r.ok, `curl -fsSL ${site}/install | sh installs apm and checks its SHA-256`, r.detail);
 }
 
 // ---------- docs ----------
@@ -338,7 +363,7 @@ async function call(path: string, init: { method?: string; jar?: Jar; body?: unk
 }
 
 const TotpUri = z.object({ totpURI: z.string() });
-const Packed = z.array(z.object({ filename: z.string(), integrity: z.string() })).length(1);
+const Packed = z.tuple([z.object({ filename: z.string(), integrity: z.string() })]);
 const DeviceStart = z.object({ deviceCode: z.string(), userCode: z.string() });
 const DeviceToken = z.object({ token: z.string(), username: z.string() });
 const AccountView = z.object({ security: z.object({ totp: z.boolean() }) });
@@ -426,6 +451,8 @@ process.stdout.write(`smoke: ${stage} registry ${registry}\n`);
 await identity("before");
 
 await docsSite();
+
+await cliInstall();
 
 await stockClients();
 

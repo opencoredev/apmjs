@@ -22,7 +22,18 @@ const AGENTS_GUIDE = "https://github.com/opencoredev/apmjs/blob/main/docs/AGENTS
 const SECTIONS = [
   { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at the registry and add @apm/bun-scanner. Plain bun install then refuses revoked and confirmed-malicious versions and warns about packages scoring under 40.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
   { id: "npm", title: "Use it with npm or pnpm", body: "Set registry=https://registry.apmjs.dev/~safe/ in .npmrc. The view skips versions younger than 24 hours and versions scoring under 40.", href: `${DOCS}/guides/safe-view`, link: "The ~safe view" },
-  { id: "cli", title: "The CLI", body: "apm add, apm x and apm publish check first, then hand the work to the package manager your project already uses.", href: `${DOCS}/reference/cli`, link: "CLI reference" },
+  {
+    id: "cli",
+    title: "The CLI",
+    body: "apm add, apm x and apm publish check first, then hand the work to the package manager your project already uses. It installs as one binary for macOS or Linux, with no git or Bun needed. The install script checks the binary's SHA-256 against the checksum written into it before it installs anything, so you can read the script first and know exactly what it will accept.",
+    code: `curl -fsSL ${siteUrl("/install")} | sh
+
+# or read the script before running it
+curl -fsSL ${siteUrl("/install")} -o install.sh
+sh install.sh`,
+    href: `${DOCS}/reference/cli`,
+    link: "CLI reference",
+  },
   { id: "pulling", title: "Pulling a bad version", body: "Yank hides a version from new installs. Revoke pulls a malicious one for everyone, with a fresh second factor; a version under 72 hours old is revoked at once, even when other packages depend on it. apm incident revokes every token and recent version after a compromise.", href: `${DOCS}/guides/pull-a-version`, link: "Yank, revoke and incident response" },
   { id: "score", title: "What the score is, and is not", body: "A static read of every file and the publish history, with a file and line for every point lost. Points go to what malware does: network and processes at install time, credential files read, the environment sent out, request bins, remote shells, obfuscation. It cannot see code that only shows what it does at runtime.", href: `${DOCS}/concepts/score`, link: "How the score works" },
   { id: "capabilities", title: "Capabilities", body: "What a version can do (the network, environment variables, files, processes, dynamic code, native code, install scripts) is listed beside the score with its evidence, and costs nothing. A package can declare its capabilities under apm.capabilities in package.json; a used capability it leaves out costs points.", href: `${DOCS}/concepts/capabilities`, link: "Declaring capabilities" },
@@ -135,6 +146,7 @@ export default function Docs() {
             {s.title}
           </h2>
           <p className="text-[17px] leading-7 text-pretty text-muted-foreground">{s.body}</p>
+          {"code" in s && <Code label="Install the apm CLI">{s.code}</Code>}
           <a href={s.href} className="self-start font-medium text-foreground underline underline-offset-4">
             {s.link}
           </a>
