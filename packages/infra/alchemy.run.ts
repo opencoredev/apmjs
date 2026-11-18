@@ -56,6 +56,10 @@ export default Alchemy.Stack(
     // the full Server-Timing is on when deploy.ts found this stage's debug token; only its sha256 is sent
     const debugTokenHash = yield* Config.withDefault(Config.String("DEBUG_TOKEN_HASH"), "");
     const debug = Object.fromEntries(debugTokenHash === "" ? [] : [["APM_DEBUG_TOKEN_HASH", debugTokenHash]]);
+    // what install reads of npm's packages check (registry edge-checks.ts): "database", one statement each (the
+    // default), or "edge", each isolate's read of the block list with no database round trip. deploy.ts sets it from
+    // --install-checks; turn edge on only once a build with the publish fence is the only one live (docs/DEPLOY.md)
+    const installChecks = z.enum(["database", "edge"]).parse(yield* Config.withDefault(Config.String("INSTALL_CHECKS"), "database"));
 
     // plain-text variables only: a commit id, a build id and migration ids (deploy.ts), stamped on the registry and the website
     const provenance = z.record(z.string().regex(/^APM_[A-Z0-9_]+$/), z.string()).parse(JSON.parse(yield* Config.withDefault(Config.String("APM_PROVENANCE"), "{}")));
@@ -85,6 +89,7 @@ export default Alchemy.Stack(
         APM_AUTH_SECRET: yield* Config.Redacted("AUTH_SECRET"),
         APM_GITHUB_CLIENT_ID: yield* Config.String("GITHUB_CLIENT_ID"),
         APM_GITHUB_CLIENT_SECRET: yield* Config.Redacted("GITHUB_CLIENT_SECRET"),
+        APM_INSTALL_CHECKS: installChecks,
         // what built this version: its commit, its deploy run and its sealed migration manifest (rollback.ts provenanceVars).
         // deploy-record.ts confirms the live version carries them before it records the run, and /-/ping reports APM_BUILD
         ...provenance,

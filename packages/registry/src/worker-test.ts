@@ -9,7 +9,8 @@
 // public-log insert fail inside Postgres for that request. All of it answers only to a caller holding
 // TEST_CONTROL_SECRET, a binding the deployed Worker does not have. TEST_R2_DELAY_MS (another binding only benches
 // set, "30" or "20-50") adds that many milliseconds, or a uniform draw in that range, before every call to the R2
-// bucket, as production's R2 round trip does.
+// bucket, as production's R2 round trip does. TEST_PUBLISH_FENCE_MS (another binding) is how long a first publish
+// waits for edge views (production: FIRST_PUBLISH_HOLD_MS, edge-checks.ts); without it the suite's publishes skip it.
 import { Effect } from "effect";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
@@ -17,7 +18,7 @@ import { Store, type StoreFault } from "./db.ts";
 import { fail, json } from "./http.ts";
 import { issueToken } from "./server.ts";
 import { FETCHED_AT_HEADER, packumentKey, READ_AT_HEADER } from "./upstream.ts";
-import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv } from "./worker.ts";
+import worker, { consume, handle, parseEnv, servicesFor, sweep, type RawEnv, type TestControls } from "./worker.ts";
 
 /** A positive millisecond time from a test header, or null. */
 function timeHeader(req: Request, name: string): number | null {
@@ -35,7 +36,16 @@ function testClock(req: Request): ReturnType<typeof Clock.fixed> {
 const MintBody = z.object({ user: z.string().min(1), scope: z.enum(["publish", "stage"]) });
 
 /** The test Worker's env: the production bindings plus the control secret the harness holds and the bench's R2 delay. */
-type TestEnv = RawEnv & { readonly TEST_CONTROL_SECRET?: string; readonly TEST_R2_DELAY_MS?: string };
+type TestEnv = RawEnv & { readonly TEST_CONTROL_SECRET?: string; readonly TEST_R2_DELAY_MS?: string; readonly TEST_PUBLISH_FENCE_MS?: string };
+
+const PublishFenceMs = z.object({ TEST_PUBLISH_FENCE_MS: z.string().regex(/^\d+$/).transform(Number) });
+
+/** The test entry's controls: the faults `faults` names, and the publish fence the env asks for (none by default). */
+function controlsFor(env: TestEnv, faults: ReadonlySet<StoreFault>): TestControls {
+  const fence = PublishFenceMs.safeParse(env);
+
+  return { faults, publishFenceMs: fence.success ? fence.data.TEST_PUBLISH_FENCE_MS : 0 };
+}
 
 const R2Delay = z.object({
   TEST_R2_DELAY_MS: z
@@ -227,7 +237,7 @@ export default {
 
     if (path === "/__test/sweep") return trusted && req.method === "POST" ? sweep(env, clock).then(() => json({ ok: true })) : fail(404, "Not found");
 
-    if (!trusted) return handle(req, env, clock, ctx);
+    if (!trusted) return handle(req, env, clock, ctx, controlsFor(env, new Set()));
     const headers = new Headers(req.headers);
     headers.delete("x-apm-test-control");
     headers.delete("x-apm-test-now");
@@ -235,7 +245,7 @@ export default {
     headers.delete("x-apm-test-queue");
     headers.delete("x-apm-test-fault");
 
-    return handle(new Request(req, { headers }), envFor(req, env), clock, ctx, faultsFor(req));
+    return handle(new Request(req, { headers }), envFor(req, env), clock, ctx, controlsFor(env, faultsFor(req)));
   },
   queue: worker.queue,
   scheduled: worker.scheduled,

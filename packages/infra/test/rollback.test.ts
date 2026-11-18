@@ -82,7 +82,7 @@ function reset(): void {
   releases = [
     release(B1, ALL.slice(0, -1), { registry: "rv1", docs: "dv1" }),
     release(B2, ALL, { registry: "rv2", web: "wv1", docs: "dv0" }),
-    release(B3, ALL, { registry: "rv3", web: "wv2" }),
+    { ...release(B3, ALL, { registry: "rv3", web: "wv2" }), installChecks: "edge" },
     release(B4, ALL, { registry: "rv4", web: "wv3" }),
   ];
 }
@@ -205,6 +205,10 @@ describe("rollback.ts, the manual command", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("apmjs-registry-production:");
     expect(r.out).toMatch(/live {2}r3 {2}2026-11-16T10:00:00Z/);
+    // the registry's lines say what its install reads checked; a line from before the field, the database
+    expect(r.out).toMatch(/live {2}r3 {2}2026-11-16T10:00:00Z.*build aaaa0003 \(sha-of-aaaa0\), install checks edge/);
+    expect(r.out).toMatch(/r2 {2}2026-11-15T10:00:00Z.*install checks database/);
+    expect(r.out).toMatch(/versions wv2 {2}build aaaa0003 \(sha-of-aaaa0\)\n/);
     expect(r.out).toContain("apmjs-docs-production:");
     expect(r.out).not.toContain(TOKEN);
     expect(posted).toEqual([]);
@@ -506,11 +510,23 @@ describe("the release record", () => {
 });
 
 describe("deploy-record.ts, after a deploy whose smoke check passed", () => {
-  const stamp = (build: string, manifest: readonly string[] = ALL, sha = `sha-of-${build}`) => provenanceVars(sha, build, manifest);
+  // the registry's live version carries the install-check mode it was deployed with too; the website's ignores it
+  const stamp = (build: string, manifest: readonly string[] = ALL, sha = `sha-of-${build}`, installChecks: "database" | "edge" = "database") => ({ ...provenanceVars(sha, build, manifest), APM_INSTALL_CHECKS: installChecks });
 
-  const record = (extra: { deadlineMs?: number } = {}) => {
+  const record = (extra: { deadlineMs?: number; installChecks?: "database" | "edge" } = {}) => {
     const written: Release[] = [];
-    const done = recordLiveRelease({ cf: cf(), stage: "production", build: B5, sha: `sha-of-${B5}`, manifest: ALL, append: (r) => void written.push(r), deadlineMs: extra.deadlineMs ?? 400, intervalMs: 20 });
+
+    const done = recordLiveRelease({
+      cf: cf(),
+      stage: "production",
+      build: B5,
+      sha: `sha-of-${B5}`,
+      manifest: ALL,
+      installChecks: extra.installChecks ?? "database",
+      append: (r) => void written.push(r),
+      deadlineMs: extra.deadlineMs ?? 400,
+      intervalMs: 20,
+    });
 
     return { written, done };
   };
@@ -534,8 +550,25 @@ describe("deploy-record.ts, after a deploy whose smoke check passed", () => {
           // assets-only: it keeps no variables, so what is live is recorded as it is
           docs: { script: "apmjs-docs-production", versionId: "dv1" },
         },
+        installChecks: "database",
       },
     ]);
+  });
+
+  test("the line records the install-check mode, once the registry's live version says that mode", async () => {
+    versionVars.set("rv3", stamp(B5));
+    versionVars.set("wv2", stamp(B5));
+    // this run deployed edge views, but the live registry still says database: not this run's version
+    const early = record({ installChecks: "edge" });
+    const r = await early.done;
+
+    expect(r.kind === "not-recorded" ? r.why : "").toContain("apmjs-registry-production version rv3 says build aaaa0005 but differs from this run's stamp in APM_INSTALL_CHECKS");
+    expect(early.written).toEqual([]);
+    versionVars.set("rv3", stamp(B5, ALL, `sha-of-${B5}`, "edge"));
+    const { written, done } = record({ installChecks: "edge" });
+
+    expect((await done).kind).toBe("recorded");
+    expect(written[0]?.installChecks).toBe("edge");
   });
 
   test("a stale deployment list naming an older version is never labelled with this run: it waits, then records nothing", async () => {

@@ -90,8 +90,9 @@ import {
 import { ReviewConfig, reviewStandings } from "./review.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarning, UNAVAILABLE_TEXT, versionUrl, warningLines, type InstallWarning, type WarningSignal } from "./warnings.ts";
+import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
-import { timingOrNull } from "./timing.ts";
+import { timed as timedOf, timingOrNull } from "./timing.ts";
 import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -3659,15 +3660,50 @@ const INSTALL_HEADERS = { "content-type": "application/vnd.npm.install-v1+json; 
  */
 const installPackument = (name: string, upstream: UpstreamApi) =>
   Effect.gen(function* () {
+    const edge = Option.getOrNull(yield* Effect.serviceOption(EdgeChecks));
+    const answer = yield* installAnswer(name, upstream, edge);
+
+    if (answer !== EXPIRED) return answer;
+    // the edge view's clearance aged past its window while npm or the copy was read: the database decides, from the start
+    const decided = yield* installAnswer(name, upstream, null);
+
+    // without an edge view there is no clearance to age
+    return decided === EXPIRED ? yield* Effect.die(new Error("installAnswer: a database read expired")) : decided;
+  });
+
+/** What installAnswer gives when the edge view that cleared the name is too old to answer by the time it would. */
+const EXPIRED = "expired";
+
+/** What an install document is decided from: the two facts, the stamp of the confirmed set, and the edge's clearance if it decided. */
+type InstallFacts = { read: { local: boolean; confirmed: { version: string; digest: string }[] }; stamp: string | null; clearance: Clearance | null };
+
+/** installPackument's answer, deciding from `edge` (APM_INSTALL_CHECKS=edge) when there is one, else from the database. */
+const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi | null) =>
+  Effect.gen(function* () {
     const { baseUrl } = yield* RegistryConfig;
     const lease = yield* RequestMemory;
     // the statement and the copy's lookup (with npm's 304 when it is past the TTL) run at once; the copy answers only
     // for the stamp of the confirmed set this statement read
-    const stamped = Effect.flatMap((yield* Store).installRead(name), (read) => Effect.map(read.local ? Effect.succeed(null) : Effect.promise(() => installStamp(read.confirmed)), (stamp) => ({ read, stamp })));
-    const { read: looked, copy } = yield* upstream.installCopy({ name, served: baseUrl, lease, read: stamped, stampOf: (r) => r.stamp });
-    const { read, stamp } = looked;
 
-    if (copy === null || stamp === null) return null;
+    const fromDatabase: Effect.Effect<InstallFacts, StoreError> = Effect.flatMap((yield* Store).installRead(name), (read) =>
+      Effect.map(read.local ? Effect.succeed(null) : Effect.promise(() => installStamp(read.confirmed)), (stamp) => ({ read, stamp, clearance: null })),
+    );
+    // with APM_INSTALL_CHECKS=edge, a name this isolate's edge view clears (not published here, no version confirmed
+    // malicious) needs no statement: the database would read the same two facts (edge-checks.ts says how fresh)
+
+    const timed = timedOf(yield* timingOrNull, "edge");
+    const cleared = (clearance: Clearance): Effect.Effect<InstallFacts> => Effect.map(Effect.promise(() => installStamp([])), (stamp) => ({ read: { local: false, confirmed: [] }, stamp, clearance }));
+    const stamped: Effect.Effect<InstallFacts, StoreError> = edge === null ? fromDatabase : Effect.flatMap(timed(edge.verdict(name)), (verdict) => (verdict.kind === "clear" ? cleared(verdict) : fromDatabase));
+    const { read: looked, copy } = yield* upstream.installCopy({ name, served: baseUrl, lease, read: stamped, stampOf: (r) => r.stamp });
+    const { read, stamp, clearance } = looked;
+
+    if (copy === null || stamp === null) {
+      // npm has no such package: an edge view's clearance says so only while it is young, as for any answer
+      if (clearance !== null && edge !== null && !(yield* edge.stillClear(clearance))) return EXPIRED;
+
+      return null;
+    }
+
     const got = copy;
     // this request may have lost the database (a statement failed, or its connection closed: db-health.ts) while the
     // copy or npm was read: then the confirmed set read above is no longer the registry's word, and this request is
@@ -3681,6 +3717,14 @@ const installPackument = (name: string, upstream: UpstreamApi) =>
       if (got.kind === "copy") yield* Effect.promise(() => got.body.cancel().catch(() => undefined));
 
       return yield* up;
+    }
+
+    // an edge view's clearance decides only while it is young enough at this moment, after every wait above and just
+    // before the answer is made: one that aged past its window (a slow npm, a slow copy) hands the request to the database
+    if (clearance !== null && edge !== null && !(yield* edge.stillClear(clearance))) {
+      if (got.kind === "copy") yield* Effect.promise(() => got.body.cancel().catch(() => undefined));
+
+      return EXPIRED;
     }
 
     // from here every answer is this public package's install document: its phases may go to anyone (timing.ts)

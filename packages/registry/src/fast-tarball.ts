@@ -9,7 +9,8 @@
 //   refused here too (the packument route does not read it while the database answers, so this only adds refusals).
 //   It is this isolate's read of it from the last BLOCKLIST_RECENT_MS (Blocklist.recent): every write that blocks
 //   something adds it to the list before its transaction commits, so what the list adds beyond the database read on
-//   this same request is only a block still committing, and a read seconds old is as good for that;
+//   this same request is only a block still committing, and a read seconds old is as good for that. It is waited for
+//   at most EDGE_READ_DEADLINE_MS (300 ms); past it the database decides alone (blockListWithin);
 // - npm's document for the one version (Upstream.versionOf, a few KiB, kept in the isolate for the upstream TTL; npm's
 //   own CDN keeps it too, so asking for it from a Worker is a cache hit in the same data center): the version exists
 //   upstream, where its tarball is and what it must hash to.
@@ -36,12 +37,16 @@
 // Before round one, every download read and parsed the whole packument (tens of MB for next or typescript) and made
 // about five database round trips, and a tarball up to 32 MiB was downloaded whole before its first byte was sent.
 //
+// With APM_INSTALL_CHECKS=edge, a request without credentials from a client that checks tarballs is first asked of this
+// isolate's edge view (edge-checks.ts): a name it clears is redirected to npm with no database statement, and its
+// analysis is asked about after the answer (queueDownload). Anything the view does not clear takes the path above.
+//
 // A package published here goes to the protocol route (server.ts), as before. Anything else this path is not sure of
 // goes to the packument route it replaces, which answers it as it always has: `~safe` (its policy needs scores), a
 // file name that is not the one apm's packuments link (`<name>-<version>.tgz`), a version npm's document does not
 // confirm or could not be read for, one with no checksum, a block list that cannot be read or names the package as
 // published here, and an upstream tarball that could not be opened (that route may still have the bytes in R2).
-import { Effect, Exit, Fiber, Option, Result } from "effect";
+import { Duration, Effect, Exit, Fiber, Option, Result } from "effect";
 import { isValidVersion } from "@apm/core";
 import { Analysis, REQUEUE_AFTER_MS } from "./analysis.ts";
 import { Blocklist, verdictFor, type BlocklistBody } from "./blocklist.ts";
@@ -50,6 +55,7 @@ import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { confirmedText } from "./confirmed.ts";
 import { Store } from "./db.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
+import { EDGE_READ_DEADLINE_MS, EdgeChecks } from "./edge-checks.ts";
 import { fail } from "./http.ts";
 import { tarballBase } from "./server.ts";
 import { timed, timingOrNull, type TimingApi } from "./timing.ts";
@@ -97,6 +103,13 @@ const blockList = Effect.gen(function* () {
 });
 
 const EMPTY_LIST: BlocklistBody = { format: 1, syncedAt: null, local: [], confirmed: [] };
+
+/**
+ * The block list as blockList reads it, waited for at most EDGE_READ_DEADLINE_MS (300 ms), as an edge view's read is.
+ * Past it the database's statement on this request decides alone, as it does for the install document: the list only
+ * adds blocks whose transaction is still committing (EMPTY_LIST adds none). So a slow R2 read never holds an answer.
+ */
+const blockListWithin = (deadlineMs: number) => Effect.map(Effect.timeoutOption(blockList, Duration.millis(deadlineMs)), (read) => Option.getOrElse(read, () => EMPTY_LIST));
 
 /**
  * What the fast path came to: its answer; "local", a package published here, which the protocol route (server.ts)
@@ -189,6 +202,39 @@ const discard = (opening: Fiber.Fiber<OpenedUpstream | null>): Effect.Effect<voi
     ),
   );
 
+/**
+ * The redirect to npm's tarball answered from this isolate's edge view (edge-checks.ts), with no database statement
+ * before it: only for a request without credentials from a client that checks the tarball itself, when the view says
+ * nothing refuses the name and npm's document links its own URL. Null for the database path to answer, as before.
+ */
+const edgeRedirect = (input: { req: Request; name: string; version: string; upstream: UpstreamApi; timing: TimingApi | null }) =>
+  Effect.gen(function* () {
+    const { req, name, version, upstream, timing } = input;
+    const edge = yield* Effect.serviceOption(EdgeChecks);
+
+    if (Option.isNone(edge) || req.headers.has("authorization") || req.headers.has("cookie") || !checksTarballs(req)) return null;
+    const base = redirectBase(yield* RegistryConfig);
+
+    if (base === null) return null;
+    const checksStart = performance.now();
+    // npm's document is read beside the view: the database path reads it too, from this isolate's cache then
+    const [verdict, npm] = yield* Effect.all([timed(timing, "edge")(edge.value.verdict(name)), upstream.versionOf(name, version)], { concurrency: "unbounded" });
+
+    timing?.add("checks", performance.now() - checksStart);
+
+    if (verdict.kind !== "clear") return null;
+    const servable = servableOf(npm);
+
+    if (servable === null || !isNpmTarball(servable.tarball, name, version, base)) return yield* Effect.as(edge.value.declined, null);
+
+    // the view decides only while it is young enough now, after npm's document was read: else the database path
+    if (!(yield* edge.value.stillClear(verdict))) return null;
+    // scoring a download happens off the request path, as on the database path, and after this answer
+    yield* edge.value.downloaded({ name, version });
+
+    return answered(req, new Response(null, { status: 302, headers: { location: servable.tarball, "cache-control": "no-store" } }), timing);
+  });
+
 /** A GET or HEAD of `/<name>/-/<file>` for a package npm has, answered from npm's tarball when nothing refuses it. */
 export const fastTarball = (input: { req: Request; name: string; file: string; upstream: UpstreamApi }) =>
   Effect.gen(function* () {
@@ -196,6 +242,9 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     const version = versionOfFile(name, file);
 
     if (version === null) return PACKUMENT;
+    const fromEdge = yield* edgeRedirect({ req, name, version, upstream, timing: yield* timingOrNull });
+
+    if (fromEdge !== null) return fromEdge;
     const store = yield* Store;
     const at = yield* Effect.flatMap(Clock, (c) => c.now);
     const timing = yield* timingOrNull;
@@ -203,7 +252,7 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     // npm's document and the block list are read on fibers of their own, and npm's tarball is opened once both are
     // known and the list does not refuse it, while the database statement below still runs; each is interrupted when
     // this request ends, so a check that fails here stops them
-    const listing = yield* Effect.forkChild(timed(timing, "blocklist")(blockList));
+    const listing = yield* Effect.forkChild(timed(timing, "blocklist")(blockListWithin(EDGE_READ_DEADLINE_MS)));
     const document = yield* Effect.forkChild(upstream.versionOf(name, version));
     // a request without credentials is sent to npm's own URL once nothing refuses it, so nothing is opened for it here;
     // one with credentials is never sent elsewhere (its Authorization would follow it there in some clients), and gets
@@ -285,4 +334,18 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     }
 
     return answered(req, new Response(served.body, { headers }), timing);
+  });
+
+/**
+ * What a download answered from the edge view does after its answer (worker.ts runs it on services of its own): the
+ * statement the database path reads before its answer (Store.tarballRead), then the version queued for analysis unless
+ * it is published here, scored, decided or queued already, as on the database path.
+ */
+export const queueDownload = (input: { name: string; version: string }) =>
+  Effect.gen(function* () {
+    const at = yield* Effect.flatMap(Clock, (c) => c.now);
+    const read = yield* (yield* Store).tarballRead({ ...input, queuedSince: at - REQUEUE_AFTER_MS });
+
+    if (read.local || read.decided || read.queued) return;
+    yield* (yield* Analysis).enqueue(input.name, input.version);
   });

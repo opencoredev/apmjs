@@ -20,7 +20,7 @@
 // which on the website's reads tells what others asked for.
 import { Context, Effect, Option } from "effect";
 
-export type TimingMetric = "db" | "npm" | "npm-cache" | "npm-head" | "npm-version" | "npm-open" | "blocklist" | "install-copy" | "checks" | "analysis";
+export type TimingMetric = "db" | "npm" | "npm-cache" | "npm-head" | "npm-version" | "npm-open" | "blocklist" | "install-copy" | "checks" | "analysis" | "edge";
 
 /** "none": no header. "full": every metric with its count. */
 export type TimingDetail = "none" | "full";

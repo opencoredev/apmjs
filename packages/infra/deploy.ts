@@ -7,6 +7,11 @@
 //   bun packages/infra/deploy.ts deploy  --stage staging
 //   bun packages/infra/deploy.ts deploy  --stage production
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
+//   bun packages/infra/deploy.ts deploy  --stage staging --install-checks database   (phase 1: the publish fence, database reads)
+//   bun packages/infra/deploy.ts deploy  --stage staging --install-checks edge       (phase 2: edge views; docs/DEPLOY.md)
+//
+// The install-check mode is printed on the first line and kept on the release record's line, after the registry's
+// live version is confirmed to carry it.
 //
 // After Alchemy, a deploy runs the stage's smoke check (smoke.ts) once, with this run's build: the registry and the
 // website must answer with it before and after the behavioural checks. When it passes, still under the lock, it reads
@@ -48,13 +53,19 @@ import { recordLiveRelease } from "./deploy-record.ts";
 import { finishDeploy, recoveryAdvice, smokeCommand } from "./deploy-finish.ts";
 import { readReleases } from "./releases.ts";
 import { provenanceVars, type Cloudflare } from "./rollback.ts";
+import { installChecksOf } from "./install-checks.ts";
 
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
 const INFRA = import.meta.dirname;
 
 const Args = z.object({ action: z.enum(["plan", "deploy"]), stage: z.enum(["staging", "production"]) });
 const stageAt = process.argv.indexOf("--stage");
-const args = Args.parse({ action: process.argv[2], stage: stageAt > 0 ? process.argv[stageAt + 1] : "staging" });
+
+const args = {
+  ...Args.parse({ action: process.argv[2], stage: stageAt > 0 ? process.argv[stageAt + 1] : "staging" }),
+  // what install reads of npm's packages check on this deploy: "database" unless --install-checks edge asks
+  installChecks: installChecksOf({ argv: process.argv, env: process.env }),
+};
 
 // one change to apm at a time, on this machine: the release lock (APM_RELEASE_LOCK), held from here until this process
 // and the children it starts to change anything (Alchemy, the smoke check) have exited. A plan changes nothing and
@@ -169,7 +180,11 @@ const review = reviewSettings(args.stage);
 const debugHash = debugTokenHash(args.stage);
 const database = DATABASES[args.stage];
 
-process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"})\n`);
+process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"}; install checks ${args.installChecks})\n`);
+
+if (args.installChecks === "edge") {
+  process.stdout.write("install checks edge: only once a build with the publish fence is the only registry version serving (docs/DEPLOY.md, \"Install checks\")\n");
+}
 
 const cf: Cloudflare = { apiBase: process.env.APM_CLOUDFLARE_API ?? "https://api.cloudflare.com/client/v4", token, accountId };
 
@@ -229,6 +244,8 @@ const alchemyOptions = {
       REVIEW_TOKEN_HASH: review.hash,
       APM_ADMINS: review.admins,
       DEBUG_TOKEN_HASH: debugHash,
+      // what install reads of npm's packages check before their answer (registry edge-checks.ts): --install-checks
+      INSTALL_CHECKS: args.installChecks,
       // what built the registry and the website: this run's commit, build id and migration manifest. The record waits
       // for the live versions to carry it (deploy-record.ts), and the smoke check for them to answer with the build
       APM_PROVENANCE: JSON.stringify(provenanceVars(revision, build, migrationFiles().map((m) => m.id))),
@@ -263,7 +280,7 @@ process.exit(
     alchemyExit: exitCode,
     smoke,
     // what is live now, confirmed to be this run's versions: the line every later rollback trusts
-    record: () => recordLiveRelease({ cf, stage: args.stage, build, sha: revision, manifest: migrationFiles().map((m) => m.id) }),
+    record: () => recordLiveRelease({ cf, stage: args.stage, build, sha: revision, manifest: migrationFiles().map((m) => m.id), installChecks: args.installChecks }),
     advice: async () => recoveryAdvice({ cf, stage: args.stage, releases: readReleases(args.stage) }),
     log: (line) => process.stdout.write(`${line}\n`),
   }),

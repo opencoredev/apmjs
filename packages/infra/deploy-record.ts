@@ -7,13 +7,15 @@
 // still name the previous version at 100%, and labelling that version with this run's manifest would let a rollback
 // trust old code with a schema it was never built for. So the registry's and the website's live versions must each
 // carry this run's stamp in their settings: APM_BUILD, APM_REVISION and the sealed migration manifest, exactly
-// (rollback.ts, provenanceVars). A read that does not show them yet is tried again until RECORD_DEADLINE_MS has passed;
+// (rollback.ts, provenanceVars), and the registry's APM_INSTALL_CHECKS the mode this run deployed, which the line records
+// (docs/DEPLOY.md, "Install checks": a rollback to a build that ran with edge views must be known as one). A read that does not show them yet is tried again until RECORD_DEADLINE_MS has passed;
 // that one deadline bounds every request (each is cut short when the time left runs out) and every wait, and is checked
 // again just before the line is appended, so the run is either recorded within it or not recorded at all. The stamp corroborates this run at this moment; later, rollback.ts trusts only the
 // record, never a version's variables.
 //
 // The docs Worker is assets-only: Cloudflare keeps no variables on its versions, and Alchemy uploads it only when its
 // pages change, so its live version is recorded as it is. It runs no code against the database.
+import type { InstallChecks } from "./install-checks.ts";
 import { appendRelease, type Release } from "./releases.ts";
 import { listDeployments, provenanceVars, receiving, scriptName, versionVariables, WORKERS, type Cloudflare, type Stage, type WorkerKind } from "./rollback.ts";
 
@@ -27,7 +29,12 @@ const STAMPED: readonly WorkerKind[] = ["registry", "web"];
 
 type Attempt = { kind: "live"; workers: Release["workers"] } | { kind: "not-yet"; why: string };
 
-async function attempt(input: { cf: Cloudflare; stage: Stage; stamp: Readonly<Record<string, string>>; left: () => number }): Promise<Attempt> {
+/** What `kind`'s live version must carry: the run's stamp, and on the registry the install-check mode it was given. */
+function stampOf(kind: WorkerKind, stamp: Readonly<Record<string, string>>, installChecks: InstallChecks): Readonly<Record<string, string>> {
+  return kind === "registry" ? { ...stamp, APM_INSTALL_CHECKS: installChecks } : stamp;
+}
+
+async function attempt(input: { cf: Cloudflare; stage: Stage; stamp: Readonly<Record<string, string>>; installChecks: InstallChecks; left: () => number }): Promise<Attempt> {
   const workers: Release["workers"] = {};
 
   for (const kind of WORKERS) {
@@ -42,7 +49,7 @@ async function attempt(input: { cf: Cloudflare; stage: Stage; stamp: Readonly<Re
 
     if (STAMPED.includes(kind)) {
       const vars = await versionVariables(input.cf, script, only.version_id, input.left());
-      const wrong = Object.entries(input.stamp).filter(([name, value]) => vars[name] !== value);
+      const wrong = Object.entries(stampOf(kind, input.stamp, input.installChecks)).filter(([name, value]) => vars[name] !== value);
 
       if (wrong.length > 0) {
         const build = vars.APM_BUILD ?? "none";
@@ -64,6 +71,8 @@ export async function recordLiveRelease(input: {
   build: string;
   sha: string;
   manifest: readonly string[];
+  /** The install-check mode this run deployed the registry with (deploy.ts --install-checks). */
+  installChecks: InstallChecks;
   append?: (release: Release) => void;
   deadlineMs?: number;
   intervalMs?: number;
@@ -80,7 +89,7 @@ export async function recordLiveRelease(input: {
     let now: Attempt;
 
     try {
-      now = await attempt({ cf: input.cf, stage: input.stage, stamp, left });
+      now = await attempt({ cf: input.cf, stage: input.stage, stamp, installChecks: input.installChecks, left });
     } catch (e) {
       // a request cut short by the time left is a read that did not come back in time, not a failure of its own
       if (!(e instanceof Error && e.name === "TimeoutError") && left() > 0) throw e;
@@ -89,7 +98,7 @@ export async function recordLiveRelease(input: {
 
     if (now.kind === "live") {
       if (left() <= 0) return expired();
-      const release: Release = { build: input.build, sha: input.sha, stage: input.stage, at: new Date().toISOString(), manifest: [...input.manifest], workers: now.workers };
+      const release: Release = { build: input.build, sha: input.sha, stage: input.stage, at: new Date().toISOString(), manifest: [...input.manifest], workers: now.workers, installChecks: input.installChecks };
 
       (input.append ?? appendRelease)(release);
 

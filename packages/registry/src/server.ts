@@ -10,6 +10,7 @@ import type { Analysis } from "./analysis.ts";
 import { loadAuthEngine } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { blockBeforeCommit } from "./blocklist.ts";
+import { holdForEdges } from "./edge-checks.ts";
 import { Clock } from "./clock.ts";
 import { confirmedText, confirmedVersions } from "./confirmed.ts";
 import { RegistryConfig, type NamePolicy } from "./config.ts";
@@ -506,6 +507,10 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
       return json({ ok: true, success: true, staged: true, id, approvalUrl: link, expiresAt, message: notice, warnings }, 202, { "npm-notice": notice });
     }
 
+    // before the transaction: a new name goes on the block list and waits out the edge views (fenceNewName). The
+    // transaction checks ownership again under the package's lock, so a name someone else created meanwhile is refused
+    const fence = yield* fenceNewName(name);
+
     yield* commitVersion({
       name,
       version,
@@ -520,6 +525,7 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
       publisher: user.user,
       detail: {},
       upload: tarball,
+      fence,
     }).pipe(
       // the losing publish of a race leaves no blob behind unless another version holds the same bytes
       Effect.tapError(() => dropBlobIfUnused(key)),
@@ -609,9 +615,33 @@ export const dropBlobIfUnused = (key: string): Effect.Effect<void, StoreError | 
   });
 
 /**
+ * What a publish learned before its transaction about whether it creates the package: "existing" when the name had
+ * one, or "fenced" once a new name is on the install block list and the publish fence has passed (fenceNewName).
+ */
+export type NameFence = { readonly kind: "existing" } | { readonly kind: "fenced"; readonly name: string };
+
+/**
+ * Runs before a publish opens its transaction: a name with no package yet goes on the install block list (so the
+ * install routes refuse it while Postgres is down rather than answer from npm under its name: blocklist.ts), then the
+ * publish waits the fence (PublishFence, every Worker: 8 s), so no edge view without the name decides an answer once
+ * the transaction can create it (edge-checks.ts). Outside any transaction, so nothing is locked while it waits. A name
+ * put on the list whose publish then fails stays there until the cron's sync, which only sends it to the database path.
+ */
+export const fenceNewName = (name: string): Effect.Effect<NameFence, StoreError | BlobError, Store> =>
+  Effect.gen(function* () {
+    if (yield* (yield* Store).getPackage(name)) return { kind: "existing" };
+    yield* blockBeforeCommit({ local: [name] });
+    yield* holdForEdges;
+
+    return { kind: "fenced", name };
+  });
+
+/**
  * Makes a version live: version row, dist-tags, package metadata and the publish event, in one transaction
  * that holds the package row. With `upload`, the tarball is written to the blob store in that transaction,
  * under the blob's shared lock; without it, it is already there (an approved staged upload, whose row holds it).
+ * `fence` is fenceNewName's, taken before the transaction: a package it did not fence is never created here (the
+ * publish is refused, to be tried again).
  */
 export const commitVersion = (v: {
   name: string;
@@ -627,6 +657,7 @@ export const commitVersion = (v: {
   publisher: string;
   detail: Record<string, unknown>;
   upload?: Uint8Array;
+  fence: NameFence;
 }): Effect.Effect<void, HttpFailure | StoreError | BlobError, Store | Clock | Blobs> =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -642,9 +673,13 @@ export const commitVersion = (v: {
 
         const created = yield* store.createPackage(v.name, at, v.publisher);
 
-        // a package's data lives only here, so the install routes refuse it while Postgres is down rather than answer
-        // from npm under its name: it goes on the block list before the transaction can commit (blocklist.ts)
-        if (created) yield* blockBeforeCommit({ local: [v.name] });
+        // a package is created only under the fence taken before this transaction (fenceNewName): the name is on the
+        // block list and no edge view without it is still deciding. A name that had a package then and has none now
+        // was not fenced: refused, and the next try fences it
+        if (created && !(v.fence.kind === "fenced" && v.fence.name === v.name)) {
+          return yield* Effect.fail(refuse(409, `${v.name} changed while this publish was being checked. Publish it again.`));
+        }
+
         const pkg = yield* store.lockPackage(v.name);
 
         if (!pkg) return yield* Effect.fail(refuse(500, "Internal error"));

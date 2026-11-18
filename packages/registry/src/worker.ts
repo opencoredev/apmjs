@@ -14,6 +14,8 @@ import { Blocklist, blockTruth } from "./blocklist.ts";
 import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
 import { reportFailure, type Failure } from "./error-reports.ts";
 import { degradedRoute, isInstallRead, unavailable } from "./degraded.ts";
+import { EdgeChecks, FIRST_PUBLISH_HOLD_MS, PublishFence, type AskOutcome } from "./edge-checks.ts";
+import { queueDownload } from "./fast-tarball.ts";
 import { HEALTH_PATH, healthResponse, QUEUE_PROBE_KEY, QueueProbe } from "./health.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig, type RegistrySettings } from "./config.ts";
@@ -98,6 +100,13 @@ const WorkerEnv = z.object({
   APM_BUILD: OptionalText,
   /** Databuddy's public client id: unhandled 500s are reported to it (error-reports.ts). Production alone has one. */
   APM_DATABUDDY_CLIENT_ID: OptionalText,
+  /**
+   * What the install document and tarball redirect of a package only npm has check before their answer: "database"
+   * (the default), one statement on every request; "edge", this isolate's read of the install block list, at most 4 s
+   * old when the answer is made, with no database statement (edge-checks.ts). Every first publish waits 8 s for edge
+   * views either way (PublishFence).
+   */
+  APM_INSTALL_CHECKS: z.enum(["database", "edge"]).optional(),
 });
 
 const DebugEnv = WorkerEnv.pick({ APM_DEBUG_TOKEN_HASH: true });
@@ -219,17 +228,29 @@ export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis 
  * Every service a request uses, over this Worker's bindings. The Postgres connection and the request's memory lease
  * (memory.ts) live as long as the request.
  */
-export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, faults: ReadonlySet<StoreFault> = new Set()) {
-  const run = runServices(env, settings, clock, background, faults);
+export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, controls: TestControls = PRODUCTION) {
+  const run = runServices(env, settings, clock, background, controls);
 
-  return background === null || settings.upstreamUrl === null ? run : Layer.mergeAll(run, keptRefresh(env, settings, clock, background), choicesWriter(env, settings, clock, background));
+  return background === null || settings.upstreamUrl === null ? run : Layer.mergeAll(run, keptRefresh(env, settings, clock, background, controls), choicesWriter(env, settings, clock, background, controls));
 }
 
 /** servicesFor without KeptRefresh: what a refresh after the response runs on. */
-function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, faults: ReadonlySet<StoreFault>) {
+function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, controls: TestControls) {
   const databaseUrl = env.HYPERDRIVE.connectionString;
   const review = reviewSettings(env);
-  const core = Layer.mergeAll(Store.postgres(databaseUrl, faults), Blobs.r2(env.BLOBS), Blocklist.r2(env.BLOBS), clock, Layer.succeed(RegistryConfig, settings));
+
+  const core = Layer.mergeAll(
+    Store.postgres(databaseUrl, controls.faults),
+    Blobs.r2(env.BLOBS),
+    Blocklist.r2(env.BLOBS),
+    clock,
+    Layer.succeed(RegistryConfig, settings),
+    // every first publish waits for edge views whatever this Worker's read mode, so a build that reads them can go live
+    // once no build without the fence is left (docs/DEPLOY.md)
+    PublishFence.layer(controls.publishFenceMs),
+    edgeChecks(env, settings, clock, background, controls),
+  );
+
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
@@ -247,7 +268,7 @@ function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
  * A kept package summary worked out again after the response (kept-package.ts), on services of its own: the request's
  * connection and memory lease close with the request.
  */
-function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void) {
+function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void, controls: TestControls) {
   return Layer.succeed(
     KeptRefresh,
     KeptRefresh.of({
@@ -256,7 +277,7 @@ function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
           background(
             // with the request's background, so the AI review still looks at the packument npm sent (reviewHooks), as
             // it does after a view that read it; without KeptRefresh, so a refresh starts no other
-            Effect.runPromiseExit(runRefresh(name).pipe(Effect.provide(runServices(env, settings, clock, background, new Set())), Effect.scoped)).then((exit) => {
+            Effect.runPromiseExit(runRefresh(name).pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped)).then((exit) => {
               if (Exit.isFailure(exit)) logFailure("kept-package-refresh", { name }, Cause.pretty(exit.cause));
             }),
           ),
@@ -278,14 +299,14 @@ function keptRefresh(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
  * A resolve's kept choices written after the response (kept-choices.ts), on services of its own: the request's
  * connection and memory lease close with the request, and the answer never waits on the write.
  */
-function choicesWriter(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void) {
+function choicesWriter(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void, controls: TestControls) {
   return Layer.succeed(
     ChoicesWriter,
     ChoicesWriter.of({
       later: (write) =>
         Effect.sync(() =>
           background(
-            Effect.runPromiseExit(write.pipe(Effect.provide(runServices(env, settings, clock, background, new Set())), Effect.scoped)).then((exit) => {
+            Effect.runPromiseExit(write.pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped)).then((exit) => {
               if (Exit.isFailure(exit)) logFailure("kept-choices-write", {}, Cause.pretty(exit.cause));
             }),
           ),
@@ -293,6 +314,45 @@ function choicesWriter(env: WorkerEnv, settings: RegistrySettings, clock: Layer.
     }),
   );
 }
+
+/**
+ * The edge views (edge-checks.ts) when APM_INSTALL_CHECKS is "edge": shared by every request in the isolate, the data
+ * center's copy in the Cache API, and a download answered from one queued for analysis after the response, on services
+ * of its own (the request's connection closes with the request). Nothing otherwise.
+ */
+function edgeChecks(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, controls: TestControls) {
+  if (env.APM_INSTALL_CHECKS !== "edge" || settings.upstreamUrl === null) return Layer.empty;
+
+  const queue = (input: { name: string; version: string }): Promise<AskOutcome> =>
+    Effect.runPromiseExit(queueDownload(input).pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped)).then((exit) => {
+      if (Exit.isSuccess(exit)) return "asked";
+      logFailure("download-queue", { name: input.name, version: input.version }, Cause.pretty(exit.cause));
+
+      return "failed";
+    });
+
+  return EdgeChecks.layer(
+    {
+      bucket: env.BLOBS,
+      // `background` is set only inside a Worker request, where `caches` always exists
+      cache: background === null ? null : caches.default,
+      cacheKey: `${settings.baseUrl}-/apm/internal/edge-view`,
+      now: Date.now,
+      background,
+      // once a minute per isolate: what its views decided, its R2 reads and how many requests fell back
+      report: (counts) => console.log(JSON.stringify({ level: "info", event: "edge-checks", ...counts })),
+    },
+    queue,
+  );
+}
+
+/**
+ * What only the test entry (worker-test.ts) changes: store faults it switches on, and how long a first publish waits
+ * for edge views (FIRST_PUBLISH_HOLD_MS in production; the acceptance suite's publishes skip it unless a test asks).
+ */
+export type TestControls = { readonly faults: ReadonlySet<StoreFault>; readonly publishFenceMs: number };
+
+const PRODUCTION: TestControls = { faults: new Set(), publishFenceMs: FIRST_PUBLISH_HOLD_MS };
 
 type LogFields = Readonly<Record<string, string | number | boolean | null>>;
 
@@ -309,19 +369,19 @@ function logDegraded(fields: LogFields, cause: unknown): void {
 }
 
 /**
- * Runs the router for one request. `clock` is the system clock in production, and `faults` is empty there: only the
- * test entry (worker-test.ts) switches one on. Per-user answers are marked private, whichever route made them.
+ * Runs the router for one request. `clock` is the system clock in production, and `controls` are production's there:
+ * only the test entry (worker-test.ts) switches a fault on or shortens the publish fence. Per-user answers are marked private, whichever route made them.
  */
 export async function handle(
   req: Request,
   rawEnv: RawEnv,
   clock: Layer.Layer<Clock> = Clock.system,
   ctx: ExecutionContext | null = null,
-  faults: ReadonlySet<StoreFault> = new Set(),
+  controls: TestControls = PRODUCTION,
 ): Promise<Response> {
   const start = performance.now();
   const timing = Timing.make();
-  const res = await respond({ req, rawEnv, clock, ctx, faults, timing });
+  const res = await respond({ req, rawEnv, clock, ctx, controls, timing });
   // an answer a route marked public carries its phases to anyone (timing.ts); any other only to the debug token
   const exposed = timing.exposed();
   const detail: TimingDetail = exposed ? "full" : timingDetail(req, rawEnv);
@@ -346,9 +406,9 @@ function withBuild(req: Request, res: Response, rawEnv: RawEnv): Response {
   return stamped;
 }
 
-type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: ExecutionContext | null; faults: ReadonlySet<StoreFault>; timing: TimingApi };
+type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: ExecutionContext | null; controls: TestControls; timing: TimingApi };
 
-async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Promise<Response> {
+async function respond({ req, rawEnv, clock, ctx, controls, timing }: Respond): Promise<Response> {
   const parsed = WorkerEnv.safeParse(rawEnv);
 
   // an unhandled 500 is reported to Databuddy after the answer (error-reports.ts), on production alone: a fixed code
@@ -404,7 +464,7 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
         return fail(500, "Internal error");
       }),
     ),
-    Effect.provide(servicesFor(env, settings, clock, ctx === null ? null : (work) => ctx.waitUntil(work), faults)),
+    Effect.provide(servicesFor(env, settings, clock, ctx === null ? null : (work) => ctx.waitUntil(work), controls)),
     Effect.scoped,
     // outside servicesFor, so the Store and Upstream layers find it while they are built
     Effect.provideService(Timing, timing),

@@ -73,7 +73,9 @@ export async function finishDeploy(input: { alchemyExit: number; smoke: () => Pr
   }
 
   if (recording.kind === "not-recorded") return failed(`the smoke check passed, but this build was NOT recorded (${recording.why})`);
-  input.log(`deploy: smoke check passed; release record: build ${recording.release.build}: ${Object.entries(recording.release.workers).map(([k, w]) => `${k} ${w.versionId}`).join(", ")}`);
+  const { release } = recording;
+
+  input.log(`deploy: smoke check passed; release record: build ${release.build} (install checks ${release.installChecks ?? "database"}): ${Object.entries(release.workers).map(([k, w]) => `${k} ${w.versionId}`).join(", ")}`);
 
   return 0;
 }

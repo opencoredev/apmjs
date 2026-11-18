@@ -582,7 +582,11 @@ export async function main(argv: readonly string[], log: Log = (l) => process.st
       for (const [i, d] of all.slice(0, args.limit).entries()) {
         const recorded = receiving(d.versions).map((v) => releaseOf(releases, script, v.version_id));
         const first = recorded[0];
-        const build = first === undefined || first === null || recorded.some((r) => r?.build !== first.build) ? "not in the release record" : `build ${first.build} (${first.sha.slice(0, 12)})`;
+
+        const build =
+          first === undefined || first === null || recorded.some((r) => r?.build !== first.build)
+            ? "not in the release record"
+            : `build ${first.build} (${first.sha.slice(0, 12)})${kind === "registry" ? `, install checks ${first.installChecks ?? "database"}` : ""}`;
 
         log(`  ${i === 0 ? "live" : "    "}  ${describe(d)}  ${build}`);
       }

@@ -1,6 +1,6 @@
 // The release ledger: what each deploy run left live, kept where only the deploy machine's owner can write it.
 // deploy.ts appends one line per run, while it holds the release lock (release-lock.ts), once its smoke check passed:
-// the run's build id, git SHA, stage, migration manifest and each Worker's live version (deploy-record.ts). A rollback
+// the run's build id, git SHA, stage, migration manifest, install-check mode and each Worker's live version (deploy-record.ts). A rollback
 // only ever routes traffic to versions this ledger names, and only leaves a registry and a website live together when
 // one canonical line names both: a version whose variables say the same build (a dashboard edit that kept them, or
 // invented ones) is not in it, so it is never trusted.
@@ -11,6 +11,7 @@ import { appendFileSync, chmodSync, closeSync, existsSync, fstatSync, mkdirSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import { InstallChecks } from "./install-checks.ts";
 
 export const LEDGER_ENV = "APM_RELEASES_LEDGER";
 
@@ -29,6 +30,11 @@ const Release = z.object({
   at: z.string(),
   manifest: z.array(z.string()),
   workers: z.object({ registry: LiveVersion.optional(), web: LiveVersion.optional(), docs: LiveVersion.optional() }),
+  /**
+   * What the run's registry checked install reads with (install-checks.ts), confirmed on its live version. Lines from
+   * before the field have none: those builds had no edge mode, so they checked the database.
+   */
+  installChecks: InstallChecks.optional(),
 });
 
 export type Release = z.infer<typeof Release>;

@@ -5,17 +5,22 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { gzipSync } from "node:zlib";
-import { Effect, Layer, Option } from "effect";
+import { Duration, Effect, Layer, Option } from "effect";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis, type JobOutcome } from "../src/analysis.ts";
 import { upstreamRoute } from "../src/apm.ts";
 import { Blobs } from "../src/blobs.ts";
-import { Blocklist, type BlocklistBody } from "../src/blocklist.ts";
+import { BLOCKLIST_KEY, Blocklist, type BlocklistBody, type BlocklistReader } from "../src/blocklist.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { Store } from "../src/db.ts";
+import { EDGE_READ_DEADLINE_MS, EDGE_VIEW_MAX_AGE_MS, EdgeChecks } from "../src/edge-checks.ts";
+
+/** What npm's own client sends for an install document. */
+const INSTALL_ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+
 import { versionOfFile } from "../src/fast-tarball.ts";
 import { type Lease, MemoryPool, RequestMemory } from "../src/memory.ts";
 import { Upstream, type UpstreamApi } from "../src/upstream.ts";
@@ -94,6 +99,11 @@ function fakeNpm() {
     "/mine": () => Response.json(packument("mine", { "1.0.0": FAST })),
     "/mine/1.0.0": () => Response.json(doc("mine", "1.0.0", FAST)),
     "/mine/-/mine-1.0.0.tgz": () => new Response(FAST.bytes),
+    // asked only by the edge tests whose clock jumps while npm answers (onNpmAsk)
+    "/aging": () => Response.json(packument("aging", { "1.0.0": FAST })),
+    "/aging/1.0.0": () => Response.json(doc("aging", "1.0.0", FAST)),
+    "/aging/-/aging-1.0.0.tgz": () => new Response(FAST.bytes),
+    "/agingdoc": () => Response.json(packument("agingdoc", { "1.0.0": FAST })),
   }) satisfies Record<string, () => Response>;
 
   const server = Bun.serve({
@@ -103,6 +113,7 @@ function fakeNpm() {
       const path = new URL(req.url).pathname;
 
       asked.push(path);
+      onNpmAsk(path);
       const answer = Object.entries(routes()).find(([p]) => p === path)?.[1];
 
       return answer ? answer() : Response.json({ error: "Not found" }, { status: 404 });
@@ -117,6 +128,9 @@ function fakeNpm() {
 let db: Awaited<ReturnType<typeof freshDatabase>>;
 let npm: ReturnType<typeof fakeNpm>;
 let list: BlocklistBody | null;
+
+/** How long the database path's read of the block list (Blocklist.recent) takes. */
+let listDelayMs = 0;
 let enqueued: string[];
 let stored: string[];
 
@@ -144,7 +158,11 @@ afterAll(async () => {
 
 beforeEach(() => {
   npm.asked.length = 0;
+  edgeQueued = [];
+  edgeShift = 0;
+  onNpmAsk = () => undefined;
   list = { format: 1, syncedAt: NOW, local: [], confirmed: [] };
+  listDelayMs = 0;
   enqueued = [];
   stored = [];
 });
@@ -153,7 +171,10 @@ const blocklist = Layer.succeed(
   Blocklist,
   Blocklist.of({
     read: Effect.sync(() => (list === null ? { kind: "missing" as const } : { kind: "ok" as const, list, etag: "e" })),
-    recent: Effect.sync(() => (list === null ? { kind: "missing" as const } : { kind: "ok" as const, list, etag: "e" })),
+    recent: Effect.andThen(
+      Effect.suspend(() => Effect.sleep(Duration.millis(listDelayMs))),
+      Effect.sync(() => (list === null ? { kind: "missing" as const } : { kind: "ok" as const, list, etag: "e" })),
+    ),
     block: () => Effect.void,
     sync: () => Effect.die("not used"),
   }),
@@ -209,9 +230,49 @@ async function readAll(body: ReadableStream<Uint8Array> | null): Promise<{ bytes
  * One request through upstreamRoute; null when it does not answer (the protocol route does). The upstream TTL is an
  * hour, so npm's document for a version stays in this isolate between requests, as a hot one does in production.
  */
-async function get(path: string, options: { method?: string; headers?: Record<string, string>; safe?: boolean ; redirects?: "npm" | "upstream" } = {}): Promise<Got> {
+/**
+ * Edge checks for one request (edge-checks.ts, APM_INSTALL_CHECKS=edge): the list its view reads (null: none was
+ * written; "fail": R2 throws), and whether the database is one nothing can reach, so any statement fails the request.
+ */
+type Edge = { list: BlocklistBody | null | "fail"; deadDatabase?: boolean; delayMs?: number };
+
+/** A database no request can reach: port 9 refuses connections. */
+const DEAD_DATABASE = "postgres://apm:apm@127.0.0.1:9/none";
+
+/** Downloads the edge path answered, queued for analysis after the answer. */
+let edgeQueued: string[] = [];
+
+/** How far the edge views' clock is ahead of Date.now; a test moves it while npm answers, through onNpmAsk. */
+let edgeShift = 0;
+
+/** Called with each path npm is asked for, before it answers. */
+let onNpmAsk: (path: string) => void = () => undefined;
+
+/** A new bucket object per request, so no view outlives the request that read it. */
+const edgeLayer = (edge: Edge) => {
+  const bucket: BlocklistReader = {
+    get: async (key) => {
+      if (edge.delayMs !== undefined) await Bun.sleep(edge.delayMs);
+
+      if (edge.list === "fail") throw new Error("R2 is down");
+      const text = JSON.stringify(edge.list);
+
+      return key === BLOCKLIST_KEY && edge.list !== null ? { text: () => Promise.resolve(text), etag: "e" } : null;
+    },
+  };
+
+  return EdgeChecks.layer({ bucket, cache: null, cacheKey: "http://registry.test/-/apm/internal/edge-view", now: () => Date.now() + edgeShift, background: null, report: null }, (input) => {
+    edgeQueued.push(`${input.name}@${input.version}`);
+
+    return Promise.resolve("asked");
+  });
+};
+
+async function get(path: string, options: { method?: string; headers?: Record<string, string>; safe?: boolean ; redirects?: "npm" | "upstream"; edge?: Edge } = {}): Promise<Got> {
   const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url, legacyAuth: false, namePolicy: "open", admins: [], tarballRedirects: options.redirects ?? "upstream" } as const;
-  const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), analysis, blobs, blocklist, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
+  const store = Store.postgres(options.edge?.deadDatabase === true ? DEAD_DATABASE : db.url);
+  const edge = options.edge === undefined ? Layer.empty : edgeLayer(options.edge);
+  const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), analysis, blobs, blocklist, edge, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL));
   const layers = Layer.provideMerge(Upstream.layer(npm.url, 3_600_000, null), base);
   // npm's own client unless a test says otherwise: one of the clients that checks a tarball's integrity itself
   const req = new Request(`http://registry.test${path}`, { method: options.method ?? "GET", headers: { "user-agent": NPM_CLIENT, ...options.headers } });
@@ -328,6 +389,31 @@ describe("the upstream tarball fast path", () => {
     expect((await get("/fast/-/fast-1.0.0.tgz", AUTH))?.status).toBe(410);
     expect(npm.asked.filter((p) => p.endsWith(".tgz"))).toEqual([]);
     expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(302);
+  });
+
+  test("a block list read that misses its deadline leaves the database to decide alone: what it confirms is refused, the rest served", async () => {
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
+    listDelayMs = 2_000;
+    // on the list alone: not seen once the list is late, as on the install document's database path
+    list = { format: 1, syncedAt: NOW, local: [], confirmed: [{ name: "fast", version: "1.1.0", digest: `sha512-${FAST_NEXT.hex}`, addedAt: NOW }] };
+    await confirm("fast", "1.0.0", FAST);
+
+    try {
+      for (const options of [{}, AUTH]) {
+        const start = performance.now();
+
+        expect((await get("/fast/-/fast-1.0.0.tgz", options))?.status).toBe(410);
+        expect(performance.now() - start).toBeLessThan(EDGE_READ_DEADLINE_MS + 300);
+      }
+
+      const start = performance.now();
+
+      expect((await get("/fast/-/fast-1.1.0.tgz"))?.status).toBe(302);
+      expect((await get("/fast/-/fast-1.1.0.tgz", AUTH))?.status).toBe(200);
+      expect(performance.now() - start).toBeLessThan(2 * (EDGE_READ_DEADLINE_MS + 300));
+    } finally {
+      await dismiss("fast", "1.0.0");
+    }
   });
 
   test("a block list that was never written adds nothing; the database still refuses", async () => {
@@ -550,5 +636,131 @@ describe("which requests are redirected to npm", () => {
 
   test("by default only npm's own https URL is redirected to, so this stand-in's tarball is streamed", async () => {
     expect(await plain({ "user-agent": NPM_CLIENT }, "npm")).toEqual({ status: 200, location: null, intact: true });
+  });
+});
+
+describe("with edge checks (APM_INSTALL_CHECKS=edge)", () => {
+  // synced just now by the edge views' clock (Date.now): a list not synced for 15 minutes decides nothing
+  const synced = (input: { local?: string[]; confirmed?: { name: string; version: string; t: Tarball }[] } = {}): BlocklistBody => ({
+    format: 1,
+    syncedAt: Date.now(),
+    local: (input.local ?? []).map((name) => ({ name, addedAt: NOW })),
+    confirmed: (input.confirmed ?? []).map((c) => ({ name: c.name, version: c.version, digest: `sha512-${c.t.hex}`, addedAt: NOW })),
+  });
+
+  test("a name the view clears is redirected to npm with no database statement, and queued for analysis after the answer", async () => {
+    // the database cannot be reached: any statement would fail this request
+    const got = await get("/fast/-/fast-1.0.0.tgz", { edge: { list: synced(), deadDatabase: true } });
+
+    expect(got?.status).toBe(302);
+    expect(got?.headers.get("location")).toBe(`${npm.url}fast/-/fast-1.0.0.tgz`);
+    expect(got?.headers.get("cache-control")).toBe("no-store");
+    expect(npm.asked.filter((p) => p.endsWith(".tgz"))).toEqual([]);
+    expect(edgeQueued).toEqual(["fast@1.0.0"]);
+    // HEAD the same
+    expect((await get("/fast/-/fast-1.0.0.tgz", { method: "HEAD", edge: { list: synced(), deadDatabase: true } }))?.status).toBe(302);
+  });
+
+  test("a name the view lists as published here, or with any confirmed version, takes the database path", async () => {
+    for (const list of [synced({ local: ["fast"] }), synced({ confirmed: [{ name: "fast", version: "1.1.0", t: FAST_NEXT }] })]) {
+      await expect(get("/fast/-/fast-1.0.0.tgz", { edge: { list, deadDatabase: true } })).rejects.toThrow();
+    }
+
+    // and the database path answers as it always has, reading the same list: the confirmed version is refused, the
+    // other one served
+    const flagged = synced({ confirmed: [{ name: "fast", version: "1.1.0", t: FAST_NEXT }] });
+
+    list = flagged;
+
+    expect((await get("/fast/-/fast-1.1.0.tgz", { edge: { list: flagged } }))?.status).toBe(410);
+    expect((await get("/fast/-/fast-1.0.0.tgz", { edge: { list: flagged } }))?.status).toBe(302);
+    expect(edgeQueued).toEqual([]);
+  });
+
+  test("a name published here in the database but not yet in the view is the publish's hold to cover; with it in the view the protocol route answers", async () => {
+    await sql(`INSERT INTO packages (name, created_at, modified_at, dist_tags) VALUES ('mine', 0, 0, '{"latest":"1.0.0"}'::jsonb)`);
+
+    try {
+      expect(await get("/mine/-/mine-1.0.0.tgz", { edge: { list: synced({ local: ["mine"] }) } })).toBeNull();
+    } finally {
+      await sql("DELETE FROM packages WHERE name = 'mine'");
+    }
+  });
+
+  test("a list never synced, never written, or unreadable from R2 takes the database path, never answers open", async () => {
+    for (const list of [{ ...synced(), syncedAt: null }, null, "fail" as const]) {
+      await expect(get("/fast/-/fast-1.0.0.tgz", { edge: { list, deadDatabase: true } })).rejects.toThrow();
+      expect((await get("/fast/-/fast-1.0.0.tgz", { edge: { list } }))?.status).toBe(302);
+    }
+
+    // the database path queued it, inline, as before
+    expect(edgeQueued).toEqual([]);
+  });
+
+  test("requests with credentials, ~safe, and clients that do not check tarballs keep the database path", async () => {
+    const edge = { list: synced(), deadDatabase: true };
+
+    await expect(get("/fast/-/fast-1.0.0.tgz", { ...AUTH, edge })).rejects.toThrow();
+    await expect(get("/fast/-/fast-1.0.0.tgz", { headers: { cookie: "s=1" }, edge })).rejects.toThrow();
+    await expect(get("/fast/-/fast-1.0.0.tgz", { safe: true, edge })).rejects.toThrow();
+    await expect(get("/fast/-/fast-1.0.0.tgz", { headers: { "user-agent": "yarn/4.6.0 npm/? node/v22.11.0 linux x64" }, edge })).rejects.toThrow();
+
+    const live = { list: synced() };
+
+    expect((await get("/fast/-/fast-1.0.0.tgz", { ...AUTH, edge: live }))?.status).toBe(200);
+    expect((await get("/fast/-/fast-1.0.0.tgz", { safe: true, edge: live }))?.status).toBe(404);
+    expect(edgeQueued).toEqual([]);
+  });
+
+  test("a clearance that ages past the view's window while npm answers is not used: the tarball and install document take the database path", async () => {
+    // the view clears the name, then npm's answer takes the view's whole window (the clock jumps while npm answers)
+    onNpmAsk = (path) => {
+      if (path.startsWith("/aging")) edgeShift = EDGE_VIEW_MAX_AGE_MS;
+    };
+    // with no database to reach, the database path fails the request: so the edge's clearance did not answer it
+
+    await expect(get("/aging/-/aging-1.0.0.tgz", { edge: { list: synced(), deadDatabase: true } })).rejects.toThrow();
+    expect(npm.asked).toContain("/aging/1.0.0");
+    edgeShift = 0;
+    await expect(get("/agingdoc", { headers: { accept: INSTALL_ACCEPT }, edge: { list: synced(), deadDatabase: true } })).rejects.toThrow();
+    expect(npm.asked).toContain("/agingdoc");
+    // npm has no such package: that answer too is made from the clearance only while it is young
+    onNpmAsk = (path) => {
+      if (path.startsWith("/agingmissing")) edgeShift = EDGE_VIEW_MAX_AGE_MS;
+    };
+
+    edgeShift = 0;
+    await expect(get("/agingmissing", { headers: { accept: INSTALL_ACCEPT }, edge: { list: synced(), deadDatabase: true } })).rejects.toThrow();
+    edgeShift = 0;
+    onNpmAsk = () => undefined;
+    expect(await get("/agingmissing2", { headers: { accept: INSTALL_ACCEPT }, edge: { list: synced(), deadDatabase: true } })).toBeNull();
+
+    expect(edgeQueued).toEqual([]);
+
+    // a clearance still young when npm has answered (npm's documents are in this isolate now) is used, with no statement
+    onNpmAsk = () => undefined;
+    edgeShift = 0;
+    expect((await get("/aging/-/aging-1.0.0.tgz", { edge: { list: synced(), deadDatabase: true } }))?.status).toBe(302);
+    expect((await get("/agingdoc", { headers: { accept: INSTALL_ACCEPT }, edge: { list: synced(), deadDatabase: true } }))?.status).toBe(200);
+  });
+
+  test("a version npm's document does not confirm, or one linked from another URL, takes the database path", async () => {
+    await expect(get("/fast/-/fast-2.0.0.tgz", { edge: { list: synced(), deadDatabase: true } })).rejects.toThrow();
+    await expect(get("/moved/-/moved-1.0.0.tgz", { edge: { list: synced(), deadDatabase: true } })).rejects.toThrow();
+  });
+
+  test("a slow R2 holds neither read past its deadline: the view's read and then the database path's list read each give up at EDGE_READ_DEADLINE_MS", async () => {
+    // warm npm's document, so only the two R2 reads and the statement are timed
+    expect((await get("/fast/-/fast-1.0.0.tgz"))?.status).toBe(302);
+    listDelayMs = 1_000;
+    const start = performance.now();
+    const got = await get("/fast/-/fast-1.0.0.tgz", { edge: { list: synced(), delayMs: 1_000 } });
+    const took = performance.now() - start;
+
+    expect(got?.status).toBe(302);
+    // the view's 300 ms, then the list's 300 ms beside the statement: not the 1.3 s the second R2 read used to add
+    expect(took).toBeGreaterThanOrEqual(2 * EDGE_READ_DEADLINE_MS - 20);
+    expect(took).toBeLessThan(2 * EDGE_READ_DEADLINE_MS + 300);
+    expect(edgeQueued).toEqual([]);
   });
 });

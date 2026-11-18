@@ -43,6 +43,21 @@ bun packages/infra/smoke.ts --stage staging              # check it with stock c
 
 Migrations run first, then Alchemy updates the registry Worker, then the website. The website's `REGISTRY` service binding makes it depend on the registry, and Alchemy starts a resource only after everything it depends on has finished, and not at all when one failed. The order matters for revocation: the registry is the only thing that decides whether a version's source (files, excerpts, readmes, review quotes, score evidence) may be shown, and the website shows whatever it answers. A website deployed on its own against an older registry fails closed: it requires the `redacted` and `readmeVersion` fields that only a registry with the allowlist redaction sends, and shows "registry unavailable" where it would have shown the answer.
 
+### Install checks
+
+What the registry checks before it answers an install read of a package only npm has is set per deploy: `--install-checks database` (the default; one database statement per request) or `--install-checks edge` (each isolate's read of the R2 block list, no statement; `packages/registry/src/edge-checks.ts`, and `docs/ARCHITECTURE.md`, "Install checks answered in the data center"). `APM_INSTALL_CHECKS=edge` in the environment does the same; the flag wins. The deploy's first line says which it used.
+
+Edge views are safe only while every registry version that can publish holds the publish fence: a first publish puts its name on the block list and waits 8 s before its transaction, so no view without the name still answers when the name exists. Every build from this one on holds the fence in either mode; older builds do not. A Worker deploy is not atomic (old versions keep serving for a while, and a publish can still be running on one), so turn edge views on in two deploys:
+
+1. Phase 1: deploy this build, or any later one, in database mode, saying so: `bun packages/infra/deploy.ts deploy --stage <stage> --install-checks database`. Its first line must say `install checks database`.
+2. Phase 2: once it is the only version serving (`bun packages/infra/rollback.ts list --stage <stage>` shows one live deployment at 100% and no older one, and a few minutes have passed for publishes in flight on the old one), deploy again with `--install-checks edge`.
+
+Each run's line in the release record keeps the mode it deployed (`installChecks`), written only once the registry's live version is confirmed to carry that `APM_INSTALL_CHECKS`, and `rollback.ts list` shows it beside each registry build (`install checks database` or `edge`; a line from before the field is a build with no edge mode, shown as `database`).
+
+To go back: first deploy in database mode (or roll back to a build of this line that `rollback.ts list` shows with `install checks database`), wait until that is the only version serving, and only then roll back to a build without the fence. Rolling back from an edge deploy straight to a build without the fence leaves edge readers serving while fence-less publishes run.
+
+Each isolate in edge mode logs an `edge-checks` line once a minute in Workers Logs: how many requests it cleared, how many fell back and why (`published-here`, `confirmed`, `no-view`, `slow-read`, `expired`, `unservable`), its R2 reads and Cache API copies, failed reads, and skipped, late or failed analysis asks. Each request is counted once, as it was answered (a clearance that aged out before the answer counts only as `expired`), so the fallback share is the fallback counts over the fallbacks plus `clear`. These lines go to Workers Logs only; nothing of them is sent to Databuddy.
+
 ## Production cutover
 
 1. Confirm the zone is on Cloudflare: `dig NS apmjs.dev +short` must print `etta.ns.cloudflare.com` and `norman.ns.cloudflare.com`.
@@ -198,5 +213,6 @@ The registry Worker reads these (`packages/registry/src/worker.ts` parses them):
 | `APM_REVIEW_TOKEN_HASH` | sha256 (hex) of the AI reviewer's service token. Turns the AI review on. |
 | `APM_ADMINS` | GitHub logins that may confirm or dismiss flagged reviews. |
 | `APM_REVIEW_POPULAR_WEEKLY`, `APM_NPM_DOWNLOADS_URL`, `APM_REVIEW_LEASE_MS`, `APM_REVIEW_REQUESTS_PER_HOUR`, `APM_REVIEW_MAX_ATTEMPTS` | AI review tuning; defaults in `review.ts`. |
+| `APM_INSTALL_CHECKS` | `database` (default) or `edge`: what install reads of npm's packages check. Set by `deploy.ts --install-checks`; see "Install checks". |
 
 The website Worker gets `REGISTRY` (a service binding to the registry Worker) and `APM_REGISTRY`.

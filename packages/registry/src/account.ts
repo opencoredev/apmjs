@@ -18,7 +18,7 @@ import { sha512, tarballKey } from "./hash.ts";
 import { GRANT_MS, parseSixDigits } from "./factors.ts";
 import { requireSiteOrigin } from "./origin.ts";
 import { typedConfirmationReason } from "./approval.ts";
-import { commitVersion, dropBlobIfUnused, issueToken } from "./server.ts";
+import { commitVersion, dropBlobIfUnused, fenceNewName, issueToken } from "./server.ts";
 import { ProofFields, refusedProof, secondFactor } from "./step-up.ts";
 import { isWithheld } from "./withheld.ts";
 
@@ -436,6 +436,17 @@ export const accountRoute = (req: Request, url: URL) =>
         return fail(409, `${row.package}@${row.version}: the staged tarball no longer matches what was uploaded. Publish it again.`);
       }
 
+      // before the transaction: a new name goes on the block list and waits out the edge views (fenceNewName); the row
+      // is decided again inside it (still pending, and not expired while the fence waited), and the owners checked
+      // again under the package's lock (commitVersion)
+      const fence = yield* fenceNewName(row.package);
+
+      if (row.expires_at <= (yield* (yield* Clock).now)) {
+        yield* sweepStaged;
+
+        return fail(410, `${row.package}@${row.version} waited more than 24h and expired. Publish it again to get a new link.`);
+      }
+
       // The decision and the version land together: of two approvals racing, one commits and the other gets a 409.
       yield* store.tx(
         Effect.gen(function* () {
@@ -456,6 +467,7 @@ export const accountRoute = (req: Request, url: URL) =>
             score: row.score,
             publisher: row.staged_by,
             detail: { approvedBy: user, stagedAt: new Date(row.staged_at).toISOString() },
+            fence,
           });
         }),
       );

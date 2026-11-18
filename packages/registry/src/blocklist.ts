@@ -11,6 +11,9 @@
 // review or a publish that rolled back stays blocked here until then, which fails closed. Every write is a
 // read-modify-write guarded by the object's ETag, so two writers never lose each other's entries.
 //
+// With APM_INSTALL_CHECKS=edge, each isolate also answers install reads of npm's packages from its read of the list
+// (edge-checks.ts), under 4 s old when the answer is made.
+//
 // Until a sync has written the list (`syncedAt` null: a new stage, or an object that could not be read), degraded.ts
 // refuses every install: it cannot tell an apm package from an npm one.
 import { Context, Effect, Layer, Option } from "effect";
@@ -117,22 +120,29 @@ export type BlocklistBucket = BlocklistReader & {
   put(key: string, value: string, options: BlocklistPut): Promise<object | null>;
 };
 
+/** The list's text parsed, or why it cannot be used. */
+export function parseList(text: string): { kind: "ok"; list: BlocklistBody } | { kind: "unreadable"; reason: string } {
+  let raw: unknown;
+
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { kind: "unreadable", reason: "it is not JSON" };
+  }
+
+  const parsed = BlocklistBody.safeParse(raw);
+
+  return parsed.success ? { kind: "ok", list: parsed.data } : { kind: "unreadable", reason: "it is not in the expected shape" };
+}
+
 /** The list as the degraded routes and the health check read it: parsed whole, or why it cannot be used. */
 export async function readFrom(bucket: BlocklistReader): Promise<BlocklistRead> {
   const obj = await bucket.get(BLOCKLIST_KEY);
 
   if (obj === null) return { kind: "missing" };
-  let raw: unknown;
+  const parsed = parseList(await obj.text());
 
-  try {
-    raw = JSON.parse(await obj.text());
-  } catch {
-    return { kind: "unreadable", reason: "it is not JSON", etag: obj.etag };
-  }
-
-  const parsed = BlocklistBody.safeParse(raw);
-
-  return parsed.success ? { kind: "ok", list: parsed.data, etag: obj.etag } : { kind: "unreadable", reason: "it is not in the expected shape", etag: obj.etag };
+  return parsed.kind === "ok" ? { kind: "ok", list: parsed.list, etag: obj.etag } : { kind: "unreadable", reason: parsed.reason, etag: obj.etag };
 }
 
 /**
