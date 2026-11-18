@@ -14,7 +14,7 @@ import { Blocklist, blockTruth } from "./blocklist.ts";
 import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
 import { reportFailure, type Failure } from "./error-reports.ts";
 import { degradedRoute, isInstallRead, unavailable } from "./degraded.ts";
-import { EdgeChecks, FIRST_PUBLISH_HOLD_MS, PublishFence, type AskOutcome } from "./edge-checks.ts";
+import { EdgeChecks, FIRST_PUBLISH_HOLD_MS, PublishFence, type AskInput, type AskOutcome } from "./edge-checks.ts";
 import { queueDownload } from "./fast-tarball.ts";
 import { HEALTH_PATH, healthResponse, QUEUE_PROBE_KEY, QueueProbe } from "./health.ts";
 import { Clock } from "./clock.ts";
@@ -323,13 +323,18 @@ function choicesWriter(env: WorkerEnv, settings: RegistrySettings, clock: Layer.
 function edgeChecks(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background, controls: TestControls) {
   if (env.APM_INSTALL_CHECKS !== "edge" || settings.upstreamUrl === null) return Layer.empty;
 
-  const queue = (input: { name: string; version: string }): Promise<AskOutcome> =>
-    Effect.runPromiseExit(queueDownload(input).pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped)).then((exit) => {
-      if (Exit.isSuccess(exit)) return "asked";
-      logFailure("download-queue", { name: input.name, version: input.version }, Cause.pretty(exit.cause));
+  // the edge aborts an ask past its deadline: the signal interrupts it, closing its connection, and nothing is logged
+  // for it here (the edge counts it as a timeout)
+  const queue = ({ name, version, signal }: AskInput): Promise<AskOutcome> =>
+    Effect.runPromiseExit(queueDownload({ name, version }).pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped), { signal }).then(
+      (exit): AskOutcome => {
+        if (Exit.isSuccess(exit)) return exit.value;
 
-      return "failed";
-    });
+        if (!signal.aborted) logFailure("download-queue", { name, version }, Cause.pretty(exit.cause));
+
+        return "failed";
+      },
+    );
 
   return EdgeChecks.layer(
     {

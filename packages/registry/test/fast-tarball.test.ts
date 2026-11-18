@@ -21,7 +21,7 @@ import { EDGE_READ_DEADLINE_MS, EDGE_VIEW_MAX_AGE_MS, EdgeChecks } from "../src/
 /** What npm's own client sends for an install document. */
 const INSTALL_ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 
-import { versionOfFile } from "../src/fast-tarball.ts";
+import { queueDownload, versionOfFile } from "../src/fast-tarball.ts";
 import { type Lease, MemoryPool, RequestMemory } from "../src/memory.ts";
 import { Upstream, type UpstreamApi } from "../src/upstream.ts";
 
@@ -132,6 +132,9 @@ let list: BlocklistBody | null;
 /** How long the database path's read of the block list (Blocklist.recent) takes. */
 let listDelayMs = 0;
 let enqueued: string[];
+
+/** Whether the analysis queue refuses what it is sent (Analysis.enqueue answers false). */
+let refuseQueue = false;
 let stored: string[];
 
 const sql = async (text: string, params: readonly unknown[] = []): Promise<void> => {
@@ -164,6 +167,7 @@ beforeEach(() => {
   list = { format: 1, syncedAt: NOW, local: [], confirmed: [] };
   listDelayMs = 0;
   enqueued = [];
+  refuseQueue = false;
   stored = [];
 });
 
@@ -195,7 +199,11 @@ const analysis = Layer.succeed(
   Analysis,
   Analysis.of({
     ensure: (_pkg, v) => Effect.succeed(v),
-    enqueue: (name, version) => Effect.sync(() => void enqueued.push(`${name}@${version}`)),
+    enqueue: (name, version) => Effect.sync(() => {
+      enqueued.push(`${name}@${version}`);
+
+      return !refuseQueue;
+    }),
     runJob: () => Effect.succeed<JobOutcome>("missing"),
     recover: Effect.succeed(0),
   }),
@@ -575,6 +583,25 @@ describe("the upstream tarball fast path", () => {
     enqueued = [];
     await sql("INSERT INTO analysis_outcomes (package, version, scorer, starts, outcome, decided_at) VALUES ('fast', '1.1.0', $1, 1, 'unreadable', 0)", [SCORER]);
     await get("/fast/-/fast-1.1.0.tgz");
+    expect(enqueued).toEqual([]);
+  });
+});
+
+describe("a download answered from the edge view, asked about after its answer (queueDownload)", () => {
+  const ask = (name: string, version: string) =>
+    Effect.runPromise(queueDownload({ name, version }).pipe(Effect.provide(Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), analysis)), Effect.scoped));
+
+  test("is \"asked\" when the queue took the version, \"failed\" when it refused it, so the edge asks again in seconds and counts the failure", async () => {
+    expect(await ask("qd", "1.0.0")).toBe("asked");
+    refuseQueue = true;
+    expect(await ask("qd", "1.0.1")).toBe("failed");
+    expect(enqueued).toEqual(["qd@1.0.0", "qd@1.0.1"]);
+  });
+
+  test("is \"asked\" with nothing sent when the version is queued already", async () => {
+    await sql("INSERT INTO analysis_jobs (package, version, queued_at, scorer) VALUES ('qd', '2.0.0', $1, $2)", [NOW - 60_000, SCORER]);
+    refuseQueue = true;
+    expect(await ask("qd", "2.0.0")).toBe("asked");
     expect(enqueued).toEqual([]);
   });
 });

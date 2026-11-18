@@ -55,7 +55,7 @@ import { RegistryConfig, type RegistrySettings } from "./config.ts";
 import { confirmedText } from "./confirmed.ts";
 import { Store } from "./db.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
-import { EDGE_READ_DEADLINE_MS, EdgeChecks } from "./edge-checks.ts";
+import { EDGE_READ_DEADLINE_MS, EdgeChecks, type AskOutcome } from "./edge-checks.ts";
 import { fail } from "./http.ts";
 import { tarballBase } from "./server.ts";
 import { timed, timingOrNull, type TimingApi } from "./timing.ts";
@@ -339,13 +339,16 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
 /**
  * What a download answered from the edge view does after its answer (worker.ts runs it on services of its own): the
  * statement the database path reads before its answer (Store.tarballRead), then the version queued for analysis unless
- * it is published here, scored, decided or queued already, as on the database path.
+ * it is published here, scored, decided or queued already, as on the database path. "failed" when the queue refused
+ * the version, so the edge asks again after a few seconds instead of a minute.
  */
 export const queueDownload = (input: { name: string; version: string }) =>
   Effect.gen(function* () {
     const at = yield* Effect.flatMap(Clock, (c) => c.now);
     const read = yield* (yield* Store).tarballRead({ ...input, queuedSince: at - REQUEUE_AFTER_MS });
 
-    if (read.local || read.decided || read.queued) return;
-    yield* (yield* Analysis).enqueue(input.name, input.version);
+    if (read.local || read.decided || read.queued) return "asked" satisfies AskOutcome;
+    const queued = yield* (yield* Analysis).enqueue(input.name, input.version);
+
+    return queued ? ("asked" satisfies AskOutcome) : ("failed" satisfies AskOutcome);
   });

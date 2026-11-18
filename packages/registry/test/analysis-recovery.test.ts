@@ -13,7 +13,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, MAX_FETCH_FAILURES, RECOVER_ACCEPTED_SHARE, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, QUEUE_SEND_TIMEOUT_MS, MAX_FETCH_FAILURES, RECOVER_ACCEPTED_SHARE, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { StoreError } from "../src/errors.ts";
@@ -807,6 +807,48 @@ describe("accepted jobs that never began cannot starve behind unfinished runs", 
 
       expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe(RECOVER_PER_SWEEP);
       expect(q.sent.length).toBe(RECOVER_PER_SWEEP);
+    });
+  }, 60_000);
+});
+
+// Review of 851147c, findings 2 and 4: a queue send that never answered held its caller (an edge ask, or a download on
+// the database path) with no limit, and a refused send was reported to the edge as queued. A send now counts as
+// refused after QUEUE_SEND_TIMEOUT_MS, its reservation goes, and enqueue answers false so the caller asks again soon.
+describe("a queue send that does not answer is refused in time", () => {
+  test("enqueue answers false after QUEUE_SEND_TIMEOUT_MS and drops its reservation, so the next request queues the version", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["stalled-send"]);
+      const sent: AnalysisJob[] = [];
+      let stall = true;
+
+      const queue: AnalysisQueue = {
+        send: (job) => {
+          sent.push(job);
+
+          return stall ? new Promise<void>(() => undefined) : Promise.resolve();
+        },
+      };
+
+      const enqueue = () => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("stalled-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue })), Effect.scoped));
+      const start = performance.now();
+
+      expect(await enqueue()).toBe(false);
+      expect(performance.now() - start).toBeGreaterThanOrEqual(QUEUE_SEND_TIMEOUT_MS - 50);
+      expect(performance.now() - start).toBeLessThan(QUEUE_SEND_TIMEOUT_MS + 2_000);
+      expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'stalled-send'")).toHaveLength(0);
+      stall = false;
+      expect(await enqueue()).toBe(true);
+      expect(sent).toHaveLength(2);
+      expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'stalled-send'")).toHaveLength(1);
+    });
+  }, 60_000);
+
+  test("enqueue answers false when the queue refuses the send", async () => {
+    await withRig(async (db) => {
+      const up = upstreamStub(["refused-send"]);
+      const queue: AnalysisQueue = { send: () => Promise.reject(new Error("queue full")) };
+
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("refused-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue })), Effect.scoped))).toBe(false);
     });
   }, 60_000);
 });

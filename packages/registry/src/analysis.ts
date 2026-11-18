@@ -27,7 +27,7 @@
 // any. What a registry before apm-score-v11 refused for those caps decides nothing for this scorer: outcomes, like
 // analyses, are kept per scorer.
 import { RequestMemory } from "./memory.ts";
-import { Context, Effect, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type AnalysisStart, type RunHistory, type Unscorable, type VersionRecord } from "./db.ts";
@@ -111,6 +111,12 @@ export const MAX_FAILED_RUNS = 2;
 
 /** A queued version is sent again only after this long without a result. */
 export const REQUEUE_AFTER_MS = 10 * 60_000;
+
+/**
+ * How long a queue send may take before it counts as refused: its reservation goes and the next request queues the
+ * version again. A send that lands after this leaves the job on the queue twice, which a run handles (it stores once).
+ */
+export const QUEUE_SEND_TIMEOUT_MS = 4_000;
 
 /** How one analysis run reads: the whole package under a meter, or a smaller re-run that is marked incomplete. */
 export type RunPlan = { maxWork: number; maxScannedBytes?: number; incompleteBecause?: readonly string[] };
@@ -227,8 +233,11 @@ export type AnalysisApi = {
    * it requeued.
    */
   readonly recover: Effect.Effect<number, StoreError | BlobError, RequestMemory>;
-  /** Queues a version for analysis unless it is already scored or queued. */
-  readonly enqueue: (name: string, version: string) => Effect.Effect<void, StoreError>;
+  /**
+   * Queues a version for analysis unless it is already scored or queued. True when it is on the queue now (or recorded
+   * for the sweep, with no queue); false when the queue refused it or did not answer in QUEUE_SEND_TIMEOUT_MS.
+   */
+  readonly enqueue: (name: string, version: string) => Effect.Effect<boolean, StoreError>;
   /**
    * The consumer's work: fetch, verify, analyze and store one version, or record why it cannot be. The packument is
    * read under the run's lease (RequestMemory).
@@ -240,7 +249,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
   /** No upstream, nothing to score: local versions are scored when they are published. */
   static readonly none = Layer.succeed(
     Analysis,
-    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.void, runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
+    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.succeed(true), runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
   );
 
   /** `queue`: the analysis queue's producer, or null for a registry with none. */
@@ -266,8 +275,13 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             if (!claimed || queue === null) return true;
             const job: AnalysisJob = { name, version };
 
-            // a job the queue refused is not on it, so its reservation goes too and the next request queues it again
+            // a job the queue refused, or did not take in time, is not on it (as far as this run knows), so its
+            // reservation goes too and the next request queues it again
             return yield* Effect.tryPromise({ try: () => queue.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
+              Effect.timeoutOrElse({
+                duration: Duration.millis(QUEUE_SEND_TIMEOUT_MS),
+                orElse: () => Effect.fail(new QueueError({ operation: "send", cause: `no answer in ${QUEUE_SEND_TIMEOUT_MS} ms` })),
+              }),
               Effect.as(true),
               Effect.catchTag("QueueError", (e) =>
                 Effect.logWarning("analysis queue send failed", { name, version, cause: String(e.cause) }).pipe(Effect.andThen(store.releaseAnalysisJob(name, version, now)), Effect.as(false)),

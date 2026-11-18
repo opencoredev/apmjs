@@ -17,10 +17,12 @@ import {
   LIST_STALE_MS,
   PublishFence,
   QUEUED_MAX,
-  READ_ABANDON_MS,
+  READ_LIFETIME_MS,
   verdictOf,
   WAITING_MAX,
+  ASK_DEADLINE_MS,
   ASK_WAIT_MS,
+  type AskInput,
   type AskOutcome,
   type Clearance,
   type ColoCache,
@@ -122,7 +124,7 @@ const settle = async (): Promise<void> => {
   }
 };
 
-const edgeOf = (o: EdgeOptions, ask: (input: { name: string; version: string }) => Promise<AskOutcome> = () => Promise.resolve("asked")) =>
+const edgeOf = (o: EdgeOptions, ask: (input: AskInput) => Promise<AskOutcome> = () => Promise.resolve("asked")) =>
   Effect.runSync(
     Effect.gen(function* () {
       return yield* EdgeChecks;
@@ -278,17 +280,20 @@ describe("an isolate's edge view", () => {
     expect(b.state.reads).toBe(1);
   });
 
-  test("a stalled read stays the isolate's one read until it settles: requests past its deadline take the database path at once and start no second read", async () => {
+  test("a stalled read stays the isolate's one read until its life settles: requests past its deadline take the database path at once and start no second read, however far the clock moves", async () => {
     const b = bucket(list({}));
-    const o = options(b.api);
+    const o = options(b.api, { readLifetimeMs: 400 });
     const stalled = gate();
 
     b.state.held = stalled.wait;
     expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
     expect(b.state.reads).toBe(1);
+    // the read's life is the promise its request's background holds
+    expect(later).toHaveLength(1);
 
-    // past the view's age, and long past the read's deadline: still the one read, and no request waits on it
-    for (const step of [EDGE_VIEW_MAX_AGE_MS, EDGE_VIEW_MAX_AGE_MS, 10_000]) {
+    // past the view's age, long past the read's deadline, and past the 30 s the old rule abandoned a read at: the
+    // request that started it may still be alive (waiting on npm, then in its waitUntil), so it is still the one read
+    for (const step of [EDGE_VIEW_MAX_AGE_MS, EDGE_VIEW_MAX_AGE_MS, 10_000, 30_000, 60_000]) {
       clock += step;
       const start = performance.now();
 
@@ -297,17 +302,65 @@ describe("an isolate's edge view", () => {
       expect(b.state.reads).toBe(1);
     }
 
-    // a read out for READ_ABANDON_MS was lost with its request: one more read starts
-    clock += READ_ABANDON_MS;
+    // its life ends when its own timer does, inside the background that holds it: then, and only then, one more read
+    const started = performance.now();
+
+    await settle();
+    expect(performance.now() - started).toBeLessThan(500);
     b.state.held = null;
     expect(await decided(o, "react")).toEqual(CLEAR);
     expect(b.state.reads).toBe(2);
 
-    // the lost read landing late changes nothing: the view read after it is kept
+    // the abandoned read landing late is never looked at: the list it took (no names) does not replace a newer view
     b.set(list({ confirmed: ["react"] }));
+    clock += EDGE_VIEW_MAX_AGE_MS;
+    expect(await decided(o, "react")).toEqual({ kind: "database", reason: "confirmed" });
     stalled.open();
     await settle();
+    expect(await decided(o, "react")).toEqual({ kind: "database", reason: "confirmed" });
+  });
+
+  test("no second read starts while the first can still land: a read is out until it lands or is abandoned, never beside another", async () => {
+    const b = bucket(list({}));
+    let out = 0;
+    let most = 0;
+    const slow = gate();
+
+    const counted: BlocklistReader = {
+      get: async (key) => {
+        out++;
+        most = Math.max(most, out);
+
+        try {
+          await slow.wait;
+
+          return await b.api.get(key);
+        } finally {
+          out--;
+        }
+      },
+    };
+
+    const o = options(counted, { readLifetimeMs: 10_000 });
+
+    expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
+
+    // many requests over what the clock calls minutes, while the request that started the read is alive
+    for (let i = 0; i < 20; i++) {
+      clock += 5_000;
+      expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
+    }
+
+    expect(most).toBe(1);
+    slow.open();
+    await settle();
+    // it landed too old to decide by now: the next request reads again, alone
     expect(await decided(o, "react")).toEqual(CLEAR);
+    expect(most).toBe(1);
+  });
+
+  test("a read's life is bounded well inside the 30 s a request's background may run", () => {
+    expect(READ_LIFETIME_MS + EDGE_READ_DEADLINE_MS).toBeLessThanOrEqual(15_000);
   });
 
   test("a read that settles frees the isolate for the next one, however late it settled", async () => {
@@ -711,7 +764,125 @@ describe("downloads answered from a view", () => {
 
   test("the waiting line is no longer than what QUEUED_MAX asks get through in ASK_WAIT_MS at a third of a second each", () => {
     expect(WAITING_MAX).toBeLessThanOrEqual((QUEUED_MAX * ASK_WAIT_MS) / 333);
-    // and the wait leaves an ask of two statements at their 8 s limit inside the 30 s after a response
-    expect(ASK_WAIT_MS + 2 * 9_000).toBeLessThan(30_000);
+    // and the wait plus an ask at its deadline ends well inside the 30 s after a response
+    expect(ASK_WAIT_MS + ASK_DEADLINE_MS).toBeLessThanOrEqual(20_000);
+  });
+
+  test("downloads accepted on the same tick never run more than QUEUED_MAX asks: a turn takes its ask in the step that sees it free", async () => {
+    const release = gate();
+    let running = 0;
+    let most = 0;
+
+    const edge = edgeOf(options(bucket(list({})).api), async () => {
+      running++;
+      most = Math.max(most, running);
+      await release.wait;
+      running--;
+
+      return "asked";
+    });
+
+    // twenty at once, with no await between them (the probe that ran twenty asks together)
+    for (let i = 0; i < 20; i++) Effect.runSync(edge.downloaded({ name: "burst", version: `1.0.${i}` }));
+    await Bun.sleep(80);
+    expect(running).toBe(QUEUED_MAX);
+    // the asks end together, and every waiting turn looks again on the same few ticks
+    release.open();
+    await settle();
+    expect(most).toBe(QUEUED_MAX);
+  });
+
+  test("waiting turns that wake on the same tick after asks finish take only the asks that are free", async () => {
+    const gates = Array.from({ length: 40 }, () => gate());
+    let running = 0;
+    let most = 0;
+    let next = 0;
+
+    const edge = edgeOf(options(bucket(list({})).api), async () => {
+      const mine = gates[next++] ?? gate();
+
+      running++;
+      most = Math.max(most, running);
+      await mine.wait;
+      running--;
+
+      return "asked";
+    });
+
+    for (let i = 0; i < 40; i++) Effect.runSync(edge.downloaded({ name: "wake", version: `1.0.${i}` }));
+    await Bun.sleep(40);
+
+    // three asks end: three turns, and only three, may take their place, however many look at once
+    for (const g of gates.slice(0, 3)) g.open();
+    await Bun.sleep(80);
+    expect(running).toBe(QUEUED_MAX);
+
+    for (const g of gates) g.open();
+    await settle();
+    expect(most).toBe(QUEUED_MAX);
+  });
+
+  test("an ask that never settles (a stalled queue send) is aborted at its deadline: its slot is freed, the timeout counted, and the download asked again after a few seconds", async () => {
+    const reports: EdgeReport[] = [];
+    const signals: AbortSignal[] = [];
+    let stall = true;
+    const asked: string[] = [];
+    const o = options(bucket(list({})).api, { askDeadlineMs: 200, report: (r) => void reports.push(r) });
+
+    const edge = edgeOf(o, (input) => {
+      asked.push(input.version);
+      signals.push(input.signal);
+
+      // a stalled send: never settles, whatever the signal says
+      return stall ? new Promise<AskOutcome>(() => undefined) : Promise.resolve("asked");
+    });
+
+    // every ask stalls: QUEUED_MAX of them hold every slot, and one more waits its turn
+    for (let i = 0; i < QUEUED_MAX + 1; i++) Effect.runSync(edge.downloaded({ name: "stall", version: `3.0.${i}` }));
+    const start = performance.now();
+
+    await Promise.all(later.slice(0, QUEUED_MAX));
+    // each request's background ended at the ask's deadline, not when the send would have
+    expect(performance.now() - start).toBeLessThan(500);
+    expect(signals.slice(0, QUEUED_MAX).every((sig) => sig.aborted)).toBe(true);
+    // the slots were freed: the waiting one got its ask
+    await Bun.sleep(60);
+    expect(asked).toHaveLength(QUEUED_MAX + 1);
+    stall = false;
+    await settle();
+    // asked again after FAILED_RETRY_MS, not a minute
+    await Effect.runPromise(edge.downloaded({ name: "stall", version: "3.0.0" }));
+    await settle();
+    expect(asked).toHaveLength(QUEUED_MAX + 1);
+    clock += 5_000;
+    await Effect.runPromise(edge.downloaded({ name: "stall", version: "3.0.0" }));
+    await settle();
+    expect(asked).toHaveLength(QUEUED_MAX + 2);
+    expect(signals.at(-1)?.aborted).toBe(false);
+    clock += 60_000;
+    await Effect.runPromise(edge.declined);
+    expect(reports.at(-1)).toMatchObject({ queueTimeouts: QUEUED_MAX + 1, queueFailures: 0 });
+  });
+
+  test("a send the queue refused counts as a failure and is asked again after a few seconds", async () => {
+    const reports: EdgeReport[] = [];
+    let tries = 0;
+    const o = options(bucket(list({})).api, { report: (r) => void reports.push(r) });
+
+    const edge = edgeOf(o, () => {
+      tries++;
+
+      return Promise.resolve(tries === 1 ? "failed" : "asked");
+    });
+
+    await Effect.runPromise(edge.downloaded({ name: "refused", version: "1.0.0" }));
+    await settle();
+    clock += 5_000;
+    await Effect.runPromise(edge.downloaded({ name: "refused", version: "1.0.0" }));
+    await settle();
+    expect(tries).toBe(2);
+    clock += 60_000;
+    await Effect.runPromise(edge.declined);
+    expect(reports.at(-1)).toMatchObject({ queueFailures: 1, queueTimeouts: 0 });
   });
 });

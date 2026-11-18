@@ -29,9 +29,13 @@
 // at a time, until that read settles: a request that finds one running waits for it, on its own timer, until that
 // read's deadline (no promise is shared between requests, as Workers require), and one that comes after the deadline
 // waits not at all and takes the database path; no second read starts while the first is out, however slow R2 is. A
-// read still out after READ_ABANDON_MS (30 s, as long as the waitUntil holding it may run after its response) is taken
-// as lost with its request, so a stalled R2 costs an isolate at most one read per 30 s. A read first tries the data
-// center's copy (the Cache API, written by the isolate that last read R2, used while under 2 s old), then R2.
+// read's whole life is one promise held by the waitUntil of the request that started it: it settles when the read
+// does, or after READ_LIFETIME_MS (10 s), when the read is abandoned and whatever it brings later is dropped unused.
+// The isolate's one read ends exactly when that promise settles, never because time passed on a clock, so a second
+// read never starts while the first can still land. The read starts before its request's response, so the promise
+// settles well inside the 30 s that waitUntil may run after it; a stalled R2 costs an isolate one read per 10 s. A read
+// first tries the data center's copy (the Cache API, written by the isolate that last read R2, used while under 2 s
+// old), then R2.
 //
 // What a view does not decide goes to the database path as before: a name it lists as published here or with any
 // confirmed version, a list missing, unreadable, never synced or not synced for LIST_STALE_MS (15 minutes: the cron
@@ -43,8 +47,11 @@
 //
 // A download answered from a view asks about its analysis after the answer, in the waitUntil of the request that
 // accepted it and no other: it waits its turn for one of the isolate's QUEUED_MAX asks for at most ASK_WAIT_MS (5 s),
-// then is dropped and forgotten, so a later download of it asks again. So no accepted ask depends on another request's
-// lifetime, and each request's work after its answer ends well inside the 30 s Workers allow.
+// then is dropped and forgotten, so a later download of it asks again. A turn takes its ask in the same step that sees
+// it free, so no two turns take one ask. The ask itself, its statements, its queue send and their cleanup, gets
+// ASK_DEADLINE_MS (15 s): past it the ask is aborted, its slot freed, the timeout counted (`queueTimeouts`) and the
+// download asked about again after 5 s. So no accepted ask depends on another request's lifetime, and each request's
+// work after its answer ends by 20 s, well inside the 30 s Workers allow.
 import { Context, Duration, Effect, Layer, Option } from "effect";
 import { BLOCKLIST_KEY, parseList, type BlocklistBody, type BlocklistReader } from "./blocklist.ts";
 
@@ -70,10 +77,11 @@ const CLOCK_SKEW_MS = 250;
 const POLL_MS = 10;
 
 /**
- * How long a read may stay out before the isolate stops waiting for it to settle and may start another: the time a
- * Worker's waitUntil may run after its response, past which the request holding the read is gone with it.
+ * How long a read may be out before it is abandoned: its promise settles then, what it brings later is dropped, and the
+ * isolate may start another. Counted from the read's start, which comes before its request's response, so the timer
+ * fires well inside the 30 s a Worker's waitUntil may run after that response.
  */
-export const READ_ABANDON_MS = 30_000;
+export const READ_LIFETIME_MS = 10_000;
 
 /** How often an isolate logs what its views decided. */
 const REPORT_EVERY_MS = 60_000;
@@ -105,7 +113,9 @@ export type EdgeVerdict = Clearance | { kind: "database"; reason: EdgeFallback }
 export type ColoCache = { match(key: string): Promise<Response | undefined>; put(key: string, res: Response): Promise<void> };
 
 /** What an isolate logs once a minute: counts since its last line. */
-export type EdgeReport = Readonly<Record<"clear" | EdgeFallback | "r2Reads" | "coloHits" | "readFailures" | "queueSkipped" | "queueLate" | "queueFailures", number>>;
+export type EdgeReport = Readonly<
+  Record<"clear" | EdgeFallback | "r2Reads" | "coloHits" | "readFailures" | "readTimeouts" | "queueSkipped" | "queueLate" | "queueFailures" | "queueTimeouts", number>
+>;
 
 export type EdgeOptions = {
   readonly bucket: BlocklistReader;
@@ -118,10 +128,15 @@ export type EdgeOptions = {
   readonly background: ((work: Promise<void>) => void) | null;
   /** Where the once-a-minute counts go; null keeps none. */
   readonly report: ((counts: EdgeReport) => void) | null;
-  /** The view's age limit, how long a request waits for a read, and how long an ask waits its turn. Tests shorten them. */
+  /**
+   * The view's age limit, how long a request waits for a read, how long a read may be out, how long an ask waits its
+   * turn and how long it may run. Tests shorten them.
+   */
   readonly maxAgeMs?: number;
   readonly readDeadlineMs?: number;
+  readonly readLifetimeMs?: number;
   readonly askWaitMs?: number;
+  readonly askDeadlineMs?: number;
 };
 
 function viewOf(list: BlocklistBody, readAt: number): EdgeView {
@@ -156,14 +171,17 @@ const zero = (): Counts => ({
   r2Reads: 0,
   coloHits: 0,
   readFailures: 0,
+  readTimeouts: 0,
   queueSkipped: 0,
   queueLate: 0,
   queueFailures: 0,
+  queueTimeouts: 0,
 });
 
 /** What an isolate keeps per bucket: its view, the read it is running (when it began), the downloads it asked about. */
 type Held = {
   view: EdgeView | null;
+  /** When the isolate's one read began, until its life (startRead) settles; null while none is out. */
   reading: number | null;
   /** How many reads have landed: a request waiting on another's read looks for this to move. */
   landed: number;
@@ -285,28 +303,33 @@ function keep(held: Held, next: EdgeView): void {
 }
 
 /**
- * Starts this isolate's one read: kept as soon as it is in, then copied for the data center. The returned promise is
- * the view, for the request that started it; the rest runs after its response when there is one.
+ * Starts this isolate's one read. Its life is one promise: the read, or null once `lifetimeMs` passed first, when the
+ * read is abandoned and anything it brings later is never looked at. The isolate's one read ends when that promise
+ * settles, and only then. A view that lands is kept at once, then copied for the data center (bounded the same way).
+ * The returned promise is the view (null for an abandoned read), for the request that started it; the rest runs in its
+ * background when there is one.
  */
-function startRead(o: EdgeOptions, held: Held, maxAgeMs: number): Promise<EdgeView> {
+function startRead(o: EdgeOptions, held: Held, maxAgeMs: number, lifetimeMs: number): Promise<EdgeView | null> {
   const readAt = o.now();
 
   held.reading = readAt;
 
-  const kept = readView(o, held, readAt, maxAgeMs).then((r) => {
-    keep(held, r.view);
+  const life = within(readView(o, held, readAt, maxAgeMs), lifetimeMs).then((r) => {
+    if (r === null) held.counts.readTimeouts++;
+    else keep(held, r.view);
     held.landed++;
-
-    if (held.reading === readAt) held.reading = null;
+    held.reading = null;
 
     return r;
   });
 
-  const done = kept.then((r) => (r.text === null ? undefined : keepCopy(o, r.text, readAt, maxAgeMs)));
+  const done = life.then(async (r) => {
+    if (r !== null && r.text !== null) await within(keepCopy(o, r.text, readAt, maxAgeMs), lifetimeMs);
+  });
 
   o.background?.(done);
 
-  return kept.then((r) => r.view);
+  return life.then((r) => (r === null ? null : r.view));
 }
 
 /** What a request may decide from: a view young enough now, or why it has none. */
@@ -326,25 +349,26 @@ function checked(o: EdgeOptions, view: EdgeView | null, maxAgeMs: number): Looku
 export async function currentView(o: EdgeOptions): Promise<Lookup> {
   const maxAgeMs = o.maxAgeMs ?? EDGE_VIEW_MAX_AGE_MS;
   const deadlineMs = o.readDeadlineMs ?? EDGE_READ_DEADLINE_MS;
+  const lifetimeMs = o.readLifetimeMs ?? READ_LIFETIME_MS;
   const held = heldFor(o.bucket);
   const at = o.now();
   const view = held.view;
-  // the isolate's one read stays its one read until it settles: one past its deadline sends requests to the database
-  // path at once (the loop below does not wait), and none starts beside it unless it was lost with its request
-  const running = held.reading !== null && at - held.reading >= 0 && at - held.reading < READ_ABANDON_MS ? held.reading : null;
+  // the isolate's one read stays its one read until its life settles: one past its deadline sends requests to the
+  // database path at once (the loop below does not wait), and none starts beside it, however long it has been out
+  const running = held.reading;
 
   if (view !== null && usable(view.readAt, at, maxAgeMs)) {
-    if (at - view.readAt >= maxAgeMs / 2 && running === null && o.background !== null) void startRead(o, held, maxAgeMs);
+    if (at - view.readAt >= maxAgeMs / 2 && running === null && o.background !== null) void startRead(o, held, maxAgeMs, lifetimeMs);
 
     return { kind: "view", view };
   }
 
-  if (running === null) return checked(o, await within(startRead(o, held, maxAgeMs), deadlineMs), maxAgeMs);
+  if (running === null) return checked(o, await within(startRead(o, held, maxAgeMs, lifetimeMs), deadlineMs), maxAgeMs);
 
   // another request's read: looked for on this request's own timer, until that read's deadline; past it, not at all
   const landed = held.landed;
 
-  for (let waited = at - running; waited < deadlineMs; waited += POLL_MS) {
+  for (let waited = Math.max(0, at - running); waited < deadlineMs; waited += POLL_MS) {
     await sleep(POLL_MS);
 
     if (held.landed !== landed) return checked(o, held.view, maxAgeMs);
@@ -372,18 +396,19 @@ const FAILED_RETRY_MS = 5_000;
 
 /**
  * How many downloads an isolate remembers; how many asks it runs at once; how many downloads wait for one of those to
- * finish, each in the waitUntil of the request that accepted it, for at most ASK_WAIT_MS. A download past both is
- * skipped and not remembered, so a later download of it is asked about. An ask is a database statement and, for a
+ * finish, each in the waitUntil of the request that accepted it, for at most ASK_WAIT_MS; how long an ask may run. A
+ * download past both is skipped and not remembered, so a later download of it is asked about. An ask is a database statement and, for a
  * version not yet queued, an insert (production's round trip is 65 to 105 ms), so QUEUED_MAX at a time get through
  * WAITING_MAX in ASK_WAIT_MS while asks average under 0.33 s; slower, the late ones are dropped, counted and asked again
- * on a later download. One cold npm install of 83 new packages (scripts/perf/npm-install-bench.ts) fits. The wait plus
- * one ask (each statement gives up at 8 s, db-health.ts) stays well inside the 30 s a request's waitUntil may run after
- * its response.
+ * on a later download. One cold npm install of 83 new packages (scripts/perf/npm-install-bench.ts) fits. An ask (a
+ * statement gives up at 8 s, db-health.ts; a queue send at 4 s, analysis.ts) is aborted at ASK_DEADLINE_MS whatever it
+ * waits on, so the wait plus one ask ends by 20 s, well inside the 30 s a request's waitUntil may run after its response.
  */
 const ASKED_MAX = 10_000;
 export const QUEUED_MAX = 8;
 export const WAITING_MAX = 120;
 export const ASK_WAIT_MS = 5_000;
+export const ASK_DEADLINE_MS = 15_000;
 
 /** How often a download waiting its turn looks for a free ask. */
 const TURN_POLL_MS = 25;
@@ -410,6 +435,9 @@ function askedLately(asked: Map<string, number>, key: string, at: number): boole
 /** What asking about one download's analysis came to: "failed" is asked again after FAILED_RETRY_MS. */
 export type AskOutcome = "asked" | "failed";
 
+/** One ask: the download, and the signal that aborts it once ASK_DEADLINE_MS passed. */
+export type AskInput = { readonly name: string; readonly version: string; readonly signal: AbortSignal };
+
 export type EdgeChecksApi = {
   /** What this isolate's view says of `name`: a clearance for npm's answer, or why the database decides. */
   readonly verdict: (name: string) => Effect.Effect<EdgeVerdict>;
@@ -425,8 +453,8 @@ export type EdgeChecksApi = {
 };
 
 export class EdgeChecks extends Context.Service<EdgeChecks, EdgeChecksApi>()("@apm/registry/EdgeChecks") {
-  /** `later` asks about a download's analysis after the response, on services of its own (worker.ts). */
-  static layer(o: EdgeOptions, later: (input: { name: string; version: string }) => Promise<AskOutcome>): Layer.Layer<EdgeChecks> {
+  /** `later` asks about a download's analysis after the response, on services of its own, until aborted (worker.ts). */
+  static layer(o: EdgeOptions, later: (input: AskInput) => Promise<AskOutcome>): Layer.Layer<EdgeChecks> {
     const maxAgeMs = o.maxAgeMs ?? EDGE_VIEW_MAX_AGE_MS;
     const held = heldFor(o.bucket);
 
@@ -454,41 +482,61 @@ export class EdgeChecks extends Context.Service<EdgeChecks, EdgeChecksApi>()("@a
 
     const declined: Effect.Effect<void> = Effect.sync(() => count(o, held, "unservable"));
 
-    /** One ask; a failure is asked again after FAILED_RETRY_MS instead of a minute. */
+    const askWaitMs = o.askWaitMs ?? ASK_WAIT_MS;
+    const askDeadlineMs = o.askDeadlineMs ?? ASK_DEADLINE_MS;
+
+    /**
+     * One ask, aborted once `askDeadlineMs` passed whatever it waits on. A failure or a timeout is asked again after
+     * FAILED_RETRY_MS instead of a minute.
+     */
     const ask = async (input: { name: string; version: string }): Promise<void> => {
-      const outcome = await later(input).catch((): AskOutcome => "failed");
+      const abort = new AbortController();
+
+      const outcome = await within(
+        later({ ...input, signal: abort.signal }).catch((): AskOutcome => "failed"),
+        askDeadlineMs,
+      );
 
       if (outcome === "asked") return;
+
+      if (outcome === null) abort.abort();
       remember(held.asked, `${input.name}@${input.version}`, o.now() + FAILED_RETRY_MS);
-      count(o, held, "queueFailures");
-    };
-
-    const askWaitMs = o.askWaitMs ?? ASK_WAIT_MS;
-
-    /** Whether `turn` is among the first in line, one for each ask free now. */
-    const turnCame = (turn: number): boolean => {
-      const place = held.waiting.indexOf(turn);
-
-      return place >= 0 && place < QUEUED_MAX - held.running;
+      count(o, held, outcome === null ? "queueTimeouts" : "queueFailures");
     };
 
     /**
-     * Waits for `turn` to come, on this request's own timer, for at most ASK_WAIT_MS; false when it did not. Every
-     * free ask is taken on the same tick by the turns first in line. The turn leaves the line either way.
+     * Takes an ask for `turn` when it is among the first in line, one for each ask free now. The check, leaving the line
+     * and taking the ask happen in one step, with no await between, so turns that look on the same tick never take more
+     * asks than are free.
+     */
+    const take = (turn: number): boolean => {
+      const place = held.waiting.indexOf(turn);
+
+      if (place < 0 || place >= QUEUED_MAX - held.running) return false;
+      held.waiting.splice(place, 1);
+      held.running++;
+
+      return true;
+    };
+
+    /**
+     * Waits for `turn` to take an ask, on this request's own timer, for at most ASK_WAIT_MS; false when it did not. A
+     * turn that took none leaves the line.
      */
     const awaitTurn = async (turn: number): Promise<boolean> => {
-      try {
-        for (let waited = 0; !turnCame(turn); waited += TURN_POLL_MS) {
-          if (waited >= askWaitMs) return false;
-          await sleep(TURN_POLL_MS);
+      for (let waited = 0; !take(turn); waited += TURN_POLL_MS) {
+        if (waited >= askWaitMs) {
+          const at = held.waiting.indexOf(turn);
+
+          if (at >= 0) held.waiting.splice(at, 1);
+
+          return false;
         }
 
-        return true;
-      } finally {
-        const at = held.waiting.indexOf(turn);
-
-        if (at >= 0) held.waiting.splice(at, 1);
+        await sleep(TURN_POLL_MS);
       }
+
+      return true;
     };
 
     /** One accepted download: its turn, then its ask, all in the waitUntil of the request that accepted it. */
@@ -505,8 +553,7 @@ export class EdgeChecks extends Context.Service<EdgeChecks, EdgeChecksApi>()("@a
         return;
       }
 
-      held.running++;
-
+      // the ask was taken by awaitTurn, in the step that saw it free
       try {
         await ask(input);
       } finally {
