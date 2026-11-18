@@ -8,4 +8,6 @@ interface CloudflareEnv {
   AGENT_RATE_LIMIT?: { limit: (options: { key: string }) => Promise<{ success: boolean }> };
   /** The deploy run that uploaded this version (packages/infra/deploy.ts); GET /api/build reports it. */
   APM_BUILD?: string;
+  /** Databuddy's public client id; unhandled server errors are reported to it (lib/server-errors.ts). Production only. */
+  APM_DATABUDDY_CLIENT_ID?: string;
 }

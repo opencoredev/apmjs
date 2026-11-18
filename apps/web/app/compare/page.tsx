@@ -1,4 +1,5 @@
 import { CheckIcon, EqualIcon, XIcon } from "lucide-react";
+import { PageView } from "@/components/page-view";
 import { pageMetadata } from "@/lib/agent/seo";
 
 export const metadata = pageMetadata({
@@ -111,6 +112,7 @@ function Mark({ kind }: { kind: "no" | "yes" | "same" }) {
 export default function Compare() {
   return (
     <div className="flex flex-col items-center">
+      <PageView label="compare" />
       <header className="flex max-w-2xl flex-col items-center pt-4 text-center sm:pt-10">
         <h1 className="text-[34px] leading-[1.15] font-medium tracking-[-0.02em] text-balance sm:text-5xl sm:leading-[1.12]">npm and apm, side by side.</h1>
         <p className="mt-5 text-lg leading-8 text-pretty text-muted-foreground">

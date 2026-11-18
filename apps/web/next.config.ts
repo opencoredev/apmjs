@@ -19,6 +19,8 @@ const nextConfig: NextConfig = {
     ];
   },
   /* config options here */
+  // @apm/core ships TypeScript source; lib/server-errors.ts imports its error reporter
+  transpilePackages: ["@apm/core"],
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {

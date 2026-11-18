@@ -12,6 +12,7 @@ import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Blocklist, blockTruth } from "./blocklist.ts";
 import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
+import { reportFailure, type Failure } from "./error-reports.ts";
 import { degradedRoute, isInstallRead, unavailable } from "./degraded.ts";
 import { HEALTH_PATH, healthResponse, QUEUE_PROBE_KEY, QueueProbe } from "./health.ts";
 import { Clock } from "./clock.ts";
@@ -95,6 +96,8 @@ const WorkerEnv = z.object({
     .optional(),
   /** The deploy run that uploaded this version (packages/infra/deploy.ts): /-/ping answers with it in BUILD_HEADER. */
   APM_BUILD: OptionalText,
+  /** Databuddy's public client id: unhandled 500s are reported to it (error-reports.ts). Production alone has one. */
+  APM_DATABUDDY_CLIENT_ID: OptionalText,
 });
 
 const DebugEnv = WorkerEnv.pick({ APM_DEBUG_TOKEN_HASH: true });
@@ -348,8 +351,13 @@ type Respond = { req: Request; rawEnv: RawEnv; clock: Layer.Layer<Clock>; ctx: E
 async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Promise<Response> {
   const parsed = WorkerEnv.safeParse(rawEnv);
 
+  // an unhandled 500 is reported to Databuddy after the answer (error-reports.ts), on production alone: a fixed code
+  // and the route's label, read inside the reporter's guard
+  const report = (failure: Failure): void => reportFailure({ req, env: rawEnv, waitUntil: ctx === null ? null : (work) => ctx.waitUntil(work), failure });
+
   if (!parsed.success) {
     logFailure("config", {}, parsed.error.message);
+    report({ kind: "misconfigured" });
 
     return fail(500, "The registry is misconfigured.");
   }
@@ -391,6 +399,7 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
     Effect.catch((e: InfraError) =>
       Effect.sync(() => {
         logFailure("request", { method: req.method, path, tag: e._tag, operation: e.operation }, String(e.cause));
+        report({ kind: "infra", error: e });
 
         return fail(500, "Internal error");
       }),
@@ -405,6 +414,7 @@ async function respond({ req, rawEnv, clock, ctx, faults, timing }: Respond): Pr
 
   if (Exit.isSuccess(exit)) return exit.value;
   logFailure("defect", { method: req.method, path }, Cause.pretty(exit.cause));
+  report({ kind: "defect", cause: exit.cause });
 
   return fail(500, "Internal error");
 }

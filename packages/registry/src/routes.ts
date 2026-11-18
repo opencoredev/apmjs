@@ -134,3 +134,99 @@ export function getRouteOf(pathname: string): GetRouteName | null {
 
 /** What a GET or HEAD of a path in no route answers. */
 export const NO_GET_ROUTE = "Not found: the registry has no GET route for this path.";
+
+/** A write route: the methods it answers, a stable name and the paths it answers (routeKey form, like the GET table). */
+export type WriteRoute = { readonly name: string; readonly methods: readonly ("POST" | "PUT" | "DELETE")[]; readonly pattern: RegExp };
+
+/** An id the staged and review-job routes take. */
+const ID = "[A-Za-z0-9_-]+";
+
+/**
+ * Every write the registry answers, by the module that answers it. Only error reports read this table
+ * (error-reports.ts): a report names a route by its label here and never by its path, so a write route missing from it
+ * is reported as "unknown", not refused. test/error-reports.test.ts sends a request to every handler's path.
+ */
+const REGISTRY_WRITES = [
+  // the account (account.ts)
+  { name: "login device", methods: ["POST"], pattern: path("/-/apm/v1/login/device") },
+  { name: "login device token", methods: ["POST"], pattern: path("/-/apm/v1/login/device/token") },
+  { name: "tokens revoke", methods: ["POST"], pattern: path("/-/apm/v1/account/tokens/revoke") },
+  { name: "factor passkey-challenge", methods: ["POST"], pattern: path("/-/apm/v1/factor/passkey-challenge") },
+  { name: "factor confirm", methods: ["POST"], pattern: path("/-/apm/v1/factor/confirm") },
+  { name: "verify", methods: ["POST"], pattern: path("/-/apm/v1/verify") },
+  { name: "staged approve", methods: ["POST"], pattern: path(`/-/apm/v1/staged/${ID}/approve`) },
+  { name: "staged reject", methods: ["POST"], pattern: path(`/-/apm/v1/staged/${ID}/reject`) },
+  // a package's state and owners, scans and audits (apm.ts)
+  { name: "yank", methods: ["POST"], pattern: path("/-/apm/v1/yank") },
+  { name: "unyank", methods: ["POST"], pattern: path("/-/apm/v1/unyank") },
+  { name: "revoke", methods: ["POST"], pattern: path("/-/apm/v1/revoke") },
+  { name: "restore", methods: ["POST"], pattern: path("/-/apm/v1/restore") },
+  { name: "incident", methods: ["POST"], pattern: path("/-/apm/v1/incident") },
+  { name: "owners", methods: ["POST", "DELETE"], pattern: path("/-/apm/v1/owners") },
+  { name: "scan", methods: ["POST"], pattern: path("/-/apm/v1/scan") },
+  { name: "audit", methods: ["POST"], pattern: path("/-/apm/v1/audit") },
+  { name: "advisories bulk", methods: ["POST"], pattern: path("/-/npm/v1/security/advisories/bulk") },
+  // the AI review (review.ts) and evidence dismissals (evidence.ts)
+  { name: "review result", methods: ["POST"], pattern: path(`/-/apm/v1/review-jobs/${ID}/result`) },
+  { name: "review release", methods: ["POST"], pattern: path(`/-/apm/v1/review-jobs/${ID}/release`) },
+  { name: "review decide", methods: ["POST"], pattern: path("/-/apm/v1/review-admin/decide") },
+  { name: "review request", methods: ["POST"], pattern: path(`/-/apm/v1/review/${NAME}/${SEG}/request`) },
+  { name: "evidence dismiss", methods: ["POST"], pattern: path("/-/apm/v1/evidence-admin/dismiss") },
+  { name: "evidence restore", methods: ["POST"], pattern: path("/-/apm/v1/evidence-admin/restore") },
+  // the npm protocol (server.ts)
+  { name: "dist-tags", methods: ["PUT", "POST", "DELETE"], pattern: path(`/-/package/${NAME}/dist-tags${TAIL}`) },
+  { name: "token delete", methods: ["DELETE"], pattern: path(String.raw`/-/user/token/[\s\S]*`) },
+  { name: "adduser", methods: ["PUT"], pattern: path(String.raw`/-/user/org\.couchdb\.user:.*`) },
+  { name: "unpublish", methods: ["DELETE"], pattern: path(`/${NAME}/(?:[\\s\\S]*/)?-rev${TAIL}`) },
+  { name: "rev", methods: ["PUT"], pattern: path(`/${NAME}/-rev${TAIL}`) },
+  { name: "publish", methods: ["PUT"], pattern: path(`/${NAME}`) },
+] as const satisfies readonly WriteRoute[];
+
+/** Better Auth's writes (auth.ts ROUTES and its callback prefixes). */
+const AUTH_WRITES = [
+  { name: "auth sign-in social", methods: ["POST"], pattern: path("/api/auth/sign-in/social") },
+  { name: "auth sign-out", methods: ["POST"], pattern: path("/api/auth/sign-out") },
+  { name: "auth link-social", methods: ["POST"], pattern: path("/api/auth/link-social") },
+  { name: "auth two-factor enable", methods: ["POST"], pattern: path("/api/auth/two-factor/enable") },
+  { name: "auth two-factor disable", methods: ["POST"], pattern: path("/api/auth/two-factor/disable") },
+  { name: "auth two-factor verify-totp", methods: ["POST"], pattern: path("/api/auth/two-factor/verify-totp") },
+  { name: "auth passkey verify-registration", methods: ["POST"], pattern: path("/api/auth/passkey/verify-registration") },
+  { name: "auth passkey verify-authentication", methods: ["POST"], pattern: path("/api/auth/passkey/verify-authentication") },
+  { name: "auth device approve", methods: ["POST"], pattern: path("/api/auth/device/approve") },
+  { name: "auth device deny", methods: ["POST"], pattern: path("/api/auth/device/deny") },
+  { name: "auth callback", methods: ["POST"], pattern: path(`/api/auth/callback${TAIL}`) },
+  { name: "auth oauth2 callback", methods: ["POST"], pattern: path(`/api/auth/oauth2/callback${TAIL}`) },
+] as const satisfies readonly WriteRoute[];
+
+export const WRITE_ROUTES = [...REGISTRY_WRITES, ...AUTH_WRITES] as const;
+
+/** A route's label in an error report: its method and its name from one of the tables, or "unknown". */
+export type RouteLabel = `${"GET" | "HEAD"} ${GetRouteName}` | `${"POST" | "PUT" | "DELETE"} ${(typeof WRITE_ROUTES)[number]["name"]}` | "unknown";
+
+/** The write route a method and path (as sent) belong to, or null. */
+function writeRouteOf(method: string, pathname: string): (typeof WRITE_ROUTES)[number] | null {
+  const auth = pathname.startsWith(AUTH_PREFIX);
+  const key = routeKey(auth ? pathname : routePath(pathname).path);
+  const table: readonly (typeof WRITE_ROUTES)[number][] = auth ? AUTH_WRITES : REGISTRY_WRITES;
+
+  return table.find((r) => r.methods.some((m) => m === method) && r.pattern.test(key)) ?? null;
+}
+
+/**
+ * The label an error report carries for a request: the method and the route's name from the GET table or the write
+ * table. Built from the tables' own strings, so no part of the path or a method the client made up can be in it.
+ */
+export function routeLabel(method: string, pathname: string): RouteLabel {
+  if (method === "GET" || method === "HEAD") {
+    const name = getRouteOf(pathname);
+
+    return name === null ? "unknown" : `${method} ${name}`;
+  }
+
+  const write = writeRouteOf(method, pathname);
+
+  if (write === null) return "unknown";
+  const verb = write.methods.find((m) => m === method);
+
+  return verb === undefined ? "unknown" : `${verb} ${write.name}`;
+}

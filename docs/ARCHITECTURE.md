@@ -175,6 +175,26 @@ Limits:
 - Integrity on disk: npm records the integrity it installed at each path, which step 7 compares; pnpm and bun keep no such record in `node_modules`, so for them the frozen install's own integrity check against the checked lockfile is what binds the bytes. A user's hand patch inside an installed package is kept by design, so installed bytes are not re-hashed.
 - `.pnpmfile.cjs` is project configuration that runs while pnpm computes the lockfile, even with scripts off: apm copies it, and trusts it as part of the project.
 
+## Analytics and error reports
+
+Production sends page views and server error reports to [Databuddy](https://www.databuddy.cc). Other stages send nothing, because only production gets the client id (`packages/infra/analytics.ts`): `deploy.ts` passes it to the website and docs builds, and `alchemy.run.ts` binds it to both Workers.
+
+- **Page views** (`apps/web/lib/analytics.ts`, `apps/docs/analytics.ts`) are a Databuddy custom event named `page_view`, so they appear in Databuddy's Events report, not its Pageviews report. Each view posts one request to `https://basket.databuddy.cc/track?website_id=<client id>` with exactly this body and nothing else:
+
+  ```json
+  { "name": "page_view", "properties": { "site": "web", "route": "package" } }
+  ```
+
+  `site` is `web` (apmjs.dev) or `docs` (docs.apmjs.dev). On apmjs.dev `route` is a label: `home`, `compare`, `docs` or `package` (never the package name), sent only by pages that render `<PageView>`, so private pages, file views, error pages and new routes send nothing. On docs.apmjs.dev it is the route Blume published the page at (`/`, `/guides/ci`), which Blume's `PageFooter` slot stamps on each published page (`apps/docs/components.ts`, `apps/docs/components/PageView.astro`); the 404 page and drafts carry none and send nothing. The request omits credentials, uses `referrerPolicy: no-referrer` and follows no redirect. No URL, query, hash, referrer, title, visitor or session id, screen size, Web Vitals or browser errors are sent.
+
+  Nothing is sent when the visitor has Global Privacy Control on (`navigator.globalPrivacyControl === true`) or Do Not Track set (`"1"` or `"yes"` in `navigator.doNotTrack`, `window.doNotTrack` or `navigator.msDoNotTrack`), or when the page is not at its site's canonical origin (`https://apmjs.dev`, `https://docs.apmjs.dev`): a production build served locally or on a preview host sends nothing.
+
+  Databuddy's native pageviews are not used, because they come from its script, and its documented options can't limit what that script captures automatically: page views carry the full path and referrer, and page exits, engagement and attribution (UTM parameters and click ids) are captured on every page, private ones included. Restricting the data to the public labels above means not loading the script and posting the event directly. Databuddy's dashboards therefore show these views under Events, filtered by the `site` and `route` properties.
+
+  `apps/web/scripts/analytics-browser.ts` checks all of this in a real browser against a stubbed endpoint, serving the local builds at the canonical origins, and `apps/docs/scripts/check-labels.ts` checks the docs labels in a built site that adds a draft and a slug-moved page.
+
+- **Server errors**: the registry reports every request it answers with "Internal error" or "misconfigured", and the website reports what Next.js passes to `onRequestError` (`apps/web/instrumentation.ts`). A report carries a fixed code chosen by the error's class (`misconfigured`, `db_unavailable`, `db_error`, `blob_error`, `auth_error`, `queue_error`, `internal`, `unknown`), a static route label from the worker's method and route table (`unknown` for anything else), the status, the build id and the colo. Never an error's message, name, digest or stack, or a path as sent (`packages/core/src/error-report.ts`). Reports go to `basket.databuddy.cc/errors` from a `waitUntil` task, which also classifies and serializes the error after the answer (with no execution context nothing is reported), without following redirects, at most 10 per isolate per minute whatever hostname a request used. Workers Logs keeps the full line.
+
 ## Tests
 
 The acceptance suite (`tests/acceptance`, 309 tests) drives real `bun`, `npm` and `pnpm` and the `apm` CLI against the registry exactly as it ships:

@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { z } from "zod";
 import { COMPATIBILITY_DATE, COMPATIBILITY_FLAGS, WORKER_CPU_MS } from "../registry/scripts/compat.ts";
+import { databuddyWorkerEnv } from "./analytics.ts";
 import { websiteAgentEnv } from "./web-env.ts";
 import { WEB_ASSETS, WEB_BUILD } from "./web-build.ts";
 
@@ -89,6 +90,8 @@ export default Alchemy.Stack(
         ...provenance,
         ...review,
         ...debug,
+        // production's unhandled 500s go to Databuddy (packages/core/src/error-report.ts); other stages get no id
+        ...databuddyWorkerEnv(stage),
       },
       // Writes down pending revokes past 24h and expired staged versions (reads already treat them as final), and
       // requeues analyses the platform stopped before they stored anything.
@@ -116,7 +119,7 @@ export default Alchemy.Stack(
       rootDir: resolve(import.meta.dirname, "../../apps/web"),
       // REGISTRY is a service binding: Workers on one account cannot reach each other's public URLs. It also makes the
       // registry deploy first: Alchemy starts the website only once the registry has finished (deploy.ts, "Order")
-      env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage), ...provenance },
+      env: { REGISTRY: registry, APM_REGISTRY: registryUrl, ...websiteAgentEnv(stage), ...databuddyWorkerEnv(stage), ...provenance },
       openNext: WEB_BUILD,
       assets: { runWorkerFirst: WEB_ASSETS.runWorkerFirst === true ? true : [...WEB_ASSETS.runWorkerFirst] },
       observability: { enabled: true, logs: { enabled: true, invocationLogs: true } },

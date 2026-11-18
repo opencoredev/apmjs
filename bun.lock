@@ -39,6 +39,7 @@
       "name": "web",
       "version": "0.1.0",
       "dependencies": {
+        "@apm/core": "workspace:*",
         "@base-ui/react": "^1.9.0",
         "@better-auth/passkey": "1.7.21",
         "@opennextjs/cloudflare": "1.20.13",

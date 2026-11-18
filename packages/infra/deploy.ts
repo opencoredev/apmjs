@@ -40,6 +40,7 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { buildWorker } from "../registry/scripts/build.ts";
+import { databuddyBuildEnv } from "./analytics.ts";
 import { authSecret, prepareDatabase, type DatabaseReport } from "./stage.ts";
 import { migrationFiles } from "../registry/scripts/migrate.ts";
 import { BUSY_CODE, lockedSpawn, takeReleaseLock, type ReleaseLock } from "./release-lock.ts";
@@ -233,6 +234,8 @@ const alchemyOptions = {
       APM_PROVENANCE: JSON.stringify(provenanceVars(revision, build, migrationFiles().map((m) => m.id))),
       // the website's registry URL for anything it renders at build time
       APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
+      // the website's and the docs' Databuddy tracker: production's client id, "" (no tracker) on any other stage
+      ...databuddyBuildEnv(args.stage),
       ALCHEMY_TELEMETRY_DISABLED: "1",
       DO_NOT_TRACK: "1",
     },

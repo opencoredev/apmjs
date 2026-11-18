@@ -1,3 +1,4 @@
+import { PageView } from "@/components/page-view";
 import { pageMetadata } from "@/lib/agent/seo";
 import { MCP_URL, siteUrl } from "@/lib/agent/site";
 
@@ -101,6 +102,7 @@ apm search "schema validation" --json`}</Code>
 export default function Docs() {
   return (
     <article className="flex max-w-2xl flex-col gap-10">
+      <PageView label="docs" />
       <header className="flex flex-col gap-4">
         <h1 className="text-[34px] leading-tight font-medium tracking-[-0.02em] sm:text-5xl sm:leading-[1.1]">How apm works</h1>
         <p className="text-lg leading-8 text-pretty text-muted-foreground">

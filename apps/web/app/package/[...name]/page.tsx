@@ -39,6 +39,7 @@ import { JsonLd } from "@/components/json-ld";
 import { packageJsonLd, packageMetadata, pageMetadata } from "@/lib/agent/seo";
 import { canonicalPackagePath } from "@/lib/agent/site";
 import { CapabilityList } from "@/components/capability-list";
+import { PageView } from "@/components/page-view";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -574,12 +575,17 @@ async function PackageRoute({ params, searchParams }: PageProps) {
 
   if (!route) notFound();
 
+  // a file view reports no page view: its URL and title name a file
   if (route.kind === "file") return <FileView name={route.name} version={route.version} path={route.path} line={citedLine((await searchParams).line)} />;
 
   return (
-    <Suspense fallback={<PackageLoading name={route.name} />}>
-      <PackageContent name={route.name} searchParams={searchParams} />
-    </Suspense>
+    <>
+      {/* the label alone; the key only remounts it when the client router moves to another package */}
+      <PageView key={route.name} label="package" />
+      <Suspense fallback={<PackageLoading name={route.name} />}>
+        <PackageContent name={route.name} searchParams={searchParams} />
+      </Suspense>
+    </>
   );
 }
 

@@ -4,6 +4,7 @@ import { RecentActivity, RecentActivitySkeleton } from "@/components/recent-acti
 import { PopularPackages } from "@/components/popular-packages";
 import { AgentSetup } from "@/components/agent-setup";
 import { JsonLd } from "@/components/json-ld";
+import { PageView } from "@/components/page-view";
 import { pageMetadata, SITE_DESCRIPTION, SITE_TITLE, websiteJsonLd } from "@/lib/agent/seo";
 
 export const metadata = { ...pageMetadata({ title: SITE_TITLE, description: SITE_DESCRIPTION, path: "/" }), title: { absolute: SITE_TITLE } };
@@ -16,6 +17,7 @@ export default function Home() {
     <>
       <script dangerouslySetInnerHTML={{ __html: HIDE_EMPTY_STATE }} />
       <JsonLd data={websiteJsonLd()} />
+      <PageView label="home" />
       <SearchHome
         recent={
           <div className="flex flex-col gap-10">

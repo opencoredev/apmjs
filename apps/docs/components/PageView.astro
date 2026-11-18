@@ -1,0 +1,12 @@
+---
+// The PageFooter layout slot (components.ts): Blume renders it at the foot of every page it publishes from docs/, with
+// the route it published the page at, and nowhere else (not on the 404 page; a draft is not built at all). The route
+// goes on a hidden element for the page-view tracker (analytics.ts), which sends only on a page that has one.
+interface Props {
+  route: string;
+}
+
+const { route } = Astro.props;
+---
+
+<span hidden data-apm-page-view={route}></span>

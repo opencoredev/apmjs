@@ -1,6 +1,12 @@
 // The apm documentation site, built with Blume (https://useblume.dev). `bun run build` writes static HTML to
 // dist/, which packages/infra serves as an assets-only Worker at docs.apmjs.dev.
 import { defineConfig } from "blume";
+import { script } from "blume/analytics";
+import { docsTracker } from "./analytics";
+
+// Page views of the published pages, by the route Blume stamps on each one (analytics.ts, components.ts). The client
+// id is given to production's build alone (packages/infra/analytics.ts); without it the site sends nothing.
+const databuddyClientId = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
 
 export default defineConfig({
   title: "apm docs",
@@ -36,6 +42,11 @@ export default defineConfig({
       { label: "Report a package", href: "https://github.com/opencoredev/apmjs/issues/new?template=report-package.yml" },
     ],
   },
+
+  analytics: docsTracker(databuddyClientId).map((tag) => script(tag)),
+
+  // a search is reported with its length, never its text: a reader may paste a token or an address into the box
+  search: { analytics: { queries: false } },
 
   markdown: {
     code: { theme: { light: "github-light", dark: "github-dark" } },
