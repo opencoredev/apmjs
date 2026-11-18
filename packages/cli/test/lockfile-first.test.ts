@@ -239,7 +239,8 @@ async function apmRun(input: {
   after: Graph;
   spec: string;
   strict: boolean;
-  cmd?: "add" | "x";
+  /** `exec` and `dlx` are `x` under other names. */
+  cmd?: "add" | "x" | "exec" | "dlx";
   args?: string[];
   scenario?: Partial<Scenario>;
   prepare?: (dir: string) => void;
@@ -249,6 +250,10 @@ async function apmRun(input: {
   binFirst?: string;
   /** More environment for apm (npm_config_omit, say). */
   env?: Record<string, string>;
+  /** apm x (exec, dlx) only: what follows `x --pm <pm>` (the package and everything after it), instead of `<spec> world`. */
+  xTail?: string[];
+  /** apm add only: run it with no packages (`apm add --pm <pm> ...`). */
+  noSpec?: boolean;
 }): Promise<Run & { before: ReturnType<typeof treeHash> }> {
   const base = join(root, `case-${++counter}`);
   const dir = join(base, "project");
@@ -289,7 +294,7 @@ async function apmRun(input: {
   const before = treeHash(dir);
   const cmd = input.cmd ?? "add";
   // apm x passes what follows the package to its binary, so its own flags go first
-  const argv = cmd === "x" ? ["x", "--pm", input.pm, ...(input.strict ? ["--strict"] : []), ...(input.args ?? []), input.spec, "world"] : ["add", input.spec, "--pm", input.pm, "--json", ...(input.strict ? ["--strict"] : []), ...(input.args ?? [])];
+  const argv = cmd !== "add" ? [cmd, "--pm", input.pm, ...(input.strict ? ["--strict"] : []), ...(input.args ?? []), ...(input.xTail ?? [input.spec, "world"])] : ["add", ...(input.noSpec === true ? [] : [input.spec]), "--pm", input.pm, "--json", ...(input.strict ? ["--strict"] : []), ...(input.args ?? [])];
   const scratch = join(base, "tmp");
 
   mkdirSync(scratch);
@@ -758,6 +763,132 @@ describe.each(PMS)("apm x with the %s stand-in", (pm) => {
     expect(r.text).toContain("apm ran nothing: it installed nothing");
     expect(r.pmCalls).toHaveLength(1);
     expect(r.out).not.toContain("checked helper");
+  });
+
+  test("--ignore-scripts: the checked install runs the binary and no install script (npm: refused before it starts)", async () => {
+    const r = await apmRun({ pm, pkg: {}, before: null, after: tool, spec: "tool", strict: false, cmd: "x", args: ["--ignore-scripts"] });
+
+    if (pm === "npm") {
+      // review of 96f0ba7, finding 1: npm builds a git dependency while it computes a lockfile, so it never starts
+      expect(r.code, r.text).toBe(1);
+      expect(r.text).toContain("refused: with --ignore-scripts apm does not run npm");
+      expect(r.text).toContain("apm x --pm bun or --pm pnpm");
+      expect(r.pmCalls, JSON.stringify(r.pmCalls)).toEqual([]);
+      expect(r.out).not.toContain("checked helper");
+
+      return;
+    }
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.out).toContain("checked helper world");
+    expect(r.text).toContain("no install script ran (--ignore-scripts)");
+    expect(r.scripts, r.text).toEqual([]);
+    expect(r.pmCalls.filter((c) => c.args[0] === "rebuild" || (c.args[0] === "install" && !c.args.includes("--ignore-scripts"))), JSON.stringify(r.pmCalls)).toEqual([]);
+  });
+
+  // review of 96f0ba7, finding 6: apm's own flags after the package used to reach the binary as well
+  test("apm's flags after the package are apm's alone; the binary gets its own arguments, and everything after --", async () => {
+    const own = pm === "npm" ? "--no-cooldown" : "--ignore-scripts";
+    const xTail = ["tool", "a", own, "--pm", pm, "--version", "--force", "--", "--ignore-scripts", "--pm", "z", "--"];
+    const r = await apmRun({ pm, pkg: {}, before: null, after: tool, spec: "tool", strict: false, cmd: "x", xTail });
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.out).toContain("checked helper a --version --ignore-scripts --pm z --\n");
+
+    if (pm !== "npm") {
+      expect(r.text).toContain("no install script ran (--ignore-scripts)");
+      expect(r.scripts, r.text).toEqual([]);
+    }
+  });
+
+  test("a binary given only flags gets them (they were dropped before)", async () => {
+    const r = await apmRun({ pm, pkg: {}, before: null, after: tool, spec: "tool", strict: false, cmd: "x", xTail: ["tool", "--version"] });
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.out).toContain("checked helper --version\n");
+  });
+
+  // review of e83dc4b, finding 3: exec and dlx ran apm x but read none of its arguments, so the binary got none
+  for (const alias of ["exec", "dlx"] as const) {
+    test(`apm ${alias} passes the binary its arguments as apm x does`, async () => {
+      const xTail = ["tool", "a", "--no-cooldown", "--version", "--", "--strict"];
+      const r = await apmRun({ pm, pkg: {}, before: null, after: tool, spec: "tool", strict: false, cmd: alias, xTail });
+
+      expect(r.code, r.text).toBe(0);
+      expect(r.out).toContain("checked helper a --version --strict\n");
+    });
+  }
+
+  test("--json before the package moves apm's lines to stderr and is not passed to the binary", async () => {
+    const r = await apmRun({ pm, pkg: {}, before: null, after: tool, spec: "tool", strict: false, cmd: "x", args: ["--json"], xTail: ["tool", "b"] });
+
+    expect(r.code, r.text).toBe(0);
+    expect(r.out).toBe("checked helper b\n");
+    // apm's own lines are all on stderr
+    expect(r.text.slice(r.out.length)).toContain("apm: checked the");
+  });
+});
+
+// The smoke check of a deployed stage (packages/infra/smoke.ts) installs packages a registry answer could change, so
+// it runs apm add with every install script off. Without the flag the same add runs tool's held script.
+describe("apm add --ignore-scripts", () => {
+  const graph: Graph = { top: ["tool"], nodes: [{ name: "tool", version: "1.0.0", script: true }] };
+
+  beforeAll(() => {
+    states.set("tool@1.0.0", "clean");
+  });
+
+  for (const pm of PMS) {
+    test(`${pm}: without it, tool's held install script runs after the check`, async () => {
+      const r = await apmRun({ pm, pkg: {}, before: null, after: graph, spec: "tool", strict: false });
+
+      expect(r.code, r.text).toBe(0);
+      expect(r.scripts.length, r.text).toBe(1);
+    });
+
+    for (const how of [{ args: ["--ignore-scripts"] }, { env: { APM_IGNORE_SCRIPTS: "1" } }]) {
+      if (pm === "npm") {
+        // review of 96f0ba7, finding 1: npm builds a git dependency while it computes the lockfile, before apm can
+        // check it, so with scripts ignored npm is never started (with packages or without)
+        for (const spec of ["tool", null]) {
+          test(`npm: with ${how.args ? "--ignore-scripts" : "APM_IGNORE_SCRIPTS=1"}, apm add ${spec ?? "(no packages)"} is refused before npm starts`, async () => {
+            const r = await apmRun({ pm, pkg: spec === null ? { dependencies: { tool: "1.0.0" } } : {}, before: null, after: graph, spec: "tool", strict: false, ...how, noSpec: spec === null });
+
+            expectUntouched(r);
+            expect(r.text).toContain("refused: with --ignore-scripts apm does not run npm");
+            expect(r.text).toContain("apm add --pm bun or --pm pnpm");
+            expect(r.pmCalls, JSON.stringify(r.pmCalls)).toEqual([]);
+          });
+        }
+
+        continue;
+      }
+
+      test(`${pm}: with ${how.args ? "--ignore-scripts" : "APM_IGNORE_SCRIPTS=1"}, the checked install is done and no install script ran`, async () => {
+        const r = await apmRun({ pm, pkg: {}, before: null, after: graph, spec: "tool", strict: false, ...how });
+        const inProject = r.pmCalls.filter((c) => c.cwd === r.dir);
+
+        expect(r.code, r.text).toBe(0);
+        expect(r.json?.installed?.stage).toBe("done");
+        expect(r.text).toContain("no install script ran (--ignore-scripts)");
+        expect(r.scripts, r.text).toEqual([]);
+        // only the frozen install ran in the project, with scripts held back; no rebuild and no second install
+        expect(inProject.length, JSON.stringify(r.pmCalls)).toBe(1);
+        expect(inProject[0]?.args, JSON.stringify(r.pmCalls)).toContain("--ignore-scripts");
+        expect(r.leftInTmp, r.text).toEqual([]);
+      });
+    }
+  }
+
+  test("yarn: refused before anything, since yarn runs install scripts while it installs", async () => {
+    const r = await apmRun({ pm: "yarn", pkg: {}, before: null, after: graph, spec: "tool", strict: false, args: ["--ignore-scripts"] });
+
+    expect(r.code, r.text).toBe(1);
+    expect(r.text).toContain("refused: apm add --ignore-scripts runs no install script with pnpm and bun only, not with yarn (or npm).");
+    expect(r.text).toContain("Use bun or pnpm (apm add --pm bun or --pm pnpm)");
+    expect(r.pmCalls, JSON.stringify(r.pmCalls)).toEqual([]);
+    expect(r.scripts).toEqual([]);
+    expect(treeHash(r.dir).lines).toEqual(r.before.lines);
   });
 });
 

@@ -182,6 +182,26 @@ export function lockOnlyArgs(pm: Pm, specs: readonly string[], opts: { dev: bool
 }
 
 /**
+ * The lockfile of the project's own package.json, computed and nothing installed, every script off: what `apm add`
+ * with no packages and --ignore-scripts reads before it installs (npm, pnpm and bun; yarn is refused before this).
+ */
+export function installLockOnlyArgs(pm: Exclude<Pm, "yarn">): string[] {
+  switch (pm) {
+    case "npm":
+      return ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"];
+    case "pnpm":
+      return ["pnpm", "install", "--lockfile-only", "--ignore-scripts"];
+    case "bun":
+      return ["bun", "install", "--lockfile-only", "--ignore-scripts"];
+    default: {
+      const _exhaustive: never = pm;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
  * The install of exactly the lockfile apm checked, every script off. npm has no frozen install but `ci`, which deletes
  * node_modules first: apm uses it when there is no node_modules to keep, and otherwise npm install, which keeps what it
  * need not change (a patch the user made in an untouched package, say); apm then confirms the lockfile is unchanged

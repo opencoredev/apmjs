@@ -13,7 +13,8 @@ import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type 
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
-import { addArgs, detectPm, frozenInstallArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
+import { parseArgs, type Args } from "./args.ts";
+import { addArgs, detectPm, frozenInstallArgs, installLockOnlyArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
 import { pnpmRebuildable, removeInstalled, verifyInstall, type Omitted, type Placed } from "./verify.ts";
 import { devGroup, type DevGroup, omitArgs, releaseOmission } from "./groups.ts";
@@ -22,32 +23,6 @@ import { applyChecked, computedFiles, copyProject, restoreCommands, targets, typ
 import { makeTemp, removeTemp } from "./sandbox.ts";
 
 const VERSION = "0.1.0";
-const VALUE_FLAGS = new Set(["pm", "omit", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
-
-type Args = { cmd: string; positional: string[]; flags: Map<string, string | true>; raw: string[] };
-
-function parseArgs(argv: string[]): Args {
-  const [cmd = "help", ...rest] = argv;
-  const positional: string[] = [];
-  const flags = new Map<string, string | true>();
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i] ?? "";
-    if (a === "-D") {
-      flags.set("dev", true);
-      continue;
-    }
-    if (a.startsWith("--")) {
-      const eq = a.indexOf("=");
-      const key = eq > 0 ? a.slice(2, eq) : a.slice(2);
-      if (eq > 0) flags.set(key, a.slice(eq + 1));
-      else if (VALUE_FLAGS.has(key) && i + 1 < rest.length) flags.set(key, rest[++i] ?? "");
-      else flags.set(key, true);
-      continue;
-    }
-    positional.push(a);
-  }
-  return { cmd, positional, flags, raw: rest };
-}
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -252,6 +227,51 @@ const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
  */
 function strictMode(a: Args): boolean {
   return has(a, "strict") || process.env.APM_STRICT === "1";
+}
+
+/**
+ * --ignore-scripts or APM_IGNORE_SCRIPTS=1: apm add checks and installs exactly as it otherwise would, with every
+ * install script held back, and then runs none of them (npm's --ignore-scripts). For checks and CI that must never run
+ * a package's code.
+ */
+function ignoreScriptsMode(a: Args): boolean {
+  return has(a, "ignore-scripts") || process.env.APM_IGNORE_SCRIPTS === "1";
+}
+
+/**
+ * --ignore-scripts holds back install scripts, not what a package manager runs to build a dependency that is not a
+ * registry version: npm runs a git dependency's `prepare` (after installing its devDependencies) while it installs,
+ * with --ignore-scripts or without (npm 9.2, review of 4a9c8fb, finding 1). So with scripts ignored, apm refuses before
+ * anything is installed when the lockfile the package manager computed holds any dependency that is not a registry
+ * version: git (git+ssh, github: and the like), a remote tarball, a file:, a link:, or a workspace that is not one of
+ * the project's own declared members. Says which, and returns true when it refused.
+ */
+function refuseNotRegistry(input: { graph: LockGraph; pm: LockPm; lockfile: string; nothing: string }): boolean {
+  const local = input.graph.local;
+
+  if (local.length === 0) return false;
+  fail(`refused: with --ignore-scripts apm installs only registry versions, and the ${input.lockfile} ${input.pm} computed has ${local.length} that ${local.length === 1 ? "is" : "are"} not: ${local.map((p) => `${p.name} (${p.origin.kind}: ${p.origin.source})`).join(", ")}.`);
+  say(`A package manager builds such a dependency as it installs it (npm runs a git dependency's prepare script even with --ignore-scripts), so no install with scripts off can skip its code. ${input.nothing}`);
+
+  return true;
+}
+
+/**
+ * With scripts ignored, apm never starts npm (review of 96f0ba7, finding 1). npm builds a git dependency while it
+ * computes a lockfile, before apm can read that lockfile: its tree builder extracts the git repository (one with
+ * bundled dependencies included) and its directory packer runs `prepare`, so even `npm install --package-lock-only
+ * --ignore-scripts` can run a dependency's code. apm cannot know the whole tree npm will compute before npm computes
+ * it, because npm reads the registry itself and a registry answer is untrusted. So for npm, and for apm x under yarn
+ * (which uses npm), apm refuses before anything runs and points to bun or pnpm, which compute a lockfile without
+ * building a git dependency; their lockfile is then checked by refuseNotRegistry before anything installs.
+ * Returns true when it refused.
+ */
+function refuseNpmWithoutScripts(input: { pm: Pm; command: "add" | "x" }): boolean {
+  if (input.pm !== "npm") return false;
+  fail(`refused: with --ignore-scripts apm does not run npm: npm builds a git dependency, running its prepare script, while it computes the lockfile, before apm can check it.`);
+  say(`Nothing was run or changed. Use bun or pnpm (apm ${input.command} --pm bun or --pm pnpm ...): apm checks the lockfile they compute before anything installs, and they do not build a git dependency while computing it.`);
+
+  return true;
 }
 
 /**
@@ -912,7 +932,7 @@ type Checked = { check: LockCheck; nodes: LockNode[]; importers: LockImporter[];
  * checked package.json and lockfile over the project's, installs exactly that lockfile with every script held back,
  * confirms the install is that lockfile, and only then runs install scripts.
  */
-async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { pm: LockPm }; layout: Layout; results: Resolved[]; scopes: string[]; strict: boolean }): Promise<number> {
+async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { pm: LockPm }; layout: Layout; results: Resolved[]; scopes: string[]; strict: boolean; ignoreScripts: boolean }): Promise<number> {
   const { a, api, det, layout, results, strict } = input;
   const pm = det.pm;
   const registry = api.cfg.registry;
@@ -981,7 +1001,15 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
       return 1;
     }
 
-    const check = await checkLock({ api, graph: lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true, members: layout.members }), strict, results, headline: `in the ${t.lockfile} ${pm} computed for this add, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, results) });
+    const graph = lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true, members: layout.members });
+
+    if (input.ignoreScripts && refuseNotRegistry({ graph, pm, lockfile: t.lockfile, nothing: "Nothing was installed or run, and your project is unchanged." })) {
+      emitJson({ ok: false, det, results, error: lastError });
+
+      return 1;
+    }
+
+    const check = await checkLock({ api, graph, strict, results, headline: `in the ${t.lockfile} ${pm} computed for this add, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, results) });
 
     if (check.refused) {
       const error = lastError;
@@ -1088,6 +1116,14 @@ async function addLockfileFirst(input: { a: Args; api: Api; det: Detection & { p
     const held = await checkInstall({ api, pm, root: layout.root, lockfile: t.lockfile, checked: computed.lockfile, nodes, importers, members: layout.members, before, omitted, strict, refuse });
 
     if (held.kind === "refused") return failed("verify");
+
+    if (input.ignoreScripts) {
+      removeTemp(backup.dir);
+      say(dim(`apm: node_modules is the checked ${t.lockfile}; no install script ran (--ignore-scripts)`));
+      emitJson({ ok: true, det, results, installed: reportOf(check, { touched: true, stage: "done" }) });
+
+      return 0;
+    }
 
     stage = "scripts";
     scripts = "maybe";
@@ -1329,6 +1365,127 @@ async function addWithYarn(input: YarnInput): Promise<number> {
   return 0;
 }
 
+/** The lockfile apm wrote to the project and the backup of what was there before. */
+type Written = { lockfile: Uint8Array; backup: Backup };
+
+/**
+ * `apm add` with no packages and --ignore-scripts (npm, pnpm, bun): the project's own install, scripts off. A plain
+ * `npm install --ignore-scripts` still runs a git dependency's prepare, so apm first has the package manager compute the
+ * project's lockfile in a copy (installing nothing there), refuses when it holds anything but registry versions, and
+ * otherwise writes that lockfile (and package.json, as computed) to the project and installs exactly it, frozen. The
+ * package manager reads the project's own configuration and registry, as `npm install` would.
+ */
+async function installWithoutScripts(input: { cwd: string; det: Detection & { pm: LockPm } }): Promise<number> {
+  const { det } = input;
+  const pm = det.pm;
+  const environment = withoutSecrets(process.env);
+
+  const done = (code: number): number => {
+    emit({ ok: code === 0, pm, packages: [], error: code === 0 ? null : lastError });
+
+    return code;
+  };
+
+  const found = projectLayout({ cwd: input.cwd, pm });
+
+  if (found.kind === "refused") {
+    fail(`refused: ${found.reason}`);
+
+    return done(1);
+  }
+
+  const layout = found.layout;
+  const t = targets(layout);
+  const copy = copyProject(layout);
+  let checked: Written;
+
+  try {
+    const cmd = installLockOnlyArgs(pm);
+
+    say(dim(`apm: no packages given; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
+    const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: environment, stdoutToStderr: true });
+
+    if (run.code !== 0) {
+      fail(`apm add: ${pm} could not compute the lockfile (exit ${run.code}). Your project is unchanged.`);
+
+      return done(run.code);
+    }
+
+    const computed = computedFiles({ layout, copy });
+
+    if (computed.kind === "refused") {
+      fail(`refused: ${computed.reason}. Your project is unchanged.`);
+
+      return done(1);
+    }
+
+    const read = readLock({ pm, path: join(copy.dir, t.lockfile), cwd: join(copy.dir, layout.member) });
+
+    if (read.kind !== "read") {
+      fail(`refused: apm could not read the ${t.lockfile} ${pm} computed${read.kind === "unreadable" ? `: ${read.reason}` : ""}. Your project is unchanged.`);
+
+      return done(1);
+    }
+
+    const graph = lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true, members: layout.members });
+
+    if (refuseNotRegistry({ graph, pm, lockfile: t.lockfile, nothing: "Nothing was installed or run, and your project is unchanged." })) return done(1);
+    const applied = applyChecked({ layout, copy, computed });
+
+    switch (applied.kind) {
+      case "refused":
+        fail(`refused: ${applied.reason}`);
+
+        return done(1);
+      case "failed":
+        fail(`apm add: writing the computed files failed: ${applied.reason}`);
+        say("No install script ran and nothing was installed. To put your project back as it was, run:");
+
+        for (const c of restoreCommands({ layout, backup: applied.backup })) say(`  ${c}`);
+
+        return done(1);
+
+      case "applied":
+        checked = { lockfile: computed.lockfile, backup: applied.backup };
+        break;
+      default: {
+        const _exhaustive: never = applied;
+
+        return _exhaustive;
+      }
+    }
+  } finally {
+    removeTemp(copy.dir);
+  }
+
+  const install = frozenInstallArgs(pm, { keepNodeModules: existsSync(join(layout.root, "node_modules")) });
+
+  say(dim(`→ ${install.join(" ")}  (the ${t.lockfile} ${pm} computed, registry versions only; no install script runs)`));
+  const code = (await runCmd(install, { cwd: layout.root, env: environment, stdoutToStderr: jsonMode })).code;
+  const after = existsSync(join(layout.root, t.lockfile)) ? new Uint8Array(readFileSync(join(layout.root, t.lockfile))) : null;
+
+  if (code === 0 && (after === null || !Buffer.from(after).equals(Buffer.from(checked.lockfile)))) {
+    fail(`apm add: ${pm} changed ${t.lockfile} while it installed, so what it installed may not be what apm read. To put the project back, run:`);
+
+    for (const c of restoreCommands({ layout, backup: checked.backup })) say(`  ${c}`);
+
+    return done(1);
+  }
+
+  if (code !== 0) {
+    fail(`apm add: ${pm} could not install the computed lockfile (exit ${code}). To put the project back, run:`);
+
+    for (const c of restoreCommands({ layout, backup: checked.backup })) say(`  ${c}`);
+
+    return done(code);
+  }
+
+  removeTemp(checked.backup.dir);
+  say(dim(`apm: installed the ${t.lockfile} ${pm} computed; no install script ran (--ignore-scripts)`));
+
+  return done(0);
+}
+
 async function cmdAdd(a: Args): Promise<number> {
   const cwd = process.cwd();
   const cfg = config(cwd);
@@ -1336,10 +1493,30 @@ async function cmdAdd(a: Args): Promise<number> {
   const det = pmFor(a, cwd);
   const specs = a.positional;
   const strict = strictMode(a);
+  const ignoreScripts = ignoreScriptsMode(a);
+
+  // yarn runs install scripts while it installs, so apm cannot hold them back or skip them for it: refused before anything
+  if (det.pm === "yarn" && ignoreScripts) {
+    fail("refused: apm add --ignore-scripts runs no install script with pnpm and bun only, not with yarn (or npm).");
+    say("Nothing was changed. Use bun or pnpm (apm add --pm bun or --pm pnpm), or run apm add without --ignore-scripts.");
+    emitJson({ ok: false, det, results: [], error: lastError });
+
+    return 1;
+  }
+
+  // npm computes a lockfile only by building every git dependency in it: never started with scripts ignored
+  if (ignoreScripts && refuseNpmWithoutScripts({ pm: det.pm, command: "add" })) {
+    emitJson({ ok: false, det, results: [], error: lastError });
+
+    return 1;
+  }
 
   if (specs.length === 0) {
-    say(dim(`apm: no packages given, running ${det.pm} install`));
-    const code = (await runCmd([det.pm, "install"], { cwd, env: withoutSecrets(process.env), stdoutToStderr: jsonMode })).code;
+    if (ignoreScripts && isLockPm(det.pm)) return installWithoutScripts({ cwd, det: { pm: det.pm, why: det.why } });
+    const cmd = [det.pm, "install"];
+
+    say(dim(`apm: no packages given, running ${cmd.join(" ")}`));
+    const code = (await runCmd(cmd, { cwd, env: withoutSecrets(process.env), stdoutToStderr: jsonMode })).code;
     emit({ ok: code === 0, pm: det.pm, packages: [] });
 
     return code;
@@ -1392,7 +1569,7 @@ async function cmdAdd(a: Args): Promise<number> {
 
   if (!isLockPm(pm)) return addWithYarn({ a, api, det, layout: layout.layout, results, scopes });
 
-  return addLockfileFirst({ a, api, det: { pm, why: det.why }, layout: layout.layout, results, scopes, strict });
+  return addLockfileFirst({ a, api, det: { pm, why: det.why }, layout: layout.layout, results, scopes, strict, ignoreScripts });
 }
 
 function emitJson(input: { ok: boolean; det: Detection; results: Resolved[]; error?: string | null; installed?: InstalledReport }): void {
@@ -1451,9 +1628,9 @@ function binOf(dir: string, name: string): { kind: "found"; bin: string; path: s
  */
 async function cmdX(a: Args): Promise<number> {
   const cwd = process.cwd();
-  const [spec, ...rest] = a.positional;
+  const [spec] = a.positional;
   if (!spec) {
-    warn("usage: apm x <package>[@version] [args...]");
+    warn("usage: apm x [flags] <package>[@version] [args...] [-- args...]");
     return 2;
   }
 
@@ -1461,6 +1638,13 @@ async function cmdX(a: Args): Promise<number> {
   const api = new Api(cfg);
   const det = pmFor(a, cwd);
   const strict = strictMode(a);
+  const ignoreScripts = ignoreScriptsMode(a);
+  // yarn's own runner gives no lockfile to read; npm's does the same job
+  const xpm: LockPm = isLockPm(det.pm) ? det.pm : "npm";
+
+  // npm computes a lockfile only by building every git dependency in it: never started with scripts ignored
+  if (ignoreScripts && refuseNpmWithoutScripts({ pm: xpm, command: "x" })) return 1;
+
   const r = await resolveSpec(api, spec, a, resolveContext({ pm: det.pm, cwd, project: false }));
   printResolved(r);
   if (r.blocked !== null || r.version === null) {
@@ -1472,8 +1656,6 @@ async function cmdX(a: Args): Promise<number> {
   const treeScope = treeScopes([r]);
 
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes: treeScope }), cfg.registry, "run")) return 1;
-  // yarn's own runner gives no lockfile to read; npm's does the same job
-  const xpm: LockPm = isLockPm(det.pm) ? det.pm : "npm";
   const dir = makeTemp("x");
 
   try {
@@ -1502,7 +1684,10 @@ async function cmdX(a: Args): Promise<number> {
 
     if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "run")) return 1;
     const lockBytes = new Uint8Array(readFileSync(join(dir, lockName)));
-    const check = await checkLock({ api, graph: lockGraph(read.nodes, { integrityKnown: true }), strict, results: [r], headline: `in the ${lockName} ${xpm} computed for ${r.name}, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, [r]) });
+    const graph = lockGraph(read.nodes, { integrityKnown: true });
+
+    if (ignoreScripts && refuseNotRegistry({ graph, pm: xpm, lockfile: lockName, nothing: "apm installed nothing and ran no install script and no binary." })) return 1;
+    const check = await checkLock({ api, graph, strict, results: [r], headline: `in the ${lockName} ${xpm} computed for ${r.name}, at the exact versions and integrity it locks, before installing anything`, policy: checkPolicy(a, [r]) });
 
     if (check.refused) {
       say(`apm ran nothing: it installed nothing, ran no install script and no binary.${check.blocked.length === 0 ? ` Run apm x ${r.name} without --strict to run it with these warnings.` : ""}`);
@@ -1530,22 +1715,26 @@ async function cmdX(a: Args): Promise<number> {
       return 1;
     }
 
-    // bun installs packages again to run their scripts: the second check holds node_modules to what it held just before
-    const beforeRelease = xpm === "bun" ? installedPackages(dir, []).found : [];
-    const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, installed: held.installed, registry: cfg.registry, scopes, group: { kind: "include" }, quiet: true });
+    if (ignoreScripts) {
+      say(dim("apm: no install script ran (--ignore-scripts)"));
+    } else {
+      // bun installs packages again to run their scripts: the second check holds node_modules to what it held just before
+      const beforeRelease = xpm === "bun" ? installedPackages(dir, []).found : [];
+      const released = await releaseScripts({ pm: xpm, root: dir, members: [], fresh: held.fresh, installed: held.installed, registry: cfg.registry, scopes, group: { kind: "include" }, quiet: true });
 
-    for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
+      for (const line of released.notRun) say(`  ${yellow("!")} not run: ${line}`);
 
-    if (released.code !== 0) {
-      fail(`apm x: the install scripts failed (exit ${released.code})`);
+      if (released.code !== 0) {
+        fail(`apm x: the install scripts failed (exit ${released.code})`);
 
-      return released.code;
-    }
+        return released.code;
+      }
 
-    if (released.reinstalled) {
-      const again = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: beforeRelease, omitted, strict, refuse: (line) => fail(`refused to run ${r.name}: after ${xpm} installed packages again to run their scripts: ${line}`) });
+      if (released.reinstalled) {
+        const again = await checkInstall({ api, pm: xpm, root: dir, lockfile: lockName, checked: lockBytes, nodes: read.nodes, importers: read.importers, members: [], before: beforeRelease, omitted, strict, refuse: (line) => fail(`refused to run ${r.name}: after ${xpm} installed packages again to run their scripts: ${line}`) });
 
-      if (again.kind === "refused") return 1;
+        if (again.kind === "refused") return 1;
+      }
     }
 
     const bin = binOf(dir, r.name);
@@ -1556,8 +1745,8 @@ async function cmdX(a: Args): Promise<number> {
       return 1;
     }
 
-    const passArgs = a.raw.slice(a.raw.indexOf(spec) + 1).filter((x) => !["--force", "--no-cooldown", "--strict"].includes(x));
-    const args = rest.length > 0 ? passArgs : [];
+    // apm's own flags were taken out when the arguments were read (xargs.ts): the binary gets only its own
+    const args = a.child;
     const runEnv = pmEnv(cfg.registry, scopes);
 
     say(dim(`→ ${bin.bin}${args.length > 0 ? ` ${args.join(" ")}` : ""}`));
@@ -2055,7 +2244,12 @@ async function cmdPublish(a: Args): Promise<number> {
 const HELP = `apm ${VERSION}: checks before you install, run or publish; your package manager does the rest.
 
   apm add <pkg>[@range]...   resolve, warn on a version under 24h old or a score under 40, then <pm> add the exact version
-  apm x <pkg> [args]         show the risk card and any warning, then run it (bunx / npx)
+  apm x <pkg> [args]         (also apm exec, apm dlx) show the risk card and any warning, then run it (bunx / npx).
+                             apm's own flags (--pm, --strict, --force, --no-cooldown, --cooldown, --floor,
+                             --ignore-scripts) are never passed on; every other argument after the package is the
+                             binary's, flags alone included (apm x tool --version runs tool --version); after -- every
+                             argument goes to the binary unread. --json before the package is apm's: apm's own lines
+                             go to stderr and the binary does not get --json (apm x --json tool runs tool)
   apm publish [--bump patch|minor|major] [--dry-run] [--tag t]
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
   apm explain <pkg>[@range]  install, review-first or do-not-install, and why (exit 0, 3 or 1)
@@ -2068,10 +2262,14 @@ const HELP = `apm ${VERSION}: checks before you install, run or publish; your pa
   apm login | whoami        sign in through the browser; publishes then wait for your approval
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
 
-Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --json, --otp <code>, --no-browser
+Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
   --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
   under 40, an incomplete analysis, no score yet or ever, and a dependency the registry could not look up, instead
   of warning about them. --no-cooldown: no cooldown warning (strict: no refusal) for anything in the tree
+  --ignore-scripts (or APM_IGNORE_SCRIPTS=1): apm add and apm x check and install as usual and run no install script
+  (pnpm and bun). npm and yarn are refused before they start: npm runs a git dependency's prepare script while it
+  computes a lockfile, even with --ignore-scripts. A dependency that is not a registry version (git, a tarball URL,
+  file:, link:) is refused before anything installs
 Registry: APM_REGISTRY or registry= in .npmrc (default ${DEFAULT_REGISTRY})`;
 
 // Commands that run package install scripts: their env gets no credentials. `apm run` keeps the env, as `bun run` would.
@@ -2104,9 +2302,7 @@ async function main(a: Args): Promise<number> {
     case "install":
     case "i":
       return a.positional.length > 0 ? cmdAdd(a) : passthrough(a);
-    case "x":
-    case "exec":
-    case "dlx":
+    case "x": // also `apm exec` and `apm dlx` (args.ts)
       return cmdX(a);
     case "score":
       return cmdScore(a);

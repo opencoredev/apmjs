@@ -1,6 +1,9 @@
 // Checks a deployed stage the way people use it: stock bun and npm install real npm packages through it, apm add
 // refuses a low-score package, a login token stages a publish that goes live only after a TOTP approval, and
-// bun audit reads advisories through it. Prints one PASS/FAIL line per check; exits non-zero on any FAIL.
+// bun audit reads advisories through it. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No install
+// it runs executes an install script, and the raw npm and bun installs install committed lockfiles (smoke-commands.ts,
+// smoke-fixtures/): what a registry answers never runs code here and cannot add a dependency. That the registry
+// resolves versions is checked by reading its metadata, without installing.
 //
 //   bun packages/infra/smoke.ts --stage staging [--build <id> --subdomain <workers.dev subdomain>]
 //
@@ -21,9 +24,11 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "pg";
 import { z } from "zod";
+import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
+const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
 const { stage, build, subdomain } = parseSmokeArgs(process.argv.slice(2));
 const { registry, web, docs } = smokeTargets(stage, subdomain);
@@ -35,17 +40,17 @@ function record(ok: boolean, name: string, detail: string): void {
   process.stdout.write(`${ok ? "PASS" : "FAIL"}: ${name} (${detail})\n`);
 }
 
-async function run(cmd: string[], cwd: string, env: Record<string, string> = {}): Promise<{ code: number; out: string }> {
+async function run(cmd: string[], cwd: string, env: Record<string, string> = {}): Promise<{ code: number; out: string; stdout: string }> {
   const proc = Bun.spawn(cmd, {
     cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), TMPDIR: tmpdir(), ...env },
+    env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), TMPDIR: tmpdir(), ...env, ...NO_SCRIPTS_ENV },
     stdout: "pipe",
     stderr: "pipe",
   });
 
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 
-  return { code, out: stdout + stderr };
+  return { code, out: stdout + stderr, stdout };
 }
 
 function project(name: string, files: Record<string, string> = {}): string {
@@ -58,6 +63,11 @@ function project(name: string, files: Record<string, string> = {}): string {
   for (const [file, text] of Object.entries(files)) writeFileSync(join(dir, file), text);
 
   return dir;
+}
+
+/** A project holding a probe's committed package.json and lockfile, configured for the registry under test. */
+function locked(probe: Probe): string {
+  return project(probe, probeFixture(probe).files);
 }
 
 function installed(dir: string, name: string): string | null {
@@ -97,13 +107,40 @@ async function docsSite(): Promise<void> {
 
 // ---------- stock clients ----------
 async function stockClients(): Promise<void> {
-  const b = project("bun-app");
-  const bunAdd = await run(["bun", "add", "chalk@5.3.0", "ms"], b);
-  record(bunAdd.code === 0 && installed(b, "chalk") === "5.3.0", "bun add of real npm packages through the registry", `exit ${bunAdd.code}, chalk ${installed(b, "chalk")}`);
-  const n = project("npm-app");
-  const npm = await run(["npm", "install", "--no-audit", "--no-fund", "is-odd@3.0.1"], n);
-  const lock = existsSync(join(n, "package-lock.json")) ? readFileSync(join(n, "package-lock.json"), "utf8") : "";
-  record(npm.code === 0 && installed(n, "is-odd") === "3.0.1" && lock.includes(registry), "npm install of a real npm package through the registry", `exit ${npm.code}, lockfile resolves to the registry: ${lock.includes(registry)}`);
+  const b = locked("bun-app");
+  const added = await run(bunInstallLocked(registry), b);
+  record(added.code === 0 && installed(b, "chalk") === "5.3.0" && installed(b, "ms") === "2.1.3", "bun install of a locked project of real npm packages (chalk 5.3.0, ms 2.1.3) through the registry", `exit ${added.code}, chalk ${installed(b, "chalk")}, ms ${installed(b, "ms")}`);
+  const n = locked("npm-app");
+  const npm = await run(npmCi(registry), n);
+  record(npm.code === 0 && installed(n, "is-odd") === "3.0.1" && installed(n, "is-number") === "6.0.0", "npm ci of a locked project of a real npm package (is-odd 3.0.1) through the registry", `exit ${npm.code}, is-odd ${installed(n, "is-odd")}, is-number ${installed(n, "is-number")}`);
+}
+
+/** The registry's install metadata for a package (what npm and bun resolve from): its status and parsed JSON body. */
+async function installMetadata(name: string): Promise<{ status: number; body: unknown }> {
+  const res = await fetch(`${registry}${name.replace("/", "%2F")}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
+
+  return { status: res.status, body: res.status === 200 ? await res.json().catch(() => null) : null };
+}
+
+/**
+ * Resolution through the registry, without installing: for every version the probes lock, the registry's install
+ * metadata lists it with exactly the lockfile's integrity and dependency edges, advertises its tarball at exactly the
+ * URL the locked installs fetch, and names as latest a version it lists (metadataProblem). A registry that resolves
+ * wrongly fails here; the locked installs never resolve.
+ */
+async function resolution(): Promise<void> {
+  const all = new Map<string, Locked>();
+
+  for (const probe of PROBE_NAMES) for (const l of probeFixture(probe).locked) all.set(`${l.name}@${l.version}`, l);
+  const wrong: string[] = [];
+
+  for (const l of all.values()) {
+    const problem = metadataProblem({ registry, ...(await installMetadata(l.name)), locked: l, latest: "listed" });
+
+    if (problem !== null) wrong.push(problem);
+  }
+
+  record(wrong.length === 0, "the registry resolves every locked version to the lockfile's integrity, tarball URL and dependencies, and latest is a listed version (metadata only, nothing installed)", wrong.length === 0 ? `${all.size} versions` : wrong.join("; "));
 }
 
 /**
@@ -152,7 +189,7 @@ async function apmWarning(): Promise<void> {
   const spec = `${LOW_SCORE.name}@${LOW_SCORE.version}`;
   const dir = project("apm-app");
   const t0 = Date.now();
-  const warned = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", spec], dir, env);
+  const warned = await run(apmAdd(CLI_MAIN, spec), dir, env);
   const warning = /WARNING/.test(warned.out) ? matchOf(WARNINGS, warned.out) : null;
   const warnedOk = warned.code === 0 && installed(dir, LOW_SCORE.name) === LOW_SCORE.version && warning !== null;
 
@@ -160,23 +197,41 @@ async function apmWarning(): Promise<void> {
   transcript(warnedOk, warned.out);
   const strictDir = project("apm-strict-app");
   const t1 = Date.now();
-  const bad = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", spec, "--strict"], strictDir, env);
+  const bad = await run(apmAdd(CLI_MAIN, spec, ["--strict"]), strictDir, env);
   const refusal = matchOf(REFUSALS, bad.out);
   const refusedOk = bad.code !== 0 && installed(strictDir, LOW_SCORE.name) === null && refusal !== null;
 
   record(refusedOk, "apm add --strict refuses it", `exit ${bad.code}, installed ${installed(strictDir, LOW_SCORE.name)}, refused as ${refusal ?? "nothing apm says"}, ${((Date.now() - t1) / 1000).toFixed(1)} s`);
   transcript(refusedOk, bad.out);
   const t2 = Date.now();
-  const good = await run(["bun", join(ROOT, "packages", "cli", "src", "main.ts"), "add", "ms"], dir, env);
+  const good = await run(apmAdd(CLI_MAIN, "ms"), dir, env);
   const goodOk = good.code === 0 && installed(dir, "ms") !== null;
 
   record(goodOk, "apm add installs a clean npm package (ms)", `exit ${good.code}, ${((Date.now() - t2) / 1000).toFixed(1)} s`);
   transcript(goodOk, good.out);
 }
 
+/**
+ * bun audit of a locked project holding a version with known advisories. The audit reads what is installed, so the
+ * locked install must pass first (review of 96f0ba7, finding 5): a failed install fails this check instead of
+ * leaving the audit to read nothing.
+ */
 async function bunAudit(): Promise<void> {
-  const dir = project("audit-app");
-  await run(["bun", "add", "minimist@0.0.8"], dir);
+  const dir = locked("audit-app");
+  const want = probeFixture("audit-app").locked;
+  const add = await run(bunInstallLocked(registry), dir);
+  const got = want.map((l) => `${l.name} ${installed(dir, l.name)}`);
+  const installOk = add.code === 0 && want.every((l) => installed(dir, l.name) === l.version);
+
+  record(installOk, "bun install of the locked audit project (minimist 0.0.8) through the registry", `exit ${add.code}, ${got.join(", ")}`);
+  transcript(installOk, add.out);
+
+  if (!installOk) {
+    record(false, "bun audit reports npm advisories through the registry", "not run: the audit project did not install");
+
+    return;
+  }
+
   const audit = await run(["bun", "audit"], dir);
   record(audit.code !== 0 && /minimist/.test(audit.out) && /critical/.test(audit.out), "bun audit reports npm advisories through the registry", `exit ${audit.code}`);
 }
@@ -283,6 +338,7 @@ async function call(path: string, init: { method?: string; jar?: Jar; body?: unk
 }
 
 const TotpUri = z.object({ totpURI: z.string() });
+const Packed = z.array(z.object({ filename: z.string(), integrity: z.string() })).length(1);
 const DeviceStart = z.object({ deviceCode: z.string(), userCode: z.string() });
 const DeviceToken = z.object({ token: z.string(), username: z.string() });
 const AccountView = z.object({ security: z.object({ totp: z.boolean() }) });
@@ -339,18 +395,27 @@ async function stagedPublish(): Promise<void> {
     writeFileSync(join(pkg, "package.json"), JSON.stringify({ name, version: "1.0.0", main: "index.js", license: "MIT", description: "apm staging smoke check" }));
     writeFileSync(join(pkg, "index.js"), "module.exports = 'apm staging smoke check';\n");
     writeFileSync(join(pkg, ".npmrc"), `registry=${registry}\n//${new URL(registry).host}/:_authToken=${login.token}\n`);
-    const pub = await run(["npm", "publish", "--registry", registry], pkg);
+    // packed here first, so the consumer's lockfile holds the integrity of the bytes this script made, not one the
+    // registry reports
+    const packed = await run(["npm", "pack", "--json", "--pack-destination", work], pkg);
+    const tarball = Packed.parse(JSON.parse(packed.stdout))[0];
+    const pub = await run(["npm", "publish", join(work, tarball.filename), "--registry", registry], pkg);
     const id = /\/approve\/([A-Za-z0-9_-]+)/.exec(pub.out)?.[1] ?? null;
     const hidden = await call(`${name.replace("/", "%2F")}`, { via: "registry" });
     record(pub.code === 0 && id !== null && hidden.status === 404, "npm publish with a login token stages the version and prints the approval link", `exit ${pub.code}, link ${id !== null}, packument ${hidden.status}`);
 
     if (id === null) return;
     const approved = await call(`-/apm/v1/staged/${id}/approve`, { method: "POST", jar, body: { code: totp(secret) } });
-    const live = await call(`${name.replace("/", "%2F")}`, { via: "registry" });
-    record(approved.status === 200 && live.status === 200, "a TOTP approval makes the staged version live", `approve ${approved.status}, packument ${live.status}`);
-    const consumer = project("consumer");
-    const install = await run(["npm", "install", "--no-audit", "--no-fund", `${name}@1.0.0`], consumer);
-    record(install.code === 0 && installed(consumer, name) === "1.0.0", "the approved version installs with npm", `exit ${install.code}`);
+    // live means installable as published (review of 96f0ba7, finding 4): the approved version is listed with the
+    // integrity of the tarball this check packed, at the tarball URL an install fetches, and latest names it
+    // the package this check packed declares no dependencies
+    const expected: Locked = { name, version: "1.0.0", integrity: tarball.integrity, edges: { installs: {}, peers: {} } };
+    const live = metadataProblem({ registry, ...(await installMetadata(name)), locked: expected, latest: "this" });
+    record(approved.status === 200 && live === null, "a TOTP approval makes the staged version live, as packed and tagged latest", `approve ${approved.status}, ${live ?? "metadata matches"}`);
+    const lockfile = singleLockfile("consumer", { ...expected, resolved: `${registry}${tarballPath(name, "1.0.0")}` });
+    const consumer = project("consumer", { "package.json": JSON.stringify({ name: "consumer", version: "1.0.0", private: true, dependencies: { [name]: "1.0.0" } }), "package-lock.json": lockfile });
+    const install = await run(npmCi(registry), consumer);
+    record(install.code === 0 && installed(consumer, name) === "1.0.0", "the approved version installs with npm (npm ci, the integrity of the tarball this check packed)", `exit ${install.code}`);
   } finally {
     await session.done();
   }
@@ -363,6 +428,8 @@ await identity("before");
 await docsSite();
 
 await stockClients();
+
+await resolution();
 
 await apmWarning();
 
