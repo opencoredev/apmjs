@@ -19,6 +19,18 @@
 // each: the install document of express and react and four tarballs (react, lodash, typescript, next's 43.7 MB).
 // Numbers move by about half a second between runs with npm's own latency; compare runs.
 //
+// The recording proxy takes each request as it arrives, then notes when the Worker's headers came and when the body's
+// last byte went out (or that it broke, or the client went away). An install still running at BENCH_INSTALL_TIMEOUT_MS
+// (180 s) is killed and counted as a stall, and the bench prints the requests it had sent that had no answer or an
+// unfinished body, or that none was out (the client stalled on its own). The Worker logs a slow-response line for any
+// answer past 5 s and a stall line for any bounded wait that ran out (worker.ts, deadline.ts), in this same output.
+// Local stalls seen on 2026-11-18 were all empty 302 bodies sent chunked on the local hops: workerd gzips even an
+// empty body when the client accepts gzip (production sends Content-Length: 0), and the recorder streams every answer.
+// BENCH_IDENTITY=1 asks workerd for unencoded answers and BENCH_BUFFER=1 sends each answer whole with its length;
+// with both, 22 database-mode rounds ran with no stall, against 6 in 55 before (2 of them in 22 with BENCH_IDENTITY alone,
+// where the client hung with every answer sent). Both are off by default, so
+// timings compare with earlier runs.
+//
 // Then the client matrix (BENCH_MATRIX=0 skips it): `bun add` and `npm install` with no lockfile, and `bun install
 // --frozen-lockfile` and `npm ci` from the lockfile the first made, each with a new, empty cache, BENCH_RUNS times (3)
 // after one round that warms the registry, through the registry and (unless BENCH_NPM=0) straight from npm; it prints
@@ -53,7 +65,9 @@ const PACKAGES = ["react", "react-dom", "zod", "express", "lodash", "axios"];
 const ACCEPT = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 const TARBALLS = ["react/-/react-19.2.0.tgz", "lodash/-/lodash-4.17.21.tgz", "typescript/-/typescript-5.9.3.tgz", "next/-/next-16.4.6.tgz"];
 const DOCUMENTS = ["express", "react"];
-const INSTALL_TIMEOUT_MS = 180_000;
+
+// how long one install may take before it is killed and counted as a stall (BENCH_INSTALL_TIMEOUT_MS)
+const INSTALL_TIMEOUT_MS = Number(process.env.BENCH_INSTALL_TIMEOUT_MS ?? 180_000);
 
 // production keeps answers from npm for 60 s; shorter here so the `later` install comes after it without a long wait
 const UPSTREAM_TTL_MS = Number(process.env.BENCH_UPSTREAM_TTL_MS ?? 10_000);
@@ -167,9 +181,28 @@ const worker = `http://127.0.0.1:${port}/`;
 const debugToken = randomBytes(24).toString("base64url");
 
 // ---------- npm's requests, as the Worker answered them ----------
-type Served = { path: string; status: number; headersMs: number; endMs: number; phases: Map<string, number> };
+/**
+ * One request the recorder took, from the moment it arrived: when the Worker's headers came and when the last byte of
+ * the body went out (null while either is still to come), or how it ended without one.
+ */
+type Served = {
+  path: string;
+  status: number;
+  /** Bench-clock ms (performance.now) when the client's request reached the recorder. */
+  arrivedAt: number;
+  headersMs: number | null;
+  endMs: number | null;
+  /** Why the request ended without its whole answer: the Worker's fetch failed, the body broke, or the client went away. */
+  ended: "fetch-failed" | "body-error" | "client-cancelled" | null;
+  /** How the Worker's answer said its body ends: its Content-Length and Transfer-Encoding as they came to the recorder. */
+  framing: string;
+  phases: Map<string, number>;
+};
 
 let served: Served[] = [];
+
+/** Every request since the bench started, never reset: what a stalled install is checked against. */
+const everything: Served[] = [];
 
 /** Server-Timing's metrics, by name: "db;dur=41.2;desc=\"1\", total;dur=90.1" is db 41.2 and total 90.1. */
 function phasesOf(header: string | null): Map<string, number> {
@@ -192,22 +225,77 @@ const recorder = Bun.serve({
     const headers = new Headers(req.headers);
 
     headers.set("x-apm-debug", debugToken);
+
+    // BENCH_IDENTITY=1 asks workerd for unencoded answers: with gzip accepted it sends even an empty 302 gzipped and
+    // chunked, and the stalls this bench reproduced were all such bodies left unfinished on the local hops
+    if (process.env.BENCH_IDENTITY === "1") headers.set("accept-encoding", "identity");
     const start = performance.now();
-    const res = await fetch(`${worker}${url.pathname.slice(1)}${url.search}`, { method: req.method, headers, decompress: false, redirect: "manual" });
-    const headersMs = performance.now() - start;
-    const entry: Served = { path: url.pathname, status: res.status, headersMs, endMs: headersMs, phases: phasesOf(res.headers.get("server-timing")) };
+    // recorded on arrival, so a request the Worker never answers is still listed
+    const entry: Served = { path: url.pathname, status: 0, arrivedAt: start, headersMs: null, endMs: null, ended: null, framing: "", phases: new Map() };
 
     served.push(entry);
+    everything.push(entry);
+    let res: Response;
 
-    if (!res.body) return new Response(null, { status: res.status, headers: res.headers });
+    try {
+      res = await fetch(`${worker}${url.pathname.slice(1)}${url.search}`, { method: req.method, headers, decompress: false, redirect: "manual" });
+    } catch (e) {
+      entry.ended = "fetch-failed";
+      throw e;
+    }
 
-    const body = res.body.pipeThrough(
-      new TransformStream<Uint8Array, Uint8Array>({
-        flush() {
-          entry.endMs = performance.now() - start;
-        },
-      }),
-    );
+    entry.headersMs = performance.now() - start;
+    entry.status = res.status;
+    entry.framing = `content-length ${res.headers.get("content-length") ?? "none"}, transfer-encoding ${res.headers.get("transfer-encoding") ?? "none"}`;
+    entry.phases = phasesOf(res.headers.get("server-timing"));
+
+    if (!res.body) {
+      entry.endMs = entry.headersMs;
+
+      return new Response(null, { status: res.status, headers: res.headers });
+    }
+
+    // BENCH_BUFFER=1: the whole body is read, then sent with its length, so no answer reaches the client chunked
+    if (process.env.BENCH_BUFFER === "1") {
+      try {
+        const bytes = new Uint8Array(await res.arrayBuffer());
+
+        entry.endMs = performance.now() - start;
+        const sent = new Headers(res.headers);
+
+        sent.delete("transfer-encoding");
+        sent.set("content-length", String(bytes.length));
+
+        return new Response(bytes, { status: res.status, headers: sent });
+      } catch (e) {
+        entry.ended = "body-error";
+        throw e;
+      }
+    }
+
+    // the body passed on chunk by chunk, so its end, a break, or the client going away is seen when it happens
+    const reader = res.body.getReader();
+
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        try {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            entry.endMs = performance.now() - start;
+            c.close();
+          } else c.enqueue(value);
+        } catch (e) {
+          entry.ended = "body-error";
+          c.error(e);
+        }
+      },
+      cancel(reason) {
+        if (entry.endMs === null) entry.ended = "client-cancelled";
+
+        return reader.cancel(reason);
+      },
+    });
 
     return new Response(body, { status: res.status, headers: res.headers });
   },
@@ -272,7 +360,52 @@ function servedSummary(rows: readonly Served[], kind: Fetch["kind"]): string {
   const names = [...new Set(mine.flatMap((r) => [...r.phases.keys()]))].filter((n) => n !== "total");
   const phases = names.map((n) => `${n} ${spread(mine.flatMap((r) => (r.phases.has(n) ? [r.phases.get(n) ?? 0] : [])))}`);
 
-  return `  worker ${kind}s ${mine.length}: headers ${spread(mine.map((r) => r.headersMs))} end ${spread(mine.map((r) => r.endMs))} | ${phases.join(", ")} (median/p90 ms)`;
+  return `  worker ${kind}s ${mine.length}: headers ${spread(mine.flatMap((r) => (r.headersMs === null ? [] : [r.headersMs])))} end ${spread(mine.flatMap((r) => (r.endMs === null ? [] : [r.endMs])))} | ${phases.join(", ")} (median/p90 ms)`;
+}
+
+/**
+ * After a client was killed at INSTALL_TIMEOUT_MS: every request it sent since `since` (bench clock) that had no
+ * answer's headers, an unfinished body or a broken one, with how long it had been out. None listed means the client
+ * stalled without a request out to the registry (the shape production saw: npm's request never reached the Worker).
+ */
+function reportStall(label: string, since: number): void {
+  const now = performance.now();
+  const mine = everything.filter((r) => r.arrivedAt >= since);
+  const open = mine.filter((r) => r.headersMs === null || r.endMs === null || r.ended !== null);
+  const last = mine.reduce((at, r) => Math.max(at, r.arrivedAt), since);
+
+  log(`  STALL ${label}: killed after ${INSTALL_TIMEOUT_MS} ms; ${mine.length} requests reached the registry, ${open.length} without a whole answer; last request arrived ${Math.round(now - last)} ms before the kill`);
+
+  for (const r of open) {
+    const state = r.headersMs === null ? "no headers" : r.endMs === null ? `headers after ${Math.round(r.headersMs)} ms, body unfinished` : `ended ${r.ended ?? "?"}`;
+
+    log(`    ${r.path} ${r.status || "-"} ${state}${r.ended !== null && r.headersMs === null ? ` (${r.ended})` : ""}, out ${Math.round(now - r.arrivedAt)} ms${r.framing === "" ? "" : ` (${r.framing})`}`);
+  }
+
+  if (open.length === 0) log("    no request was out: the client stalled before sending one (or between them)");
+}
+
+/** Runs `child` until it exits or INSTALL_TIMEOUT_MS passes, then kills it and reports what was still out. */
+/** A running install's stall timer: `stop` ends it and says whether it fired. */
+type StallTimer = { stop: () => boolean };
+
+function stallTimer(child: { kill: () => void }, label: string): StallTimer {
+  const since = performance.now();
+  let fired = false;
+
+  const timer = setTimeout(() => {
+    fired = true;
+    reportStall(label, since);
+    child.kill();
+  }, INSTALL_TIMEOUT_MS);
+
+  return {
+    stop: () => {
+      clearTimeout(timer);
+
+      return fired;
+    },
+  };
 }
 
 /**
@@ -294,11 +427,11 @@ async function install(label: string, registry = base): Promise<boolean> {
     { cwd: dir, stdout: "ignore", stderr: "pipe", env: { ...process.env, npm_config_userconfig: join(dir, ".npmrc-none") } },
   );
 
-  const timer = setTimeout(() => child.kill(), INSTALL_TIMEOUT_MS);
+  const timer = stallTimer(child, `npm install (${label})`);
   const stderr = await new Response(child.stderr).text();
   const code = await child.exited;
 
-  clearTimeout(timer);
+  if (timer.stop()) stalls++;
   const seconds = (performance.now() - start) / 1000;
   const fetches: Fetch[] = [];
 
@@ -349,11 +482,11 @@ async function otherClient(label: "pnpm" | "bun"): Promise<boolean> {
       : ["bun", "add", `--registry=${base}`, `--cache-dir=${join(dir, ".cache")}`, "--ignore-scripts", ...PACKAGES];
 
   const child = Bun.spawn(cmd, { cwd: dir, stdout: "pipe", stderr: "pipe", env: { ...process.env, npm_config_userconfig: join(dir, ".npmrc-none"), BUN_INSTALL_CACHE_DIR: join(dir, ".cache") } });
-  const timer = setTimeout(() => child.kill(), INSTALL_TIMEOUT_MS);
+  const timer = stallTimer(child, label);
   const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
   const code = await child.exited;
 
-  clearTimeout(timer);
+  if (timer.stop()) stalls++;
   const lockfile = label === "pnpm" ? "pnpm-lock.yaml" : "bun.lock";
   let lock = "";
 
@@ -435,11 +568,11 @@ async function clientRun(client: Client, registry: string, from: Project | null)
     env: { ...process.env, npm_config_userconfig: join(dir, ".npmrc-none"), BUN_INSTALL_CACHE_DIR: join(dir, ".cache") },
   });
 
-  const timer = setTimeout(() => child.kill(), INSTALL_TIMEOUT_MS);
+  const timer = stallTimer(child, `${client} via ${registry === base ? "apm" : registry}`);
   const [out, err] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
   const code = await child.exited;
 
-  clearTimeout(timer);
+  if (timer.stop()) stalls++;
   const seconds = (performance.now() - start) / 1000;
   const installed = PACKAGES.every((p) => existsSync(join(dir, "node_modules", p, "package.json")));
 
@@ -463,6 +596,7 @@ async function clientRun(client: Client, registry: string, from: Project | null)
  */
 async function matrix(registry: string): Promise<Map<Client, number[]> | null> {
   const times = new Map<Client, number[]>(CLIENTS.map((c) => [c, []]));
+  let failedRounds = 0;
 
   for (let round = 0; round <= RUNS; round++) {
     const bun = await clientRun("bun add", registry, null);
@@ -470,7 +604,12 @@ async function matrix(registry: string): Promise<Map<Client, number[]> | null> {
     const npmPlain = await clientRun("npm install", registry, null);
     const npmCi = npmPlain === null ? null : await clientRun("npm ci", registry, npmPlain.project);
 
-    if (bun === null || bunFrozen === null || npmPlain === null || npmCi === null) return null;
+    // a failed round (a stall included) is counted and the rest still run, so one run of the bench sees every stall
+    if (bun === null || bunFrozen === null || npmPlain === null || npmCi === null) {
+      failedRounds++;
+      log(`  round ${round} via ${registry === base ? "apm" : registry} failed`);
+      continue;
+    }
 
     // a lockfile that names npm's registry would send later installs around apm
     if (registry === base && (bun.project.lock.includes("registry.npmjs.org") || npmPlain.project.lock.includes("registry.npmjs.org"))) lockfileOk = false;
@@ -482,7 +621,7 @@ async function matrix(registry: string): Promise<Map<Client, number[]> | null> {
     times.get("npm ci")?.push(npmCi.seconds);
   }
 
-  return times;
+  return failedRounds === 0 ? times : null;
 }
 
 const median = (xs: readonly number[]): number => {
@@ -496,6 +635,9 @@ log(`pg rtt ${PG_RTT} ms, connect ${PG_CONNECT} ms, r2 ${R2_RTT} ms, install che
 
 let failed = false;
 let lockfileOk = true;
+
+/** Installs killed at INSTALL_TIMEOUT_MS. */
+let stalls = 0;
 
 // BENCH_INSTALLS=0: the single requests and the freshness check only
 if (process.env.BENCH_INSTALLS !== "0") {
@@ -631,6 +773,8 @@ if (!lockfileOk) {
   log("FAIL package-lock.json names a registry other than this one");
   failed = true;
 }
+
+log(`stalls ${stalls} (installs killed at ${INSTALL_TIMEOUT_MS} ms)`);
 
 log(failed ? "FAIL" : "ok");
 

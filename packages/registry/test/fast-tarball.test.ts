@@ -265,7 +265,7 @@ const edgeLayer = (edge: Edge) => {
       if (edge.list === "fail") throw new Error("R2 is down");
       const text = JSON.stringify(edge.list);
 
-      return key === BLOCKLIST_KEY && edge.list !== null ? { text: () => Promise.resolve(text), etag: "e" } : null;
+      return key === BLOCKLIST_KEY && edge.list !== null ? { body: new Blob([text]).stream(), etag: "e" } : null;
     },
   };
 
@@ -648,15 +648,16 @@ describe("which requests are redirected to npm", () => {
     return { status: got?.status, location: got?.headers.get("location") ?? null, intact: sha512(got?.bytes ?? new Uint8Array()) === FAST.integrity };
   };
 
-  test("npm, pnpm, bun and yarn 1 are redirected: each checks the tarball against the install document's integrity", async () => {
-    for (const ua of [NPM_CLIENT, "pnpm/9.15.0 npm/? node/v22.11.0 linux x64", "Bun/1.4.4", "yarn/1.22.22 npm/? node/v22.11.0 linux x64"]) {
+  test("npm, pnpm and yarn 1 are redirected: each checks the tarball against the install document's integrity", async () => {
+    for (const ua of [NPM_CLIENT, "pnpm/9.15.0 npm/? node/v22.11.0 linux x64", "yarn/1.22.22 npm/? node/v22.11.0 linux x64"]) {
       expect(await plain({ "user-agent": ua }), ua).toEqual({ status: 302, location: `${npm.url}fast/-/fast-1.0.0.tgz`, intact: false });
     }
   });
 
   test("yarn 2 and later, and any client apm does not know, get npm's bytes checked here", async () => {
     // Yarn Berry trusts its own cache checksum, which a first install does not have yet
-    for (const ua of ["yarn/4.6.0 npm/? node/v22.11.0 linux x64", "curl/8.5.0", ""]) {
+    // Bun is streamed too: Bun 1.4.x can wait forever on one request after following a 302 (fast-tarball.ts)
+    for (const ua of ["yarn/4.6.0 npm/? node/v22.11.0 linux x64", "Bun/1.4.4", "curl/8.5.0", ""]) {
       expect(await plain({ "user-agent": ua }), ua).toEqual({ status: 200, location: null, intact: true });
     }
   });

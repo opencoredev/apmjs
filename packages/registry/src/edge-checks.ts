@@ -56,6 +56,7 @@
 // work after its answer ends by 20 s, well inside the 30 s Workers allow.
 import { Context, Duration, Effect, Layer, Option } from "effect";
 import { BLOCKLIST_KEY, parseList, type BlocklistBody, type BlocklistReader } from "./blocklist.ts";
+import { CACHE_IDLE_MS, matchWithin, readAllWithin } from "./deadline.ts";
 
 /** How long a view may decide an answer, from when the R2 read that made it began. */
 export const EDGE_VIEW_MAX_AGE_MS = 4_000;
@@ -238,9 +239,12 @@ async function coloCopy(o: EdgeOptions, at: number, refreshMs: number): Promise<
   if (o.cache === null) return null;
 
   try {
-    const res = await o.cache.match(o.cacheKey);
+    // bounded (deadline.ts): a lookup or a body that does not answer is no copy, and the read goes on to R2, so a stuck
+    // Cache API call never keeps this isolate's one read out
+    const lookup = await matchWithin({ cache: o.cache, key: o.cacheKey, operation: "edge-view-copy" });
 
-    if (res === undefined) return null;
+    if (lookup.kind !== "hit") return null;
+    const res = lookup.res;
     const readAt = Number(res.headers.get(READ_AT));
 
     if (!Number.isFinite(readAt) || !usable(readAt, at, refreshMs)) {
@@ -249,7 +253,9 @@ async function coloCopy(o: EdgeOptions, at: number, refreshMs: number): Promise<
       return null;
     }
 
-    const parsed = parseList(await res.text());
+    // the body through a reader readAllWithin owns: past CACHE_IDLE_MS it is cancelled, not left reading on
+    const bytes = res.body === null ? new Uint8Array() : await readAllWithin({ source: res.body, ms: CACHE_IDLE_MS, operation: "edge-view-copy-body" });
+    const parsed = parseList(new TextDecoder().decode(bytes));
 
     return parsed.kind === "ok" ? viewOf(parsed.list, readAt) : null;
   } catch {
@@ -286,7 +292,8 @@ async function readView(o: EdgeOptions, held: Held, readAt: number, maxAgeMs: nu
     const obj = await o.bucket.get(BLOCKLIST_KEY);
 
     if (obj === null) return { view: { readAt, seen: { kind: "none", why: "missing" } }, text: null };
-    const text = await obj.text();
+    // no timer here (this isolate's one read is out until it settles: see startRead)
+    const text = await new Response(obj.body).text();
     const parsed = parseList(text);
 
     if (parsed.kind !== "ok") return { view: { readAt, seen: { kind: "none", why: "unreadable" } }, text: null };

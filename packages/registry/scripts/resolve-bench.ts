@@ -160,6 +160,7 @@ async function resolveOnce(input: { dbUrl: string; pool: MemoryPool; now: number
     header: timing.header,
     expose: timing.expose,
     exposed: timing.exposed,
+    phases: timing.phases,
   };
 
   const base = Layer.mergeAll(

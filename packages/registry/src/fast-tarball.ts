@@ -136,12 +136,14 @@ function redirectBase(settings: RegistrySettings): string | null {
 }
 
 /**
- * Clients that check a downloaded tarball against the install document's dist.integrity or shasum on every install:
- * npm, pnpm, bun and yarn 1. Yarn 2 and later trust their own cache checksum, which a first install has not got, so
- * they and every unnamed client get npm's bytes checked here. A client that only claims to be one of these skips
- * apm's check of bytes sent to itself, nothing more.
+ * Clients redirected to npm's own tarball: npm, pnpm and yarn 1, which check a downloaded tarball against the install
+ * document's dist.integrity or shasum on every install. Yarn 2 and later trust their own cache checksum, which a first
+ * install has not got, so they and every unnamed client get npm's bytes checked here. Bun checks integrity too, but
+ * Bun 1.4.x sometimes never sends one queued request after following a 302 and waits forever ("waiting for 1 tasks";
+ * reproduced against a bare 302 registry with no apm code, 2026-11-18), so Bun is streamed, not redirected. A client
+ * that only claims to be one of these skips apm's check of bytes sent to itself, nothing more.
  */
-const CHECKING_CLIENT = /^(?:npm\/|pnpm\/|bun\/|yarn\/1\.)/i;
+const CHECKING_CLIENT = /^(?:npm\/|pnpm\/|yarn\/1\.)/i;
 
 export function checksTarballs(req: Request): boolean {
   return CHECKING_CLIENT.test(req.headers.get("user-agent") ?? "");

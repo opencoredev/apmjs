@@ -91,7 +91,11 @@ function versionsOf(text: string): string[] {
 }
 
 async function ask(url: string, init: RequestInit = {}): Promise<Answer> {
-  const res = await fetch(url, { redirect: "manual", ...init });
+  // npm's own client by default, which is redirected; Bun's fetch would be streamed (fast-tarball.ts)
+  const headers = new Headers(init.headers);
+
+  if (!headers.has("user-agent")) headers.set("user-agent", "npm/10.9.0 node/v24.11.0 linux x64 workspaces/false");
+  const res = await fetch(url, { redirect: "manual", ...init, headers });
   const versions = versionsOf(await res.text());
 
   return { status: res.status, location: res.headers.get("location"), timing: res.headers.get("server-timing") ?? "", versions };

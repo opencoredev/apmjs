@@ -11,6 +11,9 @@ const HEX = createHash("sha512").update(BYTES).digest("hex");
 const INTEGRITY = `sha512-${createHash("sha512").update(BYTES).digest("base64")}`;
 const INSTALL = "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 
+// npm's own client, which is redirected; Bun's fetch (this test's default) is streamed (fast-tarball.ts)
+const NPM_UA = { "user-agent": "npm/10.9.0 node/v24.11.0 linux x64 workspaces/false" };
+
 let npm: ReturnType<typeof Bun.serve>;
 let reg: Registry;
 const asked: string[] = [];
@@ -53,7 +56,7 @@ const confirm = (name: string) =>
 describe("the fast tarball path through the Worker", () => {
   test("a request without credentials is sent to npm's tarball URL, never kept, and its timing is public", async () => {
     asked.length = 0;
-    const res = await fetch(tarballOf("dl-plain"), { redirect: "manual" });
+    const res = await fetch(tarballOf("dl-plain"), { headers: NPM_UA, redirect: "manual" });
 
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe(`${npm.url}dl-plain/-/dl-plain-1.0.0.tgz`);
@@ -87,10 +90,10 @@ describe("the fast tarball path through the Worker", () => {
   });
 
   test("a version confirmed malicious is 410 on the very next request, with or without credentials", async () => {
-    expect((await fetch(tarballOf("dl-bad"), { redirect: "manual" })).status).toBe(302);
+    expect((await fetch(tarballOf("dl-bad"), { headers: NPM_UA, redirect: "manual" })).status).toBe(302);
     await confirm("dl-bad");
 
-    const refused = await fetch(tarballOf("dl-bad"), { redirect: "manual" });
+    const refused = await fetch(tarballOf("dl-bad"), { headers: NPM_UA, redirect: "manual" });
 
     expect(refused.status).toBe(410);
     expect(refused.headers.get("location")).toBeNull();
@@ -109,7 +112,7 @@ describe("the fast tarball path through the Worker", () => {
     await reg.query(`INSERT INTO packages (name, created_at, modified_at, dist_tags) VALUES ('dl-mine', 0, 0, '{"latest":"1.0.0"}'::jsonb)`);
 
     for (const url of [tarballOf("dl-mine"), `${reg.url}dl-plain/-/dl-plain-9.9.9.tgz`, `${reg.url}-/apm/v1/account`]) {
-      const res = await fetch(url, { redirect: "manual" });
+      const res = await fetch(url, { headers: NPM_UA, redirect: "manual" });
       await res.body?.cancel();
 
       expect(res.status, url).not.toBe(302);
