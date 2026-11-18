@@ -82,9 +82,9 @@ export function packageCard(input: PackageCardInput) {
           {input.score === null ? (
             <div style={{ fontSize: 44, fontWeight: 600 }}>not scored</div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "0 24px", textAlign: "center" }}>
               <div style={{ fontSize: input.grade === PARTIAL_GRADE ? 64 : 120, fontWeight: 700, lineHeight: 1 }}>{input.grade === PARTIAL_GRADE ? "partial" : String(input.score)}</div>
-              <div style={{ fontSize: 32, marginTop: 12 }}>{input.grade === PARTIAL_GRADE ? `${input.score}/100 on what apm read` : `grade ${input.grade ?? "?"} · of 100`}</div>
+              <div style={{ fontSize: input.grade === PARTIAL_GRADE ? 28 : 32, lineHeight: 1.25, marginTop: 12 }}>{input.grade === PARTIAL_GRADE ? `${input.score}/100 on what apm read` : `grade ${input.grade ?? "?"} · of 100`}</div>
             </div>
           )}
         </div>
