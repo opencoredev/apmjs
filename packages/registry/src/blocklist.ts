@@ -20,6 +20,7 @@ import { Context, Effect, Layer, Option } from "effect";
 import type * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Guard } from "./db-health.ts";
+import { orDeadline, R2_GET_MS, readAllWithin } from "./deadline.ts";
 import { BlobError, StoreError } from "./errors.ts";
 
 /** The object's key in the registry's bucket. Tarballs live under sha512/ and file views under files/. */
@@ -105,8 +106,14 @@ export function verdictFor(list: BlocklistBody, name: string): NameVerdict {
   return { kind: "upstream", confirmed: list.confirmed.filter((e) => e.name === name) };
 }
 
-/** What reading the list uses of an R2 bucket: an object's text and ETag. */
-export type BlocklistReader = { get(key: string): Promise<{ text(): Promise<string>; readonly etag: string } | null> };
+/** What reading the list uses of an R2 bucket: an object's body and ETag. */
+export type BlocklistReader = { get(key: string): Promise<{ readonly body: ReadableStream<Uint8Array>; readonly etag: string } | null> };
+
+/**
+ * A bound on a whole read of the list, its get and its body together: past `ms` (or once `signal` aborts) the read
+ * fails, and a body still coming is cancelled.
+ */
+export type ReadBound = { readonly ms: number; readonly operation: string; readonly signal?: AbortSignal };
 
 /** A put's options as the list writes them: always conditional on what it read. */
 export type BlocklistPut = {
@@ -135,12 +142,27 @@ export function parseList(text: string): { kind: "ok"; list: BlocklistBody } | {
   return parsed.success ? { kind: "ok", list: parsed.data } : { kind: "unreadable", reason: "it is not in the expected shape" };
 }
 
-/** The list as the degraded routes and the health check read it: parsed whole, or why it cannot be used. */
-export async function readFrom(bucket: BlocklistReader): Promise<BlocklistRead> {
-  const obj = await bucket.get(BLOCKLIST_KEY);
+/**
+ * The list as the degraded routes and the health check read it: parsed whole, or why it cannot be used. With `bound`,
+ * the get and the body share its deadline, and the body is read through a reader this owns, cancelled at the deadline
+ * or when `bound.signal` aborts (deadline.ts, readAllWithin): nothing reads on after its caller gave up.
+ */
+export async function readFrom(bucket: BlocklistReader, bound: ReadBound | null = null): Promise<BlocklistRead> {
+  const start = performance.now();
+
+  const obj =
+    bound === null
+      ? await bucket.get(BLOCKLIST_KEY)
+      : await orDeadline({ work: bucket.get(BLOCKLIST_KEY), ms: bound.ms, operation: bound.operation, onLate: (late) => void late?.body.cancel().catch(() => undefined) });
 
   if (obj === null) return { kind: "missing" };
-  const parsed = parseList(await obj.text());
+
+  const bytes =
+    bound === null
+      ? new Uint8Array(await new Response(obj.body).arrayBuffer())
+      : await readAllWithin({ source: obj.body, ms: Math.max(0, Math.round(bound.ms - (performance.now() - start))), operation: `${bound.operation}-body`, signal: bound.signal });
+
+  const parsed = parseList(new TextDecoder().decode(bytes));
 
   return parsed.kind === "ok" ? { kind: "ok", list: parsed.list, etag: obj.etag } : { kind: "unreadable", reason: parsed.reason, etag: obj.etag };
 }
@@ -196,11 +218,11 @@ const recentReads = new WeakMap<BlocklistReader, RecentRead>();
  * (one read in flight is shared by every request that asks meanwhile), else a new one. A read that throws is not kept,
  * so the next request reads R2 again.
  */
-export function recentFrom(bucket: BlocklistReader, at: number): Promise<BlocklistRead> {
+export function recentFrom(bucket: BlocklistReader, at: number, bound: ReadBound | null = null): Promise<BlocklistRead> {
   const kept = recentReads.get(bucket);
 
   if (kept !== undefined && at - kept.at >= 0 && at - kept.at < BLOCKLIST_RECENT_MS) return kept.read;
-  const read = readFrom(bucket);
+  const read = readFrom(bucket, bound);
   const entry = { at, read };
 
   recentReads.set(bucket, entry);
@@ -228,14 +250,18 @@ export type BlocklistApi = {
 
 export class Blocklist extends Context.Service<Blocklist, BlocklistApi>()("@apm/registry/Blocklist") {
   static r2(bucket: BlocklistBucket, now: () => number = Date.now): Layer.Layer<Blocklist> {
-    const attempt = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, BlobError> =>
-      Effect.tryPromise({ try: run, catch: (cause) => new BlobError({ operation: `blocklist.${operation}`, key: BLOCKLIST_KEY, cause }) });
+    const attempt = <A>(operation: string, run: (signal: AbortSignal) => Promise<A>): Effect.Effect<A, BlobError> =>
+      Effect.tryPromise({ try: (signal) => run(signal), catch: (cause) => new BlobError({ operation: `blocklist.${operation}`, key: BLOCKLIST_KEY, cause }) });
 
     return Layer.succeed(
       Blocklist,
       Blocklist.of({
-        read: attempt("read", () => readFrom(bucket)),
-        recent: attempt("recent", () => recentFrom(bucket, now())),
+        // what a request reads is bounded (deadline.ts): past R2_GET_MS the read failed, and the request answers as it
+        // does when R2 fails (degraded.ts refuses; the fast tarball path waits 300 ms at most anyway)
+        // (its body is cancelled then, and when the request is interrupted); the recent read is shared between requests,
+        // so one request that ends does not cancel it, but its own deadline does
+        read: attempt("read", (signal) => readFrom(bucket, { ms: R2_GET_MS, operation: "blocklist-read", signal })),
+        recent: attempt("recent", () => recentFrom(bucket, now(), { ms: R2_GET_MS, operation: "blocklist-recent" })),
         block: (blocks) =>
           (blocks.local ?? []).length === 0 && (blocks.confirmed ?? []).length === 0
             ? Effect.void

@@ -24,6 +24,7 @@ import type { HttpFailure, InfraError, StoreError } from "./errors.ts";
 import { fail, failureResponse, routePath, withPrivacyHeaders, withServerTiming, withSlash } from "./http.ts";
 import { ChoicesWriter, dropStaleChoices } from "./kept-choices.ts";
 import { route } from "./router.ts";
+import { routeLabel, type RouteLabel } from "./routes.ts";
 import { ISOLATE_POOL, RequestMemory } from "./memory.ts";
 import { legacyAuthRefusal } from "./startup.ts";
 import { ReleaseHooks } from "./hooks.ts";
@@ -386,12 +387,70 @@ export async function handle(
 ): Promise<Response> {
   const start = performance.now();
   const timing = Timing.make();
-  const res = await respond({ req, rawEnv, clock, ctx, controls, timing });
+  const slow = slowWatch({ req, timing, start });
+  let res: Response;
+
+  try {
+    res = await respond({ req, rawEnv, clock, ctx, controls, timing });
+  } finally {
+    slow.stop();
+  }
+
+  slow.answered(res.status);
   // an answer a route marked public carries its phases to anyone (timing.ts); any other only to the debug token
   const exposed = timing.exposed();
   const detail: TimingDetail = exposed ? "full" : timingDetail(req, rawEnv);
 
   return withBuild(req, withServerTiming(req, withPrivacyHeaders(req, res), timing.header({ total: performance.now() - start, detail }), exposed), rawEnv);
+}
+
+/** A request slower than this to its answer's headers is logged (slowWatch). */
+export const SLOW_RESPONSE_MS = 5_000;
+
+/** One slow-response line: the route's label from the route tables and the time each phase took, never a path or a name. */
+export type SlowResponseLine = {
+  readonly level: "warn";
+  readonly event: "slow-response";
+  /** "waiting": the threshold passed with no answer yet; "answered": the answer came after it. */
+  readonly stage: "waiting" | "answered";
+  readonly route: RouteLabel;
+  /** Whether it asked for npm's install document (the abbreviated packument). */
+  readonly install: boolean;
+  readonly ms: number;
+  readonly status: number | null;
+  readonly phases: ReturnType<TimingApi["phases"]>;
+};
+
+/**
+ * Watches one request for Workers Logs: once `thresholdMs` passes with no answer, one "waiting" line with the phases
+ * done so far (a request that never answers still shows); once an answer that took longer comes, one "answered" line.
+ * `stop` ends the timer; `answered` writes the second line when it is due.
+ */
+export function slowWatch(input: { req: Request; timing: TimingApi; start: number; thresholdMs?: number; write?: (line: SlowResponseLine) => void }) {
+  const thresholdMs = input.thresholdMs ?? SLOW_RESPONSE_MS;
+  const write = input.write ?? ((line: SlowResponseLine) => console.warn(JSON.stringify(line)));
+  const route = routeLabel(input.req.method, new URL(input.req.url).pathname);
+  const install = (input.req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
+
+  const line = (stage: SlowResponseLine["stage"], status: number | null): SlowResponseLine => ({
+    level: "warn",
+    event: "slow-response",
+    stage,
+    route,
+    install,
+    ms: Math.round(performance.now() - input.start),
+    status,
+    phases: input.timing.phases(),
+  });
+
+  const timer = setTimeout(() => write(line("waiting", null)), thresholdMs);
+
+  return {
+    stop: (): void => clearTimeout(timer),
+    answered: (status: number): void => {
+      if (performance.now() - input.start >= thresholdMs) write(line("answered", status));
+    },
+  };
 }
 
 /** The header /-/ping carries this version's build id in (APM_BUILD), for the deploy's smoke check (packages/infra/smoke-identity.ts). */

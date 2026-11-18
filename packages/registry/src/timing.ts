@@ -5,7 +5,7 @@
 // "npm-version" one version's document from npm (a few KiB), "npm-open" npm's tarball answer up to its headers, "blocklist" the install block list (R2, or this
 // isolate's copy of it), "install-copy" a lookup of the install document's copy in the data center's cache, "checks"
 // the wall time of the fast tarball path's checks run at once (fast-tarball.ts), "analysis" an upstream version
-// scored on read. A Worker's clock moves only on I/O, so these are waits, and CPU work (parsing a packument, scoring)
+// scored on read, "flight-wait" a wait for another request's whole read of the same packument in this isolate (upstream.ts, listedOrSame). A Worker's clock moves only on I/O, so these are waits, and CPU work (parsing a packument, scoring)
 // shows only as the gap before `total`. Optional everywhere: tests and the queue consumer run without it.
 //
 // Who gets the header:
@@ -20,7 +20,7 @@
 // which on the website's reads tells what others asked for.
 import { Context, Effect, Option } from "effect";
 
-export type TimingMetric = "db" | "npm" | "npm-cache" | "npm-head" | "npm-version" | "npm-open" | "blocklist" | "install-copy" | "checks" | "analysis" | "edge";
+export type TimingMetric = "db" | "npm" | "npm-cache" | "npm-head" | "npm-version" | "npm-open" | "blocklist" | "install-copy" | "checks" | "analysis" | "edge" | "flight-wait";
 
 /** "none": no header. "full": every metric with its count. */
 export type TimingDetail = "none" | "full";
@@ -36,6 +36,8 @@ export type TimingApi = {
   readonly expose: () => void;
   /** Whether a route marked the answer public. */
   readonly exposed: () => boolean;
+  /** Each metric's milliseconds so far, rounded: for the slow-response log (worker.ts), which names no package. */
+  readonly phases: () => Readonly<Partial<Record<TimingMetric, number>>>;
 };
 
 export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/Timing") {
@@ -48,6 +50,7 @@ export class Timing extends Context.Service<Timing, TimingApi>()("@apm/registry/
         open = true;
       },
       exposed: () => open,
+      phases: () => Object.fromEntries([...entries].map(([metric, e]) => [metric, Math.round(e.ms)])),
       add: (metric, ms) => {
         const e = entries.get(metric) ?? { ms: 0, count: 0 };
         entries.set(metric, { ms: e.ms + ms, count: e.count + 1 });
