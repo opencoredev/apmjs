@@ -11,7 +11,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { inflateSync } from "node:zlib";
+import { deflateSync, inflateSync } from "node:zlib";
 import { Miniflare } from "miniflare";
 import { pkg } from "../lib/agent/testing";
 
@@ -71,8 +71,9 @@ function channelsOf(colour: number): number | null {
 
 /**
  * A PNG's width and height, or null unless it decodes: the signature, then chunks whose lengths and CRCs check out,
- * IHDR first, IDAT data that inflates to exactly one filtered row per line, and IEND as the last bytes. A truncated
- * or padded response fails, however its header looks (review of 020c9e8: a 24-byte header alone used to pass).
+ * IHDR first, IDAT data that inflates to exactly one filtered row per line, every row's filter type a real one (0 to 4)
+ * and unfiltered, and IEND as the last bytes. A truncated or padded response fails, however its header looks (review
+ * of 020c9e8: a 24-byte header alone used to pass; re-check: so did rows with filter byte 255).
  */
 function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
   if (bytes.length < SIGNATURE.length || SIGNATURE.some((b, i) => bytes[i] !== b)) return null;
@@ -91,6 +92,8 @@ function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
 
     if (crc32(bytes.subarray(at + 4, at + 8 + length)) !== view.getUint32(at + 8 + length)) return null;
 
+    if (type !== "IHDR" && header === null) return null;
+
     if (type === "IHDR") header = { width: view.getUint32(at + 8), height: view.getUint32(at + 12), depth: data[8] ?? 0, colour: data[9] ?? -1, interlace: data[12] ?? -1 };
     else if (type === "IDAT") idat.push(data);
     else if (type === "IEND") {
@@ -98,15 +101,96 @@ function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
       const channels = channelsOf(header.colour);
 
       if (header.depth !== 8 || header.interlace !== 0 || channels === null) return null;
-      const pixels = inflateSync(Buffer.concat(idat));
+      const filtered = inflateSync(Buffer.concat(idat));
 
-      return pixels.length === header.height * (1 + header.width * channels) ? { width: header.width, height: header.height } : null;
+      if (filtered.length !== header.height * (1 + header.width * channels)) return null;
+
+      return unfilter({ filtered, width: header.width, height: header.height, bpp: channels }) ? { width: header.width, height: header.height } : null;
     }
 
     at = end;
   }
 
   return null;
+}
+
+/** Undoes PNG's per-row filters (None, Sub, Up, Average, Paeth); null when a row names any other filter type. */
+function unfilter(input: { filtered: Uint8Array; width: number; height: number; bpp: number }): Uint8Array | null {
+  const { filtered, width, height, bpp } = input;
+  const stride = width * bpp;
+  const out = new Uint8Array(stride * height);
+
+  for (let y = 0; y < height; y++) {
+    const filter = filtered[y * (stride + 1)];
+    const src = y * (stride + 1) + 1;
+    const row = y * stride;
+
+    for (let x = 0; x < stride; x++) {
+      const raw = filtered[src + x] ?? 0;
+      const left = x >= bpp ? (out[row + x - bpp] ?? 0) : 0;
+      const up = y > 0 ? (out[row - stride + x] ?? 0) : 0;
+      const upLeft = y > 0 && x >= bpp ? (out[row - stride + x - bpp] ?? 0) : 0;
+      let predicted: number;
+
+      switch (filter) {
+        case 0:
+          predicted = 0;
+          break;
+        case 1:
+          predicted = left;
+          break;
+        case 2:
+          predicted = up;
+          break;
+        case 3:
+          predicted = (left + up) >> 1;
+          break;
+        case 4: {
+          const p = left + up - upLeft;
+          const pa = Math.abs(p - left);
+          const pb = Math.abs(p - up);
+          const pc = Math.abs(p - upLeft);
+
+          predicted = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
+          break;
+        }
+
+        default:
+          return null;
+      }
+
+      out[row + x] = (raw + predicted) & 0xff;
+    }
+  }
+
+  return out;
+}
+
+/** A well-formed PNG (valid chunks and CRCs) of RGBA rows that all name `filter`, for testing the check above. */
+function syntheticPng(input: { width: number; height: number; filter: number }): Uint8Array {
+  const chunk = (type: string, data: Uint8Array): Uint8Array => {
+    const body = new Uint8Array([...new TextEncoder().encode(type), ...data]);
+    const out = new Uint8Array(12 + data.length);
+    const view = new DataView(out.buffer);
+
+    view.setUint32(0, data.length);
+    out.set(body, 4);
+    view.setUint32(8 + data.length, crc32(body));
+
+    return out;
+  };
+
+  const ihdr = new Uint8Array(13);
+  const view = new DataView(ihdr.buffer);
+
+  view.setUint32(0, input.width);
+  view.setUint32(4, input.height);
+  ihdr.set([8, 6, 0, 0, 0], 8);
+  const rows = new Uint8Array(input.height * (1 + input.width * 4));
+
+  for (let y = 0; y < input.height; y++) rows[y * (1 + input.width * 4)] = input.filter;
+
+  return new Uint8Array([...SIGNATURE, ...chunk("IHDR", ihdr), ...chunk("IDAT", deflateSync(rows)), ...chunk("IEND", new Uint8Array())]);
 }
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
@@ -203,6 +287,13 @@ describe("the PNG check itself", () => {
     expect(pngSize(bytes.slice(0, bytes.length - 12))).toBeNull();
     expect(pngSize(new Uint8Array([...bytes, 0]))).toBeNull();
   }, 60_000);
+
+  test("rows must name a real filter type: a 1200x630 PNG with valid CRCs and filter byte 255 fails", () => {
+    expect(pngSize(syntheticPng({ width: 1200, height: 630, filter: 0 }))).toEqual({ width: 1200, height: 630 });
+    expect(pngSize(syntheticPng({ width: 1200, height: 630, filter: 4 }))).toEqual({ width: 1200, height: 630 });
+    expect(pngSize(syntheticPng({ width: 1200, height: 630, filter: 5 }))).toBeNull();
+    expect(pngSize(syntheticPng({ width: 1200, height: 630, filter: 255 }))).toBeNull();
+  });
 });
 
 describe("routes", () => {
