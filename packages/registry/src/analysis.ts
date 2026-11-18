@@ -113,10 +113,14 @@ export const MAX_FAILED_RUNS = 2;
 export const REQUEUE_AFTER_MS = 10 * 60_000;
 
 /**
- * How long a queue send may take before it counts as refused: its reservation goes and the next request queues the
- * version again. A send that lands after this leaves the job on the queue twice, which a run handles (it stores once).
+ * How long a caller waits for a queue send. A send with no answer by then may still land, so its reservation stays: the
+ * cron sweep (recover) sends the version again once REQUEUE_AFTER_MS pass with no run begun. A send that did land
+ * leaves the job on the queue twice, and the second delivery finds the run taken (startAnalysis) and stores nothing.
  */
 export const QUEUE_SEND_TIMEOUT_MS = 4_000;
+
+/** What a queue send came to: taken, refused by the queue, or no answer in QUEUE_SEND_TIMEOUT_MS (it may yet land). */
+type SendOutcome = { readonly kind: "sent" } | { readonly kind: "refused"; readonly cause: unknown } | { readonly kind: "unanswered" };
 
 /** How one analysis run reads: the whole package under a meter, or a smaller re-run that is marked incomplete. */
 export type RunPlan = { maxWork: number; maxScannedBytes?: number; incompleteBecause?: readonly string[] };
@@ -235,7 +239,8 @@ export type AnalysisApi = {
   readonly recover: Effect.Effect<number, StoreError | BlobError, RequestMemory>;
   /**
    * Queues a version for analysis unless it is already scored or queued. True when it is on the queue now (or recorded
-   * for the sweep, with no queue); false when the queue refused it or did not answer in QUEUE_SEND_TIMEOUT_MS.
+   * for the sweep, with no queue); false when the queue refused it (its reservation goes) or did not answer in
+   * QUEUE_SEND_TIMEOUT_MS (its reservation stays, for the sweep).
    */
   readonly enqueue: (name: string, version: string) => Effect.Effect<boolean, StoreError>;
   /**
@@ -275,18 +280,33 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
             if (!claimed || queue === null) return true;
             const job: AnalysisJob = { name, version };
 
-            // a job the queue refused, or did not take in time, is not on it (as far as this run knows), so its
-            // reservation goes too and the next request queues it again
-            return yield* Effect.tryPromise({ try: () => queue.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
-              Effect.timeoutOrElse({
-                duration: Duration.millis(QUEUE_SEND_TIMEOUT_MS),
-                orElse: () => Effect.fail(new QueueError({ operation: "send", cause: `no answer in ${QUEUE_SEND_TIMEOUT_MS} ms` })),
-              }),
-              Effect.as(true),
-              Effect.catchTag("QueueError", (e) =>
-                Effect.logWarning("analysis queue send failed", { name, version, cause: String(e.cause) }).pipe(Effect.andThen(store.releaseAnalysisJob(name, version, now)), Effect.as(false)),
-              ),
+            const sent = yield* Effect.tryPromise({ try: () => queue.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
+              Effect.as<SendOutcome>({ kind: "sent" }),
+              Effect.catchTag("QueueError", (e) => Effect.succeed<SendOutcome>({ kind: "refused", cause: e.cause })),
+              Effect.timeoutOrElse({ duration: Duration.millis(QUEUE_SEND_TIMEOUT_MS), orElse: () => Effect.succeed<SendOutcome>({ kind: "unanswered" }) }),
             );
+
+            switch (sent.kind) {
+              case "sent":
+                return true;
+              // the queue said no: the job is not on it, so its reservation goes and the next request queues it again
+              case "refused":
+                yield* Effect.logWarning("analysis queue send refused", { name, version, cause: String(sent.cause) });
+                yield* store.releaseAnalysisJob(name, version, now);
+
+                return false;
+              // no answer: the job may be on the queue or not, so the reservation stays and the sweep sends it again
+              // if no run begins (a second delivery of a job that was on it finds its run taken)
+              case "unanswered":
+                yield* Effect.logWarning("analysis queue send unanswered", { name, version, waitedMs: QUEUE_SEND_TIMEOUT_MS });
+
+                return false;
+              default: {
+                const _exhaustive: never = sent;
+
+                return _exhaustive;
+              }
+            }
           });
 
         // bound to the tarball the packument names for the version: the bytes this run fetched, or would have

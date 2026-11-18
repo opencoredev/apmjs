@@ -28,14 +28,16 @@
 // waiting at most EDGE_READ_DEADLINE_MS (300 ms) before it takes the database path instead. An isolate runs one read
 // at a time, until that read settles: a request that finds one running waits for it, on its own timer, until that
 // read's deadline (no promise is shared between requests, as Workers require), and one that comes after the deadline
-// waits not at all and takes the database path; no second read starts while the first is out, however slow R2 is. A
-// read's whole life is one promise held by the waitUntil of the request that started it: it settles when the read
-// does, or after READ_LIFETIME_MS (10 s), when the read is abandoned and whatever it brings later is dropped unused.
-// The isolate's one read ends exactly when that promise settles, never because time passed on a clock, so a second
-// read never starts while the first can still land. The read starts before its request's response, so the promise
-// settles well inside the 30 s that waitUntil may run after it; a stalled R2 costs an isolate one read per 10 s. A read
-// first tries the data center's copy (the Cache API, written by the isolate that last read R2, used while under 2 s
-// old), then R2.
+// waits not at all and takes the database path; no second read starts while the first is out, however slow R2 is.
+// Two things are kept apart. How long a request waits for a read's result is its deadline, and no more. Whether the
+// isolate's one read is out is the underlying read itself, its R2 call and the body it streams included: the read is
+// out until that work settles, and no timer ends it, so two underlying reads are never out at once. The request that
+// started the read keeps it in its waitUntil for READ_LIFETIME_MS (10 s) at most, which settles well inside the 30 s
+// waitUntil may run after its response; a read still out past that is counted once (`readTimeouts`), and the isolate
+// stays on the database path until the read settles, every request it sends there counted (`readStuck`). A read that
+// never settles (its request's context gone) leaves that isolate on the database path for its life, which is safe and
+// shows in the log. A read first tries the data center's copy (the Cache API, written by the isolate that last read
+// R2, used while under 2 s old), then R2.
 //
 // What a view does not decide goes to the database path as before: a name it lists as published here or with any
 // confirmed version, a list missing, unreadable, never synced or not synced for LIST_STALE_MS (15 minutes: the cron
@@ -77,9 +79,9 @@ const CLOCK_SKEW_MS = 250;
 const POLL_MS = 10;
 
 /**
- * How long a read may be out before it is abandoned: its promise settles then, what it brings later is dropped, and the
- * isolate may start another. Counted from the read's start, which comes before its request's response, so the timer
- * fires well inside the 30 s a Worker's waitUntil may run after that response.
+ * How long the request that started a read keeps it in its waitUntil. Counted from the read's start, which comes before
+ * its request's response, so it ends well inside the 30 s a Worker's waitUntil may run after that response. It does not
+ * end the read: the isolate's one read is out until the read itself settles, however long that takes.
  */
 export const READ_LIFETIME_MS = 10_000;
 
@@ -114,7 +116,7 @@ export type ColoCache = { match(key: string): Promise<Response | undefined>; put
 
 /** What an isolate logs once a minute: counts since its last line. */
 export type EdgeReport = Readonly<
-  Record<"clear" | EdgeFallback | "r2Reads" | "coloHits" | "readFailures" | "readTimeouts" | "queueSkipped" | "queueLate" | "queueFailures" | "queueTimeouts", number>
+  Record<"clear" | EdgeFallback | "r2Reads" | "coloHits" | "readFailures" | "readTimeouts" | "readStuck" | "queueSkipped" | "queueLate" | "queueFailures" | "queueTimeouts", number>
 >;
 
 export type EdgeOptions = {
@@ -172,6 +174,7 @@ const zero = (): Counts => ({
   coloHits: 0,
   readFailures: 0,
   readTimeouts: 0,
+  readStuck: 0,
   queueSkipped: 0,
   queueLate: 0,
   queueFailures: 0,
@@ -181,7 +184,7 @@ const zero = (): Counts => ({
 /** What an isolate keeps per bucket: its view, the read it is running (when it began), the downloads it asked about. */
 type Held = {
   view: EdgeView | null;
-  /** When the isolate's one read began, until its life (startRead) settles; null while none is out. */
+  /** When the isolate's one read began, until the read itself settles (startRead); null while none is out. */
   reading: number | null;
   /** How many reads have landed: a request waiting on another's read looks for this to move. */
   landed: number;
@@ -215,7 +218,7 @@ const usable = (readAt: number, at: number, maxAgeMs: number): boolean => at - r
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** `work`'s result, or null once `ms` passed first. */
+/** `work`'s result, or null once `ms` passed first. It does not stop `work`, which runs on. */
 async function within<T>(work: Promise<T>, ms: number): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -297,39 +300,45 @@ async function readView(o: EdgeOptions, held: Held, readAt: number, maxAgeMs: nu
   }
 }
 
-/** Keeps `next` unless the isolate already holds a view read later. */
+/** Keeps `next` unless the isolate already holds a view read later (a read is dated from its start). */
 function keep(held: Held, next: EdgeView): void {
   if (held.view === null || next.readAt >= held.view.readAt) held.view = next;
 }
 
 /**
- * Starts this isolate's one read. Its life is one promise: the read, or null once `lifetimeMs` passed first, when the
- * read is abandoned and anything it brings later is never looked at. The isolate's one read ends when that promise
- * settles, and only then. A view that lands is kept at once, then copied for the data center (bounded the same way).
- * The returned promise is the view (null for an abandoned read), for the request that started it; the rest runs in its
- * background when there is one.
+ * Starts this isolate's one read. The read is out until readView itself settles (its R2 call and the body it reads),
+ * and only then: no timer ends it, so a second read never starts while the first can still land. A view that lands is
+ * kept at once. The request that started the read keeps it in its background for at most `lifetimeMs`, then copies a
+ * view from R2 for the data center (bounded the same way); a read still out by then is counted, and runs on. The
+ * returned promise is the view, for the request that started it, which waits for it only until its own deadline.
  */
-function startRead(o: EdgeOptions, held: Held, maxAgeMs: number, lifetimeMs: number): Promise<EdgeView | null> {
+function startRead(o: EdgeOptions, held: Held, maxAgeMs: number, lifetimeMs: number): Promise<EdgeView> {
   const readAt = o.now();
 
   held.reading = readAt;
 
-  const life = within(readView(o, held, readAt, maxAgeMs), lifetimeMs).then((r) => {
-    if (r === null) held.counts.readTimeouts++;
-    else keep(held, r.view);
+  // readView catches its own failures, so this settles exactly when the underlying read does
+  const read = readView(o, held, readAt, maxAgeMs).then((r) => {
+    keep(held, r.view);
     held.landed++;
     held.reading = null;
 
     return r;
   });
 
-  const done = life.then(async (r) => {
-    if (r !== null && r.text !== null) await within(keepCopy(o, r.text, readAt, maxAgeMs), lifetimeMs);
+  const bounded = within(read, lifetimeMs).then(async (r) => {
+    if (r === null) {
+      held.counts.readTimeouts++;
+
+      return;
+    }
+
+    if (r.text !== null) await within(keepCopy(o, r.text, readAt, maxAgeMs), lifetimeMs);
   });
 
-  o.background?.(done);
+  o.background?.(bounded);
 
-  return life.then((r) => (r === null ? null : r.view));
+  return read.then((r) => r.view);
 }
 
 /** What a request may decide from: a view young enough now, or why it has none. */
@@ -353,8 +362,8 @@ export async function currentView(o: EdgeOptions): Promise<Lookup> {
   const held = heldFor(o.bucket);
   const at = o.now();
   const view = held.view;
-  // the isolate's one read stays its one read until its life settles: one past its deadline sends requests to the
-  // database path at once (the loop below does not wait), and none starts beside it, however long it has been out
+  // the isolate's one read stays its one read until it settles: one past its deadline sends requests to the database
+  // path at once (the loop below does not wait), and none starts beside it, however long it has been out
   const running = held.reading;
 
   if (view !== null && usable(view.readAt, at, maxAgeMs)) {
@@ -364,6 +373,9 @@ export async function currentView(o: EdgeOptions): Promise<Lookup> {
   }
 
   if (running === null) return checked(o, await within(startRead(o, held, maxAgeMs, lifetimeMs), deadlineMs), maxAgeMs);
+
+  // a read out past the time its request keeps it: the isolate is on the database path until it settles
+  if (at - running >= lifetimeMs) held.counts.readStuck++;
 
   // another request's read: looked for on this request's own timer, until that read's deadline; past it, not at all
   const landed = held.landed;

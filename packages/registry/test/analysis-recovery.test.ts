@@ -812,43 +812,83 @@ describe("accepted jobs that never began cannot starve behind unfinished runs", 
 });
 
 // Review of 851147c, findings 2 and 4: a queue send that never answered held its caller (an edge ask, or a download on
-// the database path) with no limit, and a refused send was reported to the edge as queued. A send now counts as
-// refused after QUEUE_SEND_TIMEOUT_MS, its reservation goes, and enqueue answers false so the caller asks again soon.
-describe("a queue send that does not answer is refused in time", () => {
-  test("enqueue answers false after QUEUE_SEND_TIMEOUT_MS and drops its reservation, so the next request queues the version", async () => {
+// the database path) with no limit, and a refused send was reported to the edge as queued. A send now gets
+// QUEUE_SEND_TIMEOUT_MS and enqueue answers false. Review of 95409e4, finding 2: a send with no answer may still land,
+// and dropping its reservation then left nothing for the sweep, so a lost send was never retried. Its reservation now
+// stays and the sweep sends it again; only a send the queue refused drops it.
+describe("a queue send that does not answer is left to the sweep", () => {
+  /** A queue whose sends never answer while `stall.on`, recording every job it was handed either way. */
+  const stallingQueue = (stall: { on: boolean }) => {
+    const sent: AnalysisJob[] = [];
+
+    const queue: AnalysisQueue = {
+      send: (job) => {
+        sent.push(job);
+
+        return stall.on ? new Promise<void>(() => undefined) : Promise.resolve();
+      },
+    };
+
+    return { queue, sent };
+  };
+
+  test("enqueue answers false after QUEUE_SEND_TIMEOUT_MS and keeps its reservation, so a request does not send it again before the sweep would", async () => {
     await withRig(async (db, sql) => {
       const up = upstreamStub(["stalled-send"]);
-      const sent: AnalysisJob[] = [];
-      let stall = true;
-
-      const queue: AnalysisQueue = {
-        send: (job) => {
-          sent.push(job);
-
-          return stall ? new Promise<void>(() => undefined) : Promise.resolve();
-        },
-      };
-
-      const enqueue = () => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("stalled-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue })), Effect.scoped));
+      const stall = { on: true };
+      const q = stallingQueue(stall);
+      const enqueue = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("stalled-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
       const start = performance.now();
 
-      expect(await enqueue()).toBe(false);
+      expect(await enqueue(T0)).toBe(false);
       expect(performance.now() - start).toBeGreaterThanOrEqual(QUEUE_SEND_TIMEOUT_MS - 50);
       expect(performance.now() - start).toBeLessThan(QUEUE_SEND_TIMEOUT_MS + 2_000);
-      expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'stalled-send'")).toHaveLength(0);
-      stall = false;
-      expect(await enqueue()).toBe(true);
-      expect(sent).toHaveLength(2);
-      expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'stalled-send'")).toHaveLength(1);
+      expect(await sql("SELECT queued_at::bigint AS at FROM analysis_jobs WHERE package = 'stalled-send'")).toEqual([{ at: String(T0) }]);
+      // a request inside the reservation finds it pending and sends nothing
+      stall.on = false;
+      expect(await enqueue(T0 + 5_000)).toBe(true);
+      expect(q.sent).toHaveLength(1);
     });
   }, 60_000);
 
-  test("enqueue answers false when the queue refuses the send", async () => {
-    await withRig(async (db) => {
+  test("after a timed-out resend the row stays pending, and the next sweep finds it and sends it again", async () => {
+    await withRig(async (db, sql) => {
+      const up = upstreamStub(["lost-send"]);
+      const stall = { on: true };
+      const q = stallingQueue(stall);
+      const sweep = (now: number) => Effect.runPromise(Effect.flatMap(Analysis, (a) => a.recover).pipe(Effect.provide(layerFor({ url: db.url, now, upstream: up.layer, queue: q.queue })), Effect.scoped));
+      const pending = () => sql("SELECT queued_at::bigint AS at FROM analysis_jobs WHERE package = 'lost-send'");
+
+      // the request's send never answers
+      expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("lost-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue })), Effect.scoped))).toBe(false);
+      expect(await pending()).toEqual([{ at: String(T0) }]);
+
+      // the first sweep after REQUEUE_AFTER_MS finds it and sends it again; that send times out too, and the row stays
+      const first = T0 + REQUEUE_AFTER_MS + 1;
+
+      expect(await sweep(first)).toBe(1);
+      expect(q.sent).toHaveLength(2);
+      expect(await pending()).toEqual([{ at: String(first) }]);
+
+      // the next sweep finds it again, and this send is taken
+      stall.on = false;
+      expect(await sweep(first + REQUEUE_AFTER_MS)).toBe(1);
+      expect(q.sent).toEqual([
+        { name: "lost-send", version: "1.0.0" },
+        { name: "lost-send", version: "1.0.0" },
+        { name: "lost-send", version: "1.0.0" },
+      ]);
+      expect(await pending()).toEqual([{ at: String(first + REQUEUE_AFTER_MS) }]);
+    });
+  }, 60_000);
+
+  test("enqueue answers false when the queue refuses the send, and drops its reservation so the next request queues it", async () => {
+    await withRig(async (db, sql) => {
       const up = upstreamStub(["refused-send"]);
       const queue: AnalysisQueue = { send: () => Promise.reject(new Error("queue full")) };
 
       expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("refused-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue })), Effect.scoped))).toBe(false);
+      expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'refused-send'")).toHaveLength(0);
     });
   }, 60_000);
 });

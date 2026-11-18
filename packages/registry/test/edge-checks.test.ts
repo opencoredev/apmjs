@@ -280,19 +280,23 @@ describe("an isolate's edge view", () => {
     expect(b.state.reads).toBe(1);
   });
 
-  test("a stalled read stays the isolate's one read until its life settles: requests past its deadline take the database path at once and start no second read, however far the clock moves", async () => {
+  test("a stalled read stays the isolate's one read until the read itself settles: past its deadline requests take the database path at once, past its lifetime they are counted as stuck, and no second read starts", async () => {
+    const reports: EdgeReport[] = [];
     const b = bucket(list({}));
-    const o = options(b.api, { readLifetimeMs: 400 });
+    const o = options(b.api, { readLifetimeMs: 400, report: (r) => void reports.push(r) });
     const stalled = gate();
 
     b.state.held = stalled.wait;
     expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
     expect(b.state.reads).toBe(1);
-    // the read's life is the promise its request's background holds
+    // the request that started the read keeps it in its background, for the read's lifetime at most
     expect(later).toHaveLength(1);
+    const started = performance.now();
 
-    // past the view's age, long past the read's deadline, and past the 30 s the old rule abandoned a read at: the
-    // request that started it may still be alive (waiting on npm, then in its waitUntil), so it is still the one read
+    await settle();
+    expect(performance.now() - started).toBeLessThan(500);
+
+    // the background let go, the read did not settle: it is still the isolate's one read, however far the clock moves
     for (const step of [EDGE_VIEW_MAX_AGE_MS, EDGE_VIEW_MAX_AGE_MS, 10_000, 30_000, 60_000]) {
       clock += step;
       const start = performance.now();
@@ -302,22 +306,18 @@ describe("an isolate's edge view", () => {
       expect(b.state.reads).toBe(1);
     }
 
-    // its life ends when its own timer does, inside the background that holds it: then, and only then, one more read
-    const started = performance.now();
+    // the minute's line shows the read that outlived its lifetime and the requests it sent to the database path
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ readTimeouts: 1, r2Reads: 1 });
+    expect(reports[0]?.readStuck).toBeGreaterThanOrEqual(4);
 
-    await settle();
-    expect(performance.now() - started).toBeLessThan(500);
-    b.state.held = null;
-    expect(await decided(o, "react")).toEqual(CLEAR);
-    expect(b.state.reads).toBe(2);
-
-    // the abandoned read landing late is never looked at: the list it took (no names) does not replace a newer view
+    // the read settles: what it took (no names) lands too old to decide, and only now does one more read start
     b.set(list({ confirmed: ["react"] }));
-    clock += EDGE_VIEW_MAX_AGE_MS;
-    expect(await decided(o, "react")).toEqual({ kind: "database", reason: "confirmed" });
     stalled.open();
-    await settle();
+    await Bun.sleep(1);
+    b.state.held = null;
     expect(await decided(o, "react")).toEqual({ kind: "database", reason: "confirmed" });
+    expect(b.state.reads).toBe(2);
   });
 
   test("no second read starts while the first can still land: a read is out until it lands or is abandoned, never beside another", async () => {
@@ -358,6 +358,71 @@ describe("an isolate's edge view", () => {
     expect(await decided(o, "react")).toEqual(CLEAR);
     expect(most).toBe(1);
   });
+
+  test("across the real lifetime: a read that settles 12 s after it began keeps the isolate's one read until it settles, and never has another beside it", async () => {
+    const b = bucket(list({}));
+    let out = 0;
+    let most = 0;
+    let reads = 0;
+    const slow = gate();
+
+    const counted: BlocklistReader = {
+      get: async (key) => {
+        out++;
+        reads++;
+        most = Math.max(most, out);
+
+        try {
+          await slow.wait;
+
+          return await b.api.get(key);
+        } finally {
+          out--;
+        }
+      },
+    };
+
+    // READ_LIFETIME_MS as shipped, on real timers; the request clock follows the real one
+    const begun = performance.now();
+    const base = clock;
+    const o = options(counted, { now: () => base + Math.round(performance.now() - begun) });
+    const opened = setTimeout(slow.open, 12_000);
+
+    try {
+      expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
+      expect(later).toHaveLength(1);
+      let backgroundEndedAt: number | null = null;
+
+      void Promise.all(later).then(() => {
+        backgroundEndedAt = performance.now() - begun;
+      });
+
+      // requests every quarter second while the read is out: before its lifetime, past it, and up to its end
+      while (out > 0) {
+        expect(await decided(o, "react")).toEqual({ kind: "database", reason: "slow-read" });
+        expect(reads).toBe(1);
+        await Bun.sleep(250);
+      }
+
+      const settledAt = performance.now() - begun;
+
+      // the background let go at the lifetime, the read stayed out until 12 s
+      expect(backgroundEndedAt).not.toBeNull();
+      expect(backgroundEndedAt ?? 0).toBeGreaterThanOrEqual(READ_LIFETIME_MS - 50);
+      expect(backgroundEndedAt ?? 0).toBeLessThan(READ_LIFETIME_MS + 1_000);
+      expect(settledAt).toBeGreaterThanOrEqual(12_000 - 50);
+      expect(most).toBe(1);
+
+      // settled 12 s after it began, too old to decide: the next request reads again, alone
+      expect(await decided(o, "react")).toEqual(CLEAR);
+      expect(reads).toBe(2);
+      expect(most).toBe(1);
+    } finally {
+      clearTimeout(opened);
+      slow.open();
+      later = [];
+    }
+  }, 30_000);
 
   test("a read's life is bounded well inside the 30 s a request's background may run", () => {
     expect(READ_LIFETIME_MS + EDGE_READ_DEADLINE_MS).toBeLessThanOrEqual(15_000);
