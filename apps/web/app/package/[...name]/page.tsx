@@ -4,7 +4,7 @@ import { Suspense } from "react";
 import { ArrowDownIcon, ChevronDownIcon } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
-import { getPackage, getTarballReadme, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
+import { getPackage, getTarballReadme, getVersionInfo, type Dismissed, type Facts, type Fetched, type PackageEvent, type PackageInfo } from "@/lib/registry";
 import { EvidenceAdminControl, EvidenceAdminProvider, type EvidenceItem } from "@/components/evidence-admin";
 import { DismissedEvidence } from "@/components/dismissed-evidence";
 import { needsTarballReadme, readmeSource, tarballTooLarge, type ReadmeSource, type TarballRead } from "@/lib/readme-source";
@@ -25,6 +25,8 @@ import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { versionCountLabel } from "@/lib/version-count";
+import { chooseVersion, rowsWith, type VersionState } from "@/lib/shown-version";
+import { buttonVariants } from "@/components/ui/button";
 import { REGISTRY } from "@/lib/registry-url";
 import { askedVersion, shownOf } from "@/lib/early-answer";
 import { startPackageReads } from "@/lib/package-reads";
@@ -601,11 +603,82 @@ function SectionTitle({ id, children, aside }: { id: string; children: React.Rea
   );
 }
 
-/** The version a link names with ?v=, when the package has it; else the latest. */
-function shownVersion(pkg: PackageInfo, v: string | string[] | undefined): string | null {
-  const asked = Array.isArray(v) ? v[0] : v;
+/**
+ * The version `?v=` names: latest without one, a listed version or dist-tag at once, and any other version number
+ * from the registry's per-version answer, which also says whether it exists. `extra` is that answer's row, for a
+ * version the package answer does not list.
+ */
+type Resolved =
+  | { kind: "shown"; version: string | null; extra: VersionState | null }
+  | { kind: "no-such-version"; asked: string }
+  | { kind: "unavailable"; version: string };
 
-  return asked !== undefined && pkg.versions.some((x) => x.version === asked) ? asked : pkg.latest;
+async function resolveVersion(input: { pkg: PackageInfo; asked: string | undefined }): Promise<Resolved> {
+  const choice = chooseVersion(input);
+
+  switch (choice.kind) {
+    case "latest":
+    case "listed":
+      return { kind: "shown", version: choice.version, extra: null };
+    case "invalid":
+      return { kind: "no-such-version", asked: choice.asked };
+    case "unlisted": {
+      const info = await getVersionInfo(input.pkg.name, choice.version);
+
+      switch (info.kind) {
+        case "ok":
+          return { kind: "shown", version: info.value.version, extra: { version: info.value.version, status: info.value.status, unscorable: info.value.unscorable?.text ?? null } };
+        case "missing":
+          return { kind: "no-such-version", asked: choice.version };
+        case "unavailable":
+          return { kind: "unavailable", version: choice.version };
+        default: {
+          const _exhaustive: never = info;
+
+          return _exhaustive;
+        }
+      }
+    }
+
+    default: {
+      const _exhaustive: never = choice;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** `?v=` names no version of this package: say so, and offer latest and the listed versions, instead of showing latest. */
+function NoSuchVersion({ pkg, asked }: { pkg: PackageInfo; asked: string }) {
+  return (
+    <div className="flex flex-col gap-10 sm:gap-12">
+      <header className="flex flex-col gap-4">
+        <PackageName name={pkg.name} />
+        {pkg.description && <p className="max-w-2xl text-lg leading-8 text-pretty text-muted-foreground">{pkg.description}</p>}
+      </header>
+      <div role="alert" className="flex max-w-xl flex-col items-start gap-4 rounded-2xl bg-surface px-5 py-6 sm:px-6">
+        <div className="flex flex-col gap-2">
+          <h2 className="text-2xl font-medium tracking-tight">No such version</h2>
+          <p className="text-[15px] leading-6 text-pretty break-words text-muted-foreground">
+            {pkg.name} has no version <span className="font-mono text-foreground">{asked}</span> on npm. Check the version number, or pick one below.
+          </p>
+        </div>
+        {pkg.latest && (
+          <Link href={packagePath(pkg.name)} className={buttonVariants({ size: "lg" })}>
+            Show the latest, {pkg.latest}
+          </Link>
+        )}
+      </div>
+      {pkg.versions.length > 0 && (
+        <section aria-labelledby="versions">
+          <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{versionCountLabel(pkg.versions.length)}</span>}>
+            Versions
+          </SectionTitle>
+          <VersionList rows={pkg.versions.map((v) => ({ ...v, when: ago(v.publishedAt) }))} packageHref={packagePath(pkg.name)} current={null} />
+        </section>
+      )}
+    </div>
+  );
 }
 
 /** The header's note about an open or confirmed AI review flag, once the review answer arrives. */
@@ -712,7 +785,14 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
 
   if (found.kind === "unavailable") return <RegistryUnavailable what={`the package ${name}`} retryHref={packagePath(name)} />;
   const pkg = found.value;
-  const version = shownVersion(pkg, query.v);
+  // a version outside the newest 200 the package answer lists is read from the per-version endpoint (shown-version.ts)
+  const resolved = await resolveVersion({ pkg, asked });
+
+  if (resolved.kind === "no-such-version") return <NoSuchVersion pkg={pkg} asked={resolved.asked} />;
+
+  if (resolved.kind === "unavailable") return <RegistryUnavailable what={`${name} ${resolved.version}`} retryHref={`${packagePath(name)}?v=${encodeURIComponent(resolved.version)}`} />;
+  const { version, extra } = resolved;
+  const rows = rowsWith(pkg.versions, extra);
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
 
@@ -720,7 +800,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // the score render without waiting for the slowest call.
   // a version the package answer reports revoked or revoke-pending, or does not list, is shown only from a redacted
   // answer or a fresh read of that version
-  const shown = version ? shownOf(pkg.versions, version, isLatest && pkg.score?.redacted === true) : null;
+  const shown = version ? shownOf(rows, version, isLatest && pkg.score?.redacted === true) : null;
   const review = shown ? reads.review(shown) : Promise.resolve<Fetched<ReviewAnswer>>(none);
 
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball, unless that
@@ -733,7 +813,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
 
   const links = packageLinks({ homepage: pkg.homepage, repository: pkg.repository, bugs: pkg.bugs });
   const score = isLatest ? pkg.score : versionScore.kind === "ok" ? versionScore.value : null;
-  const unscored = score ? null : unscoredNotice({ pkg, version });
+  const unscored = score ? null : unscoredNotice({ pkg: { ...pkg, versions: rows }, version });
   const unscorable = unscored?.kind === "unscorable";
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
@@ -768,7 +848,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
         </div>
         {!isLatest && pkg.latest && (
           <p className="text-sm text-muted-foreground">
-            An older version.{" "}
+            {extra ? `An older version, not among the newest ${pkg.versions.length} listed below.` : "An older version."}{" "}
             <Link href={packagePath(pkg.name)} className="text-foreground underline-offset-4 hover:underline">
               Show the latest, {pkg.latest}
             </Link>

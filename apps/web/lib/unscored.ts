@@ -16,7 +16,10 @@ const unscorableText = (reason: string): string => `${reason}. ${UNSCORABLE_INST
  * The notice for the shown version: the package answer's `unscored` for latest, the version row's `unscorable` for an
  * older one. A registry from before these fields sends neither, and gets the old wording.
  */
-export function unscoredNotice(input: { pkg: Pick<PackageInfo, "unscored" | "versions" | "latest">; version: string | null }): UnscoredNotice {
+export function unscoredNotice(input: {
+  pkg: Pick<PackageInfo, "unscored" | "latest"> & { versions: readonly { version: string; unscorable?: string | null }[] };
+  version: string | null;
+}): UnscoredNotice {
   const { pkg, version } = input;
   const isLatest = version === pkg.latest;
 
