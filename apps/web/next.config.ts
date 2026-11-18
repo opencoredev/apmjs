@@ -18,7 +18,10 @@ const nextConfig: NextConfig = {
       ...NOINDEX.map((source) => ({ source, headers: [{ key: "X-Robots-Tag", value: "noindex, nofollow" }] })),
     ];
   },
-  /* config options here */
+  // The status page lives on its own host; people still type apmjs.dev/status.
+  async redirects() {
+    return [{ source: "/status", destination: "https://status.apmjs.dev", permanent: false }];
+  },
   // @apm/core ships TypeScript source; lib/server-errors.ts imports its error reporter
   transpilePackages: ["@apm/core"],
   cacheComponents: true,

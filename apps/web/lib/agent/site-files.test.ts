@@ -148,6 +148,14 @@ describe("SEO helpers", () => {
     expect(m.twitter).toMatchObject({ card: "summary_large_image" });
   });
 
+  test("package description reads as a sentence, scored or not", () => {
+    const scored = packageMetadata({ name: "react", description: "UI library.", latest: "19.3.1", score: { score: 100, grade: "A" } });
+    const unscored = packageMetadata({ name: "fresh", description: "", latest: "1.0.0", score: null });
+
+    expect(String(scored.description)).toStartWith("UI library. react 19.3.1 has an apm security score of 100/100 (grade A).");
+    expect(String(unscored.description)).toStartWith("fresh 1.0.0 is not scored by apm yet.");
+  });
+
   test("clip cuts at a word and adds an ellipsis", () => {
     expect(clip("short")).toBe("short");
     expect(clip("one two three four five six", 16)).toBe("one two three…");

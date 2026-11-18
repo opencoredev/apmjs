@@ -9,6 +9,7 @@ import { cn } from "cn";
 import { ScoreBadge, StatusBadge } from "@/components/score-badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { PackageInfo } from "@/lib/registry";
+import { showAllLabel } from "@/lib/version-count";
 
 /** A version row with its age already worded on the server, so hydration matches. */
 export type VersionRow = PackageInfo["versions"][number] & { when: string };
@@ -72,7 +73,7 @@ export function VersionList({ rows, packageHref, current }: { rows: VersionRow[]
             !hiddenWide && "lg:hidden",
           )}
         >
-          {open ? "Show fewer versions" : `Show all ${rows.length} versions`}
+          {open ? "Show fewer versions" : showAllLabel(rows.length)}
           <ChevronDownIcon className={cn("size-4 text-muted-foreground transition-transform", open && "rotate-180")} aria-hidden />
         </button>
       )}

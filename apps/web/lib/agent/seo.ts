@@ -43,6 +43,7 @@ export type PackageMeta = { name: string; description: string; latest: string | 
 
 export function packageMetadata(p: PackageMeta): Metadata {
   const scoreText = p.score ? `apm security score ${p.score.score}/100 (grade ${p.score.grade})` : "not scored by apm yet";
+  const verdict = p.score ? `has an apm security score of ${p.score.score}/100 (grade ${p.score.grade})` : `is ${scoreText}`;
   const title = `${p.name}${p.latest ? ` ${p.latest}` : ""}: ${p.score ? `score ${p.score.score}/100 (${p.score.grade})` : "security score"} · apm`;
   const short = p.description ? clip(p.description, 90) : "";
   const lead = short === "" ? "" : /[.!?…]$/.test(short) ? `${short} ` : `${short}. `;
@@ -50,7 +51,7 @@ export function packageMetadata(p: PackageMeta): Metadata {
   return {
     ...pageMetadata({
       title,
-      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} is ${scoreText}. See every risk signal with its cited line, the AI review and how to install it.`,
+      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and how to install it.`,
       path: canonicalPackagePath(p.name),
       image: `/og${canonicalPackagePath(p.name).slice("/package".length)}`,
       imageAlt: `${p.name} on apm: ${scoreText}`,

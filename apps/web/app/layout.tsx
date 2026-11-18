@@ -49,7 +49,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-6 text-sm text-muted-foreground sm:px-6">
             <span>
               <LogoMark className="mr-2 inline-block size-4 align-[-3px]" />
-              apm registry demo. Your package manager stays the same.
+              apm scores npm packages and checks them before your package manager installs them.
             </span>
             <span className="flex gap-5">
               <Link href="/compare" className="hover:text-foreground">

@@ -24,6 +24,7 @@ import { headlineKind, ScoreHeadline } from "@/components/score-headline";
 import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
+import { versionCountLabel } from "@/lib/version-count";
 import { REGISTRY } from "@/lib/registry-url";
 import { askedVersion, shownOf } from "@/lib/early-answer";
 import { startPackageReads } from "@/lib/package-reads";
@@ -829,7 +830,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
           </section>
 
           <section aria-labelledby="versions" className="order-8 lg:order-none">
-            <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{pkg.versions.length} total</span>}>
+            <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{versionCountLabel(pkg.versions.length)}</span>}>
               Versions
             </SectionTitle>
             <VersionList rows={pkg.versions.map((v) => ({ ...v, when: ago(v.publishedAt) }))} packageHref={packagePath(pkg.name)} current={version} />
