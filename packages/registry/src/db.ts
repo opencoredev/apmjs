@@ -5,7 +5,7 @@ import type { SqlError } from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import { PgClient } from "@effect/sql-pg";
 import { z } from "zod";
-import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, PREVIOUS_SCORER, reusableAnalysis, SCORER, type Analysis, type EvidenceDismissal } from "@apm/core";
+import { applyDismissals, dependencySpecs, isRegistryDependency, parseAnalysis, PREVIOUS_SCORER, reusableAnalysis, SCORER, type Analysis, type EvidenceDismissal, type NameHistory } from "@apm/core";
 import { createHash, randomBytes } from "node:crypto";
 import { digestLabel, digestOf } from "./digest.ts";
 import { CHALLENGE_MS, CONFIRMATION_MS, FAILURE_WINDOW_MS, GRANT_MS, MAX_FAILURES, isConfirmationId, type ConfirmationId } from "./factors.ts";
@@ -127,8 +127,11 @@ const TextSize = z.object({ octets: z.number().int().min(0), separators: z.numbe
 
 export type TextSize = z.infer<typeof TextSize>;
 
+/** npm's record of an upstream package's name that each of its versions carries (core NameHistory, upstream.ts). */
+const NameHistoryRow = z.object({ first: z.number(), fifth: z.number().nullable() });
+
 /** A version's record as upstream_choices keeps it (migration 0021): its manifest summarized, and no score. */
-const KeptRecord = VersionRow.omit({ score: true });
+const KeptRecord = VersionRow.omit({ score: true }).extend({ history: NameHistoryRow.optional() });
 
 /**
  * What upstream_choices keeps of an upstream package (upstream.ts, chosen): its dist-tags, the versions each choice took,
@@ -301,8 +304,11 @@ export type Unscorable = { readonly reason: z.infer<typeof UnscorableReason>; re
  */
 export type RecordedUnscorable = Unscorable & { readonly digest: string | null };
 
-/** A version as stored; an upstream one also carries why it can never be scored, when that is decided. */
-export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: RecordedUnscorable };
+/**
+ * A version as stored; an upstream one also carries why it can never be scored, when that is decided, and npm's record
+ * of its package's name (`history`, which the score reads: core settleEstablishedName).
+ */
+export type VersionRecord = z.infer<typeof VersionRow> & { unscorable?: RecordedUnscorable; history?: NameHistory };
 
 /**
  * The runs of a version so far, the one starting included, as Store.startAnalysis finds them. `starts` counts every

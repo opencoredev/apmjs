@@ -146,3 +146,36 @@ export function typoConflicts(candidate: string, popular: readonly string[] = PO
 
   return out;
 }
+
+/**
+ * What npm's record of a package says about the age of its name (the upstream packument's version times): when its
+ * first listed version was published, and when its fifth was (null with fewer than five). Times npm did not give
+ * (zero or less) are left out, so a missing time never makes a name look old.
+ */
+export type NameHistory = { first: number; fifth: number | null };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How old a name must be to be established in its own right (isEstablishedName): first published at least two years
+ * ago, with at least five versions published at least a year ago. A typosquat is a new name, and npm's publish times
+ * cannot be backdated, so a look-alike would have had to be published, and kept publishing, years before it is used.
+ * The checked look-alikes popular packages depend on clear it with room (safer-buffer 2018 with 7, querystring 2011
+ * with 5, merge2 2014 with 23, pathe 2021 with 25); npm's placeholder for a removed name has one version.
+ */
+export const ESTABLISHED_NAME = { minAgeMs: 2 * 365 * DAY_MS, minVersions: 5, versionAgeMs: 365 * DAY_MS } as const;
+
+/** A name's history from the publish times of its listed versions (any order), or null when npm gave none. */
+export function nameHistoryOf(publishedAt: Iterable<number>): NameHistory | null {
+  const times = [...publishedAt].filter((t) => Number.isFinite(t) && t > 0).toSorted((a, b) => a - b);
+  const first = times[0];
+
+  if (first === undefined) return null;
+
+  return { first, fifth: times[ESTABLISHED_NAME.minVersions - 1] ?? null };
+}
+
+/** Whether a name npm has this history for is long established at `now` (ESTABLISHED_NAME). */
+export function isEstablishedName(history: NameHistory, now: number): boolean {
+  return now - history.first >= ESTABLISHED_NAME.minAgeMs && history.fifth !== null && now - history.fifth >= ESTABLISHED_NAME.versionAgeMs;
+}

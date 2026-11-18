@@ -135,6 +135,7 @@ export function reportFor(v: VersionRecord, at: number, opts: { ignoreRecent?: b
     deprecated: v.deprecated,
     status: v.status,
     statusReason: v.status_reason,
+    name: v.history ?? null,
   });
 }
 

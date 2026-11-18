@@ -8,7 +8,7 @@ import { entryPoints, targetFiles } from "./entries.ts";
 import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts";
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
-import { typoConflicts } from "./names.ts";
+import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
 import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
 import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
@@ -2417,10 +2417,15 @@ export function gradeOf(score: number): Grade {
   return "F";
 }
 
-export type VersionState = { publishedAt: number; now: number; deprecated: string | null; status: "active" | "yanked" | "revoke-pending" | "revoked"; statusReason: string | null };
+/**
+ * What a score is worked out with besides the analysis: the version's age and state, and, for an upstream package, npm's
+ * record of its name (settleEstablishedName); null or absent when there is none.
+ */
+export type VersionState = { publishedAt: number; now: number; deprecated: string | null; status: "active" | "yanked" | "revoke-pending" | "revoked"; statusReason: string | null; name?: NameHistory | null };
 
 /** Applies time- and state-based signals and computes the number. */
-export function finalize(analysis: Analysis, state: VersionState): ScoreReport {
+export function finalize(stored: Analysis, state: VersionState): ScoreReport {
+  const analysis = settleEstablishedName(stored, state.name ?? null, state.now);
   const signals = [...analysis.signals];
 
   if (state.now - state.publishedAt < COOLDOWN_MS) {
@@ -2545,7 +2550,121 @@ export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismi
     if (s.confidence === "confirmed" && isCodeSignal(s.id) && fallback.length > 0) signals.push(signal(s.id, fallback, "possible"));
   }
 
-  return { ...analysis, signals, dismissed: [...(analysis.dismissed ?? []), ...dismissed] };
+  return { ...analysis, signals: recombined(signals, settledByDismissal(signals, dismissed)), dismissed: [...(analysis.dismissed ?? []), ...dismissed] };
+}
+
+/**
+ * What a suspicious-combination pairing can rest on that a later step sets aside: a file whose obfuscated evidence was
+ * all dismissed (`file: obfuscated code that also …`), a capture endpoint's line that was dismissed (`file:line: … (a
+ * capture endpoint in a file that starts processes)`), and the look-alike name (`a name like a popular package's that
+ * runs a script at install (…)`), with the install evidence that pairing quotes.
+ */
+type Settled = { obfuscatedFiles: ReadonlySet<string>; captureLines: ReadonlySet<string>; name: { install: readonly string[] } | null };
+
+const OBFUSCATED_PAIRINGS = [": obfuscated code that also uses the network", ": obfuscated code that also starts processes", ": obfuscated code that loads modules by names built at runtime"] as const;
+
+const CAPTURE_PAIRING = " (a capture endpoint in a file that starts processes)";
+
+const NAME_PAIRING = "a name like a popular package's that runs a script at install (";
+
+/** The pairings whose line starts with fixed words rather than a file: never a file's own pairing. */
+const UNFILED_PAIRINGS = ["runs code built at runtime (", "starts processes at install and ships a compiled program (", NAME_PAIRING] as const;
+
+/** Every piece of evidence a signal keeps, shown or not, and its possible evidence. */
+function keptEvidence(s: Signal): string[] {
+  return [...s.evidence, ...(s.more ?? []), ...(s.fallback ?? [])];
+}
+
+/** Whether a signal still cites `file`: in evidence it keeps, or in the sources it counted and did not keep. */
+function stillCites(s: Signal | undefined, file: string): boolean {
+  return s !== undefined && (keptEvidence(s).some((e) => citedSource(e) === file) || (s.sources ?? []).includes(file));
+}
+
+/**
+ * What the dismissals just applied settle for suspicious-combination: each file whose obfuscated evidence is all gone,
+ * and each capture endpoint line with nothing left at it. A file or line the signal still cites (in any evidence it
+ * keeps, or in the sources of evidence it did not keep) is not settled.
+ */
+function settledByDismissal(signals: readonly Signal[], dismissed: readonly DismissedEvidence[]): Settled {
+  const obfuscated = signals.find((s) => s.id === "obfuscated");
+  const capture = signals.find((s) => s.id === "capture-endpoint");
+
+  // a line is left when the signal keeps evidence at it, or counted evidence it did not keep in that file
+  const captureLeft = (file: string, line: number): boolean =>
+    capture !== undefined && stillCites(capture, file) && (capture.uncounted !== undefined || keptEvidence(capture).some((e) => evidenceAt(e)?.file === file && evidenceAt(e)?.line === line));
+
+  return {
+    obfuscatedFiles: new Set(dismissed.flatMap((d) => (d.signal === "obfuscated" && !stillCites(obfuscated, d.file) ? [d.file] : []))),
+    captureLines: new Set(dismissed.flatMap((d) => (d.signal === "capture-endpoint" && !captureLeft(d.file, d.line) ? [`${d.file}:${d.line}`] : []))),
+    name: null,
+  };
+}
+
+/** A pairing line without the marks factLine may end it with (a text match, a test file), last first. */
+function withoutMarks(line: string): string {
+  const inTest = line.endsWith(IN_TEST_FILE) ? line.slice(0, -IN_TEST_FILE.length) : line;
+
+  return inTest.endsWith(TEXT_MATCH) ? inTest.slice(0, -TEXT_MATCH.length) : inTest;
+}
+
+/**
+ * Whether a pairing line rests only on what `settled` sets aside. Matched exactly against the line assess() writes for
+ * it (a file name or a quoted command cannot make another pairing match): an obfuscated file's pairings by the whole
+ * line, a capture endpoint's by its file and line at the start and its words at the end, the name's by the whole line
+ * with the install evidence it quotes. Anything else stays.
+ */
+function restsOnSettled(line: string, settled: Settled): boolean {
+  if ([...settled.obfuscatedFiles].some((file) => OBFUSCATED_PAIRINGS.some((p) => line === `${file}${p}`))) return true;
+
+  if (settled.name !== null && settled.name.install.some((e) => line === `${NAME_PAIRING}${e})`)) return true;
+
+  if (UNFILED_PAIRINGS.some((p) => line.startsWith(p)) || !withoutMarks(line).endsWith(CAPTURE_PAIRING)) return false;
+  const at = evidenceAt(line);
+
+  return at !== null && line.startsWith(`${at.file}:${at.line}: `) && settled.captureLines.has(`${at.file}:${at.line}`);
+}
+
+/**
+ * suspicious-combination worked out again from the pairings left once `settled` is set aside (a reviewer's dismissal,
+ * an established name): the pairings that rest only on it go, and the points are those of the pairings left, as
+ * assess() prices them; with none left the signal goes. A signal that counted pairings it did not keep is left as it
+ * is, since apm cannot tell what those rest on.
+ */
+function recombined(signals: readonly Signal[], settled: Settled): Signal[] {
+  const combined = signals.find((s) => s.id === "suspicious-combination");
+
+  if (combined === undefined || combined.uncounted !== undefined) return [...signals];
+  const all = [...combined.evidence, ...(combined.more ?? [])];
+  const left = all.filter((line) => !restsOnSettled(line, settled));
+
+  if (left.length === all.length) return [...signals];
+
+  if (left.length === 0) return signals.filter((s) => s !== combined);
+  const again = signal("suspicious-combination", left);
+  again.points = Math.max(COMBINATION_MAX, POINTS["suspicious-combination"] + COMBINATION_MORE * (left.length - 1));
+
+  return signals.map((s) => (s === combined ? again : s));
+}
+
+/**
+ * The analysis with its look-alike name set aside when npm's record shows the name is long established
+ * (names.ts isEstablishedName: first published two years ago or more, five versions a year old or more). A typosquat
+ * is a new name, and npm's publish times cannot be backdated, so one listed that long is a package in its own right,
+ * whatever it resembles: `typosquat` stays listed, at no points, saying when the name was first published, and the
+ * install pairing that rested on the name leaves suspicious-combination. Without a record (a tarball scored on its
+ * own, a package published here, a record from before this) or for a younger name, nothing changes. Worked out when
+ * the score is (finalize), so no stored analysis needs to be read again.
+ */
+export function settleEstablishedName(analysis: Analysis, history: NameHistory | null, now: number): Analysis {
+  const name = analysis.signals.find((s) => s.id === "typosquat");
+
+  if (name === undefined || name.points >= 0 || history === null || !isEstablishedName(history, now)) return analysis;
+  const since = new Date(history.first).toISOString().slice(0, 10);
+  const kept: Signal = { ...name, label: `${name.label}, but it is an established name (on npm since ${since}), so it costs nothing`, points: 0 };
+  const signals = analysis.signals.map((s) => (s === name ? kept : s));
+  const install = analysis.signals.find((s) => s.id === "install-script");
+
+  return { ...analysis, signals: recombined(signals, { obfuscatedFiles: new Set(), captureLines: new Set(), name: { install: install ? keptEvidence(install) : [] } }) };
 }
 
 /** A stored analysis (v1 or v2), or null when the value is not one. */

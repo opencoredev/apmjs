@@ -106,6 +106,8 @@ export const KeptPackage = z.object({
   etag: z.string().nullable(),
   /** In publish order. */
   versions: z.array(KeptVersion),
+  /** npm's record of the name, from every version it lists (upstream.ts); absent in a summary kept before this. */
+  history: z.object({ first: z.number(), fifth: z.number().nullable() }).optional(),
 });
 
 export type KeptPackage = z.infer<typeof KeptPackage>;
@@ -122,6 +124,8 @@ export function summarize(pkg: SummarySource): KeptPackage | null {
   const tagged = new Set(Object.values(pkg.distTags));
   const kept = all.filter((v) => cut === null || v.published_at >= cut || byNumber.has(v.version) || tagged.has(v.version));
   const latest = all.find((v) => v.version === pkg.distTags.latest);
+  // every version carries the same record of the name, made from all of them, kept or not
+  const history = all[0]?.history;
 
   const summary: KeptPackage = {
     name: pkg.name,
@@ -144,6 +148,8 @@ export function summarize(pkg: SummarySource): KeptPackage | null {
     })),
   };
 
+  if (history) summary.history = history;
+
   // bytes, not string length: a character outside ASCII is up to 3 bytes in UTF-8, and Postgres stores bytes
   return new TextEncoder().encode(JSON.stringify(summary)).byteLength > KEPT_PACKAGE_MAX_BYTES ? null : summary;
 }
@@ -160,8 +166,10 @@ function latestManifest(links: z.infer<typeof LatestLinks>): VersionRecord["mani
 export function expand(kept: KeptPackage): CachedPackage {
   const versions = kept.versions.map((v): Omit<VersionRecord, "score"> => {
     const digest = digestOf(v);
+    const history = kept.history ? { history: kept.history } : {};
 
     return {
+      ...history,
       package: kept.name,
       version: v.version,
       manifest: v.version === kept.distTags.latest ? latestManifest(kept.latest) : {},

@@ -2,6 +2,7 @@
 // and rewritten so tarballs flow through apm, where they are verified, cached in R2 and scored.
 import { Context, Duration, Effect, Exit, Layer, Option } from "effect";
 import { z } from "zod";
+import { nameHistoryOf } from "@apm/core";
 import { Blobs, type BlobBody } from "./blobs.ts";
 import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
@@ -195,6 +196,16 @@ function isTransientStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
+/**
+ * Answers for the tarball of a version the packument lists that may succeed when asked again: the transient ones, and
+ * 404, which npm's CDN answers for a while right after a publish (@firebase/analytics 0.10.26 was stored unscorable
+ * for it on its first day, and npm served it later). An analysis still gives up on a tarball that keeps failing after
+ * MAX_FETCH_FAILURES runs over FETCH_GIVE_UP_MS (analysis.ts), so a tarball npm lost for good ends unavailable as before.
+ */
+export function isRetryableTarballStatus(status: number): boolean {
+  return isTransientStatus(status) || status === 404;
+}
+
 export type UpstreamAdvisories = { kind: "ok"; advisories: Record<string, unknown[]> } | { kind: "unavailable" };
 
 /** npm serves packuments from registry.npmjs.org and tarballs from the same host. */
@@ -258,8 +269,10 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
     });
   }
 
-  // npm has no insert order: an upstream version's seq is its place in publish order
-  const ordered = versions.toSorted((a, b) => a.published_at - b.published_at).map((v, seq) => ({ ...v, seq }));
+  // npm has no insert order: an upstream version's seq is its place in publish order. Each carries npm's record of the
+  // name (its versions' publish times), which the score reads (core settleEstablishedName)
+  const history = nameHistoryOf(versions.map((v) => v.published_at));
+  const ordered = versions.toSorted((a, b) => a.published_at - b.published_at).map((v, seq) => (history === null ? { ...v, seq } : { ...v, seq, history }));
 
   return {
     name,
@@ -930,7 +943,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               await res.body?.cancel();
               release();
 
-              return { kind: "unavailable", reason: `the upstream answered ${res.status}`, retryable: isTransientStatus(res.status) };
+              return { kind: "unavailable", reason: `the upstream answered ${res.status}`, retryable: isRetryableTarballStatus(res.status) };
             }
 
             return { kind: "ok", res, release };

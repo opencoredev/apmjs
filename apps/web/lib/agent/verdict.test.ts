@@ -5,10 +5,10 @@ import { z } from "zod";
 import cases from "../../../../tests/fixtures/explain-verdicts.json";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { satisfies } from "../../../../packages/registry/src/semver";
-import { explainFor, MAX_OLDER_LOOKUPS, olderRange, parsePackageSpec } from "./explain";
+import { newestFirst, satisfies } from "../../../../packages/registry/src/semver";
+import { belowFreshRun, COOLDOWN_MS, explainFor, MAX_OLDER_LOOKUPS, olderRange, parsePackageSpec } from "./explain";
 import { CoverageField, parseResolve, type ResolveOutcome } from "./source";
-import { fakeSource, NETWORK, REVIEW_CLEAN, signal } from "./testing";
+import { fakeSource, NETWORK, pkg, REVIEW_CLEAN, signal } from "./testing";
 import { ReviewAnswer } from "../review-schema";
 import { AI_REVIEW_COVERAGE, AS_VERSION, DEPENDENCY_COVERAGE, ESTABLISHED_DEPENDENCY_NAMES, explainInstall, GAP_SIGNALS, isRisky, LEGACY_RISK_SIGNALS, NOTE_KINDS, reviewInput, readingOf, RISK_SIGNALS, riskSignalsOf, VERDICTS, verdictText, type OlderSearch, type ReviewInput } from "./verdict";
 
@@ -401,7 +401,7 @@ describe("an older version past the cooldown", () => {
     const source = fakeSource({ resolve: (_n, range) => (range === "latest" ? fresh("4.13.19") : range === "<4.13.19" ? ok(100, { version: "4.13.18" }) : { kind: "missing", reason: "no" }), reviews: { "hono@4.13.18": REVIEW_CLEAN } });
     const v = await explainFor({ name: "hono", range: null, source });
 
-    expect(source.calls).toEqual(["resolve hono@latest", "resolve hono@<4.13.19", "review hono@4.13.18"]);
+    expect(source.calls).toEqual(["resolve hono@latest", "package hono", "resolve hono@<4.13.19", "review hono@4.13.18"]);
     expect(v.verdict).toBe("install");
     expect(v.version).toBe("4.13.18");
     expect(v.commands?.npm).toBe("npm install hono@4.13.18");
@@ -414,7 +414,7 @@ describe("an older version past the cooldown", () => {
     const source = fakeSource({ resolve: (_n, range) => (range === "^4" ? fresh("4.2.0") : ok(100, { version: "4.1.9" })), reviews: { "hono@4.1.9": REVIEW_CLEAN } });
     const v = await explainFor({ name: "hono", range: "^4", source });
 
-    expect(source.calls[1]).toBe("resolve hono@^4 <4.2.0");
+    expect(source.calls[2]).toBe("resolve hono@^4 <4.2.0");
     expect(v.version).toBe("4.1.9");
   });
 
@@ -436,6 +436,56 @@ describe("an older version past the cooldown", () => {
     expect(v.verdict).toBe("review-first");
     expect(v.version).toBe("1.0.9");
     expect(v.summary).toContain(`it and the ${MAX_OLDER_LOOKUPS} versions before it in range were all published inside apm's 24-hour cooldown`);
+  });
+
+  // launch audit 2026-11-18: ai, openai and electron-to-chromium publish several versions a day, and stepping back one
+  // version a lookup gave up after three with an older version past the cooldown in range
+  const NOW = Date.UTC(2026, 10, 18, 17);
+  const HOUR = 60 * 60 * 1000;
+  const listed = (hoursAgo: Record<string, number>) => Object.entries(hoursAgo).map(([version, h]) => ({ version, publishedAt: new Date(NOW - h * HOUR).toISOString(), publishedBy: "a", status: "active", statusReason: null, deprecated: null, score: 100, grade: "A" }));
+
+  test("a burst of releases inside the cooldown: one lookup below the whole run finds the version past it", async () => {
+    // ai@7.0.176: 7.0.174 to 7.0.176 inside the cooldown, 7.0.173 115 hours old
+    const versions = listed({ "7.0.176": 2, "7.0.175": 9, "7.0.174": 20, "7.0.173": 115, "7.0.172": 200 });
+    const all = versions.map((v) => v.version);
+    const ages = new Map(versions.map((v) => [v.version, Date.parse(v.publishedAt)]));
+
+    const source = fakeSource({
+      packages: { ai: pkg({ name: "ai", latest: "7.0.176", versions }) },
+      resolve: (_n, range) => {
+        const v = range === "latest" ? "7.0.176" : all.filter((x) => satisfies(x, range)).toSorted(newestFirst)[0];
+
+        if (v === undefined) return { kind: "refused", reason: "none", newest: null, skipped: [], confirmed: [] };
+
+        return NOW - (ages.get(v) ?? 0) < COOLDOWN_MS ? fresh(v) : ok(100, { version: v });
+      },
+      reviews: { "ai@7.0.173": REVIEW_CLEAN },
+    });
+
+    const v = await explainFor({ name: "ai", range: null, source });
+
+    expect(source.calls).toEqual(["resolve ai@latest", "package ai", "resolve ai@<7.0.174", "review ai@7.0.173"]);
+    expect(v.verdict).toBe("install");
+    expect(v.version).toBe("7.0.173");
+  });
+
+  test("belowFreshRun: the lowest fresh version under the pick by number, stopping at the first one past the cooldown", () => {
+    const versions = listed({ "2.0.0": 1, "2.0.0-rc.2": 3, "1.10.0": 5, "1.9.1": 6, "1.9.0": 30, "1.2.0": 2 });
+
+    expect(belowFreshRun({ version: "2.0.0", listed: versions, now: NOW })).toBe("1.9.1");
+    // a version the list does not have: ask below it, as before
+    expect(belowFreshRun({ version: "3.0.0", listed: versions, now: NOW })).toBe("3.0.0");
+    // a time the list does not give stops the run
+    expect(belowFreshRun({ version: "2.0.0", listed: [...versions.filter((x) => x.version !== "1.10.0"), { ...versions[0], version: "1.10.0", publishedAt: "" }].map((x) => ({ version: x.version, publishedAt: x.publishedAt })), now: NOW })).toBe("2.0.0-rc.2");
+    // its order is semver's, as the registry's
+    const numbers = ["1.0.0", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "0.9.10", "0.10.0", "10.0.0"];
+    const run = (top: string, old: string | null = null) => belowFreshRun({ version: top, listed: numbers.map((version) => ({ version, publishedAt: new Date(version === old ? NOW - 2 * COOLDOWN_MS : NOW).toISOString() })), now: NOW });
+
+    expect([...numbers].toSorted(newestFirst).at(-1)).toBe("0.9.10");
+    expect(run("10.0.0")).toBe("0.9.10");
+    // 1.0.0 > rc.1 > beta.11 > beta.2 > alpha.beta: the run stops above the one past the cooldown
+    expect(run("1.0.0", "1.0.0-alpha.beta")).toBe("1.0.0-beta.2");
+    expect(run("1.0.0", "1.0.0-beta.2")).toBe("1.0.0-beta.11");
   });
 
   test("an older lookup the registry does not answer is unknown, never the fresh version as an install", async () => {
