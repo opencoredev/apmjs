@@ -13,7 +13,7 @@ import { z } from "zod";
 import { Client } from "pg";
 import { SCORER } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Analysis, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, QUEUE_SEND_TIMEOUT_MS, MAX_FETCH_FAILURES, RECOVER_ACCEPTED_SHARE, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
+import { Analysis, BACKGROUND_PER_SWEEP, FETCH_GIVE_UP_MS, WORKER_CPU_MS, MAX_FAILED_RUNS, QUEUE_SEND_TIMEOUT_MS, MAX_FETCH_FAILURES, RECOVER_ACCEPTED_SHARE, RECOVER_PER_SWEEP, REQUEUE_AFTER_MS, RUN_WINDOW_MS, type AnalysisJob, type AnalysisQueue, type JobOutcome } from "../src/analysis.ts";
 import { Clock } from "../src/clock.ts";
 import { Store, type VersionRecord } from "../src/db.ts";
 import { StoreError } from "../src/errors.ts";
@@ -889,6 +889,38 @@ describe("a queue send that does not answer is left to the sweep", () => {
 
       expect(await Effect.runPromise(Effect.flatMap(Analysis, (a) => a.enqueue("refused-send", "1.0.0")).pipe(Effect.provide(layerFor({ url: db.url, now: T0, upstream: up.layer, queue })), Effect.scoped))).toBe(false);
       expect(await sql("SELECT 1 FROM analysis_jobs WHERE package = 'refused-send'")).toHaveLength(0);
+    });
+  }, 60_000);
+});
+
+// review of 4ac264b, load: a sweep queued its seeding without a bound. Work nobody waits for is bounded by one room a
+// sweep (BACKGROUND_PER_SWEEP) and sent at once: the delayed trickle that replaced it recorded each delay apart from its
+// claim, so a user's ask in between found the job reserved and sent nothing (review of 8f4ced8, P2). A user's ask is
+// sent at once whatever the sweep queued
+describe("a sweep's background work shares one room, and is sent at once", () => {
+  test("background sends share one room a sweep, none is delayed; a user's ask is sent at once", async () => {
+    await withRig(async (db) => {
+      const up = upstreamStub([]);
+      const q = queueStub();
+      const layer = layerFor({ url: db.url, now: T0, upstream: up.layer, queue: q.queue });
+      const versions = (prefix: string) => Array.from({ length: 30 }, (_, i) => `${prefix}.${i}`);
+
+      const queued = await Effect.runPromise(
+        Effect.gen(function* () {
+          const a = yield* Analysis;
+          const first = yield* a.enqueueBackground("seeded-a", versions("1.0"));
+          const second = yield* a.enqueueBackground("seeded-b", versions("2.0"));
+          const third = yield* a.enqueueBackground("seeded-c", versions("3.0"));
+
+          yield* a.enqueue("asked", "1.0.0");
+
+          return [first, second, third];
+        }).pipe(Effect.provide(layer), Effect.scoped),
+      );
+
+      expect(queued).toEqual([30, BACKGROUND_PER_SWEEP - 30, 0]);
+      expect(q.sent.filter((j) => j.name !== "asked").length).toBe(BACKGROUND_PER_SWEEP);
+      expect(q.sent.filter((j) => j.name === "asked")).toEqual([{ name: "asked", version: "1.0.0" }]);
     });
   }, 60_000);
 });

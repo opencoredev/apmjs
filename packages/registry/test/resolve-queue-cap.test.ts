@@ -129,6 +129,9 @@ function recordingAnalysis(asked: Set<string>) {
             return v;
           }),
         enqueue: (name, version) => Effect.sync(() => (note(name, version), true)),
+        // a page's or a sweep's seeding counts as queued too, should a resolve ever reach it
+        admitSeeds: (name, versions) => Effect.sync(() => (versions.forEach((v) => note(name, v)), versions.length)),
+        enqueueBackground: (name, versions) => Effect.sync(() => (versions.forEach((v) => note(name, v)), versions.length)),
         runJob: () => Effect.succeed<JobOutcome>("missing"),
         recover: Effect.succeed(0),
       });

@@ -5,7 +5,7 @@ import { Cause, Effect, Exit, Layer } from "effect";
 import * as SqlClient from "effect/sql/SqlClient";
 import { z } from "zod";
 import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
-import { matureRevocations, refreshLatestScores } from "./apm.ts";
+import { matureRevocations, refreshLatestScores, seedKeptPackages } from "./apm.ts";
 import { KeptRefresh, refreshKeptPackages, runRefresh } from "./kept-package.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
@@ -14,6 +14,7 @@ import { Blocklist, blockTruth } from "./blocklist.ts";
 import { DatabaseUnavailable, isDatabaseUnavailable } from "./db-health.ts";
 import { reportFailure, type Failure } from "./error-reports.ts";
 import { degradedRoute, isInstallRead, unavailable } from "./degraded.ts";
+import { Seeding, type SeedInput } from "./seeding.ts";
 import { EdgeChecks, FIRST_PUBLISH_HOLD_MS, PublishFence, type AskInput, type AskOutcome } from "./edge-checks.ts";
 import { queueDownload } from "./fast-tarball.ts";
 import { HEALTH_PATH, healthResponse, QUEUE_PROBE_KEY, QueueProbe } from "./health.ts";
@@ -241,7 +242,22 @@ export type RequestServices = Store | Blobs | Clock | RegistryConfig | Analysis 
 export function servicesFor(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: Background = null, controls: TestControls = PRODUCTION) {
   const run = runServices(env, settings, clock, background, controls);
 
-  return background === null || settings.upstreamUrl === null ? run : Layer.mergeAll(run, keptRefresh(env, settings, clock, background, controls), choicesWriter(env, settings, clock, background, controls));
+  return background === null || settings.upstreamUrl === null
+    ? run
+    : Layer.mergeAll(run, keptRefresh(env, settings, clock, background, controls), choicesWriter(env, settings, clock, background, controls), seeding(env, settings, clock, background, controls));
+}
+
+/**
+ * A package page's seeding (seeding.ts), after the answer, on services of its own (the request's connection closes with
+ * the request): the claim under the global bound and its sends (Analysis.admitSeeds), aborted at its deadline.
+ */
+function seeding(env: WorkerEnv, settings: RegistrySettings, clock: Layer.Layer<Clock>, background: (work: Promise<void>) => void, controls: TestControls) {
+  const run = ({ name, versions, signal }: SeedInput): Promise<void> =>
+    Effect.runPromiseExit(Effect.flatMap(Analysis, (a) => a.admitSeeds(name, versions)).pipe(Effect.provide(runServices(env, settings, clock, background, { ...controls, faults: new Set() })), Effect.scoped), { signal }).then((exit) => {
+      if (Exit.isFailure(exit) && !signal.aborted) logFailure("seed-versions", { name }, Cause.pretty(exit.cause));
+    });
+
+  return Seeding.layer({ background, run, now: Date.now });
 }
 
 /** servicesFor without KeptRefresh: what a refresh after the response runs on. */
@@ -657,6 +673,12 @@ const refreshPages = refreshKeptPackages.pipe(
   Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "kept-package-refresh", refreshed: n }))) : Effect.void)),
 );
 
+/** Queues the dist-tagged and recent versions of packages someone looked at (apm.ts, seedKeptPackages). */
+const seedPages = seedKeptPackages.pipe(
+  Effect.tap((n) => (n > 0 ? Effect.sync(() => console.log(JSON.stringify({ level: "info", event: "seed-versions", queued: n }))) : Effect.void)),
+  Effect.catch((e) => Effect.sync(() => logFailure("seed-versions", {}, String(e)))),
+);
+
 /**
  * Works the kept popular-scores answers out again (apm.ts), last: it reads whole packuments, the slowest part. A
  * package refreshPages just read is in the isolate's cache.
@@ -673,7 +695,7 @@ export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.sy
   await sendProbe(env.ANALYSIS_QUEUE);
 
   const exit = await Effect.runPromiseExit(
-    Effect.all([syncBlocklist, matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all([syncBlocklist, matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, seedPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));

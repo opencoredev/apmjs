@@ -389,6 +389,9 @@ const LATEST_SCORE_INSERT_LOCK = 0x617_06d_4c53;
 // Serializes new kept_packages rows the same way (a package's first view after apm scored it).
 const KEPT_PACKAGE_INSERT_LOCK = 0x617_06d_4b50;
 
+/** The advisory lock a page's seeding admissions queue on (admitSeedJobs): "apmSA". */
+const SEED_ADMISSION_LOCK = 0x617_06d_5341;
+
 /** The advisory lock writers of upstream_choices take (writeChoices): one writer at a time, and a busy lock skips the write. */
 export const KEPT_CHOICES_INSERT_LOCK = 0x617_06d_4b43;
 
@@ -630,6 +633,22 @@ export type StoreApi = {
   readonly setUpstreamAnalysis: (input: { name: string; version: string; digest: string; analysis: unknown; at: number }) => Effect.Effect<void, StoreError>;
   /** Records that a version was sent for analysis; false when it was sent less than `staleMs` ago. */
   readonly claimAnalysisJob: (name: string, version: string, now: number, staleMs: number) => Effect.Effect<boolean, StoreError>;
+  /** claimAnalysisJob for several versions of one package in one statement: the versions it claimed now. Never waits on a lock. */
+  readonly claimAnalysisJobs: (input: { name: string; versions: readonly string[]; now: number; staleMs: number }) => Effect.Effect<string[], StoreError>;
+  /**
+   * claimAnalysisJobs for a page's seeding, under one global quota: at most `max` jobs (any package, any caller) claimed
+   * since `since`. Admissions queue behind each other on an advisory lock, each counts under a fresh snapshot once it
+   * holds it, and claims only the room left, so concurrent seeds never pass the quota between them (review of 4ac264b,
+   * P2: one claim from 59 reached 67, four at once 91). Demand claims (claimAnalysisJob, claimAnalysisJobs) never take
+   * the lock, so a user's own ask is never held behind seeding; one landing beside an admission can pass the quota by
+   * its own rows, never by a seed's.
+   */
+  readonly admitSeedJobs: (input: { name: string; versions: readonly string[]; now: number; staleMs: number; since: number; max: number }) => Effect.Effect<string[], StoreError>;
+  /**
+   * Up to `limit` kept summaries of packages asked about since `askedSince`, the ones seeded longest ago (or never) first,
+   * each marked seeded at `at` in the same statement (migration 0024), for the cron's seeding (kept-package.ts).
+   */
+  readonly keptPackagesToSeed: (input: { askedSince: number; seededBefore: number; at: number; limit: number }) => Effect.Effect<{ name: string; summary: unknown }[], StoreError>;
   /** Drops the reservation claimAnalysisJob made at `claimedAt` (when the queue refused the job); a newer claim stays. */
   readonly releaseAnalysisJob: (name: string, version: string, claimedAt: number) => Effect.Effect<void, StoreError>;
   /** Records that the current scorer will never score this version, and why. */
@@ -1403,6 +1422,19 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
              WHERE package = ${name}`,
         none,
       ),
+    keptPackagesToSeed: ({ askedSince, seededBefore, at, limit }) =>
+      run(
+        "keptPackagesToSeed",
+        sql`WITH picked AS (
+              SELECT package FROM kept_packages
+              WHERE asked_at >= ${askedSince} AND (seeded_at IS NULL OR seeded_at < ${seededBefore})
+              ORDER BY seeded_at NULLS FIRST, asked_at DESC LIMIT ${limit}
+              FOR UPDATE SKIP LOCKED
+            )
+            UPDATE kept_packages k SET seeded_at = ${at} FROM picked WHERE k.package = picked.package
+            RETURNING k.package AS name, k.summary`,
+        all(z.object({ name: z.string(), summary: z.unknown() })),
+      ),
     keptPackagesToRefresh: ({ askedSince, computedBefore, at, limit }) =>
       run(
         "keptPackagesToRefresh",
@@ -1580,6 +1612,47 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
             RETURNING package`,
         changed,
       ),
+
+    claimAnalysisJobs: ({ name, versions, now, staleMs }) =>
+      versions.length === 0
+        ? Effect.succeed([])
+        : run(
+            "claimAnalysisJobs",
+            sql`INSERT INTO analysis_jobs (package, version, queued_at, scorer)
+                SELECT ${name}, w.version, ${now}, ${SCORER} FROM unnest(${[...new Set(versions)]}::text[]) AS w(version)
+                ON CONFLICT (package, version) DO UPDATE SET queued_at = EXCLUDED.queued_at, scorer = EXCLUDED.scorer
+                WHERE analysis_jobs.queued_at <= ${now - staleMs}
+                RETURNING version`,
+            all(z.object({ version: z.string() })),
+          ).pipe(Effect.map((rows) => rows.map((r) => r.version))),
+
+    admitSeedJobs: ({ name, versions, now, staleMs, since, max }) =>
+      versions.length === 0
+        ? Effect.succeed([])
+        : api.tx(
+            Effect.gen(function* () {
+              // one admission at a time: the lock is held to the end of the transaction, past the insert's commit
+              yield* run("admitSeedJobs: lock", sql`SELECT pg_advisory_xact_lock(${SEED_ADMISSION_LOCK})`, none);
+              // a statement of its own after the lock, so its snapshot sees every admission that held it before
+              const counted = yield* run("admitSeedJobs: count", sql`SELECT count(*) AS n FROM analysis_jobs WHERE queued_at > ${since}`, one(z.object({ n: Int })));
+              const room = Math.max(0, max - (counted?.n ?? max));
+
+              if (room === 0) return [];
+
+              const rows = yield* run(
+                "admitSeedJobs: claim",
+                // the intake count reads analysis_jobs_queued (migration 0014)
+                sql`INSERT INTO analysis_jobs (package, version, queued_at, scorer)
+                    SELECT ${name}, w.version, ${now}, ${SCORER} FROM unnest(${[...new Set(versions)].slice(0, room)}::text[]) AS w(version)
+                    ON CONFLICT (package, version) DO UPDATE SET queued_at = EXCLUDED.queued_at, scorer = EXCLUDED.scorer
+                    WHERE analysis_jobs.queued_at <= ${now - staleMs}
+                    RETURNING version`,
+                all(z.object({ version: z.string() })),
+              );
+
+              return rows.map((r) => r.version);
+            }),
+          ),
 
     releaseAnalysisJob: (name, version, claimedAt) =>
       run("releaseAnalysisJob", sql`DELETE FROM analysis_jobs WHERE package = ${name} AND version = ${version} AND queued_at = ${claimedAt}`, none),

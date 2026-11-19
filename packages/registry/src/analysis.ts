@@ -31,6 +31,8 @@ import { Context, Duration, Effect, Layer } from "effect";
 import { ambiguousPaths, analyze, ArchiveError, failedAnalysis, MAX_ANALYSIS_WORK, Meter, MeterExhausted, parseAnalysis, readTarball, unfinishedAnalysis, type Analysis as Scored, type TarEntry } from "@apm/core";
 import { Clock } from "./clock.ts";
 import { Manifest, Store, type AnalysisStart, type RunHistory, type Unscorable, type VersionRecord } from "./db.ts";
+import { isWithheld } from "./withheld.ts";
+import { SEED_INTAKE_MAX, SEED_INTAKE_WINDOW_MS } from "./seeding.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
 import { digestLabel, digestOf, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
@@ -78,6 +80,15 @@ export const RUN_WINDOW_MS = WORKER_CPU_MS + 2 * 60_000;
 export const RECOVER_PER_SWEEP = 200;
 
 /**
+ * Work a sweep queues that nobody is waiting for (enqueueBackground): the cron's seeding. The queue runs one analysis
+ * at a time; on production (18 Nov, read-only) a run took 1.0 s on average (p99 4.9 s, the longest 17.8 s), and the
+ * queue stored 622 to 1,217 an hour when it had a backlog. So a sweep sends at most BACKGROUND_PER_SWEEP of them, about
+ * a minute of the queue's work, each at once: a delay recorded apart from its claim let a user's ask in between find
+ * the job reserved and send nothing (review of 8f4ced8, P2), and a user's ask is always sent at once.
+ */
+export const BACKGROUND_PER_SWEEP = 48;
+
+/**
  * Of a sweep's RECOVER_PER_SWEEP, the room kept for accepted jobs that never began a run; the rest is for runs that
  * began and never ended. Either kind takes what the other leaves unused.
  */
@@ -118,6 +129,41 @@ export const REQUEUE_AFTER_MS = 10 * 60_000;
  * leaves the job on the queue twice, and the second delivery finds the run taken (startAnalysis) and stores nothing.
  */
 export const QUEUE_SEND_TIMEOUT_MS = 4_000;
+
+/**
+ * Versions published this recently are queued once someone looks at their package, whichever dist-tag names them: a
+ * prerelease line (typescript's daily 7.1.0-dev builds under `next`, next's canaries) is never `latest`, and before
+ * this nothing queued it until someone asked for that exact version, so the package page showed a week of them as
+ * "n/a" (18 Nov 2026).
+ */
+export const RECENT_SEED_MS = 7 * 24 * 60 * 60_000;
+
+/** At most this many versions besides `latest` are queued for one look at a package (versionsToSeed). */
+export const SEED_PER_PACKAGE = 8;
+
+/** A version as versionsToSeed reads it. */
+export type SeedCandidate = Pick<VersionRecord, "version" | "published_at" | "status">;
+
+/**
+ * The versions of an upstream package to queue when someone looks at it, besides `latest` (which ensure queues): each
+ * version a dist-tag names and each published in the last RECENT_SEED_MS, newest first, at most `limit`
+ * (SEED_PER_PACKAGE), and only those not withheld that `done` says have no result yet (a score, or a decision that it
+ * cannot be scored). Pure.
+ */
+export function versionsToSeed<V extends SeedCandidate>(input: { versions: readonly V[]; distTags: Readonly<Record<string, string>>; now: number; done: (v: V) => boolean; limit?: number }): string[] {
+  const tagged = new Set(Object.values(input.distTags));
+  const latest = input.distTags.latest;
+
+  return input.versions
+    .filter((v) => v.version !== latest && (tagged.has(v.version) || v.published_at >= input.now - RECENT_SEED_MS))
+    .filter((v) => !isWithheld(v.status) && !input.done(v))
+    .toSorted((a, b) => b.published_at - a.published_at)
+    .slice(0, input.limit ?? SEED_PER_PACKAGE)
+    .map((v) => v.version);
+}
+
+/** Whether a version as a read carries it has a result: a score (any scorer's the store returned) or an outcome. */
+export const hasResult = (v: Pick<VersionRecord, "score" | "unscorable">): boolean => v.unscorable !== undefined || parseAnalysis(v.score) !== null;
 
 /** What a queue send came to: taken, refused by the queue, or no answer in QUEUE_SEND_TIMEOUT_MS (it may yet land). */
 type SendOutcome = { readonly kind: "sent" } | { readonly kind: "refused"; readonly cause: unknown } | { readonly kind: "unanswered" };
@@ -244,6 +290,17 @@ export type AnalysisApi = {
    */
   readonly enqueue: (name: string, version: string) => Effect.Effect<boolean, StoreError>;
   /**
+   * Several versions of one package queued for a page's seeding, claimed in one statement under the global bound (SEED_INTAKE_MAX in SEED_INTAKE_WINDOW_MS): claims and sends
+   * nothing when the queue took that many jobs lately. How many it sent.
+   */
+  readonly admitSeeds: (name: string, versions: readonly string[]) => Effect.Effect<number, StoreError>;
+  /**
+   * Several versions of one package queued as work nobody waits for (a sweep's): within this service's
+   * BACKGROUND_PER_SWEEP (the sweep builds this service once), each claimed version sent at once. How many it claimed;
+   * none once the sweep's room is spent.
+   */
+  readonly enqueueBackground: (name: string, versions: readonly string[]) => Effect.Effect<number, StoreError>;
+  /**
    * The consumer's work: fetch, verify, analyze and store one version, or record why it cannot be. The packument is
    * read under the run's lease (RequestMemory).
    */
@@ -254,7 +311,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
   /** No upstream, nothing to score: local versions are scored when they are published. */
   static readonly none = Layer.succeed(
     Analysis,
-    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.succeed(true), runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
+    Analysis.of({ ensure: (_pkg, v) => Effect.succeed(v), enqueue: () => Effect.succeed(true), admitSeeds: () => Effect.succeed(0), enqueueBackground: () => Effect.succeed(0), runJob: () => Effect.succeed<JobOutcome>("missing"), recover: Effect.succeed(0) }),
   );
 
   /** `queue`: the analysis queue's producer, or null for a registry with none. */
@@ -268,19 +325,14 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
         const timeAnalysis = timed(yield* timingOrNull, "analysis");
 
         /**
-         * Queues a version unless it was queued less than REQUEUE_AFTER_MS ago. True when it is on the queue now. With no
-         * queue the job is recorded all the same (analysis_jobs), and the cron sweep runs it once REQUEUE_AFTER_MS pass.
+         * Sends a job this request claimed (claimAnalysisJob) at `claimedAt`. True when it is on the queue now. A refusal
+         * drops the reservation, so the next request queues it again; no answer keeps it, for the sweep.
          */
-        const enqueue = (name: string, version: string): Effect.Effect<boolean, StoreError> =>
+        const send = (q: AnalysisQueue, name: string, version: string, claimedAt: number): Effect.Effect<boolean, StoreError> =>
           Effect.gen(function* () {
-            const now = yield* clock.now;
-            const claimed = yield* store.claimAnalysisJob(name, version, now, REQUEUE_AFTER_MS);
-
-            // claimed by an earlier request, whose job is on the queue
-            if (!claimed || queue === null) return true;
             const job: AnalysisJob = { name, version };
 
-            const sent = yield* Effect.tryPromise({ try: () => queue.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
+            const sent = yield* Effect.tryPromise({ try: () => q.send(job), catch: (cause) => new QueueError({ operation: "send", cause }) }).pipe(
               Effect.as<SendOutcome>({ kind: "sent" }),
               Effect.catchTag("QueueError", (e) => Effect.succeed<SendOutcome>({ kind: "refused", cause: e.cause })),
               Effect.timeoutOrElse({ duration: Duration.millis(QUEUE_SEND_TIMEOUT_MS), orElse: () => Effect.succeed<SendOutcome>({ kind: "unanswered" }) }),
@@ -292,7 +344,7 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               // the queue said no: the job is not on it, so its reservation goes and the next request queues it again
               case "refused":
                 yield* Effect.logWarning("analysis queue send refused", { name, version, cause: String(sent.cause) });
-                yield* store.releaseAnalysisJob(name, version, now);
+                yield* store.releaseAnalysisJob(name, version, claimedAt);
 
                 return false;
               // no answer: the job may be on the queue or not, so the reservation stays and the sweep sends it again
@@ -307,6 +359,50 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
                 return _exhaustive;
               }
             }
+          });
+
+        /**
+         * Queues a version unless it was queued less than REQUEUE_AFTER_MS ago. True when it is on the queue now. With no
+         * queue the job is recorded all the same (analysis_jobs), and the cron sweep runs it once REQUEUE_AFTER_MS pass.
+         */
+        const enqueue = (name: string, version: string): Effect.Effect<boolean, StoreError> =>
+          Effect.gen(function* () {
+            const now = yield* clock.now;
+            const claimed = yield* store.claimAnalysisJob(name, version, now, REQUEUE_AFTER_MS);
+
+            // claimed by an earlier request, whose job is on the queue
+            if (!claimed || queue === null) return true;
+
+            return yield* send(queue, name, version, now);
+          });
+
+        // how many background jobs this sweep has queued
+        let background = 0;
+
+        const enqueueBackground = (name: string, versions: readonly string[]): Effect.Effect<number, StoreError> =>
+          Effect.gen(function* () {
+            const room = Math.max(0, BACKGROUND_PER_SWEEP - background);
+
+            if (room === 0 || versions.length === 0) return 0;
+            const now = yield* clock.now;
+            const claimed = yield* store.claimAnalysisJobs({ name, versions: [...new Set(versions)].slice(0, room), now, staleMs: REQUEUE_AFTER_MS });
+
+            background += claimed.length;
+
+            if (queue !== null) yield* Effect.forEach(claimed, (version) => send(queue, name, version, now), { concurrency: "unbounded" });
+
+            return claimed.length;
+          });
+
+        const admitSeeds = (name: string, versions: readonly string[]): Effect.Effect<number, StoreError> =>
+          Effect.gen(function* () {
+            const now = yield* clock.now;
+            const claimed = yield* store.admitSeedJobs({ name, versions: versions.slice(0, SEED_PER_PACKAGE), now, staleMs: REQUEUE_AFTER_MS, since: now - SEED_INTAKE_WINDOW_MS, max: SEED_INTAKE_MAX });
+
+            if (queue === null) return claimed.length;
+            const sent = yield* Effect.forEach(claimed, (version) => send(queue, name, version, now), { concurrency: "unbounded" });
+
+            return sent.filter(Boolean).length;
           });
 
         // bound to the tarball the packument names for the version: the bytes this run fetched, or would have
@@ -602,6 +698,8 @@ export class Analysis extends Context.Service<Analysis, AnalysisApi>()("@apm/reg
               return v;
             }),
           enqueue,
+          admitSeeds,
+          enqueueBackground,
           runJob,
         };
 

@@ -204,6 +204,8 @@ const analysis = Layer.succeed(
 
       return !refuseQueue;
     }),
+    admitSeeds: () => Effect.succeed(0),
+    enqueueBackground: () => Effect.succeed(0),
     runJob: () => Effect.succeed<JobOutcome>("missing"),
     recover: Effect.succeed(0),
   }),

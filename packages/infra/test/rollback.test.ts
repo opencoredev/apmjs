@@ -209,8 +209,9 @@ describe("migration markers", () => {
     const ids = files.map((m) => m.id);
 
     expect(unsafeMigrations(ids)).toEqual(files.filter((m) => !isRollbackSafe(m.sql)).map((m) => m.id));
-    // the first migrations predate the marker and stay unsafe; a marked one (0028) is not
+    // the first migrations predate the marker and stay unsafe; a marked one (0024, 0028) is not
     expect(unsafeMigrations(["0001_registry"])).toEqual(["0001_registry"]);
+    expect(unsafeMigrations(["0024_seeding"])).toEqual([]);
     expect(unsafeMigrations(["0028_ai_review_switch"])).toEqual([]);
     expect(unsafeMigrations(["9999_unknown"])).toEqual(["9999_unknown"]);
   });
@@ -551,6 +552,8 @@ describe("the schema check", () => {
     deployments.set("apmjs-registry-production", [dep("r9", "rv3", "2026-11-17T00:00:00Z"), dep("r8", "rv1", "2026-11-16T23:00:00Z"), ...(deployments.get("apmjs-registry-production") ?? [])]);
 
     expect(await check("rv1")).toEqual({ kind: "unsafe", ids: [NEWEST] });
+    // production's build before this one has 0026 and 0028 and not 0024, which sorts below them: it can be gone back to
+    expect(await migrationCheck({ manifests: [{ version: "rv-before-0024", migrations: ALL.filter((id) => id !== "0024_seeding") }], ledger: () => ledgerOf(db.url) })).toEqual({ kind: "ok", extra: ["0024_seeding"] });
   });
 
   test("an applied migration outside the manifest is checked wherever it sorts: one added later with a lower number is refused", async () => {

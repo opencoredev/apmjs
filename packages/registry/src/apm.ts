@@ -55,7 +55,8 @@ import {
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
-import { Analysis, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
+import { Analysis, hasResult, SEED_PER_PACKAGE, versionsToSeed, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
+import { Seeding } from "./seeding.ts";
 import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
@@ -95,7 +96,7 @@ import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarnin
 import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
 import { timed as timedOf, timingOrNull } from "./timing.ts";
-import { pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
+import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
 import { installStamp, scoredPackage, Upstream, type ChosenAnswer, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
@@ -485,6 +486,21 @@ const lookupOrUnknown = (name: string, lease: Lease) =>
  */
 const ensureAnalyzed = (src: Catalog, v: VersionRecord) =>
   src.kind === "local" || parseAnalysis(v.score) ? Effect.succeed(v) : Effect.flatMap(Analysis, (a) => a.ensure({ name: src.name }, v));
+
+/**
+ * Hands an upstream package's versions besides `latest` that someone looking at it may install (those a dist-tag names
+ * and the recent ones with no result: analysis.ts, versionsToSeed) to be queued after the answer (seeding.ts). Never
+ * waits on the store or the queue: with no seeding here (outside a request) the cron's seeding reaches them.
+ */
+const seedVersions = (src: Extract<Source, { kind: "upstream" }>, at: number) =>
+  Effect.gen(function* () {
+    const seeding = yield* Effect.serviceOption(Seeding);
+
+    if (Option.isNone(seeding)) return;
+    const versions = versionsToSeed({ versions: src.versions, distTags: src.distTags, now: at, done: hasResult });
+
+    if (versions.length > 0) yield* seeding.value.look({ name: src.name, versions });
+  });
 
 // ---------- publish guard ----------
 const INSTALL_KEYS = ["preinstall", "install", "postinstall"] as const;
@@ -1408,6 +1424,9 @@ const packageResponse = (name: string) =>
     const local = src.kind === "local" ? src.pkg : null;
     const latest0 = src.versions.find((v) => v.version === src.distTags.latest) ?? null;
     const latest = latest0 ? yield* ensureAnalyzed(src, latest0) : null;
+
+    // a prerelease line (typescript@next, next@canary) is never latest: its versions are queued with it
+    if (src.kind === "upstream") yield* seedVersions(src, at);
     const latestReport = latest ? reportFor(latest, at) : null;
     const latestFree = latest && latestReport ? sourceFreeReport(latest, latestReport) : null;
     const text = local ? packageTextShown(local, src.versions) : null;
@@ -1562,8 +1581,9 @@ export const LATEST_SCORE_CAPACITY = 1_000;
 type WorkedOut =
   | { kind: "local"; score: LatestScore }
   | { kind: "unanalysed"; score: LatestScore }
-  // `waiting`: the latest version, when the current scorer has no result for it yet (the queue may score it)
-  | { kind: "upstream"; score: LatestScore; waiting: string | null }
+  // `waiting`: the latest version, when the current scorer has no result for it yet (the queue may score it); `seeds`:
+  // the other versions a dist-tag names or published recently with no result yet (analysis.ts, versionsToSeed)
+  | { kind: "upstream"; score: LatestScore; waiting: string | null; seeds: string[] }
   | { kind: "unavailable" };
 
 /**
@@ -1610,7 +1630,7 @@ const workOutLatestScore = (name: string, known: boolean) =>
 
       if (kind === "local") return { kind, score } satisfies WorkedOut;
 
-      return { kind, score, waiting: latest && !r && !latest.unscorable ? latest.version : null } satisfies WorkedOut;
+      return { kind, score, waiting: latest && !r && !latest.unscorable ? latest.version : null, seeds: src?.kind === "upstream" ? versionsToSeed({ versions: src.versions, distTags: src.distTags, now: at, done: hasResult }) : [] } satisfies WorkedOut;
     }),
   );
 
@@ -1670,6 +1690,44 @@ const popularScoresResponse = (url: URL) =>
     return json({ packages });
   });
 
+/** Kept packages (asked about in the last day) the cron seeds a sweep, and versions it queues for them in all. */
+export const SEED_SWEEP_PACKAGES = 12;
+export const SEED_SWEEP_JOBS = 24;
+
+/** How long the cron leaves a package it seeded before it seeds it again. */
+export const SEED_SWEEP_AGAIN_MS = 60 * 60_000;
+
+/**
+ * The cron's seeding, the durable path a page's seeding (seeding.ts) only speeds up: the packages someone looked at in
+ * the last day (kept_packages), seeded longest ago first (migration 0024), each one's dist-tagged and recent versions
+ * with no result yet (versionsToSeed over its kept summary, results read in one statement), SEED_SWEEP_JOBS in all a
+ * sweep, with no global intake bound: this is what reaches the versions a busy queue made the pages skip.
+ * Sent at once as background work, within the sweep's room (analysis.ts, enqueueBackground). Returns how many it queued.
+ */
+export const seedKeptPackages = Effect.gen(function* () {
+  const at = yield* now;
+  const store = yield* Store;
+  const analysis = yield* Analysis;
+  const rows = yield* store.keptPackagesToSeed({ askedSince: at - KEPT_PACKAGE_ASKED_WINDOW_MS, seededBefore: at - SEED_SWEEP_AGAIN_MS, at, limit: SEED_SWEEP_PACKAGES });
+  let room = SEED_SWEEP_JOBS;
+
+  for (const row of rows) {
+    const kept = KeptPackage.safeParse(row.summary);
+
+    if (room <= 0 || !kept.success || kept.data.name !== row.name || (yield* store.getPackage(row.name)) !== null) continue;
+    const { versions, distTags } = expand(kept.data);
+    // every candidate, then the ones with a result (an analysis or an outcome) left out, then the newest that fit
+    const wanted = versionsToSeed({ versions, distTags, now: at, done: () => false, limit: Number.POSITIVE_INFINITY });
+    const decided = yield* store.decidedAnalyses(wanted.map((version) => ({ name: row.name, version })));
+    const picked = versionsToSeed({ versions, distTags, now: at, done: (v) => decided.has(`${row.name} ${v.version}`), limit: Math.min(SEED_PER_PACKAGE, room) });
+
+    if (picked.length === 0) continue;
+    room -= yield* analysis.enqueueBackground(row.name, picked);
+  }
+
+  return SEED_SWEEP_JOBS - room;
+});
+
 /**
  * The cron's part for popular-scores: drops kept answers nobody asked about for a week, then works out again the ones
  * asked about in the last day that are older than LATEST_SCORE_REFRESH_MS, oldest first and one at a time. A name now
@@ -1683,7 +1741,8 @@ export const refreshLatestScores = Effect.gen(function* () {
 
   yield* store.dropLatestScores({ kind: "asked-before", askedBefore: at - LATEST_SCORE_DROP_MS });
   const kept = yield* store.latestScoresToRefresh({ askedSince: at - LATEST_SCORE_ASKED_WINDOW_MS, computedBefore: at - LATEST_SCORE_REFRESH_MS, limit: LATEST_SCORE_REFRESH_LIMIT });
-  // latest versions the current scorer has no result for, queued a few a sweep (LATEST_SCORE_SEED_PER_SWEEP)
+  // latest versions the current scorer has no result for, and the dist-tagged and recent ones besides, queued a few a
+  // sweep (LATEST_SCORE_SEED_PER_SWEEP)
   let seeded = 0;
 
   const refreshed = yield* Effect.forEach(
@@ -1697,11 +1756,12 @@ export const refreshLatestScores = Effect.gen(function* () {
             case "unanalysed":
               return Effect.as(store.refreshLatestScore({ score: w.score, at }), 1);
             case "upstream": {
-              const seed = w.waiting !== null && seeded < LATEST_SCORE_SEED_PER_SWEEP ? w.waiting : null;
+              // latest first, then the versions a dist-tag names or published recently, within the sweep's room
+              const seeds = [...(w.waiting === null ? [] : [w.waiting]), ...w.seeds].slice(0, Math.max(0, LATEST_SCORE_SEED_PER_SWEEP - seeded));
 
-              if (seed !== null) seeded++;
+              seeded += seeds.length;
 
-              return Effect.andThen(seed === null ? Effect.void : analysis.enqueue(before.name, seed), Effect.as(store.refreshLatestScore({ score: keptLatestScore(before, w.score, w.waiting), at }), 1));
+              return Effect.andThen(seeds.length === 0 ? Effect.void : analysis.enqueueBackground(before.name, seeds), Effect.as(store.refreshLatestScore({ score: keptLatestScore(before, w.score, w.waiting), at }), 1));
             }
 
             case "unavailable":
