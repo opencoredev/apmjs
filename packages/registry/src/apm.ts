@@ -97,6 +97,7 @@ import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts
 import { fastTarball } from "./fast-tarball.ts";
 import { timed as timedOf, timingOrNull } from "./timing.ts";
 import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
+import { newestPublishersFirst } from "./publishers.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
 import { installStamp, scoredPackage, Upstream, type ChosenAnswer, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
@@ -970,7 +971,6 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
     }
 
     const previous = existing ? yield* versionsOf(name) : [];
-    const previousPublishers = [...new Set(previous.map((v) => v.published_by))];
     const last = previous[previous.length - 1];
     const prevDeps = last ? new Set(dependencyNames(last.manifest)) : null;
     const addedDependencies = prevDeps ? dependencyNames(tarManifest).filter((d) => !prevDeps.has(d)) : [];
@@ -981,7 +981,7 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
       manifest: tarManifest,
       files,
       publisher: user,
-      previousPublishers,
+      previousPublishers: newestPublishersFirst(previous.map((v) => ({ publisher: v.published_by, at: v.published_at }))),
       riskyDependencies: deps.risky,
       addedDependencies,
       uncheckedDependencies: deps.unchecked,

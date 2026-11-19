@@ -46,6 +46,10 @@ export default {
     const digest = { algo: "sha512", hex: url.searchParams.get("sha512") ?? "" };
     const v = version();
     const pkg = { name: url.searchParams.get("name") ?? "pkg", versions: [v] };
+    // ?ballastMiB=27: live objects held through the run, as the queue run holds the version's packument (next's weighs
+    // 26.6 MiB, walk-memory.test.ts), on either route (until round 10 the held route left it out)
+    const ballast = [];
+    for (let i = 0; i < Number(url.searchParams.get("ballastMiB") ?? 0) * 1024; i++) ballast.push(Array.from({ length: 256 }, (_, k) => k + i));
 
     if (url.pathname === "/stream") {
       const before = [];
@@ -58,10 +62,6 @@ export default {
       const hold = url.searchParams.get("holdMiB");
       const work = url.searchParams.get("work");
       const limits = { ...READ, ...(hold ? { holdBytes: Number(hold) * 1024 * 1024 } : {}), ...(work ? { work: Number(work) } : {}) };
-      // ?ballastMiB=27: live objects held through the run, as the queue run holds the version's packument (next's
-      // weighs 26.6 MiB, walk-memory.test.ts)
-      const ballast = [];
-      for (let i = 0; i < Number(url.searchParams.get("ballastMiB") ?? 0) * 1024; i++) ballast.push(Array.from({ length: 256 }, (_, k) => k + i));
       // a queue job's lease (worker.ts opens one of REQUEST_WEIGHT for each message), from a pool of its own
       const lease = new MemoryPool().request();
       const result = await analyzeStreamedTarball({ pkg, v, digest, open, plan: { maxWork: QUEUE_WORK }, limits, memory: lease });
@@ -76,9 +76,9 @@ export default {
       const before = [await measure(env)];
       const result = analyzeUpstreamTarball(pkg, v, bytes, { maxWork: QUEUE_WORK });
       // the scorer is handed what readTarball gives under its own cap, for a tarball the registry's cap sends to a stream
-      if (result.kind === "stream") return Response.json({ result, before, after: await measure(env) });
+      if (result.kind === "stream") return Response.json({ result, before, after: await measure(env), ballast: ballast.length });
       const after = await measure(env);
-      return Response.json({ result: summary(result), before, after });
+      return Response.json({ result: summary(result), before, after, ballast: ballast.length });
     }
 
     return new Response("not found", { status: 404 });

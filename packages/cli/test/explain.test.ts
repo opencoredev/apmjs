@@ -8,9 +8,9 @@ import { z } from "zod";
 import cases from "../../../tests/fixtures/explain-verdicts.json";
 import { CoverageField, type TreeReviews } from "../src/api.ts";
 import { parseReview } from "../src/agent.ts";
-import { analyze, BENIGN_OMISSIONS as CORE_BENIGN, ESTABLISHED_DEPENDENCY_NAMES as CORE_ESTABLISHED, finalize, GAP_SIGNALS as CORE_GAPS, LEGACY_RISK_SIGNALS as CORE_LEGACY, NAME_RISK_SIGNALS as CORE_NAME, RISK_SIGNALS as CORE_RISKS, SCORER, SIGNAL_IDS } from "@apm/core";
+import { analyze, BENIGN_OMISSIONS as CORE_BENIGN, COVERAGE_SCORERS as CORE_COVERAGE_SCORERS, ESTABLISHED_DEPENDENCY_NAMES as CORE_ESTABLISHED, finalize, GAP_SIGNALS as CORE_GAPS, LEGACY_RISK_SIGNALS as CORE_LEGACY, NAME_RISK_SIGNALS as CORE_NAME, RISK_SIGNALS as CORE_RISKS, SCORER, SIGNAL_IDS } from "@apm/core";
 import { satisfies } from "../../registry/src/semver.ts";
-import { AI_REVIEW_COVERAGE, BENIGN_OMISSIONS, CURRENT_SCORER, DEPENDENCY_COVERAGE, ESTABLISHED_DEPENDENCY_NAMES, EXIT, explain, GAP_SIGNALS, LEGACY_RISK_SIGNALS, NAME_RISK_SIGNALS, NOTE_KINDS, olderRange, RISK_SIGNALS, VERDICTS, type OlderSearch, type ResolvedInput, type ReviewInput } from "../src/explain.ts";
+import { AI_REVIEW_COVERAGE, BENIGN_OMISSIONS, COVERAGE_SCORERS, CURRENT_SCORER, DEPENDENCY_COVERAGE, ESTABLISHED_DEPENDENCY_NAMES, EXIT, explain, GAP_SIGNALS, LEGACY_RISK_SIGNALS, NAME_RISK_SIGNALS, NOTE_KINDS, olderRange, RISK_SIGNALS, VERDICTS, type OlderSearch, type ResolvedInput, type ReviewInput } from "../src/explain.ts";
 
 type TreeReviewsWire = z.input<typeof TreeReviews>;
 
@@ -168,6 +168,7 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
     expect([...ESTABLISHED_DEPENDENCY_NAMES]).toEqual([...CORE_ESTABLISHED]);
     expect([...BENIGN_OMISSIONS]).toEqual([...CORE_BENIGN]);
     expect(CURRENT_SCORER).toBe(SCORER);
+    expect([...COVERAGE_SCORERS]).toEqual([...CORE_COVERAGE_SCORERS]);
   });
 
   // review of abcbb18, P1: 28 copies of the environment were exfiltration, 32 were incomplete only, and the verdict sets

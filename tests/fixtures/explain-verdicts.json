@@ -4703,6 +4703,59 @@
           "The AI review found nothing in the files it read."
         ]
       }
+    },
+    {
+      "name": "a reading stopped for its resources scores 0, its findings kept as evidence: review-first (round 13 review of d594415)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 0,
+        "lost": [
+          {
+            "id": "incomplete",
+            "label": "Analysis incomplete",
+            "points": -100,
+            "evidence": [
+              "lib/tool: apm stopped reading its text at what one reading may hold (8 MiB of results, 16 MiB a list while reading); what it found counts, and the rest of it was not read"
+            ]
+          },
+          {
+            "label": "Reads credential files",
+            "points": -30,
+            "evidence": []
+          }
+        ],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "review-first",
+        "commands": true,
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 0/100 (C)). It passes apm's install policy.",
+        "reasons": [
+          "Analysis incomplete (-100 points).",
+          "apm could not fully analyse it: `lib/tool: apm stopped reading its text at what one reading may hold (8 MiB of results, 16 MiB a list while reading); what it found counts, and the rest of it was not read`."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "notes": []
+      }
     }
   ]
 }

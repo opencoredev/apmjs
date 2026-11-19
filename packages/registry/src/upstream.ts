@@ -15,6 +15,7 @@ import { CACHE_WEIGHT, RequestMemory, type Block, type Lease, type MemoryPool } 
 import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPackument, type PackumentRead } from "./packument-read.ts";
 import { timingOrNull } from "./timing.ts";
 import { verifiedStream } from "./verified-stream.ts";
+import { NO_RECORDED_PUBLISHER } from "./publishers.ts";
 import { ChoicesWriter, choiceHolds, isStrongEtag, KEPT_CHOICES_MAX_AGE_MS, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
 import { Clock } from "./clock.ts";
 import { reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
@@ -260,7 +261,7 @@ export function cachedPackage(name: string, body: KeptPackument, serveCost: Serv
       size: 0,
       tarball_key: digest ? upstreamBlobKey(digest) : "",
       published_at: Date.parse(raw.time[v] ?? "") || 0,
-      published_by: doc._npmUser?.name ?? "upstream",
+      published_by: doc._npmUser?.name ?? NO_RECORDED_PUBLISHER,
       deprecated: typeof doc.deprecated === "string" && doc.deprecated !== "" ? doc.deprecated : null,
       status: "active",
       status_reason: null,

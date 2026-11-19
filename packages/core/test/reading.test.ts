@@ -4,7 +4,7 @@
 // earns. A whole-flow stop is `incomplete`, as it always was, and its evidence names the stop (review of 120efc2:
 // no signal id of its own, so production's parser still reads the report).
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, PREVIOUS_SCORER, readingOf, SCORER, storedAnalysis, unfinishedAnalysis, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { analyze, finalize, parseAnalysis, PREVIOUS_SCORER, readingOf, riskSignalsIn, SCORER, storedAnalysis, unfinishedAnalysis, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
 
 const STATE = { publishedAt: 0, now: 1e13, deprecated: null, status: "active", statusReason: null } as const;
 const MANIFEST = { name: "probe-pkg", version: "1.0.0", main: "index.js", license: "MIT" };
@@ -150,5 +150,35 @@ describe("a whole-flow stop is incomplete, and its evidence names the stop", () 
 
     expect(ids(a)).toEqual(["incomplete"]);
     expect(a.signals[0]?.evidence.some((e) => e.includes("could not finish tracing"))).toBe(false);
+  });
+});
+
+// apm-score-v12 ships in two deploys: first a build that still writes v11 and reads v12, then the build that writes it,
+// so a rollback from the second lands on a build whose parser reads every report it wrote (production-parser.test.ts)
+describe("a report apm-score-v12 writes, read by this build", () => {
+  /** `a` as a v12 registry stores it (as JSON), parsed by this build. */
+  const asV12 = (a: Omit<Analysis, "coverage"> & Partial<Pick<Analysis, "coverage">>): Analysis | null => parseAnalysis(JSON.parse(JSON.stringify({ ...a, scorer: "apm-score-v12" })));
+
+  test("parses, keeps its scorer, and reads its coverage as v12 states it", () => {
+    const partial = asV12(analysisOf(BIG, { maxScannedBytes: 64 }));
+    const complete = asV12(analysisOf({ "index.js": "module.exports = 1;\n" }));
+
+    expect(partial?.scorer).toBe("apm-score-v12");
+    expect(partial === null ? null : readingOf(partial).kind).toBe("partial");
+    expect(partial === null ? null : finalize(partial, STATE).grade).toBe("P");
+    expect(complete === null ? null : readingOf(complete).kind).toBe("complete");
+  });
+
+  test("with no coverage record it is incomplete, as v11's own would be", () => {
+    const { coverage: _coverage, ...rest } = analysisOf({ "index.js": "module.exports = 1;\n" });
+    const parsed = asV12(rest);
+
+    expect(parsed === null ? null : readingOf(parsed)).toEqual({ kind: "incomplete", why: "no-coverage" });
+  });
+
+  test("its risk signals count as risks, and v9's credential-access does not come back for it", () => {
+    const report = { scorer: "apm-score-v12", signals: [{ id: "remote-shell", points: -50 }, { id: "credential-access", points: -20 }] };
+
+    expect(riskSignalsIn(report).map((s) => s.id)).toEqual(["remote-shell"]);
   });
 });

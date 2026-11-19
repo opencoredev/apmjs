@@ -72,8 +72,13 @@ const nameExempt = (of: RiskOf): boolean => of.kind === "dependency" && ESTABLIS
 /** The scorer whose signal ids RISK_SIGNALS names (packages/core SCORER). */
 export const CURRENT_SCORER = "apm-score-v11";
 
-/** The scorers whose signal ids are RISK_SIGNALS': apm-score-v10, which split v9's, and every one since. */
-const SPLIT_SCORERS: readonly string[] = ["apm-score-v10", CURRENT_SCORER];
+/** The scorers whose signal ids are RISK_SIGNALS': apm-score-v10, which split v9's, and every one since (apm-score-v12 before any registry writes it). */
+const SPLIT_SCORERS: readonly string[] = ["apm-score-v10", CURRENT_SCORER, "apm-score-v12"];
+
+/** The scorers that always state coverage and grade a partial reading "P": apm-score-v11 and every one since (packages/core COVERAGE_SCORERS). */
+export const COVERAGE_SCORERS: readonly string[] = [CURRENT_SCORER, "apm-score-v12"];
+
+const statesCoverage = (scorer: string | null): boolean => scorer !== null && COVERAGE_SCORERS.includes(scorer);
 
 /** Signals that say apm did not read or finish everything: every analysis with one holds (packages/core GAP_SIGNALS). */
 export const GAP_SIGNALS = ["incomplete", "unanalyzed-files"] as const;
@@ -121,7 +126,7 @@ export function readingOf(input: { scorer: string | null; signals: readonly { id
   if (input.signals.some((s) => isGap(s.id))) return { kind: "incomplete" };
   const c = input.coverage;
 
-  if (c === null) return input.scorer === CURRENT_SCORER ? { kind: "incomplete" } : { kind: "complete" };
+  if (c === null) return statesCoverage(input.scorer) ? { kind: "incomplete" } : { kind: "complete" };
 
   switch (c.kind) {
     case "complete":
@@ -129,7 +134,7 @@ export function readingOf(input: { scorer: string | null; signals: readonly { id
     case "partial": {
       const benign = c.reasons.length > 0 && c.reasons.every((r) => BENIGN_OMISSIONS.some((b) => b === r));
 
-      return input.scorer === CURRENT_SCORER && benign ? { kind: "partial", omittedFiles: c.omittedFiles, omittedBytes: c.omittedBytes } : { kind: "incomplete" };
+      return statesCoverage(input.scorer) && benign ? { kind: "partial", omittedFiles: c.omittedFiles, omittedBytes: c.omittedBytes } : { kind: "incomplete" };
     }
 
     case "unreadable":

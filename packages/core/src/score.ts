@@ -2,6 +2,7 @@
 // 100 means nothing risky was found. Every deduction is a named signal with evidence.
 // Popularity is deliberately not an input: it is gameable and says nothing about compromise.
 // What the analysis reads and what it cannot catch is written up in docs/SCORE.md.
+import { MAX_SCAN_TEMP_BYTES, withKeepLimit } from "./kept.ts";
 import { z } from "zod";
 import { dependencySpecs, isRegistryDependency } from "./deps.ts";
 import { entryPoints, targetFiles } from "./entries.ts";
@@ -9,12 +10,14 @@ import { boundedManifest, MANIFEST_LIMITS, measureManifest } from "./manifest.ts
 import { MAX_ANALYZED_FILE_BYTES, MAX_SCANNED_BYTES, SKIP_REASONS, type SkippedFile } from "./limits.ts";
 import { charge, chargeText, inPhase, MAX_ANALYSIS_WORK, Meter, MeterExhausted, PHASE_NAMES, withMeter, type Phase } from "./meter.ts";
 import { isEstablishedName, typoConflicts, type NameHistory } from "./names.ts";
-import { commandWords, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind } from "./scripts.ts";
-import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
+import { commandWords, commandWordsWithin, expandHooks, gypCommands, isInlineDownload, otherScripts, type ExpandedHook, type HookKind, type ShellWords } from "./scripts.ts";
+import { importsOf, joinStrings, langOf, scanFile, scanText, type Confidence, type Lang, type ExecutedCode, type FlowFinding, type Hidden, type Imports, type TextFinding } from "./source.ts";
 import { scanTextRules } from "./textrules.ts";
+import { keptBytes, MAX_KEPT_VIEW_BYTES, scanBinaryImports, scanBinaryText, type BinaryTextScan } from "./binary-text.ts";
+import { hasDataMagic, isExecutable, NATIVE_NAME, nativeBefore, readAsTextBefore } from "./executable.ts";
 import { ambiguousPaths, MemoryRefused, type HoldRule, type LookAt, type StreamMemory, type TarEntry } from "./tarball.ts";
 import { CAPABILITY_IDS, declarationOf, matchesPattern, type CapabilityId, type Declaration } from "./declare.ts";
-import { factsOf as readFacts, secretFamily, type Fact } from "./facts.ts";
+import { factsOf as readFacts, RISK_FACT_KINDS, secretFamily, type Fact } from "./facts.ts";
 import { boundOf, PRECISION_BOUNDS, type Bound, type Exports, type Label, type Sink } from "./flow.ts";
 import { CrossFile, MAX_CROSS_FILE_STEPS } from "./xfile.ts";
 
@@ -88,6 +91,12 @@ export type SignalId = (typeof SIGNAL_IDS)[number];
  * writes parses under every apm-score-v11 parser.
  */
 export const SCORER = "apm-score-v11";
+
+/**
+ * Every scorer name a stored analysis may carry. apm-score-v12 is here before any build writes it, so a build that
+ * writes it can be rolled back to this one without its reports failing to parse (production-parser.test.ts).
+ */
+export const PARSED_SCORERS = ["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", "apm-score-v9", "apm-score-v10", SCORER, "apm-score-v12"] as const;
 
 const SignalSchema = z.object({
   id: z.enum(SIGNAL_IDS),
@@ -189,7 +198,7 @@ export const NOT_CHECKED: readonly string[] = [
 ];
 
 const AnalysisSchema = z.object({
-  scorer: z.enum(["apm-score-v1", "apm-score-v2", "apm-score-v3", "apm-score-v4", "apm-score-v5", "apm-score-v6", "apm-score-v7", "apm-score-v8", "apm-score-v9", "apm-score-v10", SCORER]),
+  scorer: z.enum(PARSED_SCORERS),
   signals: z.array(SignalSchema),
   facts: FactsSchema,
   notChecked: z.array(z.string()).default([...NOT_CHECKED]),
@@ -274,7 +283,7 @@ export const ESTABLISHED_DEPENDENCY_NAMES = ["safer-buffer"] as const;
  */
 export function riskSignalsIn(report: { scorer?: string; signals: readonly { id: string; points: number }[] }, of: { kind: "version" } | { kind: "dependency"; name: string } = { kind: "version" }): { id: string; points: number }[] {
   // apm-score-v10 split v9's credential-access, and every scorer since keeps v10's ids
-  const split: readonly string[] = [PREVIOUS_SCORER, SCORER];
+  const split: readonly string[] = ["apm-score-v10", SCORER, "apm-score-v12"];
   const legacy = report.scorer === undefined || !split.includes(report.scorer);
   const exempt = of.kind === "dependency" && ESTABLISHED_DEPENDENCY_NAMES.some((n) => n === of.name);
   const counts = (id: string): boolean => (RISK_SIGNALS.some((r) => r === id) && !(exempt && NAME_RISK_SIGNALS.some((n) => n === id))) || (legacy && LEGACY_RISK_SIGNALS.some((r) => r === id));
@@ -307,18 +316,28 @@ export type Reading =
   | { kind: "partial"; coverage: Extract<Coverage, { kind: "partial" }> }
   | { kind: "incomplete"; why: "signal" | "legacy-gap" | "no-coverage" } | { kind: "incomplete"; why: "coverage"; coverage: Extract<Coverage, { kind: "partial" }> };
 
+/**
+ * The scorers that always state coverage and grade a partial reading "P": apm-score-v11 and every one since. A package
+ * published on apm keeps the analysis made at its publish, so a v11 reading of one keeps reading as v11 wrote it.
+ */
+export const COVERAGE_SCORERS = [SCORER, "apm-score-v12"] as const;
+
+function statesCoverage(scorer: Analysis["scorer"]): boolean {
+  return COVERAGE_SCORERS.some((s) => s === scorer);
+}
+
 export function readingOf(a: Pick<Analysis, "scorer" | "signals" | "coverage">): Reading {
   if (a.signals.some((s) => s.id === "incomplete")) return { kind: "incomplete", why: "signal" };
 
   if (a.signals.some((s) => GAP_SIGNALS.some((g) => g === s.id))) return { kind: "incomplete", why: "legacy-gap" };
   const c = a.coverage;
 
-  if (c === undefined) return a.scorer === SCORER ? { kind: "incomplete", why: "no-coverage" } : { kind: "complete" };
+  if (c === undefined) return statesCoverage(a.scorer) ? { kind: "incomplete", why: "no-coverage" } : { kind: "complete" };
 
   if (c.kind === "complete") return c;
   const benign = c.reasons.length > 0 && c.reasons.every((r) => BENIGN_OMISSIONS.some((b) => b === r));
 
-  return a.scorer === SCORER && benign ? { kind: "partial", coverage: c } : { kind: "incomplete", why: "coverage", coverage: c };
+  return statesCoverage(a.scorer) && benign ? { kind: "partial", coverage: c } : { kind: "incomplete", why: "coverage", coverage: c };
 }
 
 /**
@@ -487,39 +506,54 @@ const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh|bash|ps1|py|cmd|bat)$/i;
  */
 const NOT_CODE = /(?:^|\/)(?:readme|changelog|changes|history|license|licence|copying|authors|contributors|notice|security|code_of_conduct)(?:\.[\w.-]*)?$|\.(?:md|markdown|mdx|txt|rst|adoc|d\.[cm]?ts|map|json|jsonc|json5|ya?ml|toml|css|scss|sass|less|styl|html?|svg|xml|csv|tsv|lock|flow)$/i;
 
-/** Executables and native modules: never read, reported as `binary`. */
+/**
+ * Executables and native modules, listed as `binary` and not read as code: a native name, or an ELF or Mach-O file
+ * whose structure parses (executable.ts). A magic number alone is not enough: `cf fa ed fe`, a newline and shell
+ * commands is a script `sh` runs (review of 1978ee3, P1). A file something runs through an interpreter is read as
+ * source whatever this says (`invokedFiles`). Before apm-score-v12 the magic was joined with `<<` into a signed 32-bit
+ * number, so no Mach-O matched and a 24 MB macOS executable was read as JavaScript until the platform stopped the run.
+ */
 function isBinary(e: TarEntry): boolean {
-  if (/\.(?:node|exe|dll|so|dylib)$/.test(e.path)) return true;
-  const d = e.data;
+  return NATIVE_NAME.test(e.path) || isExecutable(e.data, e.size);
+}
 
-  if (d.length < 4) return false;
-  const magic = ((d[0] ?? 0) << 24) | ((d[1] ?? 0) << 16) | ((d[2] ?? 0) << 8) | (d[3] ?? 0);
+/**
+ * A file node loads as JavaScript (an entry point, a file code requires) that is native code all the same: a `.node`
+ * addon, which node opens as one, or an executable by its structure, which is not JavaScript node could run. Any other
+ * native name (`index.so`) holding JavaScript runs as JavaScript, so it is read.
+ */
+function isNativeEntry(e: TarEntry): boolean {
+  return e.path.endsWith(".node") || isExecutable(e.data, e.size);
+}
 
-  return magic === 0x7f454c46 || magic === 0xcffaedfe || magic === 0xfeedfacf || magic === 0xcafebabe || (d[0] === 0x4d && d[1] === 0x5a && e.path.endsWith(".exe"));
+/**
+ * Files something runs through an interpreter or executes by path: every file a package.json script names (a lifecycle
+ * hook or any other script), and every `bin` target (npm links it, and a shell runs one the kernel will not load as a
+ * script). Each is read as source whatever its bytes, and still listed as native code when it is an executable: an
+ * interpreter reads the bytes as text even when a valid header comes first. Commands found in code add theirs as the
+ * walk finds them (analyze).
+ */
+function invokedFiles(manifest: AnalyzeInput["manifest"], byPath: ReadonlyMap<string, TarEntry>, hooks: readonly ExpandedHook[]): Set<string> {
+  const out = new Set<string>();
+
+  const take = (word: string): void => {
+    const f = resolveIn(byPath, word);
+
+    if (f && f.path !== "package.json") out.add(f.path);
+  };
+
+  const commands = [...hooks.flatMap((h) => h.commands.map((c) => c.text)), ...Object.values(otherScripts(manifest, hooks))];
+
+  for (const c of commands) for (const w of [...scriptTargets(c), ...commandWords(c)]) take(w);
+
+  for (const e of entryPoints(manifest)) if (e.field.startsWith("bin")) take(e.path);
+
+  return out;
 }
 
 /** Images, fonts, archives and WebAssembly, recognised by their first bytes. JavaScript cannot start with these. */
 function isBinaryData(e: TarEntry): boolean {
-  const d = e.data;
-
-  if (d.length < 4) return false;
-  const b = (i: number): number => d[i] ?? -1;
-  const ascii = (s: string, at = 0): boolean => [...s].every((c, i) => b(at + i) === c.charCodeAt(0));
-
-  return (
-    (b(0) === 0x89 && ascii("PNG", 1)) ||
-    (b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) ||
-    ascii("GIF8") ||
-    (ascii("RIFF") && ascii("WEBP", 8)) ||
-    ascii("wOFF") ||
-    ascii("wOF2") ||
-    ascii("OTTO") ||
-    (b(0) === 0 && b(1) === 1 && b(2) === 0 && b(3) === 0) ||
-    (b(0) === 0 && ascii("asm", 1)) ||
-    (b(0) === 0x1f && b(1) === 0x8b) ||
-    (ascii("PK") && b(2) === 3 && b(3) === 4) ||
-    ascii("%PDF")
-  );
+  return hasDataMagic(e.data);
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -642,11 +676,11 @@ function signal(id: SignalId, all: string[], confidence: Confidence = "confirmed
  * hooks (prepare, prepack, postpack) only what a command runs (`runTargets`), since a build's paths are mostly operands
  * (`rimraf ./dist`, `tsc -p ./tsconfig.json`).
  */
-function installRunsOf(commands: readonly { text: string; kind: HookKind }[], byPath: ReadonlyMap<string, TarEntry>): string[] {
+function installRunsOf(commands: readonly { text: string; kind: HookKind }[], byPath: ReadonlyMap<string, TarEntry>, targets: (cmd: string) => string[] = scriptTargetsBefore): string[] {
   const out = new Set<string>();
 
   for (const c of commands) {
-    for (const w of c.kind === "install" ? [...scriptTargets(c.text), ...commandWords(c.text), ...runTargets(c.text)] : runTargets(c.text)) {
+    for (const w of c.kind === "install" ? [...targets(c.text), ...commandWords(c.text), ...runTargets(c.text, targets)] : runTargets(c.text, targets)) {
       const f = resolveIn(byPath, w);
 
       if (f && f.path !== "package.json") out.add(f.path);
@@ -660,8 +694,8 @@ function installRunsOf(commands: readonly { text: string; kind: HookKind }[], by
  * What a command runs: a script after an interpreter (`scriptTargets`), the program a command segment starts with
  * (`./install.sh`, `FOO=1 ./bin/setup`), and modules `node -e`, `--require` and `--import` load.
  */
-export function runTargets(cmd: string): string[] {
-  const out = [...scriptTargets(cmd)];
+export function runTargets(cmd: string, targets: (cmd: string) => string[] = scriptTargets): string[] {
+  const out = [...targets(cmd)];
 
   for (const segment of cmd.split(/[;&|()]+/)) {
     const first = segment.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)+/, "").split(/\s+/)[0] ?? "";
@@ -678,14 +712,46 @@ export function runTargets(cmd: string): string[] {
   return out;
 }
 
-/** Paths an install-script command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`. */
+/**
+ * Paths a command runs after an interpreter, as production (274d284) read them: node, bun, `deno run`, sh, bash, zsh, tsx
+ * and ts-node. Production's walk, its reading plan, its floor and its install roots take a command's scripts from this
+ * alone (round 17 review of b287849, P1: with python3 recognised, `postinstall: python3 lib/loader` put lib/loader
+ * first, its require made the package's own `python3` file JavaScript before it was read, and the facts in its comment
+ * went: 0 (F), review-first, became 87, install). The second layer reads what scriptTargets adds.
+ */
+export function scriptTargetsBefore(cmd: string): string[] {
+  return scriptTargetsBeforeWithin(cmd, Number.POSITIVE_INFINITY).words;
+}
+
+/** scriptTargetsBefore, `max` at most, and cut past that. */
+function scriptTargetsBeforeWithin(cmd: string, max: number): ShellWords {
+  return targetsWithin(cmd, max, /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|tsx|ts-node)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g);
+}
+
+/**
+ * Paths a command runs after an interpreter: `node setup`, `sh ./install.sh`, `bun x.ts`, `python3 x`, `. ./env.sh`. Only
+ * the second layer reads these (scriptTargetsBefore is production's).
+ */
 export function scriptTargets(cmd: string): string[] {
-  const out: string[] = [];
-  const re = /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|tsx|ts-node)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g;
+  return scriptTargetsWithin(cmd, Number.POSITIVE_INFINITY).words;
+}
 
-  for (const m of cmd.matchAll(re)) if (m[1] && !m[1].startsWith("-")) out.push(m[1]);
+/** scriptTargets, `max` at most, and cut past that: what the rest runs is not known (round 13 review of d594415, P2). */
+function scriptTargetsWithin(cmd: string, max: number): ShellWords {
+  return targetsWithin(cmd, max, /(?:^|[;&|]\s*|\s)(?:node|bun|deno run|sh|bash|zsh|dash|ksh|tsx|ts-node|python3?|perl|ruby|source|\.)\s+(?:-[\w-]+\s+)*((?:\.{0,2}\/)?[\w@./-]+)/g);
+}
 
-  return out;
+function targetsWithin(cmd: string, max: number, re: RegExp): ShellWords {
+  const words: string[] = [];
+
+  for (const m of cmd.matchAll(re)) {
+    if (!m[1] || m[1].startsWith("-")) continue;
+
+    if (words.length >= max) return { kind: "cut", words };
+    words.push(m[1]);
+  }
+
+  return { kind: "complete", words };
 }
 
 /**
@@ -741,6 +807,42 @@ function joinPath(dir: string, rel: string): string {
   return parts.join("/");
 }
 
+/**
+ * `rel` from `dir` inside the package, or null when it is absolute or climbs out of the package's folder: a target the
+ * package's own files cannot account for, which a walk that only adds what it reads leaves alone.
+ */
+function insidePackage(dir: string, rel: string): string | null {
+  if (rel.startsWith("/")) return null;
+  const parts = dir ? dir.split("/") : [];
+
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === ".") continue;
+
+    if (seg === "..") {
+      if (parts.length === 0) return null;
+      parts.pop();
+    } else parts.push(seg);
+  }
+
+  return parts.join("/");
+}
+
+/**
+ * Every file a command's `word` may name, run from `from`: beside it, and from the package's folder, where npm runs
+ * scripts (a shell keeps whatever folder it was started in, so both are plausible). Each that exists, once.
+ */
+function candidatesOf(byPath: ReadonlyMap<string, TarEntry>, from: string, word: string): TarEntry[] {
+  const out = new Map<string, TarEntry>();
+
+  for (const p of [insidePackage(dirOf(from), word), insidePackage("", word)]) {
+    const f = p === null ? undefined : resolveIn(byPath, p);
+
+    if (f) out.set(f.path, f);
+  }
+
+  return [...out.values()];
+}
+
 /** The file node would load for `raw`: exact, then each extension it tries, then a directory index. */
 const PROBES = ["", ".js", ".cjs", ".mjs", ".json", ".node", ".ts", ".cts", ".mts", "/index.js", "/index.cjs", "/index.mjs", "/index.json", "/index.node", "/index.ts"];
 
@@ -756,17 +858,29 @@ function resolveIn(byPath: ReadonlyMap<string, TarEntry>, raw: string): TarEntry
   return undefined;
 }
 
-function isShellScript(f: TarEntry, text: string): boolean {
+function isShellScript(f: Pick<TarEntry, "path">, text: string): boolean {
   return /\.(?:sh|bash|zsh|ps1|cmd|bat)$/i.test(f.path) || /^#!.*\b(?:ba|z|da)?sh\b/.test(text) || (!/\.[^/]+$/.test(f.path) && !/^#!.*\b(?:node|bun|deno)\b/.test(text));
 }
 
 export type DependencyRisk = { name: string; version: string; score: number };
+
+/** How many earlier publishers new-publisher's evidence names before saying how many more there are. */
+const PUBLISHERS_NAMED = 5;
+
+/** `names` as new-publisher's evidence lists them: each once, in the order given, the first PUBLISHERS_NAMED by name. */
+function publisherList(names: readonly string[]): string {
+  const unique = [...new Set(names)];
+  const shown = unique.slice(0, PUBLISHERS_NAMED).join(", ");
+
+  return unique.length > PUBLISHERS_NAMED ? `${shown} and ${unique.length - PUBLISHERS_NAMED} more` : shown;
+}
 
 export type AnalyzeInput = {
   name: string;
   manifest: Record<string, unknown>;
   files: readonly TarEntry[];
   publisher: string;
+  /** Every account that published a version of this package before this one, most recent first (new-publisher names the first few). */
   previousPublishers: readonly string[];
   /** Dependencies (resolved) whose own score is below the floor. */
   riskyDependencies?: readonly DependencyRisk[];
@@ -778,6 +892,8 @@ export type AnalyzeInput = {
   maxScannedBytes?: number;
   /** Steps the flow analysis across files may take, carved out of the meter. Defaults to MAX_CROSS_FILE_STEPS. */
   maxCrossFileSteps?: number;
+  /** What binaries' plain views may keep while the walks run (binary-text.ts keptBytes). Defaults to MAX_KEPT_VIEW_BYTES. */
+  maxKeptViewBytes?: number;
   /**
    * The work meter this analysis charges (meter.ts). A caller that unpacked the tarball under it passes it on, so the
    * unpack and the analysis share one bound. Without one, the analysis gets a meter of `maxWork` units.
@@ -796,6 +912,16 @@ export type AnalyzeInput = {
    * past the byte budget, and never reads the head as if it were the file. Empty, or left out, for a tarball read whole.
    */
   notHeld?: ReadonlySet<TarEntry>;
+  /**
+   * Paths of `files` a streamed read holds only for the second layer (planLayers' `extra`): production's walk counts
+   * them not held, as production's plan left them, and only the second layer reads them.
+   */
+  extraHeld?: ReadonlySet<string>;
+  /**
+   * Why a streamed read's plan stopped for its resources where production's went on (FirstPass.stopped): the analysis
+   * is incomplete for it and scores 0, since the files it holds may not be the ones production's plan held.
+   */
+  stoppedBecause?: readonly string[];
   /** What else limited the reading, said in `coverage` when it is partial (a streamed read's cut import graph). */
   coverageNotes?: readonly string[];
 };
@@ -829,11 +955,13 @@ type Found = {
   get: (id: SignalId) => { evidence: string[]; confidence: Confidence; possible: string[] } | undefined;
   /** Every confirmed piece of evidence, with what it rests on. */
   confirmed: (id: SignalId) => { evidence: string; cited: Cited }[];
+  /** A copy to add to, leaving this one as it is (its lists are copied; the evidence strings are shared). */
+  clone: () => Found;
 };
 
-function collector(): Found {
-  const found = new Map<SignalId, { confirmed: string[]; possible: string[]; has: Set<string> }>();
-  const rank = new Map<string, number>();
+function collector(seed?: { found: ReadonlyMap<SignalId, { confirmed: string[]; possible: string[]; has: Set<string> }>; rank: ReadonlyMap<string, number> }): Found {
+  const found = new Map<SignalId, { confirmed: string[]; possible: string[]; has: Set<string> }>([...(seed?.found ?? [])].map(([id, e]) => [id, { confirmed: [...e.confirmed], possible: [...e.possible], has: new Set(e.has) }]));
+  const rank = new Map<string, number>(seed?.rank ?? []);
   // the call or load a parsed program showed comes before a text match, and a text match in code before one in a
   // comment, a regex or a type, so the shown evidence cites the most direct line
 
@@ -870,6 +998,11 @@ function collector(): Found {
       const possible = ranked(entry.possible);
 
       return entry.confirmed.length > 0 ? { evidence: ranked(entry.confirmed), confidence: "confirmed", possible } : { evidence: possible, confidence: "possible", possible: [] };
+    },
+    clone: () => {
+      charge("score", [...found.values()].reduce((n, e) => n + e.confirmed.length + e.possible.length, 0));
+
+      return collector({ found, rank });
     },
   };
 }
@@ -965,6 +1098,12 @@ type V3Walk = {
   /** Called with the text of each file this walk reads that the first walk did not. */
   read: (f: TarEntry, text: string) => void;
   notHeld: ReadonlySet<TarEntry>;
+  /** Files something runs as a script or executes (invokedFiles and code's commands): read whatever their bytes. */
+  invoked: ReadonlySet<string>;
+  /** Files the first walk read whole through their views: read whole, as `readWhole`'s are, and their imports read again by `viewImports`. */
+  viewed: ReadonlySet<TarEntry>;
+  /** The imports of a file the first walk read through its views, read again from its production view. */
+  viewImports: (f: TarEntry) => Imports;
 };
 
 /**
@@ -988,10 +1127,20 @@ const READ_BY_NAME = ["package.json", "binding.gyp", "Makefile", "makefile", "GN
  * reaches (with the parser's own imports, which find the same literal paths), for a reading plan made before the file
  * is held. Charges the installed meter for the text pass.
  */
-export function importPaths(bytes: Uint8Array): string[] {
-  chargeText("text", bytes.length, 3);
+/** A file's paths for a reading plan: production's (v3's pattern), and what a shell script runs, which only the second layer follows. */
+export type PlanPaths = { paths: string[]; shell: ShellWords };
 
-  return importsOf(joinStrings(new TextDecoder().decode(bytes)).text).paths;
+export function importPaths(bytes: Uint8Array, path?: string): PlanPaths {
+  chargeText("text", bytes.length, 3);
+  const text = new TextDecoder().decode(bytes);
+  const paths = importsOf(joinStrings(text).text).paths;
+
+  // a shell script runs what its commands name, sourced files too: the second layer reads those, and its plan holds
+  // them from what production's plan leaves of the budget (planLayers); a walk cut at its bound stops the plan (round 13
+  // review of d594415, P2)
+  if (path === undefined || !isShellScript({ path }, text)) return { paths, shell: { kind: "complete", words: [] } };
+
+  return { paths, shell: shellWords(text) };
 }
 
 /**
@@ -1018,7 +1167,21 @@ const IMPORT_LIST_BYTES = 64;
  * The first pass's rule and its look, the import paths of each file it looked at (which fill as it reads), and whether
  * it stopped keeping them at its allowance: a plan made from a cut graph may miss what the rest load.
  */
-export type FirstPass = { hold: HoldRule; look: LookAt; imports: Map<string, readonly string[]>; readonly importsCut: boolean };
+export type FirstPass = {
+  hold: HoldRule;
+  look: LookAt;
+  /** Production's (274d284) import graph: the paths v3's pattern finds, kept and cut as production's first pass kept them. */
+  imports: Map<string, readonly string[]>;
+  /** What shell scripts run, which only the second layer follows (planLayers), kept apart within the same limits. */
+  shellRuns: Map<string, readonly string[]>;
+  readonly importsCut: boolean;
+  /**
+   * Why the graph stopped for its resources where production's went on (a file's joining past a reading's temporary
+   * budget, a script's words past their bound, what scripts run past the graph's limits), or null: the analysis then
+   * scores 0 (stoppedBecause), since the plan may hold other files than production's did.
+   */
+  readonly stopped: string | null;
+};
 
 /**
  * The first pass of a streamed read. It holds package.json whenever apm reads a manifest that large at all (4 MB of
@@ -1045,6 +1208,10 @@ export function firstPass(limits: FirstPassLimits): FirstPass {
   let chars = 0;
   let edges = 0;
   let cut = false;
+  const shellRuns = new Map<string, readonly string[]>();
+  let shellChars = 0;
+  let shellEdges = 0;
+  let stopped: string | null = null;
 
   const hold: HoldRule = ({ path, size }) => {
     // the manifest the analysis and the plan read: held whenever apm would read it at all, outside the file budget (a
@@ -1073,41 +1240,85 @@ export function firstPass(limits: FirstPassLimits): FirstPass {
   };
 
   const look: LookAt = (file, bytes) => {
-    if (cut || NOT_CODE.test(file.path) || NEVER_RUN.test(file.path) || isBinary({ ...file, data: bytes }) || isBinaryData({ ...file, data: bytes })) return;
+    // production's (274d284) look, exactly: not a doc, type, map or data file, not what it took for native code (a
+    // native name, ELF's magic); a Mach-O, which its check never matched, has its imports read as production's had
+    if (cut || NOT_CODE.test(file.path) || NEVER_RUN.test(file.path) || !readAsTextBefore(file.path, bytes)) return;
     // the decoded text and the joined text it is read from, two bytes a character at most, while it is read
     const reading = 4 * bytes.length;
 
     if (!memory.take(reading)) throw new MemoryRefused(`no memory to read ${file.path}'s imports`);
     let paths: string[];
+    let runs: string[];
 
     try {
-      // a path is copied out of the text it was matched in: V8 keeps a whole file's text alive behind a slice of it
-      paths = importPaths(bytes).map((p) => decoder.decode(encoder.encode(p)));
+      // a path is copied out of the text it was matched in: V8 keeps a whole file's text alive behind a slice of it. The
+      // lists the joining builds are held to a reading's temporary budget (kept.ts) (round 11: a held Mach-O of a million
+      // joined literals, read for its imports as production read it, reached 83.8 MiB live; production ended its isolate)
+      // once the plan has stopped, what scripts run is not read: only production's paths are, as production's pass read
+      // them, so the second layer's work stops spending the stream's meter (round 17 review of b287849, P1)
+      const read = withKeepLimit(Number.POSITIVE_INFINITY, MAX_SCAN_TEMP_BYTES, () => importPaths(bytes, stopped === null ? file.path : undefined));
+
+      // its joining stopped where production's went on: production's graph is not known past here, so the graph is cut
+      // and the plan stopped for its resources
+      if (read.stopped) {
+        cut = true;
+        stopped ??= `${file.path}: apm stopped reading the paths it loads at what one reading may hold, so the files read were not chosen as production chose them`;
+
+        return;
+      }
+
+      paths = read.value.paths.map((p) => decoder.decode(encoder.encode(p)));
+      runs = read.value.shell.words.map((p) => decoder.decode(encoder.encode(p)));
+
+      // a script's walk cut at its bound: what it runs is not all known (round 13 review of d594415, P2)
+      if (read.value.shell.kind === "cut") stopped ??= `${file.path}: apm read the first ${MAX_SHELL_TOKENS.toLocaleString("en-US")} words of this script's commands and stopped, so what the rest runs was not followed`;
     } finally {
       memory.give(reading);
     }
 
-    if (paths.length === 0) return;
+    // production's graph, kept and cut by production's limits, whatever scripts run besides
     const more = paths.reduce((n, p) => n + p.length, 0);
 
-    if (chars + more > maxChars || edges + paths.length > maxEdges) {
-      cut = true;
+    if (paths.length > 0) {
+      if (chars + more > maxChars || edges + paths.length > maxEdges) {
+        cut = true;
+
+        return;
+      }
+
+      if (!memory.take(IMPORT_LIST_BYTES + paths.length * IMPORT_PATH_BYTES + 2 * more)) throw new MemoryRefused(`no memory to keep ${file.path}'s imports`);
+      chars += more;
+      edges += paths.length;
+      imports.set(file.path, paths);
+    }
+
+    // what scripts run, on limits of their own: past them the plan stopped for its resources
+    const ran = runs.reduce((n, p) => n + p.length, 0);
+
+    if (runs.length === 0 || stopped !== null) return;
+
+    if (shellChars + ran > maxChars || shellEdges + runs.length > maxEdges) {
+      stopped = `${file.path}: what the package's shell scripts run is past what apm keeps of them, so the files read were not chosen as they would be`;
 
       return;
     }
 
-    if (!memory.take(IMPORT_LIST_BYTES + paths.length * IMPORT_PATH_BYTES + 2 * more)) throw new MemoryRefused(`no memory to keep ${file.path}'s imports`);
-    chars += more;
-    edges += paths.length;
-    imports.set(file.path, paths);
+    if (!memory.take(IMPORT_LIST_BYTES + runs.length * IMPORT_PATH_BYTES + 2 * ran)) throw new MemoryRefused(`no memory to keep what ${file.path} runs`);
+    shellChars += ran;
+    shellEdges += runs.length;
+    shellRuns.set(file.path, runs);
   };
 
   return {
     hold,
     look,
     imports,
+    shellRuns,
     get importsCut() {
       return cut;
+    },
+    get stopped() {
+      return stopped;
     },
   };
 }
@@ -1115,26 +1326,33 @@ export function firstPass(limits: FirstPassLimits): FirstPass {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** A streamed read's plan (planLayers): production's, and what the second layer holds besides. */
+export type ReadingPlan = { production: Set<string>; extra: Set<string> };
+
 /**
- * Which files of a tarball too large to hold a streamed read keeps whole, at most `budget` bytes of them: the files
- * `analyze` would read first, in its order. That is the files it reads by name, then what install hooks run,
- * binding.gyp and the declared entries, then every file those reach through `imports` (the paths each file loads, as
- * importPaths reads them), then every other file that could be code, code extensions first. A file that does not fit
- * is passed over for the next, as `analyze` passes it over. Files `analyze` never reads (native binaries, images and
- * the like, known by their first bytes; one over MAX_ANALYZED_FILE_BYTES) are never held. `files` may hold only each
- * file's first bytes: only paths, sizes and those are read. `analyze` reports any file it reaches that is not held as
- * skipped, so a plan that guessed wrong costs completeness, never a clean reading of what was not read.
+ * Which files of a tarball too large to hold a streamed read keeps whole, at most `budget` bytes of them, in two layers.
+ * `production` is production's (274d284) plan, exactly: the files `analyze` reads by name, then what install hooks run,
+ * binding.gyp and the declared entries, then every file those reach through `imports` (production's graph, beside the
+ * file), then every other file that could be code, code extensions first, passing over a file that does not fit for the
+ * next, and never holding what production never read (a native name, ELF's magic, data, one over
+ * MAX_ANALYZED_FILE_BYTES). `extra` is what the second layer reads besides, held from what production's plan left of the
+ * budget: what scripts and bin run, whatever their first bytes (invokedFiles), and what those and every held file reach,
+ * beside the file or from the package's folder, through `imports` and what shell scripts run (`shellRuns`). Production's
+ * walk counts an `extra` file as not held (AnalyzeInput.extraHeld), so it reads what production's read, and the second
+ * layer cannot crowd out a file production held (round 16 review of c272202). `files` may hold only each file's first
+ * bytes: only paths, sizes and those are read.
  */
-export function planReading(input: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; imports: ReadonlyMap<string, readonly string[]>; budget: number }): Set<string> {
+export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; imports: ReadonlyMap<string, readonly string[]>; shellRuns?: ReadonlyMap<string, readonly string[]>; budget: number }): ReadingPlan {
   const { files, imports, budget } = input;
   const byPath = new Map(files.map((f) => [f.path, f]));
   const held = new Set<string>();
+  const extra = new Set<string>();
   let total = 0;
 
   charge("score", files.length * 4);
 
   const take = (f: TarEntry): void => {
-    if (held.has(f.path) || isBinary(f) || isBinaryData(f) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
+    if (held.has(f.path) || !readAsTextBefore(f.path, f.data) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
     held.add(f.path);
     total += f.size;
   };
@@ -1146,15 +1364,16 @@ export function planReading(input: { manifest: AnalyzeInput["manifest"]; files: 
   }
 
   // a manifest past what apm reads is not read here either: `analyze` reads nothing of the version then
-  if (measureManifest(input.manifest).kind !== "ok") return held;
+  if (measureManifest(input.manifest).kind !== "ok") return { production: held, extra };
   const manifest = input.manifest;
   const first: string[] = [];
+  const hooks = expandHooks(manifest);
 
-  for (const h of expandHooks(manifest)) {
+  for (const h of hooks) {
     if (h.kind === "publish") continue;
 
     for (const c of h.commands) {
-      for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+      for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
         const f = resolveIn(byPath, w);
 
         if (f && f.path !== "package.json") first.push(f.path);
@@ -1201,7 +1420,45 @@ export function planReading(input: { manifest: AnalyzeInput["manifest"]; files: 
 
   for (const f of rest) take(f);
 
-  return held;
+  // the second layer's, from what is left: what scripts and bin run first, then what everything held reaches
+  const invoked = invokedFiles(manifest, byPath, hooks);
+
+  const takeExtra = (f: TarEntry): void => {
+    if (held.has(f.path) || extra.has(f.path) || (!invoked.has(f.path) && !readAsTextBefore(f.path, f.data)) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
+    extra.add(f.path);
+    total += f.size;
+  };
+
+  const shellRuns = input.shellRuns ?? new Map<string, readonly string[]>();
+  const seenX = new Set<string>();
+  const queueX = [...invoked, ...held];
+
+  for (let qi = 0; qi < queueX.length; qi++) {
+    const path = queueX[qi] ?? "";
+    const f = byPath.get(path);
+
+    if (!f || seenX.has(path)) continue;
+    seenX.add(path);
+    takeExtra(f);
+
+    if (!held.has(path) && !extra.has(path)) continue;
+
+    for (const spec of [...(imports.get(path) ?? []), ...(shellRuns.get(path) ?? [])]) {
+      charge("score", 1);
+
+      // beside the file, or from the package's folder, where npm runs a script's commands (as `analyze` resolves them)
+      for (const target of candidatesOf(byPath, path, spec)) if (!seenX.has(target.path)) queueX.push(target.path);
+    }
+  }
+
+  return { production: held, extra };
+}
+
+/** Every file a streamed read holds (planLayers): production's plan and the second layer's. */
+export function planReading(input: Parameters<typeof planLayers>[0]): Set<string> {
+  const plan = planLayers(input);
+
+  return new Set([...plan.production, ...plan.extra]);
 }
 
 /** What the v3 walk could not read: run code too large or past the budget, and other files past the budget. */
@@ -1221,7 +1478,7 @@ function readLikeV3(w: V3Walk): V3Skips {
   const first: string[] = [];
 
   for (const c of w.installCommands) {
-    for (const word of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+    for (const word of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, word);
 
       if (f && f.path !== "package.json") {
@@ -1255,13 +1512,14 @@ function readLikeV3(w: V3Walk): V3Skips {
   let qi = 0;
 
   const readFile = (f: TarEntry, reached: boolean): void => {
-    if (isBinary(f)) {
-      add("binary", f.path);
+    const asSource = w.invoked.has(f.path);
+    // production's (274d284) reader, as in analyzeFile: a native name or ELF's magic is binary and not read, nor is data;
+    // a Mach-O is read as the text production read (round 16 review of c272202)
+    const native = nativeBefore(f.path, f.data);
 
-      return;
-    }
+    if (native || isBinary(f)) add("binary", f.path);
 
-    if (isBinaryData(f)) return;
+    if (!asSource && (native || hasDataMagic(f.data))) return;
 
     if (w.notHeld.has(f)) {
       skipNotHeld(f, reached, skipped, unanalyzed);
@@ -1282,8 +1540,10 @@ function readLikeV3(w: V3Walk): V3Skips {
     }
 
     scanned += f.data.length;
-    // keyed by the entry, not its path: only these bytes' own read can stand in for reading them
-    const known = w.readWhole.get(f);
+    // keyed by the entry, not its path: only these bytes' own read can stand in for reading them. One read through its
+    // views was read whole too, as production read it whole as text; its imports are read again from the view below
+    const viewed = w.viewed.has(f);
+    const known = viewed ? null : w.readWhole.get(f);
 
     // decoding the bytes, and what this walk reads of a file the first walk did not read whole
     chargeText("text", f.data.length, known === undefined ? TEXT_PASSES_PER_FILE : 1);
@@ -1298,7 +1558,7 @@ function readLikeV3(w: V3Walk): V3Skips {
     if (installTargets.has(f.path) && isShellScript(f, textOf()) && isInlineDownload(textOf())) add("install-download", `${f.path}: run by an install script and downloads code`);
 
     if (!reached) return;
-    const imports = known ?? importsOf(joinStrings(textOf()).text);
+    const imports = viewed ? w.viewImports(f) : (known ?? importsOf(joinStrings(textOf()).text));
 
     // v3's pattern takes any require(…) or import(…) whose argument is not a literal for a computed load
     for (const d of imports.dynamic) if (!w.dynamicAt.has(`${f.path}:${d.line}`)) add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}${TEXT_MATCH}`);
@@ -1334,7 +1594,7 @@ function readLikeV3(w: V3Walk): V3Skips {
     drain();
   }
 
-  for (const f of w.files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
+  for (const f of w.files) if (!seen.has(f.path) && (nativeBefore(f.path, f.data) || isBinary(f))) add("binary", f.path);
 
   return { skipped, unanalyzed };
 }
@@ -1395,7 +1655,11 @@ export function meterEvidence(phase: Phase, limit: number): string {
  * floor on `incomplete` alone. It charges nothing, so it can be built on a spent meter.
  */
 export function unfinishedAnalysis(u: Unfinished): Analysis {
-  return incompleteAnalysis({ manifest: u.manifest, files: u.files, evidence: [meterEvidence(u.phase, u.limit), ...(u.because ?? [])], notChecked: `everything past the analysis work limit (${PHASE_NAMES[u.phase]})` });
+  // a reading stopped for its resources scores 0, as one stopped at what a binary's text may hold does (assess): this
+  // analysis reads more than production's (274d284) and spends more of the meter, so it can run out where production's
+  // finished below 39, and what it did not read could cost more than `incomplete`'s 61 points (round 16 review of
+  // c272202: a package production scored 35 (F), complete, scored 39 here, stopped)
+  return incompleteAnalysis({ manifest: u.manifest, files: u.files, evidence: [meterEvidence(u.phase, u.limit), ...(u.because ?? [])], notChecked: `everything past the analysis work limit (${PHASE_NAMES[u.phase]})`, stopped: true });
 }
 
 /** What `manifestOverAnalysis` needs: the version, which limit its package.json is past, and limits hit before. */
@@ -1423,10 +1687,14 @@ export function failedAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: r
 }
 
 /** `incomplete` and nothing that reads as a pass. Reads package.json only within MANIFEST_LIMITS (boundedManifest). */
-function incompleteAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; evidence: string[]; notChecked: string }): Analysis {
+function incompleteAnalysis(u: { manifest: AnalyzeInput["manifest"]; files: readonly TarEntry[]; evidence: string[]; notChecked: string; stopped?: boolean }): Analysis {
+  const unfinished = signal("incomplete", u.evidence);
+
+  if (u.stopped === true) unfinished.points = -100;
+
   return {
     scorer: SCORER,
-    signals: [signal("incomplete", u.evidence)],
+    signals: [unfinished],
     facts: factsOf(boundedManifest(u.manifest), u.files),
     notChecked: [...NOT_CHECKED, u.notChecked],
     skipped: [],
@@ -1453,16 +1721,36 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   if (ambiguous.length > 0) throw new AmbiguousPathsError(ambiguous);
   const found = collector();
-  const add = found.add;
+  // Round 15 review of c139b5b: what the branch reads beyond production's walk (a binary's view after a load, a file a
+  // shell script or a command runs, a file read again as code) changed how production's own readings were read, by
+  // replacing them or by changing which reader a file got. The walk now has two layers: "production", production's walk
+  // (274d284's order, roots, exact paths and reader for every file), whose results are production's; and "extra", what
+  // the branch reads besides, kept apart. The analysis is assessed on the first alone, then with the second, and takes
+  // from the second only what it adds (withExtras): nothing production's reading concluded is replaced or read again.
+  let layer: "production" | "extra" = "production";
+  const extraAdds: { id: SignalId; ev: string; confidence: Confidence | undefined; cited: Cited | undefined }[] = [];
+
+  const add: Found["add"] = (id, ev, confidence, cited) => {
+    if (layer === "production") found.add(id, ev, confidence, cited);
+    else extraAdds.push({ id, ev, confidence, cited });
+  };
 
   // Why this run read less is added before anything it found: only the first SHOWN_EVIDENCE lines are shown, and a
   // smaller re-run of a big package also has parser-limit and skipped-file warnings, so the reason added last was cut
   // (six parser-depth warnings pushed it out). Same rank ("tree") and first in, so first shown.
   for (const why of input.incompleteBecause ?? []) add("incomplete", why);
 
+  for (const why of input.stoppedBecause ?? []) add("incomplete", why);
+
   const byPath = new Map(files.map((f) => [f.path, f]));
-  const notHeld: ReadonlySet<TarEntry> = input.notHeld ?? new Set();
+  // what the second layer may read of a streamed read: everything held
+  const notHeldExtra: ReadonlySet<TarEntry> = input.notHeld ?? new Set();
+  const heldForExtra = input.extraHeld ?? new Set<string>();
+  // what production's walk may read: what production's plan held, so not a file held only for the second layer
+  const notHeld: ReadonlySet<TarEntry> = heldForExtra.size === 0 ? notHeldExtra : new Set([...notHeldExtra, ...files.filter((f) => heldForExtra.has(f.path))]);
   const hooks = expandHooks(manifest);
+  // read as source whatever their bytes: what scripts and bin run, and (as the walk finds them) what code runs
+  const invoked = invokedFiles(manifest, byPath, hooks);
 
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
@@ -1516,16 +1804,24 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // A byte budget, not a file count, bounds the work, so filler files can only push out other filler.
   const budget = input.maxScannedBytes ?? MAX_SCANNED_BYTES;
   const installTargets = new Set<string>();
+  // what install hooks run as the second layer reads them (scriptTargets): production's roots are production's
+  const installTargetsX = new Set<string>();
   const first: string[] = [];
 
   for (const c of installCommands) {
-    for (const w of [...scriptTargets(c.text), ...commandWords(c.text)]) {
+    for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, w);
 
       if (f && f.path !== "package.json") {
         installTargets.add(f.path);
         first.push(f.path);
       }
+    }
+
+    for (const w of scriptTargets(c.text)) {
+      const f = resolveIn(byPath, w);
+
+      if (f && f.path !== "package.json") installTargetsX.add(f.path);
     }
   }
 
@@ -1566,6 +1862,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   const limits = new Map<string, string[]>();
   // files whose whole text the text rules read here, with v3's imports of each parsed one, for the v3 walk below
   const readWhole = new Map<TarEntry, Imports | null>();
+  // files production's walk read whole through their views (a Mach-O production read as plain text): the floor's walk
+  // reads their imports again from the view, as production's read them again from its text
+  const viewedWhole = new Set<TarEntry>();
   const dynamicAt = new Set<string>();
   // what each file shows beyond the code signals, and which files each one loads, for the v10 risk signals
   const fileFacts = new Map<string, Fact[]>();
@@ -1577,6 +1876,19 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   const rawFiles = new Set<string>();
   // files whose flow reading stopped before it finished, in code that runs: each is incomplete, and its evidence says so
   const flowStopped = new Set<string>();
+  // the extra layer's own: what its readings found, apart from production's (layer, above)
+  const extraFacts = new Map<string, Fact[]>();
+  const extraFlows = new Map<string, { flows: FlowFinding[]; exports: Exports }>();
+  const extraEdges = new Map<string, Set<string>>();
+  const extraRaw = new Set<string>();
+  const extraFlowStopped = new Set<string>();
+  const factsIn = (): Map<string, Fact[]> => (layer === "production" ? fileFacts : extraFacts);
+  const flowsIn = (): Map<string, { flows: FlowFinding[]; exports: Exports }> => (layer === "production" ? fileFlows : extraFlows);
+
+  const edge = (from: string, to: string): void => {
+    const m = layer === "production" ? edges : extraEdges;
+    m.set(from, (m.get(from) ?? new Set()).add(to));
+  };
 
   /**
    * Code a file holds as text (run from a string, recovered from its own comments or regexes, or held in a string that
@@ -1597,69 +1909,321 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     heldBytes.set(path, spent + e.code.length);
     chargeText("held", e.code.length, TEXT_PASSES_PER_FILE);
     const scan = inPhase("held", () => scanFile(e.code, "js"));
-    const facts = fileFacts.get(path) ?? [];
+    const facts = factsIn().get(path) ?? [];
     const snippet = `${e.snippet}${HELD_NOTES[e.origin]}`;
 
     for (const fact of readFacts(e.code, scan.hidden, scan.commands)) if ((e.origin !== "held" && e.origin !== "data") || HELD_RISKS.has(fact.kind)) facts.push({ ...fact, line: e.line, snippet, near: true });
 
     if (e.origin === "recovered" && (scan.read === "raw" || scan.findings.some((x) => x.confidence === "confirmed"))) facts.push({ kind: "runs-hidden", line: e.line, snippet, text: false, near: true });
-    fileFacts.set(path, facts);
-    const flows: { flows: FlowFinding[]; exports: Exports } = fileFlows.get(path) ?? { flows: [], exports: new Map() };
+    factsIn().set(path, facts);
+    const flows: { flows: FlowFinding[]; exports: Exports } = flowsIn().get(path) ?? { flows: [], exports: new Map() };
 
     // a string kept as data (an export, a property value, an array element) is not run: its flows are not the file's
     // (a package that exports example code), and what it would do counts only through the facts above
     if (e.origin !== "data") for (const x of scan.flows ?? []) flows.flows.push({ ...x, line: e.line, snippet });
-    fileFlows.set(path, flows);
+    flowsIn().set(path, flows);
 
     if (e.origin === "run" || e.origin === "recovered") {
       for (const u of scan.unread ?? []) add("incomplete", `${path}:${e.line}: ${e.snippet} (${u.why})`);
 
       // the stop is one of `unread`, so it is incomplete already; a string only held is not read for this, as before
-      if (scan.flowStopped === true) flowStopped.add(path);
+      if (scan.flowStopped === true) (layer === "production" ? flowStopped : extraFlowStopped).add(path);
     }
 
     // code that code held as text runs or holds in turn, as sure as the outer one is to run
     for (const inner of scan.executed ?? []) readHeld(path, { ...inner, line: e.line, snippet: e.snippet, origin: e.origin === "run" ? inner.origin : e.origin }, depth + 1);
   };
 
-  const analyzeFile = (f: TarEntry, reached: boolean): void => {
-    if (isBinary(f)) {
-      add("binary", f.path);
+  // files production's walk read no text of (a native name, an ELF file, data), and ones it read through a binary's view
+  const unreadText = new Set<string>();
+  const viewedEver = new Set<string>();
+  // the extra layer's walk: what it reaches beyond production's, and what it has read
+  const queueX: string[] = [];
+  const reachedX = new Set<string>();
+  const doneX = new Set<string>();
 
-      return;
+  /** Reaches `path` in the current layer's walk: production's queue, or the extra layer's. */
+  const reach = (path: string): void => {
+    if (layer === "production") {
+      if (!reachable.has(path)) {
+        reachable.add(path);
+        queue.push(path);
+      }
+    } else if (!reachable.has(path) && !reachedX.has(path)) {
+      reachedX.add(path);
+      queueX.push(path);
+    }
+  };
+
+  /** Whether the current layer's walk has read `path`. */
+  const readYet = (path: string): boolean => seen.has(path) || (layer === "extra" && doneX.has(path));
+
+  /**
+   * `word`, in a command `from` runs, names a file it runs: read as source whatever its bytes, and reached when `from`
+   * is. Only in the extra layer: production's walk followed a command to one file, by its path, and read nothing more.
+   */
+  const runs = (from: TarEntry, word: string, reached: boolean): void => {
+    // only ever adds: every plausible target is read as source, and a word it cannot resolve takes nothing away
+    for (const target of candidatesOf(byPath, from.path, word)) {
+      if (target.path === from.path || target.path === "package.json") continue;
+      edge(from.path, target.path);
+      invoked.add(target.path);
+
+      if (reached && !readYet(target.path)) reach(target.path);
+    }
+  };
+
+  // what production's walk read that the extra layer reads on: the commands code runs, and the scripts a shell runs
+  const laterCommands: { f: TarEntry; line: number; value: string; reached: boolean }[] = [];
+  const laterShell: { f: TarEntry; reached: boolean }[] = [];
+
+  /** The language a file is read in: the one its name or shebang gives, and JavaScript (or TypeScript) when code loads it. */
+  const languageOf = (path: string, text: string): Lang => {
+    const named = langOf(path, text);
+
+    // a type declaration code loads runs too (node strips its types, or older node runs it as JavaScript)
+    return runsAsCode.has(path) && (named === "plain" || named === "c" || named === "python") ? "js" : runsAsCode.has(path) && named === "declaration" ? "ts" : named;
+  };
+
+  /**
+   * The language production (274d284) read `f` in: langOf reads no more of a text than its first line (a shebang), and a
+   * newline byte is never inside a UTF-8 sequence, so the line decodes as it does in the whole text.
+   */
+  const languageBefore = (f: TarEntry): Lang => {
+    const eol = f.data.indexOf(0x0a);
+
+    charge("score", eol === -1 ? f.data.length : eol);
+
+    return languageOf(f.path, new TextDecoder().decode(eol === -1 ? f.data : f.data.subarray(0, eol + 1)));
+  };
+
+  // every file a load in some file's reading names, reached or not, read before or after it (followImports)
+  const loadedAnywhere = new Set<string>();
+  // binaries read through the plain view: one a load names by the end of the walks is read again as production reads code
+  // it loads (round 6 review of fbc6738, P1). A view counts as it is read, as production's plain reading counted it, so
+  // nothing waits but the file: what views add to the result is held to MAX_KEPT_VIEW_BYTES (viewBytes), and its imports
+  // are followed and let go (round 7 review of dce1655, memory review of 49b35f9)
+  const viewed = new Map<string, { f: TarEntry; reached: boolean }>();
+  let viewBytes = 0;
+  // what binaries' NUL-deleted views found that their production views did not, by file (countView)
+  const viewExtras: { path: string; findings: readonly TextFinding[]; facts: readonly Fact[] }[] = [];
+  // a reading stopped for its resources (a binary's text past what it may hold, a shell walk past its bound): what it
+  // did not read could cost more than `incomplete`'s 61 points, so the analysis scores 0 (round 13 review of d594415)
+  // a streamed read's plan that stopped for its resources stops the analysis too
+  let resourceStopped = (input.stoppedBecause ?? []).length > 0;
+
+  /** A shell walk cut at its bound: incomplete, and stopped for its resources. */
+  const shellCut = (why: string): void => {
+    resourceStopped = true;
+    add("incomplete", why);
+  };
+
+  // text files read in the language their name gives (plain, C, Python, a declaration) because nothing had loaded them
+  // yet: one a load names by the end of the walks is read again as code, as production read a file loaded before it was
+  // reached. The order the walk meets files in decides nothing then (round 8 review: a stand-in path reached lib/t字 as
+  // well as lib/t漢, its __dirname path reached lib/bridge.dat before lib/middle's load did, and bridge.dat was read as
+  // plain text where production read it as JavaScript)
+  const plainRead = new Map<string, { f: TarEntry; reached: boolean }>();
+
+  /**
+   * Counts a binary's view, as production's plain reading counted the file, and what it keeps against what views may add
+   * (viewBytes): the next view's reading is given what is left (kept.ts). Its imports are followed and let go: only its
+   * findings and facts stay.
+   */
+  const countWithin = (f: TarEntry, read: Pick<Extract<BinaryTextScan, { kind: "read" }>, "findings" | "facts" | "extraFindings" | "extraFacts">): void => {
+    viewBytes += keptBytes({ findings: [...read.findings, ...read.extraFindings], facts: [...read.facts, ...read.extraFacts] });
+    countView(f, read);
+  };
+
+  /** Records that some file's reading loads `path`: one read as plain text, or through a view, the extra layer reads again as code. */
+  const markLoaded = (path: string): void => {
+    loadedAnywhere.add(path);
+  };
+
+  /**
+   * A Mach-O or universal binary production (274d284) read as text (its executable check never matched one), which
+   * nothing runs as a script: read through its views (binary-text.ts), with every finding and fact a plain file gets,
+   * from its text decoded as production decoded it (review of 45d3655). Called after the file passed production's
+   * holding, size and byte-budget checks and spent its bytes (analyzeFile), as production spent them before reading it
+   * (round 16 review of c272202, P2). False when production read it in a language other than plain text: the caller
+   * reads it as production did.
+   */
+  const readBinaryText = (f: TarEntry, reached: boolean): boolean => {
+    // production read it as plain text, which is what the view reads, or in a language (JavaScript when code loads it,
+    // or one its name gives), whose reading also tokenizes it: `require('./p'/*x*/+'ayload.txt')` (round 5 review of
+    // 535a5b5, P1). That one is read below exactly as production read it, at production's cost, as is one any file
+    // was already found to load
+    if (languageBefore(f) !== "plain" || loadedAnywhere.has(f.path)) return false;
+
+    // its reading may keep what is left of the views' budget, charged as it finds it (kept.ts)
+    const read = scanBinaryText(f.data, (input.maxKeptViewBytes ?? MAX_KEPT_VIEW_BYTES) - viewBytes);
+
+    if (read.kind === "read") {
+      // what it reaches and loads counts now, as production's plain reader had it count, and what it holds too: a load
+      // found later reads it again as code (viewed), which only adds to what it counted
+      followImports(f, read.imports, reached, false);
+      countWithin(f, read);
+
+      // a reading that did not finish keeps what it found, every signal of it, and says so: an analysis that stopped is
+      // incomplete, never a file left out for its size or the budget, and the install verdict holds it (round 12 review
+      // of 7cd0b2b, P2: its findings were dropped and the file reported unread for the budget, so a Mach-O production
+      // scored 65 (C), complete, scored 100 (P), which installs)
+      if (read.stopped) resourceStopped = true;
+
+      // a load whose path holds a stand-in the bytes could not give: which file production's path loaded is not known
+      if (read.unresolved) {
+        resourceStopped = true;
+        add("incomplete", `${f.path}: a load in its text names a path built from pieces around a character apm holds as a stand-in, so which file it loads was not known; apm stopped there`);
+      }
+
+      if (read.stopped) add("incomplete", `${f.path}: apm stopped reading its text at what one reading may hold (${(MAX_KEPT_VIEW_BYTES / 1024 / 1024).toFixed(0)} MiB of results, ${(MAX_SCAN_TEMP_BYTES / 1024 / 1024).toFixed(0)} MiB a list while reading); what it found counts, and the rest of it was not read`);
+
+      viewed.set(f.path, { f, reached });
+      viewedEver.add(f.path);
+
+      // production's floor (readLikeV3) does not read it again, as production's did not read a file its first walk read
+      // whole, but reads its imports again when it reaches it, from its view (scanBinaryImports)
+      if (layer === "production") viewedWhole.add(f);
+
+      return true;
     }
 
-    if (isBinaryData(f)) return;
+    return false;
+  };
 
-    if (notHeld.has(f)) {
-      skipNotHeld(f, reached, skipped, unanalyzed);
+  /** What `read` found in the text of `f`, a file production read as plain text: counted as production counted it. */
+  const countView = (f: TarEntry, read: Pick<Extract<BinaryTextScan, { kind: "read" }>, "findings" | "facts" | "extraFindings" | "extraFacts">): void => {
+    for (const finding of read.findings) add(finding.id, describeFinding(f.path, finding), finding.confidence, citedAs(finding));
+    (layer === "production" ? rawFiles : extraRaw).add(f.path);
+    factsIn().set(f.path, [...(factsIn().get(f.path) ?? []), ...read.facts]);
+
+    // what the NUL-deleted view adds is kept apart: the analysis is assessed on production's reading alone, then again
+    // with these, and takes only what they add (viewExtras, below)
+    if (read.extraFindings.length > 0 || read.extraFacts.length > 0) viewExtras.push({ path: f.path, findings: read.extraFindings, facts: read.extraFacts });
+  };
+
+  /**
+   * What `f`'s reading imports, followed as analyzeFile follows a file's: each path an edge and, from a reached file,
+   * reached; each load also code (runsAsCode) and, from any file, reached or not, recorded (loadedAnywhere); a computed
+   * load evidence where analyzeFile cites one. A path read from a binary's view holds the real characters production's
+   * text held (binary-text.ts): it names the file production's exact path named, and no other.
+   */
+  const followImports = (f: TarEntry, imports: Imports, reached: boolean, javascript: boolean): void => {
+    for (const d of javascript || reached ? imports.dynamic : []) {
+      add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
+      dynamicAt.add(`${f.path}:${d.line}`);
+    }
+
+    for (const spec of imports.paths) {
+      const load = imports.loads.includes(spec);
+      // the file production's exact path named (a binary's paths hold its real characters: binary-text.ts)
+      const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
+
+      if (!target) continue;
+      edge(f.path, target.path);
+
+      if (load) markLoaded(target.path);
+
+      if (readYet(target.path)) continue;
+
+      if (load) {
+        runsAsCode.add(target.path);
+        exposedOnly.delete(target.path);
+      }
+
+      if (reached) reach(target.path);
+    }
+  };
+
+  // what the extra layer has read of the budget: its own, so production's walk reads what production's read
+  let scannedExtra = 0;
+  // files production's walk left unread for their holding, size or the byte budget: the extra layer reads none of them
+  const leftUnread = new Set<string>();
+
+  const analyzeFile = (f: TarEntry, reached: boolean): void => {
+    const production = layer === "production";
+    // read as source whatever its bytes: what a script or command runs, in the extra layer (production read every file
+    // by its name and first bytes)
+    const asSource = !production && invoked.has(f.path);
+    // a Mach-O read through its views rather than decoded whole
+    let view: boolean;
+
+    if (production) {
+      // production's (274d284) reader, exactly, whoever loads or runs the file (round 16 review of c272202, P1): a native
+      // name or an ELF file is listed as `binary` and not read, nor is data (an image, a font, an archive, WebAssembly).
+      // A Mach-O, which its check never matched, is read as the text it read
+      const native = nativeBefore(f.path, f.data);
+
+      if (native || isBinary(f)) add("binary", f.path);
+
+      if (native || hasDataMagic(f.data)) {
+        unreadText.add(f.path);
+
+        return;
+      }
+
+      view = isBinary(f);
+    } else {
+      if (leftUnread.has(f.path)) return;
+      // node loads an entry or a required file as JavaScript: only a .node addon or a real executable is native there;
+      // what a script or command runs is read as source whatever its bytes
+      const native = runsAsCode.has(f.path) ? isNativeEntry(f) : isBinary(f);
+
+      if (native) add("binary", f.path);
+      view = !asSource && (native || isBinaryData(f));
+
+      // what production never read and nothing reads as source stays unread
+      if (view && !readAsTextBefore(f.path, f.data)) {
+        unreadText.add(f.path);
+
+        return;
+      }
+    }
+
+    // production's holding, size and byte-budget checks, in its order, before anything of the file is read or its loads
+    // followed; the extra layer has the same checks on an allowance of its own
+    if ((production ? notHeld : notHeldExtra).has(f)) {
+      if (production) {
+        skipNotHeld(f, reached, skipped, unanalyzed);
+        leftUnread.add(f.path);
+      }
 
       return;
     }
 
     if (f.data.length > MAX_ANALYZED_FILE_BYTES) {
-      skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
+      if (production) {
+        skipped.push({ path: f.path, size: f.data.length, reason: "too-large" });
+        leftUnread.add(f.path);
+      }
 
       return;
     }
 
-    if (scanned + f.data.length > budget) {
-      (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-budget" });
+    if ((production ? scanned : scannedExtra) + f.data.length > budget) {
+      if (production) {
+        (reached ? skipped : unanalyzed).push({ path: f.path, size: f.data.length, reason: "over-budget" });
+        leftUnread.add(f.path);
+      }
 
       return;
     }
 
-    scanned += f.data.length;
+    if (production) scanned += f.data.length;
+    else scannedExtra += f.data.length;
     // decoding the bytes, choosing the language, and the passes below over the whole text: the file's facts, v3's
     // imports and the joined text it reads them from
     chargeText("text", f.data.length, TEXT_PASSES_PER_FILE);
+
+    if (view && readBinaryText(f, reached)) return;
     // read whatever the bytes are: skipping "non-text" would let a NUL byte hide code
     const text = new TextDecoder().decode(f.data);
 
-    const named = langOf(f.path, text);
-    // a type declaration code loads runs too (node strips its types, or older node runs it as JavaScript)
-    const lang = runsAsCode.has(f.path) && (named === "plain" || named === "c" || named === "python") ? "js" : runsAsCode.has(f.path) && named === "declaration" ? "ts" : named;
+    const lang = languageOf(f.path, text);
     const scan = scanFile(text, lang);
+
+    // read in its own language only because nothing loads it yet: a later load reads it again as code (plainRead)
+    if (!runsAsCode.has(f.path) && (lang === "plain" || lang === "c" || lang === "python" || lang === "declaration")) plainRead.set(f.path, { f, reached });
 
     // a README or LICENSE a pattern exposes is not JavaScript: node would throw a SyntaxError, so nothing in it runs
     if (scan.rejected && exposedOnly.has(f.path) && NOT_CODE.test(f.path)) return;
@@ -1674,38 +2238,69 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     }
 
     if (lang !== "json" && lang !== "declaration") {
-      if (scan.read === "raw") rawFiles.add(f.path);
+      if (scan.read === "raw") (production ? rawFiles : extraRaw).add(f.path);
       const facts = readFacts(text, scan.hidden, scan.commands);
       // the parser's environment reads follow aliases and `globalThis.process.env`; a name read through one sits as near
       // the network as the file is small
       const near = text.length < 16 * 1024;
 
       for (const e of scan.env ?? []) facts.push(e.name === null ? { kind: "env-object", line: e.line, snippet: e.snippet, text: false, near } : { kind: "env", line: e.line, snippet: e.snippet, name: e.name, text: false, near });
-      fileFacts.set(f.path, facts);
-      fileFlows.set(f.path, { flows: [...(scan.flows ?? [])], exports: scan.exports ?? new Map() });
+
+      // production read each file once; an extra reading of it adds to what the extra layer has of it, never replaces
+      if (production) {
+        fileFacts.set(f.path, facts);
+        fileFlows.set(f.path, { flows: [...(scan.flows ?? [])], exports: scan.exports ?? new Map() });
+      } else {
+        extraFacts.set(f.path, [...(extraFacts.get(f.path) ?? []), ...facts]);
+        const had = extraFlows.get(f.path);
+
+        extraFlows.set(f.path, { flows: [...(had?.flows ?? []), ...(scan.flows ?? [])], exports: scan.exports ?? had?.exports ?? new Map() });
+      }
 
       for (const e of scan.executed ?? []) readHeld(f.path, e, 1);
 
       for (const u of scan.unread ?? []) add("incomplete", `${f.path}:${u.line}: ${u.snippet} (${u.why})`);
 
-      if (scan.flowStopped === true) flowStopped.add(f.path);
+      if (scan.flowStopped === true) (production ? flowStopped : extraFlowStopped).add(f.path);
     }
 
-    // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does
+    // a file a command runs (`exec('node app.js')`) runs when this file does, as a file it loads does: production
+    // linked the first file a word names (an edge, nothing read); the extra layer follows every one (laterCommands)
     for (const c of scan.commands ?? []) {
-      for (const word of [...scriptTargets(c.value), ...commandWords(c.value)]) {
-        const target = resolveIn(byPath, joinPath(dirOf(f.path), word)) ?? resolveIn(byPath, word);
+      if (production) {
+        // production's words for it (scriptTargetsBefore), each list held to MAX_SHELL_TOKENS: one cut there stops the
+        // reading, since production linked every word
+        const lists = [scriptTargetsBeforeWithin(c.value, MAX_SHELL_TOKENS), commandWordsWithin(c.value, MAX_SHELL_TOKENS)];
 
-        if (target && target.path !== f.path && target.path !== "package.json") edges.set(f.path, (edges.get(f.path) ?? new Set()).add(target.path));
-      }
+        if (lists.some((l) => l.kind === "cut")) shellCut(`${f.path}:${c.line}: apm read the first ${MAX_SHELL_TOKENS.toLocaleString("en-US")} words of the command it runs and stopped, so what the rest runs was not followed`);
+
+        // each word once: the edges are a set, and resolving a word again finds the same file
+        for (const word of new Set(lists.flatMap((l) => l.words))) {
+          const target = resolveIn(byPath, joinPath(dirOf(f.path), word)) ?? resolveIn(byPath, word);
+
+          if (target && target.path !== f.path && target.path !== "package.json") edge(f.path, target.path);
+        }
+
+        laterCommands.push({ f, line: c.line, value: c.value, reached });
+      } else followCommand(f, c.line, c.value, reached);
     }
 
-    if (installTargets.has(f.path) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
+    // a shell script runs what its commands name, sourced files too (`sh lib/tool`, `. ./lib/env`), whatever their
+    // bytes: a bounded walk, since each file is read once (review of 4ac264b, P1: `sh setup.sh` running `sh lib/tool`,
+    // a valid Mach-O followed by shell lines, scored 90 where the same bytes run directly scored 0). A walk cut at its
+    // bound did not finish: it is incomplete, and scores 0 (round 13 review of d594415, P2). Production did not walk a
+    // script: the extra layer does (laterShell)
+    if (lang === "plain" && (asSource || isShellScript(f, text))) {
+      if (production) laterShell.push({ f, reached });
+      else walkShell(f, text, reached);
+    }
+
+    if ((installTargets.has(f.path) || (!production && installTargetsX.has(f.path))) && isShellScript(f, text) && isInlineDownload(text)) add("install-download", `${f.path}: run by an install script and downloads code`);
     // every path apm-score-v3's pattern finds in the text is reached too, so no file v3 read goes unread
     const v3Imports = scan.read === "parsed" ? importsOf(joinStrings(text).text) : null;
     const imports = v3Imports ? { ...scan.imports, paths: [...new Set([...scan.imports.paths, ...v3Imports.paths])] } : scan.imports;
 
-    readWhole.set(f, v3Imports);
+    if (production) readWhole.set(f, v3Imports);
 
     // a computed load in JavaScript counts wherever it is: a file nothing here reaches can still be loaded and run by its
     // path. In any other file it is only v3's pattern over text, reported where v3 reported it, in a reached file.
@@ -1713,26 +2308,48 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
     for (const d of javascript || reached ? imports.dynamic : []) {
       add("dynamic-require", `${f.path}:${d.line}: ${d.snippet}`);
-      dynamicAt.add(`${f.path}:${d.line}`);
+
+      if (production) dynamicAt.add(`${f.path}:${d.line}`);
     }
 
     for (const spec of imports.paths) {
       const target = resolveIn(byPath, joinPath(dirOf(f.path), spec));
 
-      if (target) edges.set(f.path, (edges.get(f.path) ?? new Set()).add(target.path));
+      if (target) edge(f.path, target.path);
 
-      if (!target || seen.has(target.path)) continue;
+      // a load from any file, reached or not, makes its target code: one production's walk read as plain text before the
+      // load is read again as code by the extra layer (viewed, plainRead), which only adds
+      if (target && imports.loads.includes(spec)) markLoaded(target.path);
+
+      if (!target || readYet(target.path)) continue;
 
       if (imports.loads.includes(spec)) {
         runsAsCode.add(target.path);
         exposedOnly.delete(target.path);
       }
 
-      if (reached && !reachable.has(target.path)) {
-        reachable.add(target.path);
-        queue.push(target.path);
-      }
+      if (reached) reach(target.path);
     }
+  };
+
+  /** A command code runs, followed as the extra layer follows one: every file each word could name, read as source. */
+  const followCommand = (f: TarEntry, line: number, value: string, reached: boolean): void => {
+    const lists = [scriptTargetsWithin(value, MAX_SHELL_TOKENS), commandWordsWithin(value, MAX_SHELL_TOKENS)];
+
+    for (const word of new Set(lists.flatMap((l) => l.words))) runs(f, word, reached);
+
+    if (lists.some((l) => l.kind === "cut")) shellCut(`${f.path}:${line}: apm read the first ${MAX_SHELL_TOKENS.toLocaleString("en-US")} words of the command it runs and stopped, so what the rest runs was not followed`);
+  };
+
+  /** A shell script's commands, followed as the extra layer follows them: every file a word could name, read as source. */
+  const walkShell = (f: TarEntry, text: string, reached: boolean): void => {
+    const shell = shellWords(text);
+
+    // each word once: a script that names one word 100,000 times runs one file (round 17: 800 scripts of `a a a ...`
+    // resolved 200,000 words each, about 0.3 s a script)
+    for (const word of new Set(shell.words)) runs(f, word, reached);
+
+    if (shell.kind === "cut") shellCut(`${f.path}: apm read the first ${MAX_SHELL_TOKENS.toLocaleString("en-US")} words of this script's commands and stopped, so what the rest runs was not followed`);
   };
 
   for (; qi < queue.length; qi++) {
@@ -1766,7 +2383,25 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     rawFiles.add(f.path);
   };
 
-  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld });
+  // production's floor, as production's: it read no file as source for being run (the extra layer does)
+  // a viewed file's imports, read again from its production view as production read them again from its text: held only
+  // while the floor's walk follows them. A reading that stops here did not finish
+  const viewImports = (f: TarEntry): Imports => {
+    const read = scanBinaryImports(f.data);
+
+    if (read.kind !== "read") return { paths: [], loads: [], dynamic: [] };
+
+    if (read.stopped) {
+      resourceStopped = true;
+      add("incomplete", `${f.path}: apm stopped reading the paths its text loads at what one reading may hold (${(MAX_KEPT_VIEW_BYTES / 1024 / 1024).toFixed(0)} MiB of results, ${(MAX_SCAN_TEMP_BYTES / 1024 / 1024).toFixed(0)} MiB a list while reading), so what the rest loads was not followed`);
+    }
+
+    return read.imports;
+  };
+
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld, invoked: new Set(), viewed: viewedWhole, viewImports });
+  // production's facts before its flows across files add theirs: the extra layer's assessment works those out again
+  const productionFacts = new Map([...fileFacts].map(([path, list]) => [path, [...list]]));
 
   const { cross, cut } = inPhase("cross-file", () => addFlowFacts(fileFlows, fileFacts, byPath, input.maxCrossFileSteps));
 
@@ -1791,7 +2426,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
           notes,
         };
 
-  for (const f of files) if (!seen.has(f.path) && isBinary(f)) add("binary", f.path);
+  for (const f of files) if (!seen.has(f.path) && (nativeBefore(f.path, f.data) || isBinary(f))) add("binary", f.path);
 
   const facts = factsOf(manifest, files);
 
@@ -1801,37 +2436,177 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   for (const t of typos) add("typosquat", t.reason);
 
   if (input.previousPublishers.length > 0 && !input.previousPublishers.includes(input.publisher)) {
-    add("new-publisher", `${input.publisher} has not published this package before (previous: ${input.previousPublishers.join(", ")})`);
+    add("new-publisher", `${input.publisher} has not published this package before (previous: ${publisherList(input.previousPublishers)})`);
   }
 
   for (const d of input.riskyDependencies ?? []) add("risky-dependency", `${d.name}@${d.version} scores ${d.score}/100`);
 
   for (const d of input.addedDependencies ?? []) add("new-dependency", `adds ${d}`);
 
+  // ---------- the extra layer: what the branch reads beyond production's walk, kept apart ----------
+  const productionStopped = resourceStopped;
+
+  layer = "extra";
+
+  for (const c of laterCommands) followCommand(c.f, c.line, c.value, c.reached);
+
+  for (const sh of laterShell) walkShell(sh.f, new TextDecoder().decode(sh.f.data), sh.reached);
+
+  // until nothing more is read: what a script or a command runs that production's walk read no text of (a native name,
+  // an ELF file, data), read as source; what that reaches; and a file production's walk read as plain text, or through
+  // a binary's plain view, that some file loads, read again as code (round 6 review of fbc6738: index.js -> lib/first
+  // (plain, `require('./tool')`) -> lib/tool (`require('./p'/*x*/+'ayload.txt')`) reaches the payload). Each only adds
+  for (let more = true, qx = 0; more; ) {
+    more = false;
+
+    // a file production's walk read no text of, or read only through a binary's view, that a script or command runs, or
+    // that node loads as JavaScript (an entry, a required file) under a native name other than `.node`: read as source.
+    // Production listed these as binary and read none of them (round 16 review of c272202, P1); one its walk did not
+    // reach at all is read only when the extra layer reaches it
+    for (const path of [...invoked, ...runsAsCode]) {
+      const f = byPath.get(path);
+
+      if (!f || doneX.has(path) || !seen.has(path) || !(unreadText.has(path) || viewedEver.has(path))) continue;
+      doneX.add(path);
+      // read as source here, so not again below as a view a load names
+      viewed.delete(path);
+      analyzeFile(f, reachable.has(path) || reachedX.has(path));
+      more = true;
+    }
+
+    for (; qx < queueX.length; qx++) {
+      const path = queueX[qx] ?? "";
+      const f = byPath.get(path);
+
+      if (!f || seen.has(path) || doneX.has(path)) continue;
+      doneX.add(path);
+      analyzeFile(f, true);
+      more = true;
+    }
+
+    for (const path of [...viewed.keys(), ...plainRead.keys()]) {
+      if (!loadedAnywhere.has(path) && !runsAsCode.has(path)) continue;
+      const v = viewed.get(path) ?? plainRead.get(path);
+
+      viewed.delete(path);
+      plainRead.delete(path);
+
+      if (v === undefined) continue;
+      runsAsCode.add(path);
+      exposedOnly.delete(path);
+      analyzeFile(v.f, v.reached || reachable.has(path) || reachedX.has(path));
+      more = true;
+    }
+  }
+
+  layer = "production";
+
   // scoring weighs every fact of every file, every edge between files and every piece of evidence
   charge("score", [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0));
 
-  const assessed = inPhase("score", () => assess({
-    found,
-    fileFacts,
+  const assessInput = {
     edges,
     // every lifecycle script that runs on the installing machine: install hooks, and prepare, prepack and postpack,
     // which npm runs when it installs a package from git
     installRoots: [...installRunsOf(hookCommands, byPath), ...(gyp ? [gyp.path] : [])],
+    // production's binaries (a native name, ELF's magic) and every executable whose structure parses
     installBinaries: installRunsOf(hookCommands, byPath).filter((p) => {
       const f = byPath.get(p);
 
-      return f !== undefined && isBinary(f);
+      return f !== undefined && (nativeBefore(f.path, f.data) || isBinary(f));
     }),
     reached: reachable,
     rawFiles,
     flowStopped,
     crossStopped: cross.exhausted,
     hookEvidence,
+    resourceStopped: productionStopped,
     gyp: gyp !== undefined,
     binPaths: new Set(entryPoints(manifest).flatMap((e) => (e.field.startsWith("bin") ? [joinPath("", e.path)] : []))),
     declaration: declarationOf(manifest),
-  }));
+  };
+
+  // production's walk, assessed on its own: every file read as production read it, so this is production's assessment
+  // (round 14 review of e2b3b8e, P1: assessed with a binary's NUL-deleted view, a distant dump took the place of a nearby
+  // harvest, and 62 (C) became 97 (A); round 15 review of c139b5b, P1: a file read again as code replaced the facts its
+  // plain reading gave, and a stand-in changed which reader a file got, and 35 (F) became 97 (A))
+  const production = inPhase("score", () => assess({ ...assessInput, found, fileFacts }));
+  const extras = extraAdds.length > 0 || extraFacts.size > 0 || extraFlows.size > 0 || extraEdges.size > 0 || extraRaw.size > 0 || extraFlowStopped.size > 0 || viewExtras.length > 0 || reachedX.size > 0 || resourceStopped !== productionStopped;
+  // then with what the extra layer and the NUL-deleted views add, of which only what it adds is taken: a signal
+  // production's assessment lacks. Nothing production's assessment concluded is removed or changed, so the score is
+  // never above it, and the verdict never looser
+
+  const assessed = !extras
+    ? production
+    : withExtras(
+        production,
+        inPhase("score", () => {
+          const more = found.clone();
+          // a piece of evidence the extra layer read at a line production's reading cites already for that signal adds
+          // nothing (the same text read again, perhaps with a stand-in shown: round 15 review, P3)
+          const cited = new Set<string>();
+
+          for (const id of new Set(extraAdds.map((x) => x.id))) {
+            const got = found.get(id);
+
+            for (const ev of [...(got?.evidence ?? []), ...(got?.possible ?? [])]) {
+              const at = evidenceAt(ev);
+
+              if (at) cited.add(`${id} ${at.file}:${at.line}`);
+            }
+          }
+
+          for (const x of extraAdds) {
+            const at = evidenceAt(x.ev);
+
+            if (!at || !cited.has(`${x.id} ${at.file}:${at.line}`)) more.add(x.id, x.ev, x.confidence, x.cited);
+          }
+
+          for (const x of viewExtras) for (const f of x.findings) more.add(f.id, describeFinding(x.path, f), f.confidence, citedAs(f));
+          const facts = new Map<string, Fact[]>([...productionFacts].map(([path, list]) => [path, [...list]]));
+
+          for (const [path, list] of extraFacts) facts.set(path, [...(facts.get(path) ?? []), ...list]);
+
+          for (const x of viewExtras) facts.set(x.path, [...(facts.get(x.path) ?? []), ...x.facts]);
+          const flows = new Map(fileFlows);
+
+          for (const [path, x] of extraFlows) flows.set(path, { flows: [...(flows.get(path)?.flows ?? []), ...x.flows], exports: flows.get(path)?.exports ?? x.exports });
+          const both = inPhase("cross-file", () => addFlowFacts(flows, facts, byPath, input.maxCrossFileSteps));
+
+          for (const why of both.cut) more.add("incomplete", why);
+
+          if (both.cross.exhausted) more.add("incomplete", `flows across files: stopped at the work budget (${input.maxCrossFileSteps ?? MAX_CROSS_FILE_STEPS} steps), so values one file gives another were not all followed`);
+          const allEdges = new Map([...edges].map(([from, to]) => [from, new Set(to)]));
+
+          for (const [from, to] of extraEdges) allEdges.set(from, new Set([...(allEdges.get(from) ?? []), ...to]));
+
+          const installRunsX = installRunsOf(hookCommands, byPath, scriptTargets);
+
+          return assess({
+            ...assessInput,
+            // what install hooks run as the second layer reads them
+            installRoots: [...new Set([...assessInput.installRoots, ...installRunsX])],
+            installBinaries: [
+              ...new Set([
+                ...assessInput.installBinaries,
+                ...installRunsX.filter((p) => {
+                  const f = byPath.get(p);
+
+                  return f !== undefined && (nativeBefore(f.path, f.data) || isBinary(f));
+                }),
+              ]),
+            ],
+            found: more,
+            fileFacts: facts,
+            edges: allEdges,
+            reached: new Set([...reachable, ...reachedX]),
+            rawFiles: new Set([...rawFiles, ...extraRaw]),
+            flowStopped: new Set([...flowStopped, ...extraFlowStopped]),
+            crossStopped: cross.exhausted || both.cross.exhausted,
+            resourceStopped,
+          });
+        }),
+      );
 
   const signals = assessed.signals;
 
@@ -1858,6 +2633,51 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   };
 }
 
+/**
+ * Production's assessment, and of `more` (the same with what the NUL-deleted views added) only what production's lacks:
+ * a signal it does not have, which costs points, and a capability it does not list. Every signal production's
+ * assessment has stays as it gave it, so the score is never above production's and the verdict never looser, whatever
+ * the second views hold.
+ */
+function withExtras(production: Assessed, more: Assessed): Assessed {
+  const had = new Set(production.signals.map((s) => s.id));
+  const added = more.signals.filter((s) => !had.has(s.id) && s.points < 0);
+  const listed = new Set(production.capabilities.map((c) => c.id));
+  const stronger = more.signals.find((s) => s.id === "incomplete");
+
+  // production's signals first, in its order, as it gave them, except that an `incomplete` the second reading stopped
+  // for its resources (-100) raises production's (-61) and adds its reasons; what the second views add after
+  return {
+    signals: [...production.signals.map((s) => (s.id === "incomplete" && stronger !== undefined ? strongerIncomplete(s, stronger) : s)), ...added],
+    capabilities: [...production.capabilities, ...more.capabilities.filter((c) => !listed.has(c.id))],
+    declaration: production.declaration,
+  };
+}
+
+/**
+ * Production's `incomplete`, raised to `stronger`'s points when those are lower (a reading the extra layer stopped for its
+ * resources scores 0: round 16 review of c272202, P2), with both readings' reasons: production's as it gave them, after
+ * the reasons only the extra layer has, so the reason it stopped is among what every surface shows.
+ */
+function strongerIncomplete(had: Signal, stronger: Signal): Signal {
+  if (stronger.points >= had.points) return had;
+  const kept = [...had.evidence, ...(had.more ?? [])];
+  const theirs = [...stronger.evidence, ...(stronger.more ?? [])].filter((e) => !kept.includes(e));
+  const all = [...theirs, ...kept];
+  const out = keepRest({ id: had.id, label: had.label, points: stronger.points, evidence: all.slice(0, SHOWN_EVIDENCE), confidence: had.confidence }, all);
+
+  if (had.fallback !== undefined) out.fallback = had.fallback;
+  const uncounted = (had.uncounted ?? 0) + (stronger.uncounted ?? 0);
+
+  // evidence either reading counted and did not keep stays counted, and every source either cited stays on record
+  if (uncounted > 0) {
+    out.uncounted = (out.uncounted ?? 0) + uncounted;
+    out.sources = [...new Set([...(out.sources ?? all.map(citedSource)), ...(had.sources ?? []), ...(stronger.sources ?? [])])];
+  }
+
+  return out;
+}
+
 // ---------- apm-score-v10: code held as text, and flows across files ----------
 
 /** How deep code held as text is read (code in a string that runs code in a string), and how much of it per file. */
@@ -1873,7 +2693,124 @@ const HELD_NOTES: Record<ExecutedCode["origin"], string> = {
 };
 
 /** The facts a string that only holds code adds: what it would do that malware does, not what it can do. */
-const HELD_RISKS: ReadonlySet<Fact["kind"]> = new Set(["env-dump", "credential-read", "credential-near", "remote-shell", "fetched-code", "capture-endpoint"]);
+const HELD_RISKS: ReadonlySet<Fact["kind"]> = new Set(RISK_FACT_KINDS);
+
+
+
+/** Paths a shell script's commands may run: after an interpreter or `.`/`source`, and every word that could name a file. */
+function shellWords(text: string): ShellWords {
+  // each list at most MAX_SHELL_TOKENS: a script's whole text is read for them (round 12: a 4 MB quoted word ended the
+  // isolate where production, which never read a script's words this way, also did, though elsewhere). Past that the
+  // walk is cut, and says so (round 13 review of d594415, P2: 100,010 commands before `sh ./payload.node` scored 90,
+  // complete, where 99,000 scored 0)
+  const lists = [scriptTargetsWithin(text, MAX_SHELL_TOKENS), commandWordsWithin(text, MAX_SHELL_TOKENS), shellTokens(text)];
+  const words = lists.flatMap((l) => l.words);
+
+  charge("score", words.length);
+
+  return { kind: lists.some((l) => l.kind === "cut") ? "cut" : "complete", words };
+}
+
+/** Characters that end a shell word outside quotes. */
+const SHELL_BREAK = new Set([" ", "\t", "\n", "\r", ";", "&", "|", "(", ")", "<", ">"]);
+
+/** At most this many words are read from one script: more is not a real install script, and bounds the walk. */
+const MAX_SHELL_TOKENS = 100_000;
+
+/** The longest word that can name a file (PATH_MAX): one longer is let go as it is read, never built whole. */
+const MAX_SHELL_WORD = 4096;
+
+/**
+ * The words a shell would see in `text`, quotes removed (`"lib/pay load.txt"`, `'a b'`, `lib/pay\ load.txt`), comments
+ * left out. A word whose value depends on the run (a `$` expansion, a backtick, an unquoted glob) cannot be resolved
+ * here and is left out: it adds nothing, and takes nothing away.
+ */
+export function shellTokens(text: string): ShellWords {
+  const out: string[] = [];
+  let cut = false;
+  let word = "";
+  let long = false;
+  let has = false;
+  let open = false;
+  let quote: "'" | '"' | null = null;
+
+  // a word is built a character at a time: past MAX_SHELL_WORD it names no file, and is let go
+  const put = (c: string): void => {
+    if (word.length < MAX_SHELL_WORD) word += c;
+    else long = true;
+  };
+
+  const end = (): void => {
+    if (has && !open && !long && word.length > 0) {
+      if (out.length < MAX_SHELL_TOKENS) out.push(word);
+      else cut = true;
+    }
+
+    word = "";
+    long = false;
+    has = false;
+    open = false;
+  };
+
+  chargeText("score", text.length, 2);
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i] ?? "";
+
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      else put(c);
+      continue;
+    }
+
+    if (c === "\\" && i + 1 < text.length) {
+      const next = text[++i] ?? "";
+
+      // a backslash before a newline joins the lines; before anything else it quotes it
+      if (next !== "\n") {
+        put(next);
+        has = true;
+      }
+
+      continue;
+    }
+
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      else {
+        if (c === "$" || c === "`") open = true;
+        put(c);
+      }
+
+      continue;
+    }
+
+    if (c === "'" || c === '"') {
+      quote = c;
+      has = true;
+      continue;
+    }
+
+    if (c === "#" && !has) {
+      while (i < text.length && text[i] !== "\n") i++;
+      end();
+      continue;
+    }
+
+    if (SHELL_BREAK.has(c)) {
+      end();
+      continue;
+    }
+
+    if (c === "$" || c === "`" || c === "*" || c === "?" || c === "[" || (c === "~" && !has)) open = true;
+    put(c);
+    has = true;
+  }
+
+  end();
+
+  return { kind: cut ? "cut" : "complete", words: out };
+}
 
 /** At most this many flow facts of one kind per file. */
 const MAX_FLOW_FACTS = 40;
@@ -2001,6 +2938,8 @@ function addFlowFacts(fileFlows: ReadonlyMap<string, { flows: readonly FlowFindi
 
 type AssessInput = {
   found: Found;
+  /** A reading stopped for its resources (analyze, resourceStopped): `incomplete` then costs every point. */
+  resourceStopped: boolean;
   fileFacts: ReadonlyMap<string, readonly Fact[]>;
   /** The files each file loads by a path apm resolved. */
   edges: ReadonlyMap<string, ReadonlySet<string>>;
@@ -2129,6 +3068,11 @@ function assess(input: AssessInput): Assessed {
   const unfinished = found.get("incomplete");
 
   if (unfinished || stops.length > 0) put("incomplete", [...stops, ...(unfinished?.evidence ?? [])], unfinished?.confidence, unfinished?.possible);
+  const stoppedForResources = risks.get("incomplete");
+
+  // what a reading stopped for its resources did not read could cost more than 61 points: it scores 0, its findings
+  // kept as evidence, so it is never above production's reading of the whole (round 13 review of d594415, P2)
+  if (stoppedForResources && input.resourceStopped) stoppedForResources.points = -100;
 
   // v9's non-code signals keep their ids; their points are v10's
   for (const id of ["install-download", "git-install-script", "risky-dependency", "typosquat", "install-script", "unanalyzed-files", "new-publisher", "new-dependency", "dynamic-require", "no-license"] as const) {

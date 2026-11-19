@@ -1,5 +1,9 @@
 export * from "./tarball.ts";
 
+export * from "./executable.ts";
+
+export * from "./binary-text.ts";
+
 export * from "./names.ts";
 
 export * from "./secrets.ts";

@@ -1,5 +1,5 @@
 {
-  "//": "What production (origin/main, 1cfc60a) parses in a stored analysis: its signal ids, coverage reasons, skip reasons, capability ids and current scorer. packages/core/test/production-parser.test.ts holds the branch to it, so a report this branch writes still parses after a rollback, and checks it against origin/main itself when that ref is present. Update it only when main ships a new list.",
+  "//": "What production (origin/main, 1cfc60a) parses in a stored analysis: its signal ids, coverage reasons, skip reasons, capability ids, current scorer and every scorer name its parser reads (parsedScorers: a build may write a scorer name only once production reads it). packages/core/test/production-parser.test.ts holds the branch to it, so a report this branch writes still parses after a rollback, and checks it against origin/main itself when that ref is present. Update it only when main ships a new list.",
   "signalIds": [
     "install-script",
     "shell-exec",
@@ -55,5 +55,8 @@
     "native",
     "install"
   ],
-  "scorer": "apm-score-v11"
+  "scorer": "apm-score-v11",
+  "parsedScorers": [
+    "apm-score-v11"
+  ]
 }

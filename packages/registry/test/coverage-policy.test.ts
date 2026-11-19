@@ -2,7 +2,8 @@
 // 98. Every install path checks coverage apart from the score: the install warning (resolve, scan, the Bun scanner,
 // apm add), strict mode, ~safe and scan's policy (policyBlock), and a staged publish's approval.
 import { describe, expect, test } from "bun:test";
-import { analyze, finalize, PREVIOUS_SCORER, unfinishedAnalysis, type Analysis, type TarEntry } from "@apm/core";
+import { analyze, finalize, PREVIOUS_SCORER, readingOf, unfinishedAnalysis, type Analysis, type TarEntry } from "@apm/core";
+import { machO } from "../../core/test/executables.ts";
 import { keptLatestScore, policyBlock, DEFAULT_POLICY } from "../src/apm.ts";
 import { typedConfirmationReason } from "../src/approval.ts";
 import type { VersionRecord } from "../src/db.ts";
@@ -92,4 +93,28 @@ describe("the home page's kept scores while the current scorer catches up", () =
     expect(keptLatestScore(kept, none, "3.10.2")).toEqual(none);
     expect(keptLatestScore(kept, none, null)).toEqual(none);
   });
+});
+
+// Round 12 review of 7cd0b2b, P2: a binary's reading that passed what it may keep was reported as a file left unread for
+// the budget, its findings dropped: 100 (P), which a partial reading's policy lets through. It keeps what it found and
+// is incomplete: every install path holds it.
+describe("a binary's reading that stopped at what it may hold is incomplete, not a budget omission", () => {
+  const dense = (): Analysis => {
+    const m = { name: "big", version: "1.0.0", license: "MIT" };
+    const data = machO({ size: 256, tail: enc.encode(`\n${"'child_'+'process';\n".repeat(60_000)}`) });
+
+    return analyze({ name: "big", manifest: m, files: [entry("package.json", JSON.stringify(m)), { path: "lib/b000000", size: data.length, mode: 0o755, data }], publisher: "a", previousPublishers: [] });
+  };
+
+  test("its findings count, it reads as incomplete, and scan's policy, strict mode and ~safe refuse it", () => {
+    const a = dense();
+    const r = report(a);
+
+    // production (274d284): 65 (C), complete. A reading stopped for its resources scores 0 (round 13 review of d594415)
+    expect(r.score).toBe(0);
+    expect(r.coverage).toEqual({ kind: "complete" });
+    expect(readingOf(a)).toEqual({ kind: "incomplete", why: "signal" });
+    expect(policyBlock(version(a), DEFAULT_POLICY, AT)).toMatch(/^score 0\/100 is below 40 \(incomplete/);
+    expect(scoreWarning({ name: "big", version: "1.0.0", report: r, floor: 40, url: "", via: [] })?.kind).toBe("incomplete");
+  }, 60_000);
 });

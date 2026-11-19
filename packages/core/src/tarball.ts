@@ -2,6 +2,7 @@
 // Every header is validated and every limit is enforced, so a hostile archive gets a typed
 // error, never a hang or an unbounded allocation.
 import { gunzipSync } from "node:zlib";
+import { EXECUTABLE_HEAD_BYTES, hasExecutableMagic } from "./executable.ts";
 import { chargeText, metered, MeterExhausted, type Meter } from "./meter.ts";
 
 export type TarEntry = { path: string; size: number; mode: number; data: Uint8Array };
@@ -262,8 +263,9 @@ function paxPathOf(data: Uint8Array, at: number): string | null {
 // A tarball too large to hold (next 16.4.6 is 43.7 MB and unpacks to 192 MB; a Worker has 128 MB) is inflated and read a
 // chunk at a time. Every file passes through; the caller's rule decides, from its path and size alone, which ones are
 // kept whole, and which are gathered only to be looked at (the paths a file imports, say) and then let go. Of every file
-// not kept only its first HEAD_BYTES are kept, which is all the checks of a file's first bytes read (score.ts's isBinary
-// and isBinaryData). The headers are read exactly as readTar reads them: the same checksum,
+// not kept only its first HEAD_BYTES are kept, which is all the checks of a file's first bytes read (score.ts's
+// isBinaryData), or EXECUTABLE_HEAD_BYTES of one that starts like an executable, enough to check its structure
+// (executable.ts). The headers are read exactly as readTar reads them: the same checksum,
 // size, PAX, GNU long-name, type and path rules, the same limits and the same charges to the meter, so a held file is
 // the bytes readTar would give for it (test/tarball-stream.test.ts holds the two to each other on random chunkings).
 
@@ -314,7 +316,9 @@ export type TarStreamOptions = { readonly memory?: StreamMemory; readonly expect
 
 /**
  * A streamed read's files, in archive order, as readTar would give them, except that a file the read did not hold has
- * only its first HEAD_BYTES in `data` (its `size` is still its whole size). `notHeld` holds exactly those entries.
+ * only its first HEAD_BYTES in `data` (its `size` is still its whole size). `notHeld` holds exactly those entries: as
+ * in production (274d284), nothing of their text is read (round 11 review of ee69d23: reading the text of binaries the
+ * read did not hold, as they passed, read files production never read, and three of them ended the isolate).
  */
 export type StreamedTarball = { files: TarEntry[]; notHeld: ReadonlySet<TarEntry>; unpackedBytes: number; charged: number };
 
@@ -335,7 +339,7 @@ type Pending =
   | { kind: "header" }
   // a file entry's bytes: all of them when held, else the first HEAD_BYTES
   // `name`: the header's own name field, which readTar's errors quote
-  | { kind: "file"; entry: TarEntry; name: string; keep: Keep; gathered: Uint8Array | null; left: number; pad: number }
+  | { kind: "file"; entry: TarEntry; name: string; keep: Keep; gathered: Uint8Array | null; left: number; pad: number; probed: boolean }
   // a GNU long name or a PAX header, held whole to be read once its last byte is in
   | { kind: "meta"; type: "L" | "x"; name: string; buf: Uint8Array; at: number; left: number; pad: number }
   // bytes passed over: `required`, another entry type's data, which must all arrive; then `pad`, which may be cut short
@@ -364,6 +368,7 @@ export class TarStream {
   private charged = 0;
   private readonly memory: StreamMemory;
   private readonly expect: readonly ListedEntry[] | null;
+
 
   constructor(
     private readonly hold: HoldRule,
@@ -414,6 +419,16 @@ export class TarStream {
 
           if (p.gathered !== null) p.gathered.set(chunk.subarray(at, at + n), written);
           else if (written < p.entry.data.length) p.entry.data.set(chunk.subarray(at, at + Math.min(n, p.entry.data.length - written)), written);
+
+          // an unheld file that starts like an executable keeps EXECUTABLE_HEAD_BYTES, so its structure can be checked
+          // (executable.ts): a magic number alone does not make a file native code
+          if (!p.probed && written + n >= Math.min(4, p.entry.size)) {
+            p.probed = true;
+            const head = p.gathered ?? p.entry.data;
+
+            if (hasExecutableMagic(head)) this.keepHead(p, chunk.subarray(at, at + n), written);
+          }
+
           p.left -= n;
           at += n;
 
@@ -565,7 +580,32 @@ export class TarStream {
     const gathered = held ? entry.data : keep === "look" ? new Uint8Array(size) : null;
 
     if (size === 0 && keep !== "head") this.look(entry, entry.data);
-    this.pending = size > 0 ? { kind: "file", entry, name, keep, gathered, left: size, pad } : { kind: "header" };
+    // a file held whole is read by the analysis itself; one of HEAD_BYTES or less is held whole too (its head is all of it)
+    this.pending = size > 0 ? { kind: "file", entry, name, keep, gathered, left: size, pad, probed: held } : { kind: "header" };
+  }
+
+  /**
+   * Grows what an unheld file keeps from HEAD_BYTES to EXECUTABLE_HEAD_BYTES, charged first: `part` is the chunk's
+   * bytes of the file from offset `written`. A gathered file is copied into it once it has all arrived.
+   */
+  private keepHead(p: Extract<Pending, { kind: "file" }>, part: Uint8Array, written: number): void {
+    const old = p.entry.data;
+    const grown = new Uint8Array(Math.min(p.entry.size, EXECUTABLE_HEAD_BYTES));
+
+    if (grown.length <= old.length) return;
+    chargeText("tar", grown.length - old.length);
+    this.take(grown.length - old.length);
+    grown.set(old);
+
+    if (p.gathered === null) {
+      // the chunk's bytes past what the first HEAD_BYTES already hold
+      const from = Math.max(written, old.length);
+      const to = Math.min(written + part.length, grown.length);
+
+      if (to > from) grown.set(part.subarray(from - written, to - written), from);
+    }
+
+    p.entry.data = grown;
   }
 
   private readMeta(p: Extract<Pending, { kind: "meta" }>): void {

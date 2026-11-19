@@ -36,6 +36,7 @@ import { SEED_INTAKE_MAX, SEED_INTAKE_WINDOW_MS } from "./seeding.ts";
 import { QueueError, type BlobError, type StoreError } from "./errors.ts";
 import { digestLabel, digestOf, Upstream, type Digest, type UpstreamPackage } from "./upstream.ts";
 import { timed, timingOrNull } from "./timing.ts";
+import { upstreamPublishers } from "./publishers.ts";
 import { analyzeStreamedTarball, type StreamedAnalysis } from "./streamed-analysis.ts";
 import { WORKER_CPU_MS } from "../scripts/compat.ts";
 
@@ -263,10 +264,9 @@ function analyzeOrThrow(pkg: UpstreamPackage, v: VersionRecord, bytes: Uint8Arra
     }
   }
 
-  const earlier = pkg.versions.filter((x) => x.published_at < v.published_at);
-  const previousPublishers = [...new Set(earlier.map((x) => x.published_by))];
+  const publishers = upstreamPublishers(pkg.versions, v);
 
-  const analysis = analyze({ name: pkg.name, manifest, files, publisher: v.published_by, previousPublishers, maxScannedBytes: plan.maxScannedBytes, incompleteBecause: plan.incompleteBecause, meter });
+  const analysis = analyze({ name: pkg.name, manifest, files, ...publishers, maxScannedBytes: plan.maxScannedBytes, incompleteBecause: plan.incompleteBecause, meter });
 
   return { kind: "scored", analysis, spent: meter.exhausted !== null };
 }

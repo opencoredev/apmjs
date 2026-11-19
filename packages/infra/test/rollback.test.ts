@@ -209,9 +209,10 @@ describe("migration markers", () => {
     const ids = files.map((m) => m.id);
 
     expect(unsafeMigrations(ids)).toEqual(files.filter((m) => !isRollbackSafe(m.sql)).map((m) => m.id));
-    // the first migrations predate the marker and stay unsafe; a marked one (0024, 0028) is not
+    // the first migrations predate the marker and stay unsafe; a marked one (0024, 0025, 0028) is not
     expect(unsafeMigrations(["0001_registry"])).toEqual(["0001_registry"]);
     expect(unsafeMigrations(["0024_seeding"])).toEqual([]);
+    expect(unsafeMigrations(["0025_rescore_ts_darwin"])).toEqual([]);
     expect(unsafeMigrations(["0028_ai_review_switch"])).toEqual([]);
     expect(unsafeMigrations(["9999_unknown"])).toEqual(["9999_unknown"]);
   });
@@ -552,8 +553,14 @@ describe("the schema check", () => {
     deployments.set("apmjs-registry-production", [dep("r9", "rv3", "2026-11-17T00:00:00Z"), dep("r8", "rv1", "2026-11-16T23:00:00Z"), ...(deployments.get("apmjs-registry-production") ?? [])]);
 
     expect(await check("rv1")).toEqual({ kind: "unsafe", ids: [NEWEST] });
-    // production's build before this one has 0026 and 0028 and not 0024, which sorts below them: it can be gone back to
-    expect(await migrationCheck({ manifests: [{ version: "rv-before-0024", migrations: ALL.filter((id) => id !== "0024_seeding") }], ledger: () => ledgerOf(db.url) })).toEqual({ kind: "ok", extra: ["0024_seeding"] });
+    // production's build (everything but 0025) goes back with 0025 named, and one from before 0024 with 0024 and 0025
+    const without = (...gone: string[]) => ALL.filter((id) => !gone.includes(id));
+
+    expect(await migrationCheck({ manifests: [{ version: "rv-production", migrations: without("0025_rescore_ts_darwin") }], ledger: () => ledgerOf(db.url) })).toEqual({ kind: "ok", extra: ["0025_rescore_ts_darwin"] });
+    expect(await migrationCheck({ manifests: [{ version: "rv-before-0024", migrations: without("0024_seeding", "0025_rescore_ts_darwin") }], ledger: () => ledgerOf(db.url) })).toEqual({ kind: "ok", extra: ["0024_seeding", "0025_rescore_ts_darwin"] });
+    // 274d284's build (migrations through 0023) is refused once main's 0026, which has no marker, is applied: 0024, 0025
+    // and 0028 are marked, and are not what stops it (round 5 review of 535a5b5, P2)
+    expect(await migrationCheck({ manifests: [{ version: "rv-274d284", migrations: ALL.filter((id) => id <= "0023_scorer_rollout") }], ledger: () => ledgerOf(db.url) })).toEqual({ kind: "unsafe", ids: ["0026_retry_upstream_404"] });
   });
 
   test("an applied migration outside the manifest is checked wherever it sorts: one added later with a lower number is refused", async () => {

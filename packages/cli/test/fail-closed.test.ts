@@ -3,7 +3,8 @@
 // scorer, finalize and the CLI's verdict, end to end (the website's verdict answers the same: explain-verdicts.json).
 import { describe, expect, test } from "bun:test";
 import { analyze, finalize, type AnalyzeInput } from "../../core/src/index.ts";
-import { explain, type ResolvedInput } from "../src/explain.ts";
+import { explain, readingOf, type ResolvedInput } from "../src/explain.ts";
+import { machO } from "../../core/test/executables.ts";
 
 const enc = new TextEncoder();
 const entry = (path: string, text: string) => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
@@ -64,4 +65,26 @@ describe("fail-closed: an incomplete analysis is review-first unless its one gap
     expect(v.summary).toContain("apm read only part of probe-pkg@1.0.0: 1 file");
     expect(v.notes.map((n) => n.kind)).toContain("partial-analysis");
   });
+});
+
+// Round 12 review of 7cd0b2b, P2: one Mach-O of 60,000 lines of `'child_'+'process';` passed what one binary's reading
+// may keep, and its findings were dropped and the file reported unread for the budget: 100 (P), which installs, where
+// production (274d284) scored 65 (C), complete. Its reading keeps every signal it finds and says it did not finish.
+describe("a binary's reading that stopped at what it may hold: never higher than production, never installed", () => {
+  test("60,000 lines of 'child_'+'process' in one Mach-O: at most production's 65, review-first", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT" };
+    const data = machO({ size: 256, tail: enc.encode(`\n${"'child_'+'process';\n".repeat(60_000)}`) });
+    const files = [entry("package.json", JSON.stringify(manifest)), { path: "lib/b000000", size: data.length, mode: 0o755, data }];
+    const report = finalize(analyze({ name: manifest.name, manifest, files, publisher: "fake", previousPublishers: [] }), STATE);
+    const resolved: ResolvedInput = { kind: "ok", version: "1.0.0", report, skipped: [], deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "off" }, warnings: [], risks: [] } };
+    const v = explain({ name: "probe-pkg", range: null, resolved, review: { kind: "off" }, older: { kind: "not-needed" } });
+
+    // production (274d284): 65 (C), complete; on 7cd0b2b: 100 (P), partial, which installs
+    expect(report.score).toBeLessThanOrEqual(65);
+    expect(report.signals.map((s) => s.id)).toEqual(expect.arrayContaining(["obfuscated", "suspicious-combination", "incomplete"]));
+    // not a size or budget omission: nothing is left out, and the reading is incomplete
+    expect(report.coverage).toEqual({ kind: "complete" });
+    expect(readingOf({ scorer: report.scorer, signals: report.signals, coverage: report.coverage ?? null })).toEqual({ kind: "incomplete" });
+    expect(v.verdict).toBe("review-first");
+  }, 60_000);
 });

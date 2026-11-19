@@ -1,0 +1,3895 @@
+[
+ {
+  "name": "same line, plain and joined credential, network",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 1)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 2)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 3)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 4)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 5)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 6)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 7)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 8)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 9)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 10)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 11)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 12)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 13)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 14)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 15)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 16)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 17)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 18)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 19)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 20)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 21)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 22)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 23)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 24)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential, network (NULs 25)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 1)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 2)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 3)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 4)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 5)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 6)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 7)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 8)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 9)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 10)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 11)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 12)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 13)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 14)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 15)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 16)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 17)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 18)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 19)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 20)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 21)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 22)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 23)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 24)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined credential (NULs 25)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 1)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 2)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 3)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 4)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 5)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 6)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 7)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 8)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 9)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 10)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-mention",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 11)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 12)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 13)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 14)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 15)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 16)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 17)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 18)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 19)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 20)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 21)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-mention",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 22)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 23)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 24)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "same line, plain and joined names of three kinds (NULs 25)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 1)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 2)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 3)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 4)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 5)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 6)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 7)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 8)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 9)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 10)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 11)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 12)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 13)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 14)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 15)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 16)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 17)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 18)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 19)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 20)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 21)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 22)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 23)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 24)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "two lines, plain then joined (NULs 25)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 1)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 2)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 3)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 4)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 5)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 6)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 7)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 8)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 9)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 10)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "decoded and plain on one line (NULs 11)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "decoded and plain on one line (NULs 12)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 13)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 14)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 15)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 16)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 17)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 18)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 19)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 20)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 21)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "decoded and plain on one line (NULs 22)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "decoded and plain on one line (NULs 23)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 24)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "decoded and plain on one line (NULs 25)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 1)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 2)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 3)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 4)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 5)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 6)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 7)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 8)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 9)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 10)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 11)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 12)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 13)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 14)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 15)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 16)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 17)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 18)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 19)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 20)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "escaped and plain on one line (NULs 21)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 22)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 23)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 24)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "escaped and plain on one line (NULs 25)",
+  "score": 65,
+  "coverage": "complete",
+  "risks": [
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 1)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 2)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 3)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 4)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 5)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 6)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 7)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 8)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 9)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 10)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 11)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 12)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 13)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 14)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 15)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 16)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 17)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 18)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 19)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 20)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 21)",
+  "score": 50,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 22)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 23)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 24)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ],
+  "ids": [
+   "credential-read",
+   "obfuscated",
+   "suspicious-combination"
+  ]
+ },
+ {
+  "name": "hidden in a comment and in code (NULs 25)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 1)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 2)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 3)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 4)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 5)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 6)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 7)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 8)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 9)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 10)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 11)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 12)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 13)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 14)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 15)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 16)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 17)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 18)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 19)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 20)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 21)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 22)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 23)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 24)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "three-family harvest beside the network (NULs 25)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "a download piped to a shell",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 1)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 2)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 3)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 4)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 5)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 6)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 7)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "a download piped to a shell (NULs 8)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 9)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 10)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 11)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 12)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 13)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 14)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 15)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 16)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 17)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 18)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "a download piped to a shell (NULs 19)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 20)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 21)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 22)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 23)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 24)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "a download piped to a shell (NULs 25)",
+  "score": 39,
+  "coverage": "complete",
+  "risks": [
+   "remote-shell"
+  ],
+  "ids": [
+   "remote-shell"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 1)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 2)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 3)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 4)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 5)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 6)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 7)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 8)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 9)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 10)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 11)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 12)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 13)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 14)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 15)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 16)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 17)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 18)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 19)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 20)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 21)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 22)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 23)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 24)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a three-family harvest beside the network (NULs 25)",
+  "score": 62,
+  "coverage": "complete",
+  "risks": [
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-mention",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 1)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 2)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 3)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 4)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 5)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 6)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 7)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 8)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 9)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 10)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 11)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 12)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 13)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 14)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 15)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 16)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 17)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 18)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 19)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 20)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 21)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 22)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 23)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 24)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a distant dump, then a credential read beside the network (NULs 25)",
+  "score": 35,
+  "coverage": "complete",
+  "risks": [
+   "credential-read",
+   "exfiltration"
+  ],
+  "ids": [
+   "credential-read",
+   "exfiltration"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 1)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 2)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 3)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 4)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 5)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 6)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 7)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 8)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 9)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 10)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 11)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 12)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 13)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 14)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 15)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 16)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 17)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 18)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 19)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 20)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 21)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 22)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 23)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 24)",
+  "score": 97,
+  "coverage": "complete",
+  "risks": [],
+  "ids": [
+   "credential-mention"
+  ]
+ },
+ {
+  "name": "round 14: a credential name beside a marker (NULs 25)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 1)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 2)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 3)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 4)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 5)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 6)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 7)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 8)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 9)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 10)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 11)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 12)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 13)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 14)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 15)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 16)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 17)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 18)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 19)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 20)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 21)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 22)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 23)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 24)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ },
+ {
+  "name": "round 14: a process call beside a run marker (NULs 25)",
+  "score": 100,
+  "coverage": "complete",
+  "risks": [],
+  "ids": []
+ }
+]

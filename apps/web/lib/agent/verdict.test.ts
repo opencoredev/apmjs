@@ -323,6 +323,9 @@ describe("the risk rules", () => {
     expect(readingOf({ scorer: "apm-score-v11", signals: [], coverage: null }).kind).toBe("incomplete");
     expect(readingOf({ scorer: "apm-score-v10", signals: [], coverage: partial(["over-budget"]) }).kind).toBe("incomplete");
     expect(readingOf({ scorer: null, signals: [], coverage: partial(["over-budget"]) }).kind).toBe("incomplete");
+    // apm-score-v12 states coverage as v11 does: this build reads it before any registry writes it
+    expect(readingOf({ scorer: "apm-score-v12", signals: [], coverage: partial(["over-budget"]) })).toEqual({ kind: "partial", omittedFiles: 2, omittedBytes: 9 });
+    expect(readingOf({ scorer: "apm-score-v12", signals: [], coverage: null }).kind).toBe("incomplete");
   });
 
   test("isRisky: any risk signal that cost points, or a score under the floor", () => {

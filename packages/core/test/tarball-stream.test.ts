@@ -4,7 +4,9 @@
 // skipped, so the analysis is incomplete, and reads every other file exactly as it would from a tarball held whole.
 import { describe, expect, test } from "bun:test";
 import { gunzipSync } from "node:zlib";
-import { analyze, ArchiveError, firstPass, HEAD_BYTES, MAX_ANALYZED_FILE_BYTES, Meter, planReading, readTar, TarballInflater, TarStream, type Analysis, type HoldRule, type TarEntry } from "../src/index.ts";
+import { chargeOf } from "./scan-charge.ts";
+import { elf, machO } from "./executables.ts";
+import { analyze, ArchiveError, keptBytes, readingOf, EXECUTABLE_HEAD_BYTES, scanBinaryText, firstPass, hasExecutableMagic, HEAD_BYTES, MAX_ANALYZED_FILE_BYTES, Meter, planReading, readTar, TarballInflater, TarStream, type Analysis, type HoldRule, type TarEntry } from "../src/index.ts";
 
 type Spec = { name: string; data?: Uint8Array | string; type?: string; pax?: string; longName?: string };
 
@@ -113,13 +115,18 @@ function errorOf(fn: () => void): string {
   }
 }
 
-/** The same file, in the read and in readTar's: whole when held, else readTar's first HEAD_BYTES. */
+/**
+ * The same file, in the read and in readTar's: whole when held, else readTar's first HEAD_BYTES, or its first
+ * EXECUTABLE_HEAD_BYTES when it starts like an executable (so its structure can be checked, executable.ts).
+ */
 function expectSame(got: { files: TarEntry[]; notHeld: ReadonlySet<TarEntry> }, want: TarEntry[]): void {
   expect(got.files.map((f) => [f.path, f.size, f.mode])).toEqual(want.map((f) => [f.path, f.size, f.mode]));
   got.files.forEach((f, i) => {
     const w = want[i]?.data ?? new Uint8Array();
 
-    expect(Buffer.from(f.data).equals(Buffer.from(got.notHeld.has(f) ? w.subarray(0, HEAD_BYTES) : w))).toBe(true);
+    const head = hasExecutableMagic(w) ? EXECUTABLE_HEAD_BYTES : HEAD_BYTES;
+
+    expect(Buffer.from(f.data).equals(Buffer.from(got.notHeld.has(f) ? w.subarray(0, head) : w))).toBe(true);
   });
 }
 
@@ -134,6 +141,10 @@ const SPECS: Spec[] = [
   { name: "ignored", pax: `package/${"deep/".repeat(40)}pax.js`, data: "pax" },
   { name: "ignored", longName: `package/${"long/".repeat(30)}gnu.js`, data: "gnu" },
   { name: "package/bin.node", data: new Uint8Array([0x7f, 0x45, 0x4c, 0x46, ...Array.from({ length: 3000 }, () => 7)]) },
+  // past EXECUTABLE_HEAD_BYTES: an unheld one keeps only that much
+  { name: "package/lib/tool", data: new Uint8Array([0xcf, 0xfa, 0xed, 0xfe, ...Array.from({ length: 70_000 }, (_, i) => i % 251)]) },
+  // a magic of three bytes and a size of three: nothing to grow
+  { name: "package/lib/short", data: new Uint8Array([0xcf, 0xfa, 0xed]) },
 ];
 
 describe("TarStream reads what readTar reads", () => {
@@ -281,7 +292,8 @@ const PKG: TarEntry[] = [
   entry("prebuilt/addon.node", new Uint8Array([0x7f, 0x45, 0x4c, 0x46, ...Array.from({ length: 5000 }, () => 2)])),
 ];
 
-const run = (files: readonly TarEntry[], notHeld?: ReadonlySet<TarEntry>, maxScannedBytes?: number): Analysis => analyze({ name: "pkg", manifest, files, notHeld, publisher: "a", previousPublishers: [], maxScannedBytes });
+const run = (files: readonly TarEntry[], notHeld?: ReadonlySet<TarEntry>, maxScannedBytes?: number): Analysis =>
+  analyze({ name: "pkg", manifest, files, notHeld, publisher: "a", previousPublishers: [], maxScannedBytes });
 
 const incompleteOf = (a: Analysis): string[] => a.signals.find((s) => s.id === "incomplete")?.evidence ?? [];
 
@@ -290,6 +302,8 @@ describe("analyze over a streamed read", () => {
     const { files, notHeld } = withoutHolding(PKG, (f) => /\.(?:node|png|md)$/.test(f.path));
 
     expect(JSON.stringify(run(files, notHeld))).toBe(JSON.stringify(run(PKG)));
+    // with no read of their text, a native module and an image stay as production left them, never read: complete
+    expect(run(files, notHeld).coverage).toEqual({ kind: "complete" });
   });
 
   test("a reached file it does not hold is skipped, never read from its head, and makes coverage partial", () => {
@@ -379,5 +393,76 @@ describe("the reading plan", () => {
     expect(kinds).toEqual(["hold", "look", "hold", "hold", "head", "head"]);
     // and with a budget of one byte, package.json still
     expect(firstPass({ holdBytes: 1, lookFileBytes: 1 << 20, lookTotalBytes: 1 << 30 }).hold({ path: "package.json", size: 1800 })).toBe("hold");
+  });
+});
+
+// Round 11 review of ee69d23: a streamed read read the text of every binary it did not hold as it passed, files
+// production (274d284) never read (its plan held a Mach-O like any text file, within its budget, and left the rest
+// unread), and three of them ended the isolate. A streamed read now keeps nothing of a file it does not hold; the plan
+// holds a Mach-O as production's did, and the analysis reads that one whole. Round 9 review, P2: a file the views'
+// budget leaves out is reported at its size.
+describe("binaries in a streamed read, as production read them", () => {
+  const tail = enc.encode(`\n${"'child_'+'process';\n".repeat(200)}`);
+  const binaries = Array.from({ length: 12 }, (_, i) => ({ name: `lib/b${String(i).padStart(2, "0")}`, data: machO({ size: EXECUTABLE_HEAD_BYTES + 4096, tail }) }));
+  // each larger than the head a streamed read keeps of a Mach-O it does not hold
+  const SIZE = binaries[0]!.data.length;
+  const pkg = { name: "pkg", version: "1.0.0", license: "MIT" };
+  const bytes = tar([{ name: "package/package.json", data: JSON.stringify(pkg) }, ...binaries.map((b) => ({ name: `package/${b.name}`, data: b.data }))]);
+
+  const read = (hold: HoldRule) => {
+    const t = new TarStream(hold);
+
+    for (const c of chunks(bytes, rng(9), 4096)) t.push(c);
+
+    return t.end();
+  };
+
+  test("one the read did not hold is unread at its size, its text never read: the reading is partial", () => {
+    const got = read(({ path }) => (path === "package.json" ? "hold" : "head"));
+
+    expect(got.files.find((f) => f.path === binaries[0]!.name)?.data.length).toBe(EXECUTABLE_HEAD_BYTES);
+    const a = analyze({ name: "pkg", manifest: pkg, files: got.files, notHeld: got.notHeld, publisher: "a", previousPublishers: [] });
+
+    expect(a.coverage).toMatchObject({ kind: "partial", omittedFiles: 12, omittedBytes: 12 * SIZE });
+    // nothing of their text was read
+    expect(a.signals.find((s) => s.id === "obfuscated")).toBeUndefined();
+  });
+
+  test("one the read held is read whole, as the same file in a tarball held whole is", () => {
+    const got = read(() => "hold");
+    const streamed = analyze({ name: "pkg", manifest: pkg, files: got.files, notHeld: got.notHeld, publisher: "a", previousPublishers: [] });
+    const whole = analyze({ name: "pkg", manifest: pkg, files: readTar(bytes), publisher: "a", previousPublishers: [] });
+
+    expect(JSON.stringify(streamed)).toBe(JSON.stringify(whole));
+    expect(streamed.signals.find((s) => s.id === "obfuscated")).toBeDefined();
+  });
+
+  test("the plan holds a Mach-O in its turn and within its budget, as production's held it; never an ELF file or a native name", () => {
+    const linux = entry("lib/linux-tool", elf({ size: 4096 }));
+    const addon = entry("lib/addon.node", binaries[0]!.data);
+    const files = [entry("package.json", JSON.stringify(pkg)), ...binaries.slice(0, 3).map((b) => entry(b.name, b.data)), linux, addon];
+    const plan = planReading({ manifest: pkg, files, imports: new Map(), budget: 1 << 30 });
+
+    expect([...plan].sort()).toEqual(["lib/b00", "lib/b01", "lib/b02", "package.json"]);
+    // room for two: the third is passed over, as production's plan passed it over
+    const two = planReading({ manifest: pkg, files, imports: new Map(), budget: 2 * SIZE + 600 });
+
+    expect([...two].sort()).toEqual(["lib/b00", "lib/b01", "package.json"]);
+  });
+
+  // round 12 review of 7cd0b2b, P2: a view past the budget was dropped and its file reported unread for the budget
+  test("held views past the analysis's budget keep their signals, and the analysis says it did not finish", () => {
+    const one = scanBinaryText(binaries[0]!.data);
+    const each = one.kind === "read" ? keptBytes({ findings: one.findings, facts: one.facts }) : 0;
+    const a = analyze({ name: "pkg", manifest: pkg, files: readTar(bytes), publisher: "a", previousPublishers: [], maxKeptViewBytes: each + chargeOf(binaries[0]!.data) + each / 2 });
+    const whole = analyze({ name: "pkg", manifest: pkg, files: readTar(bytes), publisher: "a", previousPublishers: [] });
+
+    expect(a.coverage).toEqual({ kind: "complete" });
+    const stopped = a.signals.find((s) => s.id === "incomplete");
+
+    expect((stopped?.evidence.length ?? 0) + (stopped?.more?.length ?? 0)).toBe(10);
+    expect(readingOf(a).kind).toBe("incomplete");
+    // every signal the whole reading found, and incomplete besides
+    expect(a.signals.map((s): string => s.id).filter((id) => id !== "incomplete")).toEqual(whole.signals.map((s): string => s.id));
   });
 });

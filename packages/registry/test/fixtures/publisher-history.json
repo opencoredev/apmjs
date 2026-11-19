@@ -1,0 +1,365 @@
+{
+ "typescript": {
+  "name": "typescript",
+  "dist-tags": {
+   "rc": "7.0.1-rc",
+   "latest": "7.0.2"
+  },
+  "maintainers": [
+   {
+    "name": "microsoft1es"
+   },
+   {
+    "name": "typescript-bot"
+   },
+   {
+    "name": "weswigham"
+   },
+   {
+    "name": "andrewbranch"
+   },
+   {
+    "name": "typescript-deploys"
+   },
+   {
+    "name": "microsoft-oss-releases"
+   },
+   {
+    "name": "jakebailey"
+   }
+  ],
+  "time": {
+   "0.8.0": "2012-10-01T15:35:41.062Z",
+   "0.8.1": "2012-11-15T20:53:44.894Z",
+   "0.8.2": "2013-01-22T01:31:00.505Z",
+   "3.8.2": "2020-02-20T22:45:56.500Z",
+   "3.9.0-dev.20200221": "2020-02-21T18:55:27.361Z",
+   "5.9.3": "2025-09-30T21:19:38.784Z",
+   "6.0.3": "2026-04-16T23:38:27.905Z",
+   "7.0.1-rc": "2026-06-18T13:43:46.028Z",
+   "7.0.2": "2026-07-08T15:55:18.431Z",
+   "7.1.0-dev.20260710.1": "2026-07-10T08:20:21.522Z",
+   "7.1.0-dev.20261117.1": "2026-11-17T08:39:33.660Z"
+  },
+  "versions": {
+   "0.8.0": {
+    "name": "typescript",
+    "version": "0.8.0",
+    "_npmUser": {
+     "name": "typescript"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-0.8.0.tgz",
+     "shasum": "e1725d0ebd476eed6c38fda07fdf6942e0f22a0a",
+     "integrity": "sha512-t4DYxzL6Gt3+TRuJXtmh+3KfcY5iSM8J4lzUgfQkTOr78xFbmor79x/dQEGMaiqO2HJBbFGO3RlIaxPzpP5JMA=="
+    }
+   },
+   "0.8.1": {
+    "name": "typescript",
+    "version": "0.8.1",
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-0.8.1.tgz",
+     "shasum": "9499f7fe4f4e56010a8c14a5ca000eeb9b5dd4eb",
+     "integrity": "sha512-/cfem275IES0o4/zVD1UmXfE3k5j2OAianSI2Oa1gYzWhAJ44OjNlXv3LVIj5EZ0fgks/XBtzp8aXVsaYILTVg=="
+    }
+   },
+   "0.8.2": {
+    "name": "typescript",
+    "version": "0.8.2",
+    "_npmUser": {
+     "name": "typescript"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-0.8.2.tgz",
+     "shasum": "8894a39e4f27547973162bda165f88d57e7c9d5e",
+     "integrity": "sha512-rc182AVnpWJ2d6mSAjzALdgEZMJqtsAwPjogw7ch8NRa7iTD8vGG2YoZto1R5Bkt5xCXFcg5SrkRenYtI+poHQ=="
+    }
+   },
+   "3.8.2": {
+    "name": "typescript",
+    "version": "3.8.2",
+    "_npmUser": {
+     "name": "typescript"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-3.8.2.tgz",
+     "shasum": "91d6868aaead7da74f493c553aeff76c0c0b1d5a",
+     "integrity": "sha512-EgOVgL/4xfVrCMbhYKUQTdF37SQn4Iw73H5BgCrF1Abdun7Kwy/QZsE/ssAy0y4LxBbvua3PIbFsbRczWWnDdQ=="
+    }
+   },
+   "3.9.0-dev.20200221": {
+    "name": "typescript",
+    "version": "3.9.0-dev.20200221",
+    "_npmUser": {
+     "name": "typescript-bot"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-3.9.0-dev.20200221.tgz",
+     "shasum": "81a17712845fd3372fda96c7132bdf05eba96793",
+     "integrity": "sha512-J8MYk210amMLeWZosEJvvB8NAhDhaRzY9QRxmcN4h5ZCI93n6EgjX5918CZhrOjJxUIQAE46CcMbF0e+VDy1EA=="
+    }
+   },
+   "5.9.3": {
+    "name": "typescript",
+    "version": "5.9.3",
+    "_npmUser": {
+     "name": "typescript-bot"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+     "shasum": "5b4f59e15310ab17a216f5d6cf53ee476ede670f",
+     "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="
+    }
+   },
+   "6.0.3": {
+    "name": "typescript",
+    "version": "6.0.3",
+    "_npmUser": {
+     "name": "typescript-bot"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
+     "shasum": "90251dc007916e972786cb94d74d15b185577d21",
+     "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="
+    }
+   },
+   "7.0.1-rc": {
+    "name": "typescript",
+    "version": "7.0.1-rc",
+    "_npmUser": {
+     "name": "typescript-deploys"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.0.1-rc.tgz",
+     "shasum": "cf7c211803b742c1cace8183656acc57685eaaf7",
+     "integrity": "sha512-drEP77wK7CCDlPfXZH4e008UUQOsw1DFmHmZOZjuNA+yoDLLnSNMZRXi90NbV/1LVo7SbNLq1bs3jjvk49TEqQ=="
+    }
+   },
+   "7.0.2": {
+    "name": "typescript",
+    "version": "7.0.2",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz",
+     "shasum": "9ec773d7954a8c182c17cc5bbd575aa28bc51582",
+     "integrity": "sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA=="
+    }
+   },
+   "7.1.0-dev.20260710.1": {
+    "name": "typescript",
+    "version": "7.1.0-dev.20260710.1",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.1.0-dev.20260710.1.tgz",
+     "shasum": "8751c3042214e93f62ef49e1096baa66ad9cf99d",
+     "integrity": "sha512-Bb+YXjhOM3sD+A3VJO/iv8En7b8vZNXts9Ne3aPWoze/AUFwvs7nqM6mlobJve9C8KYY5FA+/REOEnQHkFUfbw=="
+    }
+   },
+   "7.1.0-dev.20261117.1": {
+    "name": "typescript",
+    "version": "7.1.0-dev.20261117.1",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/typescript/-/typescript-7.1.0-dev.20261117.1.tgz",
+     "shasum": "788980c5f6399b4ba2987df80be71bd977e6e0fa",
+     "integrity": "sha512-4grWj8gHZqfaB/gKuVt9PfP92ZylyEQ8185ZfeHDnleOeadczo27JGg8+EYm+PFnwkbbmXqKXGv+L1xu4TuZdQ=="
+    }
+   }
+  }
+ },
+ "@typescript/typescript-darwin-arm64": {
+  "name": "@typescript/typescript-darwin-arm64",
+  "dist-tags": {
+   "rc": "7.0.1-rc",
+   "latest": "7.0.2"
+  },
+  "maintainers": [
+   {
+    "name": "microsoft1es"
+   },
+   {
+    "name": "typescript-bot"
+   },
+   {
+    "name": "weswigham"
+   },
+   {
+    "name": "andrewbranch"
+   },
+   {
+    "name": "typescript-deploys"
+   },
+   {
+    "name": "microsoft-oss-releases"
+   },
+   {
+    "name": "jakebailey"
+   }
+  ],
+  "time": {
+   "7.0.1-rc": "2026-06-18T13:42:30.580Z",
+   "7.0.2": "2026-07-08T15:49:36.897Z",
+   "7.1.0-dev.20260710.1": "2026-07-10T08:15:46.235Z",
+   "7.1.0-dev.20261117.1": "2026-11-17T08:34:05.311Z"
+  },
+  "versions": {
+   "7.0.1-rc": {
+    "name": "@typescript/typescript-darwin-arm64",
+    "version": "7.0.1-rc",
+    "_npmUser": {
+     "name": "typescript-deploys"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.0.1-rc.tgz",
+     "shasum": "dee4a0eba61cc25425573b78537d1448c0a3dfd6",
+     "integrity": "sha512-Slc0yTftT2F/uGDmtPst8ijydneL6uZaLEyr2UjahxZpbhTjHFBJ5agXtVz/TL4A+ldxzjzj+E8QtLZlh/5mXw=="
+    }
+   },
+   "7.0.2": {
+    "name": "@typescript/typescript-darwin-arm64",
+    "version": "7.0.2",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.0.2.tgz",
+     "shasum": "a55fdfcfa58df58d27db2237cde6a5c1e35a7235",
+     "integrity": "sha512-gowzar9MwS/aRWp6f3a4KUqzRjAZjOsmGNCM6LcTgXum+dBfgsBVMN+AgvOCCbguXyick6LJhpBszxMebJ8syA=="
+    }
+   },
+   "7.1.0-dev.20260710.1": {
+    "name": "@typescript/typescript-darwin-arm64",
+    "version": "7.1.0-dev.20260710.1",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.1.0-dev.20260710.1.tgz",
+     "shasum": "67bca249f9fa939e4c6594da28113a4c7c63321f",
+     "integrity": "sha512-d+p3m+UGY88hIF3q+CO0d6gk6/zu41pJQsCpUQziabsCeAsAv3QStEZxGH8PPH7MDrpfejhGEgprlIc944SVDw=="
+    }
+   },
+   "7.1.0-dev.20261117.1": {
+    "name": "@typescript/typescript-darwin-arm64",
+    "version": "7.1.0-dev.20261117.1",
+    "_npmUser": {
+     "name": "microsoft1es"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.1.0-dev.20261117.1.tgz",
+     "shasum": "2e199351a11f8f18655034a95435bbb38319fe61",
+     "integrity": "sha512-FK55win8pWF6KgVJD9EZ7+vwEss1d/Be0LdeVYkGs3l3Zlx/W7+x2/gNwZFI3kCVy58MrZun4pCi3IJbl1pq/A=="
+    }
+   }
+  }
+ },
+ "event-stream": {
+  "name": "event-stream",
+  "dist-tags": {
+   "latest": "4.0.1"
+  },
+  "maintainers": [
+   {
+    "name": "npm"
+   }
+  ],
+  "time": {
+   "0.1.0": "2011-12-07T06:11:27.548Z",
+   "3.0.0": "2012-08-18T13:39:02.524Z",
+   "3.3.3": "2016-06-18T23:39:10.007Z",
+   "3.3.4": "2016-07-17T07:24:09.767Z",
+   "3.3.5": "2018-09-05T05:27:47.219Z",
+   "4.0.0": "2018-09-16T11:20:20.938Z",
+   "4.0.1": "2018-09-29T06:55:49.107Z"
+  },
+  "versions": {
+   "0.1.0": {
+    "name": "event-stream",
+    "version": "0.1.0",
+    "_npmUser": {
+     "name": "dominictarr"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-0.1.0.tgz",
+     "shasum": "6e9d2d059cf66deeb001d211bd60e45a9c0ae05e",
+     "integrity": "sha512-G2vAsEZXILxnixvwO+bfYhfYHgjS5dbMkoBU4W18A0bUJRvH2UJgO6pkAQZq22FORWOdQazsjAQ+uaTKAJ+s/w=="
+    }
+   },
+   "3.0.0": {
+    "name": "event-stream",
+    "version": "3.0.0",
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-3.0.0.tgz",
+     "shasum": "5533eb561cff52d9b9673651ba7485841043a9ba",
+     "integrity": "sha512-aCbQXVxkkATPFkQwkKbNjSurzaZHx//t75OhB842wqVEa12DHOYMbBSJEP/qeZ4vjZT1MxW6ylYfn4StdghZmg=="
+    }
+   },
+   "3.3.3": {
+    "name": "event-stream",
+    "version": "3.3.3",
+    "_npmUser": {
+     "name": "dominictarr"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-3.3.3.tgz",
+     "shasum": "f7d437a98f9c0715f4b643a97b66425549479b9b",
+     "integrity": "sha512-AZ8CioTQrnT8Uyy/WVx5VW9uj4IbvSs5Bofe5KXcqEWRjlQvZVGRiThRjXEW5Zy2ZEUdgGfT+I5phDpFV4iL9w=="
+    }
+   },
+   "3.3.4": {
+    "name": "event-stream",
+    "version": "3.3.4",
+    "_npmUser": {
+     "name": "dominictarr"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-3.3.4.tgz",
+     "shasum": "4ab4c9a0f5a54db9338b4c34d86bfce8f4b35571",
+     "integrity": "sha512-QHpkERcGsR0T7Qm3HNJSyXKEEj8AHNxkY3PK8TS2KJvQ7NiSHe3DDpwVKKtoYprL/AreyzFBeIkBIWChAqn60g=="
+    }
+   },
+   "3.3.5": {
+    "name": "event-stream",
+    "version": "3.3.5",
+    "_npmUser": {
+     "name": "right9ctrl"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-3.3.5.tgz",
+     "shasum": "e5dd8989543630d94c6cf4d657120341fa31636b",
+     "integrity": "sha512-vyibDcu5JL20Me1fP734QBH/kenBGLZap2n0+XXM7mvuUPzJ20Ydqj1aKcIeMdri1p+PU+4yAKugjN8KCVst+g=="
+    }
+   },
+   "4.0.0": {
+    "name": "event-stream",
+    "version": "4.0.0",
+    "_npmUser": {
+     "name": "right9ctrl"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-4.0.0.tgz",
+     "shasum": "2477e13a4ea5bf62fbb292a3f96d78bd4906f7c1",
+     "integrity": "sha512-DOB0pW11hF+A572U9vmYbQuLVvzXb2ZQhP14wAhMesOLoWVmWNKZ05niYwgUEEO7Ex+lbPpsqT+pch4O7Ijqmg=="
+    }
+   },
+   "4.0.1": {
+    "name": "event-stream",
+    "version": "4.0.1",
+    "_npmUser": {
+     "name": "right9ctrl"
+    },
+    "dist": {
+     "tarball": "https://registry.npmjs.org/event-stream/-/event-stream-4.0.1.tgz",
+     "shasum": "4092808ec995d0dd75ea4580c1df6a74db2cde65",
+     "integrity": "sha512-qACXdu/9VHPBzcyhdOWR5/IahhGMf0roTeZJfzz077GwylcDd90yOHLouhmv7GJ5XzPi6ekaQWd8AvPP2nOvpA=="
+    }
+   }
+  }
+ }
+}

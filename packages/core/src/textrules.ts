@@ -4,6 +4,7 @@
 // confirmed wherever it sits, comments, regex bodies, types and JSON included (apm-score-v9); a parsed program only
 // says which of those a match sits in, so the evidence can name it. Pure.
 import { encodedLiterals, envExfil, hexIdentifierRun, lineOf, namedSignal, printable, ruleHits, type Hidden, type TextFinding, v3Encoded, type Where } from "./rules.ts";
+import { findingKey, keepItem, tempBytes, type TempList } from "./kept.ts";
 import { chargeText } from "./meter.ts";
 
 // ---------- joining split strings ----------
@@ -14,6 +15,41 @@ const ESCAPED_LIT = /(['"])((?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|[\w./:@ -])*)
 
 function unescapeJs(s: string): string {
   return s.replace(/\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})/g, (_, x: string | undefined, u: string | undefined) => String.fromCharCode(Number.parseInt(x ?? u ?? "0", 16)));
+}
+
+/**
+ * A chain's literals joined: each one's text without its quotes, read one match at a time and charged to a temporary
+ * budget of its own before it is kept (round 11 review of ee69d23: a match for each of 1,000,001 literals was built
+ * first, and ended the isolate), or null when they do not fit. Equal to
+ * `[...chain.matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("")`.
+ */
+function joinLiterals(chain: string): string | null {
+  // what joining one chain builds is let go once it is joined: charged on its own, not to the joining's lists
+  const temp = tempBytes();
+  let out = "";
+
+  ONE_LIT.lastIndex = 0;
+
+  for (let m = ONE_LIT.exec(chain); m !== null; m = ONE_LIT.exec(chain)) {
+    if (!temp.fits(48 + 2 * m[0].length)) return null;
+    out += m[0].slice(1, -1);
+  }
+
+  return out;
+}
+
+/**
+ * `body` with its escapes decoded, each escape charged to the joining's temporary budget before the decoding builds
+ * anything (round 12 review of 7cd0b2b: a million `\\x61` in one string, decoded at once, ended production's isolate and
+ * this one's), or null when they do not fit.
+ */
+function unescapeWithin(body: string): string | null {
+  const temp = tempBytes();
+  let escapes = 0;
+
+  for (let i = body.indexOf("\\"); i !== -1; i = body.indexOf("\\", i + 1)) escapes++;
+
+  return temp.fits(48 * escapes + 2 * body.length) ? unescapeJs(body) : null;
 }
 
 function quote(s: string): string {
@@ -29,7 +65,11 @@ type Edit = { start: number; end: number; length: number };
  */
 type Tracked = { text: string; edits: Edit[] };
 
-function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string[]) => string | null): Tracked {
+/**
+ * `fn` gives a match's replacement, null to leave it, or false when what it would build does not fit the joining's
+ * temporary budget (kept.ts): the pass stops there, the rest of the text as written, and keeps what it replaced.
+ */
+function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string[]) => string | null | false, temp: TempList): Tracked {
   // the match pass, and the text copied into the result
   chargeText("text", text.length, 2);
   const edits: Edit[] = [];
@@ -39,8 +79,13 @@ function replaceTracked(text: string, re: RegExp, fn: (m: string, groups: string
   for (const m of text.matchAll(re)) {
     const replacement = fn(m[0], m.slice(1).map((g) => g ?? ""));
 
+    if (replacement === false) break;
+
     if (replacement === null) continue;
     chargeText("text", m[0].length + replacement.length, 2);
+
+    // the edit, and the pieces the result is joined from until it is read (kept.ts)
+    if (!temp.fits(160 + 2 * replacement.length)) break;
     out += text.slice(last, m.index) + replacement;
     edits.push({ start: m.index, end: m.index + m[0].length, length: replacement.length });
     last = m.index + m[0].length;
@@ -80,6 +125,8 @@ export type Joined = { text: string; built: Built[]; origin: (index: number) => 
 export function joinStrings(text: string): Joined {
   // the three `includes` tests
   chargeText("text", text.length, 3);
+  // in a binary's scan, its lists are held to a limit as they grow (kept.ts); elsewhere this counts nothing
+  const temp = tempBytes();
   const built: Built[] = [];
   const passes: Edit[][] = [];
   let out = text;
@@ -94,37 +141,56 @@ export function joinStrings(text: string): Joined {
   };
 
   if (out.includes("\\x") || out.includes("\\u")) {
+    // each string built is taken as its edit is made, and held with the edits (kept.ts)
+    const values: string[] = [];
+
     const step = replaceTracked(out, ESCAPED_LIT, (_m, [, body = ""]) => {
       if (!/\\[xu]/.test(body)) return null;
+      const value = unescapeWithin(body);
 
-      return quote(unescapeJs(body));
-    });
+      if (value === null || !temp.fits(64 + 2 * value.length)) return false;
+      values.push(value);
 
-    for (const e of step.edits) {
+      return quote(value);
+    }, temp);
+
+    step.edits.forEach((e, i) => {
       chargeText("text", e.end - e.start, 3);
-      built.push({ value: unescapeJs(text.slice(e.start + 1, e.end - 1)), index: e.start });
-    }
+      built.push({ value: values[i] ?? "", index: e.start });
+    });
 
     passes.push(step.edits);
     out = step.text;
   }
 
   if (out.includes("+")) {
-    const before = out;
-    const step = replaceTracked(out, CHAIN, (m) => quote([...m.matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("")));
+    const values: string[] = [];
 
-    for (const e of step.edits) {
+    const step = replaceTracked(
+      out,
+      CHAIN,
+      (m) => {
+        const joined = joinLiterals(m);
+
+        if (joined === null || !temp.fits(64 + 2 * joined.length)) return false;
+        values.push(joined);
+
+        return quote(joined);
+      },
+      temp,
+    );
+
+    step.edits.forEach((e, i) => {
       chargeText("text", e.end - e.start, 3);
-      const value = [...before.slice(e.start, e.end).matchAll(ONE_LIT)].map((p) => p[0].slice(1, -1)).join("");
-      built.push({ value, index: toOriginal(e.start, passes.length) });
-    }
+      built.push({ value: values[i] ?? "", index: toOriginal(e.start, passes.length) });
+    });
 
     passes.push(step.edits);
     out = step.text;
   }
 
   if (out.includes("[")) {
-    const step = replaceTracked(out, /(?<=[\w$)\]])\s*\[\s*(['"])([A-Za-z_$][\w$]*)\1\s*\]/g, (_m, [, name = ""]) => `.${name}`);
+    const step = replaceTracked(out, /(?<=[\w$)\]])\s*\[\s*(['"])([A-Za-z_$][\w$]*)\1\s*\]/g, (_m, [, name = ""]) => `.${name}`, temp);
     passes.push(step.edits);
     out = step.text;
   }
@@ -169,9 +235,18 @@ export function decodedStrings(text: string): Decoded[] {
   }
 
   if (text.includes("fromCharCode")) {
+    // in a binary's reading, each list of codes is held to the temporary budget before it is split (kept.ts)
+    const temp = tempBytes();
+
     for (const m of text.matchAll(/fromCharCode\s*\(\s*((?:\d{1,3}\s*,\s*){2,}\d{1,3})\s*\)|\[\s*((?:\d{2,3}\s*,\s*){3,}\d{2,3})\s*\]/g)) {
       chargeText("text", m[0].length, 4);
-      const codes = (m[1] ?? m[2] ?? "").split(",").map((n) => Number(n.trim()));
+      const list = m[1] ?? m[2] ?? "";
+      let commas = 0;
+
+      for (let i = list.indexOf(","); i !== -1; i = list.indexOf(",", i + 1)) commas++;
+
+      if (!temp.fits(48 * (commas + 1))) break;
+      const codes = list.split(",").map((n) => Number(n.trim()));
 
       if (codes.every((c) => c >= 32 && c < 127)) push(String.fromCharCode(...codes), "char codes", m.index);
     }
@@ -213,27 +288,37 @@ export function scanTextRules(text: string, read: TextRead = {}): TextFinding[] 
     return kind ? { ...where, hidden: kind } : where;
   };
 
-  const out = ruleHits(text, "as written", new Set(), place);
+  const out: TextFinding[] = [];
+
+  // each finding is charged as it is made: in a binary's reading, past what it may keep only a finding that says to the
+  // scorer what none kept yet says is kept (kept.ts, findingKey)
+  const add = (...found: TextFinding[]): void => {
+    for (const f of found) if (keepItem(f, findingKey(f))) out.push(f);
+  };
+
+  add(...ruleHits(text, "as written", new Set(), place));
   const have = (): Set<TextFinding["id"]> => new Set(out.map((f) => f.id));
 
   // escapes and identifier runs are read on the file as written; its tokens in plain form have them decoded
   if (read.encoded ?? shown === undefined) {
     const hex = hexIdentifierRun(text);
 
-    if (hex >= 0) out.push({ id: "obfuscated", ...place(hex), how: "as written", confidence: "confirmed" });
-    out.push(...encodedLiterals(text, place));
+    if (hex >= 0) add({ id: "obfuscated", ...place(hex), how: "as written", confidence: "confirmed" });
+    add(...encodedLiterals(text, place));
   }
 
+  // in a binary's reading the joining's lists are held to its temporary budget (kept.ts): past it the joining stops
+  // where it is, keeping what it joined, and the reading is stopped
   const joined = joinStrings(text);
   const at = (index: number): Where => place(joined.origin(index));
 
   if (joined.text !== text) {
-    out.push(...ruleHits(joined.text, "after joining strings", have(), at));
+    add(...ruleHits(joined.text, "after joining strings", have(), at));
 
     // v3's obfuscated rule also ran on the joined text: base64 split into pieces is one run once joined
     const encoded = have().has("obfuscated") ? -1 : v3Encoded(joined.text);
 
-    if (encoded >= 0) out.push({ id: "obfuscated", ...at(encoded), how: "after joining strings", confidence: "confirmed" });
+    if (encoded >= 0) add({ id: "obfuscated", ...at(encoded), how: "after joining strings", confidence: "confirmed" });
   }
 
   for (const b of joined.built) {
@@ -242,8 +327,8 @@ export function scanTextRules(text: string, read: TextRead = {}): TextFinding[] 
     if (!id) continue;
     const where = place(b.index);
 
-    out.push({ id, ...where, how: "after joining strings", confidence: "confirmed" });
-    out.push({ id: "obfuscated", ...where, snippet: `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings", confidence: "confirmed" });
+    add({ id, ...where, how: "after joining strings", confidence: "confirmed" });
+    add({ id: "obfuscated", ...where, snippet: `builds "${b.value.slice(0, 40)}" from pieces: ${where.snippet}`, how: "after joining strings", confidence: "confirmed" });
   }
 
   for (const d of decodedStrings(joined.text)) {
@@ -260,14 +345,14 @@ export function scanTextRules(text: string, read: TextRead = {}): TextFinding[] 
     if (hits.length === 0) continue;
     const snippet = `${d.how} "${d.value.slice(0, 60)}" at ${where.snippet}`.slice(0, 120);
 
-    for (const h of hits) out.push({ ...where, id: h.id, snippet, how: "decoded", confidence: "confirmed" });
-    out.push({ ...where, id: "obfuscated", snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded", confidence: "confirmed" });
+    for (const h of hits) add({ ...where, id: h.id, snippet, how: "decoded", confidence: "confirmed" });
+    add({ ...where, id: "obfuscated", snippet: `hides code in ${d.how}: ${where.snippet}`, how: "decoded", confidence: "confirmed" });
   }
 
   if (!have().has("credential-access") && have().has("network")) {
     const dump = envExfil(text);
 
-    if (dump >= 0) out.push({ id: "credential-access", ...place(dump), how: "as written", confidence: "confirmed" });
+    if (dump >= 0) add({ id: "credential-access", ...place(dump), how: "as written", confidence: "confirmed" });
   }
 
   return out;

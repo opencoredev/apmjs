@@ -1,6 +1,7 @@
 // Static reading of one file's text. Every file is read with the text rules (rules.ts) over its whole text, after a
 // pass that joins strings split to dodge them and decoders for the cheap encodings (base64, hex, \x escapes, char
 // codes); JavaScript and TypeScript are also parsed (js.ts), which adds what the tree sees. Pure.
+import { keepString, tempBytes } from "./kept.ts";
 import { scanJs, type Command, type EnvRead, type ExecutedCode, type FlowFinding, type Imports, type Unread } from "./js.ts";
 import type { Dialect, ParseOutcome, Range } from "./parse.ts";
 import { MAX_PARSED_TOKENS, MAX_PARSED_TS_BYTES, parseEach } from "./parse.ts";
@@ -151,8 +152,65 @@ const STATIC_IMPORT = /(?:\brequire(?:\.resolve)?\s*\(|\bimport\s*\(|\bfrom\s+|\
 // `(?<![\w$])`, not `\b`: `\b` falls between every `a` and `$` of `a$a$…`, and each start there scanned to the end
 
 const DIRNAME_JOIN = /(?<![\w$])[\w$]+\.(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*['"][^'"\n]+['"]\s*)+)\)/g;
+
+/** One quoted argument of a `path.join(__dirname, ...)` call. */
+const SEGMENT = /['"]([^'"\n]+)['"]/g;
+
 const DIRNAME_PLUS = /\b__dirname\s*\+\s*['"](\/[^'"\n]+)['"]/g;
+
+// the same patterns with where each group sits (importParts)
+const STATIC_IMPORT_AT = /(?:\brequire(?:\.resolve)?\s*\(|\bimport\s*\(|\bfrom\s+|\bimport\s+)\s*['"\x60](\.{1,2}\/[^'"\x60\n]+)['"\x60]/dg;
+const DIRNAME_JOIN_AT = /(?<![\w$])[\w$]+\.(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*['"][^'"\n]+['"]\s*)+)\)/dg;
+const SEGMENT_AT = /['"]([^'"\n]+)['"]/dg;
+const DIRNAME_PLUS_AT = /\b__dirname\s*\+\s*['"](\/[^'"\n]+)['"]/dg;
 const CALL = /(?<![\w$.])(?:require|import)\s*\(/g;
+
+/** A path importsOf read, as the text and spans of `text` it is made of, in the order importsOf lists its paths. */
+export type ImportPart = { readonly kind: "text"; readonly text: string } | { readonly kind: "span"; readonly start: number; readonly end: number };
+
+export type ImportParts = readonly ImportPart[];
+
+/**
+ * Where each path importsOf(text) lists sits in `text`, in its order: a static load is one span, a `path.join(__dirname,
+ * ...)` its segments joined by "/", and `__dirname + '/x'` its literal. A binary's view holds one character for each of
+ * production's, so a span of the view is where production's text held that path, and the bytes give its real characters
+ * where the view holds a stand-in (binary-text.ts; round 15 review of c139b5b, P1: a stand-in matched a file production's
+ * exact path did not, and changed how that file was read).
+ */
+export function importParts(text: string): ImportParts[] {
+  const out: ImportParts[] = [];
+
+  for (const m of text.matchAll(STATIC_IMPORT_AT)) {
+    const at = m.indices?.[1];
+
+    if (m[1] && at) out.push([{ kind: "span", start: at[0], end: at[1] }]);
+  }
+
+  for (const m of text.matchAll(DIRNAME_JOIN_AT)) {
+    const at = m.indices?.[1];
+    const args = m[1] ?? "";
+    const parts: ImportPart[] = [{ kind: "text", text: "./" }];
+
+    for (const s of args.matchAll(SEGMENT_AT)) {
+      const seg = s.indices?.[1];
+
+      if (!at || !seg) continue;
+
+      if (parts.length > 1) parts.push({ kind: "text", text: "/" });
+      parts.push({ kind: "span", start: at[0] + seg[0], end: at[0] + seg[1] });
+    }
+
+    out.push(parts);
+  }
+
+  for (const m of text.matchAll(DIRNAME_PLUS_AT)) {
+    const at = m.indices?.[1];
+
+    if (at) out.push([{ kind: "text", text: "." }, { kind: "span", start: at[0], end: at[1] }]);
+  }
+
+  return out;
+}
 
 /**
  * Relative paths a file no parser read loads (a literal require or import, require.resolve, path.join(__dirname,
@@ -164,17 +222,44 @@ export function importsOf(text: string): Imports {
   chargeText("text", text.length, 4);
   const paths: string[] = [];
 
-  for (const m of text.matchAll(STATIC_IMPORT)) if (m[1]) paths.push(m[1]);
+  // in a binary's reading, each path is charged as it is found, once as a path and once as a load; past what it may
+  // keep, none is (kept.ts)
+  for (const m of text.matchAll(STATIC_IMPORT)) if (m[1] && keepString(m[1]) && keepString(m[1])) paths.push(m[1]);
+
   // read raw, every literal require or import is taken for a load
   const loads = [...paths];
 
+  // in a binary's reading, each segment is held to the temporary budget as it is read (kept.ts; round 11 review of ee69d23)
+  const temp = tempBytes();
+
   for (const m of text.matchAll(DIRNAME_JOIN)) {
     chargeText("text", m[0].length, 3);
-    const segs = [...(m[1] ?? "").matchAll(/['"]([^'"\n]+)['"]/g)].map((s) => s[1] ?? "");
-    paths.push(`./${segs.join("/")}`);
+    const args = m[1] ?? "";
+    let path: string | null = "./";
+    let first = true;
+
+    SEGMENT.lastIndex = 0;
+
+    for (let s = SEGMENT.exec(args); s !== null && path !== null; s = SEGMENT.exec(args)) {
+      const seg = s[1] ?? "";
+
+      // past the budget the path is not known, and the reading is stopped
+      if (!temp.fits(48 + 2 * seg.length)) path = null;
+      else {
+        path += first ? seg : `/${seg}`;
+        first = false;
+      }
+    }
+
+    if (path !== null && keepString(path)) paths.push(path);
   }
 
-  for (const m of text.matchAll(DIRNAME_PLUS)) paths.push(`.${m[1] ?? ""}`);
+  for (const m of text.matchAll(DIRNAME_PLUS)) {
+    const path = `.${m[1] ?? ""}`;
+
+    if (keepString(path)) paths.push(path);
+  }
+
   const dynamic: Imports["dynamic"] = [];
 
   for (const m of text.matchAll(CALL)) {

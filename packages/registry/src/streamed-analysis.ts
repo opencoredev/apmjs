@@ -5,7 +5,7 @@
 // 1. The first pass inflates and reads every entry as it arrives (@apm/core's TarballInflater). It keeps package.json
 //    and the other files the analysis reads by name, the first bytes of every file, and the paths each code file imports
 //    (each file gathered on its own and let go once read). It hashes every byte it is sent.
-// 2. With the manifest and that import graph, planReading picks the files `analyze` would read first, in its order, up
+// 2. With the manifest and that import graph, planLayers picks the files `analyze` would read first, in its order, up
 //    to READ.holdBytes. When the first pass already holds them all (a package of one native binary and a package.json),
 //    that is the reading. Otherwise a second pass reads the tarball again and keeps those files whole.
 // 3. `analyze` runs over every entry, told which ones it holds only the first bytes of (`notHeld`): a file it reaches
@@ -34,13 +34,16 @@ import {
   ambiguousPaths,
   analyze,
   ENTRY_BYTES,
+  EXECUTABLE_HEAD_BYTES,
   firstPass,
+  hasExecutableMagic,
   HEAD_BYTES,
   MAX_ANALYSIS_WORK,
   Meter,
   MeterExhausted,
   metered,
-  planReading,
+  planLayers,
+  type ReadingPlan,
   TarballInflater,
   unfinishedAnalysis,
   type Analysis,
@@ -53,6 +56,7 @@ import {
 } from "@apm/core";
 import { Manifest, type Unscorable, type VersionRecord } from "./db.ts";
 import type { Digest } from "./digest.ts";
+import { upstreamPublishers } from "./publishers.ts";
 import type { OpenedTarball, UpstreamPackage } from "./upstream.ts";
 
 /** What a streamed read may cost, and what it may hold. */
@@ -316,7 +320,8 @@ function keepOnly(t: StreamedTarball, keep: ReadonlySet<string>, memory: StreamM
 
   const files = t.files.map((f) => {
     if (t.notHeld.has(f) || keep.has(f.path)) return f;
-    const cut = { ...f, data: f.data.slice(0, HEAD_BYTES) };
+    // what checks of a file's first bytes read: an executable's header and load commands, else HEAD_BYTES
+    const cut = { ...f, data: f.data.slice(0, hasExecutableMagic(f.data) ? EXECUTABLE_HEAD_BYTES : HEAD_BYTES) };
     freed += f.data.length - cut.data.length;
 
     return cut;
@@ -327,15 +332,21 @@ function keepOnly(t: StreamedTarball, keep: ReadonlySet<string>, memory: StreamM
   return { files, notHeld: new Set(files.filter((f, i) => f !== t.files[i] || t.notHeld.has(f))), unpackedBytes: t.unpackedBytes, charged: t.charged - freed };
 }
 
-/** What a pass that read nothing usable comes to for the run. */
-function failedPass(pass: Exclude<Pass, { kind: "read" }>, what: string): StreamedAnalysis {
+/**
+ * What a pass that read nothing usable comes to for the run. A pass that ran the stream's meter out after its bytes
+ * passed their checksum is an analysis that stopped (`stopped`): incomplete, scoring 0, as a plan or an analysis that
+ * runs its meter out is, never a tarball too large to read (round 17 review of b287849, P1: an archive of 800 shell
+ * scripts ran the meter out reading their words, came back too-large, which installs with a note, where production read
+ * it and scored 35, review-first).
+ */
+function failedPass(pass: Exclude<Pass, { kind: "read" }>, stopped: () => Analysis): StreamedAnalysis {
   switch (pass.kind) {
     case "refused":
       return pass.tooLarge
         ? { kind: "unscorable", unscorable: { reason: "too-large", detail: `the tarball ${pass.message}, the most apm reads as a stream` } }
         : { kind: "unscorable", unscorable: { reason: "unreadable", detail: `the tarball is not one apm can read (${pass.message})` } };
     case "spent":
-      return { kind: "unscorable", unscorable: { reason: "too-large", detail: `the tarball is too large for apm to read: ${what} ran past the work it may spend` } };
+      return { kind: "scored", analysis: stopped(), spent: true };
     case "unscorable":
     case "fetch-failed":
     case "absent":
@@ -373,17 +384,21 @@ async function analyzeOrFail({ pkg, v, digest, open, plan, memory, limits = READ
   const first = firstPass({ holdBytes: budget, lookFileBytes: limits.lookFileBytes, lookTotalBytes: limits.lookTotalBytes, memory });
   const one = await readPass({ open, digest, hold: first.hold, look: first.look, meter: streamMeter, memory, limits });
 
-  if (one.kind !== "read") return failedPass(one, "reading it");
+  // a pass that ran the stream's meter out: the analysis stopped where its meter did
+  const meterStop = (manifest: VersionRecord["manifest"], files: readonly TarEntry[]) => (): Analysis =>
+    unfinishedAnalysis({ name: pkg.name, manifest, files, phase: streamMeter.exhausted ?? "tar", limit: streamMeter.limit, because: plan.incompleteBecause });
+
+  if (one.kind !== "read") return failedPass(one, meterStop(v.manifest, []));
   let tarball = one.tarball;
   const manifest = manifestOf(tarball.files, tarball.notHeld, v.manifest);
-  let planned: Set<string> | null;
+  let planned: ReadingPlan | null;
 
   // the path check and the plan charge the stream's meter, as the passes do: a package whose exports cost more than
   // the meter has left is an analysis that stopped, and says so
   try {
     const files = tarball.files;
 
-    planned = metered(streamMeter, () => (ambiguousPaths(files).length > 0 ? null : planReading({ manifest, files, imports: first.imports, budget })));
+    planned = metered(streamMeter, () => (ambiguousPaths(files).length > 0 ? null : planLayers({ manifest, files, imports: first.imports, shellRuns: first.shellRuns, budget })));
   } catch (e) {
     if (!(e instanceof MeterExhausted)) throw e;
 
@@ -394,9 +409,11 @@ async function analyzeOrFail({ pkg, v, digest, open, plan, memory, limits = READ
   if (planned === null) return { kind: "unscorable", unscorable: { reason: "unreadable", detail: "the tarball holds a path twice or one outside the package folder, so tools disagree on what it installs" } };
   // the tarball's own package.json, which the first pass holds whenever apm reads a manifest that large, is what the
   // plan and the analysis read: it stays held whatever the plan's budget, so it is never reported as not read
-  const wanted = new Set([...planned, "package.json"]);
+  const wanted = new Set([...planned.production, ...planned.extra, "package.json"]);
   const importsCut = first.importsCut;
+  const stopped = first.stopped;
   first.imports.clear();
+  first.shellRuns.clear();
   // what the first pass held and the plan does not want is let go before anything else is read
   tarball = keepOnly(tarball, wanted, memory);
 
@@ -416,14 +433,13 @@ async function analyzeOrFail({ pkg, v, digest, open, plan, memory, limits = READ
 
     const two = await readPass({ open, digest, hold, meter: streamMeter, memory, limits, expect: one.files.map((f) => ({ path: f.path, size: f.size, mode: f.mode })) });
 
-    if (two.kind !== "read") return failedPass(two, "reading it again");
+    if (two.kind !== "read") return failedPass(two, meterStop(manifest, one.files));
     const files = two.tarball.files.map((f) => kept.get(f.path) ?? f);
     // the first pass's entries the merge does not use, and the second's it replaced, are let go
     memory.give(one.files.reduce((n, f) => n + (kept.has(f.path) ? 0 : chargeOf(f)), 0) + two.tarball.files.reduce((n, f) => n + (kept.has(f.path) ? chargeOf(f) : 0), 0));
     tarball = { files, notHeld: new Set(files.filter((f) => two.tarball.notHeld.has(f))), unpackedBytes: two.tarball.unpackedBytes, charged: 0 };
   }
 
-  const earlier = pkg.versions.filter((x) => x.published_at < v.published_at);
   const meter = new Meter(Math.min(plan.maxWork, limits.work));
 
   const analysis = analyze({
@@ -431,11 +447,16 @@ async function analyzeOrFail({ pkg, v, digest, open, plan, memory, limits = READ
     manifest,
     files: tarball.files,
     notHeld: tarball.notHeld,
-    publisher: v.published_by,
-    previousPublishers: [...new Set(earlier.map((x) => x.published_by))],
+    ...upstreamPublishers(pkg.versions, v),
     maxScannedBytes: budget,
-    incompleteBecause: plan.incompleteBecause,
+    // a cut graph means the plan may have missed files production's followed: the reading is incomplete, said whether
+    // or not a file was left out (round 12 review of 7cd0b2b, P3: a complete report dropped the note)
+    incompleteBecause: importsCut ? [...(plan.incompleteBecause ?? []), IMPORTS_CUT_TEXT] : plan.incompleteBecause,
     coverageNotes: importsCut ? [IMPORTS_CUT_TEXT] : [],
+    // production's walk reads what production's plan held; what the second layer's holds it does not (round 16 review of
+    // c272202), and a plan that stopped for its resources stops the analysis
+    extraHeld: planned.extra,
+    stoppedBecause: stopped === null ? [] : [stopped],
     meter,
   });
 

@@ -65,7 +65,7 @@ function reports(): { name: string; analysis: Analysis }[] {
   ];
 }
 
-const Lists = z.object({ signalIds: z.array(z.string()), coverageReasons: z.array(z.string()), skipReasons: z.array(z.string()), capabilityIds: z.array(z.string()), scorer: z.string() });
+const Lists = z.object({ signalIds: z.array(z.string()), coverageReasons: z.array(z.string()), skipReasons: z.array(z.string()), capabilityIds: z.array(z.string()), scorer: z.string(), parsedScorers: z.array(z.string()) });
 
 /** origin/main's packages/core/src, extracted next to this package's node_modules so its imports resolve. */
 const mainDir = hasMain ? mkdtempSync(join(import.meta.dir, "../node_modules/.apm-main-core-")) : null;
@@ -89,9 +89,12 @@ function askMain(stored: string[]): z.infer<typeof MainAnswer> {
   writeFileSync(
     join(mainDir, "ask.ts"),
     [
+      'import * as core from "./src/index.ts";',
       'import { CAPABILITY_IDS, COVERAGE_REASONS, parseAnalysis, SCORER, SIGNAL_IDS, SKIP_REASONS } from "./src/index.ts";',
       "const stored: string[] = JSON.parse(await Bun.stdin.text());",
-      "const lists = { signalIds: SIGNAL_IDS, coverageReasons: COVERAGE_REASONS, skipReasons: SKIP_REASONS, capabilityIds: CAPABILITY_IDS, scorer: SCORER };",
+      // every scorer name its parser reads: PARSED_SCORERS where it exports it (af95d58 on), else only its own
+      'const parsedScorers = "PARSED_SCORERS" in core && Array.isArray(core.PARSED_SCORERS) ? core.PARSED_SCORERS : [SCORER];',
+      "const lists = { signalIds: SIGNAL_IDS, coverageReasons: COVERAGE_REASONS, skipReasons: SKIP_REASONS, capabilityIds: CAPABILITY_IDS, scorer: SCORER, parsedScorers };",
       "console.log(JSON.stringify({ lists, parsed: stored.map((s) => parseAnalysis(JSON.parse(s)) !== null) }));",
     ].join("\n"),
   );
@@ -110,7 +113,8 @@ describe("a report this branch writes parses under production's parser", () => {
     expect(COVERAGE_REASONS.filter((r) => !prod.coverageReasons.includes(r))).toEqual([]);
     expect(SKIP_REASONS.filter((r) => !prod.skipReasons.includes(r))).toEqual([]);
     expect(CAPABILITY_IDS.filter((c) => !prod.capabilityIds.includes(c))).toEqual([]);
-    expect(SCORER).toBe(prod.scorer);
+    // the scorer this branch writes is one production's parser reads: its own, or a newer one it was taught first
+    expect(prod.parsedScorers).toContain(SCORER);
   });
 
   test("the ids the scorer emits for every kind of unfinished analysis are production's", () => {

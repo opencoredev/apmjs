@@ -254,32 +254,86 @@ export function hexIdentifierRun(text: string): number {
   return -1;
 }
 
-/** The texts whose newline offsets were last worked out, newest first: lineOf is asked about a few texts in turn. */
-/** A line as snippets show it, and the whole of it trimmed when that is short enough to show whole. */
-type Line = { whole: string; short: string | null };
+/**
+ * A line as snippets show it, found without copying it (round 11 review of ee69d23: the whole line was copied and
+ * rewritten before the snippet was cut from it, and a 32 MiB line of carriage returns ended the isolate): where it ends
+ * once a final `\r` is dropped, and the whole of it trimmed when that is short enough to show whole.
+ */
+type Line = { end: number; short: string | null };
 
-type LineIndex = { text: string; starts: number[]; lines: Map<number, Line> };
+/**
+ * The texts whose newline offsets were last worked out, newest first: lineOf is asked about a few texts in turn.
+ * `starts` holds where every `step`th line starts (lines 1, 1 + step, ...); `count` is how many lines there are.
+ */
+type LineIndex = { text: string; starts: Uint32Array; step: number; count: number; lines: Map<number, Line> };
+
+/** The most line starts an index holds: 4 MiB. A text of more lines keeps every few, and counts the rest when asked. */
+const MAX_LINE_STARTS = 1 << 20;
 
 const LINE_INDEX: LineIndex[] = [];
 
 /**
- * Where each line of `text` starts (0, then one past each `\n`), and each line's text as a snippet shows it, made the
- * first time it is asked for. Built in one pass (charged) and kept for a few texts, so many findings on one long line
- * read it once.
+ * Where the lines of `text` start (0, then one past each `\n`), and each line's text as a snippet shows it, made the
+ * first time it is asked for, and kept for a few texts, so many findings on one long line read it once. Counted, then
+ * made at its size, four bytes a line, to MAX_LINE_STARTS; a text of more lines keeps the start of every `step`th, and
+ * lineOf counts the few between (round 11 review of ee69d23: one number a newline, in an array, for a 32 MiB file of
+ * newlines ended the isolate; round 12 review of 7cd0b2b: stopping the reading there instead dropped its findings).
  */
 function lineIndex(text: string): LineIndex {
   for (const e of LINE_INDEX) if (e.text === text) return e;
   chargeText("text", text.length, 2);
-  const starts = [0];
+  let count = 1;
 
-  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) starts.push(i + 1);
-  const entry = { text, starts, lines: new Map<number, Line>() };
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) count++;
+  const step = Math.ceil(count / MAX_LINE_STARTS);
+  const starts = new Uint32Array(Math.ceil(count / step));
+  let line = 1;
+
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
+    if (line % step === 0) starts[line / step] = i + 1;
+    line++;
+  }
+
+  const entry = { text, starts, step, count, lines: new Map<number, Line>() };
 
   LINE_INDEX.unshift(entry);
 
   if (LINE_INDEX.length > 4) LINE_INDEX.pop();
 
   return entry;
+}
+
+/**
+ * Drops `text`'s newline index, and with it the cache's hold on `text`: binary-text.ts reads views of megabytes, and
+ * the cache would otherwise keep one alive while the next is built.
+ */
+export function forgetText(text: string): void {
+  const at = LINE_INDEX.findIndex((e) => e.text === text);
+
+  if (at !== -1) LINE_INDEX.splice(at, 1);
+}
+
+/**
+ * Where a binary's view holds a line or paragraph separator as `\r` (binary-text.ts), while that view is read: a snippet
+ * shows it as production's text did, ↵, at a line's end too, where a `\r` is a CRLF's and dropped (round 15 review of
+ * c139b5b, P3).
+ */
+let separators: { text: string; at: ReadonlySet<number> } | null = null;
+
+/** Runs `fn` with `at` the positions of `text` that hold a separator as `\r`. */
+export function withSeparators<T>(text: string, at: readonly number[], fn: () => T): T {
+  if (at.length === 0) return fn();
+  const outer = separators;
+
+  // the line cache is by a text's value: the same text read without separators (a `\r` that is one) is not this one
+  forgetText(text);
+  separators = { text, at: new Set(at) };
+
+  try {
+    return fn();
+  } finally {
+    separators = outer;
+  }
 }
 
 /** A line number and the text around a position, trimmed to about 80 characters, and the left-out text it sits in. */
@@ -297,9 +351,10 @@ export function lineOf(text: string, index: number): Where {
   let lo = 0;
   let hi = starts.length - 1;
 
-  chargeText("text", 160 + 32 * Math.ceil(Math.log2(starts.length + 1)));
+  chargeText("text", 160 + 32 * Math.ceil(Math.log2(index_.count + 1)));
 
-  // the last line that starts at or before the position: one more than the newlines before it
+  // the last kept line start at or before the position, then the newlines from there to it: one more than the newlines
+  // before the position
   while (lo < hi) {
     const mid = (lo + hi + 1) >> 1;
 
@@ -307,35 +362,51 @@ export function lineOf(text: string, index: number): Where {
     else hi = mid - 1;
   }
 
-  const line = lo + 1;
+  let line = lo * index_.step + 1;
+
+  // fewer than `step` of them: none when every start is kept
+  if (index_.step > 1) for (let i = text.indexOf("\n", starts[lo] ?? 0); i !== -1 && i < index; i = text.indexOf("\n", i + 1)) line++;
   const start = text.lastIndexOf("\n", index - 1) + 1;
   const end = text.indexOf("\n", index);
 
-  // a CRLF line's \r is its own end; any other carriage return or separator is inside the line
+  // a CRLF line's \r is its own end; any other carriage return or separator is inside the line, shown as ↵ (one unit
+  // for one, so every position holds). Only what the snippet shows is copied
   let known = index_.lines.get(start);
 
   if (known === undefined) {
-    chargeText("text", (end === -1 ? text.length : end) - start, 5);
+    const stop = end === -1 ? text.length : end;
 
-    const read = text
-      .slice(start, end === -1 ? undefined : end)
-      .replace(/\r$/, "")
-      .replace(/[\r\u2028\u2029]/g, "↵");
+    chargeText("text", stop - start, 5);
+    const crlf = stop > start && text.charCodeAt(stop - 1) === 0x0d && !(separators?.text === text && separators.at.has(stop - 1));
+    const lineEnd = crlf ? stop - 1 : stop;
+    let a = start;
+    let b = lineEnd;
 
-    const trimmed = read.trim();
+    while (a < b && trimmedAway(text.charCodeAt(a))) a++;
 
-    known = { whole: read, short: trimmed.length <= 80 ? trimmed : null };
+    while (b > a && trimmedAway(text.charCodeAt(b - 1))) b--;
+    known = { end: lineEnd, short: b - a <= 80 ? shown(text, a, b) : null };
     index_.lines.set(start, known);
   }
 
   if (known.short !== null) return { line, snippet: known.short };
-  const whole = known.whole;
+  const length = known.end - start;
   const col = index - start;
   const from = Math.max(0, col - 30);
   const to = from + 80;
-  const snippet = `${from > 0 ? "…" : ""}${whole.slice(from, to).trim()}${to < whole.length ? "…" : ""}`;
+  const snippet = `${from > 0 ? "…" : ""}${shown(text, start + from, start + Math.min(to, length)).trim()}${to < length ? "…" : ""}`;
 
   return { line, snippet };
+}
+
+/** `text` from `from` to `to` as a snippet shows it: a carriage return or a line or paragraph separator as ↵. */
+function shown(text: string, from: number, to: number): string {
+  return text.slice(from, to).replace(/[\r\u2028\u2029]/g, "↵");
+}
+
+/** Whether String.prototype.trim takes the code unit off a line's ends, once its separators are shown as ↵. */
+function trimmedAway(unit: number): boolean {
+  return unit === 0x09 || unit === 0x0b || unit === 0x0c || unit === 0x20 || unit === 0xa0 || unit === 0x1680 || (unit >= 0x2000 && unit <= 0x200a) || unit === 0x202f || unit === 0x205f || unit === 0x3000 || unit === 0xfeff;
 }
 
 /** Whether a decoded string reads as text: at least 95% printable ASCII, tabs and newlines. */

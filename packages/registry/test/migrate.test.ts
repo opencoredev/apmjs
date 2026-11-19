@@ -422,3 +422,236 @@ test("0018 drops the five smaller re-runs stored after the 13 Nov memory stops, 
     await db.drop();
   }
 }, 30_000);
+
+// Production, 16 to 18 Nov: four macOS typescript builds stored apm-score-v11's smaller re-run (29/100, F) after two
+// platform stops on their Mach-O lib/tsc. 0025 drops exactly those four results, their outcome rows and reservations, at
+// the digest each was stored for, so the deploy that reads them in full scores them again. Rows shaped as production's.
+/** A stored analysis as the 0025 fixtures write it: its scorer and signals, and whatever else the stored row holds. */
+type Stored0025 = {
+  readonly scorer: string;
+  readonly signals: readonly { id: string; points: number; evidence: readonly string[]; more?: readonly string[] }[];
+  readonly skipped?: readonly { path: string; size: number; reason: string }[];
+  readonly coverage?: { kind: string; notes?: readonly string[]; reasons?: readonly string[]; omittedBytes?: number; omittedFiles?: number };
+  readonly facts?: readonly string[];
+  readonly capabilities?: readonly string[];
+};
+
+test("0025 drops the four typescript darwin re-runs and nothing else, and a second run of it drops nothing", async () => {
+  const db = await migratedBefore("0025");
+  const c = await connect(db.url);
+  const reason = "2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB";
+  const ARM = "@typescript/typescript-darwin-arm64";
+  const X64 = "@typescript/typescript-darwin-x64";
+
+  const D = {
+    arm702: "sha512-828c336abf4cc12fda456a7a7f76b8294ab34630198ceb2618d08ce8b713817ba6f9d05f82c05530df8082f38209b82e5f289c93a2c986906ccf131e6c9f2cc8",
+    armDev: "sha512-193fee4506d937c47b581f2bcd06f2715d080b20f5bf90be32fafcdcc0c95fd28904378b157affa5ce14760c2e1fa7eb1a8918fec52b00eb64b79ae431206498",
+    x64702: "sha512-499f716489ea02936534673db345b5552b24b5848e7bd705a8d388aa63751acf129a48ca65816dd35ec6e15c0fc404889ce0ee01d6d35bbb1788551ff3ddd180",
+    x64Dev: "sha512-4c2658941144e5feccb14c92dda360f33c3fbd39b3413eee70a6f55758076446f3a372f29b45667faa5f440912801e2b50a6f2c0c9b752329e4e55596ba8a610",
+  };
+
+  const skipped = (size: number) => [{ path: "lib/tsc", size, reason: "over-budget" }];
+  const coverage = (size: number) => ({ kind: "partial", notes: [], reasons: ["over-budget"], omittedBytes: size, omittedFiles: 1 });
+  // as production stored them: the re-run's line first in `incomplete`, new-publisher on the 7.0.2 builds
+
+  const rerun = (size: number, publisher: boolean) => ({
+    scorer: "apm-score-v11",
+    signals: [
+      { id: "incomplete", points: -61, evidence: [reason] },
+      ...(publisher ? [{ id: "new-publisher", points: -10, evidence: ["microsoft1es has not published this package before (previous: typescript-deploys)"] }] : []),
+    ],
+    skipped: skipped(size),
+    coverage: coverage(size),
+    facts: [],
+    capabilities: [],
+  });
+  // the same line past the evidence shown, in `more`
+
+  const rerunInMore = (size: number) => ({ ...rerun(size, false), signals: [{ id: "incomplete", points: -61, evidence: ["not analyzed: lib/tsc (over-budget)"], more: [reason] }] });
+  const complete = { scorer: "apm-score-v11", signals: [], skipped: [], coverage: { kind: "complete" }, facts: [], capabilities: ["native"] };
+  const v10 = { scorer: "apm-score-v10", signals: [{ id: "incomplete", points: -61, evidence: ["an earlier analysis of this version was stopped"] }, { id: "unanalyzed-files", points: 0, evidence: ["lib/tsc"] }] };
+
+
+  const analysis = (pkg: string, version: string, digest: string, scorer: string, value: Stored0025) =>
+    c.query("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5::jsonb, 1)", [pkg, version, digest, scorer, JSON.stringify(value)]);
+
+  const outcome = (pkg: string, version: string, scorer: string, starts: number, result: string | null = null) =>
+    c.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at, outcome, detail, decided_at) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)", [pkg, version, scorer, starts, result, result === null ? null : "x", result === null ? null : 1]);
+
+  const job = (pkg: string, version: string, scorer: string | null) => c.query("INSERT INTO analysis_jobs (package, version, queued_at, scorer) VALUES ($1, $2, 1, $3)", [pkg, version, scorer]);
+
+  try {
+    // the four: the analysis, three starts and no outcome, the v11 reservation
+    for (const [pkg, version, digest, value] of [
+      [ARM, "7.0.2", D.arm702, rerun(23_653_616, true)],
+      [ARM, "7.1.0-dev.20261118.1", D.armDev, rerun(25_883_698, false)],
+      [X64, "7.0.2", D.x64702, rerun(24_971_184, true)],
+      [X64, "7.1.0-dev.20261118.1", D.x64Dev, rerunInMore(27_330_912)],
+    ] as const) {
+      await analysis(pkg, version, digest, "apm-score-v11", value);
+      await outcome(pkg, version, "apm-score-v11", 3);
+      await job(pkg, version, "apm-score-v11");
+    }
+
+    // must survive:
+    // - apm-score-v10's rows for the same versions (its analysis, its outcome row)
+    await analysis(ARM, "7.0.2", D.arm702, "apm-score-v10", v10);
+    await outcome(ARM, "7.0.2", "apm-score-v10", 3);
+    // - one of the four re-published at another digest, with the same line
+    await analysis(X64, "7.0.2", "sha512-republished", "apm-score-v11", rerun(24_971_184, true));
+    // - a correct v11 analysis of another darwin build, its outcome row and reservation
+    await analysis(X64, "7.1.0-dev.20261116.1", "sha512-x64-20261116", "apm-score-v11", complete);
+    await outcome(X64, "7.1.0-dev.20261116.1", "apm-score-v11", 1);
+    await job(X64, "7.1.0-dev.20261116.1", "apm-score-v11");
+    // - the same line on versions left out on purpose: 7.0.1-rc (analysis-limit) and a large-JavaScript package
+    await analysis(ARM, "7.0.1-rc", "sha512-rc", "apm-score-v11", rerun(25_421_488, false));
+    await outcome(ARM, "7.0.1-rc", "apm-score-v11", 4, "analysis-limit");
+    await job(ARM, "7.0.1-rc", "apm-score-v11");
+    await analysis("hyperframes", "0.9.58", "sha512-hf", "apm-score-v11", rerun(1_301_737, false));
+    await outcome("hyperframes", "0.9.58", "apm-score-v11", 3);
+    await job("hyperframes", "0.9.58", "apm-score-v11");
+    // - typescript@7.0.2's own rows: v10's clean analysis, its outcome row, its reservation from before scorers were recorded
+    await analysis("typescript", "7.0.2", "sha512-ts702", "apm-score-v10", { scorer: "apm-score-v10", signals: [{ id: "new-publisher", points: -10, evidence: ["x"] }] });
+    await outcome("typescript", "7.0.2", "apm-score-v10", 1);
+    await job("typescript", "7.0.2", null);
+    // - the AI reviews of the four, and a review job
+
+    for (const [pkg, version, digest] of [[ARM, "7.0.2", D.arm702], [X64, "7.0.2", D.x64702]] as const) {
+      await c.query("INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state) VALUES ($1, $2, $3, 'benign', '{}'::jsonb, 1, 'none')", [pkg, version, digest]);
+    }
+
+    await c.query(
+      "INSERT INTO review_jobs (id, package, version, digest, source, reasons, priority, state, enqueued_at, updated_at) VALUES ('rj1', $1, '7.1.0-dev.20261118.1', $2, 'upstream', '[]'::jsonb, 1, 'done', 1, 1)",
+      [ARM, D.armDev],
+    );
+
+    const rows = async (table: string, extra = "") => (await c.query<{ k: string }>(`SELECT package || '@' || version${extra} AS k FROM ${table} ORDER BY 1`)).rows.map((r) => r.k);
+    // sorted here, not by the database's collation
+    const sorted = (xs: readonly string[]): string[] => [...xs].sort();
+
+    const snapshot = async () => ({
+      analyses: sorted(await rows("upstream_analysis", " || ' ' || digest || ' ' || scorer")),
+      outcomes: sorted(await rows("analysis_outcomes", " || ' ' || scorer")),
+      jobs: sorted(await rows("analysis_jobs", " || ' ' || COALESCE(scorer, '-')")),
+      reviews: sorted(await rows("reviews", " || ' ' || digest")),
+      reviewJobs: sorted(await rows("review_jobs", " || ' ' || digest")),
+    });
+
+    const listed = {
+      analyses: [
+        `${ARM}@7.0.1-rc sha512-rc apm-score-v11`,
+        `${ARM}@7.0.2 ${D.arm702} apm-score-v10`,
+        `${X64}@7.0.2 sha512-republished apm-score-v11`,
+        `${X64}@7.1.0-dev.20261116.1 sha512-x64-20261116 apm-score-v11`,
+        "hyperframes@0.9.58 sha512-hf apm-score-v11",
+        "typescript@7.0.2 sha512-ts702 apm-score-v10",
+      ],
+      outcomes: [`${ARM}@7.0.1-rc apm-score-v11`, `${ARM}@7.0.2 apm-score-v10`, `${X64}@7.1.0-dev.20261116.1 apm-score-v11`, "hyperframes@0.9.58 apm-score-v11", "typescript@7.0.2 apm-score-v10"],
+      jobs: [`${ARM}@7.0.1-rc apm-score-v11`, `${X64}@7.1.0-dev.20261116.1 apm-score-v11`, "hyperframes@0.9.58 apm-score-v11", "typescript@7.0.2 -"],
+      reviews: [`${ARM}@7.0.2 ${D.arm702}`, `${X64}@7.0.2 ${D.x64702}`],
+      reviewJobs: [`${ARM}@7.1.0-dev.20261118.1 ${D.armDev}`],
+    };
+
+    const after = { analyses: sorted(listed.analyses), outcomes: sorted(listed.outcomes), jobs: sorted(listed.jobs), reviews: sorted(listed.reviews), reviewJobs: sorted(listed.reviewJobs) };
+
+    expect(await migrate(db.url)).toEqual(idsFrom("0025"));
+    expect(await snapshot()).toEqual(after);
+    // the runner applies it once; its statements run again, as a second apply would, delete nothing more
+    const sql = migrationFiles().find((m) => m.id === "0025_rescore_ts_darwin")?.sql ?? "";
+
+    expect(sql).toContain("apm:rollback-safe");
+    await c.query("BEGIN");
+    await c.query(sql);
+    await c.query("COMMIT");
+    expect(await snapshot()).toEqual(after);
+    expect(await migrate(db.url)).toEqual([]);
+  } finally {
+    await c.end();
+    await db.drop();
+  }
+}, 30_000);
+
+// If one of the four was scored again in full before 0025 runs (same version, digest and scorer, no re-run line), its
+// result, outcome row and reservation stay: the line is what marks a row as the re-run.
+test("0025 keeps one of the four when its v11 analysis no longer carries the re-run's line", async () => {
+  const db = await migratedBefore("0025");
+  const c = await connect(db.url);
+  const ARM = "@typescript/typescript-darwin-arm64";
+  const digest = "sha512-828c336abf4cc12fda456a7a7f76b8294ab34630198ceb2618d08ce8b713817ba6f9d05f82c05530df8082f38209b82e5f289c93a2c986906ccf131e6c9f2cc8";
+  const fullRead = { scorer: "apm-score-v11", signals: [{ id: "new-publisher", points: -10, evidence: ["microsoft1es has not published this package before (previous: typescript-deploys)"] }], skipped: [], coverage: { kind: "complete" } };
+  // a later read, incomplete for another reason, whose line only quotes the re-run's: still not the re-run
+  const quoting = { ...fullRead, signals: [...fullRead.signals, { id: "incomplete", points: -20, evidence: ["not analyzed: docs/2 earlier analyses of this version were stopped by the platform.md (binary)"] }] };
+
+  try {
+    await c.query("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, '7.0.2', $2, 'apm-score-v11', $3::jsonb, 1)", [ARM, digest, JSON.stringify(quoting)]);
+    await c.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ($1, '7.0.2', 'apm-score-v11', 1, 1)", [ARM]);
+    await c.query("INSERT INTO analysis_jobs (package, version, queued_at, scorer) VALUES ($1, '7.0.2', 1, 'apm-score-v11')", [ARM]);
+
+    expect(await migrate(db.url)).toEqual(idsFrom("0025"));
+    const count = async (table: string) => (await c.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table} WHERE package = $1`, [ARM])).rows[0]?.n;
+
+    expect([await count("upstream_analysis"), await count("analysis_outcomes"), await count("analysis_jobs")]).toEqual([1, 1, 1]);
+  } finally {
+    await c.end();
+    await db.drop();
+  }
+}, 30_000);
+
+// Round 5 review of f328874, P2: the migration chose its rows in one statement and deleted them in later ones, so a
+// complete analysis another connection wrote over a chosen row in between was deleted, with its bookkeeping. Now one
+// statement deletes under the whole guard: here another connection holds one of the four rows, rewritten as complete,
+// while the migration waits on it; once that commits, the migration reads the row as it now stands and keeps it.
+test("0025 keeps one of the four that another connection replaces with a complete analysis while the migration waits on it", async () => {
+  const db = await migratedBefore("0025");
+  const c = await connect(db.url);
+  const writer = await connect(db.url);
+  const ARM = "@typescript/typescript-darwin-arm64";
+  const X64 = "@typescript/typescript-darwin-x64";
+  const rerun = JSON.stringify({ scorer: "apm-score-v11", signals: [{ id: "incomplete", points: -61, evidence: ["2 earlier analyses of this version were stopped by the platform before they stored anything, so this one read at most 4 MB"] }] });
+  const complete = JSON.stringify({ scorer: "apm-score-v11", signals: [], coverage: { kind: "complete" } });
+
+  const four = [
+    [ARM, "7.0.2", "sha512-828c336abf4cc12fda456a7a7f76b8294ab34630198ceb2618d08ce8b713817ba6f9d05f82c05530df8082f38209b82e5f289c93a2c986906ccf131e6c9f2cc8"],
+    [ARM, "7.1.0-dev.20261118.1", "sha512-193fee4506d937c47b581f2bcd06f2715d080b20f5bf90be32fafcdcc0c95fd28904378b157affa5ce14760c2e1fa7eb1a8918fec52b00eb64b79ae431206498"],
+    [X64, "7.0.2", "sha512-499f716489ea02936534673db345b5552b24b5848e7bd705a8d388aa63751acf129a48ca65816dd35ec6e15c0fc404889ce0ee01d6d35bbb1788551ff3ddd180"],
+    [X64, "7.1.0-dev.20261118.1", "sha512-4c2658941144e5feccb14c92dda360f33c3fbd39b3413eee70a6f55758076446f3a372f29b45667faa5f440912801e2b50a6f2c0c9b752329e4e55596ba8a610"],
+  ] as const;
+
+  try {
+    for (const [pkg, version, digest] of four) {
+      await c.query("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, 'apm-score-v11', $4::jsonb, 1)", [pkg, version, digest, rerun]);
+      await c.query("INSERT INTO analysis_outcomes (package, version, scorer, starts, started_at) VALUES ($1, $2, 'apm-score-v11', 3, 1)", [pkg, version]);
+      await c.query("INSERT INTO analysis_jobs (package, version, queued_at, scorer) VALUES ($1, $2, 1, 'apm-score-v11')", [pkg, version]);
+    }
+
+    // a run stores its complete analysis over the first of the four, and resets its outcome row, and has not committed
+    await writer.query("BEGIN");
+    await writer.query("UPDATE upstream_analysis SET analysis = $3::jsonb, analyzed_at = 2 WHERE package = $1 AND version = $2 AND scorer = 'apm-score-v11'", [ARM, "7.0.2", complete]);
+    const migrating = migrate(db.url);
+    let waiting = 0;
+
+    for (let i = 0; i < 300 && waiting === 0; i++) {
+      waiting = (await c.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")).rows[0]?.n ?? 0;
+
+      if (waiting === 0) await Bun.sleep(5);
+    }
+
+    // the migration is in its statement, waiting on that row
+    expect(waiting).toBe(1);
+    await writer.query("COMMIT");
+    expect(await migrating).toEqual(idsFrom("0025"));
+
+    const rows = async (table: string) => (await c.query<{ k: string }>(`SELECT package || '@' || version AS k FROM ${table} ORDER BY 1`)).rows.map((r) => r.k);
+
+    // on f328874 (its statements split as the reviewer split them): the complete analysis deleted, with its outcome row
+    // and reservation
+    expect(await rows("upstream_analysis")).toEqual([`${ARM}@7.0.2`]);
+    expect((await c.query("SELECT analysis FROM upstream_analysis")).rows).toEqual([{ analysis: JSON.parse(complete) }]);
+    expect(await rows("analysis_outcomes")).toEqual([`${ARM}@7.0.2`]);
+    expect(await rows("analysis_jobs")).toEqual([`${ARM}@7.0.2`]);
+  } finally {
+    await writer.end();
+    await c.end();
+    await db.drop();
+  }
+}, 30_000);

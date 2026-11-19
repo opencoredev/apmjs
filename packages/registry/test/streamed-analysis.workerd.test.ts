@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { MAX_UPSTREAM_TARBALL_BYTES } from "../src/upstream.ts";
 import { WORKER_CPU_MS } from "../src/analysis.ts";
+import { machO } from "../../core/test/executables.ts";
 import { ENTRY } from "./streamed-analysis-entry.ts";
 import { startWorkerdHeap, type WorkerdHeap } from "./workerd-heap.ts";
 
@@ -44,6 +45,9 @@ const HEAP_CAP_MB = 96;
 
 /** The most live memory any full collection may find during a run: half the cap, the rest left to garbage and the runtime. */
 const LIVE_LIMIT = (HEAP_CAP_MB / 2) * MB;
+
+/** What production (274d284) held live reading the round 11 review's unheld binaries as a stream: 36.9 MiB, ballast in. */
+const PRODUCTION_LIVE = 36.9 * MB;
 
 const DIRS = [join(homedir(), ".cache", "apm-corpus", "tgz"), join(homedir(), ".cache", "apm-big", "tgz")];
 
@@ -219,6 +223,48 @@ function scored(m: Measured): z.infer<typeof Scored> {
 }
 
 describe("a tarball too large to hold is scored as a stream", () => {
+  // first, in an isolate nothing else has run in yet, as production's figure was measured. Round 11 review of ee69d23: a streamed read read the text of each binary it did not hold as it passed, which
+  // production (274d284) never did (its plan held a Mach-O like any text file, within its budget, and left the rest
+  // unread), and three allocations of that reading ended the isolate: a newline index of one number a newline, the
+  // whole of a snippet's line copied and rewritten, and a match for every literal of a chain (a 32 MiB chain stopped
+  // on a RangeError instead). Production finished each partial at 36.9 MiB live; now nothing of a file the read did not
+  // hold is read, as in production, and the four come out partial with no more live than production's and 4 MiB
+  for (const [mode, tail, held] of [
+    ["33,554,303 newlines", `${"\n".repeat(33_554_303)}require('child_process');`, false],
+    ["a line of 33,554,301 carriage returns", `require('child_process'); ${"\r".repeat(33_554_301)}x`, false],
+    ["a chain of 1,000,001 literals", `${"'aaaa'+".repeat(1_000_000)}'b';`, false],
+    ["a chain of 8,388,582 literals", `${"'a'+".repeat(8_388_581)}'b';`, false],
+    // 4 MB each: held, as production's plan held it, and read for its imports as production read it; production ended
+    // its isolate on both. The joining's lists, unbounded, reached 83.8 MiB live on the chain (kept.ts now holds them, and
+    // cuts the graph), and a script's words, built a character at a time, ended this one's on a million escapes (round 12)
+    ["a held chain of 1,000,001 literals", `${"'a'+".repeat(1_000_000)}'b';`, true],
+    ["a held string of a million \\x61 escapes", `"${"\\x61".repeat(1_000_000)}"`, true],
+  ] as const) {
+    test(`a Mach-O of ${mode}, beside 49 MiB of native code and 27 MiB of live objects: ${held ? "incomplete" : "unread, partial"}, as production or stricter`, async () => {
+      const data = machO({ size: 256, tail: new TextEncoder().encode(tail) });
+      const bytes = tgz({ "package.json": JSON.stringify({ name: "unheld-binary", version: "1.0.0", license: "MIT" }), "filler.node": new Uint8Array(49 * MB), "lib/b000000": data });
+      const file = `unheld-${mode.replace(/\W+/g, "-")}.tgz`;
+
+      generated.set(file, bytes);
+      const m = await run("stream", file, `unheld-binary (${mode})`, sha512(bytes), "&ballastMiB=27");
+      const r = scored(m);
+
+      // on ee69d23: V8 reached its heap limit (newlines, carriage returns, a million literals), or the scan's RangeError
+      // made the version unscorable (8 million literals); on 7cd0b2b the escapes ended the isolate
+      if (held) {
+        // its reading stopped at what it may hold: what it found counts, and the analysis is incomplete
+        expect(r.signals.map((x) => x.id)).toContain("incomplete");
+      } else {
+        expect(r.coverage).toMatchObject({ kind: "partial", reasons: ["over-budget"] });
+        expect(r.coverage?.kind === "partial" ? r.coverage.omittedBytes : 0).toBeGreaterThanOrEqual(data.length);
+      }
+
+      // an unheld file is not read, so the run holds what production's did; a held one is read, its lists held to 16 MiB
+      // while it reads (kept.ts), where production ended its isolate: held to round 10's target for a dense reading
+      expect(m.liveHeap).toBeLessThanOrEqual(held ? 72 * MB : PRODUCTION_LIVE + 4 * MB);
+    }, 300_000);
+  }
+
   test("a generated 36 MiB tarball (one native binary, a little code) reads in one pass to the analysis it gets held whole", async () => {
     const bytes = tgz({
       "package.json": JSON.stringify({ name: "big-native", version: "1.0.0", license: "MIT", main: "index.js" }),
@@ -243,6 +289,36 @@ describe("a tarball too large to hold is scored as a stream", () => {
 
     for (const b of [...m.answer.before, m.answer.after]) expect(b - m.base).toBeLessThan(8 * MB);
   }, 120_000);
+
+  // round 9 review, P1: each streamed scan of a binary the read did not hold was kept whole until the analysis read it,
+  // charged to the lease alone, so 5 MiB of comments, 49 MiB of native filler and 800 Mach-O files of 200 findings each
+  // spent a queue run's lease (27 MiB of metadata held beside it) and came back a retryable failure, no report.
+  // Production (274d284) scored it 50 (P), partial. Scans keep MAX_KEPT_VIEW_BYTES at most, all together; past it a
+  // file is not scanned and is unread
+  test("800 Mach-O files of 200 findings each, streamed beside 27 MiB of live objects: scored, partial, as production", async () => {
+    const tail = new TextEncoder().encode(`\n${"'child_'+'process';\n".repeat(200)}`);
+    const machOs = Object.fromEntries(Array.from({ length: 800 }, (_, i) => [`lib/b${String(i).padStart(6, "0")}`, machO({ size: 256, tail })]));
+
+    const bytes = tgz({
+      "package.json": JSON.stringify({ name: "scan-budget", version: "1.0.0", license: "MIT" }),
+      "filler.node": new Uint8Array(49 * MB),
+      "aa.js": `/*${" ".repeat(4 * MB - 4)}*/`,
+      "ab.js": `/*${" ".repeat(MB - 4)}*/`,
+      ...machOs,
+    });
+
+    generated.set("scan-budget.tgz", bytes);
+    const m = await run("stream", "scan-budget.tgz", "scan-budget", sha512(bytes), "&ballastMiB=27");
+    const r = scored(m);
+
+    // on 6dcf4f2: fetch-failed, "the registry had no memory to spare for this tarball's read"
+    // production (274d284): 50 (P), partial. The files the plan held pass what views may keep together: they keep their
+    // signals, and the reading is incomplete besides (round 12 review of 7cd0b2b): never higher, never installed
+    expect(r.score).toBeLessThanOrEqual(50);
+    expect(r.coverage?.kind).toBe("partial");
+    expect(r.signals.map((x) => x.id)).toContain("incomplete");
+    expect(m.liveHeap).toBeLessThan(LIVE_LIMIT + 32 * MB);
+  }, 300_000);
 
   test("bytes that do not match their sha512 store nothing", async () => {
     const bytes = generated.get("big-native.tgz") ?? new Uint8Array();
@@ -296,6 +372,48 @@ describe("a tarball too large to hold is scored as a stream", () => {
     // the ballast is live throughout: what a full collection leaves is the run's and the ballast's
     expect(m.liveHeap).toBeLessThan(LIVE_LIMIT + 32 * MB);
   }, 300_000);
+
+  // @typescript/typescript-darwin-arm64 7.0.2 (9.3 MB, a 24 MB Mach-O lib/tsc) is under the caps, so the queue holds it
+  // whole. Its executable was read as JavaScript until the Mach-O check matched (core isBinary), and production's runs
+  // of it were all stopped by the platform. Listed as native code, its text is still read exactly as production decoded
+  // it (binary-text.ts, one byte a code unit): about 8 s of a Worker's 60, well inside a quarter of the limit
+  test.skipIf(tarballAt("typescript-darwin-arm64-7.0.2.tgz") === null)("@typescript/typescript-darwin-arm64 7.0.2, held whole: its Mach-O is listed, not read, inside the CPU limit and the heap cap", async () => {
+    const bytes = served("typescript-darwin-arm64-7.0.2.tgz") ?? new Uint8Array();
+    // beside 8 MiB of live objects, over 20 times its own packument (350 KB on npm, 18 Nov): the run's view of lib/tsc
+    // (23 MB, one byte a code unit) and the rules' joined copy of it are live while it is read. Until round 10 the held
+    // route never built the ballast this asked for. With next's 27 MiB beside it, c558aff ended this test's isolate: the
+    // line cache kept the joined copy after the read (binary-text.ts, Merged). It now finishes at 81.9 MiB live, over the
+    // limit below by 2 MiB, so the test holds what this package's own packument weighs, and more
+    const m = await run("held", "typescript-darwin-arm64-7.0.2.tgz", "@typescript/typescript-darwin-arm64 (with a packument's weight held)", sha512(bytes), "&ballastMiB=8");
+    const r = scored(m);
+
+    expect(r).toMatchObject({ score: 100, grade: "A", coverage: { kind: "complete" }, skipped: 0 });
+    expect(m.cpuMs).toBeLessThan(CPU_MS_HERE / 4);
+    expect(m.liveHeap).toBeLessThan(LIVE_LIMIT + 32 * MB);
+  }, 300_000);
+
+  // round 10 review of c558aff, P1: one extensionless Mach-O of 60,000 lines of `'child_'+'process';` (7 KB gzipped)
+  // made 120,000 findings a view, in two views, cloned whole before any budget was checked, and ended the isolate;
+  // production (274d284) finished it complete, 65 (C), at 77.8 MiB live, and 65,000 lines at 85.5 MiB. Its reading is
+  // now charged as it finds its results and stops at what it may keep (kept.ts), and the run stays well under the cap
+  // beside a packument's weight. Round 12 review of 7cd0b2b, P2: it was then reported unread for the budget and its
+  // findings dropped, 100 (P), which installs. It keeps every signal it found and is incomplete: at most production's 65
+  for (const lines of [60_000, 65_000]) {
+    test(`one Mach-O of ${lines.toLocaleString("en")} joined strings, held whole beside 27 MiB of live objects: its signals kept, incomplete, at most 65, at most 72 MiB live`, async () => {
+      const data = machO({ size: 256, tail: new TextEncoder().encode(`\n${"'child_'+'process';\n".repeat(lines)}`) });
+      const bytes = tgz({ "package.json": JSON.stringify({ name: "dense-scan", version: "1.0.0", license: "MIT" }), "lib/b000000": data });
+
+      generated.set(`dense-${lines}.tgz`, bytes);
+      const m = await run("held", `dense-${lines}.tgz`, `dense-scan (${lines} joins)`, sha512(bytes), "&ballastMiB=27");
+      const r = scored(m);
+
+      // on c558aff: V8 reached its heap limit and the isolate ended; on 7cd0b2b: 100 (P), partial
+      expect(r.coverage).toEqual({ kind: "complete" });
+      expect(r.signals.map((x) => x.id)).toEqual(expect.arrayContaining(["obfuscated", "incomplete"]));
+      expect(r.score).toBeLessThanOrEqual(65);
+      expect(m.liveHeap).toBeLessThanOrEqual(72 * MB);
+    }, 300_000);
+  }
 
   for (const [file, name] of [
     ["express-5.3.0.tgz", "express"],

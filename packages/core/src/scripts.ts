@@ -188,9 +188,31 @@ export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolea
   return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
 }
 
+/** Words a reading of a command or script found: all of them, or the first few and a cut, past which it read no more. */
+export type ShellWords = { readonly kind: "complete" | "cut"; readonly words: string[] };
+
 /** Paths a command runs or reads: every word that could name a file, `./setup` and `setup.js` alike. */
 export function commandWords(cmd: string): string[] {
-  return cmd.split(/[\s;&|()<>'"=`]+/).flatMap((w) => (w.length > 0 && !w.startsWith("-") && !w.startsWith("$") && /^[\w@./-]+$/.test(w) ? [w.replace(/^\.\//, "")] : []));
+  return commandWordsWithin(cmd, Number.POSITIVE_INFINITY).words;
+}
+
+/**
+ * commandWords, `max` at most, read one at a time (a script's whole text is read for them: a split of 32 MB of short
+ * words was an array of millions), and cut past that: what the rest names is not known (round 13 review of d594415, P2).
+ */
+export function commandWordsWithin(cmd: string, max: number): ShellWords {
+  const words: string[] = [];
+
+  for (const m of cmd.matchAll(/[^\s;&|()<>'"=`]+/g)) {
+    const w = m[0];
+
+    if (w.startsWith("-") || w.startsWith("$") || !/^[\w@./-]+$/.test(w)) continue;
+
+    if (words.length >= max) return { kind: "cut", words };
+    words.push(w.replace(/^\.\//, ""));
+  }
+
+  return { kind: "complete", words };
 }
 
 /** Commands a binding.gyp runs at install: `<!(...)` expansions and the argv of every action. */

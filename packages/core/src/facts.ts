@@ -5,6 +5,7 @@
 // is left out, and in a file with no tree every match is kept and marked as a text match. In a parsed file the flow
 // analysis (flow.ts) adds what a character window cannot show: a value reaching the call that sends, runs or reads it
 // (`sends-*`, `runs-download`, `reads-credential`); score.ts turns those into facts. Pure.
+import { chargeFact } from "./kept.ts";
 import type { Command } from "./js.ts";
 import { escapedTextAt, hexIdentifierRun, lineOf, longBase64Text, type Hidden } from "./rules.ts";
 import { chargeText } from "./meter.ts";
@@ -41,6 +42,13 @@ export type FactKind = (typeof FACT_KINDS)[number];
  * characters of it, or the whole file is shorter than SMALL_FILE: what a stealer collects and sends sits together.
  */
 export type Fact = { kind: FactKind; line: number; snippet: string; name?: string; text: boolean; near: boolean };
+
+/**
+ * The facts text that does not run as the file's own code still adds: what it would do that malware does, not what it
+ * can do. A string that only holds code (score.ts), and the text a shell would run in a file read as binary
+ * (binary-text.ts), add these and nothing else, so neither lists capabilities a package's own code does not show.
+ */
+export const RISK_FACT_KINDS: readonly FactKind[] = ["env-dump", "credential-read", "credential-near", "remote-shell", "fetched-code", "capture-endpoint"];
 
 /** How close a network call must be to what a file collects for the two to read as one flow, and a file short enough to be one. */
 const NEAR_NETWORK = 1500;
@@ -137,6 +145,34 @@ const SECRET_FAMILIES: readonly { family: string; re: RegExp }[] = [
   { family: "AI", re: /^(?:OPENAI_API_KEY|ANTHROPIC_API_KEY)$/ },
 ];
 
+/** A name of each family, which secretFamily gives that family. */
+const FAMILY_NAMES = new Map([
+  ["npm", "NPM_TOKEN"],
+  ["GitHub", "GITHUB_TOKEN"],
+  ["AWS", "AWS_SECRET_ACCESS_KEY"],
+  ["Google Cloud", "GOOGLE_APPLICATION_CREDENTIALS"],
+  ["Azure", "AZURE_SECRET"],
+  ["CI", "CI_JOB_TOKEN"],
+  ["chat", "SLACK_TOKEN"],
+  ["AI", "OPENAI_API_KEY"],
+]);
+
+/** The longest name a fact a saturated reading keeps holds (kept.ts). */
+const SHORT_NAME = 128;
+
+/**
+ * `fact` as a saturated binary reading keeps it: a name longer than SHORT_NAME becomes its family's name when it names a
+ * secret, so secretFamily reads it the same, and is cut with "…" otherwise, which no family matches (each is anchored
+ * and all word characters). Everything else the scorer reads (kind, line, near, text) is kept (round 13 review of
+ * d594415, P3: one fact per kind lost a three-family harvest, and with it exfiltration).
+ */
+function shortened(fact: Fact): Fact {
+  if (fact.name === undefined || fact.name.length <= SHORT_NAME) return fact;
+  const family = secretFamily(fact.name);
+
+  return { ...fact, name: family === null ? `${fact.name.slice(0, SHORT_NAME)}…` : (FAMILY_NAMES.get(family) ?? fact.name.slice(0, SHORT_NAME)) };
+}
+
 /** The credential family an environment variable belongs to, for the variables stealers go for; null for any other. */
 export function secretFamily(name: string): string | null {
   return SECRET_FAMILIES.find((f) => f.re.test(name))?.family ?? null;
@@ -174,7 +210,10 @@ export function factsOf(text: string, hidden?: Where, commands?: readonly Comman
     if (near) nearCounts.set(kind, (nearCounts.get(kind) ?? 0) + 1);
 
     const where = lineOf(text, index);
-    out.push(name === undefined ? { kind, ...where, text: isText, near } : { kind, ...where, name, text: isText, near });
+    const fact: Fact = name === undefined ? { kind, ...where, text: isText, near } : { kind, ...where, name, text: isText, near };
+
+    // in a binary's reading, charged as it is found; past what it may keep, kept with a long name shortened (kept.ts)
+    out.push(chargeFact(fact) ? fact : shortened(fact));
 
     return true;
   };
