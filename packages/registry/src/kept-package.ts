@@ -35,7 +35,7 @@ import { Cause, Context, Effect, Exit, Option } from "effect";
 import semver from "semver";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
-import { Store, type KeptPackageRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
+import { Store, type KeptPackageRow, type PageScores, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import { digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
@@ -281,13 +281,40 @@ const keptRow = (name: string, at: number) => Effect.map(Effect.flatMap(Store, (
  * What a page read has of an upstream package before it looks at its summary: "read" when its kept row (null: none)
  * and its scores came with the package row (Store.pageRead, one round trip), "unread" when this file reads them.
  */
-export type PageFirst = { kind: "read"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses } | { kind: "unread" };
+export type PageFirst = { kind: "read"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses; whole: ReadonlySet<string> } | { kind: "unread" };
+
+/**
+ * Which stored analyses a page's read of `need` asks Store.pageRead for whole: the one of the version it shows (resolved
+ * as versionAsked resolves it, the dist-tags from the kept summary). The other versions' are read only for their score
+ * and grade, without PAGE_TRIMMED's members.
+ */
+export function pageScores(need: PageNeed): PageScores {
+  switch (need.kind) {
+    case "page":
+      return { kind: "shown", versions: [], tags: ["latest"] };
+    case "version":
+      return { kind: "shown", versions: [need.version], tags: [] };
+    case "spec":
+      return { kind: "shown", versions: [need.spec], tags: [need.spec] };
+    case "history":
+      return need.spec === undefined ? { kind: "shown", versions: [], tags: ["latest"] } : { kind: "shown", versions: [need.spec], tags: [need.spec] };
+    default: {
+      const _exhaustive: never = need;
+
+      return _exhaustive;
+    }
+  }
+}
 
 /** The kept row `first` brought, or keptRow's. */
 const firstRow = (name: string, at: number, first: PageFirst) => (first.kind === "read" ? Effect.succeed(parseKept(name, first.kept)) : keptRow(name, at));
 
-/** The scores `first` brought, or upstreamAnalyses'. */
-const firstAnalyses = (name: string, first: PageFirst) => (first.kind === "read" ? Effect.succeed(first.analyses) : Effect.flatMap(Store, (s) => s.upstreamAnalyses(name)));
+/**
+ * The scores `first` brought when they hold the analysis of `shown` whole (pageScores), else upstreamAnalyses': a read
+ * whose shown version came without PAGE_TRIMMED's members reads every analysis again, whole, rather than show it so.
+ */
+const firstAnalyses = (name: string, first: PageFirst, shown: string) =>
+  first.kind === "read" && first.whole.has(shown) ? Effect.succeed(first.analyses) : Effect.flatMap(Store, (s) => s.upstreamAnalyses(name));
 
 /** What a request holds of an expanded summary: each version's record and its scored copy. */
 const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECORD_WEIGHT + SCORED_WEIGHT);
@@ -541,11 +568,13 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
     const { kept, fetched } = yield* keptFor(input);
 
     // the scores read with the row (pageRead) or now: either way after the request began, so a score or a dismissal
-    // committed before it is in them
-    if (kept !== null) {
+    // committed before it is in them. keptFor answers only when the summary holds the version the read shows
+    const shown = kept === null ? undefined : versionAsked(kept, input.need);
+
+    if (kept !== null && shown !== undefined) {
       if (!lease.take(expandWeight(kept))) return { kind: "unknown" } satisfies Probe;
 
-      return scoredPackage(expand(kept), yield* firstAnalyses(name, first));
+      return scoredPackage(expand(kept), yield* firstAnalyses(name, first, shown.version));
     }
 
     // npm's packument was read instead, which can take seconds: the scores are read again after it, as before

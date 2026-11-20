@@ -220,6 +220,11 @@ const VersionInfo = z.object({
 /** The per-version answer: one version's state, facts and score. */
 export type VersionDetails = z.infer<typeof VersionInfo>;
 
+const versionInfoPath = (name: string, version: string): string => `-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`;
+
+/** One version's state, facts and score, read from the registry now: never one this request read before (getVersionInfo). */
+export const readVersionInfo = (name: string, version: string): Promise<Fetched<VersionDetails>> => getJson(versionInfoPath(name, version), VersionInfo);
+
 /** The per-version answers this request read, by registry path (requestScope), as packageReads does for packages. */
 const versionReads = new WeakMap<object, Map<string, Promise<Fetched<VersionDetails>>>>();
 
@@ -230,7 +235,7 @@ const versionReads = new WeakMap<object, Map<string, Promise<Fetched<VersionDeta
  * and in tests through React's cache.
  */
 export const getVersionInfo = cache((name: string, version: string): Promise<Fetched<VersionDetails>> => {
-  const path = `-/apm/v1/packages/${encodeName(name)}/versions/${encodeURIComponent(version)}`;
+  const path = versionInfoPath(name, version);
   const scope = requestScope();
 
   if (scope === null) return getJson(path, VersionInfo);

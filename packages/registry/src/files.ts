@@ -11,7 +11,8 @@
 // in the parsed entry list, never joined onto anything, so "../" and friends can only name an entry that exists.
 // Answers are cached in the blob store under the tarball's digest: one index of paths and sizes, and one
 // object per path read, so a repeat costs one or two small reads instead of inflating the tarball again.
-import { pageProbe } from "./kept-package.ts";
+import { pageProbe, pageScores } from "./kept-package.ts";
+import { Clock } from "./clock.ts";
 import { RequestMemory } from "./memory.ts";
 import { Effect, Option } from "effect";
 import { z } from "zod";
@@ -85,7 +86,13 @@ const writeCached = (key: string, value: FileIndex | FileBody | LineCount | Bloc
 /** The version, local first, then upstream. */
 const findVersion = (name: string, version: string) =>
   Effect.gen(function* () {
-    if (yield* (yield* Store).getPackage(name)) {
+    const need = { kind: "version", version } as const;
+    // the package row, or an upstream package's kept summary and its scores with only this version's analysis whole, in
+    // one round trip (Store.fileRead): next's analyses whole are 5 MB, and a file view reads none of them. A local
+    // package's versions are not in it: the one asked for is read on its own, its state as of now (versionOf)
+    const row = yield* (yield* Store).fileRead({ name, at: yield* (yield* Clock).now, scores: pageScores(need) });
+
+    if (row.kind === "local") {
       const v = yield* versionOf(name, version);
 
       return v ? ({ kind: "local", v } satisfies Found) : null;
@@ -95,7 +102,7 @@ const findVersion = (name: string, version: string) =>
 
     if (Option.isNone(upstream)) return null;
     // the kept summary names the version's tarball and checksum when it holds the version (kept-package.ts)
-    const probe = yield* pageProbe({ upstream: upstream.value, name, need: { kind: "version", version }, lease: yield* RequestMemory, first: { kind: "unread" } });
+    const probe = yield* pageProbe({ upstream: upstream.value, name, need, lease: yield* RequestMemory, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } });
 
     switch (probe.kind) {
       case "found": {

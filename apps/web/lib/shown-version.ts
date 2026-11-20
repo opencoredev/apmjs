@@ -18,6 +18,9 @@ export type VersionChoice =
 // A semver version as npm stores it: three numbers, an optional prerelease and optional build metadata.
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
+/** Whether `asked` is a version number rather than a dist-tag: one the per-version endpoint can be asked about as it is. */
+export const isVersionNumber = (asked: string): boolean => VERSION.test(asked);
+
 /** Decides from the package answer; `unlisted` still needs the per-version endpoint to say whether it exists. */
 export function chooseVersion(input: { pkg: Pick<PackageInfo, "versions" | "latest" | "distTags">; asked: string | undefined }): VersionChoice {
   const { pkg, asked } = input;

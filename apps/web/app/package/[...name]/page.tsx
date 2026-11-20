@@ -816,8 +816,9 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const tarballReadme: Promise<TarballRead | null> =
     version && needsTarballReadme(pkg.readme) ? (tarballTooLarge({ pkg, version }) ? Promise.resolve({ kind: "not-opened" }) : getTarballReadme({ name, version })) : Promise.resolve(null);
 
-  // an older version's own facts, from the per-version answer (already read when the package answer doesn't list it)
-  const versionDetails: Promise<Fetched<VersionDetails>> = isLatest || version === null ? Promise.resolve(none) : details ? Promise.resolve({ kind: "ok", value: details }) : getVersionInfo(name, version);
+  // an older version's own facts, from the per-version answer (already read when the package answer doesn't list it,
+  // and started with the package answer when ?v= is a version number: lib/package-reads.ts)
+  const versionDetails: Promise<Fetched<VersionDetails>> = isLatest || shown === null ? Promise.resolve(none) : details ? Promise.resolve({ kind: "ok", value: details }) : reads.details(shown);
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
   const [versionScore, detailsRead] = await Promise.all([shown && !isLatest ? reads.score(shown) : Promise.resolve(none), versionDetails]);
 

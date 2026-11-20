@@ -1,6 +1,8 @@
-// Runs the registry Worker locally for development: the production bundle (dist/worker.js) in workerd through
-// Miniflare, R2 and the analysis queue simulated, Hyperdrive pointing at Postgres. Nothing here persists:
-// the database is a fresh copy of the migrated schema and R2 lives in memory.
+// Runs the registry Worker locally for development, in workerd through Miniflare: R2 and the analysis queue simulated,
+// Hyperdrive pointing at Postgres. Nothing here persists: the database is a fresh copy of the migrated schema and R2
+// lives in memory. It runs the test entry (worker-test.js): the production Worker, whose test controls answer only to
+// TEST_CONTROL_SECRET, left unset here. Local workerd refuses the production entry, whose named constant exports
+// (BUILD_HEADER) it takes for handlers.
 //
 //   bun run registry                       # http://127.0.0.1:4873/, proxying registry.npmjs.org
 //   APM_UPSTREAM=off bun run registry      # no npm proxy
@@ -17,7 +19,7 @@ import { freshDatabase } from "../tests/acceptance/postgres.ts";
 
 const port = Number(process.env.APM_PORT ?? 4873);
 const url = `http://127.0.0.1:${port}/`;
-const [database, script] = await Promise.all([freshDatabase(), buildWorker("worker", mkdtempSync(`${tmpdir()}/apm-dev-`))]);
+const [database, script] = await Promise.all([freshDatabase(), buildWorker("worker-test", mkdtempSync(`${tmpdir()}/apm-dev-`))]);
 
 const bindings = new Map([
   ["APM_REGISTRY_URL", url],
@@ -38,6 +40,8 @@ const PASSED_THROUGH = [
   "APM_REVIEW_POPULAR_WEEKLY",
   "APM_NPM_DOWNLOADS_URL",
   "APM_AI_FLAGS_HOLD",
+  // the full Server-Timing (registry timing.ts) for a request whose x-apm-debug header hashes to it
+  "APM_DEBUG_TOKEN_HASH",
 ];
 
 for (const key of PASSED_THROUGH) {

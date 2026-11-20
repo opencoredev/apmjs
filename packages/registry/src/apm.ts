@@ -96,7 +96,7 @@ import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarnin
 import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
 import { timed as timedOf, timingOrNull } from "./timing.ts";
-import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, type PageNeed } from "./kept-package.ts";
+import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, pageScores, type PageNeed } from "./kept-package.ts";
 import { newestPublishersFirst } from "./publishers.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -260,18 +260,20 @@ const briefly = <A, E, R>(use: (lease: Lease) => Effect.Effect<A, E, R>) =>
  *
  * The package row, a local package's versions and owners, and an upstream package's kept row and scores come in one
  * round trip (Store.pageRead) instead of four in a row, and each version's state is the one at the registry's time now.
+ * Only the shown version's analysis comes whole (pageScores); the others carry what their score and grade are read
+ * from, so next's page no longer reads 2,656 unread files' names for each of its scored versions.
  */
 const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const row = yield* (yield* Store).pageRead({ name, at, scores: true });
+    const row = yield* (yield* Store).pageRead({ name, at, scores: pageScores(need) });
 
     if (row.kind === "local") return { src: localSource(row.pkg, row.versions.map((v) => atTime(v, at))), maintainers: row.owners };
 
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses } });
+    const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } });
 
     return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
   });

@@ -14,6 +14,8 @@ export type DatabaseLink = {
   readonly set: (mode: LinkMode) => void;
   /** How many connections the link has accepted (or refused) since it started. */
   readonly accepted: () => number;
+  /** How many bytes the database has sent the Worker through the link since it started (tests/perf counts a request's). */
+  readonly received: () => number;
   readonly stop: () => Promise<void>;
 };
 
@@ -23,6 +25,7 @@ export async function startDatabaseLink(databaseUrl: string): Promise<DatabaseLi
   const pairs = new Set<{ client: Socket; upstream: Socket }>();
   let mode: LinkMode = "up";
   let accepted = 0;
+  let received = 0;
 
   const server = createServer((client) => {
     accepted++;
@@ -46,6 +49,9 @@ export async function startDatabaseLink(databaseUrl: string): Promise<DatabaseLi
     });
     upstream.on("error", () => upstream.destroy());
     client.on("close", () => upstream.destroy());
+    upstream.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+    });
     client.pipe(upstream);
     upstream.pipe(client);
     const pair = { client, upstream };
@@ -62,6 +68,7 @@ export async function startDatabaseLink(databaseUrl: string): Promise<DatabaseLi
   return {
     url: url.toString(),
     accepted: () => accepted,
+    received: () => received,
     set: (next) => {
       mode = next;
 

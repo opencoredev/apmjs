@@ -11,7 +11,8 @@ import { fileApiPath, packageApiPath, REGISTRY } from "./registry-url";
 // lib/registry.ts is the server entry point; outside Next its marker import would throw
 void mock.module("server-only", () => ({}));
 
-const { getFile, getPackage, getReview, getVersionScore } = await import("./registry");
+const { getFile, getPackage, getReview, getVersionInfo, getVersionScore } = await import("./registry");
+const { chooseVersion, rowsWith } = await import("./shown-version");
 const { GET: readmeRoute } = await import("../app/api/readme/route");
 const { startPackageReads } = await import("./package-reads");
 const { shownOf } = await import("./early-answer");
@@ -95,6 +96,14 @@ const GONE = { kind: "unavailable", reason: { kind: "status", status: 410 } } as
 const reviewPath = (name: string) => `/-/apm/v1/review/${name}/1.0.0`;
 const scorePath = (name: string) => `/-/apm/v1/score/${name}/1.0.0`;
 const packagePath = (name: string) => `/${packageApiPath(name)}`;
+const detailsPath = (name: string) => `/${packageApiPath(name)}/versions/1.0.0`;
+
+/** The per-version answer; withheld, the registry sends no deprecation text (the publisher's). */
+function detailsBody(status: "active" | "revoked" | "revoke-pending") {
+  const withheld = status !== "active";
+
+  return { version: "1.0.0", status, statusReason: withheld ? "a leaked key" : null, deprecated: withheld ? null : `moved to ${SOURCE}`, facts: null, score: null, unscorable: null };
+}
 
 /** A review answer. */
 function reviewBody(name: string, redacted: boolean) {
@@ -258,17 +267,19 @@ describe("a revoke between the page's early reads and its package answer", () =>
       const name = `early-${status}`;
       answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
       answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+      answers.set(detailsPath(name), { status: 200, body: detailsBody("active") });
       toHold.add(packagePath(name));
 
       const reads = startPackageReads({ name, asked: "1.0.0" });
       const pkg = await heldRequest(packagePath(name));
       // the early reads were answered while 1.0.0 was active
-      await sent([reviewPath(name), scorePath(name)]);
+      await sent([reviewPath(name), scorePath(name), detailsPath(name)]);
       await Bun.sleep(5);
 
       // the revoke commits, then the package answer reads the versions
       answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
       answers.set(scorePath(name), { status: 200, body: scoreBody(name, true) });
+      answers.set(detailsPath(name), { status: 200, body: detailsBody(status) });
       pkg.release({ status: 200, body: withVersion(name, status) });
       const found = await reads.package;
 
@@ -284,6 +295,13 @@ describe("a revoke between the page's early reads and its package answer", () =>
       // each was asked twice: the early read and the read for the withheld version
       expect(seen.filter((s) => s.path === reviewPath(name)).length).toBe(2);
       expect(seen.filter((s) => s.path === scorePath(name)).length).toBe(2);
+
+      // the per-version answer too: the early one said active, so the withheld version's is read again
+      const details = await reads.details(shown);
+
+      expect(details.kind === "ok" && details.value.status).toBe(status);
+      expect(JSON.stringify(details)).not.toContain(SOURCE);
+      expect(seen.filter((s) => s.path === detailsPath(name)).length).toBe(2);
     });
   }
 
@@ -291,18 +309,85 @@ describe("a revoke between the page's early reads and its package answer", () =>
     const name = "early-active";
     answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
     answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
-    answers.set(packagePath(name), { status: 200, body: withVersion(name, "active") });
+    answers.set(detailsPath(name), { status: 200, body: detailsBody("active") });
+    toHold.add(packagePath(name));
 
     const reads = startPackageReads({ name, asked: "1.0.0" });
+    const pkg = await heldRequest(packagePath(name));
+    // sent while the package answer is still on its way: the per-version read does not wait for it
+    await sent([reviewPath(name), scorePath(name), detailsPath(name)]);
+    pkg.release({ status: 200, body: withVersion(name, "active") });
     const found = await reads.package;
 
     if (found.kind !== "ok") throw new Error(`package answer: ${found.kind}`);
     const shown = shownOf(found.value.versions, "1.0.0");
-    const [review, score] = await Promise.all([reads.review(shown), reads.score(shown)]);
+    const [review, score, details] = await Promise.all([reads.review(shown), reads.score(shown), reads.details(shown)]);
 
     expect(review.kind === "ok" && !review.value.redacted).toBe(true);
     expect(score.kind === "ok" && !score.value.redacted).toBe(true);
-    expect(seen.filter((s) => s.path === reviewPath(name) || s.path === scorePath(name)).length).toBe(2);
+    expect(details.kind === "ok" && details.value.status).toBe("active");
+    expect(seen.filter((s) => s.path === reviewPath(name) || s.path === scorePath(name) || s.path === detailsPath(name)).length).toBe(3);
+  });
+
+  // review of b91a69c, P1: the early per-version read was the request's kept one (getVersionInfo), so for a version the
+  // package answer does not list, the page's own read after that answer got the early "active" back and let the early
+  // review and score through. Run with the request context production has, so the request's kept reads are on.
+  for (const status of ["revoked", "revoke-pending"] as const) {
+    test(`?v= of a version outside the newest 200 that went ${status}: its state comes from a read after the package answer`, async () => {
+      const name = `unlisted-${status}`;
+      const context = Symbol.for("__cloudflare-context__");
+      Reflect.set(globalThis, context, { env: {}, ctx: { waitUntil: () => {} }, cf: undefined });
+
+      try {
+        answers.set(reviewPath(name), { status: 200, body: reviewBody(name, false) });
+        answers.set(scorePath(name), { status: 200, body: scoreBody(name, false) });
+        answers.set(detailsPath(name), { status: 200, body: detailsBody("active") });
+        toHold.add(packagePath(name));
+
+        const reads = startPackageReads({ name, asked: "1.0.0" });
+        const pkg = await heldRequest(packagePath(name));
+        // the early reads were answered while 1.0.0 was active
+        await sent([reviewPath(name), scorePath(name), detailsPath(name)]);
+        await Bun.sleep(5);
+
+        // the revoke commits, then the package answer arrives, listing only 2.0.0
+        answers.set(reviewPath(name), { status: 200, body: reviewBody(name, true) });
+        answers.set(scorePath(name), { status: 200, body: scoreBody(name, true) });
+        answers.set(detailsPath(name), { status: 200, body: detailsBody(status) });
+        const listed = withVersion(name, "active");
+        pkg.release({ status: 200, body: { ...listed, versions: listed.versions.filter((v) => v.version !== "1.0.0") } });
+        const found = await reads.package;
+
+        if (found.kind !== "ok") throw new Error(`package answer: ${found.kind}`);
+        expect(chooseVersion({ pkg: found.value, asked: "1.0.0" }).kind).toBe("unlisted");
+
+        // as the page's resolveVersion reads an unlisted version, then builds the row it shows it from
+        const info = await getVersionInfo(name, "1.0.0");
+
+        if (info.kind !== "ok") throw new Error(`per-version answer: ${info.kind}`);
+        const shown = shownOf(rowsWith(found.value.versions, { version: info.value.version, status: info.value.status }), "1.0.0");
+        const [review, score] = await Promise.all([reads.review(shown), reads.score(shown)]);
+
+        expect(info.value.status).toBe(status);
+        expect(shown).toEqual({ version: "1.0.0", status: "withheld" });
+        expect(review.kind === "ok" && review.value.redacted).toBe(true);
+        expect(score.kind === "ok" && score.value.redacted).toBe(true);
+        expect(JSON.stringify([info, review, score])).not.toContain(SOURCE);
+        // the early read and the one after the package answer
+        expect(seen.filter((s) => s.path === detailsPath(name)).length).toBe(2);
+      } finally {
+        Reflect.deleteProperty(globalThis, context);
+      }
+    });
+  }
+
+  test("?v= naming a dist-tag: no per-version read starts before the package answer resolves it", async () => {
+    const name = "early-tag";
+    answers.set(packagePath(name), { status: 200, body: withVersion(name, "active") });
+    const reads = startPackageReads({ name, asked: "next" });
+    await reads.package;
+
+    expect(seen.filter((s) => s.path.startsWith(`/${packageApiPath(name)}/versions/`))).toEqual([]);
   });
 });
 

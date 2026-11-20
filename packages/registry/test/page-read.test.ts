@@ -1,18 +1,27 @@
 // Store.pageRead is the package page's first read in one round trip: it must answer exactly what the statements it
 // replaced answer (getPackage, then listVersions and owners, or keptPackage and upstreamAnalyses), mark a kept row asked
-// about as keptPackage does, and read no scores when told not to. touchKeptPackage, which a view now writes after its
-// answer, marks only the summary npm confirmed, and only forward. Against a real Postgres, through the real Store.
+// about as keptPackage does, and read no scores when told not to. Only the shown version's analysis comes whole; every
+// other one comes without the members no score is read from, and scores and grades the same. touchKeptPackage, which a
+// view now writes after its answer, marks only the summary npm confirmed, and only forward. Against a real Postgres,
+// through the real Store.
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { createHash } from "node:crypto";
 import { Client } from "pg";
 import { z } from "zod";
-import { SCORER } from "@apm/core";
+import { analyze, finalize, parseAnalysis, PREVIOUS_SCORER, SCORER, storedAnalysis, type TarEntry } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { Store, type PageRow } from "../src/db.ts";
+import { PAGE_TRIMMED, Store, type PageRow, type PageScores, type VersionRecord } from "../src/db.ts";
 import { digestLabel, digestOf } from "../src/digest.ts";
+import { pageScores } from "../src/kept-package.ts";
 
 const HOUR = 60 * 60_000;
+
+function entry(path: string, text: string): TarEntry {
+  const data = new TextEncoder().encode(text);
+
+  return { path, size: data.length, mode: 0o644, data };
+}
 
 const integrityOf = (text: string) => `sha512-${createHash("sha512").update(text).digest("base64")}`;
 
@@ -42,6 +51,9 @@ const asUpstream = (row: PageRow) => {
 
   return row;
 };
+
+/** Every analysis whole: the package answer's read before only the shown version's came whole. */
+const EVERY: PageScores = { kind: "shown", versions: [], tags: ["latest"] };
 
 const AskedAt = z.array(z.object({ asked_at: z.coerce.number(), computed_at: z.coerce.number() }));
 
@@ -88,7 +100,7 @@ describe("pageRead", () => {
         [SCORER, name, digestLabel(digest)],
       );
 
-      const [row, pkg, versions, owners] = await run(url, (s) => Effect.all([s.pageRead({ name, at: 10 * HOUR, scores: true }), s.getPackage(name), s.listVersions(name), s.owners(name)]));
+      const [row, pkg, versions, owners] = await run(url, (s) => Effect.all([s.pageRead({ name, at: 10 * HOUR, scores: EVERY }), s.getPackage(name), s.listVersions(name), s.owners(name)]));
       const local = asLocal(row);
 
       expect(pkg).not.toBeNull();
@@ -109,7 +121,7 @@ describe("pageRead", () => {
       await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail) VALUES ($1, '0.9.0', $2, 'too-large', 'over the cap')", [name, SCORER]);
       const at = 10 * HOUR;
 
-      const row = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: true })));
+      const row = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: EVERY })));
       // asked about now: the mark is written once an hour, as keptPackage writes it
       expect(AskedAt.parse(await sql("SELECT asked_at, computed_at FROM kept_packages WHERE package = $1", [name]))).toEqual([{ asked_at: at, computed_at: 100 }]);
       const [kept, analyses] = await run(url, (s) => Effect.all([s.keptPackage({ name, at }), s.upstreamAnalyses(name)]));
@@ -122,16 +134,89 @@ describe("pageRead", () => {
       expect(row.analyses.unscorable.get("0.9.0")).toEqual({ reason: "too-large", detail: "over the cap", digest: null });
 
       // the review answer's read: the same row, no scores
-      const listing = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: false })));
+      const listing = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: { kind: "none" } })));
       expect(listing.kept).toEqual(kept);
       expect(listing.analyses.scores.size).toBe(0);
       expect(listing.analyses.unscorable.size).toBe(0);
     });
   });
 
+  test("only the shown version's analysis comes whole; the others come without the members no score is read from, and score and grade the same", async () => {
+    await withDatabase(async ({ sql, url }) => {
+      const name = "big-npm";
+      const digest = "sha512-d";
+      // capabilities (the network, the environment) and a long list of files apm did not read, as next's analyses have
+      const code = "const https = require('https');\nhttps.get(process.env.TARGET_URL, () => {});\nmodule.exports = 1;\n";
+      const manifest = { name, version: "2.0.0", license: "MIT", main: "index.js" };
+      const base = analyze({ name, manifest, files: [entry("package.json", JSON.stringify(manifest)), entry("index.js", code)], publisher: "a", previousPublishers: [] });
+      const skipped = Array.from({ length: 50 }, (_, i) => ({ path: `dist/chunk-${i}.js`, size: 9_000_000 + i, reason: "over-budget" as const }));
+      const partial = { ...base, skipped, coverage: { kind: "partial" as const, omittedFiles: 50, omittedBytes: 450_000_000, reasons: ["over-budget" as const], notes: [] } };
+      // an apm-score-v10 analysis the current scorer reuses: it left no file unread
+      const reused = { ...base, scorer: PREVIOUS_SCORER, coverage: undefined };
+
+      expect(base.capabilities.length).toBeGreaterThan(0);
+      await sql("INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2, 100, 0)", [name, JSON.stringify({ name, distTags: { latest: "2.0.0", next: "3.0.0-rc.1" } })]);
+
+      for (const [version, scorer, analysis] of [
+        ["1.0.0", PREVIOUS_SCORER, reused],
+        ["2.0.0", SCORER, partial],
+        ["3.0.0-rc.1", SCORER, partial],
+        ["1.5.0", SCORER, base],
+      ] as const) {
+        await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5, 0)", [name, version, digest, scorer, JSON.stringify(analysis)]);
+      }
+
+      const at = 10 * HOUR;
+      const whole = await run(url, (s) => s.upstreamAnalyses(name));
+      const read = (scores: PageScores) => run(url, (s) => s.pageRead({ name, at, scores })).then(asUpstream);
+      const state = { publishedAt: 0, now: at, deprecated: null, status: "active" as const, statusReason: null };
+
+      // what Store holds for a version (VersionRecord's score), read as reportFor reads it
+      const graded = (stored: VersionRecord["score"]) => {
+        const a = storedAnalysis(parseAnalysis(stored));
+
+        if (a === null) throw new Error("no analysis");
+        const r = finalize(a, state);
+
+        return { score: r.score, grade: r.grade, signals: r.signals };
+      };
+
+      for (const [need, shown] of [
+        [{ kind: "page" }, "2.0.0"],
+        [{ kind: "version", version: "1.5.0" }, "1.5.0"],
+        [{ kind: "history", spec: "next" }, "3.0.0-rc.1"],
+        [{ kind: "history", spec: "1.0.0" }, "1.0.0"],
+        [{ kind: "history", spec: undefined }, "2.0.0"],
+      ] as const) {
+        const row = await read(pageScores(need));
+
+        // of the versions with an analysis, only the shown one (a spec is asked for as a version and as a tag)
+        expect(["1.0.0", "1.5.0", "2.0.0", "3.0.0-rc.1"].filter((v) => row.whole.has(v))).toEqual([shown]);
+        expect([...row.analyses.scores.keys()].toSorted()).toEqual([...whole.scores.keys()].toSorted());
+
+        for (const [key, stored] of whole.scores) {
+          const got = row.analyses.scores.get(key);
+
+          if (key.startsWith(`${shown} `)) expect(got).toEqual(stored);
+          else {
+            // what it leaves out is gone, and what a score is worked out from reads the same
+            const left = z.looseObject({ skipped: z.array(z.unknown()), capabilities: z.array(z.unknown()) }).parse(got);
+            expect(left.skipped).toEqual([]);
+            expect(left.capabilities).toEqual([]);
+            expect(graded(got)).toEqual(graded(stored));
+          }
+        }
+      }
+
+      // the trimmed members are exactly the ones PAGE_TRIMMED names
+      expect([...PAGE_TRIMMED]).toEqual(["skipped", "capabilities"]);
+      expect(graded(partial).grade).toBe("P");
+    });
+  });
+
   test("a name nobody kept or scored: an upstream row with nothing in it", async () => {
     await withDatabase(async ({ url }) => {
-      const row = asUpstream(await run(url, (s) => s.pageRead({ name: "never-seen", at: 1, scores: true })));
+      const row = asUpstream(await run(url, (s) => s.pageRead({ name: "never-seen", at: 1, scores: EVERY })));
 
       expect(row.kept).toBeNull();
       expect(row.analyses.scores.size).toBe(0);

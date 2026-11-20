@@ -335,13 +335,43 @@ const AnalysesColumns = {
 const AnalysesRow = z.object(AnalysesColumns);
 
 /** Store.pageRead's one row: the local columns, empty unless `pkg` is there, and the upstream ones, empty unless it is not. */
-const PageReadRow = z.object({ pkg: PackageOut.nullable(), versions: z.array(VersionRow), owners: z.array(z.string()), kept: KeptPackageRow.nullable(), ...AnalysesColumns });
+const PageReadRow = z.object({
+  pkg: PackageOut.nullable(),
+  versions: z.array(VersionRow),
+  owners: z.array(z.string()),
+  kept: KeptPackageRow.nullable(),
+  ...AnalysesColumns,
+  // the versions whose analyses came whole (PageScores)
+  shown: z.array(z.string()),
+});
+
+/**
+ * Which of an upstream package's stored analyses Store.pageRead sends: none, or every one, those of `versions` and of
+ * the versions the kept summary's dist-tags in `tags` name whole, and every other one without PAGE_TRIMMED's members.
+ */
+export type PageScores = { kind: "none" } | { kind: "shown"; versions: readonly string[]; tags: readonly string[] };
+
+/**
+ * Members of a stored analysis a package page's read leaves out of the versions it does not show (PageScores): the
+ * files apm did not read and the capabilities, nine tenths of next@16.4.6's 300 KB analysis (2,656 files), which every
+ * read of next's page sent for each of its scored versions. No score or grade is worked out from them (core finalize,
+ * readingOf, settleEstablishedName; reusableAnalysis reads `skipped` only of an apm-score-v10 analysis, and the query
+ * sends one only when apm_v10_reusable found it empty), so a version's place in the list reads the same.
+ * packages/registry/test/page-read.test.ts holds the two readings to each other.
+ */
+export const PAGE_TRIMMED = ["skipped", "capabilities"] as const;
 
 /**
  * What Store.pageRead found: a package published here with its versions (each with its dismissals left out, as
- * listVersions has them) and owners, or an upstream package's kept summary (null when none is kept) and its scores.
+ * listVersions has them) and owners, or an upstream package's kept summary (null when none is kept), its scores, and
+ * the versions whose analyses came whole (PageScores).
  */
-export type PageRow = { kind: "local"; pkg: PackageRecord; versions: VersionRecord[]; owners: string[] } | { kind: "upstream"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses };
+export type PageRow =
+  | { kind: "local"; pkg: PackageRecord; versions: VersionRecord[]; owners: string[] }
+  | { kind: "upstream"; kept: KeptPackageRow | null; analyses: UpstreamAnalyses; whole: ReadonlySet<string> };
+
+/** What Store.fileRead found: a package published here (files.ts reads its one version on its own), or pageRead's upstream row. */
+export type FileRow = { kind: "local" } | Extract<PageRow, { kind: "upstream" }>;
 
 export type Advisory = z.infer<typeof AdvisoryRow>;
 
@@ -568,10 +598,12 @@ export type StoreApi = {
   readonly keptPackage: (input: { name: string; at: number }) => Effect.Effect<KeptPackageRow | null, StoreError>;
   /**
    * What a package page's read starts from, in one round trip: getPackage, then for a package published here
-   * listVersions and owners, else keptPackage (marking it asked about the same way) and, when `scores`, upstreamAnalyses
-   * (none otherwise). One statement, so one snapshot: nothing it returns is older than the statement.
+   * listVersions and owners, else keptPackage (marking it asked about the same way) and upstreamAnalyses as `scores`
+   * says (PageScores). One statement, so one snapshot: nothing it returns is older than the statement.
    */
-  readonly pageRead: (input: { name: string; at: number; scores: boolean }) => Effect.Effect<PageRow, StoreError>;
+  readonly pageRead: (input: { name: string; at: number; scores: PageScores }) => Effect.Effect<PageRow, StoreError>;
+  /** pageRead for a file or readme view: a local package's row alone, without its versions, owners or their scores. */
+  readonly fileRead: (input: { name: string; at: number; scores: PageScores }) => Effect.Effect<FileRow, StoreError>;
   /**
    * Keeps a summary worked out at `at` for a name asked about at `at`. A kept one is replaced; a new row is added only
    * while the table holds fewer than `capacity`. Which names may have a row is the caller's call (kept-package.ts).
@@ -872,6 +904,47 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     scores: new Map(analyses.flatMap((a) => currentScore(a.analysis, dismissalsFor(dismissals, a.version, a.digest)).map((score) => [`${a.version} ${a.digest}`, score] as const))),
     unscorable: new Map(unscorable.map((u) => [u.version, { reason: u.outcome, detail: u.detail ?? "", digest: u.digest }] as const)),
   });
+
+  /**
+   * The statement behind pageRead and fileRead. With `local: "none"` a local package's versions and owners are left out:
+   * every version's whole score of a busy local package is megabytes, and a file view needs one version.
+   */
+  const pageRow = ({ name, at, scores, local }: { name: string; at: number; scores: PageScores; local: "versions" | "none" }) =>
+    Effect.gen(function* () {
+      const read = scores.kind === "shown";
+      const versions = scores.kind === "shown" ? [...scores.versions] : [];
+      const tags = scores.kind === "shown" ? [...scores.tags] : [];
+      const withVersions = local === "versions";
+
+      return yield* run(
+        withVersions ? "pageRead" : "fileRead",
+        sql`WITH asked AS (
+              UPDATE kept_packages SET asked_at = ${at} WHERE package = ${name} AND asked_at < ${at - LATEST_SCORE_ASKED_MARK_MS}
+            ),
+            p AS (SELECT * FROM packages WHERE name = ${name}),
+            shown AS (
+              SELECT v AS version FROM unnest(${versions}::text[]) AS v
+              UNION SELECT k.summary -> 'distTags' ->> t FROM kept_packages k, unnest(${tags}::text[]) AS t WHERE k.package = ${name}
+            )
+            SELECT
+              (SELECT to_jsonb(p) FROM p) AS pkg,
+              (SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY v.published_at, v.seq), '[]'::jsonb)
+                 FROM versions v WHERE ${withVersions} AND v.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS versions,
+              (SELECT coalesce(jsonb_agg(o."user" ORDER BY o."user"), '[]'::jsonb)
+                 FROM owners o WHERE ${withVersions} AND o.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS owners,
+              (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
+                 FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
+              (SELECT jsonb_build_object('summary', k.summary, 'computed_at', k.computed_at)
+                 FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
+              (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest,
+                        'analysis', CASE WHEN u.version IN (SELECT version FROM shown) THEN u.analysis ELSE u.analysis - ${[...PAGE_TRIMMED]}::text[] END) ORDER BY u.scorer), '[]'::jsonb)
+                 FROM upstream_analysis u WHERE ${read} AND u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
+              (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
+                 FROM analysis_outcomes o WHERE ${read} AND o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable,
+              (SELECT coalesce(jsonb_agg(version), '[]'::jsonb) FROM shown WHERE version IS NOT NULL AND ${read}) AS shown`,
+        z.tuple([PageReadRow]).transform(([r]) => r),
+      );
+    });
 
   const insertStaged = (s: NewStaged) =>
     run(
@@ -1274,32 +1347,20 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     // an int8 arrives as a JSON number, which Int reads as the driver's bigint).
     pageRead: ({ name, at, scores }) =>
       Effect.gen(function* () {
-        const row = yield* run(
-          "pageRead",
-          sql`WITH asked AS (
-                UPDATE kept_packages SET asked_at = ${at} WHERE package = ${name} AND asked_at < ${at - LATEST_SCORE_ASKED_MARK_MS}
-              ),
-              p AS (SELECT * FROM packages WHERE name = ${name})
-              SELECT
-                (SELECT to_jsonb(p) FROM p) AS pkg,
-                (SELECT coalesce(jsonb_agg(to_jsonb(v) ORDER BY v.published_at, v.seq), '[]'::jsonb)
-                   FROM versions v WHERE v.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS versions,
-                (SELECT coalesce(jsonb_agg(o."user" ORDER BY o."user"), '[]'::jsonb)
-                   FROM owners o WHERE o.package = ${name} AND EXISTS (SELECT 1 FROM p)) AS owners,
-                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
-                   FROM evidence_dismissals e WHERE e.package = ${name} AND e.restored_at IS NULL) AS dismissals,
-                (SELECT jsonb_build_object('summary', k.summary, 'computed_at', k.computed_at)
-                   FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE ${scores} AND u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE ${scores} AND o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable`,
-          z.tuple([PageReadRow]).transform(([r]) => r),
-        );
+        const row = yield* pageRow({ name, at, scores, local: "versions" });
 
         if (row.pkg !== null) return { kind: "local", pkg: row.pkg, versions: dismissedFrom(row.versions, row.dismissals), owners: row.owners } satisfies PageRow;
 
-        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable) } satisfies PageRow;
+        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable), whole: new Set(row.shown) } satisfies PageRow;
+      }),
+    // pageRead's statement without a local package's versions and owners: a file view reads its one version on its own
+    fileRead: ({ name, at, scores }) =>
+      Effect.gen(function* () {
+        const row = yield* pageRow({ name, at, scores, local: "none" });
+
+        if (row.pkg !== null) return { kind: "local" } satisfies FileRow;
+
+        return { kind: "upstream", kept: row.kept, analyses: analysesOf(row.analyses, row.dismissals, row.unscorable), whole: new Set(row.shown) } satisfies FileRow;
       }),
     latestScores: ({ names, at }) =>
       run(
