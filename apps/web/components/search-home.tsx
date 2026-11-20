@@ -1,10 +1,9 @@
 "use client";
 
 // The home page: one search box, results as you type.
-// - Every keystroke asks /api/search (same origin); the previous request is aborted.
-// - Answers are kept per query, so backspacing and retyping is instant.
-// - The last answer stays on screen until the next one arrives, so nothing flashes.
+// - Searching, the per-query cache and aborting stale requests live in components/live-search.tsx.
 // - The name check runs in three parts after a short pause and fills its slots on its own.
+// - The box is a real GET form to /, so Enter before hydration still loads /?q=<query>.
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -12,9 +11,9 @@ import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { ArrowRightIcon, CheckIcon, ChevronDownIcon, CloudOffIcon, CornerDownLeftIcon, LoaderCircleIcon, SearchIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { cn } from "cn";
 import { ScoreBadge } from "@/components/score-badge";
+import { Highlight, isFresh, useLiveSearch, useTypedBeforeHydration, type SearchDone, type Stored } from "@/components/live-search";
 import {
   NAME_PART_SCHEMAS,
-  SearchAnswer,
   alternativesView,
   looksLikePackageName,
   typoRisk,
@@ -23,85 +22,15 @@ import {
   type NamePartAnswer,
   type SearchHit,
 } from "@/lib/search-schema";
+import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
 
-const SEARCH_DEBOUNCE_MS = 30;
 const NAME_CHECK_DEBOUNCE_MS = 250;
-
-/** Errors and answers made without npm are only reused this long, so a retype after an outage asks again. */
-const DEGRADED_TTL_MS = 5_000;
-
-function normalize(q: string): string {
-  return q.trim().toLowerCase();
-}
-
-function urlFor(q: string): string {
-  return q ? `/?q=${encodeURIComponent(q)}` : "/";
-}
-
-function packageHref(name: string): string {
-  return `/package/${name}`;
-}
-
-// ---------- data ----------
-
-type SearchDone = { kind: "ok"; answer: SearchAnswer } | { kind: "error" };
-
-type Stored<T> = { value: T; at: number; degraded: boolean };
-
-function fresh<T>(entry: Stored<T> | undefined): boolean {
-  return entry !== undefined && (!entry.degraded || Date.now() - entry.at < DEGRADED_TTL_MS);
-}
-
-function useLiveSearch(q: string): { current: SearchDone | null; shownQuery: string; pending: boolean; retry: () => void } {
-  const [done, setDone] = useState<ReadonlyMap<string, Stored<SearchDone>>>(() => new Map());
-  const [shownQuery, setShownQuery] = useState("");
-  const have = q === "" || fresh(done.get(q));
-
-  useEffect(() => {
-    if (have) return;
-    const ctrl = new AbortController();
-
-    const timer = setTimeout(async () => {
-      let result: SearchDone = { kind: "error" };
-
-      try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`, { signal: ctrl.signal });
-        const parsed = SearchAnswer.safeParse(await res.json());
-
-        if (res.ok && parsed.success) result = { kind: "ok", answer: parsed.data };
-      } catch {
-        if (ctrl.signal.aborted) return;
-      }
-
-      const degraded = result.kind === "error" || result.answer.upstreamFailed;
-      setDone((prev) => new Map(prev).set(q, { value: result, at: Date.now(), degraded }));
-      setShownQuery(q);
-    }, SEARCH_DEBOUNCE_MS);
-
-    return () => {
-      clearTimeout(timer);
-      ctrl.abort();
-    };
-  }, [q, have]);
-
-  const current = (done.get(q) ?? done.get(shownQuery))?.value ?? null;
-
-  const retry = () =>
-    setDone((prev) => {
-      const next = new Map(prev);
-      next.delete(q);
-
-      return next;
-    });
-
-  return { current, shownQuery: done.has(q) ? q : shownQuery, pending: !have, retry };
-}
 
 type PartState<P extends NamePart> = { kind: "loading" } | { kind: "ok"; data: NamePartAnswer[P] } | { kind: "error" };
 
 function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P> {
   const [done, setDone] = useState<ReadonlyMap<string, Stored<PartState<P>>>>(() => new Map());
-  const have = q === null || fresh(done.get(q));
+  const have = q === null || isFresh(done.get(q));
 
   useEffect(() => {
     if (q === null || have) return;
@@ -132,20 +61,6 @@ function useNamePart<P extends NamePart>(q: string | null, part: P): PartState<P
 }
 
 // ---------- small pieces ----------
-
-function Highlight({ name, q, className }: { name: string; q: string; className?: string }) {
-  const i = q ? name.indexOf(q) : -1;
-
-  if (i < 0) return <span className={cn("truncate font-mono", className)}>{name}</span>;
-
-  return (
-    <span className={cn("truncate font-mono text-muted-foreground", className)}>
-      {name.slice(0, i)}
-      <span className="text-foreground">{name.slice(i, i + q.length)}</span>
-      {name.slice(i + q.length)}
-    </span>
-  );
-}
 
 function SourceTag({ source }: { source: SearchHit["source"] }) {
   return source === "local" ? (
@@ -533,12 +448,22 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     alternatives: useNamePart(nameQuery, "alternatives"),
   };
 
+  // Text typed while the page was still loading wins over ?q=: it is what the visitor sees in the box.
+  const typedEarly = useRef(false);
+  useTypedBeforeHydration(inputRef, (typed) => {
+    typedEarly.current = true;
+    setValue(typed);
+    const url = urlFor(normalize(typed));
+
+    if (url !== `${window.location.pathname}${window.location.search}`) window.history.replaceState(null, "", url);
+  });
+
   // Read ?q= once after mount; the server never renders a query, so the shell stays static.
   useEffect(() => {
     const initial = new URLSearchParams(window.location.search).get("q") ?? "";
     delete document.documentElement.dataset.q;
 
-    if (initial) setValue(initial);
+    if (initial && !typedEarly.current) setValue(initial);
   }, []);
 
   useEffect(() => {
@@ -619,11 +544,13 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
   return (
     <div className="flex flex-col">
       <h1 className="mb-5 text-2xl font-medium tracking-tight text-balance sm:mb-6 sm:text-3xl">Check npm packages before you install them.</h1>
-      <div role="search" className="relative">
+      {/* A GET form to /: before hydration Enter loads /?q=<query>; after it, onKeyDown handles Enter. */}
+      <form role="search" action="/" method="get" className="relative" onSubmit={(e) => e.preventDefault()}>
         <SearchIcon className="pointer-events-none absolute top-1/2 left-5 size-5 -translate-y-1/2 text-muted-foreground" aria-hidden />
         <input
           ref={inputRef}
           type="search"
+          name="q"
           value={value}
           autoFocus
           autoComplete="off"
@@ -669,7 +596,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
         >
           <span className="block h-full w-1/3 animate-[apm-progress_0.9s_ease-in-out_infinite] rounded-full bg-foreground/50" />
         </span>
-      </div>
+      </form>
       <p className="sr-only" aria-live="polite">
         {pending ? "Searching" : current?.kind === "ok" ? `${current.answer.hits.length} results for ${shownQuery}` : ""}
       </p>

@@ -6,9 +6,6 @@
     "apps/web/components/logo.tsx": {
       "shadcn/no-inline-styles": 1
     },
-    "apps/web/components/search-home.tsx": {
-      "anti-slop/no-known-value-widening": 1
-    },
     "apps/web/lib/account.ts": {
       "anti-slop/no-conditional-empty-object-spread": 1,
       "anti-slop/no-runtime-typeof": 7,
