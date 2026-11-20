@@ -2,7 +2,7 @@
 import "server-only";
 import { cache } from "react";
 import { z } from "zod";
-import { Coverage } from "./coverage";
+import { Coverage, OmittedFolder } from "./coverage";
 import { encodeName, excerptApiPath, fileApiPath, packageApiPath, readmeApiPath, REGISTRY } from "./registry-url";
 import { ExcerptAnswer } from "./file-excerpt";
 import { POLICIES, type CachePolicy } from "./edge-cache";
@@ -67,7 +67,7 @@ export type Facts = z.infer<typeof Facts>;
 
 
 /** A version's full score as the package answer (latest) and the versions route (any version) carry it. */
-const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
+const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), omittedFolders: z.array(OmittedFolder).optional(), ...Reviewable, ...CapabilityFields });
 
 const PackageInfo = z.object({
   name: z.string(),
@@ -247,7 +247,7 @@ export const getVersionInfo = cache((name: string, version: string): Promise<Fet
   return read;
 });
 
-const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), ...Reviewable, ...CapabilityFields });
+const VersionScore = z.object({ version: z.string(), score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), omittedFolders: z.array(OmittedFolder).optional(), ...Reviewable, ...CapabilityFields });
 
 export type VersionScore = z.infer<typeof VersionScore>;
 

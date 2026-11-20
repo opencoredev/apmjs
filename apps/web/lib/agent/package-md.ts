@@ -1,5 +1,6 @@
 // The package page as Markdown, for agents: GET /package/<name>.md (or ?format=md) and the check_package MCP
 // tool. The same facts as the HTML page, in the order an agent deciding on an install needs them. Pure.
+import { isNotAllRead, NOT_ALL_READ_INSTALLS, scoreOnWhatWasRead, skippedSentence } from "../coverage";
 import { citeEvidence, namesFile } from "../evidence";
 import { installCommand, installNote, INSTALL_CLIENTS } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
@@ -163,6 +164,19 @@ export function unscorableLine(unscorable: NonNullable<VersionInfo["unscorable"]
   return `apm cannot score this version. The registry's reason: ${inlineCode(oneLine(unscorable.text))}. ${UNSCORABLE_INSTALLS}`;
 }
 
+/**
+ * The score line's value. A version apm did not read in full (grade P) has no letter: the number is what the files apm
+ * read scored, then what it skipped and what installs do about it.
+ */
+export function scoreLine(input: { name: string; score: ScoreReport; unpackedSize: number | null }): string {
+  const { score } = input;
+
+  if (!isNotAllRead(score.grade)) return `${score.score}/100, grade ${oneLine(score.grade)}`;
+  const skipped = score.coverage?.kind === "partial" ? ` ${skippedSentence({ coverage: score.coverage, name: oneLine(input.name), unpackedSize: input.unpackedSize })}` : "";
+
+  return `${scoreOnWhatWasRead(score.score)}. Not fully checked:${skipped || " apm did not read every file."} ${NOT_ALL_READ_INSTALLS}`;
+}
+
 /** The whole Markdown document for one package version. */
 export function packageMarkdown(input: PackageView): string {
   const view = withholdSource(input);
@@ -180,7 +194,7 @@ export function packageMarkdown(input: PackageView): string {
     ...(view.status?.deprecated ? [`- Deprecated: ${inlineCode(view.status.deprecated)}`] : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
-    `- Score: ${score ? `${score.score}/100, grade ${oneLine(score.grade)}` : unscorable !== null ? "none: apm cannot score this version" : "not scored yet"}`,
+    `- Score: ${score ? scoreLine({ name: pkg.name, score, unpackedSize: view.facts?.unpackedSize ?? null }) : unscorable !== null ? "none: apm cannot score this version" : "not scored yet"}`,
     `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : ""}`,
     `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
     "",

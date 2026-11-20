@@ -62,7 +62,9 @@ describe("fail-closed: an incomplete analysis is review-first unless its one gap
     expect(report.signals.map((s) => s.id)).not.toContain("incomplete");
     expect(report.grade).toBe("P");
     expect(v.verdict).toBe("install");
-    expect(v.summary).toContain("apm read only part of probe-pkg@1.0.0: 1 file");
+    expect(v.summary).toContain("apm did not read all of probe-pkg@1.0.0: it skipped 1 file");
+    // the grade stays P for agents; the words never show it
+    expect(v.summary).not.toContain("(P)");
     expect(v.notes.map((n) => n.kind)).toContain("partial-analysis");
   });
 });

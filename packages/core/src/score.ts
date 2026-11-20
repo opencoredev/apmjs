@@ -236,6 +236,55 @@ export function coverageText(c: Extract<Coverage, { kind: "partial" }>): string 
   return `${c.omittedFiles.toLocaleString("en-US")} file${c.omittedFiles === 1 ? "" : "s"} (${(c.omittedBytes / 1_000_000).toFixed(1)} MB) not read`;
 }
 
+/** A folder of files apm did not read, for saying where they are: its path ("." for the package's top level), how many files and bytes. */
+export type OmittedFolder = { path: string; files: number; bytes: number };
+
+/** How many folders a summary of unread files names. */
+export const OMITTED_FOLDERS_SHOWN = 3;
+
+/**
+ * Folder names common to npm packages' build output and layout. A skipped file's folder is named publicly only when
+ * every part of it (at most two) is one of these: a publisher's own folder name can hold anything, a secret included,
+ * and a version's summary can be public while its tarball is not (confirmed malicious, unpublished upstream).
+ */
+export const KNOWN_FOLDERS: ReadonlySet<string> = new Set([
+  "dist", "lib", "build", "out", "es", "esm", "cjs", "umd", "mjs", "compiled", "bundle", "bundles", "vendor", "src", "bin",
+  "types", "typings", "prebuilds", "native", "assets", "static", "public", "docs", "doc", "test", "tests", "__tests__",
+  "fixtures", "examples", "locales", "locale", "i18n", "fonts", "images", "img", "wasm", "node_modules", "server", "client",
+  "browser", "node", "cli", "core", "runtime", "modules", "scripts", "styles", "css", "icons", "data", "generated",
+  "release", "binding", "bindings", "napi", "legacy", "experimental", "shared", "internal", "plugins", "templates",
+]);
+
+/** A skipped file's folder as shown: "." for the package root, its first two parts when all are known, else null. */
+export function folderLabel(path: string): string | null {
+  const parts = path.split("/").slice(0, -1).slice(0, 2);
+
+  if (parts.length === 0) return ".";
+
+  return parts.every((p) => KNOWN_FOLDERS.has(p)) ? parts.join("/") : null;
+}
+
+/**
+ * The folders that hold the most unread bytes, biggest first, at most OMITTED_FOLDERS_SHOWN: each file counts under its
+ * first two folders (`dist/compiled/webpack/bundle5.js` under `dist/compiled`), a file at the top level under ".".
+ * Each path counts once, whichever walk skipped it.
+ */
+export function omittedFolders(skipped: readonly { path: string; size: number }[]): OmittedFolder[] {
+  const byPath = new Map(skipped.map((s) => [s.path, s.size]));
+  const folders = new Map<string, OmittedFolder>();
+
+  for (const [path, size] of byPath) {
+    const key = folderLabel(path);
+
+    // a folder the publisher named freely is never repeated (review of c93d72e, finding 1): it is only counted
+    if (key === null) continue;
+    const f = folders.get(key) ?? { path: key, files: 0, bytes: 0 };
+    folders.set(key, { path: key, files: f.files + 1, bytes: f.bytes + size });
+  }
+
+  return [...folders.values()].toSorted((a, b) => b.bytes - a.bytes || a.path.localeCompare(b.path)).slice(0, OMITTED_FOLDERS_SHOWN);
+}
+
 export type DismissedEvidence = z.infer<typeof DismissedSchema>;
 
 export type Capability = z.infer<typeof CapabilitySchema>;

@@ -254,9 +254,10 @@ function listsCapabilities(scorer: string | null | undefined): boolean {
 }
 
 /** The page's one dark panel: score, meter, and every signal with its file:line evidence. */
-function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["score"]>; name: string; version: string | null }) {
+function ScorePanel({ score, name, version, unpackedSize }: { score: NonNullable<PackageInfo["score"]>; name: string; version: string | null; unpackedSize: number | null }) {
   const tone = INVERSE_TONE[toneOf(score.score, score.grade)];
-  // a partial reading (apm-score-v11) leads with what apm did not read; its number is only what the code it read scored
+  // a version apm did not read in full (apm-score-v11) leads with what apm skipped; its number is only what the files it
+  // read scored
   const partial = headlineKind(score.grade, score.coverage) !== "score";
   const key: ItemKey | null = version && score.digest && score.scorer ? { name, version, digest: score.digest, scorer: score.scorer } : null;
   const dismissedOf = (signal: string) => score.dismissed.filter((d) => d.signal === signal);
@@ -271,7 +272,7 @@ function ScorePanel({ score, name, version }: { score: NonNullable<PackageInfo["
   return (
     <div className="overflow-hidden rounded-2xl bg-inverse text-inverse-foreground">
       <div className="flex flex-wrap items-end justify-between gap-x-6 gap-y-5 px-5 pt-5 pb-6 sm:px-6">
-        <ScoreHeadline score={score.score} grade={score.grade} coverage={score.coverage} tone={tone} version={version} />
+        <ScoreHeadline score={score.score} grade={score.grade} coverage={score.coverage} tone={tone} version={version} name={name} unpackedSize={unpackedSize} folders={score.redacted ? [] : (score.omittedFolders ?? [])} />
         <div className="flex flex-col items-end gap-1.5 text-right">
           {!partial && <span className={`font-mono text-3xl leading-none font-semibold ${tone.text}`}>{score.grade}</span>}
           <span className="text-sm text-inverse-muted">
@@ -893,7 +894,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
           <section aria-labelledby="score" className="order-4 lg:order-none">
             <SectionTitle id="score">Security score</SectionTitle>
             {score ? (
-              <ScorePanel score={score} name={pkg.name} version={version} />
+              <ScorePanel score={score} name={pkg.name} version={version} unpackedSize={glance.of === "shown" ? (glance.facts?.unpackedSize ?? null) : null} />
             ) : (
               <p className={`rounded-xl px-5 py-4 text-pretty ${unscorable ? "bg-warn-soft text-foreground" : "bg-surface text-muted-foreground"}`}>
                 {unscored?.text ?? "Not scored yet."}

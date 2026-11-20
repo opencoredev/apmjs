@@ -36,6 +36,7 @@ import {
   missingEntries,
   COOLDOWN_MS,
   coverageText,
+  omittedFolders,
   partialCoverage,
   readingOf,
   storedAnalysis,
@@ -185,6 +186,8 @@ function sourceFreeReport(v: VersionRecord, r: ScoreReport) {
     declaration: r.declaration ? (withheld ? { kind: r.declaration.kind, notes: [] } : r.declaration) : null,
     // how much apm read (apm-score-v11): counts, reasons and apm's own words, nothing of the package's
     coverage: r.coverage ?? null,
+    // where the unread files are, for the page to name them: a withheld version's paths are references, so it names none
+    omittedFolders: withheld || r.coverage?.kind !== "partial" ? [] : omittedFolders(r.skipped),
   };
 }
 
@@ -1453,7 +1456,7 @@ const packageResponse = (name: string) =>
       facts: latestFree?.facts ?? null,
       score:
         latest && latestReport && latestFree
-          ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, capabilities: latestFree.capabilities, declaration: latestFree.declaration, coverage: latestFree.coverage, ...reviewable(latest, latestReport) }
+          ? { score: latestFree.score, grade: latestFree.grade, notChecked: latestFree.notChecked, capabilities: latestFree.capabilities, declaration: latestFree.declaration, coverage: latestFree.coverage, omittedFolders: latestFree.omittedFolders, ...reviewable(latest, latestReport) }
           : null,
       versions: [...src.versions]
         .sort((a, b) => newestFirst(a.version, b.version))
@@ -1539,7 +1542,7 @@ const versionResponse = (name: string, version: string) =>
         publishedAt: new Date(v.published_at).toISOString(),
         publishedBy: v.published_by,
         facts: free?.facts ?? null,
-        score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, coverage: free.coverage, ...reviewable(v, report) } : null,
+        score: report && free ? { score: free.score, grade: free.grade, notChecked: free.notChecked, coverage: free.coverage, omittedFolders: free.omittedFolders, ...reviewable(v, report) } : null,
         // this version's own outcome when apm decided it can never score it: the package answer's list holds only the
         // newest 200 versions, so a view of an older one reads it here
         unscorable: !report && v.unscorable && !isWithheld(v.status) ? { reason: v.unscorable.reason, text: notScored(src, v).text } : null,
@@ -2360,6 +2363,15 @@ type PendingDep = { name: string; version: string; via: string[] };
 
 const MAX_UNCHECKED_LISTED = 50;
 
+/** How many queued entries a stopped walk looks at to name the ones it did not check; the rest are only counted. */
+const STOP_INSPECTED = MAX_UNCHECKED_LISTED * 4;
+
+/** The longest dependency text a stopped walk lists by name (a 214-character name and its range fit): longer is counted. */
+const STOP_NAME_CHARS = 512;
+
+/** How many characters of names and paths a stopped walk lists at most, the paths included. */
+const STOP_LIST_BYTES = 16 * 1024;
+
 /**
  * Dependency lookups (a name and a range to pick a version for) one resolve walk makes at most, failed ones included:
  * the 300 packages it checks plus room for ranges that match nothing, git specs and repeats under another range. A
@@ -2601,10 +2613,45 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       return null;
     };
 
+    /**
+     * The walk stopped at `qi`: every dependency still queued is unchecked. The first of them are listed by name, each
+     * once, as far as the listing has room (one place kept for the rest), so an answer never says only "36 more"; one
+     * entry counts those left.
+     */
     const stop = (qi: number, reason: string): void => {
       const rest = queue.length - qi;
       unchecked += rest;
-      uncheckedDeps.push({ dependency: `${rest} more`, reason, via: [rootId] });
+      const named = new Set<string>();
+      let covered = 0;
+      let listedBytes = 0;
+
+      // bounded work and size (review of c93d72e, finding 3): at most STOP_INSPECTED queued entries are looked at, one
+      // longer than STOP_NAME_CHARS is not listed, and listing ends once the names and their paths (`via`) reach
+      // STOP_LIST_BYTES (re-check of 5212041: a deep chain repeated a 6.7 KB path 49 times); everything not listed is
+      // counted in the last entry
+      for (let j = qi; j < queue.length && j - qi < STOP_INSPECTED && uncheckedDeps.length < MAX_UNCHECKED_LISTED - 1; j++) {
+        const item = queue[j];
+
+        if (item === undefined) break;
+        const dependency = describeDependency(item.dep);
+
+        // a spec longer than any package name and range (a URL, a git spec) is only counted, never copied whole, and
+        // the text is not clipped: the CLI reads a name's scope from it (re-check of 72041ee, findings 4 and 5)
+        if (dependency.length > STOP_NAME_CHARS) continue;
+
+        if (!named.has(dependency)) {
+          const bytes = dependency.length + item.via.reduce((n, v) => n + v.length + 3, 0);
+
+          if (listedBytes + bytes > STOP_LIST_BYTES) break;
+          listedBytes += bytes;
+          named.add(dependency);
+          uncheckedDeps.push({ dependency, reason, via: item.via });
+        }
+
+        covered++;
+      }
+
+      if (rest > covered) uncheckedDeps.push({ dependency: `${rest - covered} more`, reason, via: [rootId] });
       limited = true;
       warnings.push(stateWarning({ kind: "unchecked", name: root.package, version: root.version, text: `${rest} more ${rest === 1 ? "dependency was" : "dependencies were"} not checked: ${reason}`, url: versionUrl(webUrl, root.package, root.version), via: [] }));
     };

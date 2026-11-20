@@ -144,7 +144,7 @@ const ResolveBody = z.object({
   warnings: z.array(z.object({ name: z.string(), kind: z.string(), text: z.string() })).optional(),
 });
 
-type Resolved = { status: number; body: z.infer<typeof ResolveBody>; queries: number };
+type Resolved = { status: number; body: z.infer<typeof ResolveBody>; queries: number; bytes: number };
 
 /** No tarball is read here: the walk only reads catalogs and stored analyses. */
 const noBlobs = Layer.succeed(
@@ -173,7 +173,13 @@ async function resolve(input: { url: string; name: string; npm?: string; strict?
   const base = Layer.mergeAll(store, Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), RequestMemory.layer(POOL), budget);
   const layers = input.npm === undefined ? base : Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), base);
 
-  const program = Effect.flatMap(resolveResponse(u), (res) => Effect.promise(async () => ({ status: res.status, body: ResolveBody.parse(await res.json()) })));
+  const program = Effect.flatMap(resolveResponse(u), (res) =>
+    Effect.promise(async () => {
+      const text = await res.text();
+
+      return { status: res.status, body: ResolveBody.parse(JSON.parse(text)), bytes: text.length };
+    }),
+  );
 
   const out = await Effect.runPromise(program.pipe(Effect.provideService(Statement.CurrentTransformer, counter), Effect.provide(layers), Effect.scoped));
 
@@ -251,6 +257,51 @@ describe("the resolve walk bounds its database work", () => {
     });
   });
 
+  test("a walk stopped at its package limit names the dependencies it did not reach, then counts the rest", () => {
+    // root -> 360 leaves: the walk checks 300 and stops with 60 left. 49 of them are listed by name, the listing's last
+    // place says how many more (an answer once said only "60 more", and the explain note quoted that)
+    const leaves = Array.from({ length: 360 }, (_, i) => ({ name: `leaf${String(i).padStart(3, "0")}` }));
+    const root = { name: "root", dependencies: Object.fromEntries(leaves.map((l) => [l.name, "^1.0.0"])) };
+
+    return withDatabase({ local: [...leaves, root] }, async (url) => {
+      const r = await resolve({ url, name: "root" });
+      const listed = r.body.tree.uncheckedDeps;
+
+      report("root with 360 leaves", r);
+      expect(r.status).toBe(200);
+      expect(r.body.tree.packages.length).toBe(300);
+      expect(r.body.tree.unchecked).toBe(60);
+      expect(listed).toHaveLength(50);
+      expect(listed.slice(0, 49).every((d) => /^leaf3\d\d@\^1\.0\.0$/.test(d.dependency) && d.reason === "the check stops after 300 packages")).toBe(true);
+      expect(new Set(listed.map((d) => d.dependency)).size).toBe(50);
+      expect(listed.at(-1)).toEqual({ dependency: "11 more", reason: "the check stops after 300 packages" });
+      // still one warning for the walk, counting all 60
+      expect(r.body.warnings?.map((w) => w.text)).toEqual(["60 more dependencies were not checked: the check stops after 300 packages"]);
+    });
+  });
+
+  // re-check of 5212041: a deep chain made each listed name carry a long path; the listing has a byte budget
+  test("a stopped walk under a deep chain keeps its listing small and still counts every dependency", () => {
+    const leaves = Array.from({ length: 320 }, (_, i) => ({ name: `leaf${String(i).padStart(3, "0")}` }));
+    const chain = Array.from({ length: 31 }, (_, i) => ({ name: `${"c".repeat(150)}${String(i).padStart(2, "0")}` }));
+    const linked = chain.map((c, i) => ({ ...c, dependencies: i < chain.length - 1 ? { [chain[i + 1]?.name ?? ""]: "^1.0.0" } : Object.fromEntries(leaves.map((l) => [l.name, "^1.0.0"])) }));
+    const root = { name: "root", dependencies: { [chain[0]?.name ?? ""]: "^1.0.0" } };
+
+    return withDatabase({ local: [...leaves, ...linked, root] }, async (url) => {
+      const r = await resolve({ url, name: "root" });
+      const listed = r.body.tree.uncheckedDeps;
+      const more = listed.at(-1)?.dependency ?? "";
+      const named = listed.length - (/^\d+ more$/.test(more) ? 1 : 0);
+      const counted = /^\d+ more$/.test(more) ? Number(more.split(" ")[0]) : 0;
+
+      expect(r.status).toBe(200);
+      expect(r.body.tree.unchecked).toBeGreaterThan(0);
+      expect(named + counted).toBe(r.body.tree.unchecked);
+      // the whole answer, paths included: 415 KB before the budget
+      expect(r.bytes).toBeLessThan(96 * 1024);
+    });
+  });
+
   test("a dependency nobody has is reported as not existing, with no upstream configured", () =>
     withDatabase({ local: [{ name: "root", dependencies: { "no-such-dep": "^1.0.0" } }] }, async (url) => {
       const r = await resolve({ url, name: "root" });
@@ -272,6 +323,8 @@ describe("the resolve walk bounds its database work", () => {
       expect(r.body.tree.packages.length).toBe(MAX_WALK_LEVELS);
       expect(r.body.tree.unchecked).toBe(1);
       expect(r.body.tree.uncheckedDeps[0]?.reason).toBe(`the check stops after ${MAX_WALK_LEVELS} levels of dependencies`);
+      // the dependency it did not reach, by name: an answer once said only "1 more"
+      expect(r.body.tree.uncheckedDeps.map((d) => d.dependency)).toEqual([`c${MAX_WALK_LEVELS + 1}@^1.0.0`]);
       // four statements per level read (heads, the picked rows' sizes, the rows, dismissals: review of 16fc8b5,
       // finding 4), plus the root's
       expect(r.queries).toBeLessThanOrEqual(4 * MAX_WALK_LEVELS + 6);

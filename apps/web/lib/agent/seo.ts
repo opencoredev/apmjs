@@ -1,6 +1,7 @@
 // Per-page metadata (title, description, canonical URL, Open Graph and Twitter cards) and the JSON-LD the pages
 // embed. Pure, so the pages and the tests share it.
 import type { Metadata } from "next";
+import { isNotAllRead, NOT_ALL_READ, scoreOnWhatWasRead } from "../coverage";
 import { canonicalPackagePath, SITE_URL, siteUrl } from "./site";
 
 export const SITE_NAME = "apm";
@@ -41,10 +42,36 @@ export function pageMetadata(input: { title: string; description: string; path: 
 /** What the package page's metadata needs to know. */
 export type PackageMeta = { name: string; description: string; latest: string | null; score: { score: number; grade: string } | null };
 
+/** A score in the words of a title, an image's alt text, a description's verdict and the JSON-LD's grade line. */
+type ScoreWords = { title: string; alt: string; verdict: string; grade: string };
+
+/**
+ * A score in the words of the page's metadata. A version apm did not read in full (grade P) never shows its letter: its
+ * number is only what the files apm read scored.
+ */
+function scoreWords(score: { score: number; grade: string }): ScoreWords {
+  if (isNotAllRead(score.grade)) {
+    return {
+      title: `score ${score.score}/100, ${NOT_ALL_READ}`,
+      alt: `apm security score ${scoreOnWhatWasRead(score.score)}, not every file read`,
+      verdict: `scores ${scoreOnWhatWasRead(score.score)}; apm did not read every file`,
+      grade: "not every file read",
+    };
+  }
+
+  return {
+    title: `score ${score.score}/100 (${score.grade})`,
+    alt: `apm security score ${score.score}/100 (grade ${score.grade})`,
+    verdict: `has an apm security score of ${score.score}/100 (grade ${score.grade})`,
+    grade: `grade ${score.grade}`,
+  };
+}
+
 export function packageMetadata(p: PackageMeta): Metadata {
-  const scoreText = p.score ? `apm security score ${p.score.score}/100 (grade ${p.score.grade})` : "not scored by apm yet";
-  const verdict = p.score ? `has an apm security score of ${p.score.score}/100 (grade ${p.score.grade})` : `is ${scoreText}`;
-  const title = `${p.name}${p.latest ? ` ${p.latest}` : ""}: ${p.score ? `score ${p.score.score}/100 (${p.score.grade})` : "security score"} · apm`;
+  const words = p.score ? scoreWords(p.score) : null;
+  const scoreText = words ? words.alt : "not scored by apm yet";
+  const verdict = words ? words.verdict : `is ${scoreText}`;
+  const title = `${p.name}${p.latest ? ` ${p.latest}` : ""}: ${words ? words.title : "security score"} · apm`;
   const short = p.description ? clip(p.description, 90) : "";
   const lead = short === "" ? "" : /[.!?…]$/.test(short) ? `${short} ` : `${short}. `;
 
@@ -96,7 +123,7 @@ export function packageJsonLd(p: PackageMeta & { license: string | null; reposit
     codeRepository: p.repository ?? undefined,
     sameAs: p.homepage ?? undefined,
     maintainer: p.maintainers.length > 0 ? p.maintainers.slice(0, 5).map((name) => ({ "@type": "Person", name })) : undefined,
-    additionalProperty: p.score ? { "@type": "PropertyValue", name: "apm security score", value: p.score.score, maxValue: 100, description: `grade ${p.score.grade}` } : undefined,
+    additionalProperty: p.score ? { "@type": "PropertyValue", name: "apm security score", value: p.score.score, maxValue: 100, description: scoreWords(p.score).grade } : undefined,
     isPartOf: { "@type": "WebSite", name: SITE_NAME, url: `${SITE_URL}/` },
   };
 }

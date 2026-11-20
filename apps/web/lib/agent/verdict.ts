@@ -18,13 +18,25 @@
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
 import type { Fetched } from "../registry";
 import type { PublicReview, ReviewAnswer } from "../review-schema";
-import type { DepRef, DepReviews, ReportCoverage, ResolveOutcome, WarningInput } from "./source";
+import type { DepCheck, DepRef, DepReviews, ReportCoverage, ResolveOutcome, WarningInput } from "./source";
 import { inlineCode, oneLine, UNTRUSTED_NOTE } from "./text";
 
-/** "2,656 files (74.0 MB) not read": how much of a version a partial reading left out. */
-function notReadText(c: { omittedFiles: number; omittedBytes: number }): string {
-  return `${c.omittedFiles.toLocaleString("en-US")} file${c.omittedFiles === 1 ? "" : "s"} (${(c.omittedBytes / 1_000_000).toFixed(1)} MB) not read`;
+/** "2,656 files (74.0 MB)": what a version apm did not read in full left out. */
+function omittedText(c: { omittedFiles: number; omittedBytes: number }): string {
+  return `${c.omittedFiles.toLocaleString("en-US")} file${c.omittedFiles === 1 ? "" : "s"} (${(c.omittedBytes / 1_000_000).toFixed(1)} MB)`;
 }
+
+/** Why apm skips whole files, in the words every explain answer uses. */
+const SKIPPED_WHY = "over what apm reads of one file or of one package";
+
+/**
+ * The grade of a version apm did not read in full (packages/core readingOf). It stays "P" in `grade` for agents; the
+ * answer's text never shows the letter.
+ */
+const NOT_ALL_READ_GRADE = "P";
+
+/** A registry's count of the unchecked dependencies it did not list by name: "36 more". */
+const COUNTED_REST = /^\d+ more$/;
 
 export const VERDICTS = ["install", "review-first", "do-not-install", "not-found", "unknown"] as const;
 
@@ -269,7 +281,37 @@ const quoted = (text: string): string => inlineCode(text, { max: 300 });
 /** A version or range as written when it is a plain one, else quoted. */
 const plain = (text: string): string => (/^[0-9A-Za-z.+~^-]{1,64}$/.test(text) ? text : quoted(text));
 
-const scoreTextOf = (report: { score: number; grade: string }): string => `scores ${report.score}/100 (${oneLine(report.grade)})`;
+const scoreTextOf = (report: { score: number; grade: string }): string =>
+  report.grade === NOT_ALL_READ_GRADE ? `scores ${report.score}/100 on the files apm read` : `scores ${report.score}/100 (${oneLine(report.grade)})`;
+
+/**
+ * The note for a version apm did not read in full: what it skipped, why, that nothing in it was checked, and what the
+ * files it read scored.
+ */
+function partialText(input: { id: string; reading: { omittedFiles: number; omittedBytes: number }; report: { score: number; grade: string } }): string {
+  const one = input.reading.omittedFiles === 1;
+
+  return `apm did not read all of ${input.id}: it skipped ${omittedText(input.reading)} ${one ? "that was" : "that were"} ${SKIPPED_WHY}, so nothing in ${one ? "it" : "them"} was checked. It ${scoreTextOf(input.report)}.`;
+}
+
+/**
+ * The note for dependencies apm could not score: the first few by name, then how many more. A registry that stopped its
+ * walk before naming any sends only a count ("36 more"), so the note says so, with its reason.
+ */
+function uncheckedText(deps: Pick<DepCheck, "unchecked" | "uncheckedDeps">): string {
+  const shown = deps.uncheckedDeps.filter((d) => !COUNTED_REST.test(d.dependency)).slice(0, SHOWN);
+  const head = `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score`;
+
+  if (shown.length === 0) {
+    const reason = deps.uncheckedDeps[0]?.reason;
+
+    return `${head}. The registry did not name ${deps.unchecked === 1 ? "it" : "them"}${reason ? `; its reason: ${quoted(reason)}` : ""}.`;
+  }
+
+  const rest = deps.unchecked - shown.length;
+
+  return `${head}: ${shown.map((d) => quoted(d.dependency)).join(", ")}${rest > 0 ? ` and ${rest} more` : ""}.`;
+}
 
 const listed = (deps: readonly DepRef[]): string => `${deps.slice(0, SHOWN).map((d) => quoted(`${d.name}@${d.version}`)).join(", ")}${deps.length > SHOWN ? ` and ${deps.length - SHOWN} more` : ""}`;
 
@@ -437,7 +479,7 @@ function noteWhy(note: Note, id: string): string {
     case "not-scored":
       return `apm has no score for ${id}, so nothing has read its code`;
     case "partial-analysis":
-      return `apm read only part of ${id}, leaving files unread for their size or its byte budget`;
+      return `apm did not read all of ${id}: it skipped files ${SKIPPED_WHY}`;
     case "lost-points":
       return "it lost points for signals that are not risks";
     case "dependency-gaps":
@@ -784,7 +826,7 @@ function decide(input: ExplainInput): Decided {
   } else {
     // whole files left unread for their size or the byte budget, and recorded as the only gap: apm's own gap, not a
     // risk, so the install goes ahead with what was not read said here
-    if (reading?.kind === "partial") notes.push({ kind: "partial-analysis", text: `apm read only part of ${id}: ${notReadText(reading)}, past the size apm reads of one file or the bytes one analysis reads. It ${scoreTextOf(report)} on the code it read.` });
+    if (reading?.kind === "partial") notes.push({ kind: "partial-analysis", text: partialText({ id, reading, report }) });
 
     if (reading?.kind !== "incomplete" && report.score < CLEAN_SCORE && holds.length === 0) notes.push({ kind: "lost-points", text: `${id} ${scoreTextOf(report)}, under the ${CLEAN_SCORE} the site shows as clean, for signals that are not risks; the reasons list them.` });
   }
@@ -795,7 +837,7 @@ function decide(input: ExplainInput): Decided {
   if (gaps.length > 0) notes.push({ kind: "dependency-gaps", text: `apm could not fully check ${plural(gaps.length, "dependency", "dependencies")}: ${warningList(gaps)}.` });
 
   if (deps.unchecked > 0) {
-    notes.push({ kind: "dependency-gaps", text: `${plural(deps.unchecked, "dependency", "dependencies")} apm could not score: ${deps.uncheckedDeps.slice(0, SHOWN).map((d) => quoted(d.dependency)).join(", ")}.` });
+    notes.push({ kind: "dependency-gaps", text: uncheckedText(deps) });
   }
 
   const clearFresh = byClass("fresh-clear");
@@ -851,7 +893,7 @@ function decide(input: ExplainInput): Decided {
   }
 
   // a partial reading says how much apm left unread
-  const why = head.kind === "partial-analysis" && reading?.kind === "partial" ? `apm read only part of ${id}: ${notReadText(reading)}, left unread for their size or its byte budget` : noteWhy(head, id);
+  const why = head.kind === "partial-analysis" && reading?.kind === "partial" ? `apm did not read all of ${id}: it skipped ${omittedText(reading)}, ${SKIPPED_WHY}` : noteWhy(head, id);
 
   return { ...known, verdict: "install", summary: `Install ${id}: it ${scoreTextOf(report)} and nothing apm found needs a person to look first, but ${why}${more(shown.length - 1)}.${note}`, reasons, commands, notes };
 }

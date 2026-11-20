@@ -75,7 +75,7 @@ describe("summarizeLimitations", () => {
 
   test("adds what is specific to the version", () => {
     const s = summarizeLimitations([...GENERAL_LIMITS, "dependency left-pad", "dependency git+https://x", "3 file(s) not analyzed: the package is larger than the 200.0 MB one analysis reads"]);
-    expect(s.extra).toBe("Also: 2 dependencies apm could not score, 3 files not analyzed.");
+    expect(s.extra).toBe("Also: 2 dependencies apm could not score, 3 files skipped.");
   });
 });
 

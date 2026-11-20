@@ -113,7 +113,8 @@ describe("PackageRow", () => {
     const html = renderToStaticMarkup(<PackageRow pkg={pkg({ latest: { version: "2.0.0", status: "yanked", publishedAt: "2026-11-01T00:00:00.000Z" }, score: { score: 61, grade: "P" } })} />);
 
     expect(html).toContain("yanked");
-    expect(html).toContain("partial");
+    expect(html).toContain("· not all read");
+    expect(html).not.toContain("partial");
   });
 
   test("the registry's answer parses", () => {

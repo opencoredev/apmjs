@@ -751,7 +751,117 @@
         "notes": [
           {
             "kind": "dependency-gaps",
-            "text": "312 dependencies apm could not score: `a@1`, `300 more`."
+            "text": "312 dependencies apm could not score: `a@1` and 311 more."
+          }
+        ]
+      }
+    },
+    {
+      "name": "the walk stopped before reaching next's dependencies: the note names the first few, then how many more (the registry lists them since plain-partial)",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 36,
+        "uncheckedDeps": [
+          {
+            "dependency": "@next/env@16.4.6",
+            "reason": "the check stops after 6 s"
+          },
+          {
+            "dependency": "@swc/helpers@0.5.15",
+            "reason": "the check stops after 6 s"
+          },
+          {
+            "dependency": "caniuse-lite@^1.0.30001579",
+            "reason": "the check stops after 6 s"
+          },
+          {
+            "dependency": "postcss@8.4.31",
+            "reason": "the check stops after 6 s"
+          },
+          {
+            "dependency": "32 more",
+            "reason": "the check stops after 6 s"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
+        "reasons": [
+          "The AI review found nothing in the files it read."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "incomplete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "36 dependencies apm could not score: `@next/env@16.4.6`, `@swc/helpers@0.5.15`, `caniuse-lite@^1.0.30001579` and 33 more."
+          }
+        ]
+      }
+    },
+    {
+      "name": "a registry that sends only a count of the dependencies its walk did not reach: the note says it named none, and why, never a bare `36 more`",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": 92,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 36,
+        "uncheckedDeps": [
+          {
+            "dependency": "36 more",
+            "reason": "the check stops after 6 s"
+          }
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "install",
+        "commands": true,
+        "summary": "Install x@1.0.0: it scores 92/100 (A) and nothing apm found needs a person to look first, but apm could not fully check some of its dependencies.",
+        "reasons": [
+          "The AI review found nothing in the files it read."
+        ],
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "incomplete"
+        },
+        "notes": [
+          {
+            "kind": "dependency-gaps",
+            "text": "36 dependencies apm could not score. The registry did not name them; its reason: `the check stops after 6 s`."
           }
         ]
       }
@@ -1623,7 +1733,7 @@
       "expect": {
         "verdict": "install",
         "commands": true,
-        "summary": "Install x@1.0.0: it scores 98/100 (P) and nothing apm found needs a person to look first, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, left unread for their size or its byte budget.",
+        "summary": "Install x@1.0.0: it scores 98/100 on the files apm read and nothing apm found needs a person to look first, but apm did not read all of x@1.0.0: it skipped 2,656 files (74.0 MB), over what apm reads of one file or of one package.",
         "reasons": [
           "Data that looks encoded (-2 points).",
           "The AI review found nothing in the files it read."
@@ -1635,7 +1745,7 @@
         "notes": [
           {
             "kind": "partial-analysis",
-            "text": "apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, past the size apm reads of one file or the bytes one analysis reads. It scores 98/100 (P) on the code it read."
+            "text": "apm did not read all of x@1.0.0: it skipped 2,656 files (74.0 MB) that were over what apm reads of one file or of one package, so nothing in them was checked. It scores 98/100 on the files apm read."
           }
         ]
       }
@@ -1681,7 +1791,7 @@
       "expect": {
         "verdict": "review-first",
         "commands": true,
-        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 (P)). It passes apm's install policy.",
+        "summary": "Review x@1.0.0 before installing: apm could not fully analyse it (it scores 39/100 on the files apm read). It passes apm's install policy.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
@@ -4199,7 +4309,7 @@
       "expect": {
         "verdict": "install",
         "commands": true,
-        "summary": "Install x@1.0.0: it scores 98/100 (P) and nothing apm found needs a person to look first, but apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, left unread for their size or its byte budget.",
+        "summary": "Install x@1.0.0: it scores 98/100 on the files apm read and nothing apm found needs a person to look first, but apm did not read all of x@1.0.0: it skipped 2,656 files (74.0 MB), over what apm reads of one file or of one package.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
@@ -4207,7 +4317,7 @@
         "notes": [
           {
             "kind": "partial-analysis",
-            "text": "apm read only part of x@1.0.0: 2,656 files (74.0 MB) not read, past the size apm reads of one file or the bytes one analysis reads. It scores 98/100 (P) on the code it read."
+            "text": "apm did not read all of x@1.0.0: it skipped 2,656 files (74.0 MB) that were over what apm reads of one file or of one package, so nothing in them was checked. It scores 98/100 on the files apm read."
           }
         ],
         "reasons": [

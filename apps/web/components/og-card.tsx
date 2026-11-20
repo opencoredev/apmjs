@@ -2,7 +2,8 @@
 // score and grade). 1200×630, for ImageResponse (Satori).
 /* oxlint-disable shadcn/no-inline-styles -- ImageResponse (Satori) renders inline styles only: no stylesheet, no Tailwind, no theme tokens */
 import { MARK_INK, MARK_PULLED, WORD } from "@/components/logo";
-import { toneOf, type Tone, PARTIAL_GRADE } from "@/components/score-badge";
+import { toneOf, type Tone } from "@/components/score-badge";
+import { isNotAllRead, NOT_ALL_READ } from "@/lib/coverage";
 import type { PackageInfo } from "@/lib/registry";
 
 export const OG_SIZE = { width: 1200, height: 630 };
@@ -83,8 +84,16 @@ export function packageCard(input: PackageCardInput) {
             <div style={{ fontSize: 44, fontWeight: 600 }}>not scored</div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "0 24px", textAlign: "center" }}>
-              <div style={{ fontSize: input.grade === PARTIAL_GRADE ? 64 : 120, fontWeight: 700, lineHeight: 1 }}>{input.grade === PARTIAL_GRADE ? "partial" : String(input.score)}</div>
-              <div style={{ fontSize: input.grade === PARTIAL_GRADE ? 28 : 32, lineHeight: 1.25, marginTop: 12 }}>{input.grade === PARTIAL_GRADE ? `${input.score}/100 on what apm read` : `grade ${input.grade ?? "?"} · of 100`}</div>
+              {/* a version apm did not read in full: its number in the warning tone, and no letter */}
+              <div style={{ fontSize: 120, fontWeight: 700, lineHeight: 1 }}>{String(input.score)}</div>
+              {isNotAllRead(input.grade) ? (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", fontSize: 30, lineHeight: 1.25, marginTop: 12 }}>
+                  <div>of 100</div>
+                  <div style={{ whiteSpace: "nowrap" }}>{NOT_ALL_READ}</div>
+                </div>
+              ) : (
+                <div style={{ fontSize: 32, lineHeight: 1.25, marginTop: 12 }}>{`grade ${input.grade ?? "?"} · of 100`}</div>
+              )}
             </div>
           )}
         </div>

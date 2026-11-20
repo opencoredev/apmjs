@@ -2,6 +2,7 @@
 // and gets one JSON answer (the transport allows JSON instead of an SSE stream). No sessions, no
 // server-to-client requests, so a GET has nothing to stream. The route (app/mcp/route.ts) adds the rate limit.
 import { z } from "zod";
+import { isNotAllRead, NOT_ALL_READ } from "../coverage";
 import { packagePath } from "../package-route";
 import { looksLikePackageName } from "../search-schema";
 import { capabilitiesOf } from "./capabilities";
@@ -103,7 +104,7 @@ const searchPackages: Tool<typeof SearchInput> = {
     // names, versions and descriptions come from npm and publishers: one line each, the description quoted
     const lines = hits.map(
       (h) =>
-        `- ${oneLine(h.name)}@${oneLine(h.version)}${h.score ? ` score ${h.score.score}/100 (${oneLine(h.score.grade)})` : " (not scored yet)"}${h.weeklyDownloads !== null ? `, ${h.weeklyDownloads} downloads/week` : ""}${h.source === "local" ? ", published to apm" : ""}${h.description ? `: ${inlineCode(oneLine(h.description).slice(0, 160))}` : ""}`,
+        `- ${oneLine(h.name)}@${oneLine(h.version)}${h.score ? ` score ${h.score.score}/100 (${isNotAllRead(h.score.grade) ? NOT_ALL_READ : oneLine(h.score.grade)})` : " (not scored yet)"}${h.weeklyDownloads !== null ? `, ${h.weeklyDownloads} downloads/week` : ""}${h.source === "local" ? ", published to apm" : ""}${h.description ? `: ${inlineCode(oneLine(h.description).slice(0, 160))}` : ""}`,
     );
 
     const head = hits.length === 0 ? `Nothing matches "${query}".` : `${hits.length} of ${answer.total} for "${query}"${answer.upstreamFailed ? " (npm did not answer; apm packages only)" : ""}:`;

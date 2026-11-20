@@ -97,7 +97,10 @@ export function summarizeLimitations(notChecked: readonly string[]): LimitationS
 
   if (deps > 0) parts.push(`${deps} ${deps === 1 ? "dependency" : "dependencies"} apm could not score`);
 
-  if (unread) parts.push(`${/^\d+/.exec(unread)?.[0] ?? "some"} ${unread.startsWith("1 ") ? "file" : "files"} not analyzed`);
+  // "2,656 files skipped", as the score panel says it
+  const count = /^\d+/.exec(unread ?? "")?.[0];
+
+  if (unread) parts.push(`${count === undefined ? "some" : Number(count).toLocaleString("en-US")} ${unread.startsWith("1 ") ? "file" : "files"} skipped`);
 
   return { headline: HEADLINE, extra: parts.length > 0 ? `Also: ${parts.join(", ")}.` : null, total: limitationCount(l) };
 }

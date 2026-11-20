@@ -1,15 +1,15 @@
 import { cn } from "cn";
+import { isNotAllRead, NOT_ALL_READ, PARTIAL_GRADE, scoreOnWhatWasRead } from "@/lib/coverage";
+
+export { PARTIAL_GRADE };
 
 export type Tone = "none" | "ok" | "warn" | "bad";
-
-/** The grade of a partial reading (apm-score-v11): it scores only what apm read, so it is never shown as a pass. */
-export const PARTIAL_GRADE = "P";
 
 export function toneOf(score: number | null | undefined, grade?: string | null): Tone {
   if (score === null || score === undefined) return "none";
 
-  // a partial reading is a warning whatever it scored
-  if (grade === PARTIAL_GRADE) return "warn";
+  // a version apm did not read in full is a warning whatever it scored: it is never shown as a pass
+  if (isNotAllRead(grade)) return "warn";
 
   if (score >= 75) return "ok";
 
@@ -31,21 +31,30 @@ export function scoreTone(score: number | null | undefined, grade?: string | nul
 }
 
 /**
- * `unscorable`: the registry decided the version can never be scored (too large, unreadable, over its limits). A partial
- * reading (grade P) reads "partial" in the warning tone, never a letter and a number that look like a pass.
+ * `unscorable`: the registry decided the version can never be scored (too large, unreadable, over its limits). A version
+ * apm did not read in full (grade P) reads "98 · not all read" in the warning tone, never a letter and a number that
+ * look like a pass.
  */
 export function ScoreBadge({ score, grade, unscorable = false, className }: { score: number | null | undefined; grade?: string | null; unscorable?: boolean; className?: string }) {
   const unscored = score === null || score === undefined;
+  const notAllRead = !unscored && isNotAllRead(grade);
+  const notAllReadLabel = unscored ? "" : `${scoreOnWhatWasRead(score)}; apm did not read every file`;
 
   return (
     <span
       className={cn("inline-flex h-7 min-w-[3.75rem] shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-mono text-[13px] tabular-nums", unscored && unscorable ? SOFT.warn : scoreTone(score, grade), className)}
-      title={unscored ? (unscorable ? "Cannot be scored" : "Not scored yet") : grade === PARTIAL_GRADE ? `Partial analysis: ${score}/100 on the code apm read` : `apm score ${score}/100`}
+      title={unscored ? (unscorable ? "Cannot be scored" : "Not scored yet") : notAllRead ? notAllReadLabel : `apm score ${score}/100`}
     >
       {unscored ? (
         <span aria-label={unscorable ? "Cannot be scored" : "Not scored"}>n/a</span>
-      ) : grade === PARTIAL_GRADE ? (
-        <span aria-label={`Partial analysis, ${score}/100 on the code apm read`}>partial</span>
+      ) : notAllRead ? (
+        <span className="inline-flex items-baseline gap-1.5 whitespace-nowrap">
+          <span aria-hidden>{score}</span>
+          <span aria-hidden className="font-sans">
+            · {NOT_ALL_READ}
+          </span>
+          <span className="sr-only">{notAllReadLabel}</span>
+        </span>
       ) : (
         <>
           <span className="font-semibold">{grade ?? ""}</span>
