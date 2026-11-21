@@ -144,8 +144,8 @@ const noBlobs = Layer.succeed(
   Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }),
 );
 
-describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries, not their packuments", () => {
-  const nextText = existsSync(NEXT) ? readFileSync(NEXT, "utf8") : "{}";
+function loadNext() {
+  const nextText = readFileSync(NEXT, "utf8");
   const next = Packument.parse(JSON.parse(nextText));
   const latest = next["dist-tags"].latest;
   const manifest = next.versions[latest];
@@ -156,17 +156,24 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
   // a week after next's latest was published: nothing in the tree is inside its cooldown
   const now = Date.parse(next.time[latest] ?? "") + 7 * DAY;
   const texts = new Map(Object.entries(deps).map(([name, range]) => [name, dependencyPackument(name, range, now - 30 * DAY)]));
+
+  return { nextText, next, latest, deps, now, texts };
+}
+
+describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries, not their packuments", () => {
+  let data: ReturnType<typeof loadNext>;
   let db: Awaited<ReturnType<typeof freshDatabase>>;
   let npm: ReturnType<typeof Bun.serve>;
 
   beforeAll(async () => {
+    data = loadNext();
     db = await freshDatabase();
     npm = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
       fetch: (req) => {
         const name = decodeURIComponent(new URL(req.url).pathname.slice(1));
-        const text = name === "next" ? nextText : texts.get(name);
+        const text = name === "next" ? data.nextText : data.texts.get(name);
 
         return text === undefined ? Response.json({ error: "Not found" }, { status: 404 }) : new Response(text, { headers: { "content-type": "application/json" } });
       },
@@ -181,7 +188,7 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
   /** The real Upstream layer over the stand-in npm, and what the routes read beside it. */
   const layers = () => {
     const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url.href, legacyAuth: false, namePolicy: "open", admins: [] } as const;
-    const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now, wallNow: now }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }));
+    const base = Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: data.now, wallNow: data.now }), Analysis.none, noBlobs, Layer.succeed(RegistryConfig, settings), Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }));
 
     return Layer.provideMerge(Upstream.layer(npm.url.href, 60_000, null), base);
   };
@@ -206,11 +213,11 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
 
       process.stdout.write(`[walk-memory] next ${pass}: ${r.tree.packages.length} checked, ${r.tree.unchecked} unchecked (${overBudget.length} over-budget); the request held ${(request.peakTaken / MiB).toFixed(1)} MiB at most and ${(request.taken / MiB).toFixed(2)} MiB once answered, the pool ${(pool.peakCharged / MiB).toFixed(1)} MiB\n`);
       expect(r.status).toBe(200);
-      expect(r.version).toBe(latest);
+      expect(r.version).toBe(data.latest);
       // on 71ebc2d: 7 or more of next's 15 dependencies over-budget
       expect(overBudget).toEqual([]);
       expect(r.tree.unchecked).toBe(0);
-      expect(r.tree.packages.map((p) => p.name).toSorted()).toEqual(Object.keys(deps).toSorted());
+      expect(r.tree.packages.map((p) => p.name).toSorted()).toEqual(Object.keys(data.deps).toSorted());
       expect(request.peakTaken).toBeLessThanOrEqual(REQUEST_METADATA_WEIGHT);
       // what the request still holds is the root's summary, not next's 26.6 MiB packument
       expect(request.taken).toBeLessThan(1 * MiB);
@@ -221,7 +228,7 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
 
   test("a package the isolate cache has is read through, never charged to the request", async () => {
     const pool = new MemoryPool();
-    const keep = (pkg: UpstreamPackage) => summarize({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions.filter((v) => v.version === latest) });
+    const keep = (pkg: UpstreamPackage) => summarize({ kind: "upstream", name: pkg.name, distTags: pkg.distTags, versions: pkg.versions.filter((v) => v.version === data.latest) });
     const read = (request: Lease) => run(Effect.flatMap(Upstream, (up) => up.summaries(["next"], request, keep)), request);
     const first = pool.request();
     const cold = await read(first);
@@ -254,9 +261,9 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
     const cached = pool.cache().taken;
     process.stdout.write(`[walk-memory] the review's look at next holds ${(look.held.taken / MiB).toFixed(2)} MiB beside the cache's ${(cached / MiB).toFixed(1)} MiB\n`);
     // what considerUpstream reads: every version, each with its publish time and digest
-    expect(look.pkg.versions.length).toBe(Object.keys(next.versions).length);
-    expect(look.pkg.versions.find((v) => v.version === latest)?.integrity).toMatch(/^sha512-/);
-    expect(look.pkg.distTags.latest).toBe(latest);
+    expect(look.pkg.versions.length).toBe(Object.keys(data.next.versions).length);
+    expect(look.pkg.versions.find((v) => v.version === data.latest)?.integrity).toMatch(/^sha512-/);
+    expect(look.pkg.distTags.latest).toBe(data.latest);
     // under 1 KiB a version, against 6.6 KiB a version for next's packument; on ed380b3 it held all 26.6 MiB
     expect(look.held.taken).toBeLessThan(look.pkg.versions.length * 1024);
     expect(look.held.taken).toBeLessThan(cached / 5);
@@ -268,7 +275,7 @@ describe.skipIf(!existsSync(NEXT))("a resolve of next holds its tree's summaries
   test("a scan of next's tree checks every package, none over-budget", async () => {
     const pool = new MemoryPool();
     const request = pool.request();
-    const packages = [{ name: "next", version: latest }, ...Object.entries(deps).map(([name, range]) => ({ name, version: versionFor(range) }))];
+    const packages = [{ name: "next", version: data.latest }, ...Object.entries(data.deps).map(([name, range]) => ({ name, version: versionFor(range) }))];
     const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages }) });
     const r = await run(Effect.flatMap(scanResponse(req, { kind: "anon" }), (res) => Effect.promise(async () => ScanAnswer.parse(await res.json()))), request);
 

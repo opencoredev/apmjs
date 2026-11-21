@@ -254,14 +254,21 @@ function installedVersion(p: string, name: string): string | null {
   return existsSync(f) ? z.object({ version: z.string() }).parse(JSON.parse(readFileSync(f, "utf8"))).version : null;
 }
 
+const NPM_MAJOR = Number(Bun.spawnSync(["npm", "--version"], { stdout: "pipe" }).stdout.toString("utf8").trim().split(".")[0] ?? "0");
+
 describe("the reproducer (review of 4a9c8fb, finding 1)", () => {
-  test("npm install --ignore-scripts of a registry package with a git dependency runs the git repository's prepare: the command smoke and validate ran before", async () => {
+  test("npm install --ignore-scripts of a registry package with a git dependency installs it (and runs prepare on npm < 11)", async () => {
     reset("honest");
     const p = project("npm-raw", { "package.json": JSON.stringify({ name: "raw", version: "1.0.0", private: true }) });
     const r = await sh(["npm", "install", NO_SCRIPTS, "--no-audit", "--no-fund", "evil@1.0.0"], p, NO_SCRIPTS_ENV);
 
     expect(r.code, r.out).toBe(0);
-    expect(ran().filter((m) => m.startsWith("gitdep-prepare-")).length, r.out).toBeGreaterThan(0);
+    expect(existsSync(join(p, "node_modules", "gitdep", "package.json")), r.out).toBe(true);
+
+    const prepares = ran().filter((m) => m.startsWith("gitdep-prepare-"));
+
+    if (NPM_MAJOR < 11) expect(prepares.length, r.out).toBeGreaterThan(0);
+    else expect(prepares, r.out).toEqual([]);
   });
 
   test("bun add --ignore-scripts of it does not run the prepare (bun 1.4): bun is not affected, and smoke's bun installs are locked all the same", async () => {
@@ -498,7 +505,12 @@ describe.each(["npm", "bun"] as const)("%s: smoke's locked install", (pm) => {
     expect(r.code, r.out).toBe(0);
     expect(existsSync(join(p, "node_modules", "gitdep", "package.json")), r.out).toBe(true);
 
-    if (pm === "npm") expect(ran().filter((m) => m.startsWith("gitdep-prepare-")).length, r.out).toBeGreaterThan(0);
+    if (pm === "npm") {
+      const prepares = ran().filter((m) => m.startsWith("gitdep-prepare-"));
+
+      if (NPM_MAJOR < 11) expect(prepares.length, r.out).toBeGreaterThan(0);
+      else expect(prepares, r.out).toEqual([]);
+    }
   });
 });
 

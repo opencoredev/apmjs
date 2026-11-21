@@ -1,15 +1,12 @@
 // The public view of an AI review depends on no free text from the model or the publisher (independent re-checks of
-// 7207ea0 and 70dc3df). Masking is stubbed here to return its text unchanged, and secrets seeded in the quote, the
-// excerpt, the model's sentence and summary, the second opinion, the coverage paths and the file names still reach no
-// public field. A confirmed finding is public as `file N`, line, severity and a fixed label: never a file name.
-import { describe, expect, mock, test } from "bun:test";
-
-const core = await import("@apm/core");
-
-mock.module("@apm/core", () => ({ ...core, redactSecrets: (text: string) => text }));
-
-const { publicView, ReviewRow } = await import("../src/review.ts");
-const { FINDING_LABELS, labelOf } = await import("../src/public-finding.ts");
+// 7207ea0 and 70dc3df). Rows are built directly without running ReviewRow's redaction transform, and secrets seeded in
+// the quote, the excerpt, the model's sentence and summary, the second opinion, the coverage paths and the file names
+// still reach no public field. A confirmed finding is public as `file N`, line, severity and a fixed label: never a
+// file name.
+import { describe, expect, test } from "bun:test";
+import { ReviewResult } from "@apm/ai-review";
+import { publicView, type StoredReview } from "../src/review.ts";
+import { FINDING_LABELS, labelOf } from "../src/public-finding.ts";
 
 // built at run time so no secret-shaped literal sits in the repository
 const KEY = ["sk", "proj", "Q8vT2mLw9XyZ4bN7cR1dF6gH3jK5pS0uV"].join("-");
@@ -30,35 +27,34 @@ const finding = (file: string) => ({
 
 const SEEDED_FILES = ["index.js", `config/${KEY}.json`, `notes/password = "${SPACED}".txt`, `dump/${DIGITS}${DIGITS}.bin`, `config/${KEY}.json`];
 
-const row = (humanState: "pending" | "confirmed" | "dismissed", files: readonly string[] = SEEDED_FILES) =>
-  ReviewRow.parse({
-    package: "shop",
-    version: "1.0.0",
-    digest: "sha512-x",
+const row = (humanState: "pending" | "confirmed" | "dismissed", files: readonly string[] = SEEDED_FILES): StoredReview => ({
+  package: "shop",
+  version: "1.0.0",
+  digest: "sha512-x",
+  outcome: "flagged",
+  result: ReviewResult.parse({
     outcome: "flagged",
-    result: {
-      outcome: "flagged",
-      verdict: "malicious",
-      findings: files.map(finding),
-      model: "fake-flash",
-      reviewedAt: "2026-11-18T10:00:00.000Z",
-      summary: `Summary that quotes ${KEY}, "${SPACED}" and ${DIGITS}`,
-      coverage: { mode: "files", previousVersion: null, filesInScope: 56, filesRead: 36 },
-      read: ["index.js", `cache/${KEY}.js`, `${SHORT}-${DIGITS}.txt`],
-      notRead: [
-        { kind: "file", path: `backup/${SPACED}.json`, reason: "binary" },
-        { kind: "file", path: `keys/${DIGITS}.pem`, reason: "too-large" },
-        { kind: "dependency", name: "left-pad" },
-      ],
-      attempts: [{ result: "malicious", kept: 1, dropped: 0, promptTokens: 1, completionTokens: 1, latencyMs: 1 }],
-      secondOpinion: { reviewer: "strong", verdict: "malicious", summary: KEY, findings: [finding(`second/${KEY}`)] },
-    },
-    reviewed_at: 1,
-    human_state: humanState,
-    human_by: humanState === "pending" ? null : "octo-admin",
-    human_at: humanState === "pending" ? null : 2,
-    human_note: humanState === "pending" ? null : "Checked by hand.",
-  });
+    verdict: "malicious",
+    findings: files.map(finding),
+    model: "fake-flash",
+    reviewedAt: "2026-11-18T10:00:00.000Z",
+    summary: `Summary that quotes ${KEY}, "${SPACED}" and ${DIGITS}`,
+    coverage: { mode: "files", previousVersion: null, filesInScope: 56, filesRead: 36 },
+    read: ["index.js", `cache/${KEY}.js`, `${SHORT}-${DIGITS}.txt`],
+    notRead: [
+      { kind: "file", path: `backup/${SPACED}.json`, reason: "binary" },
+      { kind: "file", path: `keys/${DIGITS}.pem`, reason: "too-large" },
+      { kind: "dependency", name: "left-pad" },
+    ],
+    attempts: [{ result: "malicious", kept: 1, dropped: 0, promptTokens: 1, completionTokens: 1, latencyMs: 1 }],
+    secondOpinion: { reviewer: "strong", verdict: "malicious", summary: KEY, findings: [finding(`second/${KEY}`)] },
+  }),
+  reviewed_at: 1,
+  human_state: humanState,
+  human_by: humanState === "pending" ? null : "octo-admin",
+  human_at: humanState === "pending" ? null : 2,
+  human_note: humanState === "pending" ? null : "Checked by hand.",
+});
 
 describe("the public view with masking stubbed out", () => {
   test("the stub is in force: the parsed row still holds every secret", () => {
