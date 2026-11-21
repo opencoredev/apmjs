@@ -19,7 +19,8 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  process.env.TMPDIR = savedTmp;
+  if (savedTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmp;
   rmSync(outside, { recursive: true, force: true });
   rmSync(scratch, { recursive: true, force: true });
 });

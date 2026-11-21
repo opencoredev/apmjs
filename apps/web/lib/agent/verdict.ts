@@ -633,6 +633,10 @@ function decide(input: ExplainInput): Decided {
 
       if (refusedAsPulled(resolve.skipped)) return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
 
+      if (resolve.skipped.length === 0 && resolve.newest === null) {
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} matches ${plain(range)}. Check the version or range.`, reasons, commands: null, coverage: NOT_READ };
+      }
+
       // held back for another reason (strict mode's cooldown or score floor): not a sign of malice, so a look first,
       // and no command to run now
       return { ...base, verdict: "review-first", version: resolve.newest, score: null, summary: `Review ${asked} before installing: apm's install policy holds it back for now, and nothing in its answer says it is malicious. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };

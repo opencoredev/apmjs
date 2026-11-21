@@ -43,10 +43,12 @@ const bold = paint("1");
 let jsonMode = false;
 let jsonDone = false;
 let lastError: string | null = null;
+let lastWarn: string | null = null;
 function say(line = ""): void {
   (jsonMode ? process.stderr : process.stdout).write(`${line}\n`);
 }
 function warn(line: string): void {
+  lastWarn = line;
   process.stderr.write(`${line}\n`);
 }
 
@@ -2141,19 +2143,11 @@ async function cmdPublish(a: Args): Promise<number> {
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "publish")) return 1;
   const bumpKind = flag(a, "bump");
   const dry = has(a, "dry-run");
-  let version = pj.version;
-  if (bumpKind) {
-    version = bump(pj.version, bumpKind);
-    if (!dry) {
-      const full: unknown = JSON.parse(readFileSync(pjPath, "utf8"));
-      writeFileSync(pjPath, `${JSON.stringify({ ...Object(full), version }, null, 2)}\n`);
-    }
-    say(dim(`version ${pj.version} → ${version}${dry ? " (dry run, package.json unchanged)" : ""}`));
-  }
+  const version = bumpKind ? bump(pj.version, bumpKind) : pj.version;
   const id = `${pj.name}@${version}`;
 
   // 1. Without a "files" allowlist, what ships depends on the package manager (npm ships .env.production,
-  //    bun does not), so any secret-shaped file in the folder blocks the publish.
+  //    bun does not), so any secret-shaped file in the folder blocks the publish (before --bump touches package.json).
   if (!pj.files) {
     const local = findSecrets(walkFiles(cwd)).findings;
     if (local.length > 0) {
@@ -2162,6 +2156,14 @@ async function cmdPublish(a: Args): Promise<number> {
       say(`so whether they ship depends on the package manager. Add "files": ["dist", ...] to package.json, or delete them.`);
       return 1;
     }
+  }
+
+  if (bumpKind) {
+    if (!dry) {
+      const full: unknown = JSON.parse(readFileSync(pjPath, "utf8"));
+      writeFileSync(pjPath, `${JSON.stringify({ ...Object(full), version }, null, 2)}\n`);
+    }
+    say(dim(`version ${pj.version} → ${version}${dry ? " (dry run, package.json unchanged)" : ""}`));
   }
 
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
@@ -2353,7 +2355,7 @@ jsonMode = has(args, "json");
 try {
   process.exitCode = await main(args);
 
-  if (ownsJson) emit({ ok: process.exitCode === 0, error: lastError });
+  if (ownsJson) emit({ ok: process.exitCode === 0, error: lastError ?? (process.exitCode !== 0 ? lastWarn : null) });
 } catch (e) {
   fail(`apm: ${e instanceof Error ? e.message : String(e)}`);
 

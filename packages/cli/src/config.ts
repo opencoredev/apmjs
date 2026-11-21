@@ -34,11 +34,12 @@ function readNpmrc(path: string): Map<string, string> {
   }
 }
 
-/** The project .npmrc files from `cwd` upward, nearest first. */
-function projectNpmrcs(cwd: string): string[] {
+/** The project .npmrc files from `cwd` upward, nearest first, stopping before any user-home/userconfig directory. */
+function projectNpmrcs(cwd: string, userDirs: ReadonlySet<string>): string[] {
   const out: string[] = [];
   let dir = cwd;
   for (let i = 0; i < 20; i++) {
+    if (userDirs.has(dir)) break;
     const p = join(dir, ".npmrc");
     if (existsSync(p)) out.push(p);
     const parent = dirname(dir);
@@ -77,7 +78,10 @@ export function tokenRegistry(env: Record<string, string | undefined>): string {
 
 export function loadConfig(cwd: string, env: Record<string, string | undefined>): Config {
   const userconfig = userconfigPath(env);
-  const files = [...projectNpmrcs(cwd), userconfig].map(readNpmrc);
+  const userDirs = new Set<string>([homedir(), dirname(userconfig)]);
+
+  if (env.HOME) userDirs.add(env.HOME);
+  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map(readNpmrc);
   const registry = withSlash(env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? files.find((f) => f.has("registry"))?.get("registry") ?? DEFAULT_REGISTRY);
   const envToken = env.APM_TOKEN || null;
 

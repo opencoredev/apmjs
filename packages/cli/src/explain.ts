@@ -163,7 +163,7 @@ export function readingOf(input: { scorer: string | null; signals: readonly { id
  * Older versions `apm explain` asks for when the one picked is inside the cooldown, before it gives up: each is a
  * resolve of its own, so a burst of releases costs at most this many more.
  */
-export const MAX_OLDER_LOOKUPS = 2;
+export const MAX_OLDER_LOOKUPS = 5;
 
 /** A dist-tag (latest, next, beta) rather than a semver range: a name, not a version, `x` or a `v1`. */
 const TAG = /^(?!v?\d)(?![xX]$)[A-Za-z][\w.-]*$/;
@@ -783,6 +783,10 @@ function decide(input: ExplainInput): Decided {
       }
 
       if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      if (resolved.skipped.length === 0 && resolved.newest === null) {
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} matches ${plain(range)}. Check the version or range.`, reasons, commands: null, coverage: NOT_READ };
+      }
 
       // held back for another reason (strict mode's cooldown or score floor): not a sign of malice, so a look first,
       // and no command to run now
