@@ -57,6 +57,17 @@
   ],
   "scorer": "apm-score-v11",
   "parsedScorers": [
-    "apm-score-v11"
+    "apm-score-v1",
+    "apm-score-v2",
+    "apm-score-v3",
+    "apm-score-v4",
+    "apm-score-v5",
+    "apm-score-v6",
+    "apm-score-v7",
+    "apm-score-v8",
+    "apm-score-v9",
+    "apm-score-v10",
+    "apm-score-v11",
+    "apm-score-v12"
   ]
 }

@@ -90,8 +90,11 @@ export function modelClient(input: {
           signal: AbortSignal.timeout(input.timeoutMs ?? 300_000),
         });
       } catch (cause) {
-        if (attempt >= 4) throw new ModelUnavailable("the model could not be reached", { cause });
-        input.log("warn", "model.retry", { attempt, why: "network" });
+        const timedOut = cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError");
+        const maxAttempts = timedOut ? 2 : 4;
+
+        if (attempt >= maxAttempts) throw new ModelUnavailable(timedOut ? "the model timed out" : "the model could not be reached", { cause });
+        input.log("warn", "model.retry", { attempt, why: timedOut ? "timeout" : "network" });
         await sleep(2000 * attempt);
         continue;
       }

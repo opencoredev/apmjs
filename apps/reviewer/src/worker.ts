@@ -156,12 +156,23 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
 
   const pause = (ms: number): Promise<void> =>
     new Promise((resolve) => {
-      const t = setTimeout(resolve, ms);
+      if (deps.signal.aborted) {
+        resolve();
 
-      deps.signal.addEventListener("abort", () => {
+        return;
+      }
+
+      const onAbort = (): void => {
         clearTimeout(t);
         resolve();
-      });
+      };
+
+      const t = setTimeout(() => {
+        deps.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+
+      deps.signal.addEventListener("abort", onAbort, { once: true });
     });
 
   while (!deps.signal.aborted) {

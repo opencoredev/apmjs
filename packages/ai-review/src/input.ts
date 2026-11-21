@@ -117,13 +117,18 @@ class Budget {
   }
 }
 
+/** Keeps publisher-controlled metadata (tar paths, script commands) on one line so it cannot forge prompt headers. */
+function singleLine(text: string): string {
+  return text.replace(/[\r\n\u2028\u2029]/g, (ch) => (ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`));
+}
+
 function header(input: { name: string; version: string; previous: string | null; pkg: PackageFiles; extra: readonly string[] }): string {
   const scripts = installScripts(input.pkg.manifest);
-  const scriptText = scripts.length > 0 ? scripts.map((s) => `${s.key}: ${s.command}`).join(" | ") : "none";
+  const scriptText = scripts.length > 0 ? scripts.map((s) => `${singleLine(s.key)}: ${singleLine(s.command)}`).join(" | ") : "none";
   const versionText = input.previous === null ? " (no previous version available: full review)" : ` (previous version: ${input.previous})`;
 
   return [
-    `Package: ${input.name}@${input.version}${versionText}`,
+    `Package: ${singleLine(input.name)}@${singleLine(input.version)}${versionText}`,
     `Files: ${input.pkg.files.length}, unpacked bytes: ${input.pkg.files.reduce((n, f) => n + f.size, 0)}`,
     `Install-time scripts: ${scriptText}`,
     ...input.extra,
@@ -166,7 +171,7 @@ export type BuildOptions = { budgetTokens?: number };
 export function buildFilesInput(input: { name: string; version: string; pkg: PackageFiles } & BuildOptions): ReviewInput {
   const { pkg } = input;
   const b = new Budget(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN));
-  const all = pkg.files.map((f) => `${f.path} (${f.size} bytes)`);
+  const all = pkg.files.map((f) => `${singleLine(f.path)} (${f.size} bytes)`);
   const listing = all.length > 200 ? [...all.slice(0, 200), `…and ${all.length - 200} more files`] : all;
 
   b.add({ path: null, header: "=== FILE LIST ===", body: listing.join("\n"), share: 0.1 });
@@ -178,7 +183,7 @@ export function buildFilesInput(input: { name: string; version: string; pkg: Pac
   for (const f of ordered(pkg.manifest, pkg.files, pkg.files)) {
     if (f.data.length > MAX_DECODED_BYTES) tooLarge.push(f.path);
     else if (b.left < MIN_BLOCK_CHARS) b.skip(f.path);
-    else b.add({ path: f.path, header: `=== FILE ${f.path} ===`, body: numbered(linesOf(textOf(f))), share: MAX_FILE_SHARE });
+    else b.add({ path: f.path, header: `=== FILE ${singleLine(f.path)} ===`, body: numbered(linesOf(textOf(f))), share: MAX_FILE_SHARE });
   }
 
   const inScope = pkg.files.filter((f) => f.path === "package.json" || isReviewable(f)).length;
@@ -251,7 +256,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
     const l = linesOf(textOf(f));
 
     if (!old) {
-      b.add({ path: f.path, header: `=== NEW FILE ${f.path} ===`, body: numbered(l), share: MAX_FILE_SHARE });
+      b.add({ path: f.path, header: `=== NEW FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE });
       continue;
     }
 
@@ -259,7 +264,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
 
     // only line endings or trailing bytes changed: nothing to show, nothing hidden
     if (h.length === 0) b.read.push(f.path);
-    else b.add({ path: f.path, header: `=== DIFF ${f.path} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE });
+    else b.add({ path: f.path, header: `=== DIFF ${singleLine(f.path)} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE });
   }
 
   const touched = [...added, ...changed];
