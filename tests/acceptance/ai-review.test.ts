@@ -948,8 +948,8 @@ describe("AI review standings for install decisions", () => {
   test("an upstream version confirmed malicious is not served either, plain or ~safe, and comes back once cleared", async () => {
     // quiet-lib 1.0.1 was reviewed (found nothing) in the Request AI review test
     expect(dig((await review("quiet-lib", "1.0.1")).body, "review", "state")).toBe("found-nothing");
-    // an upstream version has no manifest route of its own, and 1.0.1 is no dist-tag's target
-    const upstreamServed = { ...SERVED, manifest: 404, tagged: false };
+    // 1.0.1 is no dist-tag's target; upstream version manifest routes now answer 200 when served and 404 when confirmed malicious
+    const upstreamServed = { ...SERVED, tagged: false };
 
     expect(await served("quiet-lib", "1.0.1")).toEqual(upstreamServed);
     await reg.query("UPDATE reviews SET human_state = 'confirmed', human_at = $1 WHERE package = 'quiet-lib' AND version = '1.0.1'", [clock]);
