@@ -3761,6 +3761,8 @@ const auditResponse = (req: Request) =>
     return json(yield* collectAdvisories(query));
   });
 
+const LegacyAuditBody = z.object({}).loose();
+
 /** Legacy npm / yarn v1 audit endpoints (`/-/npm/v1/security/audits` and `/audits/quick`), proxied to upstream. */
 const legacyAuditProxy = (req: Request, endpoint: "audits" | "audits/quick") =>
   Effect.gen(function* () {
@@ -3768,8 +3770,8 @@ const legacyAuditProxy = (req: Request, endpoint: "audits" | "audits/quick") =>
 
     if (!upstream?.audits) return fail(503, "The upstream audit service is unavailable.");
 
-    const body = yield* Effect.tryPromise({ try: () => req.text(), catch: () => refuse(400, "Could not read audit request body.") });
-    const proxied = yield* upstream.audits(endpoint, body);
+    const payload = yield* parseBody(req, LegacyAuditBody);
+    const proxied = yield* upstream.audits(endpoint, JSON.stringify(payload));
 
     if (proxied.kind !== "ok") return fail(503, "The upstream audit service did not answer. Try again shortly.");
 

@@ -205,13 +205,15 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
 }
 
 /**
- * Strips the single top-level tar folder (normally `package/`) and normalizes redundant `.` and empty segments so
- * entries like `package/./install.js` resolve to `install.js` just as npm's `node-tar` extracts them. Preserves a
- * leading `/` and any `..` segments so `ambiguousPaths` still rejects absolute paths and escapes.
+ * Strips the single top-level tar folder (normally `package/`) and normalizes backslashes, redundant `.`, and empty
+ * segments so entries like `package/./install.js` and `package/.\install.js` resolve to `install.js` just as npm's
+ * `node-tar` extracts them. Preserves a leading `/` and any `..` segments so `ambiguousPaths` still rejects absolute
+ * paths and escapes.
  */
 function normalizeTarPath(raw: string): string {
-  const slash = raw.indexOf("/");
-  const stripped = slash >= 0 ? raw.slice(slash + 1) : raw;
+  const unix = raw.replaceAll("\\", "/");
+  const slash = unix.indexOf("/");
+  const stripped = slash >= 0 ? unix.slice(slash + 1) : unix;
 
   if (stripped.startsWith("/")) return stripped;
 

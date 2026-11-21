@@ -216,9 +216,9 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   });
 
   const summary = [
-    listed("Added files", added.map((f) => `${f.path} (${f.size} bytes)`), 60),
-    listed("Removed files", removed.map((f) => f.path), 30),
-    listed("Changed files", changed.map((f) => f.path), 60),
+    listed("Added files", added.map((f) => `${singleLine(f.path)} (${f.size} bytes)`), 60),
+    listed("Removed files", removed.map((f) => singleLine(f.path)), 30),
+    listed("Changed files", changed.map((f) => singleLine(f.path)), 60),
   ];
 
   const pj = pkg.files.find((f) => f.path === "package.json");

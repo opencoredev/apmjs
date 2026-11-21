@@ -72,21 +72,53 @@ export function carriesCredentials(req: Request): boolean {
   return req.headers.has("authorization") || req.headers.has("cookie");
 }
 
-/** Normalizes an IPv6 address to its /64 prefix so rotating addresses within one /64 share a rate-limit bucket. */
+/** Normalizes an IPv6 address to its /64 prefix, while unwrapping IPv4-mapped IPv6 (`::ffff:1.2.3.4`) to its IPv4 address. */
 export function normalizeRateLimitAddress(ip: string): string {
   const clean = ip.split("%")[0]?.trim().toLowerCase() ?? "";
 
   if (!clean.includes(":")) return clean;
 
   const halves = clean.split("::");
-  const left = halves[0] ? halves[0].split(":").filter((s) => s !== "") : [];
-  const right = halves.length > 1 && halves[1] ? halves[1].split(":").filter((s) => s !== "") : [];
+
+  const expandSide = (part: string): string[] => {
+    const groups: string[] = [];
+
+    for (const seg of part.split(":").filter((s) => s !== "")) {
+      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(seg);
+
+      if (m) {
+        const octets = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+
+        if (octets.every((n) => n >= 0 && n <= 255)) {
+          groups.push((((octets[0] ?? 0) << 8) | (octets[1] ?? 0)).toString(16), (((octets[2] ?? 0) << 8) | (octets[3] ?? 0)).toString(16));
+          continue;
+        }
+      }
+
+      groups.push(seg);
+    }
+
+    return groups;
+  };
+
+  const left = halves[0] ? expandSide(halves[0]) : [];
+  const right = halves.length > 1 && halves[1] ? expandSide(halves[1]) : [];
   const missing = halves.length > 1 ? Math.max(0, 8 - left.length - right.length) : 0;
-  const full = [...left, ...Array<string>(missing).fill("0"), ...right].slice(0, 8);
+  const full = [...left, ...Array<string>(missing).fill("0"), ...right].slice(0, 8).map((g) => g.padStart(4, "0"));
 
   if (full.length < 4) return clean;
 
-  return `${full.slice(0, 4).map((g) => g.padStart(4, "0")).join(":")}::/64`;
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d or ::ffff:aabb:ccdd): keep the IPv4 address so distinct IPv4 clients never share 0000::/64
+  if (full.length === 8 && full.slice(0, 5).every((g) => g === "0000") && full[5] === "ffff") {
+    const hi = parseInt(full[6] ?? "0", 16);
+    const lo = parseInt(full[7] ?? "0", 16);
+
+    if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+      return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+
+  return `${full.slice(0, 4).join(":")}::/64`;
 }
 
 /** The address Cloudflare reported for the request, or null when there is none (a service binding, a local run). */
