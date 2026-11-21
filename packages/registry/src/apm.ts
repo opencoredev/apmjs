@@ -1809,8 +1809,15 @@ const eventsResponse = (name: string) =>
     const events = yield* store.eventsFor(name);
     const pkg = yield* store.getPackage(name);
 
-    // a package proxied from upstream has a log only for what apm's reviewers did to it (dismissed evidence)
-    if (events.length === 0 && !pkg) return fail(404, "Not found");
+    // a package proxied from upstream has a log only for what apm's reviewers did to it (dismissed evidence),
+    // and still answers 200 with an empty events list when it exists upstream
+    if (events.length === 0 && !pkg) {
+      const upstream = yield* upstreamOrNull;
+      const existsUpstream = upstream ? yield* lookupWithin(name, yield* RequestMemory) : null;
+
+      if (!existsUpstream || existsUpstream === "unknown" || existsUpstream === "over-budget") return fail(404, "Not found");
+    }
+
     // an upstream version is never withheld; a local one's events keep who, when and which version (withheld.ts).
     // A pending revoke only ever becomes final, so the stored status says whether a version is withheld.
     const withheld = new Set(pkg ? (yield* store.listVersions(name)).filter((v) => isWithheld(v.status)).map((v) => v.version) : []);
@@ -3425,6 +3432,12 @@ const ScanBody = z.object({
 export const MAX_SCAN = 2000;
 export const MAX_SCAN_ANONYMOUS = 200;
 
+/** Unscored versions one anonymous scan request may enqueue onto the analysis queue (mirrors anonymous resolve). */
+export const ANONYMOUS_QUEUED_SCAN = 8;
+
+/** Maximum package names accepted by one bulk advisory or audit request. */
+export const MAX_AUDIT_PACKAGES = 5000;
+
 /** Upstream lookups one scan runs at once. */
 const SCAN_CONCURRENCY = 8;
 
@@ -3468,9 +3481,9 @@ export function scanIntegrity(sent: string | undefined, stored: { integrity: str
 }
 
 /** One package's findings. Whatever its os and cpu, it is checked: the package manager is about to install it. */
-const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined; bundled?: boolean | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy }) =>
+const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined; bundled?: boolean | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy; queueBudget: { left: number } | null }) =>
   Effect.gen(function* () {
-    const { p, strict, at, lease, policy } = input;
+    const { p, strict, at, lease, policy, queueBudget } = input;
     const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne[] => [{ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } }];
     const url = versionUrl(webUrl, p.name, p.version);
@@ -3537,7 +3550,17 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     // inside the cooldown: a warning (strict: refused), and the version is still checked
     const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
     const findings: ScanOne[] = [...yanked, ...unverified, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
-    // a stored analysis of these exact bytes is reused; a version never analyzed is queued
+    // a stored analysis of these exact bytes is reused; a version never analyzed is queued (capped for anonymous callers)
+    const needsQueue = !parseAnalysis(v0.score) && !v0.unscorable;
+
+    if (needsQueue && queueBudget !== null) {
+      if (queueBudget.left <= 0) {
+        return [...findings, ...unchecked(`anonymous scan queues at most ${ANONYMOUS_QUEUED_SCAN} unscored packages per request; sign in (apm login) to queue more`)] satisfies ScanOne[];
+      }
+
+      queueBudget.left--;
+    }
+
     const v = yield* ensureAnalyzed(src, v0);
     const r = reportFor(v, at, { ignoreRecent: true });
 
@@ -3601,9 +3624,10 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // and in `pending`, which a scanner that knows it waits on
     const pending: ScanPending[] = [];
     const checked = packages.slice(0, cap);
+    const queueBudget = signedIn ? null : { left: ANONYMOUS_QUEUED_SCAN };
     // the packuments of the packages being checked at once share the request's lease, each under a child of it given
     // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
-    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy })), { concurrency: SCAN_CONCURRENCY });
+    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy, queueBudget })), { concurrency: SCAN_CONCURRENCY });
     const results = reads.flat();
 
     for (const r of results) {
@@ -3655,7 +3679,7 @@ type Audit = { advisories: Record<string, unknown[]>; unavailable: string[] };
 
 const audit = (advisories: Record<string, unknown[]>, unavailable: string[]): Audit => ({ advisories, unavailable });
 
-/** Local advisories plus the upstream's for names not published here. `unavailable` names packages whose upstream advisories could not be fetched. */
+/** Local advisories plus the upstream's for names not published here, in two batched DB queries. `unavailable` names packages whose upstream advisories could not be fetched. */
 const collectAdvisories = (query: z.infer<typeof AuditBody>) =>
   Effect.gen(function* () {
     const store = yield* Store;
@@ -3663,21 +3687,28 @@ const collectAdvisories = (query: z.infer<typeof AuditBody>) =>
     const upstream = yield* upstreamOrNull;
     const out: Record<string, unknown[]> = {};
     const upstreamQuery: Record<string, string[]> = {};
+    const names = Object.keys(query);
+
+    if (names.length === 0) return audit(out, []);
+
+    const [localNames, localAdvisories] = yield* Effect.all([store.existingPackages(names), store.advisoriesForPackages(names)]);
 
     for (const [name, versions] of Object.entries(query)) {
-      if (!(yield* store.getPackage(name))) upstreamQuery[name] = versions;
+      if (!localNames.has(name)) upstreamQuery[name] = versions;
+    }
 
-      const list = (yield* store.advisoriesFor(name)).map((a) => ({
+    for (const a of localAdvisories) {
+      const entry = {
         id: a.id,
-        url: `${baseUrl}package/${name}`,
+        url: `${baseUrl}package/${a.package}`,
         title: a.title,
         severity: a.severity,
         vulnerable_versions: a.versions.join(" || "),
         cwe: ["CWE-506"],
         cvss: { score: 10, vectorString: null },
-      }));
+      };
 
-      if (list.length > 0) out[name] = list;
+      (out[a.package] ??= []).push(entry);
     }
 
     if (upstream && Object.keys(upstreamQuery).length > 0) {
@@ -3704,13 +3735,18 @@ const collectAdvisories = (query: z.infer<typeof AuditBody>) =>
 const bulkAdvisories = (req: Request) =>
   Effect.gen(function* () {
     const query = yield* parseBody(req, AuditBody);
-    const audit = yield* collectAdvisories(query);
 
-    if (audit.unavailable.length > 0) {
-      return fail(503, `The upstream advisory service did not answer for ${audit.unavailable.length} package(s), so this audit would be incomplete. Try again shortly.`);
+    if (Object.keys(query).length > MAX_AUDIT_PACKAGES) {
+      return fail(413, `An audit request may list at most ${MAX_AUDIT_PACKAGES} packages.`);
     }
 
-    return json(audit.advisories);
+    const res = yield* collectAdvisories(query);
+
+    if (res.unavailable.length > 0) {
+      return fail(503, `The upstream advisory service did not answer for ${res.unavailable.length} package(s), so this audit would be incomplete. Try again shortly.`);
+    }
+
+    return json(res.advisories);
   });
 
 /** apm's audit: the same advisories, plus the packages whose advisories could not be fetched. */
@@ -3718,7 +3754,26 @@ const auditResponse = (req: Request) =>
   Effect.gen(function* () {
     const query = yield* parseBody(req, AuditBody);
 
+    if (Object.keys(query).length > MAX_AUDIT_PACKAGES) {
+      return fail(413, `An audit request may list at most ${MAX_AUDIT_PACKAGES} packages.`);
+    }
+
     return json(yield* collectAdvisories(query));
+  });
+
+/** Legacy npm / yarn v1 audit endpoints (`/-/npm/v1/security/audits` and `/audits/quick`), proxied to upstream. */
+const legacyAuditProxy = (req: Request, endpoint: "audits" | "audits/quick") =>
+  Effect.gen(function* () {
+    const upstream = yield* upstreamOrNull;
+
+    if (!upstream?.audits) return fail(503, "The upstream audit service is unavailable.");
+
+    const body = yield* Effect.tryPromise({ try: () => req.text(), catch: () => refuse(400, "Could not read audit request body.") });
+    const proxied = yield* upstream.audits(endpoint, body);
+
+    if (proxied.kind !== "ok") return fail(503, "The upstream audit service did not answer. Try again shortly.");
+
+    return new Response(proxied.body, { status: 200, headers: { "content-type": proxied.contentType, "cache-control": "no-store" } });
   });
 
 // ---------- upstream packuments and tarballs ----------
@@ -3741,6 +3796,20 @@ const ABBREV = [
   "hasInstallScript",
   "deprecated",
 ];
+
+function filterDistTags(distTags: Record<string, string>, keptIds: ReadonlySet<string>) {
+  const tags: Record<string, string> = {};
+
+  for (const [t, v] of Object.entries(distTags)) if (keptIds.has(v)) tags[t] = v;
+
+  if (!tags.latest) {
+    const h = highest([...keptIds]);
+
+    if (h) tags.latest = h;
+  }
+
+  return tags;
+}
 
 /**
  * The packument apm serves for a package only npm has. What the registry keeps of npm's is each version's
@@ -4092,6 +4161,34 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       return new Response(got.body, { headers });
     }
 
+    // GET /<upstream-pkg>/<version|tag>: npm view and tools that fetch a single version manifest
+    if (sp.rest.length === 1) {
+      const spec = sp.rest[0] ?? "";
+      const confirmed = yield* confirmedVersions(src.name, src.versions);
+      const offered = src.versions.filter((v) => !confirmed.has(v.version));
+      const view = viaSafe ? safeView(at) : null;
+      const keptIds = new Set<string>();
+
+      for (const v of offered) if (!view || view.keep(v)) keptIds.add(v.version);
+
+      const tags = view || confirmed.size > 0 ? filterDistTags(src.distTags, keptIds) : src.distTags;
+      const resolved = tagTarget(tags, spec) ?? spec;
+      const v = offered.find((x) => x.version === resolved);
+
+      if (!v) return fail(404, "Version not found");
+
+      if (view && !view.keep(v)) return fail(404, `${src.name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
+
+      const baseDoc = {
+        ...servableManifest(v.manifest),
+        dist: { tarball: tarballUrl(`${baseUrl}${view?.prefix ?? ""}`, src.name, v.version), shasum: v.shasum, integrity: v.integrity },
+      };
+
+      const r = reportFor(v, at);
+
+      return json(r ? { ...baseDoc, _apmScore: compact(r) } : baseDoc, 200, { "cache-control": "no-cache" });
+    }
+
     if (sp.rest.length > 0) return null;
     const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
 
@@ -4136,6 +4233,31 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
     const p = url.pathname;
 
     if (p === "/-/npm/v1/security/advisories/bulk" && req.method === "POST") return yield* bulkAdvisories(req);
+
+    if (p === "/-/npm/v1/security/audits" && req.method === "POST") return yield* legacyAuditProxy(req, "audits");
+
+    if (p === "/-/npm/v1/security/audits/quick" && req.method === "POST") return yield* legacyAuditProxy(req, "audits/quick");
+
+    if (p.startsWith("/-/package/") && upstream && (req.method === "GET" || req.method === "HEAD")) {
+      const sp = splitPath(p.slice("/-/package".length));
+
+      if (sp && sp.rest[0] === "dist-tags" && sp.rest.length === 1 && !(yield* (yield* Store).getPackage(sp.name))) {
+        const src = yield* lookupWithin(sp.name, yield* RequestMemory);
+
+        if (src === "unknown" || src === "over-budget") return fail(503, `The upstream registry could not be read for ${sp.name}. Try again shortly.`);
+
+        if (src && src.kind === "upstream") {
+          const confirmed = yield* confirmedVersions(src.name, src.versions);
+          const offeredIds = new Set<string>();
+
+          for (const v of src.versions) if (!confirmed.has(v.version)) offeredIds.add(v.version);
+
+          const tags = confirmed.size > 0 ? filterDistTags(src.distTags, offeredIds) : src.distTags;
+
+          return req.method === "HEAD" ? new Response(null, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-cache" } }) : json(tags, 200, { "cache-control": "no-cache" });
+        }
+      }
+    }
 
     if (p === "/-/v1/search" && upstream && (req.method === "GET" || req.method === "HEAD")) return yield* searchResponse(url);
 

@@ -72,11 +72,28 @@ export function carriesCredentials(req: Request): boolean {
   return req.headers.has("authorization") || req.headers.has("cookie");
 }
 
+/** Normalizes an IPv6 address to its /64 prefix so rotating addresses within one /64 share a rate-limit bucket. */
+export function normalizeRateLimitAddress(ip: string): string {
+  const clean = ip.split("%")[0]?.trim().toLowerCase() ?? "";
+
+  if (!clean.includes(":")) return clean;
+
+  const halves = clean.split("::");
+  const left = halves[0] ? halves[0].split(":").filter((s) => s !== "") : [];
+  const right = halves.length > 1 && halves[1] ? halves[1].split(":").filter((s) => s !== "") : [];
+  const missing = halves.length > 1 ? Math.max(0, 8 - left.length - right.length) : 0;
+  const full = [...left, ...Array<string>(missing).fill("0"), ...right].slice(0, 8);
+
+  if (full.length < 4) return clean;
+
+  return `${full.slice(0, 4).map((g) => g.padStart(4, "0")).join(":")}::/64`;
+}
+
 /** The address Cloudflare reported for the request, or null when there is none (a service binding, a local run). */
 function clientAddress(headers: Headers): string | null {
   const first = headers.get("cf-connecting-ip")?.split(",")[0]?.trim();
 
-  return first ? first : null;
+  return first ? normalizeRateLimitAddress(first) : null;
 }
 
 /** What a refused resolve answers: when to ask again, and never kept by a cache. */

@@ -743,6 +743,10 @@ export type StoreApi = {
   readonly deleteAdvisoriesFor: (name: string, version: string) => Effect.Effect<void, StoreError>;
   readonly addAdvisory: (a: Omit<Advisory, "id">) => Effect.Effect<number, StoreError>;
   readonly advisoriesFor: (name: string) => Effect.Effect<Advisory[], StoreError>;
+  /** Names among `names` that are published locally on this registry, in one query. */
+  readonly existingPackages: (names: readonly string[]) => Effect.Effect<Set<string>, StoreError>;
+  /** Local advisories across every package in `names`, in one query. */
+  readonly advisoriesForPackages: (names: readonly string[]) => Effect.Effect<Advisory[], StoreError>;
 
   /** Live dismissals (not undone) on these packages. */
   readonly dismissalsOf: (names: readonly string[]) => Effect.Effect<DismissalRecord[], StoreError>;
@@ -1858,6 +1862,17 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         one(z.object({ id: Int })).transform((row) => row?.id ?? 0),
       ),
     advisoriesFor: (name) => run("advisoriesFor", sql`SELECT * FROM advisories WHERE package = ${name} ORDER BY id`, all(AdvisoryRow)),
+    existingPackages: (names) =>
+      names.length === 0
+        ? Effect.succeed(new Set<string>())
+        : Effect.map(
+            run("existingPackages", sql`SELECT name FROM packages WHERE name = ANY(${names})`, all(z.object({ name: z.string() }))),
+            (rows) => new Set(rows.map((r) => r.name)),
+          ),
+    advisoriesForPackages: (names) =>
+      names.length === 0
+        ? Effect.succeed([])
+        : run("advisoriesForPackages", sql`SELECT * FROM advisories WHERE package = ANY(${names}) ORDER BY package, id`, all(AdvisoryRow)),
 
     dismissalsOf,
     addDismissal: (d) =>

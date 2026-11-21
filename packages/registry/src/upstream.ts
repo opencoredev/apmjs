@@ -209,6 +209,8 @@ export function isRetryableTarballStatus(status: number): boolean {
 
 export type UpstreamAdvisories = { kind: "ok"; advisories: Record<string, unknown[]> } | { kind: "unavailable" };
 
+export type UpstreamAuditProxy = { kind: "ok"; body: string; contentType: string } | { kind: "unavailable" };
+
 /** npm serves packuments from registry.npmjs.org and tarballs from the same host. */
 const NPM_ORIGIN = "https://registry.npmjs.org";
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
@@ -800,6 +802,7 @@ export type UpstreamApi = {
   readonly openTarball: (pkg: UpstreamPackage, version: string) => Effect.Effect<OpenedTarball, BlobError>;
   /** Forwards an advisory bulk request. A failure is "unavailable", never an empty (clean) answer. */
   readonly advisories: (body: unknown) => Effect.Effect<UpstreamAdvisories>;
+  readonly audits?: (endpoint: "audits" | "audits/quick", body: string) => Effect.Effect<UpstreamAuditProxy>;
 };
 
 /** Each version's devDependencies (DEV_DEPENDENCIES), and the longest version document of that read as JSON. */
@@ -2153,6 +2156,25 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               }),
               Effect.orElseSucceed((): UpstreamAdvisories => ({ kind: "unavailable" })),
             ),
+          audits: (endpoint, body) =>
+            Effect.tryPromise(async (): Promise<UpstreamAuditProxy> => {
+              const res = await fetch(`${baseUrl}-/npm/v1/security/${endpoint}`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body,
+                signal: AbortSignal.timeout(10_000),
+              });
+
+              if (res.status !== 200) {
+                await res.body?.cancel();
+
+                return { kind: "unavailable" };
+              }
+
+              const text = await res.text();
+
+              return { kind: "ok", body: text, contentType: res.headers.get("content-type") ?? "application/json" };
+            }).pipe(Effect.orElseSucceed((): UpstreamAuditProxy => ({ kind: "unavailable" }))),
         };
 
         return Upstream.of(api);

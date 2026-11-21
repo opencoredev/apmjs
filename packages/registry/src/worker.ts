@@ -694,8 +694,27 @@ export async function sweep(rawEnv: RawEnv, clock: Layer.Layer<Clock> = Clock.sy
 
   await sendProbe(env.ANALYSIS_QUEUE);
 
+  const isolate = <A, E, R>(step: string, eff: Effect.Effect<A, E, R>) =>
+    eff.pipe(
+      Effect.asVoid,
+      Effect.catch((e) => Effect.sync(() => logFailure("sweep-step", { step }, String(e)))),
+    );
+
   const exit = await Effect.runPromiseExit(
-    Effect.all([syncBlocklist, matureRevocations, sweepStaged, sweepConfirmations, dropStaleChoices, recoverAnalyses, refreshPages, seedPages, refreshPopular], { discard: true }).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
+    Effect.all(
+      [
+        isolate("syncBlocklist", syncBlocklist),
+        isolate("matureRevocations", matureRevocations),
+        isolate("sweepStaged", sweepStaged),
+        isolate("sweepConfirmations", sweepConfirmations),
+        isolate("dropStaleChoices", dropStaleChoices),
+        isolate("recoverAnalyses", recoverAnalyses),
+        isolate("refreshPages", refreshPages),
+        isolate("seedPages", seedPages),
+        isolate("refreshPopular", refreshPopular),
+      ],
+      { discard: true },
+    ).pipe(Effect.provide(servicesFor(env, settings, clock)), Effect.scoped),
   );
 
   if (Exit.isFailure(exit)) logFailure("sweep", {}, Cause.pretty(exit.cause));
