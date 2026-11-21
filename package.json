@@ -39,6 +39,7 @@
     "workerd"
   ],
   "patchedDependencies": {
-    "@opennextjs/cloudflare@1.20.13": "patches/@opennextjs%2Fcloudflare@1.20.13.patch"
+    "@opennextjs/cloudflare@1.20.13": "patches/@opennextjs%2Fcloudflare@1.20.13.patch",
+    "next@16.4.6": "patches/next@16.4.6.patch"
   }
 }

@@ -318,3 +318,23 @@ describe("routes", () => {
     }
   });
 });
+
+describe("pages under concurrent load in one isolate", () => {
+  test("5 rounds of 12 concurrent renders each end in </html> with a <title>", async () => {
+    const paths = ["/", "/compare", "/docs", "/reviews", "/privacy", "/terms"];
+
+    for (let round = 0; round < 5; round++) {
+      const results = await Promise.all(
+        Array.from({ length: 12 }, async (_, i) => {
+          const path = `${paths[i % paths.length]}?c=${round}-${i}`;
+          const res = await site().dispatchFetch(`http://apm.test${path}`, { headers: { "accept-encoding": "identity" } });
+          const html = await res.text();
+
+          return { path, status: res.status, whole: html.trimEnd().endsWith("</html>"), title: /<title>[^<]+<\/title>/.test(html) };
+        }),
+      );
+
+      for (const r of results) expect(r).toEqual({ path: r.path, status: 200, whole: true, title: true });
+    }
+  }, 120_000);
+});

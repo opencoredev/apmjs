@@ -446,6 +446,23 @@ async function stagedPublish(): Promise<void> {
   }
 }
 
+async function concurrentPages(): Promise<void> {
+  for (const [label, base] of [["the home page", web], ["a package page (react)", `${web}package/react`]] as const) {
+    const results = await Promise.all(
+      Array.from({ length: 16 }, async (_, i) => {
+        const res = await fetch(`${base}?smoke=${i}`, { headers: { "accept-encoding": "identity" } });
+        const html = await res.text();
+
+        return { ok: res.status === 200 && html.trimEnd().endsWith("</html>") && /<title>[^<]+<\/title>/.test(html), status: res.status, bytes: html.length };
+      }),
+    );
+
+    const bad = results.filter((r) => !r.ok);
+
+    record(bad.length === 0, `${label} finishes every render under 16 concurrent requests`, bad.length === 0 ? "16/16 complete HTML" : `${bad.length}/16 cut off (${bad.slice(0, 3).map((b) => `HTTP ${b.status} ${b.bytes}B`).join(", ")})`);
+  }
+}
+
 process.stdout.write(`smoke: ${stage} registry ${registry}\n`);
 
 await identity("before");
@@ -465,6 +482,8 @@ await signInLoads();
 await stagedPublish();
 
 await bunAudit();
+
+await concurrentPages();
 
 await identity("after");
 
