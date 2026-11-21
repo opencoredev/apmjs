@@ -33,7 +33,7 @@ None of them calls a version "safe". A score says what apm read in the tarball. 
 
 **The cooldown.** When the version a range resolves to is under 24 hours old, the verdict asks the registry again for the newest version in the range below it (`<4.13.19` for `latest`, `^4 <4.2.0` for `^4`, `>=1.0.0 <=2.0.0 <2.0.0` for `1.0.0 - 2.0.0`), up to two more times, and answers for that version. Each time it asks below the whole run of versions published inside the cooldown that the pick heads, read from the package's version list, so a package that releases several times a day (ai, openai) needs one lookup; what the registry picks is checked for the cooldown again (`apm explain` still steps back one version a lookup). It answers with an `older-version` note naming the one it passed over. The command installs the older version exactly. Only when nothing older in the range passes (a brand-new package, or an exact version asked for) is it `review-first`, because the cooldown is apm's main defence against a fresh malicious release.
 
-**Risk signals.** These scorer signals (packages/core, apm-score-v10) make a version, or a dependency the registry warned about, `review-first` wherever they cost points, whatever the score:
+**Risk signals.** These scorer signals (packages/core, apm-score-v11) make a version, or a dependency the registry warned about, `review-first` wherever they cost points, whatever the score:
 
 | Signal | Why a person should look |
 | --- | --- |

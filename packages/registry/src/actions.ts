@@ -77,9 +77,9 @@ export function commandLine(a: LiveAction): string {
     case "incident":
       return `apm incident --since ${canonicalSince(a.since)}${a.dryRun ? " --dry-run" : ""}`;
     case "owner-add":
-      return `apm owner add ${a.user} ${a.name}`;
+      return `npm owner add ${a.user} ${a.name}`;
     case "owner-remove":
-      return `apm owner rm ${a.user} ${a.name}`;
+      return `npm owner rm ${a.user} ${a.name}`;
     default: {
       const _exhaustive: never = a;
 

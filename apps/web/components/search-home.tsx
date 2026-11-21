@@ -505,13 +505,13 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     clearRef.current = () => update("");
   });
 
-  // Enter pressed while the answer for the typed query was still loading: open its first hit once it lands.
+  // Enter pressed while the answer for the typed query was still loading: open it only on an exact name match.
   useEffect(() => {
     if (enterFor === null || enterFor !== q || !fresh || current?.kind !== "ok") return;
     setEnterFor(null);
-    const first = current.answer.hits[0];
+    const exact = current.answer.hits.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
-    if (first) router.push(packageHref(first.name));
+    if (exact) router.push(packageHref(exact.name));
   }, [enterFor, q, fresh, current, router]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -531,9 +531,9 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
         return;
       }
 
-      const hit = actionable[active >= 0 ? active : 0];
+      const selected = active >= 0 ? actionable[active] : actionable.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
-      if (hit) router.push(packageHref(hit.name));
+      if (selected) router.push(packageHref(selected.name));
     } else if (e.key === "Escape") {
       e.preventDefault();
       update("");

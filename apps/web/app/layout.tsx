@@ -51,7 +51,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               <LogoMark className="mr-2 inline-block size-4 align-[-3px]" />
               apm scores npm packages and checks them before your package manager installs them.
             </span>
-            <span className="flex gap-5">
+            <span className="flex flex-wrap gap-5">
               <Link href="/compare" className="hover:text-foreground">
                 npm vs apm
               </Link>
@@ -60,6 +60,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               </Link>
               <Link href="/reviews" className="hover:text-foreground">
                 AI review
+              </Link>
+              <Link href="/privacy" className="hover:text-foreground">
+                Privacy
+              </Link>
+              <Link href="/terms" className="hover:text-foreground">
+                Terms
               </Link>
               <a href="https://status.apmjs.dev" className="hover:text-foreground">
                 Status

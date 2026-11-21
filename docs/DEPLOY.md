@@ -67,7 +67,7 @@ Each isolate in edge mode logs an `edge-checks` line once a minute in Workers Lo
 
 ## What the stack creates
 
-Per stage: the R2 bucket `apmjs-blobs-<stage>` (tarballs under `sha512/`, file views under `files/`, and under `state/` the install block list and the queue probe's last record), the R2 bucket `apmjs-cli-<stage>` (the CLI's binaries and install script, bound to the website as `CLI`; see [The apm CLI](#the-apm-cli)), the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batches of 5, 3 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
+Per stage: the R2 bucket `apmjs-blobs-<stage>` (tarballs under `sha512/`, file views under `files/`, and under `state/` the install block list and the queue probe's last record), the R2 bucket `apmjs-cli-<stage>` (the CLI's binaries and install script, bound to the website as `CLI`; see [The apm CLI](#the-apm-cli)), the queue `apmjs-analysis-<stage>` and its consumer (the registry Worker, batch size 1, maxConcurrency 1, 5 retries), the Hyperdrive config `apmjs-<stage>` with caching off (version states change at any time), the Workers `apmjs-registry-<stage>` (with a cron every 10 minutes) and `apmjs-web-<stage>`, the assets-only Worker `apmjs-docs-<stage>` (the Blume build of `apps/docs`, no Worker code), and in production the three custom domains. Workers Logs is on for all three.
 
 ## State
 

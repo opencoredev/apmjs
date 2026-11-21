@@ -20,7 +20,7 @@ const AGENTS_GUIDE = "https://github.com/opencoredev/apmjs/blob/main/docs/AGENTS
 
 // The ids stay stable: package pages and the AI review section link to /docs#bun, #npm, #cli, #capabilities and #ai-review; llms.txt and the MCP server link to #agents.
 const SECTIONS = [
-  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at the registry and add @apm/bun-scanner. Plain bun install then refuses revoked and confirmed-malicious versions and warns about packages scoring under 40.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
+  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at https://registry.apmjs.dev/ (or ~safe/ for the 24-hour cooldown and score floor), or use `apm add`. The optional @apm/bun-scanner package is not on a registry yet; see the guide for trying it from a local checkout.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
   { id: "npm", title: "Use it with npm or pnpm", body: "Set registry=https://registry.apmjs.dev/~safe/ in .npmrc. The view skips versions younger than 24 hours and versions scoring under 40.", href: `${DOCS}/guides/safe-view`, link: "The ~safe view" },
   {
     id: "cli",

@@ -49,6 +49,8 @@ jobs:
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web
+      - name: Build web (Next.js + OpenNext bundle)
+        run: bun packages/infra/build-web.ts
       - name: Docs site (Blume build, then a strict link check that fails on any navigation warning)
         run: bun run build && bun run validate
         working-directory: apps/docs

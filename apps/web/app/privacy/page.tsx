@@ -1,0 +1,59 @@
+import { pageMetadata } from "@/lib/agent/seo";
+
+export const metadata = pageMetadata({
+  title: "Privacy policy · apm",
+  description: "What data apm collects when you browse apmjs.dev, sign in with GitHub, or publish packages, and how it is handled.",
+  path: "/privacy",
+});
+
+export default function PrivacyPage() {
+  return (
+    <article className="mx-auto flex max-w-3xl flex-col gap-8">
+      <header className="flex flex-col gap-3">
+        <h1 className="text-3xl font-medium tracking-tight sm:text-4xl">Privacy policy</h1>
+        <p className="text-sm text-muted-foreground">Last updated: November 20, 2026</p>
+        <p className="text-lg leading-7 text-pretty text-muted-foreground">
+          apm is an open-source package registry and security scorer operated at apmjs.dev, registry.apmjs.dev, and docs.apmjs.dev. This page states what data we collect and why.
+        </p>
+      </header>
+
+      <section className="flex flex-col gap-3 border-t pt-6">
+        <h2 className="text-xl font-medium tracking-tight">Browsing and API requests</h2>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          You do not need an account to browse packages, install from the registry, or query the HTTP and MCP APIs. Our Cloudflare Workers handle incoming requests and record standard operational logs (status codes, latency, route labels, and error codes). Rate limiting hashes or keys requests by your network address (normalized to a /64 prefix for IPv6) inside Cloudflare.
+        </p>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          We send privacy-preserving page views and server error events to Databuddy with no cookies, no referrer header, and no package names in page-view labels.
+        </p>
+      </section>
+
+      <section className="flex flex-col gap-3 border-t pt-6">
+        <h2 className="text-xl font-medium tracking-tight">Accounts, sign-in, and second factors</h2>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          When you sign in with GitHub OAuth, we store your GitHub numeric user ID, GitHub login, email address, and display name to bind your permanent @scope and manage sessions.
+        </p>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          If you enroll an authenticator app (TOTP), passkey (WebAuthn), or recovery codes, we store the encrypted TOTP secret, passkey public key metadata, and hashed recovery codes. Session cookies are HttpOnly and restricted to apmjs.dev. CLI staging tokens are stored as SHA-256 hashes.
+        </p>
+      </section>
+
+      <section className="flex flex-col gap-3 border-t pt-6">
+        <h2 className="text-xl font-medium tracking-tight">Published packages and public logs</h2>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          Packages you publish to apm, their tarballs, metadata, security scores, yanks, revocations, and moderation events are public by design so installers can verify what they run.
+        </p>
+      </section>
+
+      <section className="flex flex-col gap-3 border-t pt-6">
+        <h2 className="text-xl font-medium tracking-tight">Contact and deletion requests</h2>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          To request account deletion or ask a privacy question, open an issue on{" "}
+          <a href="https://github.com/opencoredev/apmjs/issues" className="text-foreground underline underline-offset-4">
+            github.com/opencoredev/apmjs
+          </a>{" "}
+          or report security-sensitive matters privately through GitHub Security Advisories.
+        </p>
+      </section>
+    </article>
+  );
+}

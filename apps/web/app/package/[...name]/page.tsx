@@ -513,10 +513,21 @@ export async function generateMetadata({ params, searchParams }: PageProps): Pro
   if (found.kind !== "ok") return pageMetadata({ title: `${route.name} · apm`, description: `The apm security score and install policy for ${route.name}.`, path: canonicalPackagePath(route.name) });
   const pkg = found.value;
   const meta = packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
-  // a ?v= that names no version shows "No such version": keep it out of search indexes (the read is shared with the page)
+  // a ?v= that names no version shows "No such version": keep it out of search indexes and do not claim latest's score/version
   const resolved = await resolveVersion({ pkg, asked: askedVersion((await searchParams).v) });
 
-  return resolved.kind === "no-such-version" ? { ...meta, robots: { index: false, follow: true } } : meta;
+  if (resolved.kind === "no-such-version") {
+    return {
+      ...pageMetadata({
+        title: `${pkg.name} ${resolved.asked}: no such version · apm`,
+        description: `${pkg.name} has no version ${resolved.asked} on apm or npm.`,
+        path: canonicalPackagePath(pkg.name),
+      }),
+      robots: { index: false, follow: true },
+    };
+  }
+
+  return meta;
 }
 
 /** The page's columns while the package answer is read: the install box, the score and the facts. */

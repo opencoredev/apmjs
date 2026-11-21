@@ -5,7 +5,7 @@ sidebar:
   label: CLI
 ---
 
-`apm` 0.1.0 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
+`apm` 0.1.2 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
 
 Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks the binary's SHA-256 before it installs; see [Quick start](/quickstart#2-get-the-apm-cli) for what it checks and how to read it first.
 
@@ -14,7 +14,7 @@ Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks t
 | Flag | Meaning |
 | --- | --- |
 | `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then bun if it is installed, else npm. |
-| `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
+| `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install`, `explain`, `search`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
 | `--otp <code>` | A six-digit code from your authenticator app, for commands that need a fresh second factor. |
 | `--help`, `-h` | Print the command list. |
 | `--version`, `-v` | Print the version. |
@@ -207,6 +207,22 @@ apm login --username <name> --password-stdin [--email <address>]
 ```
 
 The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+
+## apm explain
+
+```bash
+apm explain <package>[@range] [--strict] [--json]
+```
+
+Prints apm's install verdict (`install`, `review-first`, `do-not-install`, `not-found` or `unknown`) with reasons, evidence, notes and exact install commands. Exit codes: `0` for `install`, `1` for `do-not-install` and `not-found`, `2` for wrong usage, `3` for `review-first`, and `4` for `unknown`.
+
+## apm search
+
+```bash
+apm search <query> [--size <n>] [--json]
+```
+
+Searches npm and apm packages and prints matching packages with their latest version, weekly downloads and apm score where available.
 
 ## apm whoami
 

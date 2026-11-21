@@ -9,8 +9,9 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 
 | In CI you want to | Use | Status |
 | --- | --- | --- |
-| Fail the install on revoked or low-scoring versions (by default a low score only warns) | Bun scanner with `APM_SCANNER_STRICT=1`, or `apm add --strict` | Works |
+| Fail the install on revoked or low-scoring versions (by default a low score only warns) | `apm add --strict` or `registry=https://registry.apmjs.dev/~safe/` | Works |
 | Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works |
+| Run the Bun security scanner automatically on `bun install` | `@apm/bun-scanner` (not on a registry yet; strict mode cannot run from a local path) | Not published yet |
 | Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
 | Publish live from CI with no person | OIDC trusted publishing | Does not exist |
@@ -18,19 +19,15 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 
 ## Check installs in CI
 
-A score informs; it does not block, so by default a low or missing score only warns, in CI too. With Bun, use the [scanner in strict mode](/guides/bun-scanner#strict-mode-for-ci) so a score under 40, an incomplete or missing score, and any package it could not check cancel the install (`apm add --strict` does the same for apm's own CLI):
-
-```bash
-APM_SCANNER_STRICT=1 bun install --frozen-lockfile
-```
-
-With npm or pnpm, commit an `.npmrc` that points at the `~safe` view:
+A score informs; it does not block, so by default a low or missing score only warns, in CI too. Use `apm add --strict` (or `APM_STRICT=1`) so a score under 40, an incomplete or missing score, and any package it could not check cancel the install, or point your package manager at the `~safe` view:
 
 ```ini title=".npmrc"
 registry=https://registry.apmjs.dev/~safe/
 ```
 
-Then, after the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:
+For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
+
+After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:
 
 ```bash
 apm audit --json

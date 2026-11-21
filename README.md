@@ -24,7 +24,7 @@ A package registry that stock `bun`, `npm` and `pnpm` talk to unmodified, plus `
 - `packages/infra`: the Alchemy stack that deploys the registry and the website, plus the deploy and smoke scripts
 - `packages/core`: score engine, secret scanner, typo distance, tarball reader
 - `packages/cli`: `apm`, released as standalone binaries by `packages/infra/release-cli.ts`
-- `packages/bun-scanner`: `[install.security] scanner = "@apm/bun-scanner"` makes stock `bun install` refuse revoked and confirmed-malicious versions and warn about low-scoring ones (`APM_SCANNER_STRICT=1` refuses those too)
+- `packages/bun-scanner`: optional Bun security scanner (in-repo only, not published to a registry yet) that makes stock `bun install` refuse revoked and confirmed-malicious versions and warn about low-scoring ones (`APM_SCANNER_STRICT=1` refuses those too)
 - `apps/web`: Next.js + shadcn UI (search with name check, package pages), deployed as a Worker through OpenNext
 - `apps/docs`: the documentation site at https://docs.apmjs.dev, built with [Blume](https://useblume.dev) and served as static assets (`cd apps/docs && bun run dev`)
 - `tests/acceptance`: over 180 tests that drive real bun, npm and pnpm against the registry's Worker build in Miniflare, on Postgres 18
