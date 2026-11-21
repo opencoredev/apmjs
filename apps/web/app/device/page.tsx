@@ -1,7 +1,10 @@
 import { Suspense } from "react";
 import { DeviceView } from "./device-view";
 
-export const metadata = { title: "Log in the CLI · apm" };
+export const metadata = {
+  title: "Log in the CLI · apm",
+  description: "Approve an apm CLI device login from your browser.",
+};
 
 export default function DevicePage() {
   return (

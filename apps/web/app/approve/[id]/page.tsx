@@ -1,7 +1,10 @@
 import { Suspense } from "react";
 import { ApproveView } from "./approve-view";
 
-export const metadata = { title: "Approve a version · apm" };
+export const metadata = {
+  title: "Approve a version · apm",
+  description: "Review and approve a staged package release on apm with your second factor.",
+};
 
 export default function ApprovePage() {
   return (

@@ -1,6 +1,6 @@
 // The npm wire protocol: tokens, packuments, tarballs, publish, dist-tags, adduser and search.
 // apm's own routes live in apm.ts and account.ts; router.ts puts them together.
-import type { RequestMemory } from "./memory.ts";
+import { RequestMemory } from "./memory.ts";
 import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
@@ -1130,18 +1130,37 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
         return new Response(null, { headers: { "content-type": "application/octet-stream", "content-length": String(head.value.size) } });
       }
 
+      // charge the request's memory lease before buffering a local tarball so concurrent downloads cannot exceed the isolate pool
+      const lease = Option.getOrNull(yield* Effect.serviceOption(RequestMemory));
+      let bytes: Uint8Array;
+
+      if (lease !== null) {
+        const opened = yield* blobs.stream(v.tarball_key);
+
+        if (Option.isNone(opened)) return fail(404, "Tarball missing");
+
+        if (!lease.take(opened.value.size)) {
+          yield* Effect.promise(() => opened.value.body.cancel());
+
+          return json({ error: `The registry is busy serving other packages. Try ${name}@${v.version} again shortly.` }, 503, { "retry-after": "5" });
+        }
+
+        bytes = new Uint8Array(yield* Effect.promise(() => new Response(opened.value.body).arrayBuffer()));
+      } else {
+        const loaded = yield* blobs.bytes(v.tarball_key);
+
+        if (Option.isNone(loaded)) return fail(404, "Tarball missing");
+        bytes = loaded.value;
+      }
+
       // the bytes are checked against the checksum the packument publishes before any of them are sent
-      const bytes = yield* blobs.bytes(v.tarball_key);
-
-      if (Option.isNone(bytes)) return fail(404, "Tarball missing");
-
-      if (!matchesPublished(bytes.value, v)) {
+      if (!matchesPublished(bytes, v)) {
         yield* Effect.logError("stored tarball failed its integrity check").pipe(Effect.annotateLogs({ name, version: v.version, key: v.tarball_key }));
 
         return fail(500, `The stored tarball of ${name}@${v.version} does not match its published checksum, so it is not served.`);
       }
 
-      return new Response(bytes.value, { headers: { "content-type": "application/octet-stream", "content-length": String(bytes.value.length) } });
+      return new Response(bytes, { headers: { "content-type": "application/octet-stream", "content-length": String(bytes.length) } });
     }
 
     if (!pkg) return fail(404, "Not found");

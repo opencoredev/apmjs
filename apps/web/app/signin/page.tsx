@@ -1,7 +1,10 @@
 import { Suspense } from "react";
 import { SignInView } from "./sign-in-view";
 
-export const metadata = { title: "Sign in · apm" };
+export const metadata = {
+  title: "Sign in · apm",
+  description: "Sign in to apm with GitHub or Vercel to manage packages, publishing tokens, and AI review requests.",
+};
 
 export default function SignInPage() {
   return (

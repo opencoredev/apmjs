@@ -4200,7 +4200,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 5);
 
-      for (const v of cooled) yield* ensureAnalyzed(src, v);
+      yield* Effect.forEach(cooled, (v) => ensureAnalyzed(src, v), { concurrency: "unbounded" });
     }
 
     const headers = { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" };

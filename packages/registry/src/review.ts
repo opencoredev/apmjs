@@ -650,9 +650,16 @@ function adminsOf(settings: ReviewSettings): ReadonlySet<string> {
 /**
  * One of apm's reviewers, signed in on the website. A token never counts, not even the reviewer's own:
  * a stolen `apm login` or CI token must not read the private queue or clear a flag.
+ * Entries in `settings.admins` may be GitHub logins or immutable numeric GitHub user IDs (`12345` or `id:12345`).
  */
 function isAdmin(v: Viewer, settings: ReviewSettings): v is SessionViewer {
-  return v.kind === "user" && v.via.kind === "session" && v.githubLogin !== null && adminsOf(settings).has(v.githubLogin);
+  if (v.kind !== "user" || v.via.kind !== "session") return false;
+  const admins = adminsOf(settings);
+  const githubId = v.user.github_id;
+
+  if (githubId !== null && (admins.has(githubId) || admins.has(`id:${githubId}`))) return true;
+
+  return v.githubLogin !== null && admins.has(v.githubLogin);
 }
 
 /**
