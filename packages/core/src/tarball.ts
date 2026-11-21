@@ -195,14 +195,30 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     let full = paxPath ?? longName ?? (prefix ? `${prefix}/${name}` : name);
     longName = null;
     paxPath = null;
-    const slash = full.indexOf("/");
-    full = slash >= 0 ? full.slice(slash + 1) : full;
+    full = normalizeTarPath(full);
     // the entry's bytes are copied out of the archive
     chargeText("tar", size + full.length);
     entries.push({ path: full, size, mode, data: new Uint8Array(data) });
   }
 
   return entries;
+}
+
+/**
+ * Strips the single top-level tar folder (normally `package/`) and normalizes redundant `.` and empty segments so
+ * entries like `package/./install.js` resolve to `install.js` just as npm's `node-tar` extracts them. Preserves a
+ * leading `/` and any `..` segments so `ambiguousPaths` still rejects absolute paths and escapes.
+ */
+function normalizeTarPath(raw: string): string {
+  const slash = raw.indexOf("/");
+  const stripped = slash >= 0 ? raw.slice(slash + 1) : raw;
+
+  if (stripped.startsWith("/")) return stripped;
+
+  return stripped
+    .split("/")
+    .filter((s) => s !== "" && s !== ".")
+    .join("/");
 }
 
 /**
@@ -558,8 +574,7 @@ export class TarStream {
     let full = this.paxPath ?? this.longName ?? (prefix ? `${prefix}/${name}` : name);
     this.longName = null;
     this.paxPath = null;
-    const slash = full.indexOf("/");
-    full = slash >= 0 ? full.slice(slash + 1) : full;
+    full = normalizeTarPath(full);
     this.namesBytes += full.length;
 
     if (this.namesBytes > MAX_STREAMED_NAMES_BYTES) throw new ArchiveError("too-large", `its file names take more than ${MAX_STREAMED_NAMES_BYTES / (1024 * 1024)} MB`);
