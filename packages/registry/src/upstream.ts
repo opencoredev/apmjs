@@ -34,7 +34,10 @@ const UpPackument = z
     name: z.string(),
     "dist-tags": z.record(z.string(), z.string()).default({}),
     versions: z.record(z.string(), z.unknown()).default({}),
-    time: z.record(z.string(), z.string()).default({}),
+    // a package whose every version was unpublished is a 200 from npm whose `time.unpublished` is an object
+    // ({ time, versions }): an entry that is not a string reads as "" (no time) instead of refusing the whole
+    // packument, which answered 503 "try again shortly" for a name npm answers
+    time: z.record(z.string(), z.string().catch("")).default({}),
     description: z.string().optional(),
     readme: z.string().optional(),
     maintainers: z.array(z.object({ name: z.string() }).loose()).optional(),
