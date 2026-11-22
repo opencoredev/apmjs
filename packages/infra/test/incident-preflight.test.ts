@@ -166,14 +166,21 @@ describe("evaluateMigrations", () => {
     expect(edited.reasons).toEqual(["pending migrations added or edited since the deployed commit: 0002_b"]);
   });
 
-  test("an applied migration edited or removed refuses", () => {
+  test("an applied migration edited, removed, or re-added refuses; one already absent on the deployed commit passes", () => {
     const edited = verdict({ applied: ["0001_a"], head: { "0001_a": sql("CREATE TABLE t (id bigint);\n") }, deployed: { "0001_a": FIRST } });
 
-    expect(edited.appliedIssues).toEqual(["0001_a is applied but was edited since the deployed commit"]);
+    expect(edited.appliedIssues).toEqual(["0001_a is applied and was edited since the deployed commit"]);
     expect(edited.reasons).toHaveLength(1);
     const removed = verdict({ applied: ["0001_a", "0002_b"], head: { "0001_a": FIRST }, deployed: { "0001_a": FIRST, "0002_b": SAFE } });
 
-    expect(removed.appliedIssues).toEqual(["0002_b is applied but removed at HEAD"]);
+    expect(removed.appliedIssues).toEqual(["0002_b is applied and was removed since the deployed commit"]);
+    const readded = verdict({ applied: ["0001_a", "0002_old"], head: { "0001_a": FIRST, "0002_old": SAFE }, deployed: { "0001_a": FIRST } });
+
+    expect(readded.appliedIssues).toEqual(["0002_old is applied and was re-added since the deployed commit"]);
+    // historical ledger row already absent at deployed.sha (e.g. a renamed staging migration): unchanged
+    const historical = verdict({ applied: ["0001_a", "0017_historical"], head: { "0001_a": FIRST }, deployed: { "0001_a": FIRST } });
+
+    expect(historical).toEqual({ pending: [], appliedIssues: [], reasons: [] });
   });
 });
 

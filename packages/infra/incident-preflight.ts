@@ -267,8 +267,11 @@ export function evaluateMigrations(input: {
     const head = input.atHead(id);
     const deployed = input.atDeployed(id);
 
-    if (head === null) appliedIssues.push(`${id} is applied but removed at HEAD`);
-    else if (deployed !== null && !head.equals(deployed)) appliedIssues.push(`${id} is applied but was edited since the deployed commit`);
+    // only migrations present at the deployed commit can be edited or removed by the candidate; historical
+    // ledger rows already absent on the deployed commit (e.g. a renamed staging migration) are unchanged
+    if (deployed !== null && head === null) appliedIssues.push(`${id} is applied and was removed since the deployed commit`);
+    else if (deployed !== null && head !== null && !head.equals(deployed)) appliedIssues.push(`${id} is applied and was edited since the deployed commit`);
+    else if (deployed === null && head !== null) appliedIssues.push(`${id} is applied and was re-added since the deployed commit`);
   }
 
   const applied = new Set(input.applied);
