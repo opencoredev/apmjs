@@ -3,7 +3,7 @@
 import { Context, Duration, Effect, Exit, Layer, Option } from "effect";
 import { z } from "zod";
 import { nameHistoryOf } from "@apm/core";
-import { Blobs, type BlobBody } from "./blobs.ts";
+import { Blobs } from "./blobs.ts";
 import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { upstreamPuts, type PendingPuts } from "./pending-puts.ts";
@@ -853,6 +853,23 @@ const waitBounded = (put: Promise<unknown>, operation: string): Promise<void> =>
 const isLate = (e: BlobError): boolean => e.cause instanceof DeadlinePassed;
 
 /**
+ * A read of the blob store's copy of an npm tarball, where any failure is a miss: R2 past its deadline, as before, and
+ * also R2 answering with an error of its own. The copy is only a cache of npm's bytes, and what npm sends instead is
+ * checked against the same digest, so a miss costs a download from npm and nothing else. When only a late read was a
+ * miss, an R2 outage that answered with errors (10001, 2026-11-22) made every download of an npm package a 500.
+ */
+const cacheRead = <A>(read: Effect.Effect<Option.Option<A>, BlobError>): Effect.Effect<Option.Option<A>> =>
+  read.pipe(
+    Effect.catchTag("BlobError", (e) =>
+      Effect.sync(() => {
+        if (!isLate(e)) console.warn(JSON.stringify({ level: "warn", event: "upstream-blob-read", error: "read-failed", operation: e.operation }));
+
+        return Option.none<A>();
+      }),
+    ),
+  );
+
+/**
  * Like Effect.tryPromise, but an interruption is joined: it aborts the signal `run` was given and waits for the
  * promise to settle before the interrupted fiber ends. A read (readPackument) stopped this way has canceled its stream
  * and given its charge back by then, so the scope that releases its lease runs after nothing refers to the read any
@@ -1006,14 +1023,18 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
         const cachedCopy = (digest: Digest) =>
           Effect.gen(function* () {
             const key = upstreamBlobKey(digest);
-            // R2 past its deadline (blobs.ts) is a miss: npm is asked, as for a copy never kept
-            const cached = yield* Effect.catchIf(blobs.bytes(key), isLate, () => Effect.succeed(Option.none<Uint8Array>()));
+            // R2 past its deadline (blobs.ts) or failing is a miss: npm is asked, as for a copy never kept
+            const cached = yield* cacheRead(blobs.bytes(key));
 
             if (Option.isNone(cached)) return null;
 
             if (matches(cached.value, digest)) return cached.value;
-            // a disposable cache's delete (blobs.ts, "cache"): given up on at its deadline, never under the blob lock
-            yield* Effect.catchIf(blobs.remove(key, "cache"), isLate, () => Effect.void);
+            // a disposable cache's delete (blobs.ts, "cache"): given up on at its deadline or on R2 failure, never under the blob lock
+            yield* Effect.catchTag(blobs.remove(key, "cache"), "BlobError", (e) =>
+              Effect.sync(() => {
+                if (!isLate(e)) console.warn(JSON.stringify({ level: "warn", event: "upstream-blob-remove", error: "remove-failed", operation: e.operation }));
+              }),
+            );
 
             return null;
           });
@@ -2133,8 +2154,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const at = locate(pkg, version);
 
               if (at.kind !== "found") return at;
-              // R2 past its deadline is a miss here too: npm's answer is opened instead
-              const cached = yield* Effect.catchIf(blobs.stream(upstreamBlobKey(at.digest)), isLate, () => Effect.succeed(Option.none<BlobBody>()));
+              // R2 past its deadline or failing is a miss here too: npm's answer is opened instead
+              const cached = yield* cacheRead(blobs.stream(upstreamBlobKey(at.digest)));
 
               if (Option.isSome(cached)) return { kind: "stream", body: cached.value.body, length: cached.value.size, digest: at.digest } as const;
               const opened = yield* Effect.promise(() => open(at.url));

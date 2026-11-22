@@ -576,6 +576,34 @@ describe("R2 waits are bounded (blobs.ts)", () => {
     expect(got.ms).toBeLessThan(2_000);
   }, 20_000);
 
+  // R2 answering with an error of its own (10001, "We encountered an internal error") is a miss like a late get: before
+  // this, serve and openTarball failed with BlobError and every download of an npm package was a 500 (2026-11-22)
+  const failingR2 = () =>
+    bucket({
+      get: () => Promise.reject(new Error("get: We encountered an internal error. Please try again. (10001)")),
+    });
+
+  test("an upstream tarball whose R2 get fails is served from npm", async () => {
+    const works: Promise<void>[] = [];
+    const got = await withUpstream(failingR2(), served("r2-failing"), works);
+
+    expect(got.kind).toBe("ok");
+  }, 20_000);
+
+  test("an upstream tarball whose R2 get fails is opened from npm (openTarball)", async () => {
+    const works: Promise<void>[] = [];
+
+    const got = await withUpstream(
+      failingR2(),
+      (up) => Effect.flatMap(up.get("r2-failing-open", POOL.request()), (pkg) => (pkg === null ? Effect.die(new Error("not found")) : up.openTarball(pkg, "1.0.0"))),
+      works,
+    );
+
+    expect(got.kind).toBe("stream");
+
+    if (got.kind === "stream") await new Response(got.body).arrayBuffer();
+  }, 20_000);
+
   test("a cache put to R2 that never settles: the tarball is answered without waiting for it", async () => {
     const works: Promise<void>[] = [];
     let puts = 0;
