@@ -22,7 +22,7 @@ describe("install checks on a deploy", () => {
   });
 
   test("deploy.ts passes its choice to the stack, and the stack's own default is the database", () => {
-    expect(readFileSync(join(INFRA, "deploy.ts"), "utf8")).toMatch(/INSTALL_CHECKS: args\.installChecks,/);
+    expect(readFileSync(join(INFRA, "deploy.ts"), "utf8")).toMatch(/INSTALL_CHECKS: installChecks,/);
     const stack = readFileSync(join(INFRA, "alchemy.run.ts"), "utf8");
 
     expect(stack).toMatch(/z\.enum\(\["database", "edge"\]\)\.parse\(yield\* Config\.withDefault\(Config\.String\("INSTALL_CHECKS"\), "database"\)\)/);

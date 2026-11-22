@@ -73,6 +73,8 @@ export async function recordLiveRelease(input: {
   manifest: readonly string[];
   /** The install-check mode this run deployed the registry with (deploy.ts --install-checks). */
   installChecks: InstallChecks;
+  /** Synchronous final check run immediately before appending to the ledger; a non-null string refuses recording. */
+  beforeAppend?: () => string | null;
   append?: (release: Release) => void;
   deadlineMs?: number;
   intervalMs?: number;
@@ -97,6 +99,11 @@ export async function recordLiveRelease(input: {
     }
 
     if (now.kind === "live") {
+      if (left() <= 0) return expired();
+      const refused = input.beforeAppend?.() ?? null;
+
+      if (refused !== null) return { kind: "not-recorded", why: refused };
+
       if (left() <= 0) return expired();
       const release: Release = { build: input.build, sha: input.sha, stage: input.stage, at: new Date().toISOString(), manifest: [...input.manifest], workers: now.workers, installChecks: input.installChecks };
 

@@ -9,6 +9,16 @@
 //   bun packages/infra/deploy.ts deploy  --stage staging --adopt   (state lost: adopt what exists)
 //   bun packages/infra/deploy.ts deploy  --stage staging --install-checks database   (phase 1: the publish fence, database reads)
 //   bun packages/infra/deploy.ts deploy  --stage staging --install-checks edge       (phase 2: edge views; docs/DEPLOY.md)
+//   bun packages/infra/deploy.ts deploy  --stage production --incident               (the incident agent's deploy)
+//
+// --incident (marker APM_INCIDENT_PREFLIGHT_V1, which the incident helper apmjs-ops.py looks for here) runs the incident
+// preflight (incident-preflight.ts) under the release lock, before the database, a build or Alchemy, and prints
+// `incident preflight: PASS|REFUSED` with its JSON evidence line; a refusal exits 1 having changed nothing. An incident
+// deploy keeps the live release's install-check mode: it inherits it when --install-checks and APM_INSTALL_CHECKS are
+// absent, and refuses when either asks for another.
+//
+// Every deploy records HEAD and the tracked files right after it takes the lock, before it reads any source, and exits 1
+// when either changed before Alchemy starts, or before the release record is written (then nothing is recorded).
 //
 // The install-check mode is printed on the first line and kept on the release record's line, after the registry's
 // live version is confirmed to carry it.
@@ -47,30 +57,39 @@ import { z } from "zod";
 import { buildWorker } from "../registry/scripts/build.ts";
 import { databuddyBuildEnv } from "./analytics.ts";
 import { authSecret, prepareDatabase, type DatabaseReport } from "./stage.ts";
-import { migrationFiles } from "../registry/scripts/migrate.ts";
+import { migrationFiles, migrationFromBytes, type Migration } from "../registry/scripts/migrate.ts";
 import { BUSY_CODE, lockedSpawn, takeReleaseLock, type ReleaseLock } from "./release-lock.ts";
 import { recordLiveRelease } from "./deploy-record.ts";
 import { finishDeploy, recoveryAdvice, smokeCommand } from "./deploy-finish.ts";
 import { readReleases } from "./releases.ts";
-import { provenanceVars, type Cloudflare } from "./rollback.ts";
+import { ledgerOf, provenanceVars, stageDatabaseUrl, type Cloudflare } from "./rollback.ts";
 import { installChecksOf } from "./install-checks.ts";
+import { checkoutDrift, checkoutSnapshot, INCIDENT_PREFLIGHT_MARKER, preflightLines, resolveIncidentInstallChecks, runIncidentPreflight, type CheckoutSnapshot } from "./incident-preflight.ts";
 
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
 const INFRA = import.meta.dirname;
+const REPO_ROOT = join(INFRA, "..", "..");
 
 const Args = z.object({ action: z.enum(["plan", "deploy"]), stage: z.enum(["staging", "production"]) });
 const stageAt = process.argv.indexOf("--stage");
 
 const args = {
   ...Args.parse({ action: process.argv[2], stage: stageAt > 0 ? process.argv[stageAt + 1] : "staging" }),
-  // what install reads of npm's packages check on this deploy: "database" unless --install-checks edge asks
-  installChecks: installChecksOf({ argv: process.argv, env: process.env }),
+  // the incident agent's deploy: the incident preflight (APM_INCIDENT_PREFLIGHT_V1) runs first and must pass
+  incident: process.argv.includes("--incident"),
 };
+
+// what install reads of npm's packages check on this deploy: "database" unless --install-checks edge asks; an incident
+// deploy inherits the live release's mode instead (below)
+let installChecks = installChecksOf({ argv: process.argv, env: process.env });
 
 // one change to apm at a time, on this machine: the release lock (APM_RELEASE_LOCK), held from here until this process
 // and the children it starts to change anything (Alchemy, the smoke check) have exited. A plan changes nothing and
 // takes no lock.
 let lock: ReleaseLock | null = null;
+
+/** The checkout as this deploy found it, right after taking the lock: the upload and the record refuse once it moved. */
+let beforeCheckout: CheckoutSnapshot | null = null;
 
 if (args.action === "deploy") {
   const taken = takeReleaseLock({ script: import.meta.path, argv: process.argv.slice(2), stage: args.stage });
@@ -82,6 +101,17 @@ if (args.action === "deploy") {
 
   lock = taken.lock;
   process.stdout.write(`release lock: held (${lock.path})\n`);
+  beforeCheckout = checkoutSnapshot(REPO_ROOT);
+
+  if (!beforeCheckout.ok) {
+    process.stdout.write(`deploy refused: the checkout could not be read (${beforeCheckout.error}); nothing changed\n`);
+    process.exit(1);
+  }
+}
+
+/** Why the checkout moved since this deploy took the lock, or null (always null for a plan, which records nothing). */
+function drift(): string | null {
+  return beforeCheckout === null ? null : checkoutDrift(REPO_ROOT, beforeCheckout);
 }
 
 /** The Neon database each stage owns. Production keeps Neon's default database. */
@@ -179,20 +209,53 @@ const neonUrl = secretFile("neon-url");
 const review = reviewSettings(args.stage);
 const debugHash = debugTokenHash(args.stage);
 const database = DATABASES[args.stage];
+const cf: Cloudflare = { apiBase: process.env.APM_CLOUDFLARE_API ?? "https://api.cloudflare.com/client/v4", token, accountId };
 
-process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"}; install checks ${args.installChecks})\n`);
+// the migrations this run will apply and record: for --incident, the exact bytes preflight validated (never re-read from disk)
+let runMigrations: readonly Migration[] = migrationFiles();
 
-if (args.installChecks === "edge") {
+// the incident preflight, under the lock and before the database, a build or Alchemy (incident-preflight.ts)
+if (args.action === "deploy" && args.incident) {
+  const preflight = await runIncidentPreflight({ cf, stage: args.stage, repo: REPO_ROOT, releases: readReleases(args.stage), readAppliedMigrations: () => ledgerOf(stageDatabaseUrl(args.stage)) });
+
+  for (const line of preflightLines(preflight)) process.stdout.write(`${line}\n`);
+
+  if (!preflight.ok) {
+    process.stdout.write(`deploy refused by the incident preflight (${INCIDENT_PREFLIGHT_MARKER}): nothing changed\n`);
+    process.exit(1);
+  }
+
+  const resolved = resolveIncidentInstallChecks({ argv: process.argv, env: process.env, deployed: preflight.deployed.installChecks, requested: installChecks });
+
+  if (resolved.kind === "refused") {
+    process.stdout.write(`deploy refused: ${resolved.why}; nothing changed\n`);
+    process.exit(1);
+  }
+
+  installChecks = resolved.installChecks;
+  runMigrations = preflight.migrations.map((m) => migrationFromBytes(m.id, m.bytes));
+}
+
+process.stdout.write(`apm ${args.action} → ${args.stage} (database ${database}; AI review ${review.hash === "" ? "off" : "on"}; install checks ${installChecks})\n`);
+
+if (installChecks === "edge") {
   process.stdout.write("install checks edge: only once a build with the publish fence is the only registry version serving (docs/DEPLOY.md, \"Install checks\")\n");
 }
 
-const cf: Cloudflare = { apiBase: process.env.APM_CLOUDFLARE_API ?? "https://api.cloudflare.com/client/v4", token, accountId };
+// no database writes if the checkout already moved since the lock was taken (including untracked migration files)
+const movedBeforeDb = drift();
+
+if (movedBeforeDb !== null) {
+  process.stdout.write(`deploy refused before migrations: ${movedBeforeDb}; nothing changed\n`);
+  process.exit(1);
+}
 
 const report = await prepareDatabase({
   action: args.action,
   adminUrl: databaseUrl(neonUrl, new URL(neonUrl).pathname.slice(1)),
   databaseUrl: databaseUrl(neonUrl, database),
   database,
+  migrations: runMigrations,
 });
 
 process.stdout.write(describeDatabase(report, database));
@@ -209,10 +272,10 @@ const bundle = planDir === null ? await buildWorker("worker") : await buildWorke
 process.stdout.write(`registry bundle: ${bundle}\n`);
 
 const subdomain = await workersSubdomain(token, accountId);
-const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: INFRA }).stdout.toString().trim() || "unknown";
+const head = beforeCheckout !== null && beforeCheckout.ok ? beforeCheckout.head : Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: INFRA }).stdout.toString().trim() || "unknown";
 
 // a tree with uncommitted changes is not the commit it names
-const dirty = Bun.spawnSync(["git", "status", "--porcelain", "--untracked-files=no"], { cwd: INFRA }).stdout.toString().trim() !== "";
+const dirty = beforeCheckout !== null && beforeCheckout.ok ? beforeCheckout.trackedStatus !== "" : Bun.spawnSync(["git", "status", "--porcelain", "--untracked-files=no"], { cwd: INFRA }).stdout.toString().trim() !== "";
 const revision = dirty ? `${head}-dirty` : head;
 const build = randomUUID();
 const alchemyFlags: string[] = [];
@@ -245,10 +308,10 @@ const alchemyOptions = {
       APM_ADMINS: review.admins,
       DEBUG_TOKEN_HASH: debugHash,
       // what install reads of npm's packages check before their answer (registry edge-checks.ts): --install-checks
-      INSTALL_CHECKS: args.installChecks,
+      INSTALL_CHECKS: installChecks,
       // what built the registry and the website: this run's commit, build id and migration manifest. The record waits
       // for the live versions to carry it (deploy-record.ts), and the smoke check for them to answer with the build
-      APM_PROVENANCE: JSON.stringify(provenanceVars(revision, build, migrationFiles().map((m) => m.id))),
+      APM_PROVENANCE: JSON.stringify(provenanceVars(revision, build, runMigrations.map((m) => m.id))),
       // the website's registry URL for anything it renders at build time
       APM_REGISTRY: args.stage === "production" ? "https://registry.apmjs.dev/" : `https://apmjs-registry-${args.stage}.${subdomain}.workers.dev/`,
       // the website's and the docs' Databuddy tracker: production's client id, "" (no tracker) on any other stage
@@ -257,6 +320,15 @@ const alchemyOptions = {
       DO_NOT_TRACK: "1",
     },
   };
+
+// nothing uploads from a checkout that moved since this deploy read it
+const moved = drift();
+
+if (moved !== null) {
+  if (planDir !== null) rmSync(planDir, { recursive: true, force: true });
+  process.stdout.write(`deploy refused before Alchemy: ${moved}; nothing was uploaded\n`);
+  process.exit(1);
+}
 
 // a deploy's Alchemy holds the release lock with this process: killing this one mid-upload leaves it held
 const child = lock === null ? Bun.spawn(alchemyCommand, { ...alchemyOptions, stdout: "inherit", stderr: "inherit" }) : lockedSpawn(lock, alchemyCommand, alchemyOptions);
@@ -280,7 +352,14 @@ process.exit(
     alchemyExit: exitCode,
     smoke,
     // what is live now, confirmed to be this run's versions: the line every later rollback trusts
-    record: () => recordLiveRelease({ cf, stage: args.stage, build, sha: revision, manifest: migrationFiles().map((m) => m.id), installChecks: args.installChecks }),
+    // and only from the checkout this run started from: a moved one is never recorded
+    record: async () => {
+      const movedBeforeRecord = drift();
+
+      if (movedBeforeRecord !== null) return { kind: "not-recorded", why: movedBeforeRecord };
+
+      return recordLiveRelease({ cf, stage: args.stage, build, sha: revision, manifest: runMigrations.map((m) => m.id), installChecks, beforeAppend: drift });
+    },
     advice: async () => recoveryAdvice({ cf, stage: args.stage, releases: readReleases(args.stage) }),
     log: (line) => process.stdout.write(`${line}\n`),
   }),

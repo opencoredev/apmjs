@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Client } from "pg";
-import { migrate, migrationFiles, pendingMigrations } from "../registry/scripts/migrate.ts";
+import { migrate, migrationFiles, pendingMigrations, type Migration } from "../registry/scripts/migrate.ts";
 
 export type DeployAction = "plan" | "deploy";
 
@@ -31,16 +31,16 @@ function databaseExists(adminUrl: string, database: string): Promise<boolean> {
  * reports what deploy would do and writes nothing. `adminUrl` is a database on the same server to create it
  * from; `databaseUrl` is the stage's own.
  */
-export async function prepareDatabase(input: { action: DeployAction; adminUrl: string; databaseUrl: string; database: string }): Promise<DatabaseReport> {
+export async function prepareDatabase(input: { action: DeployAction; adminUrl: string; databaseUrl: string; database: string; migrations?: readonly Migration[] }): Promise<DatabaseReport> {
   const exists = await databaseExists(input.adminUrl, input.database);
 
   switch (input.action) {
     case "plan":
-      return exists ? { kind: "planned", pending: await pendingMigrations(input.databaseUrl) } : { kind: "missing", pending: migrationFiles().map((m) => m.id) };
+      return exists ? { kind: "planned", pending: await pendingMigrations(input.databaseUrl) } : { kind: "missing", pending: (input.migrations ?? migrationFiles()).map((m) => m.id) };
     case "deploy":
       if (!exists) await withClient(input.adminUrl, (c) => c.query(`CREATE DATABASE "${input.database.replace(/"/g, "")}"`));
 
-      return { kind: "migrated", applied: await migrate(input.databaseUrl), created: !exists };
+      return { kind: "migrated", applied: await migrate(input.databaseUrl, input.migrations === undefined ? {} : { migrations: input.migrations }), created: !exists };
     default: {
       const _exhaustive: never = input.action;
 

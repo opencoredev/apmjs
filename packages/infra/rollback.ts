@@ -488,7 +488,7 @@ export async function rollBack(cf: Cloudflare, steps: readonly Step[], message: 
 }
 
 /** The stage's database, as deploy.ts reaches it; null without neon-url. */
-function stageDatabaseUrl(stage: Stage): string | null {
+export function stageDatabaseUrl(stage: Stage): string | null {
   const path = join(SECRETS, "neon-url");
 
   if (!existsSync(path)) return null;

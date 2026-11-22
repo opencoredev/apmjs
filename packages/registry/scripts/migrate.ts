@@ -22,15 +22,17 @@ export const NO_TRANSACTION = "-- apm:no-transaction";
 
 export type Migration = { id: string; sql: string; transaction: boolean };
 
+export function migrationFromBytes(id: string, bytes: Buffer): Migration {
+  const sql = bytes.toString("utf8");
+
+  return { id, sql, transaction: sql.split("\n", 1)[0]?.trim() !== NO_TRANSACTION };
+}
+
 export function migrationFiles(): Migration[] {
   return readdirSync(DIR)
     .filter((f) => /^\d{4}_.+\.sql$/.test(f))
     .sort()
-    .map((f) => {
-      const sql = readFileSync(join(DIR, f), "utf8");
-
-      return { id: f.replace(/\.sql$/, ""), sql, transaction: sql.split("\n", 1)[0]?.trim() !== NO_TRANSACTION };
-    });
+    .map((f) => migrationFromBytes(f.replace(/\.sql$/, ""), readFileSync(join(DIR, f))));
 }
 
 /** A no-transaction migration's statements: whole-line comments dropped, split at each `;` that ends a line. */
@@ -154,9 +156,10 @@ async function lockMigrations(client: Client, timeoutMs: number): Promise<void> 
 
 /**
  * Applies pending migrations; returns the ids it applied. Waits up to `lockTimeoutMs` (APM_MIGRATE_LOCK_TIMEOUT_MS, else
- * 5 minutes) for another run's lock, then fails naming the session that holds it.
+ * 5 minutes) for another run's lock, then fails naming the session that holds it. When `migrations` is given, only
+ * those pre-read migrations are applied (no re-read from disk).
  */
-export async function migrate(url: string, opts: { lockTimeoutMs?: number } = {}): Promise<string[]> {
+export async function migrate(url: string, opts: { lockTimeoutMs?: number; migrations?: readonly Migration[] } = {}): Promise<string[]> {
   const lockTimeoutMs = opts.lockTimeoutMs ?? lockTimeoutFrom(process.env);
   const client = new Client({ connectionString: url });
   await client.connect();
@@ -169,7 +172,7 @@ export async function migrate(url: string, opts: { lockTimeoutMs?: number } = {}
     const done = new Set((await client.query<{ id: string }>("SELECT id FROM apm_migrations")).rows.map((r) => r.id));
     const applied: string[] = [];
 
-    for (const m of migrationFiles()) {
+    for (const m of opts.migrations ?? migrationFiles()) {
       if (done.has(m.id)) continue;
 
       try {
