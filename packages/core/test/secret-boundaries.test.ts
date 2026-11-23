@@ -2,7 +2,7 @@
 // the secret, a Google key ending in `-` was missed, and a connection string's last password, with no `;` after it, was
 // left readable.
 import { describe, expect, test } from "bun:test";
-import { findSecrets, redactSecrets } from "../src/index.ts";
+import { findSecrets, maskSecret, redactSecrets } from "../src/index.ts";
 
 const kinds = (path: string, text: string): string[] => findSecrets([{ path, data: new TextEncoder().encode(text) }]).findings.map((f) => f.kind);
 
@@ -54,5 +54,15 @@ describe("a connection string's password is masked wherever it ends", () => {
 
   test("the text around it stays as it was", () => {
     expect(redactSecrets(`Server=db;Password=${PW}`).startsWith("Server=db;Password=Z")).toBe(true);
+  });
+
+  // the value ends at the quote, `;` or newline, which are kept: only the password itself is replaced
+  test.each([
+    [`Server=db;Database=app;Password=${PW}`, `Server=db;Database=app;Password=${maskSecret(PW)}`],
+    [`"Server=db;Uid=app;Pwd=${PW}"`, `"Server=db;Uid=app;Pwd=${maskSecret(PW)}"`],
+    [`'Server=db;Password=${PW}'\nnext line`, `'Server=db;Password=${maskSecret(PW)}'\nnext line`],
+    [`"Server=db;Pwd=${PW};Password=${PW}x;"`, `"Server=db;Pwd=${maskSecret(PW)};Password=${maskSecret(`${PW}x`)};"`],
+  ])("%j is masked to %j", (text, want) => {
+    expect(redactSecrets(text)).toBe(want);
   });
 });
