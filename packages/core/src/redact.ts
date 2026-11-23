@@ -11,20 +11,20 @@ export const SECRET_CONTENT_RULES: { kind: string; re: RegExp }[] = [
   { kind: "GitHub token", re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/ },
   { kind: "Stripe live key", re: /\b[sr]k_live_[0-9a-zA-Z]{20,}\b/ },
   { kind: "Slack token", re: /\bxox[abprs]-[0-9A-Za-z-]{10,}\b/ },
-  { kind: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { kind: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/ },
   { kind: "OpenAI key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b/ },
   { kind: "Anthropic key", re: /\bsk-ant-[A-Za-z0-9_-]{32,}\b/ },
-  { kind: "registry auth token", re: /_authToken\s*=\s*[^\s$]{8,}/ },
+  { kind: "registry auth token", re: /_authToken[ \t]*=[ \t]*[^\s$]{8,}/ },
   // npm's basic auth: "//host/:_auth=base64(user:pass)" or ":_password=base64(pass)"
   // the host is matched looking back from `:_`, so each start is tried once (a forward `//[^\s:]+` from every `//` of
   // `////…` scanned to the end of the file from each)
-  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)\s*=\s*[^\s$]{4,}/ },
+  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)[ \t]*=[ \t]*[^\s$]{4,}/ },
   { kind: "Slack webhook", re: /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_/-]{20,}/ },
   { kind: "Discord webhook", re: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]{20,}/ },
 ];
 
 // In an .npmrc the auth keys need no registry prefix: "_auth=..." on its own line is a default credential.
-export const SECRET_NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)\s*=\s*[^\s$]{4,}/m }];
+export const SECRET_NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)[ \t]*=[ \t]*[^\s$]{4,}/m }];
 
 // ---------- redaction ----------
 // Best effort, for the people who may read a flag's quoted lines: the package's owners and apm's reviewers. The public
@@ -61,7 +61,8 @@ const FORMAT_RULES: readonly Rule[] = [
   { re: /[?&](?:sig|signature|token|access_token|refresh_token|id_token|key|apikey|api_key|auth|password|secret|client_secret|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature|x-goog-credential)=([^&#\s"'`<>]{4,})/gi, secret: 1 },
   // .NET and ODBC connection strings: "Server=…;Password=…;" (after a `;` or a quote, so `PASSWORD=` at a line's start is
   // the .env rule's; bounded: a value is at most 256 characters)
-  { re: /[;"'`][ \t]*(?:password|pwd)[ \t]*=([^;"'`\n]{1,256});/gi, secret: 1 },
+  // the value ends at a `;`, a quote or the line's end: the last pair of a string usually has no `;` after it
+  { re: /[;"'`][ \t]*(?:password|pwd)[ \t]*=([^;"'`\r\n]{1,256})(?=[;"'`\r\n]|$)/gi, secret: 1 },
   { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, secret: 0 },
 ];
 
