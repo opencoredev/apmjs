@@ -41,7 +41,35 @@ const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
-const INLINE_EVAL = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?:\s+-{1,2}\w[\w-]*(?:=\S+)?)*\s+(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
+const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?$/;
+const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
+const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
+
+/**
+ * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `nodejs -e`, `deno eval`. One pass over its
+ * words: a word that starts with `-` is a flag and never starts a match, so `--conditions=node` repeated cannot make
+ * each one rescan the flags after it (a regex did, in time quadratic in the script).
+ */
+function inlineEval(cmd: string): boolean {
+  const words = cmd.split(/\s+/);
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] ?? "";
+
+    if (w.startsWith("-") || !INTERPRETER.test(w)) continue;
+
+    for (let j = i + 1; j < words.length; j++) {
+      const f = words[j] ?? "";
+
+      if (EVAL_FLAG.test(f)) return true;
+
+      if (!OTHER_FLAG.test(f)) break;
+      i = j;
+    }
+  }
+
+  return false;
+}
 
 /** package.json `scripts`, as npm reads it: entries that are not strings run nothing and are dropped. */
 const ScriptsSchema = z.record(z.string(), z.string().catch("")).catch({});
@@ -105,7 +133,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
         return;
       }
 
-      const evals = viaEval || INLINE_EVAL.test(text);
+      const evals = viaEval || inlineEval(text);
       commands.push({ from, text, viaEval: evals });
 
       for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals);
@@ -185,9 +213,9 @@ export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolea
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 
   if (npxPackages(cmd).some((p) => !ctx.localBins?.has(p))) return true;
-  const inlineEval = ctx.viaEval === true || INLINE_EVAL.test(cmd);
+  const evals = ctx.viaEval === true || inlineEval(cmd);
 
-  return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
+  return evals && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
 }
 
 /** Words a reading of a command or script found: all of them, or the first few and a cut, past which it read no more. */

@@ -67,9 +67,10 @@ describe("node's inline-eval flag is recognised after other flags", () => {
 });
 
 describe("the flags a command may carry are read in linear time", () => {
-  // each flag has one reading (`--a` is never `-` then `-a`), or a run of them that never matches backtracks exponentially
-  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`]) {
-    test(cmd.slice(0, 12), () => {
+  // each flag has one reading (`--a` is never `-` then `-a`), or a run of them that never matches backtracks exponentially;
+  // and a flag value that names an interpreter (`--conditions=node`) must not start a fresh scan of the flags after it
+  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`, `node ${"--conditions=node ".repeat(16000)}x`, `npm ${"--c=npm ".repeat(16000)}x`]) {
+    test(`${cmd.slice(0, 24)} (${cmd.length} chars)`, () => {
       const started = performance.now();
 
       expandHooks({ scripts: { postinstall: cmd } });
