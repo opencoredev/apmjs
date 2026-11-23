@@ -11,7 +11,7 @@ export default function PrivacyPage() {
     <article className="mx-auto flex max-w-3xl flex-col gap-8">
       <header className="flex flex-col gap-3">
         <h1 className="text-3xl font-medium tracking-tight sm:text-4xl">Privacy policy</h1>
-        <p className="text-sm text-muted-foreground">Last updated: November 20, 2026</p>
+        <p className="text-sm text-muted-foreground">Last updated: November 23, 2026</p>
         <p className="text-lg leading-7 text-pretty text-muted-foreground">
           apm is an open-source package registry and security scorer operated at apmjs.dev, registry.apmjs.dev, and docs.apmjs.dev. This page states what data we collect and why.
         </p>
@@ -23,7 +23,13 @@ export default function PrivacyPage() {
           You do not need an account to browse packages, install from the registry, or query the HTTP and MCP APIs. Our Cloudflare Workers handle incoming requests and record standard operational logs (status codes, latency, route labels, and error codes). Rate limiting hashes or keys requests by your network address (normalized to a /64 prefix for IPv6) inside Cloudflare.
         </p>
         <p className="text-[15px] leading-7 text-muted-foreground">
-          We send privacy-preserving page views and server error events to Databuddy with no cookies, no referrer header, and no package names in page-view labels.
+          The public pages of apmjs.dev and docs.apmjs.dev load Databuddy&apos;s analytics script, which sets no cookies. It records page views (the page address, title, and the site that linked you there), Web Vitals (load and responsiveness timings), clicks on links to other sites, and JavaScript errors on those pages, along with your screen size, language, and time zone. To count visits it keeps a random visitor ID in your browser&apos;s local storage and a session ID in session storage; neither is tied to your account.
+        </p>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          The analytics script does not load on the sign-in, account, approval, device sign-in, publishing, or admin pages (/signin, /account, /approve, /device, /publish, /admin), and navigating to any of them from a public page loads a fresh page without the script. When your browser sends Global Privacy Control or Do Not Track, the analytics script does not load and your browser sends nothing to Databuddy.
+        </p>
+        <p className="text-[15px] leading-7 text-muted-foreground">
+          Separately, when an unexpected server error occurs, our Cloudflare Workers report it to Databuddy with a fixed error code, a route label, the status code, and the Cloudflare location. The report carries nothing about you or your request: no address, headers, or contents.
         </p>
       </section>
 

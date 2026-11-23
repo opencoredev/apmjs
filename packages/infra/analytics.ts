@@ -1,5 +1,5 @@
-// Databuddy (https://www.databuddy.cc): label-only page views on apmjs.dev and docs.apmjs.dev (apps/web/lib/analytics.ts,
-// apps/docs/analytics.ts), and the Workers' unhandled 500s as fixed codes (packages/core/src/error-report.ts). Production alone is given the client id, so
+// Databuddy (https://www.databuddy.cc): its standard tracker on the public pages of apmjs.dev and docs.apmjs.dev
+// (apps/web/lib/analytics.ts, apps/docs/analytics.ts), and the Workers' unhandled 500s as fixed codes (packages/core/src/error-report.ts). Production alone is given the client id, so
 // staging and local builds send nothing: deploy.ts passes it to the builds, alchemy.run.ts binds it to the Workers.
 // The id is the public one Databuddy's script tag carries, not a secret.
 
@@ -11,8 +11,8 @@ export function databuddyClientId(stage: string): string {
 }
 
 /**
- * What the website and docs builds read: apps/web/lib/analytics.ts sends page views only when it is set (Next.js
- * inlines NEXT_PUBLIC_ values at build time), and apps/docs/blume.config.ts adds its page-view script only then.
+ * What the website and docs builds read: apps/web/components/databuddy.tsx renders the tracker only when it is set
+ * (Next.js inlines NEXT_PUBLIC_ values at build time), and apps/docs/blume.config.ts adds Databuddy's adapter only then.
  */
 export function databuddyBuildEnv(stage: string) {
   return { NEXT_PUBLIC_DATABUDDY_CLIENT_ID: databuddyClientId(stage) };

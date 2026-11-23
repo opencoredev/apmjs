@@ -10,5 +10,5 @@
     "noEmit": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["blume.config.ts", "analytics.ts", "components.ts", "docs/**/meta.ts"]
+  "include": ["blume.config.ts", "analytics.ts", "docs/**/meta.ts"]
 }

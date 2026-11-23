@@ -95,7 +95,8 @@ describe("errorReporter", () => {
     expect(s?.url).toBe(`${DATABUDDY_ERRORS_URL}?client_id=client-1`);
     expect(s?.init.method).toBe("POST");
     expect(s?.init.redirect).toBe("manual");
-    expect(Object.fromEntries(new Headers(s?.init.headers))).toEqual({ "content-type": "application/json", origin: "https://registry.apmjs.dev" });
+    // Databuddy's edge blocks a report with no User-Agent (missing_user_agent), and a Worker's fetch() sends none
+    expect(Object.fromEntries(new Headers(s?.init.headers))).toEqual({ "content-type": "application/json", origin: "https://registry.apmjs.dev", "user-agent": "apmjs/1.0" });
     expect(JSON.parse(String(s?.init.body))).toEqual([errorPayload(E, 5)]);
   });
 

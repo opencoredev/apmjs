@@ -1,11 +1,16 @@
-# Header rules for Cloudflare's asset layer (the docs site is assets only, packages/infra/alchemy.run.ts). Astro names
-# every file under /_astro by its content, so a browser may keep each one instead of asking again on every page. They
-# get the website's security headers (apps/web/lib/security-headers.ts); apps/web/lib/static-headers.test.ts keeps
-# them the same.
-/_astro/*
-  Cache-Control: public, max-age=31536000, immutable
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self'; connect-src 'self' https://basket.databuddy.cc; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+# Header rules for Cloudflare's asset layer (the docs site is assets only, packages/infra/alchemy.run.ts), which serves
+# every docs page and file. Each one gets the website's security headers (apps/web/lib/security-headers.ts,
+# production); apps/web/lib/static-headers.test.ts keeps them the same. Astro names every file under /_astro by its
+# content, so a browser may keep each one instead of asking again on every page.
+#
+# Cloudflare applies every rule that matches a path and joins a header set by two of them with a comma, so each
+# header is set once: the security headers on /* alone, the cache policy on /_astro/* alone.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.databuddy.cc; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self'; connect-src 'self' https://basket.databuddy.cc; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
   X-Frame-Options: DENY
   X-Content-Type-Options: nosniff
-  Referrer-Policy: strict-origin-when-cross-origin
+  Referrer-Policy: strict-origin
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)
+
+/_astro/*
+  Cache-Control: public, max-age=31536000, immutable

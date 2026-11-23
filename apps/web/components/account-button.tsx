@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Menu } from "@base-ui/react/menu";
@@ -37,12 +36,13 @@ export function AccountButton() {
     const next = pathname && pathname !== "/signin" ? `?next=${encodeURIComponent(pathname)}` : "";
 
     return (
-      <Link
+      // Plain anchor so entering /signin from a tracked public page is a direct user-activated full navigation
+      <a
         href={`/signin${next}`}
         className="inline-flex h-9 items-center rounded-full bg-primary px-4 text-[15px] font-medium text-primary-foreground transition-colors hover:bg-primary/85"
       >
         Sign in
-      </Link>
+      </a>
     );
   }
 
@@ -75,7 +75,7 @@ export function AccountButton() {
               <Menu.LinkItem
                 key={item.href}
                 closeOnClick
-                render={<Link href={item.href} />}
+                render={<a href={item.href} />}
                 aria-current={pathname === item.href ? "page" : undefined}
                 className="flex h-9 items-center justify-between gap-4 rounded-lg px-2.5 text-[14px] outline-none data-highlighted:bg-muted"
               >

@@ -1,11 +1,10 @@
 // The apm documentation site, built with Blume (https://useblume.dev). `bun run build` writes static HTML to
 // dist/, which packages/infra serves as an assets-only Worker at docs.apmjs.dev.
 import { defineConfig } from "blume";
-import { script } from "blume/analytics";
-import { docsTracker } from "./analytics";
+import { docsAnalytics } from "./analytics";
 
-// Page views of the published pages, by the route Blume stamps on each one (analytics.ts, components.ts). The client
-// id is given to production's build alone (packages/infra/analytics.ts); without it the site sends nothing.
+// Databuddy's tracker, added by an inline loader only at the docs origin and without an opt-out (analytics.ts). The client id is given to production's build
+// alone (packages/infra/analytics.ts); without it the site renders no tracker and sends nothing.
 const databuddyClientId = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
 
 export default defineConfig({
@@ -45,7 +44,7 @@ export default defineConfig({
     ],
   },
 
-  analytics: docsTracker(databuddyClientId).map((tag) => script(tag)),
+  analytics: docsAnalytics(databuddyClientId),
 
   // a search is reported with its length, never its text: a reader may paste a token or an address into the box
   search: { analytics: { queries: false } },

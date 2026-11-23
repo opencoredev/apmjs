@@ -1,6 +1,6 @@
 // Response headers for every route, and the cache policy for per-user routes proxied to the registry.
 // Used by next.config.ts; kept here so the tests can check the exact values.
-import { DATABUDDY_INGEST_ORIGIN } from "./databuddy-origin";
+import { DATABUDDY_INGEST_ORIGIN, DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
 
 type Header = { key: string; value: string };
 
@@ -8,14 +8,15 @@ type Header = { key: string; value: string };
  * The Content-Security-Policy. Scripts need 'unsafe-inline': with Cache Components the page shell is
  * prerendered, so Next.js can't put a per-request nonce on its inline bootstrap and flight scripts
  * (node_modules/next/dist/docs/01-app/02-guides/content-security-policy.md). The policy still blocks
- * framing, plugins, <base> hijacking, off-site form posts, scripts from other origins, and fetches to
- * other origins except Databuddy's event endpoint (lib/databuddy-origin.ts).
+ * framing, plugins, <base> hijacking, off-site form posts, scripts from other origins except Databuddy's
+ * tracker (databuddy.js on its CDN), and fetches to other origins except Databuddy's event endpoint
+ * (lib/databuddy-origin.ts).
  * Avatars come from the OAuth providers, so images may load from any https origin.
  */
 export function contentSecurityPolicy(dev: boolean): string {
   const directives = [
     "default-src 'self'",
-    `script-src 'self' 'unsafe-inline'${dev ? " 'unsafe-eval'" : ""}`,
+    `script-src 'self' 'unsafe-inline' ${DATABUDDY_SCRIPT_ORIGIN}${dev ? " 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob: https:",
     "font-src 'self'",
@@ -33,12 +34,20 @@ export function contentSecurityPolicy(dev: boolean): string {
 // Passkeys need the WebAuthn features on this origin; nothing on the site uses the others.
 export const PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)";
 
+/**
+ * strict-origin on every page: a referrer names this origin and never a path, even to this origin. Databuddy's tracker
+ * (lib/analytics.ts) reports a page view's referrer with its path, and a document keeps the policy it loaded with, so a
+ * per-route policy on the private pages could not cover a client-router visit to /approve/<id> followed by a full
+ * navigation to a public page.
+ */
+export const REFERRER_POLICY = "strict-origin";
+
 export function securityHeaders(dev: boolean): Header[] {
   return [
     { key: "Content-Security-Policy", value: contentSecurityPolicy(dev) },
     { key: "X-Frame-Options", value: "DENY" },
     { key: "X-Content-Type-Options", value: "nosniff" },
-    { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+    { key: "Referrer-Policy", value: REFERRER_POLICY },
     { key: "Permissions-Policy", value: PERMISSIONS_POLICY },
   ];
 }

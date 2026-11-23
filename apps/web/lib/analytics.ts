@@ -1,36 +1,57 @@
-// Page views on apmjs.dev, sent to Databuddy's documented event endpoint (POST https://basket.databuddy.cc/track,
-// https://www.databuddy.cc/docs/api/events). Databuddy's own script is not loaded: its documented options cannot turn
-// off its automatic page views, page exits, engagement or attribution, and those carry the path, the referrer and click
-// ids from any page, the private ones included.
+// Databuddy's standard tracker (https://www.databuddy.cc/docs) on apmjs.dev. components/databuddy.tsx, mounted once in
+// app/layout.tsx, renders one inline loader (databuddyLoaderScript) and no databuddy.js tag of its own: the loader
+// decides whether the tag exists at all. The tracker sends page views (on hard loads and client-router navigations),
+// Web Vitals, browser errors and outgoing-link clicks. It sets no cookies; it keeps a random visitor id in
+// localStorage and a session id in sessionStorage.
 //
-// What is sent instead: one event per view of an allowed public page, `{ name: "page_view", properties: { site: "web",
-// route: <label> } }`, where the label is one of PAGE_LABELS. A page sends one only when it renders <PageView> with its
-// label (components/page-view.tsx), so a new route, a private page, a file view and an error page send nothing until
-// someone adds one. Never the URL, the query, the referrer (the request goes out with referrerPolicy no-referrer), the
-// title, a package name, a visitor id or anything from the page. No Web Vitals and no error capture: a vital measured
-// across a client navigation could belong to a private page as well as to the label it would be filed under.
+// databuddy.js is never fetched:
+//   - on a build without a client id: production's builds alone get one (packages/infra/analytics.ts), so staging and
+//     local builds render no loader at all;
+//   - away from the site's canonical origin (a production build served locally, on a preview host or on workers.dev),
+//     and when the visitor has opted out with Global Privacy Control or Do Not Track ("1" or "yes" in
+//     navigator.doNotTrack, window.doNotTrack or navigator.msDoNotTrack). The loader sets window.databuddyDisabled
+//     and adds no tag, so the browser asks nothing of cdn.databuddy.cc or basket.databuddy.cc;
+//   - while the page is one of PRIVATE_ROUTES. A hard load of a private page adds no tag, so databuddy.js never reads
+//     that page's URL (its query holds ids and click ids it would keep as attribution). The loader leaves
+//     window.__apmLoadDatabuddy behind, and components/databuddy-route-loader.tsx calls it after each client-router
+//     navigation: once the visitor reaches a public page, location already names that page and the tag is added.
+//   - once a document has loaded the tracker, the loader turns any client-router navigation into a private route
+//     (history.pushState, history.replaceState, or popstate) into a full page load of that route instead, so a tracked
+//     document never enters a private URL and databuddy.js never sees its path or query parameters (gclid, utm_*).
 //
-// Nothing is sent when the visitor has opted out (Global Privacy Control, or Do Not Track in any of the places browsers
-// put it), or when the page is not at the site's canonical origin: a production build served locally, on a preview
-// host or on a workers.dev address sends nothing. The client id is inlined at build time (NEXT_PUBLIC_*), and
-// production's builds alone get one (packages/infra/analytics.ts); without it nothing is sent either.
+// As defense in depth, the tag also carries PRIVATE_SKIP_PATTERNS and PRIVATE_MASK_PATTERNS.
+//
+// apps/docs/analytics.ts does the same for docs.apmjs.dev with its own copy of the loader for the docs origin.
 
-import { DATABUDDY_INGEST_ORIGIN } from "./databuddy-origin";
+import { DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
 
-export const DATABUDDY_TRACK_URL = `${DATABUDDY_INGEST_ORIGIN}/track`;
+export const DATABUDDY_SCRIPT_URL = `${DATABUDDY_SCRIPT_ORIGIN}/databuddy.js`;
 
-/** The public pages that report a view, by label. Nothing else ever does. */
-export const PAGE_LABELS = ["home", "compare", "docs", "package"] as const;
+/** The routes that never report anything: sign-in, the account, approvals, the device flow, publishing and admin. */
+export const PRIVATE_ROUTES = ["/account", "/approve", "/admin", "/device", "/signin", "/publish"] as const;
 
-export type PageLabel = (typeof PAGE_LABELS)[number];
+/** Whether `path` is a private route itself or anything under one ("/accounts-guide" is not under "/account"). */
+export function isPrivatePath(path: string): boolean {
+  return PRIVATE_ROUTES.some((route) => path === route || path.startsWith(`${route}/`));
+}
 
-/** Which site sent a view: apmjs.dev, or docs.apmjs.dev (apps/docs/analytics.ts sends the same shape). */
+/** databuddy.js matches "/foo/*" as a prefix of "/foo/" only, so each route is listed bare as well. */
+export const PRIVATE_SKIP_PATTERNS: readonly string[] = PRIVATE_ROUTES.flatMap((route) => [route, `${route}/*`]);
+
+/**
+ * The same routes, masked wherever databuddy.js still names one: leaving a private page by the client router sends a
+ * page_exit and an engagement record for it (the skip patterns are checked against the page being entered, which is
+ * public), and those carry the masked path, "/approve/*" for "/approve/stg_…", never the id after the route.
+ */
+export const PRIVATE_MASK_PATTERNS: readonly string[] = PRIVATE_ROUTES.map((route) => `${route}/**`);
+
+/** Which site a page is on: apmjs.dev, or docs.apmjs.dev. */
 export type Site = "web" | "docs";
 
-/** The one origin each site sends from. A copy of the build anywhere else sends nothing. */
+/** The one origin each site reports from. A copy of the build anywhere else loads nothing. */
 export const SITE_ORIGINS = { web: "https://apmjs.dev", docs: "https://docs.apmjs.dev" } as const satisfies Readonly<Record<Site, string>>;
 
-/** What a page can see of where it is and the visitor's opt-outs, as read from the browser (browserView). */
+/** What a page can see of where it is and the visitor's opt-outs, as the loader reads them from the browser. */
 export type BrowserView = {
   readonly origin: string;
   /** navigator.globalPrivacyControl. */
@@ -47,60 +68,72 @@ export function optedOut(view: BrowserView): boolean {
   return view.globalPrivacyControl === true || view.doNotTrack.some((v) => DNT_ON.has(v));
 }
 
-/** Whether a page on `site` may send a view: at its canonical origin, and with no opt-out. */
+/** Whether a page on `site` may load the tracker: at its canonical origin, and with no opt-out. The loader's rule. */
 export function maySend(view: BrowserView, site: Site): boolean {
   return view.origin === SITE_ORIGINS[site] && !optedOut(view);
 }
 
-/** The opt-out properties some browsers add, which lib.dom does not declare. */
-type OptOutNavigator = Navigator & { readonly globalPrivacyControl?: unknown; readonly doNotTrack?: unknown; readonly msDoNotTrack?: unknown };
+/** The tracker settings both sites put on the databuddy.js tag, as Databuddy names them (data-<name>). */
+export const DATABUDDY_SETTINGS = {
+  "track-web-vitals": "true",
+  "track-errors": "true",
+  "track-outgoing-links": "true",
+} as const satisfies Readonly<Record<string, string>>;
 
-type OptOutWindow = Window & { readonly doNotTrack?: unknown };
+/** The data- attributes of a site's databuddy.js tag; the website's also carry the private skip and mask patterns. */
+export function databuddyAttributes(site: Site, clientId: string): Readonly<Record<`data-${string}`, string>> {
+  const settings = {
+    "data-track-web-vitals": DATABUDDY_SETTINGS["track-web-vitals"],
+    "data-track-errors": DATABUDDY_SETTINGS["track-errors"],
+    "data-track-outgoing-links": DATABUDDY_SETTINGS["track-outgoing-links"],
+  };
 
-/** Reads the BrowserView from the running page. */
-function browserView(nav: OptOutNavigator, win: OptOutWindow): BrowserView {
+  if (site === "docs") return { "data-client-id": clientId, ...settings };
+
   return {
-    origin: win.location.origin,
-    globalPrivacyControl: nav.globalPrivacyControl,
-    doNotTrack: [nav.doNotTrack, win.doNotTrack, nav.msDoNotTrack],
+    "data-client-id": clientId,
+    "data-skip-patterns": JSON.stringify(PRIVATE_SKIP_PATTERNS),
+    "data-mask-patterns": JSON.stringify(PRIVATE_MASK_PATTERNS),
+    ...settings,
   };
 }
 
-/** A page view as a fetch: where it goes and the options it goes with. */
-export type PageViewRequest = { readonly url: string; readonly init: RequestInit };
+/** The window property the loader leaves for the website's client router to call (components/databuddy-route-loader.tsx). */
+export const DATABUDDY_LOAD_GLOBAL = "__apmLoadDatabuddy";
 
-/** The one event a view sends, and the fetch options that keep everything else off it. */
-export function pageViewRequest(input: { clientId: string; site: Site; route: string }): PageViewRequest {
-  return {
-    url: `${DATABUDDY_TRACK_URL}?website_id=${encodeURIComponent(input.clientId)}`,
-    init: {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name: "page_view", properties: { site: input.site, route: input.route } }),
-      mode: "cors",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      cache: "no-store",
-      redirect: "error",
-      keepalive: true,
-    },
-  };
-}
+/** The attribute that marks the one databuddy.js tag the loader adds. */
+export const DATABUDDY_TAG_MARK = "data-apm-databuddy";
 
-/** Databuddy's client id, inlined at build time; "" on every build but production's. */
-const CLIENT_ID = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
+/**
+ * The inline script each site renders instead of a databuddy.js tag. Off the canonical origin, under an opt-out, or
+ * when reading either throws, it sets window.databuddyDisabled and adds nothing. Otherwise it defines
+ * window.__apmLoadDatabuddy and calls it: that adds the databuddy.js tag once, and only while location.pathname is not
+ * a private route (the docs have none). apps/docs/analytics.ts keeps its own copy (docsLoaderScript, so the docs build
+ * imports nothing from the website); lib/analytics.test.ts checks the two are the same and runs both.
+ */
+export function databuddyLoaderScript(site: Site, clientId: string): string {
+  const origin = JSON.stringify(SITE_ORIGINS[site]);
+  const privateRoutes = JSON.stringify(site === "web" ? PRIVATE_ROUTES : []);
+  const attributes = JSON.stringify(databuddyAttributes(site, clientId));
+  const key = JSON.stringify(DATABUDDY_LOAD_GLOBAL);
+  const mark = JSON.stringify(DATABUDDY_TAG_MARK);
 
-/** Sends one view of a public page. Never throws and never waits: analytics does not change the page. */
-export function sendPageView(label: PageLabel): void {
-  if (CLIENT_ID === "") return;
+  // Once a web document loads databuddy.js, prevent client-router entry into private routes so databuddy.js never
+  // reads a private path or query string (such as gclid into did_params) in either normal or late-load timing.
+  const navGuard =
+    site === "web"
+      ? `var h=w.history;if(h){["pushState","replaceState"].forEach(function(m){var orig=h[m];if(typeof orig!=="function")return;h[m]=function(st,ti,u){if(u!=null&&u!==""){try{var t=new URL(String(u),location.origin+location.pathname);if(t.origin===location.origin&&priv(t.pathname)){location[m==="replaceState"?"replace":"assign"](t.pathname+t.search+t.hash);return}}catch(e){}}return orig.apply(this,arguments)}})}if(typeof w.addEventListener==="function")w.addEventListener("popstate",function(e){if(priv(location.pathname)){w.databuddyDisabled=true;e.stopImmediatePropagation();location.reload()}},true);`
+      : "";
 
-  try {
-    // checked on every view, before any request
-    if (!maySend(browserView(navigator, window), "web")) return;
-    const { url, init } = pageViewRequest({ clientId: CLIENT_ID, site: "web", route: label });
+  const privFn =
+    site === "web"
+      ? `function priv(p){for(var i=0;i<routes.length;i++)if(p===routes[i]||p.indexOf(routes[i]+"/")===0)return true;return false}`
+      : "";
 
-    fetch(url, init).catch(() => undefined);
-  } catch {
-    // best effort
-  }
+  const privCheck =
+    site === "web"
+      ? `if(priv(location.pathname))return;`
+      : `var p=location.pathname;for(var i=0;i<routes.length;i++)if(p===routes[i]||p.indexOf(routes[i]+"/")===0)return;`;
+
+  return `(function(){var w=window,d=document;try{var n=navigator,on=function(v){return v==="1"||v==="yes"};if(location.origin!==${origin}||n.globalPrivacyControl===true||on(n.doNotTrack)||on(w.doNotTrack)||on(n.msDoNotTrack)){w.databuddyDisabled=true;return}if(typeof w[${key}]!=="function"){var done=false,routes=${privateRoutes},attrs=${attributes};${privFn}w[${key}]=function(){if(done||d.querySelector("script[${DATABUDDY_TAG_MARK}]"))return;${privCheck}done=true;${navGuard}var s=d.createElement("script");s.src=${JSON.stringify(DATABUDDY_SCRIPT_URL)};s.async=true;s.crossOrigin="anonymous";s.setAttribute(${mark},"");for(var k in attrs)s.setAttribute(k,attrs[k]);d.head.appendChild(s)}}w[${key}]()}catch(e){w.databuddyDisabled=true}})();`;
 }

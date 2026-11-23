@@ -167,9 +167,9 @@ function PrivateFindings({ p, viewer, name, version }: { p: PrivateReview; viewe
         {viewer === "admin" && (
           <>
             {" "}
-            <Link href="/admin/reviews" className="text-foreground underline-offset-4 hover:underline">
+            <a href="/admin/reviews" className="text-foreground underline-offset-4 hover:underline">
               Open the review queue
-            </Link>
+            </a>
           </>
         )}
       </p>
@@ -203,9 +203,9 @@ function RequestReview({ onQueued, path, signInHref }: { onQueued: () => void; p
       </Button>
       {state.kind === "sign-in" && (
         <p role="alert" className="text-sm text-muted-foreground">
-          <Link href={signInHref} className="text-foreground underline underline-offset-4">
+          <a href={signInHref} className="text-foreground underline underline-offset-4">
             Sign in
-          </Link>{" "}
+          </a>{" "}
           to request an AI review.
         </p>
       )}

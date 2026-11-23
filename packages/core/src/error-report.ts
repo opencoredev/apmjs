@@ -49,6 +49,9 @@ export type ErrorPayload = {
 
 export const DATABUDDY_ERRORS_URL = "https://basket.databuddy.cc/errors";
 
+/** The User-Agent every report carries. A fixed product name: never a version, a host or anything from the request. */
+export const REPORT_USER_AGENT = "apmjs/1.0";
+
 /** Reports one isolate sends per window. */
 export const REPORT_LIMIT = { max: 10, windowMs: 60_000 } as const;
 
@@ -160,7 +163,8 @@ export function errorReporter(options: ReporterOptions): ErrorReporter {
 
       await send(url, {
         method: "POST",
-        headers: { "content-type": "application/json", origin: REPORT_ORIGINS[e.worker] },
+        // Workers send no User-Agent of their own, and Databuddy's edge refuses a report without one (missing_user_agent)
+        headers: { "content-type": "application/json", origin: REPORT_ORIGINS[e.worker], "user-agent": REPORT_USER_AGENT },
         body: JSON.stringify([errorPayload(e, now())]),
         // the collector's answer is never followed anywhere else
         redirect: "manual",

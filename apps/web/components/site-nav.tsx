@@ -17,16 +17,22 @@ function Links({ current }: { current: string | null }) {
       {LINKS.map((l) => {
         const active = current === l.href;
 
+        const className = cn(
+          "inline-flex h-9 items-center rounded-full px-2.5 text-[15px] font-medium transition-colors sm:px-3.5",
+          active ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground",
+        );
+
+        // /publish is a private route: use a plain anchor so leaving a tracked page is a direct full navigation
+        if (l.href === "/publish") {
+          return (
+            <a key={l.href} href={l.href} aria-current={active ? "page" : undefined} className={className}>
+              {l.label}
+            </a>
+          );
+        }
+
         return (
-          <Link
-            key={l.href}
-            href={l.href}
-            aria-current={active ? "page" : undefined}
-            className={cn(
-              "inline-flex h-9 items-center rounded-full px-2.5 text-[15px] font-medium transition-colors sm:px-3.5",
-              active ? "bg-secondary text-foreground" : "text-muted-foreground hover:text-foreground",
-            )}
-          >
+          <Link key={l.href} href={l.href} aria-current={active ? "page" : undefined} className={className}>
             {l.label}
           </Link>
         );

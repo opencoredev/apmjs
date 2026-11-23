@@ -5,6 +5,7 @@ import { Host_Grotesk, Geist_Mono } from "next/font/google";
 import { SearchBar } from "@/components/search-bar";
 import { SiteNav, SiteNavFallback } from "@/components/site-nav";
 import { AccountButton } from "@/components/account-button";
+import { Databuddy, DatabuddyNavigation } from "@/components/databuddy";
 import { Logo, LogoMark } from "@/components/logo";
 import { SITE_DESCRIPTION, SITE_NAME, SITE_TITLE } from "@/lib/agent/seo";
 import { SITE_URL } from "@/lib/agent/site";
@@ -25,6 +26,9 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="en" suppressHydrationWarning className={`${sans.variable} ${mono.variable} h-full antialiased`}>
+      <head>
+        <Databuddy />
+      </head>
       <body className="flex min-h-full flex-col bg-background text-foreground">
         <header className="sticky top-0 z-20 bg-background/85 backdrop-blur-md supports-[backdrop-filter]:bg-background/75">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-3 sm:flex-nowrap sm:px-6 sm:py-4">
@@ -73,6 +77,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             </span>
           </div>
         </footer>
+        <DatabuddyNavigation />
       </body>
     </html>
   );

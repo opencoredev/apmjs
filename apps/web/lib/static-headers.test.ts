@@ -1,48 +1,42 @@
 // The files Cloudflare's asset layer serves without the Worker get their headers from _headers files, not from
-// next.config.ts: the website's /_next/static/* (public/_headers) and the docs site's /_astro/* (apps/docs). Each must
-// carry every security header the Worker sends (review of de5c7b7, finding 3: only nosniff was left, so a built SVG
-// could be framed) and the immutable cache policy their content-named files allow.
+// next.config.ts: the website's /_next/static/* (public/_headers) and every docs page and file (apps/docs, which is
+// assets only). Each must carry every security header the Worker sends (review of de5c7b7, finding 3: only nosniff
+// was left, so a built SVG could be framed), each exactly once, and the content-named files the immutable cache policy.
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { headerRules, headersFor } from "../scripts/headers-file";
 import { securityHeaders } from "./security-headers";
 
-/** The headers a _headers file sets for `path`, as Cloudflare reads the file: a path line, then indented `Name: value` lines. */
-function rulesFor(file: string, path: string): Map<string, string> {
-  const out = new Map<string, string>();
-  let inside = false;
+const WEB_HEADERS = join(import.meta.dir, "..", "public", "_headers");
+const DOCS_HEADERS = join(import.meta.dir, "..", "..", "docs", "public", "_headers");
 
-  for (const line of readFileSync(file, "utf8").split("\n")) {
-    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
-
-    if (!/^\s/.test(line)) {
-      inside = line.trim() === path;
-      continue;
-    }
-
-    if (!inside) continue;
-    const at = line.indexOf(":");
-
-    out.set(line.slice(0, at).trim().toLowerCase(), line.slice(at + 1).trim());
-  }
-
-  return out;
-}
-
-const STATIC_RULES = [
-  { site: "the website", file: join(import.meta.dir, "..", "public", "_headers"), path: "/_next/static/*" },
-  { site: "the docs site", file: join(import.meta.dir, "..", "..", "docs", "public", "_headers"), path: "/_astro/*" },
+/** Each path checked, and whether it is a content-named file a browser may keep for a year. */
+const PATHS = [
+  { site: "the website", file: WEB_HEADERS, path: "/_next/static/chunks/app.js", immutable: true },
+  { site: "the docs site", file: DOCS_HEADERS, path: "/", immutable: false },
+  { site: "the docs site", file: DOCS_HEADERS, path: "/guides/ci/", immutable: false },
+  { site: "the docs site", file: DOCS_HEADERS, path: "/logo.svg", immutable: false },
+  { site: "the docs site", file: DOCS_HEADERS, path: "/_astro/page.CdE12.js", immutable: true },
 ];
 
 describe("static file headers", () => {
-  for (const rule of STATIC_RULES) {
-    test(`${rule.site}'s ${rule.path} carries every security header the Worker sends, and is kept for a year`, () => {
-      const rules = rulesFor(rule.file, rule.path);
+  for (const { site, file, path, immutable } of PATHS) {
+    test(`${site}'s ${path} carries every security header the Worker sends, each once${immutable ? ", and is kept for a year" : ""}`, () => {
+      const got = headersFor(headerRules(file), path);
 
-      for (const h of securityHeaders(false)) expect(rules.get(h.key.toLowerCase())).toBe(h.value);
-      expect(rules.get("x-frame-options")).toBe("DENY");
-      expect(rules.get("content-security-policy")).toContain("frame-ancestors 'none'");
-      expect(rules.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      for (const h of securityHeaders(false)) expect(got.get(h.key.toLowerCase()), h.key).toBe(h.value);
+      expect(got.get("x-frame-options")).toBe("DENY");
+      expect(got.get("referrer-policy")).toBe("strict-origin");
+      expect(got.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(got.get("cache-control")).toBe(immutable ? "public, max-age=31536000, immutable" : undefined);
     });
   }
+
+  test("the docs' HTML gets the CSP from the /* rule, and /_astro/* sets only its cache policy", () => {
+    const docs = headerRules(DOCS_HEADERS);
+
+    expect(docs.map((r) => r.pattern)).toEqual(["/*", "/_astro/*"]);
+    expect(docs[0]?.headers.map(([name]) => name)).toEqual(securityHeaders(false).map((h) => h.key.toLowerCase()));
+    expect(docs[1]?.headers).toEqual([["cache-control", "public, max-age=31536000, immutable"]]);
+  });
 });
