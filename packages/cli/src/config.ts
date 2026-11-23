@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { decodeIni } from "./ini.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -26,9 +27,16 @@ export function parseNpmrc(text: string): Map<string, string> {
   return out;
 }
 
+/** An .npmrc's top-level text settings as npm reads them (ini.ts): quotes removed, `; comments` dropped, sections skipped. */
 function readNpmrc(path: string): Map<string, string> {
   try {
-    return existsSync(path) ? parseNpmrc(readFileSync(path, "utf8")) : new Map();
+    const out = new Map<string, string>();
+
+    if (!existsSync(path)) return out;
+
+    for (const [key, value] of decodeIni(readFileSync(path, "utf8"), "spaced")) if (value.kind === "one" && value.item.kind === "text") out.set(key, value.item.text);
+
+    return out;
   } catch {
     return new Map();
   }
