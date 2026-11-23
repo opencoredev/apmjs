@@ -33,11 +33,20 @@ describe("the decoder computes what JavaScript computes", () => {
     ["null in a template", "function g(h){return `${1+1}${h}${null}`}", "a"],
     ["null and undefined in a joined list", 'function g(h){return [1,null,undefined,3].join("-")}', ""],
     ["a string still concatenates", "function g(h){return h+1+2+true}", "a"],
+    ["a null Buffer encoding reads utf8", 'function g(h){return Buffer.from(h,null).toString()}', "axios"],
   ];
 
   for (const [label, src, arg] of cases) {
     test(label, () => {
       expect(decoded(src, arg)).toEqual({ kind: "decoded", value: real(src, arg) });
+    });
+  }
+
+  // each throws in JavaScript: a program that throws, not a limit apm hit
+  for (const src of ["function g(h){return (255).toString(null)}", 'function g(h){return Buffer.from(h,"utf8").toString(null)}']) {
+    test(`${src.slice(21, -1)} throws, so it is not a decoder apm runs`, () => {
+      expect(() => real(src, "axios")).toThrow();
+      expect(decoded(src, "axios")).toEqual({ kind: "unsupported" });
     });
   }
 });

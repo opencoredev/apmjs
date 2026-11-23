@@ -493,7 +493,7 @@ function invoke(f: Value, args: readonly Value[], state: State): Value {
 
 /** A Buffer encoding the decoder accepts, from what the program passes (utf8 when it passes none). */
 function encoding(v: Value | undefined): BufferEncoding {
-  const e = v === undefined || v.k === "nothing" ? "utf8" : text(v);
+  const e = v === undefined || v.k === "nothing" || v.k === "null" ? "utf8" : text(v);
 
   switch (e) {
     case "hex":
@@ -595,9 +595,15 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
       if (method !== "toString") throw new Unsupported();
       work(recv.latin1.length * 2);
 
+      // Buffer.from(s, null) reads utf8, but toString(null) throws in Node
+      if (args[0]?.k === "null") throw new Unsupported();
+
       return capped(Buffer.from(recv.latin1, "latin1").toString(encoding(args[0])));
     case "num":
       if (method !== "toString") throw new Unsupported();
+
+      // toString(null) throws in JavaScript (radix 0): a program that throws, not a limit apm hit
+      if (a0.k === "null") throw new Unsupported();
 
       return str(recv.v.toString(args[0] === undefined ? 10 : number(a0)));
     case "str":
