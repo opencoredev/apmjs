@@ -134,7 +134,9 @@ export function saveToken(userconfig: string, registry: string, token: string): 
   const target = existsSync(userconfig) ? realpathSync(userconfig) : userconfig;
   const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/) : [];
   const kept = lines.filter((l) => !l.trim().startsWith(`${key}=`) && l.trim() !== "");
-  kept.push(`${key}=${token}`);
+  // npm reads no key under a [section] as a top-level setting, so the token goes above the first section header
+  const section = kept.findIndex((l) => /^\[[^\]]*\]\s*$/.test(l));
+  kept.splice(section < 0 ? kept.length : section, 0, `${key}=${token}`);
   const tmp = join(dirname(target), `.npmrc.${randomBytes(6).toString("hex")}.tmp`);
   try {
     writeFileSync(tmp, "", { mode: 0o600, flag: "wx" });

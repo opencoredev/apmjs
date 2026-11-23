@@ -222,6 +222,27 @@ describe("finding 2: APM_TOKEN only goes to the registry it was issued for", () 
     expect(r.code, r.out).toBe(0);
     expect(r.out).toContain(`alice on ${reg.url}`);
   });
+
+  test("apm login saves its token where npm and apm read it: above the first [section] of the user .npmrc", async () => {
+    const sb = makeSandbox(reg);
+    const npmrc = join(sb.home, ".npmrc");
+    writeFileSync(npmrc, [`registry=${reg.url}`, "[custom]", "color=false", ""].join("\n"));
+    const env = laptopEnv(sb.env);
+    const login = await apm(["login", "--username", "frank", "--password-stdin"], { cwd: sb.home, env, stdin: "a-long-enough-password\n" });
+
+    expect(login.code, login.out).toBe(0);
+    const lines = readFileSync(npmrc, "utf8").split("\n");
+
+    expect(lines.findIndex((l) => l.startsWith(`${hostKey(reg.url)}:_authToken=`))).toBeLessThan(lines.indexOf("[custom]"));
+    expect(lines.slice(lines.indexOf("[custom]"))).toContain("color=false");
+    const npmWho = await run(["npm", "whoami"], { cwd: sb.home, env });
+
+    expect(npmWho.stdout.trim(), npmWho.out).toBe("frank");
+    const r = await apm(["whoami"], { cwd: sb.home, env });
+
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain(`frank on ${reg.url}`);
+  });
 });
 
 describe("finding 3: apm publish uploads to the registry it checked", () => {
