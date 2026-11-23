@@ -130,6 +130,24 @@ function checksumMatches(header: Uint8Array, stored: number): boolean {
   return stored === unsigned || stored === signed;
 }
 
+/**
+ * The header's path, from its name field and, in a POSIX ustar header only, its prefix field. npm (node-tar) and Bun
+ * (libarchive) read bytes 345-499 as a prefix only under the "ustar\0" "00" magic; in GNU and v7 headers they are other
+ * fields, so joining them would scan a file under another path than the one installed.
+ */
+function headerPath(header: Uint8Array): string {
+  const name = readString(header, 0, 100);
+  const ustar = USTAR_MAGIC.every((b, i) => header[257 + i] === b);
+  const prefix = ustar ? readString(header, 345, 155) : "";
+
+  return prefix ? `${prefix}/${name}` : name;
+}
+
+const USTAR_MAGIC = [0x75, 0x73, 0x74, 0x61, 0x72, 0x00, 0x30, 0x30];
+
+/** Typeflags of a PAX extended header: "X" is the old Solaris one, which npm and Bun read as "x". */
+const isPax = (type: string): boolean => type === "x" || type === "X";
+
 function invalid(message: string): ArchiveError {
   return new ArchiveError("invalid", message);
 }
@@ -145,6 +163,7 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
   let headers = 0;
   let longName: string | null = null;
   let paxPath: string | null = null;
+  let sawZero = false;
 
   while (off + 512 <= tar.length) {
     const header = tar.subarray(off, off + 512);
@@ -152,7 +171,15 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     // a header: the zero test, the checksum and the fields each read its 512 bytes once
     chargeText("tar", 512, 4);
 
-    if (header.every((b) => b === 0)) break;
+    // npm and Bun end the archive at two zero blocks in a row and read on past a lone one, so its files are read here too
+    if (header.every((b) => b === 0)) {
+      if (sawZero) break;
+      sawZero = true;
+      off += 512;
+      continue;
+    }
+
+    sawZero = false;
     headers++;
 
     if (headers > MAX_TAR_ENTRIES) throw new ArchiveError("too-large", `more than ${MAX_TAR_ENTRIES} entries`);
@@ -165,7 +192,6 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
-    const prefix = readString(header, 345, 155);
     const dataStart = off + 512;
 
     if (dataStart + size > tar.length) throw invalid(`entry "${name}" runs past the end of the archive`);
@@ -179,12 +205,16 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
       continue;
     }
 
-    if (type === "x") {
-      paxPath = paxPathOf(data, off);
+    if (isPax(type) || type === "g") {
+      const path = paxPathOf(data, off);
+
+      // a global header's path names no entry (npm and Bun ignore it)
+      if (type !== "g") paxPath = path;
       continue;
     }
 
-    if (type === "g") continue;
+    // a GNU long link name: metadata for the next entry's link, which leaves a pending long name or PAX path in place
+    if (type === "K") continue;
 
     if (type !== "0" && type !== "\0" && type !== "7") {
       longName = null;
@@ -192,7 +222,7 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
       continue;
     }
 
-    let full = paxPath ?? longName ?? (prefix ? `${prefix}/${name}` : name);
+    let full = paxPath ?? longName ?? headerPath(header);
     longName = null;
     paxPath = null;
     full = normalizeTarPath(full);
@@ -237,7 +267,7 @@ const EQUALS = 0x3d;
 const NEWLINE = 0x0a;
 
 /**
- * The `path` of a PAX extended header, or null when it sets none. A PAX header is a run of records, each
+ * The `path` of a PAX extended header, or null when it sets none; a header that sets `size` is refused. A PAX header is a run of records, each
  * `<length> <key>=<value>\n` where `<length>` counts the whole record, digits and newline included. They are read with
  * one cursor that only moves forward, a record at a time, and a header that is not such a run is refused: a search
  * for `path=` anywhere in it (what this was before) tried every digit as a record's start, and a payload of repeated
@@ -270,6 +300,10 @@ function paxPathOf(data: Uint8Array, at: number): string | null {
     if (eq <= 0) throw invalid(`malformed pax record at byte ${at}`);
 
     if (eq === 4 && record[0] === 0x70 && record[1] === 0x61 && record[2] === 0x74 && record[3] === 0x68) path = new TextDecoder().decode(record.subarray(eq + 1));
+
+    // npm takes the next entry's size from a PAX `size` (Bun does too, but not from a global one), so reading the header's
+    // would put later entries at other bytes than they install; npm only writes one for files over 8 GB, past apm's limits
+    if (eq === 4 && record[0] === 0x73 && record[1] === 0x69 && record[2] === 0x7a && record[3] === 0x65) throw invalid(`a pax header that sets an entry's size at byte ${at}`);
     pos = end;
   }
 
@@ -359,7 +393,7 @@ type Pending =
   // `name`: the header's own name field, which readTar's errors quote
   | { kind: "file"; entry: TarEntry; name: string; keep: Keep; gathered: Uint8Array | null; left: number; pad: number; probed: boolean }
   // a GNU long name or a PAX header, held whole to be read once its last byte is in
-  | { kind: "meta"; type: "L" | "x"; name: string; buf: Uint8Array; at: number; left: number; pad: number }
+  | { kind: "meta"; type: "L" | "x" | "X" | "g"; name: string; buf: Uint8Array; at: number; left: number; pad: number }
   // bytes passed over: `required`, another entry type's data, which must all arrive; then `pad`, which may be cut short
   | { kind: "skip"; required: number; pad: number; name: string }
   // the end-of-archive block was read: the rest is ignored, as readTar ignores it
@@ -379,6 +413,7 @@ export class TarStream {
   private headers = 0;
   private longName: string | null = null;
   private paxPath: string | null = null;
+  private sawZero = false;
   private readonly entries: TarEntry[] = [];
   private readonly partial = new Set<TarEntry>();
   private namesBytes = 0;
@@ -524,12 +559,15 @@ export class TarStream {
     this.offset += 512;
     chargeText("tar", 512, 4);
 
+    // as readTar: two zero blocks in a row end the archive, a lone one is passed over
     if (header.every((b) => b === 0)) {
-      this.pending = { kind: "ended" };
+      if (this.sawZero) this.pending = { kind: "ended" };
+      this.sawZero = true;
 
       return;
     }
 
+    this.sawZero = false;
     this.headers++;
 
     if (this.headers > MAX_TAR_ENTRIES) throw new ArchiveError("too-large", `more than ${MAX_TAR_ENTRIES} entries`);
@@ -542,14 +580,13 @@ export class TarStream {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
-    const prefix = readString(header, 345, 155);
     const blocks = Math.ceil(size / 512) * 512;
     const pad = blocks - size;
     // readTar's offset once it has moved past this entry, which a PAX error names
     const after = off + 512 + blocks;
     this.offset += blocks;
 
-    if (type === "L" || type === "x") {
+    if (type === "L" || type === "x" || type === "X" || type === "g") {
       if (size > MAX_STREAMED_NAME_BYTES) throw new ArchiveError("too-large", `a ${type === "L" ? "long name" : "PAX header"} of more than ${MAX_STREAMED_NAME_BYTES / (1024 * 1024)} MB`);
       // held until its last byte is in, then let go (the name it gives is charged with the entry it names)
       this.take(size);
@@ -562,8 +599,8 @@ export class TarStream {
       return;
     }
 
-    if (type === "g" || (type !== "0" && type !== "\0" && type !== "7")) {
-      if (type !== "g") {
+    if (type !== "0" && type !== "\0" && type !== "7") {
+      if (type !== "K") {
         this.longName = null;
         this.paxPath = null;
       }
@@ -573,7 +610,7 @@ export class TarStream {
       return;
     }
 
-    let full = this.paxPath ?? this.longName ?? (prefix ? `${prefix}/${name}` : name);
+    let full = this.paxPath ?? this.longName ?? headerPath(header);
     this.longName = null;
     this.paxPath = null;
     full = normalizeTarPath(full);
@@ -629,7 +666,11 @@ export class TarStream {
     if (p.type === "L") {
       chargeText("tar", p.buf.length);
       this.longName = readString(p.buf, 0, p.buf.length);
-    } else this.paxPath = paxPathOf(p.buf, p.at);
+    } else {
+      const path = paxPathOf(p.buf, p.at);
+
+      if (p.type !== "g") this.paxPath = path;
+    }
   }
 }
 
