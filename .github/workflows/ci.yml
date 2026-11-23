@@ -42,10 +42,12 @@ jobs:
           export PATH="$PWD/node_modules/.bin:$PATH"
           for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Unit tests
-        run: bun test packages/cli/test packages/core/test packages/registry/test packages/infra/test apps/reviewer/test
+        run: bun test packages/cli/test packages/core/test packages/registry/test packages/infra/test
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web
+      - name: Reviewer unit tests
+        run: bun test apps/reviewer/test
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web
