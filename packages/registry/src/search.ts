@@ -10,6 +10,9 @@ import { packageTextShown } from "./withheld.ts";
 
 export type SearchHit = { pkg: PackageRecord; latest: VersionRecord; rank: number; owners: string[] };
 
+/** The most distinct words of a search that are ranked. */
+export const MAX_SEARCH_TERMS = 16;
+
 function bareName(name: string): string {
   return name.startsWith("@") ? name.slice(name.indexOf("/") + 1) : name;
 }
@@ -28,10 +31,18 @@ function rankOf(pkg: PackageRecord, terms: string[]): number {
     else if (pkg.keywords.some((k) => k.toLowerCase() === t)) rank += 15;
     else if (hay.includes(t)) rank += 5;
     // A misspelled name still finds the package: one edit away for short names, two for long ones.
-    else if (t.length >= 4 && editDistance(bareName(name), bareName(t)) <= (t.length >= 8 ? 2 : 1)) rank += 10;
+    else if (t.length >= 4 && withinEdits(bareName(name), bareName(t), t.length >= 8 ? 2 : 1)) rank += 10;
   }
 
   return rank;
+}
+
+/**
+ * Whether `a` and `b` are at most `max` edits apart. Two strings whose lengths differ by more than `max` never are,
+ * and editDistance costs the product of their lengths: a 12 000-character search term took 2 s against 100 packages.
+ */
+function withinEdits(a: string, b: string, max: number): boolean {
+  return Math.abs(a.length - b.length) <= max && editDistance(a, b) <= max;
 }
 
 export const searchPackages = (text: string): Effect.Effect<SearchHit[], StoreError, Store | Clock> =>
@@ -39,7 +50,9 @@ export const searchPackages = (text: string): Effect.Effect<SearchHit[], StoreEr
     const store = yield* Store;
     const now = yield* (yield* Clock).now;
     const q = text.trim().toLowerCase();
-    const terms = q.split(/\s+/).filter(Boolean);
+    // ranking costs each term against every package: past MAX_SEARCH_TERMS distinct terms the rest are not ranked, or
+    // a query of 500 name-length words took 1.8 s against 100 packages
+    const terms = [...new Set(q.split(/\s+/).filter(Boolean))].slice(0, MAX_SEARCH_TERMS);
     // a package with a withheld version is ranked, and shown, by the text its shown versions wrote (withheld.ts)
     // one query for every such package's versions, however many there are: their description and keywords only
     const withheld = yield* store.withheldPackageText();
