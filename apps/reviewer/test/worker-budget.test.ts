@@ -121,4 +121,63 @@ describe("spending", () => {
     expect(asks).toBe(2);
     expect(budget.usedToday()).toBe(12_345);
   });
+
+  test("a budget that cannot be written still gives the job back", async () => {
+    const budget = new DailyBudget(stateDir, 10 * RESERVE_PER_REVIEW);
+
+    budget.spend = () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+
+    let asks = 0;
+
+    const d = deps(budget, {
+      model: {
+        model: "test",
+        ask: async () => {
+          asks++;
+
+          if (asks === 1) return { kind: "ok", content: "not json", finishReason: "stop", usage: usage(100) };
+          throw new ModelUnavailable("the model could not be reached");
+        },
+      },
+    });
+
+    expect(await processJob(d, job(0))).toBe("released");
+    expect(d.released).toEqual(["job-0"]);
+  });
+
+  test("a job already charged and only posting its result holds no reserve", async () => {
+    const controller = new AbortController();
+    const posting = Promise.withResolvers<void>();
+    let next = 0;
+    let charged = false;
+
+    const d = deps(new DailyBudget(stateDir, 2 * RESERVE_PER_REVIEW), {
+      registry: {
+        lease: async (max) => {
+          d.leased.push(max);
+
+          // the second job only appears once the first has been charged and is posting
+          return next === 0 || (next === 1 && charged) ? [job(next++)] : [];
+        },
+        tarball: async () => [],
+        result: () => {
+          charged = true;
+
+          return posting.promise;
+        },
+        release: async () => {},
+      },
+    });
+
+    const done = runDaemon({ ...d, concurrency: 2, pollMs: 5, signal: controller.signal });
+
+    await Bun.sleep(50);
+    controller.abort();
+    posting.resolve();
+    await done;
+    // the first job spent 1000 tokens and is waiting on the registry: one full reserve is still free
+    expect(next).toBe(2);
+  });
 });
