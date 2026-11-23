@@ -37,9 +37,11 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]+)|(start|test|stop|restart)\b)|yarn(?:\s+run)?\s+([\w:.@/-]+)|pnpm(?:\s+run)?\s+([\w:.@/-]+)|bun\s+run\s+([\w:.@/-]+))/g;
+const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
+const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
+const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
-const INLINE_EVAL = /\b(?:node|bun|deno)\s+(?:-e|--eval|-p|--print|eval)\b/;
+const INLINE_EVAL = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?:\s+-{1,2}\w[\w-]*(?:=\S+)?)*\s+(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 
 /** package.json `scripts`, as npm reads it: entries that are not strings run nothing and are dropped. */
 const ScriptsSchema = z.record(z.string(), z.string().catch("")).catch({});
