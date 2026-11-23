@@ -4,7 +4,7 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, scriptTargets, type TarEntry, findingsOf } from "@apm/core";
+import { analyze, runTargets, type TarEntry, findingsOf } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
@@ -168,7 +168,8 @@ export type Tier = { tier: number; sub: number };
 export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f: TarEntry) => Tier {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const resolved = (raw: string): string | undefined => resolveIn(byPath, stripDot(raw))?.path;
-  const targets = new Set(installScripts(manifest).flatMap((s) => scriptTargets(s.command).map(resolved)));
+  // a script after an interpreter, and a program run directly (`./setup.txt` with a shebang)
+  const targets = new Set(installScripts(manifest).flatMap((s) => runTargets(s.command).map(resolved)));
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
   // npm's default entry when `main` is absent

