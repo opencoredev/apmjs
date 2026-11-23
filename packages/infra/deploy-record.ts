@@ -93,9 +93,9 @@ export async function recordLiveRelease(input: {
     try {
       now = await attempt({ cf: input.cf, stage: input.stage, stamp, installChecks: input.installChecks, left });
     } catch (e) {
-      // a request cut short by the time left is a read that did not come back in time, not a failure of its own
-      if (!(e instanceof Error && e.name === "TimeoutError") && left() > 0) throw e;
-      now = { kind: "not-yet", why: "a Cloudflare read timed out" };
+      // a read that failed (a timeout cut short by the time left, a 5xx, a reset) is a read that did not come back yet: a
+      // live build must not go unrecorded over one bad answer, and the deadline still bounds the retries
+      now = { kind: "not-yet", why: e instanceof Error && e.name === "TimeoutError" ? "a Cloudflare read timed out" : `a Cloudflare read failed (${e instanceof Error ? e.message : String(e)})` };
     }
 
     if (now.kind === "live") {
