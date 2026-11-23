@@ -39,7 +39,10 @@ export function repositoryUrl(field: RepositoryField | null | undefined): string
 
   if (gh) return `https://github.com/${gh.owner}/${gh.repo}${gh.directory ? `/tree/HEAD/${gh.directory.split("/").map(encodeURIComponent).join("/")}` : ""}`;
 
-  return safeHttpUrl(field?.url.trim().replace(/^git\+/, "").replace(/\.git$/, ""));
+  const url = safeHttpUrl(field?.url.trim().replace(/^git\+/, "").replace(/\.git$/, ""));
+
+  // A GitHub URL githubRepo could not read names no repository (github.com/../.. is github.com itself).
+  return url !== null && /^(?:www\.)?github\.com$/i.test(new URL(url).hostname) ? null : url;
 }
 
 /** A URL as people read it: host without "www.", then the path, without a trailing slash. */

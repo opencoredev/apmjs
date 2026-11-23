@@ -10,7 +10,8 @@ export const RepositoryField = z.object({ url: z.string(), directory: z.string()
 
 export type RepositoryField = z.infer<typeof RepositoryField>;
 
-const PART = /^[A-Za-z0-9._-]+$/;
+// "." and ".." would be read by a browser as path segments: github.com/../.. opens github.com.
+const PART = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
 // git+https://github.com/o/r.git, git://github.com/o/r, git@github.com:o/r.git, https://github.com/o/r/tree/main/x
 const HOSTED = /^(?:git\+)?(?:https?:\/\/|git:\/\/|ssh:\/\/|git\+ssh:\/\/)?(?:[^@/]+@)?(?:www\.)?github\.com[/:]([^/]+)\/([^/#?]+)/i;

@@ -315,6 +315,15 @@ describe("repository", () => {
     expect(githubRepo({ url: "https://github.com/a/b", directory: "../x" })).toBeNull();
     expect(githubRepo(null)).toBeNull();
   });
+
+  test("dot segments are not an owner or a repo", () => {
+    for (const url of ["https://github.com/../..", "github:./..", "https://github.com/facebook/..", "../.."]) {
+      expect(githubRepo({ url, directory: null }), url).toBeNull();
+    }
+
+    // a repo name may still start with a dot
+    expect(githubRepo({ url: "https://github.com/o/.github", directory: null })).toEqual({ owner: "o", repo: ".github", directory: "" });
+  });
 });
 
 describe("cutReadme", () => {
