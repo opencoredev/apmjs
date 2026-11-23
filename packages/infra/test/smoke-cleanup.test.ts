@@ -17,12 +17,12 @@ afterEach(() => {
 });
 
 function start(subdomain: string) {
-  // a subdomain with a space makes every stage URL invalid: the first fetch throws without touching the network
   return Bun.spawn(["bun", SMOKE, "--stage", "staging", "--subdomain", subdomain], { env: { PATH: process.env.PATH ?? "", TMPDIR: dir, APM_SECRETS_DIR: join(dir, "secrets") }, stdout: "pipe", stderr: "pipe" });
 }
 
 describe("smoke.ts's workspace", () => {
   test("is removed when a check throws and the run crashes", async () => {
+    // a subdomain with a space makes every stage URL invalid: the first fetch throws without touching the network
     const proc = start("bad host");
     const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
 
@@ -31,13 +31,31 @@ describe("smoke.ts's workspace", () => {
     expect(readdirSync(dir).filter((f) => f.startsWith("apm-smoke-"))).toEqual([]);
   });
 
-  test("is removed when the run is stopped with SIGTERM", async () => {
-    const proc = start("bad host");
+  test("is removed when the run is stopped with SIGTERM while a check waits", async () => {
+    // a local socket that accepts and never answers: the docs check's first fetch (userinfo@127.0.0.1) hangs on it
+    const connected = Promise.withResolvers<void>();
 
-    // stopped as soon as the workspace exists, before the crashing check gets to run
-    for (let i = 0; i < 200 && !readdirSync(dir).some((f) => f.startsWith("apm-smoke-")); i++) await Bun.sleep(5);
-    proc.kill("SIGTERM");
-    await proc.exited;
-    expect(readdirSync(dir).filter((f) => f.startsWith("apm-smoke-"))).toEqual([]);
+    const silent = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        open() {
+          connected.resolve();
+        },
+        data() {},
+      },
+    });
+
+    try {
+      const proc = start(`x@127.0.0.1:${silent.port}/#`);
+
+      await connected.promise;
+      expect(readdirSync(dir).filter((f) => f.startsWith("apm-smoke-"))).toHaveLength(1);
+      proc.kill("SIGTERM");
+      expect(await proc.exited).toBe(143);
+      expect(readdirSync(dir).filter((f) => f.startsWith("apm-smoke-"))).toEqual([]);
+    } finally {
+      silent.stop(true);
+    }
   });
 });
