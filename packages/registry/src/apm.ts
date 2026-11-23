@@ -81,6 +81,7 @@ import {
   splitPath,
   tagTarget,
   tarballUrl,
+  tarballVersion,
   versionOf,
   versionsOf,
   type Caller,
@@ -4107,8 +4108,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const { baseUrl } = yield* RegistryConfig;
 
     if (sp.rest[0] === "-" && sp.rest[1]) {
-      const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(sp.rest[1]);
-      const version = m?.[2];
+      const version = tarballVersion(src.name, sp.rest[1]);
 
       if (!version) return fail(404, "Not found");
 

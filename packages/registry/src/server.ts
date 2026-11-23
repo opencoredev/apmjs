@@ -70,8 +70,34 @@ export function tarballBase(name: string): string {
   return i >= 0 ? name.slice(i + 1) : name;
 }
 
+/**
+ * The version a tarball file of `name` names. `<base>-<version>.tgz` is read by its prefix: reading after the last dash
+ * took 1.0.0-0.3.7 (a valid prerelease) as 0.3.7 and served that version's bytes. A file without the prefix keeps the
+ * older reading, so links that worked before still do.
+ */
+export function tarballVersion(name: string, file: string): string | null {
+  const prefix = `${tarballBase(name)}-`;
+
+  if (file.startsWith(prefix) && file.endsWith(".tgz")) {
+    const version = file.slice(prefix.length, -".tgz".length);
+
+    if (isValidVersion(version)) return version;
+  }
+
+  return /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(file)?.[2] ?? null;
+}
+
 export function tarballUrl(base: string, name: string, version: string): string {
   return `${base}${name}/-/${tarballBase(name)}-${version}.tgz`;
+}
+
+/** A path segment decoded, or null when its escapes are malformed. */
+function decodedOrNull(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
 }
 
 /** Splits a request path into a package name and the remaining segments. */
@@ -398,6 +424,9 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     const [version, manifest] = entries[0] ?? ["", {}];
 
     if (!isValidVersion(version)) return fail(400, `Invalid version "${version}": apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
+
+    // semver ignores build metadata, so 1.0.0+a and 1.0.0+b are one version: both were stored, a version published twice
+    if (version.includes("+")) return fail(400, `Invalid version "${version}": apm does not accept build metadata (+...); versions that differ only in it are the same version.`);
     const attachment = Object.values(body._attachments)[0];
 
     if (!attachment) return fail(400, "Missing tarball");
@@ -1058,7 +1087,16 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
     if (path === "/-/whoami") return caller.kind === "user" ? json({ username: caller.user }) : fail(401, "Not logged in");
 
     if (path.startsWith("/-/user/token/") && req.method === "DELETE") {
-      if (caller.kind === "user") yield* store.revokeToken(caller.tokenHash, yield* (yield* Clock).now);
+      if (caller.kind === "user") {
+        // the token the path names is the one revoked (npm logout names its own), and only by its own account: this
+        // revoked the caller's token whatever the path named, so a leaked token stayed live behind an ok
+        const named = decodedOrNull(path.slice("/-/user/token/".length));
+        const target = named === null ? null : hashToken(named);
+        const token = target === null ? null : yield* store.getToken(target);
+
+        if (target === null || token?.user !== caller.user) return fail(404, "No such token");
+        yield* store.revokeToken(target, yield* (yield* Clock).now);
+      }
 
       return json({ ok: true });
     }
@@ -1101,10 +1139,10 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
 
     // tarball
     if (rest[0] === "-" && rest[1]) {
-      const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(rest[1]);
+      const version = tarballVersion(name, rest[1]);
 
-      if (!pkg || !m?.[2] || !isValidVersion(m[2])) return fail(404, "Not found");
-      const v = yield* versionOf(name, m[2]);
+      if (!pkg || !version || !isValidVersion(version)) return fail(404, "Not found");
+      const v = yield* versionOf(name, version);
 
       if (!v) return fail(404, "Not found");
 

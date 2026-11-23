@@ -14,7 +14,7 @@ import { confirmedAmong, confirmedText } from "./confirmed.ts";
 import { fail, json, routePath, streamedJson, streamWeight } from "./http.ts";
 import { RequestMemory } from "./memory.ts";
 import { getRouteOf } from "./routes.ts";
-import { splitPath } from "./server.ts";
+import { splitPath, tarballVersion } from "./server.ts";
 import { scoredPackage, Upstream } from "./upstream.ts";
 
 /** The header every answer made without the database carries, with why. */
@@ -99,7 +99,7 @@ export const degradedRoute = (req: Request) =>
     const confirmed = confirmedAmong(verdict.confirmed, src.versions);
 
     if (sp.rest[0] === "-" && sp.rest[1]) {
-      const version = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(sp.rest[1])?.[2];
+      const version = tarballVersion(src.name, sp.rest[1]);
 
       if (!version) return marked(fail(404, "Not found"));
 
