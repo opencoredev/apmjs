@@ -50,3 +50,14 @@ test("hundreds of name-length words are answered within the bound", async () => 
 test("a misspelled name still finds its package", async () => {
   expect((await search("search-cost-packagf-7")).names).toContain("search-cost-package-7");
 });
+
+// words that match none of these packages, by name, text or one edit
+const fillers = (n: number): string[] => Array.from({ length: n }, (_, i) => `zq${i}`);
+
+test("the 16th distinct word is ranked, the 17th is not, and a repeated word takes one place", async () => {
+  const target = "search-cost-package-7";
+
+  expect((await search([...fillers(15), target].join(" "))).names).toContain(target);
+  expect((await search([...fillers(16), target].join(" "))).names).not.toContain(target);
+  expect((await search([...Array.from({ length: 30 }, () => "zq0"), ...fillers(15).slice(1), target].join(" "))).names).toContain(target);
+});
