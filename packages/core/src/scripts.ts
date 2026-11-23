@@ -41,30 +41,31 @@ const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
-const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?$/;
+const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
+const NEXT_WORD = /\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
 
 /**
- * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `nodejs -e`, `deno eval`. One pass over its
- * words: a word that starts with `-` is a flag and never starts a match, so `--conditions=node` repeated cannot make
- * each one rescan the flags after it (a regex did, in time quadratic in the script).
+ * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
+ * may start anywhere a word boundary is, as in the regex this replaces; its flags are then read a word at a time and the
+ * search goes on after the last one, so no byte is read twice: `--conditions=node` repeated cannot make each one rescan
+ * the flags after it (the regex did, in time quadratic in the script), and no list of a long command's words is built.
  */
 function inlineEval(cmd: string): boolean {
-  const words = cmd.split(/\s+/);
+  const interpreter = new RegExp(INTERPRETER);
+  const word = new RegExp(NEXT_WORD);
 
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i] ?? "";
+  for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
+    word.lastIndex = m.index + m[0].length;
 
-    if (w.startsWith("-") || !INTERPRETER.test(w)) continue;
+    for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
+      const flag = w[1] ?? "";
 
-    for (let j = i + 1; j < words.length; j++) {
-      const f = words[j] ?? "";
+      if (EVAL_FLAG.test(flag)) return true;
 
-      if (EVAL_FLAG.test(f)) return true;
-
-      if (!OTHER_FLAG.test(f)) break;
-      i = j;
+      if (!OTHER_FLAG.test(flag)) break;
+      interpreter.lastIndex = word.lastIndex;
     }
   }
 

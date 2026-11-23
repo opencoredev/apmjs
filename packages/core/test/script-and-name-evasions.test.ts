@@ -59,8 +59,8 @@ describe("node's inline-eval flag is recognised after other flags", () => {
   const code = "\"require('https').get('https://example.invalid/x')\"";
   const plain = scoreOf({ scripts: { postinstall: `node -e ${code}` } }, {});
 
-  for (const cmd of [`node --no-warnings -e ${code}`, `node -pe ${code}`, `node --input-type=module -e ${code}`, `nodejs -e ${code}`]) {
-    test(cmd.slice(0, 30), () => {
+  for (const cmd of [`node --no-warnings -e ${code}`, `node -pe ${code}`, `node --input-type=module -e ${code}`, `nodejs -e ${code}`, `echo --result=$(node -e ${code})`, `echo "$(node --no-warnings -e ${code})"`]) {
+    test(cmd.slice(0, 40), () => {
       expect(scoreOf({ scripts: { postinstall: cmd } }, {}).score).toBe(plain.score);
     });
   }
@@ -69,7 +69,7 @@ describe("node's inline-eval flag is recognised after other flags", () => {
 describe("the flags a command may carry are read in linear time", () => {
   // each flag has one reading (`--a` is never `-` then `-a`), or a run of them that never matches backtracks exponentially;
   // and a flag value that names an interpreter (`--conditions=node`) must not start a fresh scan of the flags after it
-  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`, `node ${"--conditions=node ".repeat(16000)}x`, `npm ${"--c=npm ".repeat(16000)}x`]) {
+  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`, `node ${"--conditions=node ".repeat(16000)}x`, `npm ${"--c=npm ".repeat(16000)}x`, `echo ${"a ".repeat(4_000_000)}`, `node ${"--a ".repeat(1_000_000)}x`]) {
     test(`${cmd.slice(0, 24)} (${cmd.length} chars)`, () => {
       const started = performance.now();
 
