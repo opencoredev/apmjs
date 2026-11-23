@@ -47,9 +47,14 @@ export class DailyBudget {
 
   /** Whether another review fits in what is left of today's budget. */
   canStart(): boolean {
+    return this.reviewsThatFit() >= 1;
+  }
+
+  /** How many more reviews fit in what is left of today's budget, each reserving RESERVE_PER_REVIEW. */
+  reviewsThatFit(): number {
     this.roll();
 
-    return this.used + RESERVE_PER_REVIEW <= this.limit;
+    return Math.max(0, Math.floor((this.limit - this.used) / RESERVE_PER_REVIEW));
   }
 
   spend(tokens: number): void {

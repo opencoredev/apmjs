@@ -85,14 +85,25 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
   const ids = { job: job.id, name: job.name, version: job.version };
 
   deps.log("info", "job.start", { ...ids, reasons: job.reasons.join(","), previous: job.previous?.version ?? null });
+  // counted per answer, so a review that throws after an attempt still charges the tokens that attempt used
+  let tokens = 0;
+  let spent = false;
+
+  const ask: typeof deps.model.ask = async (messages) => {
+    const answer = await deps.model.ask(messages);
+
+    tokens += answer.usage.promptTokens + answer.usage.completionTokens;
+
+    return answer;
+  };
 
   try {
     const pkg = packageFilesOf(await deps.registry.tarball(job));
     const previous = await loadPrevious(deps, job);
     const review = buildReviewInput({ name: job.name, version: job.version, pkg, previous, budgetTokens: deps.budgetTokens });
-    const run = await runReview({ review, pkg, ask: deps.model.ask });
-    const tokens = run.attempts.reduce((n, a) => n + a.usage.promptTokens + a.usage.completionTokens, 0);
+    const run = await runReview({ review, pkg, ask });
 
+    spent = true;
     deps.budget.spend(tokens);
     let secondOpinion: ReviewResult["secondOpinion"] = null;
 
@@ -120,6 +131,7 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
 
     return "posted";
   } catch (cause) {
+    if (!spent && tokens > 0) deps.budget.spend(tokens);
     const retryable = cause instanceof ModelUnavailable || (cause instanceof RegistryError && cause.retryable);
     const why = cause instanceof Error ? cause.message : String(cause);
 
@@ -140,8 +152,10 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
 
 /** Leases as many jobs as there are free slots and reviews them. Returns how many jobs it took. */
 export async function runOnce(deps: WorkerDeps, slots: number): Promise<number> {
-  if (!deps.budget.canStart()) return 0;
-  const jobs = await deps.registry.lease(slots);
+  const fit = Math.min(slots, deps.budget.reviewsThatFit());
+
+  if (fit <= 0) return 0;
+  const jobs = await deps.registry.lease(fit);
 
   await Promise.all(jobs.map((j) => processJob(deps, j)));
 
@@ -176,7 +190,10 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
     });
 
   while (!deps.signal.aborted) {
-    if (!deps.budget.canStart()) {
+    // jobs in flight have not spent yet, so each holds a reservation against what is left
+    const fit = deps.budget.reviewsThatFit() - inflight.size;
+
+    if (fit <= 0 && inflight.size === 0) {
       if (!budgetNoted) deps.log("warn", "budget.exhausted", { usedToday: deps.budget.usedToday(), limit: deps.budget.limit, resumesInMs: deps.budget.msUntilReset() });
       budgetNoted = true;
       await pause(Math.min(deps.budget.msUntilReset() + 1000, 10 * 60_000));
@@ -184,7 +201,7 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
     }
 
     budgetNoted = false;
-    const free = deps.concurrency - inflight.size;
+    const free = Math.min(deps.concurrency - inflight.size, fit);
 
     if (free <= 0) {
       await Promise.race(inflight);
