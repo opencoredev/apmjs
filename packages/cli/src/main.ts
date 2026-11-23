@@ -2295,7 +2295,8 @@ const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain"
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const args = a.raw.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm");
+  // apm's --pm, as `--pm x` or `--pm=x`, is not the package manager's
+  const args = a.raw.filter((x, i, arr) => x !== "--pm" && !x.startsWith("--pm=") && arr[i - 1] !== "--pm");
 
   return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }

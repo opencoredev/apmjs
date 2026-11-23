@@ -4,7 +4,7 @@
 import { splitXArgs } from "./xargs.ts";
 
 /** The flags of every apm command that take the next argument as their value. */
-export const VALUE_FLAGS: ReadonlySet<string> = new Set(["pm", "omit", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp"]);
+export const VALUE_FLAGS: ReadonlySet<string> = new Set(["pm", "omit", "reason", "username", "email", "bump", "tag", "since", "cooldown", "floor", "password", "otp", "size"]);
 
 /** The other names of `apm x`. */
 export const X_ALIASES: ReadonlySet<string> = new Set(["x", "exec", "dlx"]);
