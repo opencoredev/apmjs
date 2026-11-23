@@ -1,5 +1,5 @@
-// Semver ignores build metadata, so 1.0.0+a and 1.0.0+b are the same version; both were stored, which is a version
-// published twice with different bytes. apm accepts strict semver without build metadata.
+// Semver ignores build metadata, so 1.0.0+a, 1.0.0+b and 1.0.0 are the same version. The database key compares the
+// whole text, so each was stored with its own bytes: one version published several times.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { addUser, putPublish, startRegistry, type Registry } from "../../../tests/acceptance/harness";
 
@@ -15,8 +15,10 @@ afterAll(async () => {
   await reg.stop();
 });
 
-test("a version with build metadata is refused, so 1.0.0+b cannot follow 1.0.0+a", async () => {
-  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0+a" })).status).toBe(400);
-  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0+b" })).status).toBe(400);
-  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0" })).status).toBe(201);
+test("a version equal to a published one but for build metadata is refused", async () => {
+  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0+a" })).status).toBe(201);
+  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0+b" })).status).toBe(409);
+  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.0" })).status).toBe(409);
+  // a different version still publishes
+  expect((await putPublish(reg, token, { name: "build-meta", version: "1.0.1" })).status).toBe(201);
 });

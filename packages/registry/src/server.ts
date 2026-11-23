@@ -424,9 +424,6 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     const [version, manifest] = entries[0] ?? ["", {}];
 
     if (!isValidVersion(version)) return fail(400, `Invalid version "${version}": apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
-
-    // semver ignores build metadata, so 1.0.0+a and 1.0.0+b are one version: both were stored, a version published twice
-    if (version.includes("+")) return fail(400, `Invalid version "${version}": apm does not accept build metadata (+...); versions that differ only in it are the same version.`);
     const attachment = Object.values(body._attachments)[0];
 
     if (!attachment) return fail(400, "Missing tarball");
@@ -723,6 +720,14 @@ export const commitVersion = (v: {
 
           if (!owners.includes(v.publisher)) return yield* Effect.fail(refuse(403, `You do not have permission to publish "${v.name}". Owners: ${owners.join(", ")}`));
         }
+
+        // semver ignores build metadata, so 1.0.0+a, 1.0.0+b and 1.0.0 are one version; the database key compares the
+        // whole text, so each was stored with its own bytes. Checked under the package's lock, for approvals too.
+        const core = (version: string): string => version.split("+")[0] ?? version;
+        const heads = (yield* store.localHeadsOf([v.name])).get(v.name)?.heads ?? [];
+        const same = heads.find((h) => h.version !== v.version && core(h.version) === core(v.version));
+
+        if (same) return yield* Effect.fail(refuse(409, `Cannot publish ${v.name}@${v.version}: ${same.version} is the same version (semver ignores build metadata). Versions are immutable; bump the version.`));
 
         const inserted = yield* store.insertVersion({
           package: v.name,

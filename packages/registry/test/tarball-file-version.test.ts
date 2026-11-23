@@ -3,6 +3,7 @@
 // another version's bytes and checked that version's status, for apm's own packages and for npm's.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { encodePkg, putPublish, startRegistry, type Registry } from "../../../tests/acceptance/harness";
+import { tarballVersion } from "../src/server.ts";
 
 const VERSIONS = [
   ["0.3.7", "module.exports = 'plain';\n"],
@@ -56,4 +57,18 @@ test("an npm package: pkg-1.0.0-0.3.7.tgz serves 1.0.0-0.3.7, not 0.3.7", async 
   const pre = await tgz(reg, "upstream-dash", "1.0.0-0.3.7");
 
   expect(pre.equals(expected)).toBe(true);
+});
+
+// the one reading the local route (server.ts), npm's (apm.ts, upstreamRoute) and the database-down route (degraded.ts)
+// share; the end-to-end tests above reach the local route, and npm's through fastTarball or the local route upstream
+test.each([
+  ["pkg", "pkg-1.0.0-0.3.7.tgz", "1.0.0-0.3.7"],
+  ["pkg", "pkg-0.3.7.tgz", "0.3.7"],
+  ["@scope/pkg", "pkg-2.0.0-rc.1.tgz", "2.0.0-rc.1"],
+  ["my-pkg-1", "my-pkg-1-1.0.0-1.2.3.tgz", "1.0.0-1.2.3"],
+  // a file without the package's prefix keeps the older reading
+  ["pkg", "other-1.0.0.tgz", "1.0.0"],
+  ["pkg", "pkg-latest.tgz", null],
+] as const)("tarballVersion(%p, %p) is %p", (name, file, expected) => {
+  expect(tarballVersion(name, file)).toBe(expected);
 });

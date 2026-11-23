@@ -355,14 +355,15 @@ const enqueue = (job: { name: string; version: string; digest: string; source: S
     );
   });
 
-const setJobState = (id: string, state: JobState, error: string | null, options: { refundAttempt: boolean } = { refundAttempt: false }) =>
+const setJobState = (id: string, state: JobState, error: string | null, options: { deferred: boolean } = { deferred: false }) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const at = yield* (yield* Clock).now;
-    const refund = options.refundAttempt ? 1 : 0;
     yield* query(
       "setJobState",
-      sql`UPDATE review_jobs SET state = ${state}, lease_id = NULL, lease_expires_at = NULL, last_error = ${error}, attempts = GREATEST(attempts - ${refund}, 0), updated_at = ${at} WHERE id = ${id}`,
+      options.deferred
+        ? sql`UPDATE review_jobs SET state = ${state}, lease_id = NULL, lease_expires_at = NULL, last_error = ${error}, attempts = GREATEST(attempts - 1, 0), enqueued_at = ${at}, updated_at = ${at} WHERE id = ${id}`
+        : sql`UPDATE review_jobs SET state = ${state}, lease_id = NULL, lease_expires_at = NULL, last_error = ${error}, updated_at = ${at} WHERE id = ${id}`,
       none,
     );
   });
@@ -986,8 +987,9 @@ const leaseResponse = (url: URL, settings: ReviewSettings) =>
           break;
         case "later":
           // not the job's failure (npm could not be asked): its lease gives back the attempt it took, or polls during
-          // an outage used up maxAttempts and failed the job before a reviewer saw it
-          yield* setJobState(row.id, "queued", p.why, { refundAttempt: true });
+          // an outage used up maxAttempts and failed the job before a reviewer saw it; and it goes to the back of its
+          // priority, so jobs npm cannot answer do not hold the front of the queue
+          yield* setJobState(row.id, "queued", p.why, { deferred: true });
           break;
         default: {
           const _exhaustive: never = p;
