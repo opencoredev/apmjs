@@ -42,7 +42,9 @@ const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
-const NEXT_WORD = /\s+(\S+)/y;
+
+// starts only after a non-space, as the sticky walk always does, so a search over a run of whitespace is linear too
+const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
 
