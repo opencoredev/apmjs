@@ -1101,10 +1101,11 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
 
     // tarball
     if (rest[0] === "-" && rest[1]) {
-      const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(rest[1]);
+      const prefix = `${tarballBase(name)}-`;
+      const tgzVersion = rest[1].startsWith(prefix) && rest[1].endsWith(".tgz") ? rest[1].slice(prefix.length, -".tgz".length) : "";
 
-      if (!pkg || !m?.[2] || !isValidVersion(m[2])) return fail(404, "Not found");
-      const v = yield* versionOf(name, m[2]);
+      if (!pkg || !isValidVersion(tgzVersion)) return fail(404, "Not found");
+      const v = yield* versionOf(name, tgzVersion);
 
       if (!v) return fail(404, "Not found");
 
