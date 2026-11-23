@@ -20,6 +20,7 @@ type Value =
   | { k: "num"; v: number }
   | { k: "bool"; v: boolean }
   | { k: "nothing" }
+  | { k: "null" }
   | { k: "list"; v: Value[] }
   | { k: "fn"; node: AnyNode; env: Env }
   | { k: "bytes"; latin1: string }
@@ -44,6 +45,7 @@ const MAX_CALL_DEPTH = 4;
 const MAX_REGEX_WIDTH = 64;
 
 const NOTHING: Value = { k: "nothing" };
+const NULL: Value = { k: "null" };
 
 /** The program does something the decoder does not run. */
 class Unsupported extends Error {}
@@ -256,9 +258,11 @@ function text(v: Value): string {
       return String(v.v);
     case "nothing":
       return "undefined";
+    case "null":
+      return "null";
     case "list":
       return joined(
-        v.v.map((x) => (x.k === "nothing" ? "" : text(x))),
+        v.v.map((x) => (x.k === "nothing" || x.k === "null" ? "" : text(x))),
         ",",
       );
     case "bytes":
@@ -280,6 +284,8 @@ function number(v: Value): number {
   if (v.k === "num") return v.v;
 
   if (v.k === "str" || v.k === "bool") return Number(v.v);
+
+  if (v.k === "null") return 0;
   throw new Unsupported();
 }
 
@@ -292,6 +298,7 @@ function truthy(v: Value): boolean {
     case "bool":
       return v.v;
     case "nothing":
+    case "null":
       return false;
     default:
       return true;
@@ -342,7 +349,9 @@ function literal(n: Extract<AnyNode, { type: "Literal" }>): Value {
 
   if (raw === "true" || raw === "false") return { k: "bool", v: raw === "true" };
 
-  if (raw === "null" || ("bigint" in n && n.bigint)) return NOTHING;
+  if (raw === "null") return NULL;
+
+  if ("bigint" in n && n.bigint) return NOTHING;
 
   return num(Number(n.value));
 }
@@ -441,10 +450,16 @@ function evaluate(n: AnyNode, env: Env, state: State): Value {
   }
 }
 
+/** Whether `+` adds `v` as a number, as JavaScript does when neither side is a string or an object. */
+const addsAsNumber = (v: Value): boolean => v.k === "num" || v.k === "bool" || v.k === "null" || v.k === "nothing";
+
 function binary(op: string, a: Value, b: Value): Value {
   switch (op) {
     case "+":
-      return a.k === "num" && b.k === "num" ? num(a.v + b.v) : capped(text(a) + text(b));
+      // `true + 1` is 2 and `null + 1` is 1, as JavaScript adds them; undefined adds as NaN
+      if (addsAsNumber(a) && addsAsNumber(b)) return num((a.k === "nothing" ? Number.NaN : number(a)) + (b.k === "nothing" ? Number.NaN : number(b)));
+
+      return capped(text(a) + text(b));
     case "-":
       return num(number(a) - number(b));
     case "*":
@@ -543,7 +558,8 @@ function callExpr(n: CallExpression, env: Env, state: State): Value {
       case "parseInt":
         work(text(a0).length);
 
-        return num(Number.parseInt(text(a0), a1 === undefined ? 10 : number(a1)));
+        // no radix (or undefined) lets parseInt read a `0x` prefix as hex, as JavaScript does
+        return num(Number.parseInt(text(a0), a1 === undefined || a1.k === "nothing" ? undefined : number(a1)));
       case "Number":
         return num(number(a0));
       case "String":
@@ -678,7 +694,7 @@ function arrayMethod(arr: Value[], method: string, a: readonly Value[], state: S
 
       return str(
         joined(
-          arr.map((x) => (x.k === "nothing" ? "" : text(x))),
+          arr.map((x) => (x.k === "nothing" || x.k === "null" ? "" : text(x))),
           sep === undefined || sep.k === "nothing" ? "," : text(sep),
         ),
       );
