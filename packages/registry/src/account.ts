@@ -463,13 +463,13 @@ export const accountRoute = (req: Request, url: URL) =>
       }
 
       // The decision and the version land together: of two approvals racing, one commits and the other gets a 409.
-      const tag = yield* store.tx(
+      yield* store.tx(
         Effect.gen(function* () {
           if (!(yield* store.decideStaged(id, { status: "approved", at, by: user }))) {
             return yield* Effect.fail(refuse(409, `${row.package}@${row.version} was already decided.`));
           }
 
-          return yield* commitVersion({
+          yield* commitVersion({
             name: row.package,
             version: row.version,
             manifest: row.manifest,
@@ -487,8 +487,7 @@ export const accountRoute = (req: Request, url: URL) =>
         }),
       );
 
-      // the dist-tag that names the version now (commitVersion): null for a backport, which left latest where it was
-      return json({ ok: true, status: "approved", package: row.package, version: row.version, tag });
+      return json({ ok: true, status: "approved", package: row.package, version: row.version });
     }
 
     return null;

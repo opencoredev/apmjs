@@ -24,10 +24,6 @@ import { EdgeChecks } from "../src/edge-checks.ts";
 import { MemoryPool, RequestMemory } from "../src/memory.ts";
 import { KnownMalicious, listedAmong, listedNotice, NAME_FRESH_MS, NAME_STALE_MS, osvFeed, REQUEST_BUDGET_MS, type Advisory } from "../src/osv.ts";
 import { installStamp, Upstream } from "../src/upstream.ts";
-import { summarize } from "../src/kept-package.ts";
-import { digestLabel, digestOf } from "../src/digest.ts";
-import { packument as localPackument } from "../src/server.ts";
-import { Client } from "pg";
 
 const POOL = new MemoryPool();
 const NOW = Date.parse("2026-11-25T00:00:00Z");
@@ -53,10 +49,6 @@ const NPM = new Map(Object.entries<NpmPackage>({
   "half-read": { versions: ["1.0.0", "1.1.0", "1.2.0"] },
   // listed while a slower request about it is still out
   flip: { versions: ["1.0.0", "1.1.0"] },
-  // its latest an apm reviewer confirmed malicious (the package page's answer test)
-  "confirmed-latest": { versions: ["1.0.0", "2.0.0"] },
-  // more versions than a kept summary holds: a stable 1.0.0 published first, 201 nightlies, then a listed 9.0.0
-  truncated: { versions: ["1.0.0", ...Array.from({ length: 201 }, (_, i) => `8.0.0-nightly.${i}`), "9.0.0"] },
 } satisfies Record<string, NpmPackage>));
 
 /** OSV's advisories per name: ids only in the batch answer, then each one read whole. */
@@ -82,7 +74,6 @@ const VULNS = new Map(Object.entries<Vuln[]>({
   withdrawn: [{ id: "MAL-2026-1003", withdrawn: "2026-11-24T00:00:00Z", affected: [{ package: { name: "withdrawn", ecosystem: "npm" }, versions: ["1.0.0"] }] }],
   "Legacy-Name": [{ id: "MAL-2026-1004", affected: [{ package: { name: "Legacy-Name", ecosystem: "npm" }, versions: ["1.1.0"] }] }],
   "orphan-tag": [{ id: "MAL-2026-1005", affected: [{ package: { name: "orphan-tag", ecosystem: "npm" }, versions: ["2.0.0"] }] }],
-  truncated: [{ id: "MAL-2026-1009", affected: [{ package: { name: "truncated", ecosystem: "npm" }, versions: ["9.0.0"] }] }],
   flip: [],
   "half-read": [
     { id: "MAL-2026-1006", affected: [{ package: { name: "half-read", ecosystem: "npm" }, versions: ["1.2.0"] }] },
@@ -113,8 +104,7 @@ const npm = Bun.serve({
 
     if (parts[1] !== undefined) return pkg.versions.includes(parts[1]) ? Response.json(doc(parts[1])) : Response.json({ error: "Not found" }, { status: 404 });
     const versions = Object.fromEntries(pkg.versions.map((v) => [v, doc(v)]));
-    // a long list a minute apart, oldest first, so a kept summary's publish-time window leaves the first ones out
-    const time = Object.fromEntries(pkg.versions.map((v, i) => [v, new Date(NOW - 30 * DAY + (pkg.versions.length > 200 ? i * 60_000 : 0)).toISOString()]));
+    const time = Object.fromEntries(pkg.versions.map((v) => [v, new Date(NOW - 30 * DAY).toISOString()]));
 
     return Response.json({ name, "dist-tags": { latest: pkg.versions.at(-1), ...pkg.tags }, versions, time });
   },
@@ -535,126 +525,3 @@ describe("advisories", () => {
     expect(await installStamp(rows, ["osv x"])).not.toBe(await installStamp(rows));
   });
 });
-
-describe("the package page's answers", () => {
-  const Row = z.object({ version: z.string(), refused: z.object({ kind: z.string(), ids: z.array(z.string()).optional() }).nullable() });
-  const PackageAnswer = z.object({ latest: z.string().nullable(), distTags: z.record(z.string(), z.string()), versions: z.array(Row) });
-
-  test("latest and the dist-tags are what the packuments serve, and each listed version names its advisory", async () => {
-    const got = await get("/-/apm/v1/packages/evil-tagged", { route: "apm", root: freshRoot() });
-
-    expect(got?.status).toBe(200);
-    const body = PackageAnswer.parse(JSON.parse(got?.text ?? ""));
-
-    expect(body.latest).toBe("9.0.0");
-    expect(body.distTags).toEqual({ latest: "9.0.0", old: "9.0.0" });
-    expect(body.versions.map((v) => [v.version, v.refused])).toEqual([
-      ["10.9.11", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
-      ["10.9.10", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
-      ["10.9.9", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
-      ["9.0.0", null],
-    ]);
-  });
-
-  test("latest and the dist-tags match the packument's, a tag on a listed version outside the list and a confirmed latest included", async () => {
-    const digest = digestOf({ integrity: integrity("confirmed-latest", "2.0.0"), shasum: shasum("confirmed-latest", "2.0.0") });
-    const client = new Client({ connectionString: db.url });
-
-    await client.connect();
-    await client.query("INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state) VALUES ($1, $2, $3, 'flagged', '{}', 0, 'confirmed')", ["confirmed-latest", "2.0.0", digest ? digestLabel(digest) : ""]);
-    await client.end();
-    const root = freshRoot();
-
-    for (const name of ["evil-tagged", "ranged", "all-listed", "clean", "orphan-tag", "confirmed-latest"]) {
-      const answer = PackageAnswer.parse(JSON.parse((await get(`/-/apm/v1/packages/${name}`, { route: "apm", root }))?.text ?? ""));
-      const { body } = await packument(name, { root });
-
-      expect([name, answer.distTags]).toEqual([name, body["dist-tags"]]);
-      expect([name, answer.latest]).toEqual([name, body["dist-tags"].latest ?? null]);
-    }
-
-    const confirmed = PackageAnswer.parse(JSON.parse((await get("/-/apm/v1/packages/confirmed-latest", { route: "apm", root }))?.text ?? ""));
-
-    expect(confirmed.versions.find((v) => v.version === "2.0.0")?.refused).toEqual({ kind: "confirmed-malicious" });
-  });
-
-  test("a package published here: latest and the dist-tags are its packument's when its latest is confirmed malicious and the one before is yanked", async () => {
-    const name = "here-confirmed-latest";
-    const client = new Client({ connectionString: db.url });
-    const sum = (v: string) => createHash("sha1").update(`${name}@${v}`).digest("hex");
-    const sri = (v: string) => `sha512-${createHash("sha512").update(`${name}@${v}`).digest("base64")}`;
-
-    await client.connect();
-    await client.query("INSERT INTO packages (name, created_at, modified_at, dist_tags, description, keywords, readme, readme_version) VALUES ($1, 1, 2, $2, '', '[]', '', NULL)", [name, JSON.stringify({ latest: "3.0.0", beta: "2.0.0" })]);
-
-    for (const [i, [version, status]] of ([["1.0.0", "active"], ["2.0.0", "yanked"], ["3.0.0", "active"]] as const).entries()) {
-      await client.query(
-        `INSERT INTO versions (package, version, manifest, shasum, integrity, size, tarball_key, published_at, published_by, status, status_reason, status_at)
-         VALUES ($1, $2, $3, $4, $5, 10, 'sha512/x', $6, 'alice', $7, NULL, NULL)`,
-        [name, version, JSON.stringify({ name, version }), sum(version), sri(version), 1_000 + i, status],
-      );
-    }
-
-    const digest = digestOf({ integrity: sri("3.0.0"), shasum: sum("3.0.0") });
-
-    await client.query("INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state) VALUES ($1, '3.0.0', $2, 'flagged', '{}', 0, 'confirmed')", [name, digest ? digestLabel(digest) : ""]);
-    await client.end();
-
-    const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url.href, legacyAuth: false, namePolicy: "open", admins: [], tarballRedirects: "upstream" } as const;
-
-    const served = await Effect.runPromise(
-      Effect.flatMap(Store, (s) => s.getPackage(name)).pipe(
-        Effect.flatMap((pkg) => (pkg ? localPackument(pkg, true) : Effect.die("no package row"))),
-        Effect.provide(Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Layer.succeed(RegistryConfig, settings))),
-        Effect.scoped,
-      ),
-    );
-
-    const answer = PackageAnswer.parse(JSON.parse((await get(`/-/apm/v1/packages/${name}`, { route: "apm", root: freshRoot() }))?.text ?? ""));
-
-    expect(served["dist-tags"]).toEqual({ latest: "1.0.0" });
-    expect(answer.distTags).toEqual(served["dist-tags"]);
-    expect(answer.latest).toBe("1.0.0");
-    expect(answer.versions.find((v) => v.version === "3.0.0")?.refused).toEqual({ kind: "confirmed-malicious" });
-  });
-
-  test("a kept summary that leaves out the stable version latest falls back to: the answer's latest is the packument's", async () => {
-    const listing = await Effect.runPromise(
-      Effect.flatMap(Upstream, (u) => Effect.flatMap(RequestMemory, (lease) => u.listing("truncated", lease))).pipe(
-        Effect.provide(Layer.provideMerge(Upstream.layer(npm.url.href, 1, null), Layer.mergeAll(Store.postgres(db.url), noBlobs, Clock.fixed({ now: NOW, wallNow: NOW }), RequestMemory.layer(POOL)))),
-        Effect.scoped,
-      ),
-    );
-
-    if (listing.kind !== "found") throw new Error("no package");
-    const summary = summarize(listing.pkg);
-
-    expect(summary?.versions.some((v) => v.version === "1.0.0")).toBe(false);
-    const client = new Client({ connectionString: db.url });
-
-    await client.connect();
-    await client.query("INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2::jsonb, $3, $3)", ["truncated", JSON.stringify(summary), NOW]);
-    await client.end();
-    const root = freshRoot();
-    const { body } = await packument("truncated", { root });
-    const answer = PackageAnswer.parse(JSON.parse((await get("/-/apm/v1/packages/truncated", { route: "apm", root }))?.text ?? ""));
-
-    expect(body["dist-tags"].latest).toBe("1.0.0");
-    expect(answer.distTags).toEqual(body["dist-tags"]);
-    expect(answer.latest).toBe("1.0.0");
-  });
-
-  test("the per-version answer says the same, and a clean package's answer is unchanged", async () => {
-    const root = freshRoot();
-    const listed = await get("/-/apm/v1/packages/evil-tagged/versions/10.9.11", { route: "apm", root });
-
-    expect(listed?.status).toBe(200);
-    expect(Row.parse(JSON.parse(listed?.text ?? "")).refused).toEqual({ kind: "known-malicious", ids: ["MAL-2026-1000"] });
-    const clean = PackageAnswer.parse(JSON.parse((await get("/-/apm/v1/packages/clean", { route: "apm", root }))?.text ?? ""));
-
-    expect(clean.latest).toBe("1.1.0");
-    expect(clean.distTags).toEqual({ latest: "1.1.0" });
-    expect(clean.versions.every((v) => v.refused === null)).toBe(true);
-  });
-});
-

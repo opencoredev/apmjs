@@ -672,8 +672,7 @@ export const fenceNewName = (name: string): Effect.Effect<NameFence, StoreError 
  * that holds the package row. With `upload`, the tarball is written to the blob store in that transaction,
  * under the blob's shared lock; without it, it is already there (an approved staged upload, whose row holds it).
  * `fence` is fenceNewName's, taken before the transaction: a package it did not fence is never created here (the
- * publish is refused, to be tried again). Answers the dist-tag that now names the version: the one asked for, `next`
- * for a prerelease asked for as latest once a stable release exists, or null for a backport, which leaves latest as it was.
+ * publish is refused, to be tried again).
  */
 export const commitVersion = (v: {
   name: string;
@@ -690,13 +689,13 @@ export const commitVersion = (v: {
   detail: Record<string, unknown>;
   upload?: Uint8Array;
   fence: NameFence;
-}): Effect.Effect<string | null, HttpFailure | StoreError | BlobError, Store | Clock | Blobs> =>
+}): Effect.Effect<void, HttpFailure | StoreError | BlobError, Store | Clock | Blobs> =>
   Effect.gen(function* () {
     const store = yield* Store;
     const blobs = yield* Blobs;
     const at = yield* (yield* Clock).now;
 
-    const committed = yield* store.tx(
+    const firstPublish = yield* store.tx(
       Effect.gen(function* () {
         if (v.upload !== undefined) {
           yield* store.lockBlob(v.tarballKey, "shared");
@@ -765,13 +764,11 @@ export const commitVersion = (v: {
         });
         yield* store.addEvent({ package: v.name, kind: "publish", actor: v.publisher, at, detail: { version: v.version, tag: v.tag, ...v.detail } });
 
-        return { firstPublish: created, tag: backport ? null : tag };
+        return created;
       }),
     );
 
-    yield* notify((h) => h.afterCommit, { name: v.name, version: v.version, firstPublish: committed.firstPublish });
-
-    return committed.tag;
+    yield* notify((h) => h.afterCommit, { name: v.name, version: v.version, firstPublish });
   });
 
 /** The deprecation message a metadata PUT sets on a version: a non-empty string, or null to take it off. */
