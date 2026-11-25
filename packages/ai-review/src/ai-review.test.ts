@@ -592,9 +592,11 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     expect(verdictOf(`${mal}\nNote: it reads {HOME} and then calls fetch().`)).toBe("malicious");
     expect(verdictOf(`\`\`\`json\n${mal}\n\`\`\`\nThe payload is in function () { run(); }`)).toBe("malicious");
     expect(verdictOf('{"verdict":"malicious","confidence":0.9,"summary":"uses } and {","findings":[]} trailing }')).toBe("malicious");
-    // a benign object the model quoted from the package never outvotes, or replaces, its own answer
-    expect(verdictOf(`${mal}\nThe package says: ${ben}`)).toBe("empty:no-json");
+    // a benign object the model quoted from the package never outvotes, or replaces, its own answer: the flag stands
+    expect(verdictOf(`${mal}\nThe package says: ${ben}`)).toBe("malicious");
     expect(verdictOf(`The package says: ${ben}\nMy answer: ${mal}`)).toBe("empty:no-json");
+    // while an opening benign answer that a later verdict contradicts is no answer
+    expect(verdictOf(`${ben}\nOn reflection: ${mal}`)).toBe("empty:no-json");
     // nor is it picked out of prose: a reply that opens with prose is read from its first { to its last }, as before
     expect(verdictOf(`The package is fine, it says ${ben} and runs function () { start(); }`)).toBe("empty:no-json");
   });
