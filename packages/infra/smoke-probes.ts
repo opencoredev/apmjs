@@ -25,7 +25,8 @@ export const LARGE = { name: "next", version: "16.4.6" } as const;
 /** OSV MAL-2026-20430 lists ugent_uws 10.9.9 to 10.9.11; npm still serves them, 10.9.11 as latest, beside a clean 9.0.0. */
 export const OSSF_LISTED = { name: "ugent_uws", version: "10.9.11", id: "MAL-2026-20430" } as const;
 
-export type Got<T> = { status: number | null; media: string | null; text: string; data: T | null };
+/** failure: why there is no usable answer, a transport failure (none in time, or the connection failed) or one over BODY_CAP. */
+export type Got<T> = { status: number | null; media: string | null; text: string; data: T | null; failure: "transport" | "over-cap" | null };
 
 function parsed<T>(schema: z.ZodType<T>, text: string): T | null {
   try {
@@ -67,7 +68,7 @@ export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutM
         if (size > BODY_CAP) {
           await body.cancel();
 
-          return { status: null, media, text: `the answer is over ${BODY_CAP} bytes`, data: null };
+          return { status: null, media, text: `the answer is over ${BODY_CAP} bytes`, data: null, failure: "over-cap" };
         }
 
         chunks.push(next.value);
@@ -76,11 +77,11 @@ export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutM
 
     const text = new TextDecoder().decode(Buffer.concat(chunks));
 
-    return { status: res.status, media, text, data: parsed(input.schema, text) };
+    return { status: res.status, media, text, data: parsed(input.schema, text), failure: null };
   } catch (e) {
     await cancel?.().catch(() => undefined);
 
-    return { status: null, media: null, text: e instanceof Error ? e.message : String(e), data: null };
+    return { status: null, media: null, text: e instanceof Error ? e.message : String(e), data: null, failure: "transport" };
   }
 }
 
@@ -99,9 +100,12 @@ const Explained = z.object({
 
 type Explanation = z.infer<typeof Explained>;
 
-/** An answer worth asking again: rate-limited, a server error, apm could not say, or the version is still being analysed. */
+/**
+ * An answer worth asking again: none in time or a failed connection, rate-limited, a server error, apm could not say, or
+ * the version is still being analysed. An answer over the cap is not: asking again would read as much.
+ */
 function transient(got: Got<Explanation>): boolean {
-  if (got.status === 429 || (got.status !== null && got.status >= 500)) return true;
+  if (got.failure === "transport" || got.status === 429 || (got.status !== null && got.status >= 500)) return true;
 
   return got.data !== null && (got.data.verdict === "unknown" || got.data.notes.some((n) => n.kind === "not-scored" && /still analysing/.test(n.text)));
 }
@@ -165,7 +169,7 @@ export async function ossfListed(deps: ProbeDeps): Promise<Check[]> {
     const listed = p ? Object.keys(p.versions) : [];
     const valid = p ? listed.filter((v) => SEMVER.test(v) && p.versions[v]?.version === v) : [];
     const latest = p?.["dist-tags"].latest;
-    const ok = r.status === 200 && r.media === accept && p?.name === name && !listed.includes(version) && valid.length > 0 && latest !== undefined && listed.includes(latest);
+    const ok = r.status === 200 && r.media === accept && p?.name === name && !listed.includes(version) && valid.length > 0 && latest !== undefined && valid.includes(latest);
 
     out.push({ ok, name: `the registry's ${view} packument of ${name} withholds ${version}: not in versions, not latest`, detail: p ? `${r.media ?? "no media type"}, name ${p.name}, versions ${listed.slice(0, 8).join(", ") || "none"}, latest ${latest ?? "none"}` : answerOf(r) });
   }

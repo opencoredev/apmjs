@@ -92,6 +92,12 @@ describe("ossfListed", () => {
     expect(await packumentChecks(() => answer(packument(), 200, FULL))).toEqual([true, false]);
   });
 
+  test("a latest whose key and document version disagree fails, though a valid older version is left", async () => {
+    const body = packument({ versions: { "9.0.0": { version: "9.0.0" }, "9.1.0": { version: "9.0.5" } }, "dist-tags": { latest: "9.1.0" } });
+
+    expect(await packumentChecks((accept) => answer(body, 200, accept))).toEqual([false, false]);
+  });
+
   test("an empty versions list fails", async () => {
     expect(await packumentChecks((accept) => answer(packument({ versions: {}, "dist-tags": {} }), 200, accept))).toEqual([false, false]);
   });
@@ -116,6 +122,32 @@ describe("largeExplain", () => {
     expect(check.ok).toBe(true);
     expect(check.detail).toContain("2 attempts");
     expect(s.sleeps).toEqual([5_000]);
+  });
+
+  test("a dropped connection is asked again, and the second answer passes", async () => {
+    let n = 0;
+
+    const s = stage({
+      explain: () => {
+        if (n++ === 0) throw new TypeError("The socket connection was closed unexpectedly");
+
+        return answer(explained());
+      },
+    });
+
+    const check = await largeExplain(s.deps);
+
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain("2 attempts");
+    expect(s.sleeps).toEqual([5_000]);
+  });
+
+  test("an answer over the cap is not asked again", async () => {
+    const chunk = new Uint8Array(256 * 1024).fill(32);
+    const s = stage({ explain: () => new Response(new ReadableStream({ pull: (c) => c.enqueue(chunk) }), { headers: { "content-type": FULL } }) });
+
+    expect((await largeExplain(s.deps)).ok).toBe(false);
+    expect(s.calls.length).toBe(1);
   });
 
   test("a version still being analysed is transient too", async () => {
