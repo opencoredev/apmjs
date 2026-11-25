@@ -428,8 +428,11 @@ function upstreamCatalog<V extends Listed>(probe: { kind: "found"; pkg: { distTa
   }
 }
 
-/** A package's versions with their scores (evidence checks and the reviewer's job read them). */
-const catalog = (name: string) =>
+/**
+ * A package's versions, with the score of `version` only, whole (evidence checks read its evidence; the reviewer's job
+ * reads no score).
+ */
+const catalog = (name: string, version: string) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const pkg = yield* store.getPackage(name);
@@ -439,7 +442,7 @@ const catalog = (name: string) =>
 
     if (Option.isNone(upstream)) return { kind: "absent" } satisfies Catalog;
 
-    return upstreamCatalog(yield* upstream.value.probe(name, yield* RequestMemory));
+    return upstreamCatalog(yield* upstream.value.probeFor(name, () => new Map([[version, "whole"]]), yield* RequestMemory));
   });
 
 /**
@@ -465,7 +468,7 @@ type Payload = { kind: "ok"; job: ReviewJob } | { kind: "gone"; why: string } | 
 /** The job as the reviewer sees it, or why it cannot be built. */
 const jobPayload = (row: JobRow) =>
   Effect.gen(function* () {
-    const cat: Catalog = yield* catalog(row.package);
+    const cat: Catalog = yield* catalog(row.package, row.version);
 
     if (cat.kind === "unavailable") return { kind: "later", why: "the upstream registry could not be reached" } satisfies Payload;
 
@@ -860,7 +863,7 @@ export const resolveVersion = (name: string, version: string | undefined) =>
   Effect.gen(function* () {
     if (!version) return yield* Effect.fail(refuse(404, "Name a version."));
 
-    return yield* pickVersion(yield* catalog(name), version);
+    return yield* pickVersion(yield* catalog(name, version), version);
   });
 
 /**

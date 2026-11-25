@@ -296,7 +296,7 @@ const latestWanted =
     new Map([...Object.values(pkg.distTags), ...pkg.versions.filter((v) => v.published_at >= at - RECENT_SEED_MS).map((v) => v.version)].map((v) => [v, "trimmed"] as const));
 
 /** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
-const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
+const lookupWithin = (name: string, lease: Lease, wanted: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -304,7 +304,7 @@ const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const p = yield* (wanted === undefined ? upstream.probeWithin(name, lease) : upstream.probeWithinFor(name, wanted, lease));
+    const p = yield* upstream.probeWithinFor(name, wanted, lease);
 
     switch (p.kind) {
       case "found":
@@ -475,13 +475,15 @@ const catalogWithin = (name: string, lease: Lease, choice: KeyedSelect) =>
       lease,
       choices: () => choices,
       keep: (c, reserve) => keptSummary({ kind: "upstream", name: c.name, distTags: c.distTags, versions: [...(c.versions.get(choice.key) ?? [])] }, reserve),
+      // a resolve's root answer embeds its version's report whole
+      analyses: "whole",
     });
 
     return lookupOf(got.get(name));
   });
 
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
-const lookupOrUnknown = (name: string, lease: Lease, wanted?: Wanted) =>
+const lookupOrUnknown = (name: string, lease: Lease, wanted: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -489,7 +491,7 @@ const lookupOrUnknown = (name: string, lease: Lease, wanted?: Wanted) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* (wanted === undefined ? upstream.probe(name, lease) : upstream.probeFor(name, wanted, lease));
+    const probe = yield* upstream.probeFor(name, wanted, lease);
 
     if (probe.kind === "unknown") return "unknown" as const;
 
@@ -595,8 +597,19 @@ type Lookup = Catalog | null | "unknown" | "over-budget";
 /** What the walk's `keep` reads of a version to decide whether it may install: its package, number and state. */
 type Keepable = Pick<VersionRecord, "package" | "version" | "status">;
 
-/** The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows. */
-const pickDependency = (dep: RegistryDependency, keep: (v: Keepable) => boolean, lease: Lease) => Effect.map(lookupOrUnknown(dep.name, lease), (src) => pickFrom(src, dep, keep));
+/**
+ * The newest version a registry dependency (plain or npm: alias) would install, among those `keep` allows, with the
+ * score and grade of that version only: the pick is made of the package before any analysis is read.
+ */
+const pickDependency = (dep: RegistryDependency, keep: (v: Keepable) => boolean, lease: Lease) =>
+  Effect.map(
+    lookupOrUnknown(dep.name, lease, (pkg) => {
+      const v = pickVersion({ distTags: pkg.distTags, versions: pkg.versions, dep, keep });
+
+      return new Map(v ? [[v.version, "trimmed"] as const] : []);
+    }),
+    (src) => pickFrom(src, dep, keep),
+  );
 
 /** The version of `versions` (heads or whole rows) a dependency picks: the newest in its range or tag that `keep` allows. */
 function pickVersion<V extends Pick<VersionRecord, "version" | "status">>(input: { distTags: Record<string, string>; versions: readonly V[]; dep: RegistryDependency; keep: (v: V) => boolean }): V | undefined {
@@ -789,6 +802,8 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: 
             lease,
             choices: (name) => (byName.get(name) ?? []).map((d) => dependencyChoice(d, keep)),
             keep: (c, reserve) => upstreamPicks(c, byName.get(c.name) ?? [], reserve),
+            // a dependency's score, grade, signals and coverage are read (reportFor), never its unread files or capabilities
+            analyses: "trimmed",
             deadline: deadline.at,
           })
         : null;
@@ -4128,6 +4143,18 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     return streamedJson(make(), "versions", headers, { onDone: lease.retain() });
   });
 
+/**
+ * The analyses upstreamRoute reads of a package: a tarball's version's, else every version's (the packument and a
+ * version's document embed each one's _apmScore, and ~safe's view picks versions by them), all trimmed: only a score,
+ * a grade, signals and coverage are read of them (compact, policyBlock).
+ */
+const routeWanted = (name: string, rest: readonly string[]): Wanted => {
+  const file = rest[0] === "-" ? rest[1] : undefined;
+  const version = file ? tarballVersion(name, file) : null;
+
+  return (pkg) => new Map((file ? (version ? [version] : []) : pkg.versions.map((v) => v.version)).map((v) => [v, "trimmed"] as const));
+};
+
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
 export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
   Effect.gen(function* () {
@@ -4174,7 +4201,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // the packument and the devDependencies the full one adds back are held together under the request's lease until
     // the answer is sent
     const lease = yield* RequestMemory;
-    const src = yield* lookupWithin(sp.name, lease);
+    const src = yield* lookupWithin(sp.name, lease, routeWanted(sp.name, sp.rest));
 
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
     // client retries, never "Not found", which npm reports as a package that does not exist

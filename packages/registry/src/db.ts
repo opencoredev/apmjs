@@ -333,6 +333,24 @@ const AnalysisItem = z.discriminatedUnion("kind", [
 ]);
 
 /**
+ * One row of upstreamAnalysesWithin's answer: AnalysisItem's, each analysis with the size of its text as sent, or one
+ * past the allowance (`omitted`), sent without it.
+ */
+const AnalysisWithinItem = z.discriminatedUnion("kind", [
+  AnalysisItem.options[0].extend({ octets: z.number().int().min(0), separators: z.number().int().min(0), objects: z.number().int().min(0) }),
+  z.object({ kind: z.literal("omitted"), package: z.string() }),
+  AnalysisItem.options[1],
+  AnalysisItem.options[2],
+]);
+
+/**
+ * What upstreamAnalysesWithin read: the analyses sent, the size of each package's as sent (`sizes`, textReadWeight's
+ * terms), and the packages one of whose analyses was left out for the allowance (`omitted`): those were not read, so
+ * a reader must never take them for versions with no score.
+ */
+export type AnalysesWithin = { analyses: Map<string, UpstreamAnalyses>; sizes: Map<string, TextSize[]>; omitted: ReadonlySet<string> };
+
+/**
  * An upstream version's exact bytes, by its tarball digest's label: what upstreamAnalysesFor reads the analyses of.
  * `trimmed`: without PAGE_TRIMMED's members, for a reader that works out only its score and grade (and whether it has one).
  * A null digest is a version npm lists no checksum for: it has no analysis or dismissal, only an outcome (unavailable).
@@ -584,7 +602,11 @@ export type StoreApi = {
   /** Versions `user` published after `since` that are not revoked, across every package. */
   readonly publishedSince: (user: string, since: number) => Effect.Effect<VersionRecord[], StoreError>;
 
-  /** The current scorer's analyses of this package and the versions it decided it cannot score, in one query. */
+  /**
+   * The current scorer's analyses of this package and the versions it decided it cannot score, in one query: its whole
+   * history as one value (next: 61 analyses, 16 MB), charged to no lease. No route reads it (Upstream.probeFor and
+   * chosen read only the versions they name, within their lease); the tests hold the narrower reads to it.
+   */
   readonly upstreamAnalyses: (name: string) => Effect.Effect<UpstreamAnalyses, StoreError>;
   /** upstreamAnalyses for several packages in three statements, keyed by package name; a package with neither is left out. */
   readonly upstreamAnalysesOf: (names: readonly string[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
@@ -594,6 +616,12 @@ export type StoreApi = {
    * package's history.
    */
   readonly upstreamAnalysesFor: (keys: readonly AnalysisKey[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
+  /**
+   * upstreamAnalysesFor under a budget, in the same one statement: each analysis is sent only while what the analyses
+   * sent so far hold once read (textReadWeight, by `weights`) stays within `allowance`, smallest first, so what the
+   * reply holds is bounded before it is sent. A package one of whose analyses did not fit is `omitted`.
+   */
+  readonly upstreamAnalysesWithin: (input: { keys: readonly AnalysisKey[]; allowance: number; weights: TextCoefficients }) => Effect.Effect<AnalysesWithin, StoreError>;
   /**
    * Whether upstreamAnalyses would find a score for the package (its scores are not empty), without reading one: an
    * analysis by the current scorer, or an apm-score-v10 one it reuses. currentScore keeps every row that filter passes.
@@ -919,6 +947,72 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
   /** A stored score as stored, or, with dismissals for its bytes, the analysis without them. */
   const withList = (stored: VersionRecord["score"], list: readonly EvidenceDismissal[]): VersionRecord["score"] =>
     list.length === 0 ? stored : (dismissedAnalysis(parseAnalysis(stored), list) ?? stored);
+
+  /**
+   * upstreamAnalysesFor's statement, each analysis sized as sent (its JSON text's octets, separators and objects, as
+   * keptChoicesOf sizes kept rows) and weighed by `budget`'s coefficients, smallest first: one whose running weight
+   * passes the allowance is sent as `omitted`, without its payload. With no budget every analysis is sent.
+   */
+  const analysesWithin = (keys: readonly AnalysisKey[], budget: { allowance: number; weights: TextCoefficients } | null): Effect.Effect<AnalysesWithin, StoreError> =>
+    Effect.gen(function* () {
+      if (keys.length === 0) return { analyses: new Map(), sizes: new Map(), omitted: new Set() };
+      const byKey = new Map<string, AnalysisKey>();
+
+      // each key once, whole when any reader of it asked for it whole
+      for (const k of keys) {
+        const id = JSON.stringify([k.package, k.version, k.digest]);
+
+        byKey.set(id, { ...k, trimmed: (k.trimmed ?? false) && (byKey.get(id)?.trimmed ?? true) });
+      }
+
+      // as JSON: a column of digests can be all nulls, which the driver cannot type as text[]
+      const asked = [...byKey.values()];
+      const allowance = budget?.allowance ?? Number.MAX_SAFE_INTEGER;
+      const weights = budget?.weights ?? { octet: 0, node: 0, object: 0 };
+
+      // the analyses of only these versions (whole, or trimmed as pageRead trims the versions a page does not show) and
+      // the dismissals for their bytes, and the outcomes decided for them by version, whatever their digest, as
+      // upstreamAnalysesOf reads them (scoredPackage reads one only for a version with no score; one with no checksum
+      // has only its outcome)
+      const items = yield* run(
+        "upstreamAnalysesFor",
+        sql`WITH k AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(asked.map((k) => ({ package: k.package, version: k.version, digest: k.digest, trimmed: k.trimmed ?? false })))}::jsonb) AS k(package text, version text, digest text, trimmed boolean)),
+            a AS (
+              SELECT u.package, u.version, u.digest, u.scorer, CASE WHEN k.trimmed THEN u.analysis - ${[...PAGE_TRIMMED]}::text[] ELSE u.analysis END AS payload
+                FROM upstream_analysis u JOIN k ON u.package = k.package AND u.version = k.version AND u.digest = k.digest WHERE (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+            ),
+            sized AS (
+              SELECT a.*, octet_length(x.t)::int AS octets, (octet_length(x.t) - octet_length(translate(x.t, ':,[', '')))::int AS separators, (octet_length(x.t) - octet_length(replace(x.t, '{', '')))::int AS objects
+                FROM a CROSS JOIN LATERAL (SELECT a.payload::text AS t) AS x
+            ),
+            weighed AS (
+              SELECT s.*, sum(s.w) OVER (ORDER BY s.w, s.package, s.version, s.digest, s.scorer) AS running
+                FROM (SELECT sized.*, ${weights.octet}::bigint * octets + ${weights.node}::bigint * (1 + separators) + ${weights.object}::bigint * objects AS w FROM sized) AS s
+            )
+            SELECT CASE WHEN running <= ${allowance}::bigint THEN 'analysis' ELSE 'omitted' END AS kind, package, version, digest, row_number() OVER (ORDER BY scorer) AS seq,
+                   CASE WHEN running <= ${allowance}::bigint THEN payload END AS payload, octets, separators, objects
+              FROM weighed
+            UNION ALL
+            SELECT 'decided', o.package, o.version, o.digest, row_number() OVER (ORDER BY o.scorer), jsonb_build_object('outcome', o.outcome, 'detail', o.detail), 0, 0, 0
+              FROM analysis_outcomes o WHERE (o.package, o.version) IN (SELECT package, version FROM k) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL
+            UNION ALL
+            SELECT 'dismissal', e.package, e.version, e.digest, row_number() OVER (ORDER BY e.dismissed_at, e.id), to_jsonb(e), 0, 0, 0
+              FROM evidence_dismissals e WHERE (e.package, e.version, e.digest) IN (SELECT package, version, digest FROM k) AND e.restored_at IS NULL
+            ORDER BY seq`,
+        all(AnalysisWithinItem),
+      );
+
+      const sizes = new Map<string, TextSize[]>();
+      const omitted = new Set<string>();
+
+      for (const i of items) {
+        if (i.kind === "omitted") omitted.add(i.package);
+
+        if (i.kind === "analysis") sizes.set(i.package, [...(sizes.get(i.package) ?? []), { octets: i.octets, separators: i.separators, objects: i.objects }]);
+      }
+
+      return { analyses: analysesByPackage(items.flatMap((i) => (i.kind === "omitted" ? [] : [i]))), sizes, omitted };
+    });
 
   /**
    * The rows of upstreamAnalysesOf or upstreamAnalysesFor by package: each analysis scored with the dismissals for its
@@ -1679,42 +1773,8 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
 
         return analysesByPackage(items);
       }),
-    upstreamAnalysesFor: (keys) =>
-      Effect.gen(function* () {
-        if (keys.length === 0) return new Map<string, UpstreamAnalyses>();
-        const byKey = new Map<string, AnalysisKey>();
-
-        // each key once, whole when any reader of it asked for it whole
-        for (const k of keys) {
-          const id = JSON.stringify([k.package, k.version, k.digest]);
-
-          byKey.set(id, { ...k, trimmed: (k.trimmed ?? false) && (byKey.get(id)?.trimmed ?? true) });
-        }
-
-        // as JSON: a column of digests can be all nulls, which the driver cannot type as text[]
-        const asked = [...byKey.values()];
-
-        // upstreamAnalysesOf's statement for only these versions: their analyses (whole, or trimmed as pageRead trims
-        // the versions a page does not show) and the dismissals for their bytes, and the outcomes decided for them by
-        // version, whatever their digest, as upstreamAnalysesOf reads them (scoredPackage reads one only for a version
-        // with no score; one with no checksum has only its outcome)
-        const items = yield* run(
-          "upstreamAnalysesFor",
-          sql`WITH k AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(asked.map((k) => ({ package: k.package, version: k.version, digest: k.digest, trimmed: k.trimmed ?? false })))}::jsonb) AS k(package text, version text, digest text, trimmed boolean))
-              SELECT 'analysis' AS kind, u.package, u.version, u.digest, row_number() OVER (ORDER BY u.scorer) AS seq, CASE WHEN k.trimmed THEN u.analysis - ${[...PAGE_TRIMMED]}::text[] ELSE u.analysis END AS payload
-                FROM upstream_analysis u JOIN k ON u.package = k.package AND u.version = k.version AND u.digest = k.digest WHERE (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
-              UNION ALL
-              SELECT 'decided', o.package, o.version, o.digest, row_number() OVER (ORDER BY o.scorer), jsonb_build_object('outcome', o.outcome, 'detail', o.detail)
-                FROM analysis_outcomes o WHERE (o.package, o.version) IN (SELECT package, version FROM k) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL
-              UNION ALL
-              SELECT 'dismissal', e.package, e.version, e.digest, row_number() OVER (ORDER BY e.dismissed_at, e.id), to_jsonb(e)
-                FROM evidence_dismissals e WHERE (e.package, e.version, e.digest) IN (SELECT package, version, digest FROM k) AND e.restored_at IS NULL
-              ORDER BY seq`,
-          all(AnalysisItem),
-        );
-
-        return analysesByPackage(items);
-      }),
+    upstreamAnalysesFor: (keys) => Effect.map(analysesWithin(keys, null), (r) => r.analyses),
+    upstreamAnalysesWithin: ({ keys, allowance, weights }) => analysesWithin(keys, { allowance, weights }),
     upstreamScored: (name) =>
       run(
         "upstreamScored",

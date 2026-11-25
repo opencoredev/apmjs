@@ -142,9 +142,9 @@ describe("the reader takes no read without a lease", () => {
 
   test("every method of the upstream reader that reads a packument requires a lease", () => {
     // each of these must take a Lease as its last parameter (a type error here when one stops requiring it)
-    type Leased = { [K in "probe" | "probeWithin" | "listing" | "probeMany" | "devDependencies" | "get"]: Parameters<UpstreamApi[K]> extends [...unknown[], Lease] ? true : false };
+    type Leased = { [K in "probeFor" | "probeWithinFor" | "listing" | "probeMany" | "devDependencies" | "get"]: Parameters<UpstreamApi[K]> extends [...unknown[], Lease] ? true : false };
 
-    const leased: Leased = { probe: true, probeWithin: true, listing: true, probeMany: true, devDependencies: true, get: true };
+    const leased: Leased = { probeFor: true, probeWithinFor: true, listing: true, probeMany: true, devDependencies: true, get: true };
     // summaries takes what to keep of each package after its lease
     const summaries: Parameters<UpstreamApi["summaries"]>[1] extends Lease ? true : false = true;
 
@@ -241,7 +241,7 @@ describe("a shared-cache write holds a lease of its own (review of 6862fc7, find
     const pool = new MemoryPool();
     const request = pool.request(probe.weight + READ_OVERHEAD_WEIGHT + 256 * 1024);
     const before = stall.puts.length;
-    const got = await withUpstream((up) => up.probeWithin("refused", request));
+    const got = await withUpstream((up) => up.probeWithinFor("refused", () => new Map(), request));
 
     expect(got.kind).toBe("over-budget");
     // on 6862fc7 the write was started before the conversion was refused, and kept the packument
@@ -281,7 +281,7 @@ describe("requests that read at once share the pool (review of 6862fc7, finding 
     const noBlobs = Layer.succeed(Blobs, Blobs.of({ put: () => Effect.void, stream: () => Effect.succeed(Option.none()), bytes: () => Effect.succeed(Option.none()), exists: () => Effect.succeed(false), remove: () => Effect.void }));
     const layers = Layer.provide(Upstream.layer(npm.url.href, 60_000, null), Layer.mergeAll(Store.postgres(db.url), noBlobs));
     const names = (p: string) => [0, 1, 2, 3].map((i) => `${p}${i}`);
-    const reads = (up: UpstreamApi, prefix: string, lease: Lease) => Effect.forEach(names(prefix), (n) => up.probeWithin(n, lease));
+    const reads = (up: UpstreamApi, prefix: string, lease: Lease) => Effect.forEach(names(prefix), (n) => up.probeWithinFor(n, () => new Map(), lease));
 
     const [ra, rb] = await Effect.runPromise(Effect.flatMap(Upstream, (up) => Effect.all([reads(up, "a", a), reads(up, "b", b)], { concurrency: 2 })).pipe(Effect.provide(layers), Effect.scoped));
     const kinds = [...ra, ...rb].map((p) => p.kind);

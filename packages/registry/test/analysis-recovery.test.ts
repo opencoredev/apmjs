@@ -128,8 +128,6 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       baseUrl: "http://upstream.invalid/",
       scopeExists: () => Effect.succeed("unknown"),
       search: () => Effect.succeed({ kind: "unavailable" }),
-      probe: (name) => Effect.succeed(probeOf(name)),
-      probeWithin: (name) => Effect.succeed(probeOf(name)),
       probeFor: (name) => Effect.succeed(probeOf(name)),
       probeWithinFor: (name) => Effect.succeed(probeOf(name)),
       devDependencies: () => Effect.succeed(null),
@@ -559,10 +557,10 @@ describe("every delivery of a job is recorded before it asks the upstream anythi
 
         return Upstream.of({
           ...u,
-          probe: (name, lease) => Effect.suspend(() => {
+          probeFor: (name, wanted, lease) => Effect.suspend(() => {
             calls.probe++;
 
-            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probe(name, lease);
+            return input.probe === "unknown" ? Effect.succeed<Probe>({ kind: "unknown" }) : u.probeFor(name, wanted, lease);
           }),
           tarball: (pkg, version) => Effect.suspend(() => {
             calls.tarball++;

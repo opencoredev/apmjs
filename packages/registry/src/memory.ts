@@ -107,6 +107,11 @@ export class Lease {
     return this.peak;
   }
 
+  /** The most take() may have under this lease's limit and every parent's (the pool may have less: take asks it). */
+  get headroom(): number {
+    return Math.max(0, Math.min(this.limit - this.counted, this.parent?.headroom ?? Number.POSITIVE_INFINITY));
+  }
+
   /** Nothing more fits: a read would be refused at its first kept byte. */
   get exhausted(): boolean {
     return this.full() || !this.pool.hasRoom();

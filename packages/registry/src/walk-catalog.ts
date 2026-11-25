@@ -83,9 +83,12 @@ export function jsonWeight(json: string): number {
  * itself while it is parsed (WEIGHTS.parse). Reserved before the row is read, so it is charged before it exists.
  */
 export function textReadWeight(size: TextSize): number {
-  const parsed = 2 * size.octets * WEIGHTS.text + (1 + size.separators) * (WEIGHTS.container + WEIGHTS.dictKey) + size.objects * WEIGHTS.hiddenClass;
+  return parsedWeight(size) + WEIGHTS.parse * size.octets * WEIGHTS.text;
+}
 
-  return parsed + WEIGHTS.parse * size.octets * WEIGHTS.text;
+/** textReadWeight once the text is parsed and let go: what the parsed value holds (jsonWeight of that text). */
+export function parsedWeight(size: TextSize): number {
+  return 2 * size.octets * WEIGHTS.text + (1 + size.separators) * (WEIGHTS.container + WEIGHTS.dictKey) + size.objects * WEIGHTS.hiddenClass;
 }
 
 /** What one UTF-16 unit takes in JSON text at most: a quote, a backslash and the short escapes 2, other controls and any surrogate 6. */
@@ -281,7 +284,7 @@ function headWeight(name: string, distTags: Record<string, string>): number {
 }
 
 /** The head's weight, reserved with the dist-tags' JSON text before that text is written. */
-function keptHead(name: string, distTags: Record<string, string>, reserve: Reserve): Summary<null> | null {
+export function keptHead(name: string, distTags: Record<string, string>, reserve: Reserve): Summary<null> | null {
   return reserved(reserve, WEIGHTS.container + stringWeight(name) + withText(tagsBound(distTags)), () => ({ summary: null, weight: headWeight(name, distTags) }));
 }
 

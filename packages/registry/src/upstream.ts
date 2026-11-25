@@ -7,7 +7,7 @@ import { Blobs } from "./blobs.ts";
 import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { upstreamPuts, type PendingPuts } from "./pending-puts.ts";
-import { Store, type KeptChoicesRow, type StoreApi, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
+import { Store, type AnalysisKey, type KeptChoicesRow, type StoreApi, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { readCapped, streamedJson, streamWeight, type StreamOptions } from "./http.ts";
@@ -16,9 +16,9 @@ import { DEV_DEPENDENCIES, readPackument, TRIMMED, type KeepProfile, type KeptPa
 import { timingOrNull } from "./timing.ts";
 import { verifiedStream } from "./verified-stream.ts";
 import { NO_RECORDED_PUBLISHER } from "./publishers.ts";
-import { ChoicesWriter, choiceHolds, isStrongEtag, KEPT_CHOICES_MAX_AGE_MS, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
+import { ChoicesWriter, choiceHolds, isStrongEtag, KEPT_CHOICES_MAX_AGE_MS, KEPT_TEXT_WEIGHTS, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
 import { Clock } from "./clock.ts";
-import { keptVersion, reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
+import { keptHead, keptVersion, parsedWeight, reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -326,17 +326,38 @@ export function scoredPackage(pkg: CachedPackage, analyses: UpstreamAnalyses): P
  */
 export type Wanted = (pkg: { readonly distTags: Record<string, string>; readonly versions: readonly Omit<VersionRecord, "score">[] }) => ReadonlyMap<string, "whole" | "trimmed">;
 
-/** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
-export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> => {
-  const keys = versions.flatMap((v) => {
+/** The keys of the versions of `name` that `want` names. */
+function wantedKeys(name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): AnalysisKey[] {
+  return versions.flatMap((v) => {
     const form = want.get(v.version);
     const d = digestOf(v);
 
     return form === undefined ? [] : [{ package: name, version: v.version, digest: d ? digestLabel(d) : null, trimmed: form === "trimmed" }];
   });
+}
 
-  return Effect.map(store.upstreamAnalysesFor(keys), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() });
-};
+const NO_ANALYSES: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
+
+/** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
+export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> =>
+  Effect.map(store.upstreamAnalysesFor(wantedKeys(name, versions, want)), (got) => got.get(name) ?? NO_ANALYSES);
+
+/**
+ * wantedAnalyses within `lease`: sent only while they fit its headroom (Store.upstreamAnalysesWithin), and what they
+ * hold once read taken from it, to stay taken while the lease holds the package. null, with nothing taken, when they
+ * do not fit: the caller answers "over-budget", never a package with no score.
+ */
+const wantedWithin = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">, lease: Lease): Effect.Effect<UpstreamAnalyses | null, StoreError> =>
+  Effect.gen(function* () {
+    const keys = wantedKeys(name, versions, want);
+
+    if (keys.length === 0) return NO_ANALYSES;
+    const read = yield* store.upstreamAnalysesWithin({ keys, allowance: lease.headroom, weights: KEPT_TEXT_WEIGHTS });
+
+    if (read.omitted.has(name) || !lease.take((read.sizes.get(name) ?? []).reduce((n, s) => n + parsedWeight(s), 0))) return null;
+
+    return read.analyses.get(name) ?? NO_ANALYSES;
+  });
 
 /** One version of scoredPackage: its stored analysis for its exact bytes, or why it can never be scored. */
 function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
@@ -736,17 +757,14 @@ export type UpstreamApi = {
   /** Whether `@scope` has packages upstream. */
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
   /**
-   * The package with its analyses, read under `lease` (memory.ts): what it holds stays taken from the lease until the
-   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here. It reads
-   * every stored analysis of the package whole; probeFor reads only those of the versions its `wanted` names
-   * (Store.upstreamAnalysesFor), each whole or trimmed, and every other version reads as not scored.
+   * The package with the analyses of the versions `wanted` names, each whole or trimmed, read under `lease`
+   * (memory.ts): what it holds stays taken from the lease until the lease closes. Every other version reads as not
+   * scored. The analyses are read within the lease (Store.upstreamAnalysesWithin) and charged to it; a package whose
+   * packument or analyses do not fit is "unknown" here. No reader asks for a package's whole history: on 216a4c7 a
+   * probe with no `wanted` read every stored analysis as one value (next: 61 analyses, 16 MB), charged to nothing.
    */
-  readonly probe: (name: string, lease: Lease) => Effect.Effect<Probe, StoreError>;
-  /** probe, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
-  readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
-  /** probe reading only the analyses `wanted` names (see probe). */
   readonly probeFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<Probe, StoreError>;
-  /** probeWithin reading only the analyses `wanted` names (see probe). */
+  /** probeFor, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
   readonly probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
@@ -802,17 +820,22 @@ export type UpstreamApi = {
    * the packument has not changed (304), without reading it. `deadline` (Date.now() milliseconds): a package with no
    * answer by then is "out-of-time", its read stopped (its stream cancelled, its lease given back); the packages
    * answered before it keep their choices as usual. Each package's choices are made of it as it is read and held cut
-   * down (summaryVersion); once every package is read, the analyses of only the versions they took are read, in one
-   * statement (Store.upstreamAnalysesFor), and each package is kept.
+   * down (summaryVersion), their dist-tags charged with them; once every package is read, the analyses of only the
+   * versions they took are read, whole or trimmed as `analyses` says, in one statement bounded by the lease's headroom
+   * (Store.upstreamAnalysesWithin), and each package is kept with its analyses charged to `lease`. A package one of
+   * whose analyses did not fit is "over-budget", never a package with no score.
    */
-  readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; deadline?: number }) => Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError>;
+  readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; analyses: "whole" | "trimmed"; deadline?: number }) => Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError>;
   /**
    * Each version's devDependencies, read apart from the packument the registry keeps (DEV_DEPENDENCIES): only the full
    * packument apm serves adds them back. Null when npm could not be asked, the read was refused, or it did not fit
    * `lease` (the request's, beside the packument it holds); what it weighs stays taken from `lease`.
    */
   readonly devDependencies: (name: string, lease: Lease) => Effect.Effect<DevDependencyRead | null>;
-  /** The package when upstream has it; null when it is absent, upstream cannot be asked, or it does not fit `lease`. */
+  /**
+   * The package when upstream has it, with no scores; null when it is absent, upstream cannot be asked, or it does not
+   * fit `lease`.
+   */
   readonly get: (name: string, lease: Lease) => Effect.Effect<UpstreamPackage | null, StoreError>;
   /**
    * The tarball of a version the upstream lists right now, verified against its published checksum. Cached in
@@ -1501,21 +1524,18 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           // a package that did not fit the lease could not be read: the caller asks again later
           Effect.map(listed(name, lease), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        const probeWithinFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
+        const probeWithinFor = (name: string, wanted: Wanted, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
           Effect.gen(function* () {
             const l = yield* listed(name, lease);
 
             if (l.kind !== "found") return l;
+            const analyses = yield* wantedWithin(store, name, l.pkg.versions, wanted(l.pkg), lease);
 
-            return scoredPackage(l.pkg, wanted === undefined ? yield* store.upstreamAnalyses(name) : yield* wantedAnalyses(store, name, l.pkg.versions, wanted(l.pkg)));
+            return analyses === null ? { kind: "over-budget" as const } : scoredPackage(l.pkg, analyses);
           });
 
-        const probeFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<Probe, StoreError> =>
+        const probeFor = (name: string, wanted: Wanted, lease: Lease): Effect.Effect<Probe, StoreError> =>
           Effect.map(probeWithinFor(name, wanted, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
-
-        const probeWithin = (name: string, lease: Lease) => probeWithinFor(name, undefined, lease);
-
-        const probe = (name: string, lease: Lease) => probeFor(name, undefined, lease);
 
         const probeMany = (names: readonly string[], lease: Lease): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
@@ -1623,7 +1643,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
          * has its answer, the planned rows are written one at a time, each under a short reservation of `lease` given
          * back before the next (keepPlans). A write that fails is logged and the answer stands.
          */
-        const chosen = <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; deadline?: number }): Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError> =>
+        const chosen = <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; analyses: "whole" | "trimmed"; deadline?: number }): Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError> =>
           Effect.gen(function* () {
             const { lease, choices, keep } = input;
             const wanted = [...new Set(input.names)];
@@ -1664,12 +1684,19 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               /**
                * The versions each of `name`'s choices took (a map of them by choice key, or null when one is missing), cut
                * down as a row keeps them (summaryVersion) and reserved from `lease`, so the packument they came from can
-               * be let go before their analyses are read. `plan`: the row to plan once they are kept, if any.
+               * be let go before their analyses are read. `plan`: the row to plan once they are kept, if any. The
+               * dist-tags are held by reference until the package is kept, after the packument, the cache's block or the
+               * row they came from is let go, so they are reserved with the versions, as the summary's head reserves
+               * them (keptHead): a package with tens of thousands of tags otherwise held them uncharged across the
+               * analyses' read.
                */
               const pickedOf = (name: string, distTags: Record<string, string>, taken: ReadonlyMap<string, readonly Omit<VersionRecord, "score">[]> | null, plan: Picked["plan"]): Picking => {
                 if (taken === null) return { kind: "unknown" };
+                const head = keptHead(name, distTags, lease);
+
+                if (head === null) return { kind: "over-budget" };
                 const versions = new Map<string, VersionRecord[]>();
-                let weight = 0;
+                let weight = head.weight;
 
                 for (const [key, vs] of taken) {
                   const cut: VersionRecord[] = [];
@@ -1809,17 +1836,33 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                 [...p.versions.values()].flat().map((v) => {
                   const d = digestOf(v);
 
-                  return { package: p.name, version: v.version, digest: d ? digestLabel(d) : null };
+                  return { package: p.name, version: v.version, digest: d ? digestLabel(d) : null, trimmed: input.analyses === "trimmed" };
                 }),
               );
 
-              const analyses = yield* store.upstreamAnalysesFor(keys).pipe(Effect.onError(() => Effect.sync(() => lease.give(picked.reduce((n, p) => n + p.weight, 0)))));
-              const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
+              // the statement sends only the analyses that fit the lease's headroom, smallest first, so the reply is
+              // bounded before it is sent; on 216a4c7 it was held, parsed and kept with the tree charged to nothing
+              const got = yield* store.upstreamAnalysesWithin({ keys, allowance: lease.headroom, weights: KEPT_TEXT_WEIGHTS }).pipe(Effect.onError(() => Effect.sync(() => lease.give(picked.reduce((n, p) => n + p.weight, 0)))));
+              /** What each package's analyses hold once read, taken from `lease` while its answer holds them. */
+              const held = new Map<string, number>();
+              /** Packages whose analyses were not all read, or did not fit once read: "over-budget", never unscored. */
+              const unread = new Set(got.omitted);
+
+              for (const [name, sizes] of got.sizes) {
+                const weight = sizes.reduce((n, s) => n + parsedWeight(s), 0);
+
+                if (!unread.has(name) && lease.take(weight)) held.set(name, weight);
+                else {
+                  unread.add(name);
+                  got.analyses.delete(name);
+                }
+              }
+
               const plans: PlanHandle[] = [];
 
               /** keep, handed the versions picked of `p` scored, with their scored copies charged while it runs. */
               const kept = (p: Picked): Summarized<S> => {
-                const a = analyses.get(p.name) ?? none;
+                const a = got.analyses.get(p.name) ?? NO_ANALYSES;
                 const copy = [...p.versions.values()].reduce((n, vs) => n + vs.length, 0) * SCORED_WEIGHT;
 
                 if (!lease.take(copy)) return { kind: "over-budget" };
@@ -1854,9 +1897,13 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                */
               const settled = (p: Picked, last: boolean): Summarized<S> => {
                 lease.give(p.weight);
+
+                if (unread.has(p.name)) return { kind: "over-budget" };
                 const answer = kept(p);
 
                 if (answer.kind === "over-budget" && !last && lease.take(p.weight)) again.push(p);
+                // a package not kept lets go of its analyses with its answer
+                else if (answer.kind !== "found") lease.give(held.get(p.name) ?? 0);
 
                 return answer;
               };
@@ -2102,10 +2149,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
               return answer;
             }),
-          probe,
-          probeWithin,
-          probeFor: (name: string, wanted: Wanted, lease: Lease) => probeFor(name, wanted, lease),
-          probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => probeWithinFor(name, wanted, lease),
+          probeFor,
+          probeWithinFor,
           listing,
           listingIfChanged: listedOrSame,
           installCopy,
@@ -2159,7 +2204,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           summaries,
           chosen,
           devDependencies,
-          get: (name, lease) => Effect.map(probe(name, lease), (p) => (p.kind === "found" ? p.pkg : null)),
+          get: (name, lease) => Effect.map(probeFor(name, () => new Map(), lease), (p) => (p.kind === "found" ? p.pkg : null)),
           tarball: (pkg, version) =>
             Effect.gen(function* () {
               const at = locate(pkg, version);

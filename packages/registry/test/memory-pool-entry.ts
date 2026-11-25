@@ -271,13 +271,13 @@ export default {
       const room = alone.weight + READ_OVERHEAD_WEIGHT + 256 * 1024;
       const before = await measure(env);
       const refusedLease = pool.request(room);
-      const refused = await run((up) => up.probeWithin("v-mid", refusedLease));
+      const refused = await run((up) => up.probeWithinFor("v-mid", () => new Map(), refusedLease));
       const writesAfterRefusal = release.length;
       refusedLease.release();
       const afterRefusal = await measure(env);
 
       const request = pool.request();
-      let got = await run((up) => up.probeWithin("v-mid", request));
+      let got = await run((up) => up.probeWithinFor("v-mid", () => new Map(), request));
       const kind = got.kind;
       got = null;
       request.release();
@@ -294,12 +294,12 @@ export default {
       // n reads through the Upstream layer, each stopped part way into a kept string: what they hold beyond their charge
       const n = Number(q("n"));
       const pool = new MemoryPool();
-      { const l = pool.request(); await run((up) => up.probeWithin("v-small", l)); l.release(); }
+      { const l = pool.request(); await run((up) => up.probeWithinFor("v-small", () => new Map(), l)); l.release(); }
       await Promise.all([...works]);
       const base = await measure(env);
       const charged0 = pool.charged;
       const leases = Array.from({ length: n }, () => pool.request());
-      const reads = leases.map((l, i) => run((up) => up.probeWithin("parked-" + i + "-" + Math.random(), l)));
+      const reads = leases.map((l, i) => run((up) => up.probeWithinFor("parked-" + i + "-" + Math.random(), () => new Map(), l)));
       while (unparkAll.length < n) await sleep(1);
       for (let i = 0; i < 3; i++) await sleep(1);
       const held = (await measure(env)) - base;
@@ -324,7 +324,7 @@ export default {
       const note = (p) => { if (p.kind === "found") counts.found++; if (p.kind === "over-budget") counts.overBudget++; if (p.kind === "unknown") counts.refused++; };
 
       // warm: the code every operation runs is compiled, and the layer built, before the base is measured
-      { const l = pool.request(); note(await mixed((up) => up.probeWithin("v-small", l))); l.release(); }
+      { const l = pool.request(); note(await mixed((up) => up.probeWithinFor("v-small", () => new Map(), l))); l.release(); }
       for (const r of release.splice(0)) r();
       for (const r of endLooks.splice(0)) r();
       await Promise.all([...works, ...lookWorks]);
@@ -334,7 +334,7 @@ export default {
       const operations = {
         async read() {
           const request = pool.request();
-          try { note(await mixed((up) => up.probeWithin(pick(), request))); await hold(); } finally { request.release(); }
+          try { note(await mixed((up) => up.probeWithinFor(pick(), () => new Map(), request))); await hold(); } finally { request.release(); }
         },
         async walk() {
           const request = pool.request();
@@ -350,7 +350,7 @@ export default {
           try {
             await Promise.all([pick(), pick(), pick()].map(async (name) => {
               const one = request.child();
-              try { note(await mixed((up) => up.probeWithin(name, one))); await hold(); } finally { one.release(); }
+              try { note(await mixed((up) => up.probeWithinFor(name, () => new Map(), one))); await hold(); } finally { one.release(); }
             }));
           } finally { request.release(); }
         },
@@ -359,7 +359,7 @@ export default {
           const request = pool.request();
           let res = null;
           try {
-            const p = await mixed((up) => up.probeWithin(pick(), request));
+            const p = await mixed((up) => up.probeWithinFor(pick(), () => new Map(), request));
             note(p);
             if (p.kind !== "found") return;
             const pkg = p.pkg;
@@ -384,7 +384,7 @@ export default {
           const request = pool.request();
           const stop = new AbortController();
           try {
-            const reading = mixed((up) => up.probeWithin("i-" + (1 + Math.floor(random() * 6)) + "-" + Math.random(), request), stop.signal);
+            const reading = mixed((up) => up.probeWithinFor("i-" + (1 + Math.floor(random() * 6)) + "-" + Math.random(), () => new Map(), request), stop.signal);
             await sleep(1 + Math.floor(random() * 8));
             await gate();
             stop.abort();
