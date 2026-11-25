@@ -672,3 +672,27 @@ describe("the shell reading keeps the shell's command boundaries and npm's optio
     expect(r.score).toBeGreaterThanOrEqual(SCORE_FLOOR);
   });
 });
+
+describe("the shell reading's doubts stay within the invocation, and built words are not commands", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("what follows a `--` after the name, or another command's expansion, keeps --ignore-scripts", () => {
+    for (const postinstall of ["npm run '--ignore-scripts' setup -- --no-ignore-scripts", "npm run '--ignore-scripts' setup; echo \"$PWD\""]) {
+      expect(ids({ postinstall, presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+    }
+
+    expect(ids({ postinstall: "npm run '--ignore-scripts' setup \"$X\"", presetup: DROPPER, setup: "echo setup" })).toContain("install-download");
+  });
+
+  test("a word built from a substitution, or a wrapper option that exits, runs no manager", () => {
+    for (const postinstall of ["safenpm() { echo safe; }; \"$(printf safe)npm\" run docs", "env --help 'npm' run docs"]) {
+      expect(ids({ postinstall, docs: DROPPER })).not.toContain("install-download");
+    }
+  });
+
+  test("a wrapper's options that take a value, and a run inside a quoted substitution, are still read", () => {
+    for (const postinstall of ["env -u HOME 'npm' run docs", "echo x | xargs -n1 'npm' run docs", "echo \"$('npm' run docs)\""]) {
+      expect(ids({ postinstall, docs: DROPPER })).toContain("install-download");
+    }
+  });
+});

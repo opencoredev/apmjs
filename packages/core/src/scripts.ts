@@ -69,6 +69,19 @@ const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", 
 
 // words that run the rest of the simple command as a command of its own, and the shell's words a command may follow
 const WRAPPERS = new Set(["env", "xargs", "exec", "command", "nohup", "time", "nice", "cross-env", "npx"]);
+
+// each wrapper's options that still run the command after them, and those that take the next word as their value; any
+// other option may print help, look the command up (`command -v`) or run something else, so the words after it are not read
+const WRAPPER_OPTIONS = new Map<string, { flags: ReadonlySet<string>; values: ReadonlySet<string> }>([
+  ["env", { flags: new Set(["-i", "--ignore-environment", "-0", "--null", "-"]), values: new Set(["-u", "--unset", "-C", "--chdir"]) }],
+  ["xargs", { flags: new Set(["-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-o", "--open-tty"]), values: new Set(["-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-I", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"]) }],
+  ["exec", { flags: new Set(["-c", "-l"]), values: new Set(["-a"]) }],
+  ["command", { flags: new Set(["-p"]), values: new Set() }],
+  ["nice", { flags: new Set(), values: new Set(["-n", "--adjustment"]) }],
+  ["time", { flags: new Set(["-p"]), values: new Set() }],
+  ["npx", { flags: new Set(["-y", "--yes", "--no", "-q", "--quiet"]), values: new Set() }],
+]);
+
 const KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
 const SHELL_WORD = /\S+/g;
 
@@ -281,10 +294,11 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
  * `-s`, `'a b'` is one word), each with where it ends in `cmd` and whether an unquoted `*` makes it a glob, and `null`
  * where a command ends: `;`, `&`, `|`, a newline or a group's parenthesis. A command substitution (`$(` or a backtick)
- * is `"("`, its own commands, then `")"`, and the word around it goes on after it. A comment is skipped. One pass; a quote
+ * is `"("`, its own commands, then `")"`, and the word around it goes on after it; `expanded` marks a word whose text
+ * the shell builds from a substitution or a variable, which is not the word as written. A comment is skipped. One pass; a quote
  * left open runs to the end of `cmd`.
  */
-export type ShellToken = { word: string; end: number; glob: boolean } | null | "(" | ")";
+export type ShellToken = { word: string; end: number; glob: boolean; expanded: boolean } | null | "(" | ")";
 
 
 export function* shellWords(cmd: string): Generator<ShellToken> {
@@ -298,14 +312,16 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
   // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution, `G`
   // a group, and the word each substitution interrupts
   const open: string[] = [];
-  const around: { word: string | null; glob: boolean; quoted: boolean; target: boolean }[] = [];
+  const around: { word: string | null; glob: boolean; quoted: boolean; target: boolean; expanded: boolean }[] = [];
+  let expanded = false;
 
   const enter = (c: string): "(" => {
-    around.push({ word, glob, quoted, target });
+    around.push({ word, glob, quoted, target, expanded });
     word = null;
     glob = false;
     quoted = false;
     target = false;
+    expanded = false;
     open.push(c === "`" ? "`" : ")");
 
     return "(";
@@ -313,18 +329,21 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
 
   const leave = (): ")" => {
     open.pop();
-    ({ word, glob, quoted, target } = around.pop() ?? { word: null, glob: false, quoted: false, target: false });
+    ({ word, glob, quoted, target } = around.pop() ?? { word: null, glob: false, quoted: false, target: false, expanded: false });
+    word ??= "";
+    expanded = true;
 
     return ")";
   };
 
-  const flush = function* (): Generator<{ word: string; end: number; glob: boolean }> {
-    if (word !== null && !target) yield { word, end: i, glob };
+  const flush = function* (): Generator<{ word: string; end: number; glob: boolean; expanded: boolean }> {
+    if (word !== null && !target) yield { word, end: i, glob, expanded };
 
     if (word !== null) target = false;
     word = null;
     glob = false;
     quoted = false;
+    expanded = false;
   };
 
   for (; i < cmd.length; i++) {
@@ -341,7 +360,10 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
         yield enter(c);
 
         if (c === "$") i++;
-      } else word = (word ?? "") + c;
+      } else {
+        expanded ||= c === "$";
+        word = (word ?? "") + c;
+      }
     } else if (c === "'") {
       const j = cmd.indexOf("'", i + 1);
       const close = j < 0 ? cmd.length : j;
@@ -391,6 +413,7 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
     } else if (/\s/.test(c)) yield* flush();
     else {
       glob ||= c === "*";
+      expanded ||= c === "$";
       word = (word ?? "") + c;
     }
   }
@@ -410,6 +433,13 @@ interface RunState {
   wrapper: string | null;
   fromInput: boolean;
   bare: boolean;
+  /** A word of the command is built by the shell (a substitution or a variable), so npm's argv is not the text. */
+  expands: boolean;
+  /** A script was named, and a `--` after it hands the rest to the script, so npm reads none of it. */
+  named: boolean;
+  passed: boolean;
+  /** The next word is the value of a wrapper's option. */
+  wrapValue: boolean;
 }
 
 /**
@@ -425,11 +455,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
-  const expands = /[$`]/.test(cmd);
-
   // the simple command being read; `open` holds its references, settled where it ends (a doubt after the name unsets
   // `alone`), and `after` whether the word after a flag is its value (`value`), may be (`maybe`) or is not
-  const fresh = (): RunState => ({ open: [], pm: null, pmEnd: 0, phase: "manager", after: "no", before: [], atStart: true, wrapper: null, fromInput: false, bare: false });
+  const fresh = (): RunState => ({ open: [], pm: null, pmEnd: 0, phase: "manager", after: "no", before: [], atStart: true, wrapper: null, fromInput: false, bare: false, expands: false, named: false, passed: false, wrapValue: false });
 
   let s = fresh();
   // the commands a substitution interrupts, read on where it closes
@@ -438,41 +466,68 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   const takesName = (): boolean => s.pm !== null && (s.phase !== "manager" || s.pm === "yarn" || s.pm === "pnpm");
 
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w)) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !expands && !s.fromInput && setsIgnoreScripts(s.before) });
+    if (Object.hasOwn(scripts, w)) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !s.expands && !s.fromInput && setsIgnoreScripts(s.before) });
+
+    s.named ||= Object.hasOwn(scripts, w);
 
     if (s.after === "maybe") s.after = "no";
     else s.pm = null;
+  };
+
+  const doubt = (): void => {
+    if (!s.passed) for (const r of s.open) r.alone = false;
   };
 
   for (const t of shellWords(cmd)) {
     if (t === null || t === "(" || t === ")") {
       out.push(...s.open);
 
-      if (t === "(") outer.push(s);
+      if (t === "(") {
+        s.expands = true;
+        doubt();
+        outer.push(s);
+      }
+
       s = (t === ")" ? outer.pop() : undefined) ?? fresh();
       continue;
     }
 
     const w = t.word;
 
-    // npm reads its flags anywhere in the invocation, the last one winning, and takes abbreviations and a separate `false`
-    if ((s.bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) for (const r of s.open) r.alone = false;
+    // npm reads its flags anywhere in the invocation up to a `--` after the name, the last one winning, and takes
+    // abbreviations and a separate `false`
+    if ((s.bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) doubt();
     s.bare = w === "--ignore-scripts";
+    s.passed ||= w === "--" && s.named;
+
+    if (t.expanded) {
+      // a word the shell builds is neither a command nor a script name as written, and npm's argv is not the text
+      s.expands = true;
+      doubt();
+      s.atStart = false;
+      s.pm = null;
+      continue;
+    }
 
     if (s.pm === null) {
       const base = w.slice(w.lastIndexOf("/") + 1);
+      const options = s.wrapper === null ? undefined : WRAPPER_OPTIONS.get(s.wrapper);
 
       if (!s.atStart) continue;
 
-      if (PACKAGE_MANAGERS.has(w)) {
+      if (s.wrapValue) {
+        s.wrapValue = false;
+      } else if (PACKAGE_MANAGERS.has(w)) {
         Object.assign(s, { pm: w, pmEnd: t.end, phase: "manager", after: "no", before: [], atStart: false });
-      } else if (s.wrapper === "command" && /^-[pvV]*[vV]/.test(w)) {
-        // `command -v` looks a command up without running it
-        s.atStart = false;
+      } else if (s.wrapper !== null && w.startsWith("-") && w !== "--") {
+        const key = w.split("=")[0] ?? w;
+
+        if (options?.values.has(key)) s.wrapValue = !w.includes("=");
+        else if (!(options?.flags.has(w) || (/^-[A-Za-z]./.test(w) && options?.values.has(w.slice(0, 2))))) s.atStart = false;
       } else if (WRAPPERS.has(base)) {
         s.wrapper = base;
         s.fromInput ||= base === "xargs";
-      } else if (!(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w.startsWith("-")))) s.atStart = false;
+      } else if (!(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w === "--"))) s.atStart = false;
 
       continue;
     }
