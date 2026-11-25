@@ -405,6 +405,53 @@ describe("what still goes to the package manager", () => {
     expect(r.packageJson).toBe(WITH_ZOD);
   });
 
+  test.each([[["udpate"]], [["upd"]], [["upgr"]], [["UPDATE"]], [["Up", "zod"]]])("apm %p is refused as an update", async (argv) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("would fetch new versions apm cannot check. Nothing was run.");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm upgrade with yarn names both of yarn's own update commands", async () => {
+    const r = await apm(["upgrade", "--pm", "yarn"], "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.out + r.err).toContain("yarn upgrade (yarn 1) or yarn up (yarn 2 and later)");
+  });
+
+  test.each([[["ADD", "zod"]], [["Install", "zod"]], [["CI"]], [["Remove", "zod"]], [["LINK", "left-pad"]]])("apm %p is refused: commands are lowercase", async (argv) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("apm's commands are lowercase");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([
+    [["ci", "left-pad"], "apm ci with no packages does not pass left-pad on to bun"],
+    [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
+    [["ci", "--pm", "yarn"], "yarn has no ci; for a frozen install run apm install --frozen-lockfile"],
+  ])("apm %p is refused: %s", async (argv, message) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(message);
+    expectNothingRan(r);
+  });
+
+  test.each([
+    [["ci"], "bun ci"],
+    [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
+    [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
+    [["ci", "--pm", "pnpm", "--prod"], "pnpm ci --prod"],
+  ])("apm %p is the package manager's clean install", async (argv, call) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
+  });
+
   test("apm run dev --help is the package manager's", async () => {
     const r = await apm(["run", "dev", "--help"]);
 

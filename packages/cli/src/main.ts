@@ -2334,8 +2334,23 @@ async function bareInstall(a: Args): Promise<number> {
 function update(a: Args): number {
   const det = pmFor(a, process.cwd());
 
+  const native = det.pm === "yarn" ? "yarn upgrade (yarn 1) or yarn up (yarn 2 and later)" : `${det.pm} update`;
+
   fail(`apm: apm ${a.cmd} would fetch new versions apm cannot check. Nothing was run.`);
-  say(`To check and move a dependency to its newest version, run apm add <package>@latest. To update without apm's check, run ${det.pm} update yourself.`);
+  say(`To check a dependency and move it to the newest version apm allows, run apm add <package>@latest. To update without apm's check, run ${native} yourself.`);
+
+  return 2;
+}
+
+/** `apm ci`: the package manager's clean install, with only the arguments a bare install passes on (none can name a package). */
+async function cleanInstall(a: Args): Promise<number> {
+  const cwd = process.cwd();
+  const det = pmFor(a, cwd);
+  const passed = det.pm === "yarn" ? { error: "yarn has no ci; for a frozen install run apm install --frozen-lockfile" } : bareInstallArgs(a, det.pm);
+
+  if ("args" in passed) return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  fail(`apm: ${passed.error}. Nothing was run.`);
+  say(`For other ${det.pm} ci options, run ${det.pm} ci yourself.`);
 
   return 2;
 }
@@ -2382,6 +2397,17 @@ function refuseArgs(a: Args): boolean {
 async function main(a: Args): Promise<number> {
   if (refuseArgs(a)) return 2;
 
+  const lower = a.cmd.toLowerCase();
+
+  // npm reads an abbreviation or its typo alias udpate as its update, and some package managers read a command in any case
+  if (lower.length >= 2 && ["update", "upgrade", "udpate"].some((word) => word.startsWith(lower))) return update(a);
+
+  if (lower !== a.cmd && (commandOf(lower) !== undefined || INSTALLS.has(lower))) {
+    fail(`apm: ${a.cmd} is not a command; apm's commands are lowercase (apm ${lower}). Nothing was run.`);
+
+    return 2;
+  }
+
   switch (a.cmd) {
     case "--version":
     case "-v":
@@ -2392,10 +2418,8 @@ async function main(a: Args): Promise<number> {
     case "install":
     case "i":
       return a.positional.length > 0 ? cmdAdd(a) : bareInstall(a);
-    case "update":
-    case "up":
-    case "upgrade":
-      return update(a);
+    case "ci":
+      return cleanInstall(a);
     case "x": // also `apm exec` and `apm dlx` (args.ts)
       return cmdX(a);
     case "score":
