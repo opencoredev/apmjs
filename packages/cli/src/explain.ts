@@ -273,7 +273,7 @@ export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string;
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[]; tags?: { tag: string; version: string }[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
@@ -791,6 +791,15 @@ function decide(input: ExplainInput): Decided {
       }
 
       if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      // no version tagged latest, but others tagged (a package with only a prerelease, tagged next): name them
+      const [tagged] = resolved.tags ?? [];
+
+      if (resolved.skipped.length === 0 && resolved.newest === null && tagged !== undefined) {
+        const tags = (resolved.tags ?? []).map((t) => `${quoted(t.tag)} (${quoted(t.version)})`).join(", ");
+
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.`, reasons: [...reasons, `Its tags: ${tags}.`, `To check the version tagged ${quoted(tagged.tag)}: apm explain ${name}@${tagged.tag}`], commands: null, coverage: NOT_READ };
+      }
 
       if (resolved.skipped.length === 0 && resolved.newest === null) {
         return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} matches ${plain(range)}. Check the version or range.`, reasons, commands: null, coverage: NOT_READ };

@@ -231,6 +231,16 @@ describe("apm: publish", () => {
     expect(status).toBe(404);
   });
 
+  // HOME-502 D2: a publish while logged out ended with bun's "run bunx npm login", which signs in to npm
+  test("apm publish without a login says to run apm login", async () => {
+    const sb = makeSandbox(reg);
+    const d = writePackage(work, { name: "no-login-pkg", version: "1.0.0" }, reg);
+    const r = await apm(["publish"], { cwd: d, env: sb.env });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain(`apm: no login token for ${reg.url} found; a publish needs one: run apm login`);
+    expect(r.out).toContain(`You are not logged in to ${reg.url}: run apm login, then apm publish again`);
+  });
+
   test("apm publish refuses locally when a secret would ship, before any upload", async () => {
     const sb = makeSandbox(reg, alice);
     const d = writePackage(work, { name: "oops-secret", version: "1.0.0", files: { "index.js": "module.exports=1;\n", ".env.production": "STRIPE_SECRET_KEY=sk_live_51HxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxQ\n" } }, reg, alice);

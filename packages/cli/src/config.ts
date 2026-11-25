@@ -3,6 +3,8 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { z } from "zod";
+import type { Pm } from "./pm.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -94,6 +96,83 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   }
 
   return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
+}
+
+/** The npm registry, which npm, pnpm and bun install from when nothing names another. */
+const NPM_REGISTRY = "https://registry.npmjs.org/";
+
+/** bunfig.toml's `[install] registry`, a URL or `{ url, token }`, read as its URL. */
+const BunfigRegistry = z.object({ install: z.object({ registry: z.union([z.string(), z.object({ url: z.string() }).loose().transform((r) => r.url)]) }).loose() }).loose();
+
+/** .yarnrc.yml's `npmRegistryServer` (yarn 2 and later). */
+const YarnrcRegistry = z.object({ npmRegistryServer: z.string() }).loose();
+
+/** The registry a bunfig.toml or .yarnrc.yml at `path` names; null when it names none or cannot be read. */
+function fileRegistry(path: string, kind: "bunfig" | "yarnrc"): string | null {
+  if (!existsSync(path)) return null;
+
+  try {
+    const text = readFileSync(path, "utf8");
+
+    switch (kind) {
+      case "bunfig": {
+        const parsed = BunfigRegistry.safeParse(Bun.TOML.parse(text));
+
+        return parsed.success ? parsed.data.install.registry : null;
+      }
+
+      case "yarnrc": {
+        const parsed = YarnrcRegistry.safeParse(Bun.YAML.parse(text));
+
+        return parsed.success ? parsed.data.npmRegistryServer : null;
+      }
+
+      default: {
+        const _exhaustive: never = kind;
+
+        return _exhaustive;
+      }
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The registry `pm` installs from at `cwd` when apm passes nothing (a plain install), read from the files and variables
+ * it reads: for bun, its variables, then bunfig.toml (the project's, then the user's); then npm_config_registry and the
+ * .npmrc files, nearest first; else npm's registry. Yarn's own defaults differ by version, so for yarn it is the
+ * .yarnrc.yml or .npmrc line, or null when neither names one. Only for saying where a plain install goes.
+ */
+export function pmRegistry(input: { pm: Pm; cwd: string; env: Record<string, string | undefined> }): string | null {
+  const { pm, cwd, env } = input;
+  const home = env.HOME ?? homedir();
+  const userconfig = userconfigPath(env);
+  const npmrc = [...projectNpmrcs(cwd, new Set([homedir(), home, dirname(userconfig)])), userconfig].map(readNpmrc).find((f) => f.has("registry"))?.get("registry") ?? null;
+  const fromEnv = env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? null;
+
+  switch (pm) {
+    case "bun": {
+      const bunfig = [join(cwd, "bunfig.toml"), join(env.XDG_CONFIG_HOME ?? join(home, ".config"), ".bunfig.toml"), join(home, ".bunfig.toml")].map((p) => fileRegistry(p, "bunfig")).find((r) => r !== null) ?? null;
+
+      return withSlash(env.BUN_CONFIG_REGISTRY ?? fromEnv ?? bunfig ?? npmrc ?? NPM_REGISTRY);
+    }
+
+    case "npm":
+    case "pnpm":
+      return withSlash(fromEnv ?? npmrc ?? NPM_REGISTRY);
+    case "yarn": {
+      const found = fileRegistry(join(cwd, ".yarnrc.yml"), "yarnrc") ?? npmrc;
+
+      return found === null ? null : withSlash(found);
+    }
+
+    default: {
+      const _exhaustive: never = pm;
+
+      return _exhaustive;
+    }
+  }
 }
 
 /** The token .npmrc files hold for exactly this registry host (never one keyed to another host). */

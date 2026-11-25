@@ -296,6 +296,30 @@ export function encodeName(name: string): string {
   return name.startsWith("@") ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name);
 }
 
+/** A dist-tag and the version it points at. */
+export type DistTag = { tag: string; version: string };
+
+// the packument's dist-tags; a tag or version with any other character is publisher text apm does not print
+const SAFE_TAG = /^[A-Za-z0-9][\w.+-]*$/;
+const DistTags = z.object({ "dist-tags": z.record(z.string(), z.string()) }).loose();
+
+/**
+ * The dist-tags of `name` when none of them is latest (a package with only a prerelease, tagged next), so a refusal of
+ * "no version matching latest" can say which tag to ask for. Empty when it has latest, has no tags, or cannot be read.
+ */
+export async function tagsWithoutLatest(api: Api, name: string): Promise<DistTag[]> {
+  try {
+    const r = await api.raw(encodeName(name));
+    const doc = DistTags.safeParse(r.body);
+
+    if (r.status !== 200 || !doc.success || Object.hasOwn(doc.data["dist-tags"], "latest")) return [];
+
+    return Object.entries(doc.data["dist-tags"]).flatMap(([tag, version]) => (SAFE_TAG.test(tag) && SAFE_TAG.test(version) ? [{ tag, version }] : []));
+  } catch {
+    return [];
+  }
+}
+
 /** Splits "name@range" (scoped names keep their leading @). */
 export function parseSpec(spec: string): { name: string; range: string | null } {
   const at = spec.lastIndexOf("@");
