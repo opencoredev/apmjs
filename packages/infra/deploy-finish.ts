@@ -63,7 +63,15 @@ export async function finishDeploy(input: { alchemyExit: number; smoke: () => Pr
 
   if (input.alchemyExit !== 0) return failed(`Alchemy exited ${input.alchemyExit}`);
 
-  if ((await input.smoke()) !== 0) return failed("the smoke check failed");
+  let smoked: number;
+
+  try {
+    smoked = await input.smoke();
+  } catch (e) {
+    return failed(`the smoke check could not run (${e instanceof Error ? e.message : String(e)})`);
+  }
+
+  if (smoked !== 0) return failed("the smoke check failed");
   let recording: Recording;
 
   try {

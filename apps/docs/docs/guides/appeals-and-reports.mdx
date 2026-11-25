@@ -44,7 +44,7 @@ Include:
 
 When a report is confirmed:
 
-- the version is yanked or revoked, so `apm`, the `~safe` view and the Bun scanner stop installing it;
+- the version is revoked, so its tarball answers 410 and `apm`, the `~safe` view and the Bun scanner refuse it, existing lockfiles included; or it is yanked, so new installs skip it while a lockfile that already pins it from the plain registry still installs it (through `~safe` it answers 404);
 - the package's public log records who reported it and what changed;
 - for a package that comes from npm, apm also reports it to the npm security team and to the OSV database, because apm cannot remove it at the source.
 

@@ -122,7 +122,7 @@ describe("a queued version is pending: waited for, then a warning (strict: block
   });
 
   test("a low score, default mode: printed outside a terminal, the install goes ahead", async () => {
-    stub = stubRegistry({ pendingFor: ["low"], rounds: 0, thenAdvisory: true, thenDescription: (n) => `${n}@1.0.0: scores 12/100 (F), under the floor of 40\n  - Sends data out: index.js:3: fetch(…)\n  http://web.test/package/low/v/1.0.0` });
+    stub = stubRegistry({ pendingFor: ["low"], rounds: 0, thenAdvisory: true, thenDescription: (n) => `${n}@1.0.0: scores 12/100 (F), under the floor of 40\n  - Sends data out: index.js:3: fetch(…)\n  http://web.test/package/low?v=1.0.0` });
     const r = await scan({ strict: false, waitMs: 0, names: ["low"] });
 
     expect(r).toMatchObject({ kind: "advisories", out: [] });

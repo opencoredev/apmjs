@@ -3,6 +3,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { buttonVariants } from "@/components/ui/button";
+import { clickEvent } from "@/lib/databuddy-client";
 
 export const metadata: Metadata = { title: "Page not found · apm" };
 
@@ -20,7 +21,7 @@ export default function NotFound() {
         <Link href="/" className={buttonVariants({ size: "lg" })}>
           Search packages
         </Link>
-        <a href="https://docs.apmjs.dev" className={buttonVariants({ size: "lg", variant: "outline" })}>
+        <a href="https://docs.apmjs.dev" {...clickEvent({ name: "docs_cta_clicked", props: { location: "not_found" } })} className={buttonVariants({ size: "lg", variant: "outline" })}>
           Read the docs
         </a>
       </div>

@@ -91,6 +91,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
+import { KnownMalicious, listedMalicious, maliciousText, type ListedMalicious } from "./osv.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { admitResolve, carriesCredentials, ResolveLimit } from "./resolve-limit.ts";
 import { getRouteOf } from "./routes.ts";
@@ -2937,6 +2938,21 @@ const treeReviews = (tree: Tree) =>
     return out;
   });
 
+/**
+ * The versions among `pkgs` the OSSF malicious-packages feed lists (osv.ts), npm's only: a version published on this
+ * registry is its own artifact, not npm's under that name and version, so the feed's advisories do not name it. Only
+ * that exact version is exempt: another version of the same name is still asked about (review of a02bd4b, finding 2).
+ */
+const listedOnNpm = (pkgs: readonly { name: string; version: string }[]) =>
+  Effect.gen(function* () {
+    // no feed, no database read for it (a walk's statements are counted: tree-walk.test.ts)
+    if (pkgs.length === 0 || Option.isNone(yield* Effect.serviceOption(KnownMalicious))) return [];
+    const rows = yield* Effect.flatMap(Store, (store) => store.versionSizes(pkgs.map((p) => ({ package: p.name, version: p.version }))));
+    const local = new Set(rows.map((r) => `${r.package}@${r.version}`));
+
+    return yield* listedMalicious(pkgs.filter((p) => !local.has(`${p.name}@${p.version}`)));
+  });
+
 /** Whether an apm reviewer confirmed this version malicious. False when this registry runs no AI review. */
 const reviewerConfirmed = (v: VersionRecord) =>
   Effect.gen(function* () {
@@ -3115,6 +3131,7 @@ const resolveWalk = (input: PassInput) =>
     let page = src;
     let pageLease: Lease | null = null;
     const newest = src.versions[0];
+    const knownMalicious: ListedMalicious[] = [];
 
     for (;;) {
       const candidates = page.versions.filter((v) => withheldBlock(v) === null);
@@ -3122,6 +3139,11 @@ const resolveWalk = (input: PassInput) =>
       const current = candidates.slice(0, ROOT_PAGE);
       // whether an apm reviewer confirmed any of this page malicious: one read a page
       const confirmed = yield* confirmedAmong(current);
+      // which of this page the OSSF malicious-packages feed lists: one query a page (osv.ts)
+      // (npm's versions only: a package published here is not the one the feed names)
+      const listed = new Map((page.kind === "upstream" ? yield* listedMalicious(current.map((v) => ({ name, version: v.version }))) : []).map((m) => [m.version, m]));
+
+      for (const m of listed.values()) if (knownMalicious.length < MAX_ROOT_SKIPPED) knownMalicious.push(m);
 
       for (const v0 of page.versions) {
         const held = withheldBlock(v0);
@@ -3140,7 +3162,7 @@ const resolveWalk = (input: PassInput) =>
         // an analysis is attempted only for one apm has not scored or decided on, from npm, and not confirmed malicious
         // (never installed); only an attempt spends a slot, so scored or confirmed newer versions cannot use them up
         // (review of 0126b2b, finding 1)
-        const analysable = !parseAnalysis(v0.score) && page.kind === "upstream" && !v0.unscorable && !confirmed.has(v0.version);
+        const analysable = !parseAnalysis(v0.score) && page.kind === "upstream" && !v0.unscorable && !confirmed.has(v0.version) && !listed.has(v0.version);
         const rootCanWait = analysable && (!mode.strict || cooldownBlock(v0, policy, at) === null);
         const queueRoot = allowance.kind === "all" ? analysable && analyzedCount < 5 : rootCanWait && admit(allowance, "roots", `${name}@${v0.version}`);
 
@@ -3151,7 +3173,8 @@ const resolveWalk = (input: PassInput) =>
         // confirmed malicious comes first: a confirmed version is never waited for, so strict mode's "not scored yet"
         // cannot hold a resolve on one (review of 56229cf, finding 1)
         const policyWhy = mode.strict ? policyBlock(v, policy, at) : null;
-        const block = confirmed.has(v.version) ? CONFIRMED_SKIP : policyWhy;
+        const feedListed = listed.get(v.version);
+        const block = confirmed.has(v.version) ? CONFIRMED_SKIP : feedListed ? maliciousText(feedListed) : policyWhy;
         const report = reportFor(v, at);
         const unscored = report === null ? notScored(page, v) : null;
         // the newest candidate that passes everything but a score it does not have yet: waited for, never skipped
@@ -3181,7 +3204,7 @@ const resolveWalk = (input: PassInput) =>
 
     return answered(
       json(
-        { error: `No version of ${name} matching ${range} passes the policy.${searched}`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null },
+        { error: `No version of ${name} matching ${range} passes the policy.${searched}`, name, range, version: null, skipped, newest: newest ? { version: newest.version, report: embeddedReport(newest, newestReport) } : null, knownMalicious },
         422,
       ),
     );
@@ -3230,6 +3253,13 @@ const rootAnswer = (input: {
 
     if (confirmed.length > 0) {
       return answered(json({ error: `${name}@${v.version} would install ${confirmed.map((c) => `${c.name}@${c.version}`).join(", ")}, which apm reviewers confirmed ${confirmed.length === 1 ? "is" : "are"} malicious.`, name, range, version: null, skipped, newest, tree, confirmed }, 422));
+    }
+
+    // a dependency the OSSF malicious-packages feed lists: refused in every mode, as a confirmed one is (osv.ts)
+    const knownMalicious = yield* listedOnNpm(walked.packages);
+
+    if (knownMalicious.length > 0) {
+      return answered(json({ error: `${name}@${v.version} would install ${knownMalicious.map((m) => `${m.name}@${m.version} (${m.ids.join(", ")})`).join(", ")}, which the OSSF malicious-packages feed lists as malicious.`, name, range, version: null, skipped, newest, tree, knownMalicious }, 422));
     }
 
     if (mode.strict) {
@@ -3455,7 +3485,7 @@ type ScanPending = { package: string; version: string };
  * Bun scanner reads `advisories` instead, where a yanked version is not one: bun installs it from a lockfile, as npm
  * would, and apm add refuses it only because the add makes the project depend on it anew.
  */
-type ScanBlocked = { package: string; version: string; kind: "revoked" | "yanked" | "confirmed" | "integrity"; reason: string };
+type ScanBlocked = { package: string; version: string; kind: "revoked" | "yanked" | "confirmed" | "malicious" | "integrity"; reason: string };
 
 /**
  * One finding of a package's scan. `flagged`: what the default mode installs with a warning and strict mode refuses,
@@ -3482,13 +3512,26 @@ export function scanIntegrity(sent: string | undefined, stored: { integrity: str
 }
 
 /** One package's findings. Whatever its os and cpu, it is checked: the package manager is about to install it. */
-const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined; bundled?: boolean | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy; queueBudget: { left: number } | null }) =>
+const scanOne = (input: { p: { name: string; version: string; integrity?: string | undefined; bundled?: boolean | undefined }; strict: boolean; at: number; lease: Lease; policy: Policy; queueBudget: { left: number } | null; listed: ListedMalicious | undefined }) =>
   Effect.gen(function* () {
-    const { p, strict, at, lease, policy, queueBudget } = input;
+    const { p, strict, at, lease, policy, queueBudget, listed } = input;
     const { webUrl } = yield* RegistryConfig;
     const unchecked = (reason: string): ScanOne[] => [{ kind: "unchecked", unchecked: { package: p.name, version: p.version, reason } }];
     const url = versionUrl(webUrl, p.name, p.version);
     const level = strict ? "fatal" : "warn";
+
+    // listed by the OSSF malicious-packages feed: refused in every mode, before anything else is read, so a lockfile's
+    // version npm has since removed is refused too (osv.ts)
+    if (listed) {
+      const description = `${p.name}@${p.version}: ${maliciousText(listed)}.`;
+
+      const malicious: ScanOne[] = [
+        { kind: "advisory", advisory: { package: p.name, version: p.version, level: "fatal", description, url: `https://osv.dev/vulnerability/${listed.ids[0] ?? ""}` } },
+        { kind: "blocked", blocked: { package: p.name, version: p.version, kind: "malicious", reason: description } },
+      ];
+
+      return malicious;
+    }
 
     const flagged = (warning: InstallWarning, list: Extract<ScanOne, { kind: "flagged" }>["list"]): ScanOne => ({
       kind: "flagged",
@@ -3628,7 +3671,9 @@ export const scanResponse = (req: Request, caller: Caller) =>
     const queueBudget = signedIn ? null : { left: ANONYMOUS_QUEUED_SCAN };
     // the packuments of the packages being checked at once share the request's lease, each under a child of it given
     // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
-    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy, queueBudget })), { concurrency: SCAN_CONCURRENCY });
+    // what the OSSF malicious-packages feed lists among them: one query for the whole scan (osv.ts)
+    const listed = new Map((yield* listedOnNpm(checked)).map((m) => [`${m.name}@${m.version}`, m]));
+    const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy, queueBudget, listed: listed.get(`${p.name}@${p.version}`) })), { concurrency: SCAN_CONCURRENCY });
     const results = reads.flat();
 
     for (const r of results) {
