@@ -204,6 +204,29 @@ describe("node's inline-eval flag is recognised after other flags", () => {
   }
 });
 
+describe("a script reached deep first and shallow later is read from the shallow reach", () => {
+  // `a` holds `npm run x` 7 levels of `sh -c` down, so that reach is past MAX_DEPTH; postinstall's own `npm run x` comes
+  // later and is shallow. What is read must not depend on which reach is found first
+  const deepRef = (ref: string) => Array.from({ length: 7 }).reduce<string>((s) => `sh -c ${JSON.stringify(s)}`, ref);
+
+  for (const { label, ref } of [{ label: "main's reading", ref: "npm run x" }, { label: "a flag-aware reading", ref: "npm run --silent x" }]) {
+    test(`the deep reach is ${label}`, () => {
+      const scripts = { postinstall: "npm run a && npm run x", a: deepRef(ref), x: DROPPER };
+      const [hook] = expandHooks({ scripts });
+
+      expect(hook?.commands.map((c) => c.from)).toContain("scripts.x (run by scripts.postinstall)");
+      expect(hook?.cut).toBeNull();
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
+  test("a reach past MAX_DEPTH with no shallower one is still cut", () => {
+    const [hook] = expandHooks({ scripts: { postinstall: "npm run a", a: deepRef("npm run x"), x: DROPPER } });
+
+    expect(hook?.cut).toContain("nested more than");
+  });
+});
+
 describe("the flags a command may carry are read in linear time", () => {
   // each flag has one reading (`--a` is never `-` then `-a`), or a run of them that never matches backtracks exponentially;
   // and a flag value that names an interpreter (`--conditions=node`) must not start a fresh scan of the flags after it
