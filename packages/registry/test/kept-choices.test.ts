@@ -8,20 +8,22 @@ import { createHash } from "node:crypto";
 import { Effect, Layer, Option } from "effect";
 import { Client } from "pg";
 import { z } from "zod";
-import { analyze, SCORER } from "@apm/core";
+import { analyze, PREVIOUS_SCORER, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { resolveResponse, ResolveWait } from "../src/apm.ts";
+import { apmRoute, resolveResponse, ResolveWait } from "../src/apm.ts";
+import { Auth } from "../src/auth.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import { KEPT_CHOICES_INSERT_LOCK, Store, type StoreApi, type VersionRecord } from "../src/db.ts";
 import { digestLabel, digestOf } from "../src/digest.ts";
 import { ChoicesWriter, driverWriteBytes, keepPlans, KEPT_CHOICES_MAX_AGE_MS, KEPT_CHOICES_MAX_CHOICES, KEPT_CHOICES_MAX_TEXT, keptPlan, KeptSide, KEPT_TEXT_WEIGHTS, utf8Bytes } from "../src/kept-choices.ts";
-import { pageExists, summarize } from "../src/kept-package.ts";
+import { KEPT_VERSIONS, pageExists, summarize } from "../src/kept-package.ts";
 import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
 import { NPM_FAILURE_MS, Upstream } from "../src/upstream.ts";
 import { keptSummary } from "../src/walk-catalog.ts";
+import { measured } from "./pg-proxy.ts";
 
 const NOW = Date.parse("2026-11-12T00:00:00Z");
 const DAY = 86_400_000;
@@ -32,18 +34,31 @@ type Doc = { name: string; version: string; main: string; license: string; depen
 
 const integrityOf = (id: string): string => `sha512-${createHash("sha512").update(id).digest("base64")}`;
 
-/** npm, standing in: packuments with an ETag each, a 304 for a matching If-None-Match, and a switch to fail one. */
+/**
+ * npm, standing in: packuments with an ETag each, a 304 for a matching If-None-Match, and a switch to fail one. A
+ * `name@version` in `bare` lists no checksum; one in `times` was published then (else a day apart, the last 20 days ago).
+ */
 function fakeNpm(initial: Record<string, Doc[]>) {
   const docs = new Map(Object.entries(initial));
   const failing = new Set<string>();
+  const bare = new Set<string>();
+  const times = new Map<string, number>();
   const seen = { bodies: 0, notModified: 0 };
 
   const textOf = (name: string): string | null => {
     const vs = docs.get(name);
 
     if (!vs) return null;
-    const versions = Object.fromEntries(vs.map((d) => [d.version, { ...d, dist: { tarball: `https://npm.invalid/${name}/-/${name}-${d.version}.tgz`, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${d.version}`) } }]));
-    const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(NOW - (20 - i) * DAY).toISOString()]));
+
+    const versions = Object.fromEntries(
+      vs.map((d) => {
+        const tarball = `https://npm.invalid/${name}/-/${name}-${d.version}.tgz`;
+
+        return [d.version, { ...d, dist: bare.has(`${name}@${d.version}`) ? { tarball } : { tarball, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${d.version}`) } }];
+      }),
+    );
+
+    const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(times.get(`${name}@${d.version}`) ?? NOW - (20 - i) * DAY).toISOString()]));
 
     return JSON.stringify({ name, "dist-tags": { latest: vs.at(-1)?.version ?? "" }, versions, time });
   };
@@ -72,7 +87,7 @@ function fakeNpm(initial: Record<string, Doc[]>) {
     },
   });
 
-  return { url: server.url.href, docs, failing, seen, stop: () => server.stop(true) };
+  return { url: server.url.href, docs, failing, bare, times, seen, stop: () => server.stop(true) };
 }
 
 const noBlobs = Layer.succeed(
@@ -957,5 +972,246 @@ describe("kept choices: review of acdb8eb", () => {
       expect(await lists("weak")).toEqual(["b"]);
       expect(await lists("empty")).toEqual(["b"]);
       expect(await lists("strong")).toEqual(["a", "b"]);
+    }));
+});
+
+// Production, 2026-11-25: a resolve or an explain of next read all 61 of its stored analyses (16 MB of JSON, more with
+// each canary) into the Worker, though it scores one version. A resolve now reads the analyses of the versions its
+// choices took, and nothing else of a package's history.
+describe("a resolve reads the analyses of the versions it picks, not every one stored", () => {
+  const manifest = { name: "nextlike", version: "1.0.0", license: "MIT", main: "index.js" };
+  // index.js:1 names credential files: evidence a reviewer can dismiss
+  const files = [{ path: "package.json", data: JSON.stringify(manifest) }, { path: "index.js", data: "module.exports = { deny: ['.env', '.npmrc'] };\n" }].map((f) => ({ path: f.path, size: f.data.length, mode: 0o644, data: encoder.encode(f.data) }));
+  const analysis = analyze({ name: "nextlike", manifest, files, publisher: "a", previousPublishers: [] });
+
+  const fail = (): never => {
+    throw new Error("no digest");
+  };
+
+  const digest = (version: string): string => digestLabel(digestOf({ integrity: integrityOf(`nextlike@${version}`), shasum: "1".repeat(40) }) ?? fail());
+
+  /**
+   * next's shape: 60 analyses of about 270 kB (16 MB) of versions it no longer lists, and the four it lists: 1.0.0 scored
+   * with as large an analysis, 1.0.1 by apm-score-v10 only (reused), 1.0.2 decided unreadable, and the latest, 1.0.3,
+   * by both scorers (the current one's counts) with a live dismissal of real evidence.
+   */
+  async function seed(npm: ReturnType<typeof fakeNpm>, sql: (q: string, p?: unknown[]) => Promise<unknown[]>): Promise<number> {
+    npm.docs.set("nextlike", ["1.0.0", "1.0.1", "1.0.2", "1.0.3"].map((v) => doc("nextlike", v)));
+    npm.docs.set("uses-nextlike", [doc("uses-nextlike", "1.0.0", { nextlike: "^1.0.0" })]);
+
+    const insert = (version: string, d: string, scorer: string, a: Scored) =>
+      sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('nextlike', $1, $2, $3, $4::jsonb, 1)", [version, d, scorer, JSON.stringify(a)]);
+
+    const big = { ...analysis, padding: "x".repeat(270_000) };
+
+    await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) SELECT 'nextlike', '0.0.' || i, 'old' || i, $1, $2::jsonb, 1 FROM generate_series(1, 60) i", [SCORER, JSON.stringify(big)]);
+    await insert("1.0.0", digest("1.0.0"), SCORER, big);
+    await insert("1.0.1", digest("1.0.1"), PREVIOUS_SCORER, { ...analysis, coverage: { kind: "complete" }, scorer: PREVIOUS_SCORER });
+    await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ('nextlike', '1.0.2', $1, 'unreadable', 'x', $2, 1)", [SCORER, digest("1.0.2")]);
+    await insert("1.0.3", digest("1.0.3"), PREVIOUS_SCORER, { ...analysis, coverage: { kind: "complete" }, scorer: PREVIOUS_SCORER });
+    await insert("1.0.3", digest("1.0.3"), SCORER, analysis);
+    await sql("INSERT INTO evidence_dismissals (scorer, package, version, digest, signal, file, line, reason, dismissed_by, dismissed_at) VALUES ($1, 'nextlike', '1.0.3', $2, 'credential-mention', 'index.js', 1, 'a deny list', 'admin', 1)", [SCORER, digest("1.0.3")]);
+    await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('uses-nextlike', '1.0.0', $1, $2, $3::jsonb, 1)", [digestLabel(digestOf({ integrity: integrityOf("uses-nextlike@1.0.0"), shasum: "1".repeat(40) }) ?? fail()), SCORER, JSON.stringify(analysis)]);
+    const [stored] = await sql("SELECT sum(octet_length(analysis::text))::bigint AS bytes FROM upstream_analysis WHERE package = 'nextlike'");
+
+    return z.object({ bytes: z.coerce.number() }).parse(stored).bytes;
+  }
+
+  test("chosen scores the versions it picks as a read of the whole history scores them, and reads only theirs", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const history = await seed(npm, sql);
+      const proxy = await measured(url);
+
+      try {
+        const layers = Layer.provideMerge(Upstream.layer(npm.url, 60_000, null), Layer.mergeAll(Store.postgres(proxy.url), Clock.fixed({ now: NOW, wallNow: NOW }), noBlobs, Layer.succeed(RegistryConfig, settings(npm.url))));
+        const shown = (vs: readonly VersionRecord[]) => vs.map((v) => JSON.stringify([v.version, v.score, v.unscorable ?? null]));
+        const picks = { latest: ["1.0.3"], each: ["1.0.0", "1.0.1", "1.0.2", "1.0.3"] };
+        const choices = Object.entries(picks).map(([key, wanted]) => ({ key, choose: <V extends { version: string }>(pkg: { readonly versions: readonly V[] }) => pkg.versions.filter((v) => wanted.includes(v.version)) }));
+
+        const run = async <A>(program: Effect.Effect<A, unknown, Upstream>): Promise<{ got: A; bytes: number }> => {
+          const lease = new MemoryPool().request();
+          const before = proxy.total();
+
+          try {
+            const got = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.provideService(RequestMemory, lease), Effect.scoped));
+
+            return { got, bytes: proxy.total() - before };
+          } finally {
+            lease.release();
+          }
+        };
+
+        // the scores as a read of every stored analysis gives them (Upstream.summaries reads the whole package's)
+        const whole = await run(
+          Effect.flatMap(Upstream, (up) => up.summaries(["nextlike"], new MemoryPool().request(), (pkg) => ({ summary: Object.fromEntries(Object.entries(picks).map(([key, wanted]) => [key, shown(pkg.versions.filter((v) => wanted.includes(v.version)))])), weight: 0 }))),
+        );
+
+        const picked = await run(
+          Effect.flatMap(Upstream, (up) =>
+            up.chosen({ names: ["nextlike"], lease: new MemoryPool().request(), choices: () => choices, keep: (c) => ({ summary: Object.fromEntries([...c.versions].map(([key, vs]) => [key, shown(vs)])), weight: 0 }) }),
+          ),
+        );
+
+        const expected = whole.got.get("nextlike");
+        const got = picked.got.get("nextlike");
+
+        expect(expected?.kind).toBe("found");
+        expect(got).toEqual(expected ?? { kind: "unknown" });
+        // the same scores: the current scorer's over v10's, v10's reused, the outcome, the dismissal applied
+        const latest = expected?.kind === "found" ? (expected.summary.latest ?? []) : [];
+
+        expect(latest.join()).toContain("a deny list");
+        expect(expected?.kind === "found" ? expected.summary.each?.[2] : undefined).toContain("unreadable");
+        // 16 MB stored; chosen read 1.0.0's 270 kB and the three small ones, the whole read all of it
+        expect(history).toBeGreaterThan(16_000_000);
+        expect(whole.bytes).toBeGreaterThan(history);
+        expect(picked.bytes).toBeLessThan(270_000 + 64 * 1024);
+      } finally {
+        proxy.close();
+      }
+    }));
+
+  test("a resolve of the package, and of one that depends on it, reads the analyses of the versions it picks from only", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const history = await seed(npm, sql);
+      const proxy = await measured(url);
+
+      try {
+        for (const name of ["nextlike", "uses-nextlike"]) {
+          const before = proxy.total();
+          const r = await resolve({ url: proxy.url, npm: npm.url, name });
+          const bytes = proxy.total() - before;
+
+          expect(r.status).toBe(200);
+          expect(r.text).toContain('"nextlike"');
+          expect(r.text).toContain("1.0.3");
+          // what it reads does not grow with the 16 MB of history: at most the listed versions' analyses (the root's
+          // page of candidates is all four, 1.0.0's 270 kB among them) and the other statements' rows
+          expect(history).toBeGreaterThan(16_000_000);
+          expect(bytes).toBeLessThan(270_000 + 64 * 1024);
+        }
+      } finally {
+        proxy.close();
+      }
+    }));
+
+  /** An apm route's answer for `path` at NOW, read from the database at `url` and npm at `npmUrl`. */
+  async function routed(url: string, npmUrl: string, path: string): Promise<{ status: number; text: string }> {
+    // Better Auth is built on first use only, and these routes never sign anyone in
+    const auth = Auth.layer({ databaseUrl: url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+
+    const layers = Layer.provideMerge(
+      Layer.mergeAll(Upstream.layer(npmUrl, 60_000, null), auth),
+      Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(npmUrl)), RequestMemory.layer(new MemoryPool())),
+    );
+
+    const req = new Request(`http://registry.test${path}`);
+    const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+  }
+
+  // Production, 2026-11-25: /package/next read every one of next's stored analyses, whole, on every view (the package
+  // answer, the score answer, a version's answer), and popular-scores read them twice for latest's score
+  test("the package page, the score and version answers and latest's score read only the versions they show", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const history = await seed(npm, sql);
+      const proxy = await measured(url);
+
+      const route = async (path: string) => {
+        const before = proxy.total();
+        const got = await routed(proxy.url, npm.url, path);
+
+        return { ...got, bytes: proxy.total() - before };
+      };
+
+      try {
+        // the first package answer reads npm's packument, the second the summary the first kept
+        for (const path of ["/-/apm/v1/packages/nextlike", "/-/apm/v1/packages/nextlike", "/-/apm/v1/score/nextlike", "/-/apm/v1/score/nextlike/1.0.1", "/-/apm/v1/packages/nextlike/versions/1.0.0", "/-/apm/v1/packages/nextlike/versions/1.0.2", "/-/apm/v1/popular-scores?names=nextlike", "/-/apm/v1/names?q=nextlike", "/-/package/nextlike/dist-tags", "/-/apm/v1/packages/nextlike/events"]) {
+          const r = await route(path);
+
+          expect(r.status).toBe(200);
+          // 16 MB stored; at most 1.0.0's 270 kB analysis twice (the version answer of 1.0.0: the page read's, and
+          // npm's packument's when the summary cannot answer it) and the rest of the statements' rows
+          expect(history).toBeGreaterThan(16_000_000);
+          expect(r.bytes).toBeLessThan(2 * 270_000 + 64 * 1024);
+        }
+
+        expect((await route("/-/apm/v1/packages/nextlike")).text).toContain('"score":');
+        expect((await route("/-/apm/v1/score/nextlike/1.0.1")).text).toContain('"previous":{"version":"1.0.0"');
+      } finally {
+        proxy.close();
+      }
+    }));
+
+  // Review of ef5ace1: a version npm lists no checksum for has no digest, so it was left out of the versions read, and
+  // the outcome the worker stores for it (unavailable, no digest) with it: it showed as queued for analysis
+  test("a picked or shown version npm lists no checksum for keeps its unavailable outcome", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("bare", [doc("bare", "1.0.0"), doc("bare", "1.0.1")]);
+      npm.bare.add("bare@1.0.1");
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('bare', '1.0.0', $1, $2, $3::jsonb, 1)", [digestLabel(digestOf({ integrity: integrityOf("bare@1.0.0"), shasum: "1".repeat(40) }) ?? fail()), SCORER, JSON.stringify(analysis)]);
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ('bare', '1.0.1', $1, 'unavailable', 'the upstream publishes no checksum for this version', NULL, 1)", [SCORER]);
+      const resolved = await resolve({ url, npm: npm.url, name: "bare" });
+
+      expect(resolved.body.version).toBe("1.0.1");
+      expect(resolved.text).toContain('"unscorable":"unavailable"');
+      expect(resolved.text).not.toContain("queued for analysis");
+
+      for (const path of ["/-/apm/v1/packages/bare", "/-/apm/v1/packages/bare", "/-/apm/v1/packages/bare/versions/1.0.1"]) {
+        const r = await routed(url, npm.url, path);
+
+        expect(r.status).toBe(200);
+        expect(r.text).toContain("the upstream publishes no checksum for this version");
+        expect(r.text).not.toContain('"kind":"queued"');
+      }
+    }));
+
+  // Review of ef5ace1: a package page reads the analyses of the versions it shows and keeps, so one scored only in an
+  // older version its summary leaves out was not kept, where a read of its whole history kept it. Review of e68dcd8:
+  // deciding that by reading those older analyses read all 16 MB of next's history again, whatever the trim left
+  test("a package scored only in versions its summary leaves out is kept, and deciding so reads none of their analyses", () =>
+    withRig(async ({ url, npm, sql }) => {
+      // next's shape: 60 analyses of about 270 kB, of none of the newest KEPT_VERSIONS versions, in a member no trim drops
+      const versions = Array.from({ length: KEPT_VERSIONS + 60 }, (_, i) => `0.0.${i + 1}`);
+      const label = (name: string, v: string) => digestLabel(digestOf({ integrity: integrityOf(`${name}@${v}`), shasum: "1".repeat(40) }) ?? fail());
+      const big = { ...analysis, padding: "x".repeat(270_000) };
+
+      // and a package kept without a score (KEPT_WITHOUT_SCORE) that apm could only decide it cannot score, long ago
+      for (const name of ["oldscored", "@next/swc-oldonly"]) {
+        npm.docs.set(name, versions.map((v) => doc(name, v)));
+
+        for (const [i, v] of versions.entries()) npm.times.set(`${name}@${v}`, NOW - (400 - i) * DAY);
+      }
+
+      for (const v of versions.slice(0, 60)) {
+        await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('oldscored', $1, $2, $3, $4::jsonb, 1)", [v, label("oldscored", v), SCORER, JSON.stringify(big)]);
+      }
+
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ('@next/swc-oldonly', '0.0.1', $1, 'too-large', 'over the cap', $2, 1)", [SCORER, label("@next/swc-oldonly", "0.0.1")]);
+      const [stored] = await sql("SELECT sum(octet_length(analysis::text))::bigint AS bytes FROM upstream_analysis WHERE package = 'oldscored'");
+      const proxy = await measured(url);
+
+      try {
+        for (const name of ["oldscored", "@next/swc-oldonly"]) {
+          const before = proxy.total();
+          const r = await routed(proxy.url, npm.url, `/-/apm/v1/packages/${encodeURIComponent(name)}`);
+
+          expect(r.status).toBe(200);
+          // no row yet: the page reads npm's packument, and admission asks only whether the older versions have one
+          expect(proxy.total() - before).toBeLessThan(50_000);
+        }
+      } finally {
+        proxy.close();
+      }
+
+      const kept = z.array(z.object({ package: z.string(), versions: z.coerce.number() })).parse(await sql("SELECT package, jsonb_array_length(summary -> 'versions') AS versions FROM kept_packages ORDER BY package"));
+
+      expect(z.object({ bytes: z.coerce.number() }).parse(stored).bytes).toBeGreaterThan(16_000_000);
+      // 0.0.1 to 0.0.60 are not among the versions kept: the newest KEPT_VERSIONS by publish time and by number
+      expect(kept).toEqual([
+        { package: "@next/swc-oldonly", versions: KEPT_VERSIONS },
+        { package: "oldscored", versions: KEPT_VERSIONS },
+      ]);
     }));
 });
