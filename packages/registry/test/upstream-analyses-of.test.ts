@@ -1,21 +1,22 @@
-// upstreamAnalysesOf reads at most ANALYSES_BUDGET of analyses in a round trip: every stored analysis of next as one
-// jsonb_agg value was tens of MB, and production's connection dropped it, so resolve answered 503 for next (2026-11-25).
-// Against the real Postgres store: what it returns is what upstreamAnalyses (one package, one statement) returns, and no
-// row the server sends holds more than the budget.
+// upstreamAnalysesOf sends each stored analysis as a row of its own: every stored analysis of next as one jsonb_agg
+// value was tens of MB, and production's connection dropped it, so resolve answered 503 for next (2026-11-25). Against
+// the real Postgres store: what it returns is what upstreamAnalyses (one package, one statement) returns, and no row the
+// server sends holds more than one analysis.
 import { describe, expect, test } from "bun:test";
 import { createServer, connect } from "node:net";
 import { Effect } from "effect";
 import { Client } from "pg";
 import { z } from "zod";
-import { analyze, PREVIOUS_SCORER, SCORER, type Analysis } from "@apm/core";
+import { analyze, parseAnalysis, PREVIOUS_SCORER, SCORER, type Analysis } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
-import { ANALYSES_BUDGET, Store } from "../src/db.ts";
+import { Store } from "../src/db.ts";
 
 const enc = new TextEncoder();
 const manifest = { name: "pkg", version: "1.0.0", license: "MIT", main: "index.js" };
 
+/** An analysis with one dismissable item: index.js:1 names credential files. */
 function base(): Analysis {
-  const files = [{ path: "package.json", data: JSON.stringify(manifest) }, { path: "index.js", data: "module.exports = 1;\n" }].map((f) => ({ path: f.path, size: f.data.length, mode: 0o644, data: enc.encode(f.data) }));
+  const files = [{ path: "package.json", data: JSON.stringify(manifest) }, { path: "index.js", data: "module.exports = { deny: ['.env', '.npmrc'] };\n" }].map((f) => ({ path: f.path, size: f.data.length, mode: 0o644, data: enc.encode(f.data) }));
 
   return analyze({ name: "pkg", manifest, files, publisher: "a", previousPublishers: [] });
 }
@@ -92,10 +93,10 @@ async function measured(url: string): Promise<{ url: string; largest: () => numb
   return { url: proxied.toString(), largest: () => largest, close: () => server.close() };
 }
 
-describe("upstreamAnalysesOf reads analyses a budget at a time", () => {
-  test("it returns what upstreamAnalyses returns, across pages, scorers, dismissals and outcomes", async () => {
+describe("upstreamAnalysesOf reads one analysis a row", () => {
+  test("it returns what upstreamAnalyses returns, across packages, scorers, dismissals and outcomes", async () => {
     await withDatabase(async ({ sql, url }) => {
-      // one's analyses of 1 MiB fill several budgets, so they come in pages; two's small ones all come with the keys
+      // one's analyses are 1 MiB each, two's small
       const big = { ...base(), padding: "x".repeat(1024 * 1024) };
       const count = 11;
 
@@ -110,7 +111,7 @@ describe("upstreamAnalysesOf reads analyses a budget at a time", () => {
         await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ($1, '3.0.0', $2, 'unreadable', 'x', 'f1', 1)", [name, SCORER]);
       }
 
-      await sql("INSERT INTO evidence_dismissals (scorer, package, version, digest, signal, file, line, reason, dismissed_by, dismissed_at) VALUES ($1, 'one', '1.0.1', 'd1', 'encoded-data', 'index.js', 1, 'a font table', 'admin', 1)", [SCORER]);
+      await sql("INSERT INTO evidence_dismissals (scorer, package, version, digest, signal, file, line, reason, dismissed_by, dismissed_at) VALUES ($1, 'one', '1.0.1', 'd1', 'credential-mention', 'index.js', 1, 'a deny list', 'admin', 1)", [SCORER]);
       const many = await run(url, Effect.flatMap(Store, (s) => s.upstreamAnalysesOf(["one", "two", "none"])));
 
       expect([...many.keys()].sort()).toEqual(["one", "two"]);
@@ -123,24 +124,41 @@ describe("upstreamAnalysesOf reads analyses a budget at a time", () => {
         expect([...(got?.scores ?? [])].sort()).toEqual([...one.scores].sort());
         expect([...(got?.unscorable ?? [])]).toEqual([...one.unscorable]);
       }
+
+      // the dismissal is for evidence the analysis has: it moves from the signal to dismissed, for those bytes only
+      expect(base().signals.some((s) => s.id === "credential-mention")).toBe(true);
+      const dismissed = parseAnalysis(many.get("one")?.scores.get("1.0.1 d1"));
+      const other = parseAnalysis(many.get("one")?.scores.get("1.0.2 d2"));
+
+      expect(dismissed?.dismissed?.map((d) => [d.signal, d.file, d.line, d.reason])).toEqual([["credential-mention", "index.js", 1, "a deny list"]]);
+      expect(dismissed?.signals.some((s) => s.id === "credential-mention")).toBe(false);
+      expect(other?.dismissed ?? []).toEqual([]);
+      expect(other?.signals.some((s) => s.id === "credential-mention")).toBe(true);
     });
   });
 
-  test("no row of the reply holds more than the budget, however many analyses a package has", async () => {
+  // the rows of each package as one value: next-like, 60 analyses of about 270 kB (16 MB), and 3000 small ones
+  test.each([
+    { name: "next-like", count: 60, padding: 270_000 },
+    { name: "many-small", count: 3000, padding: 0 },
+  ])("no row of the reply holds more than one analysis: $name", async ({ name, count, padding }) => {
     await withDatabase(async ({ sql, url }) => {
-      // 30 analyses of about 600 kB each: 18 MB as the one value the read was before
-      const analysis = { ...base(), padding: "x".repeat(600_000) };
-      const size = JSON.stringify(analysis).length;
-
-      for (let i = 0; i < 30; i++) await insert(sql, { name: "huge", version: `1.0.${i}`, digest: `d${i}`, scorer: SCORER, analysis });
+      await sql(
+        "INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) SELECT $1, '1.0.' || i, 'd' || i, $2, $3::jsonb, 1 FROM generate_series(1, $4::int) i",
+        [name, SCORER, JSON.stringify({ ...base(), padding: "x".repeat(padding) }), count],
+      );
+      const [sizes] = await sql("SELECT max(octet_length(analysis::text)) AS one, sum(octet_length(analysis::text)) AS every FROM upstream_analysis");
+      const { one, every } = z.object({ one: z.coerce.number(), every: z.coerce.number() }).parse(sizes);
       const proxy = await measured(url);
 
       try {
-        const got = await run(proxy.url, Effect.flatMap(Store, (s) => s.upstreamAnalysesOf(["huge"])));
+        const got = await run(proxy.url, Effect.flatMap(Store, (s) => s.upstreamAnalysesOf([name])));
 
-        expect(got.get("huge")?.scores.size).toBe(30);
-        expect(proxy.largest()).toBeGreaterThan(size);
-        expect(proxy.largest()).toBeLessThan(ANALYSES_BUDGET + 64 * 1024);
+        expect(got.get(name)?.scores.size).toBe(count);
+        expect(every).toBeGreaterThan(10 * one);
+        expect(proxy.largest()).toBeGreaterThan(one);
+        // the analysis and its key, kind and place in the reply
+        expect(proxy.largest()).toBeLessThan(one + 1024);
       } finally {
         proxy.close();
       }
