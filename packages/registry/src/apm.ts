@@ -1458,9 +1458,10 @@ function withheldOf(input: { src: Source; confirmedRows: readonly ConfirmedRevie
 }
 
 /**
- * withheldOf for a page's lookup. A kept summary of a package with more than KEPT_VERSIONS versions holds only the newest
- * (kept-package.ts), so when its latest is withheld and no stable version it holds is served, the packument's latest may
- * be an older stable one it left out: only then is npm's whole listing read (lookupWithin), and its dist-tags used.
+ * withheldOf for a page's lookup, with the record of the latest it serves. A kept summary of a package with more than
+ * KEPT_VERSIONS versions holds only the newest (kept-package.ts), so when its latest is withheld and no stable version it
+ * holds is served, the packument's latest may be an older stable one it left out: only then is npm's whole listing read
+ * (lookupWithin, without scores: the version shown is read again on its own), and its dist-tags and latest used.
  */
 const withheldFor = (found: { src: Source; confirmed: readonly ConfirmedReview[]; advisories: readonly Advisory[] }, lease: Lease) =>
   Effect.gen(function* () {
@@ -1468,13 +1469,15 @@ const withheldFor = (found: { src: Source; confirmed: readonly ConfirmedReview[]
     const withheld = withheldOf({ src, confirmedRows: found.confirmed, advisories: found.advisories });
     const latest = src.distTags.latest;
     const short = src.kind === "upstream" && src.versions.length >= KEPT_VERSIONS && latest !== undefined && withheld.refusals.has(latest) && !src.versions.some((v) => !v.version.includes("-") && !withheld.refusals.has(v.version));
+    const served = { ...withheld, latest: src.versions.find((v) => v.version === withheld.distTags.latest) ?? null };
 
-    if (!short) return withheld;
-    const whole = yield* lookupWithin(src.name, lease);
+    if (!short) return served;
+    const whole = yield* lookupWithin(src.name, lease, NO_SCORES);
 
-    if (whole === null || whole === "unknown" || whole === "over-budget") return withheld;
+    if (whole === null || whole === "unknown" || whole === "over-budget") return served;
+    const { distTags } = withheldOf({ src: whole, confirmedRows: found.confirmed, advisories: found.advisories });
 
-    return { refusals: withheld.refusals, distTags: withheldOf({ src: whole, confirmedRows: found.confirmed, advisories: found.advisories }).distTags };
+    return { refusals: withheld.refusals, distTags, latest: whole.versions.find((v) => v.version === distTags.latest) ?? null };
   });
 
 /** The package answer did not fit the request's lease: the same 503 as a packument that did not (upstreamRoute). */
@@ -1501,8 +1504,7 @@ const packageResponse = (name: string) =>
     // the row lookup read, so the answer and the versions come from one read of it
     const local = src.kind === "local" ? src.pkg : null;
     // what the packuments withhold, so latest and the dist-tags here are the ones installs get
-    const { refusals, distTags } = yield* withheldFor(found, lease);
-    const latest0 = src.versions.find((v) => v.version === distTags.latest) ?? null;
+    const { refusals, distTags, latest: latest0 } = yield* withheldFor(found, lease);
     // a latest moved off a withheld version came without PAGE_TRIMMED's members (pageScores reads npm's latest whole):
     // its record is read again, whole, so its capabilities and unread files are not lost
     const moved = latest0 !== null && latest0.version !== src.distTags.latest ? ((yield* pageLookup(name, lease, { kind: "version", version: latest0.version }))?.src.versions.find((v) => v.version === latest0.version) ?? latest0) : latest0;

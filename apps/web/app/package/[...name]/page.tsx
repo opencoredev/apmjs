@@ -29,6 +29,7 @@ import { versionCountLabel } from "@/lib/version-count";
 import { chooseVersion, rowsWith, selectVersion, sharedDefault, sharedShown } from "@/lib/shown-version";
 import { buttonVariants } from "@/components/ui/button";
 import { REGISTRY } from "@/lib/registry-url";
+import { inCooldown } from "@/lib/install-note";
 import { askedVersion, shownOf } from "@/lib/early-answer";
 import { startPackageReads } from "@/lib/package-reads";
 import { cutReadme, EXTERNAL_REL, renderReadme } from "@/lib/readme";
@@ -528,10 +529,10 @@ export async function generateMetadata({ params, searchParams }: PageProps): Pro
       return pageMetadata({ title: `${pkg.name} · apm`, description: `The apm security score and install policy for ${pkg.name}.`, path: canonicalPackagePath(pkg.name), image: ogPath(pkg.name), imageAlt: `${pkg.name} on apm` });
     case "shown": {
       const share = sharedShown({ pkg, version: selected.version, read: selected.read });
-      // a shared ?v= link gets that version's card; the canonical URL stays the package's
-      const image = asked === undefined ? ogPath(pkg.name) : `${ogPath(pkg.name)}?v=${encodeURIComponent(selected.version)}`;
+      const meta = { name: pkg.name, description: pkg.description, latest: share.version, score: share.score };
 
-      return packageMetadata({ name: pkg.name, description: pkg.description, latest: share.version, score: share.score, image });
+      // a shared ?v= link keeps it in its card and Markdown alternate; the canonical URL stays the package's
+      return packageMetadata(asked === undefined ? meta : { ...meta, v: asked });
     }
 
     default: {
@@ -716,9 +717,6 @@ function NoInstallableVersion({ pkg, why }: { pkg: PackageInfo; why: NoInstallab
     </div>
   );
 }
-
-/** How long apm's cooldown holds a new version back (packages/core DEFAULT_POLICY.cooldownMs). */
-const COOLDOWN_MS = 24 * 60 * 60_000;
 
 /** The advisory ids of a known-malicious refusal, each linking to its OSV page. */
 function AdvisoryLinks({ ids }: { ids: readonly string[] }) {
@@ -935,7 +933,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const refusal = shownRow ? refusalOf(shownRow) : details ? refusalOf(details) : null;
   // what installs get instead: the version installs get by name, unless that is the version refused
   const served = refusal && byName.kind === "latest" && byName.version !== version ? byName.version : null;
-  const inCooldown = shownRow !== undefined && refusal === null && Date.now() - Date.parse(shownRow.publishedAt) < COOLDOWN_MS;
+  const fresh = refusal === null && inCooldown({ publishedAt: shownRow?.publishedAt ?? details?.publishedAt, now: Date.now() });
   const versionRows = pkg.versions.toSorted((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).map((v) => ({ ...v, when: ago(v.publishedAt) }));
   const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
   const signInHref = `/signin?next=${encodeURIComponent(here)}`;
@@ -971,7 +969,12 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
           </Suspense>
         </div>
         {refusal && version && <RefusalBanner name={pkg.name} version={version} refusal={refusal} served={served} />}
-        {tag && asked === undefined && (
+        {asked === undefined && version === pkg.latest && install.kind !== "default" && (
+          <p className="text-sm text-muted-foreground">
+            This prerelease is tagged latest, and apm add does not install a prerelease by name, so installs {tag ? <>name its other tag, <span className="font-mono text-foreground">{tag}</span></> : "pin the version"}.
+          </p>
+        )}
+        {tag && asked === undefined && version !== pkg.latest && (
           <p className="text-sm text-muted-foreground">
             {pkg.latest === null ? "No version is tagged latest yet." : `apm does not install ${pkg.latest}, the version tagged latest.`} This is the newest, tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.
           </p>
@@ -1027,7 +1030,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
       <div className="flex flex-col gap-10 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-14">
         <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
           <div className="order-1 lg:order-none">
-            {refusal && version ? <NoInstall name={pkg.name} version={version} served={served} /> : <InstallTabs name={pkg.name} version={version} install={install} inCooldown={inCooldown} registry={REGISTRY} />}
+            {refusal && version ? <NoInstall name={pkg.name} version={version} served={served} /> : <InstallTabs name={pkg.name} version={version} install={install} inCooldown={fresh} registry={REGISTRY} />}
           </div>
 
           <section aria-labelledby="score" className="order-4 lg:order-none">

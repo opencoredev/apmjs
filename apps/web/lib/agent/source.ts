@@ -25,6 +25,8 @@ export type VersionInfo = {
   unscorable: { reason: string; text: string } | null;
   /** Why the registry does not serve this version (confirmed or known malicious); absent from an older registry. */
   refused?: Refused | null;
+  /** When it was published; absent from an older registry. */
+  publishedAt?: string | null;
 };
 
 /** The whole name check (GET /-/apm/v1/names without `part`): the three parts in one answer. */

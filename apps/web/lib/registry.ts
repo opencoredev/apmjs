@@ -228,6 +228,8 @@ const VersionInfo = z.object({
   score: PackageScore.nullable(),
   unscorable: VersionUnscorable.nullable().default(null),
   refused: Refused.nullish(),
+  // when it was published: picks among tag targets the package answer does not list (shown-version.ts), and the cooldown
+  publishedAt: z.string().nullish(),
 });
 
 /** The per-version answer: one version's state, facts and score. */

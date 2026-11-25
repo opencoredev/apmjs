@@ -2,7 +2,7 @@
 // tool. The same facts as the HTML page, in the order an agent deciding on an install needs them. Pure.
 import { isNotAllRead, NOT_ALL_READ_INSTALLS, scoreOnWhatWasRead, skippedSentence } from "../coverage";
 import { citeEvidence, namesFile } from "../evidence";
-import { installCommand, installNote, INSTALL_CLIENTS, specSuffix, type InstallSpec } from "../install-note";
+import { cooldownText, installCommand, installNote, INSTALL_CLIENTS, specSuffix, type InstallSpec } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
@@ -36,6 +36,8 @@ export type PackageView = {
   review: Fetched<ReviewAnswer>;
   /** The same selection the HTML page makes for the same URL, so both name the same release the same way. */
   install: InstallTarget;
+  /** The shown version was published in the last 24 hours (decided where the view is loaded, which reads the clock); absent: not known to be. */
+  inCooldown?: boolean;
   /** The registry URL install config points at, ending in "/". */
   registry: string;
 };
@@ -282,7 +284,8 @@ export function packageMarkdown(input: PackageView): string {
   const refusal = view.status ? refusalOf({ status: view.status.status, refused: view.refused }) : null;
   const unscorable = unscorableOf(view);
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
-  const shownNote = tag ? ` (tagged ${inlineCode(tag)}; ${pkg.latest === null ? "no version is tagged latest" : `latest is ${versionText(pkg.latest)}`})` : older ? ` (${pkg.latest ? `latest is ${versionText(pkg.latest)}` : "no version is tagged latest"})` : version ? " (latest)" : "";
+  const latestByTag = version !== null && version === pkg.latest && install.kind !== "default";
+  const shownNote = latestByTag ? ` (latest, a prerelease; installs ${tag ? `name its tag ${inlineCode(tag)}` : "pin it"})` : tag ? ` (tagged ${inlineCode(tag)}; ${pkg.latest === null ? "no version is tagged latest" : `latest is ${versionText(pkg.latest)}`})` : older ? ` (${pkg.latest ? `latest is ${versionText(pkg.latest)}` : "no version is tagged latest"})` : version ? " (latest)" : "";
 
   out.push(
     `- Version shown: ${version ? versionText(version) : "none published"}${shownNote}`,
@@ -292,7 +295,7 @@ export function packageMarkdown(input: PackageView): string {
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
     `- Score: ${score ? scoreLine({ name: pkg.name, score, unpackedSize: view.facts?.unpackedSize ?? null }) : unscorable !== null ? "none: apm cannot score this version" : "not scored yet"}`,
-    `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : tag !== null && pkg.latest !== null ? `?v=${encodeURIComponent(tag)}` : ""}`,
+    `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : tag !== null && pkg.latest !== null && version !== pkg.latest ? `?v=${encodeURIComponent(tag)}` : ""}`,
     `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
     "",
     UNTRUSTED_NOTE,
@@ -307,7 +310,9 @@ export function packageMarkdown(input: PackageView): string {
   if (withheldRows.length > 0) {
     const why = (r: Refused) => (r.kind === "known-malicious" ? `listed as malicious by the OSSF malicious-packages feed (${r.ids.map((id) => inlineCode(id)).join(", ")})` : "confirmed malicious by apm reviewers");
 
-    out.push("## Versions apm does not serve", "", ...withheldRows.map((v) => `- ${versionText(v.version)}: ${why(v.refused)}. Do not install it.`), "");
+    const advisory = (r: Refused) => (r.kind === "known-malicious" ? ` Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}` : "");
+
+    out.push("## Versions apm does not serve", "", ...withheldRows.map((v) => `- ${versionText(v.version)}: ${why(v.refused)}. Do not install it.${advisory(v.refused)}`), "");
   }
 
   out.push("## Risk signals", "");
@@ -357,6 +362,8 @@ export function packageMarkdown(input: PackageView): string {
     out.push(`No install command: apm refuses this version.${instead}`, "");
   } else {
     out.push(codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, install: named })).join("\n"), "sh"), "");
+
+    if (view.inCooldown === true && version !== null) out.push(cooldownText(versionText(version)), "");
     out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm get only some of them, and only once pointed at apm:", "");
 
     for (const client of ["bun", "npm"] as const) {

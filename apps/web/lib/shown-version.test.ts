@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { shownOf } from "./early-answer";
 import { chooseVersion, rowsWith, selectVersion, sharedDefault, taggedDefault } from "./shown-version";
 import type { Fetched, VersionDetails } from "./registry";
+import { installCommand } from "./install-note";
 import { unscoredNotice } from "./unscored";
 import { pkg } from "./agent/testing";
 
@@ -123,5 +124,59 @@ describe("the selection the page and its Markdown view share", () => {
     expect(sharedDefault(prerelease)).toEqual({ version: "0.0.2-test.2", score: { score: 92, grade: "A" } });
     expect(sharedDefault(pkg())).toEqual({ version: "1.3.0", score: { score: 75, grade: "B" } });
     expect(sharedDefault(pkg({ latest: null, distTags: {}, versions: [] }))).toEqual({ version: null, score: null });
+  });
+});
+
+// HOME-502 Sol review of b1a3a1c, findings 1 and 3: a packument that withheld the stable release tags a prerelease
+// latest, which apm's resolver refuses by bare name; and an off-list tag lost to an older listed one without a read
+describe("prerelease latest and tag targets the list does not hold", () => {
+  type Row = ReturnType<typeof pkg>["versions"][number];
+
+  const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-01-01T00:00:00.000Z", publishedBy: "me", status: "active", statusReason: null, deprecated: null, score: 90, grade: "A", ...over });
+  const details = (version: string, publishedAt: string): VersionDetails => ({ version, status: "active", statusReason: null, deprecated: null, facts: null, score: null, unscorable: null, publishedAt });
+
+  const noRead = async (): Promise<Fetched<VersionDetails>> => {
+    throw new Error("a listed version needs no read");
+  };
+
+  test("stable 1.0.0 refused, 0.9.0-beta.1 tagged latest and next: installs name next, never the bare name", async () => {
+    const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1", next: "0.9.0-beta.1" }, versions: [row("1.0.0", { refused: { kind: "confirmed-malicious" } }), row("0.9.0-beta.1")] });
+    const selected = await selectVersion({ pkg: p, asked: undefined, read: noRead });
+
+    expect(selected).toEqual({ kind: "shown", version: "0.9.0-beta.1", install: { kind: "tag", tag: "next" }, read: null });
+
+    if (selected.kind !== "shown") return;
+    expect(installCommand({ client: "apm", name: "pkg", install: selected.install })).toBe("apm add pkg@next");
+    expect(await selectVersion({ pkg: p, asked: "latest", read: noRead })).toMatchObject({ install: { kind: "tag", tag: "next" } });
+  });
+
+  test("a prerelease latest no other tag names is pinned", async () => {
+    const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1" }, versions: [row("0.9.0-beta.1")] });
+
+    expect(await selectVersion({ pkg: p, asked: undefined, read: noRead })).toMatchObject({ install: { kind: "exact", version: "0.9.0-beta.1" } });
+  });
+
+  test("with no installable latest, a newer off-list next beats an older listed beta, and the other way round", async () => {
+    const p = pkg({ latest: null, score: null, distTags: { beta: "0.5.0", next: "0.6.0" }, versions: [row("0.5.0", { publishedAt: "2026-03-01T00:00:00.000Z" })] });
+    const asked: string[] = [];
+    const newer = await selectVersion({ pkg: p, asked: undefined, read: async (version) => (asked.push(version), { kind: "ok", value: details(version, "2026-06-01T00:00:00.000Z") }) });
+
+    expect(asked).toEqual(["0.6.0"]);
+    expect(newer).toMatchObject({ kind: "shown", version: "0.6.0", install: { kind: "tag", tag: "next" } });
+
+    const older = await selectVersion({ pkg: p, asked: undefined, read: async (version) => ({ kind: "ok", value: details(version, "2025-06-01T00:00:00.000Z") }) });
+
+    expect(older).toEqual({ kind: "shown", version: "0.5.0", install: { kind: "tag", tag: "beta" }, read: null });
+  });
+
+  test("all targets off-list: published last wins, not the highest version string", async () => {
+    const p = pkg({ latest: null, score: null, distTags: { a: "9.0.0", b: "1.0.0" }, versions: [row("0.1.0", { status: "yanked" })] });
+
+    const when = new Map([
+      ["9.0.0", "2025-01-01T00:00:00.000Z"],
+      ["1.0.0", "2026-01-01T00:00:00.000Z"],
+    ]);
+
+    expect(await selectVersion({ pkg: p, asked: undefined, read: async (version) => ({ kind: "ok", value: details(version, when.get(version) ?? "") }) })).toMatchObject({ version: "1.0.0", install: { kind: "tag", tag: "b" } });
   });
 });

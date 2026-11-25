@@ -8,6 +8,7 @@
 // A withheld version's AI review is what the registry sends for it (each finding's sentence replaced, each file by
 // reference), never an earlier answer: the version and its review are two reads, and a revoke between them leaves one
 // withheld and the other not. Both are then read again; if they still disagree, the view is not built at all.
+import { inCooldown } from "../install-note";
 import type { Fetched } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import { selectVersion } from "../shown-version";
@@ -70,6 +71,7 @@ export async function loadPackageView(input: { name: string; version: string | n
       unscorable: v.unscorable,
       review,
       install,
+      inCooldown: inCooldown({ publishedAt: v.publishedAt ?? pkg.versions.find((r) => r.version === v.version)?.publishedAt, now: Date.now() }),
       registry: input.registry,
     }),
   };

@@ -8,15 +8,21 @@ import { isInstallable, noInstallable, type NoInstallable } from "./refusal";
 
 type Answer = Pick<PackageInfo, "versions" | "latest" | "distTags">;
 
+/** A dist-tag naming an installable version, with when that version was published (0 when unknown). */
+type Tagged = { readonly tag: string; readonly version: string; readonly at: number };
+
 /** What the page knows about `?v=` from the package answer alone. */
 export type VersionChoice =
   /**
-   * no `?v=`: latest, when apm installs it. Otherwise the newest installable version another tag names, and that
-   * `tag`, which installs need: a bare name resolves to latest only.
+   * no `?v=`: latest, when apm installs it. Otherwise the installable version a tag names that was published last, and
+   * that `tag`, which installs need: a bare name resolves to latest only.
    */
   | { readonly kind: "latest"; readonly version: string; readonly tag: string | null }
-  /** no `?v=`, and no tag names an installable listed version: the tags naming versions the list does not hold, highest first */
-  | { readonly kind: "tagged-unlisted"; readonly candidates: readonly { readonly tag: string; readonly version: string }[] }
+  /**
+   * no `?v=`, no installable latest, and some tags name versions the list does not hold: those are read before the
+   * newest of all eligible targets, `listed` and `unlisted` alike, is picked
+   */
+  | { readonly kind: "tagged-unlisted"; readonly listed: readonly Tagged[]; readonly unlisted: readonly { readonly tag: string; readonly version: string }[] }
   /** no `?v=`, and nothing installs by name */
   | { readonly kind: "none" }
   /** a version the package answer lists, asked by number or by dist-tag */
@@ -29,6 +35,8 @@ export type VersionChoice =
 // A semver version as npm stores it: three numbers, an optional prerelease and optional build metadata.
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
+const PRERELEASE = /^\d+\.\d+\.\d+-/;
+
 /** Whether `asked` is a version number rather than a dist-tag: one the per-version endpoint can be asked about as it is. */
 export const isVersionNumber = (asked: string): boolean => VERSION.test(asked);
 
@@ -40,23 +48,40 @@ function latestInstalls(pkg: Answer): pkg is Answer & { latest: string } {
   return row === undefined || isInstallable(row);
 }
 
+/** The one rule for picking among tag targets: published last, then by tag name so the pick never depends on order. */
+function newest<T extends Tagged>(tagged: readonly T[]): T | undefined {
+  return tagged.toSorted((a, b) => b.at - a.at || a.tag.localeCompare(b.tag))[0];
+}
+
+/** The tags naming an installable listed version, and the tags naming a version the list does not hold. */
+function tagTargets(pkg: Answer) {
+  const rows = new Map(pkg.versions.map((v) => [v.version, v]));
+  const listed: Tagged[] = [];
+  const unlisted: { tag: string; version: string }[] = [];
+
+  for (const [tag, version] of Object.entries(pkg.distTags)) {
+    const row = rows.get(version);
+
+    if (row === undefined) {
+      if (VERSION.test(version)) unlisted.push({ tag, version });
+    } else if (isInstallable(row)) listed.push({ tag, version, at: Date.parse(row.publishedAt) || 0 });
+  }
+
+  return { listed, unlisted };
+}
+
 /** Decides from the package answer; `unlisted` and `tagged-unlisted` still need the per-version endpoint. */
 export function chooseVersion(input: { pkg: Answer; asked: string | undefined }): VersionChoice {
   const { pkg, asked } = input;
 
   if (asked === undefined) {
     if (latestInstalls(pkg)) return { kind: "latest", version: pkg.latest, tag: null };
-    const tagged = taggedDefault(pkg);
+    const { listed, unlisted } = tagTargets(pkg);
 
-    if (tagged) return { kind: "latest", version: tagged.version, tag: tagged.tag };
-    const listed = new Set(pkg.versions.map((v) => v.version));
+    if (unlisted.length > 0) return { kind: "tagged-unlisted", listed, unlisted };
+    const pick = newest(listed);
 
-    const candidates = Object.entries(pkg.distTags)
-      .filter(([, version]) => !listed.has(version) && VERSION.test(version))
-      .map(([tag, version]) => ({ tag, version }))
-      .toSorted((a, b) => b.version.localeCompare(a.version, "en", { numeric: true }));
-
-    return candidates.length > 0 ? { kind: "tagged-unlisted", candidates } : { kind: "none" };
+    return pick ? { kind: "latest", version: pick.version, tag: pick.tag } : { kind: "none" };
   }
 
   const tagged = Object.hasOwn(pkg.distTags, asked) ? pkg.distTags[asked] : undefined;
@@ -70,31 +95,40 @@ export function chooseVersion(input: { pkg: Answer; asked: string | undefined })
 /**
  * A package whose latest apm does not install (none tagged, only a prerelease tagged next, or latest yanked): the
  * installable listed version a tag names that was published last, with that tag. Null when latest installs or no tag
- * names an installable listed version.
+ * names an installable listed version. A target the list does not hold needs a read: see selectVersion.
  */
 export function taggedDefault(pkg: Answer): { tag: string; version: string } | null {
   if (latestInstalls(pkg)) return null;
+  const pick = newest(tagTargets(pkg).listed);
 
-  const published = new Map(pkg.versions.filter(isInstallable).map((v) => [v.version, Date.parse(v.publishedAt) || 0]));
-
-  const tagged = Object.entries(pkg.distTags).flatMap(([tag, version]) => {
-    const at = published.get(version);
-
-    return at === undefined ? [] : [{ tag, version, at }];
-  });
-
-  const newest = tagged.toSorted((a, b) => b.at - a.at)[0];
-
-  return newest ? { tag: newest.tag, version: newest.version } : null;
+  return pick ? { tag: pick.tag, version: pick.version } : null;
 }
 
-/** How an explicit `?v=` installs: by the tag it names (latest's by name), or pinned to the number it names. */
+/**
+ * How the version latest names installs. A stable release installs by name. A prerelease never does: when a packument
+ * withheld the stable release it can tag a surviving prerelease latest, and apm's resolver refuses a bare install of a
+ * prerelease. So name another tag that names it (next first), else pin it.
+ */
+function latestInstall(input: { pkg: Answer; version: string }): InstallSpec {
+  const { pkg, version } = input;
+
+  if (!PRERELEASE.test(version)) return { kind: "default", version };
+
+  const tags = Object.entries(pkg.distTags)
+    .filter(([tag, v]) => tag !== "latest" && v === version)
+    .map(([tag]) => tag)
+    .toSorted((a, b) => Number(b === "next") - Number(a === "next") || a.localeCompare(b));
+
+  return tags[0] === undefined ? { kind: "exact", version } : { kind: "tag", tag: tags[0] };
+}
+
+/** How an explicit `?v=` installs: by the tag it names (latest's as latest installs), or pinned to the number it names. */
 function askedInstall(input: { pkg: Answer; asked: string; version: string }): InstallSpec {
   const { pkg, asked, version } = input;
 
   if (!Object.hasOwn(pkg.distTags, asked)) return { kind: "exact", version };
 
-  return asked === "latest" ? { kind: "default", version } : { kind: "tag", tag: asked };
+  return asked === "latest" ? latestInstall({ pkg, version }) : { kind: "tag", tag: asked };
 }
 
 /**
@@ -108,7 +142,7 @@ export type Selection<V> =
   | { readonly kind: "unavailable"; readonly version: string };
 
 /** Resolves `?v=`: the package answer decides when it can, and `read` (the per-version endpoint) when it can't. */
-export async function selectVersion<V extends { version: string; status: string; refused?: Refused | null }>(input: {
+export async function selectVersion<V extends { version: string; status: string; refused?: Refused | null; publishedAt?: string | null }>(input: {
   pkg: Answer;
   asked: string | undefined;
   read: (version: string) => Promise<Fetched<V>>;
@@ -118,19 +152,26 @@ export async function selectVersion<V extends { version: string; status: string;
 
   switch (choice.kind) {
     case "latest":
-      return { kind: "shown", version: choice.version, install: choice.tag === null ? { kind: "default", version: choice.version } : { kind: "tag", tag: choice.tag }, read: null };
+      return { kind: "shown", version: choice.version, install: choice.tag === null ? latestInstall({ pkg, version: choice.version }) : { kind: "tag", tag: choice.tag }, read: null };
     case "none":
       return { kind: "none", why: noInstallable(pkg) };
     case "tagged-unlisted": {
-      for (const c of choice.candidates) {
-        const info = await input.read(c.version);
+      const eligible: (Tagged & { read: V | null })[] = choice.listed.map((t) => ({ ...t, read: null }));
+      const reads = new Map<string, Fetched<V>>();
 
-        if (info.kind === "unavailable") return { kind: "unavailable", version: c.version };
+      for (const t of choice.unlisted) {
+        const info = reads.get(t.version) ?? (await input.read(t.version));
 
-        if (info.kind === "ok" && isInstallable(info.value)) return { kind: "shown", version: info.value.version, install: { kind: "tag", tag: c.tag }, read: info.value };
+        reads.set(t.version, info);
+
+        if (info.kind === "unavailable") return { kind: "unavailable", version: t.version };
+
+        if (info.kind === "ok" && isInstallable(info.value)) eligible.push({ tag: t.tag, version: info.value.version, at: Date.parse(info.value.publishedAt ?? "") || 0, read: info.value });
       }
 
-      return { kind: "none", why: noInstallable(pkg) };
+      const pick = newest(eligible);
+
+      return pick ? { kind: "shown", version: pick.version, install: { kind: "tag", tag: pick.tag }, read: pick.read } : { kind: "none", why: noInstallable(pkg) };
     }
 
     case "listed":
@@ -186,8 +227,9 @@ export function sharedShown(input: { pkg: Answer & Pick<PackageInfo, "score">; v
 }
 
 /**
- * The share of the default page: the version installs get by name, with that version's own score. A default the
- * package answer does not list (an old tagged version) is shared without a version or a score rather than another's.
+ * The share of the default page: the version installs get by name, with that version's own score. A default that may
+ * be a version the package answer does not list (an old tagged version) is shared without a version or a score rather
+ * than another's.
  */
 export function sharedDefault(pkg: Answer & Pick<PackageInfo, "score">): Shared {
   const choice = chooseVersion({ pkg, asked: undefined });

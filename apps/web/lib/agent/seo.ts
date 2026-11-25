@@ -67,8 +67,13 @@ function scoreWords(score: { score: number; grade: string }): ScoreWords {
   };
 }
 
-/** `image`: the card's site path, when a share names another version than the default (/og/<name>?v=<version>). */
-export function packageMetadata(p: PackageMeta & { image?: string }): Metadata {
+/**
+ * `v`: the ?v= a share names, when it is not the default page's. The card and the Markdown alternate keep it, so both
+ * describe the release the page shows; the canonical URL stays the package's.
+ */
+export function packageMetadata(p: PackageMeta & { v?: string }): Metadata {
+  const query = p.v === undefined ? "" : `?v=${encodeURIComponent(p.v)}`;
+
   const words = p.score ? scoreWords(p.score) : null;
   const scoreText = words ? words.alt : "not scored by apm yet";
   const verdict = words ? words.verdict : `is ${scoreText}`;
@@ -81,11 +86,11 @@ export function packageMetadata(p: PackageMeta & { image?: string }): Metadata {
       title,
       description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and how to install it.`,
       path: canonicalPackagePath(p.name),
-      image: p.image ?? `/og${canonicalPackagePath(p.name).slice("/package".length)}`,
+      image: `/og${canonicalPackagePath(p.name).slice("/package".length)}${query}`,
       imageAlt: `${p.name} on apm: ${scoreText}`,
     }),
     // the Markdown view of the same page, for agents
-    alternates: { canonical: canonicalPackagePath(p.name), types: { "text/markdown": `${canonicalPackagePath(p.name)}.md` } },
+    alternates: { canonical: canonicalPackagePath(p.name), types: { "text/markdown": `${canonicalPackagePath(p.name)}.md${query}` } },
   };
 }
 

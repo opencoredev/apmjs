@@ -382,3 +382,39 @@ describe("the Markdown view at the default URL and ?v=", () => {
     expect(md).not.toContain("None found");
   });
 });
+
+// HOME-502 Sol review of b1a3a1c, finding 5: the .md left out the page's cooldown warning, and listed advisory ids
+// without links on the default view
+describe("the Markdown view carries the page's safety context", () => {
+  const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-01-01T00:00:00.000Z", publishedBy: "x", status: "active", statusReason: null, deprecated: null, score: 90, grade: "A", ...over });
+
+  const md = async (p: PackageInfo, version: string | null) => {
+    const loaded = await loadPackageView({ name: p.name, version, registry: REGISTRY, source: fakeSource({ packages: { [p.name]: p } }) });
+
+    if (loaded.kind !== "ok") throw new Error(JSON.stringify(loaded));
+
+    return packageMarkdown(loaded.view);
+  };
+
+  test("a version published in the last 24 hours gets the cooldown note; an older one does not", async () => {
+    const fresh = new Date(Date.now() - 60 * 60_000).toISOString();
+
+    expect(await md(pkg({ versions: [row("1.3.0", { publishedAt: fresh })] }), null)).toContain("1.3.0 was published under 24 hours ago, inside apm's cooldown.");
+    expect(await md(pkg(), null)).not.toContain("inside apm's cooldown");
+  });
+
+  test("the default view links the advisory of a version apm does not serve", async () => {
+    const p = pkg({ name: "ugent_uws", latest: "9.0.0", distTags: { latest: "9.0.0" }, versions: [row("10.9.11", { refused: { kind: "known-malicious", ids: ["MAL-2026-20430"] } }), row("9.0.0")] });
+
+    expect(await md(p, null)).toContain("- 10.9.11: listed as malicious by the OSSF malicious-packages feed (`MAL-2026-20430`). Do not install it. Advisory: https://osv.dev/vulnerability/MAL-2026-20430");
+  });
+
+  test("a prerelease latest installs by its other tag in the commands and the explain link", async () => {
+    const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1", next: "0.9.0-beta.1" }, versions: [row("1.0.0", { refused: { kind: "confirmed-malicious" } }), row("0.9.0-beta.1")] });
+    const out = await md(p, null);
+
+    expect(out).toContain("apm add left-pad@next\nbun add left-pad@next");
+    expect(out).toContain("/api/explain?package=left-pad%40next");
+    expect(out).not.toContain("apm add left-pad\n");
+  });
+});

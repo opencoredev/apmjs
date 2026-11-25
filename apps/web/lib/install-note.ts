@@ -56,6 +56,20 @@ export function specSuffix(install: InstallSpec): string | null {
   }
 }
 
+/** How long apm's cooldown holds a new version back (packages/core DEFAULT_POLICY.cooldownMs). */
+export const COOLDOWN_MS = 24 * 60 * 60_000;
+
+/** Whether a version published at `publishedAt` is inside apm's cooldown at `now`; false when the time is unknown. */
+export function inCooldown(input: { publishedAt: string | null | undefined; now: number }): boolean {
+  const at = Date.parse(input.publishedAt ?? "");
+
+  return Number.isFinite(at) && input.now - at < COOLDOWN_MS;
+}
+
+/** What the install box says about a version inside the cooldown, in the words the page uses. */
+export const cooldownText = (version: string): string =>
+  `${version} was published under 24 hours ago, inside apm's cooldown. apm add warns before it installs it and --strict refuses it; plain bun, npm and pnpm install it without that check.`;
+
 export function installCommand({ client, name, install }: { client: InstallClient; name: string; install: InstallSpec }): string {
   const suffix = specSuffix(install);
   const pinned = install.kind === "default" && install.version !== null ? `${name}@${install.version}` : null;
