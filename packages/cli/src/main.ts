@@ -6,11 +6,12 @@ import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
-import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
+import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
+import { escapedPath, oneLine } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
@@ -70,22 +71,28 @@ function gradeColor(score: number): (s: string) => string {
   return score >= 75 ? green : score >= 40 ? yellow : red;
 }
 
-function printCard(title: string, report: Report | null, opts: { maxEvidence?: number } = {}): void {
+/** `refusal`: why the version is refused whatever it scores (known malicious), said before its score. */
+function printCard(title: string, report: Report | null, opts: { maxEvidence?: number; refusal?: string } = {}): void {
+  if (opts.refusal !== undefined) say(`${bold(title)}  ${red(opts.refusal)}`);
+
   if (!report) {
-    say(`${bold(title)}  ${dim("score unknown (not analyzed)")}`);
+    if (opts.refusal === undefined) say(`${bold(title)}  ${dim("score unknown (not analyzed)")}`);
     return;
   }
   const c = gradeColor(report.score);
-  say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)}`);
+
+  if (opts.refusal === undefined) say(`${bold(title)}  ${c(`score ${report.score}/100 (${report.grade})`)}`);
+  else say(`  ${dim(`its score, ${report.score}/100 (${report.grade}), does not count: apm refuses it whatever it scores`)}`);
   const bad = report.signals.filter((s) => s.points < 0);
   const info = report.signals.filter((s) => s.points >= 0);
-  if (bad.length === 0) say(`  ${green("✓")} no risk signals found`);
+  if (bad.length === 0 && opts.refusal === undefined) say(`  ${green("✓")} no risk signals found`);
   for (const s of bad) {
     const pts = String(s.points).padStart(4);
-    say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${s.id}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(s.label)}`);
-    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(e)}`);
+    // a signal's id, label and evidence are registry text: one line each, no terminal controls
+    say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${oneLine(s.id)}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(oneLine(s.label))}`);
+    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(oneLine(e))}`);
   }
-  for (const s of info) say(`  ${dim(`   · ${s.id}  ${s.label}${s.evidence[0] ? ` (${s.evidence[0]})` : ""}`)}`);
+  for (const s of info) say(`  ${dim(`   · ${oneLine(s.id)}  ${oneLine(s.label)}${s.evidence[0] ? ` (${oneLine(s.evidence[0])})` : ""}`)}`);
   printCapabilities(report.capabilities);
 }
 
@@ -208,6 +215,7 @@ type TreePackages = z.infer<typeof Tree>["packages"];
  * `tree`: the packages the registry checked under this one; every scope among them is pinned to that registry.
  * `warnings`: what installs anyway, and why it was flagged (published inside the cooldown, a low or incomplete
  * score, no score, a failed lookup). `projectPeers`: required peers the project provides, and the version checked for each.
+ * `tags`: the dist-tags of a package that has none named latest, when that is why nothing was picked; empty otherwise.
  */
 type Resolved = {
   name: string;
@@ -221,6 +229,7 @@ type Resolved = {
   tree: TreePackages;
   warnings: InstallWarning[];
   projectPeers: z.infer<typeof Tree>["projectPeers"];
+  tags: readonly DistTag[];
 };
 
 const FORCEABLE = /^(published \d+h ago|score \d+\/100 is below)/;
@@ -431,15 +440,18 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
   if (r.status === 200) {
     const ok = ResolveOk.parse(r.body);
 
-    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, projectPeers: ok.tree?.projectPeers ?? [] };
+    return { name, version: ok.version, report: ok.report, skipped: ok.skipped, blocked: null, forceable: false, source: ok.source ?? "apm", unchecked: ok.tree?.uncheckedDeps ?? [], tree: ok.tree?.packages ?? [], warnings: ok.warnings, projectPeers: ok.tree?.projectPeers ?? [], tags: [] };
   }
   if (r.status === 422) {
     const f = ResolveFail.extend({ newest: z.object({ version: z.string(), report: z.unknown() }).nullable().optional(), tree: z.object({ blocks: z.array(z.unknown()) }).loose().optional() }).parse(r.body);
     const newestReport = f.newest ? (await scoreOf(api, name, f.newest.version)) : null;
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
+    // nothing in range at all, asked for no range: a package whose versions are all under other tags (a prerelease tagged next)
+    const tags = (range === null || range === "latest") && f.skipped.length === 0 && !f.newest ? await tagsWithoutLatest(api, name) : [];
+    const blocked = tags.length > 0 ? `${name} has no version tagged latest, the one apm installs when no version is named. Its versions are tagged ${tags.map((t) => `${t.tag} (${t.version})`).join(", ")}` : f.error;
 
-    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked: f.error, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [] };
+    return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags };
   }
 
   if (r.status === 503) {
@@ -447,7 +459,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const said = z.object({ error: z.string() }).safeParse(r.body);
     const msg = said.success ? said.data.error : `the registry could not check ${name} (HTTP 503)`;
 
-    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [] };
+    return { name, version: null, report: null, skipped: [], blocked: msg, forceable: false, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
   }
 
   if (r.status === 202) {
@@ -468,12 +480,13 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
       tree: [],
       warnings: [],
       projectPeers: [],
+      tags: [],
     };
   }
   if (r.status === 404) {
     const msg = typeof r.body === "object" && r.body !== null && "error" in r.body ? String(r.body.error) : "not found";
 
-    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [] };
+    return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
   }
   if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
 
@@ -494,9 +507,41 @@ async function scoreOf(api: Api, name: string, version: string): Promise<Report 
   }
 }
 
+/** How the registry words a skip for a version known malicious (osv.ts maliciousText, apm.ts CONFIRMED_SKIP). */
+const MALICIOUS_SKIPS = ["known malicious: the OSSF malicious-packages feed lists ", "confirmed malicious by an apm reviewer"];
+
+/**
+ * The popular package a version's name is one or two edits from, when its `typosquat` signal costs points (a name npm
+ * has listed for years keeps the signal at no points). `reason` is the signal's evidence, as "one edit away from "express"".
+ */
+function lookalikeOf(report: Report | null): { reason: string; target: string | null } | null {
+  const signal = report?.signals.find((s) => s.id === "typosquat" && s.points < 0);
+
+  if (signal === undefined) return null;
+  // registry text, printed in apm's WARNING: one line, no terminal controls; only a valid package name is offered back
+  const reason = oneLine(signal.evidence[0] ?? signal.label);
+  const target = /"([^"]+)"/.exec(reason)?.[1] ?? null;
+
+  return { reason, target: target !== null && isValidPackageName(target) ? target : null };
+}
+
 function printResolved(r: Resolved): void {
-  printCard(`${r.blocked ? red("✗") : r.warnings.length > 0 ? yellow("!") : green("✓")} ${r.name}@${r.version ?? "?"}`, r.report);
-  for (const s of r.skipped.slice(0, 5)) say(`  ${dim(`skipped ${s.version}: ${s.reason}${s.revokeReason ? ` (${s.revokeReason})` : ""}`)}`);
+  if (r.tags.length > 0) {
+    say(`${red("✗")} ${bold(r.name)}  ${dim("no version is tagged latest")}`);
+
+    return;
+  }
+
+  const lookalike = r.blocked === null ? lookalikeOf(r.report) : null;
+  // a version the OSSF feed lists or an apm reviewer confirmed malicious, in the registry's own words (never an owner's
+  // yank reason): the refusal leads, not its score
+  const malicious = r.blocked === null ? undefined : r.skipped.find((s) => s.version === r.version && MALICIOUS_SKIPS.some((m) => s.reason.startsWith(m)));
+  const mark = r.blocked ? red("✗") : r.warnings.length > 0 || lookalike !== null ? yellow("!") : green("✓");
+
+  printCard(`${mark} ${r.name}@${r.version ?? "?"}`, r.report, malicious === undefined ? {} : { refusal: `refused: ${oneLine(malicious.reason)}` });
+
+  // a skip reason can carry an owner's yank or revoke words: one line, no terminal controls or bidi overrides
+  for (const s of r.skipped.filter((x) => x !== malicious).slice(0, 5)) say(`  ${dim(oneLine(`skipped ${s.version}: ${s.reason}${s.revokeReason ? ` (${s.revokeReason})` : ""}`))}`);
   // dependencies apm could not score install unchecked: say which, so nobody reads silence as clean. A registry that
   // sends each as a warning of its own (review of 93274c8, finding 4) has them printed with the warnings instead
   const warnedEach = r.warnings.some((w) => w.kind === "unchecked" && w.via.length > 0);
@@ -512,7 +557,17 @@ function printResolved(r: Resolved): void {
     else if (p.kind === "newest" || p.kind === undefined) say(`  ${dim(`peer ${p.dependency}: your package.json lists it with no lockfile entry; apm checked the newest in range${p.version ? `, ${p.version}` : ""}, and checks the version your package manager picks once it is installed`)}`);
   }
 
-  printWarnings({ warnings: r.warnings, binaries: r.tree.filter((p) => p.platform !== undefined), allFamilies: true, closing: EARLY_CLOSING });
+  printWarnings({ warnings: r.warnings, binaries: r.tree.filter((p) => p.platform !== undefined), allFamilies: true, closing: lookalike === null ? EARLY_CLOSING : null });
+
+  if (lookalike === null) return;
+  say();
+  say(`${yellow(bold("WARNING"))} ${bold(`${r.name}@${r.version ?? "?"}`)} has a name like a popular package's: ${lookalike.reason}`);
+
+  if (lookalike.target !== null) say(`  did you mean ${lookalike.target}?`);
+  say(yellow(`A look-alike name alone does not make apm refuse a package. If you meant ${lookalike.target ?? "another package"}, stop here and use that name.`));
+
+  // the other warnings above keep their own closing, after the look-alike block
+  if (r.warnings.length > 0) say(yellow(EARLY_CLOSING));
 }
 
 /**
@@ -603,6 +658,9 @@ function printPlatformFamilies(warnings: readonly InstallWarning[], binaries: re
 /** At most this many warnings are printed per package; --json has them all. */
 const MAX_PRINTED_WARNINGS = 10;
 
+/** How to sign in to an apm registry: the browser flow, or a password where the registry uses them. */
+const LOGIN_HINT = "apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords";
+
 const EARLY_CLOSING = "apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).";
 
 /**
@@ -633,7 +691,13 @@ function printWarnings(input: { warnings: readonly InstallWarning[]; binaries: r
 /** What to tell someone whose install was refused: --force only when it would help, and what it does. */
 function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean): void {
   const forceable = blocked.filter((b) => b.forceable);
-  const stuck = blocked.filter((b) => !b.forceable);
+  const stuck = blocked.filter((b) => !b.forceable && b.tags.length === 0);
+
+  for (const b of blocked) {
+    const [first] = b.tags;
+
+    if (first !== undefined) say(`To ${verb === "add" ? "install" : "run"} from the ${first.tag} tag, run the same command with ${b.name}@${first.tag} as the package argument. apm checks whatever that tag resolves to, which can be an older version than the one listed`);
+  }
 
   if (forceable.length > 0) {
     say(`Review the signals above. To ${verb === "add" ? "install" : "run"} anyway: apm ${verb} ${forceable.map((b) => b.name).join(" ")} --force`);
@@ -748,7 +812,9 @@ async function checkLock(input: { api: Api; graph: LockGraph; strict: boolean; r
     if (seen > 0) say(dim(`apm: ${seen} warning${seen === 1 ? " is" : "s are"} the early check's, shown above`));
   }
 
-  if (!refused && verdict.warnings.length === 0) say(dim("apm: no warnings"));
+  const lookalikes = input.results.filter((r) => lookalikeOf(r.report) !== null).map((r) => r.name);
+
+  if (!refused && verdict.warnings.length === 0) say(lookalikes.length > 0 ? yellow(`apm: no other warnings; the name ${lookalikes.join(", ")} looks like a popular package's (above)`) : dim("apm: no warnings"));
 
   return { graph, blocked, warnings: verdict.warnings, refused };
 }
@@ -1382,6 +1448,25 @@ async function addWithYarn(input: YarnInput): Promise<number> {
   return 0;
 }
 
+const JsonObject = z.record(z.string(), z.unknown());
+
+/** Takes `names` out of every dependency list of the package.json at `path`, keeping its indent; returns the names it lists nowhere. */
+function withoutDependencies(path: string, names: readonly string[]): string[] {
+  const text = readFileSync(path, "utf8");
+  const manifest = JsonObject.parse(JSON.parse(text));
+
+  const lists = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"].flatMap((field) => {
+    const deps = JsonObject.safeParse(manifest[field]);
+
+    return deps.success ? [{ field, deps: deps.data }] : [];
+  });
+
+  for (const { field, deps } of lists) manifest[field] = Object.fromEntries(Object.entries(deps).filter(([name]) => !names.includes(name)));
+  writeFileSync(path, `${JSON.stringify(manifest, null, /^[ \t]+/m.exec(text)?.[0] ?? 2)}\n`);
+
+  return names.filter((name) => !lists.some(({ deps }) => Object.hasOwn(deps, name)));
+}
+
 /** The lockfile apm wrote to the project and the backup of what was there before. */
 type Written = { lockfile: Uint8Array; backup: Backup };
 
@@ -1503,6 +1588,323 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
   return done(0);
 }
 
+/** A dependency spec apm cannot check before the package manager fetches what it names: a URL, git, a path, a tarball. */
+function fetchedSpec(spec: string): boolean {
+  // a dist-tag; one with a dot could be an archive's file name, which npm reads as a path
+  const tag = /^[a-z][\w-]*$/i;
+
+  if (spec === "" || isValidRange(spec) || tag.test(spec) || spec.startsWith("workspace:")) return false;
+  const alias = /^npm:(?:@[^/@]+\/)?[^/@]+(?:@(.*))?$/.exec(spec);
+
+  return alias === null || (alias[1] !== undefined && !isValidRange(alias[1]) && !tag.test(alias[1]));
+}
+
+/** The lockfile entry a removal must leave as it is: name, version and the artifact it installs. */
+function artifactOf(n: LockNode): string {
+  return `${idOf(n)} ${n.integrity ?? n.resolved ?? ""}`;
+}
+
+/** Settings that make the package manager resolve a package other than the one package.json names, which apm remove does not check. */
+const REDIRECTS = ["overrides", "resolutions", "catalog", "catalogs", "patchedDependencies", "pnpm.overrides", "pnpm.packageExtensions", "pnpm.patchedDependencies"];
+
+/** The pnpm-workspace.yaml setting that redirects resolution, "pnpm-workspace.yaml" when apm cannot read it, or undefined. */
+function workspaceRedirect(root: string): string | undefined {
+  const file = join(root, "pnpm-workspace.yaml");
+
+  if (!existsSync(file)) return undefined;
+
+  try {
+    const parsed = JsonObject.safeParse(Bun.YAML.parse(readFileSync(file, "utf8")) ?? {});
+
+    if (!parsed.success) return "pnpm-workspace.yaml";
+
+    return ["overrides", "catalog", "catalogs", "patchedDependencies", "packageExtensions", "pnpmfile"].find((key) => parsed.data[key] !== undefined);
+  } catch {
+    return "pnpm-workspace.yaml";
+  }
+}
+
+const BunfigLockfile = z.object({ install: z.object({ lockfile: z.object({ save: z.unknown().optional() }).loose().optional() }).loose().optional() }).loose();
+
+/** "install.lockfile.save" when a bunfig.toml bun reads turns off writing the lockfile (or apm cannot read it), or undefined. */
+function bunfigWithoutLock(root: string): string | undefined {
+  const configs = [join(root, "bunfig.toml"), join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), ".bunfig.toml"), join(homedir(), ".bunfig.toml")];
+
+  return configs.some((file) => {
+    if (!existsSync(file)) return false;
+
+    try {
+      const parsed = BunfigLockfile.safeParse(Bun.TOML.parse(readFileSync(file, "utf8")));
+
+      return !parsed.success || (parsed.data.install?.lockfile?.save !== undefined && parsed.data.install.lockfile.save !== true);
+    } catch {
+      return true;
+    }
+  })
+    ? "install.lockfile.save in bunfig.toml"
+    : undefined;
+}
+
+/** Every dependency entry of the package.json files at `root` and its members, or null when one cannot be read. */
+function declaredSpecs(root: string, members: readonly { dir: string }[]): { file: string; name: string; spec: string; optionalPeer: boolean }[] | null {
+  const out: { file: string; name: string; spec: string; optionalPeer: boolean }[] = [];
+
+  for (const dir of new Set(["", ...members.map((m) => m.dir)])) {
+    const file = join(root, dir, "package.json");
+    const manifest = readManifest(file);
+
+    if (manifest === null) return null;
+    const meta = z.record(z.string(), z.object({ optional: z.boolean().optional() }).catch({})).catch({}).parse(manifest.peerDependenciesMeta ?? {});
+
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+      const deps = z.record(z.string(), z.string()).safeParse(manifest[field] ?? {});
+
+      if (!deps.success) return null;
+      out.push(...Object.entries(deps.data).map(([name, spec]) => ({ file, name, spec, optionalPeer: field === "peerDependencies" && meta[name]?.optional === true })));
+    }
+  }
+
+  return out;
+}
+
+/** The JSON object at `path`, or null. */
+function readManifest(path: string): z.infer<typeof JsonObject> | null {
+  try {
+    const parsed = JsonObject.safeParse(JSON.parse(readFileSync(path, "utf8")));
+
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `apm remove <names>` (bun 1.2 and later, npm, pnpm). A removal brings the project in line with package.json, so the
+ * package manager would install anything package.json lists that the lockfile lacks, unchecked. apm first takes the
+ * names out in a copy of the project and has the package manager compute the lockfile there, installing nothing, and
+ * refuses when that lockfile has any package the current one lacks. Only then does the package manager's own removal
+ * run, made to use the lockfile, and apm confirms the lockfile gained nothing.
+ */
+async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockPm }; names: readonly string[] }): Promise<number> {
+  const { det, names } = input;
+  const pm = det.pm;
+  const environment = withoutSecrets(process.env);
+
+  // the lockfile settings are apm's for a removal: it is computed, checked and installed from the lockfile
+  for (const key of Object.keys(environment)) if (/^(npm|pnpm)_config_(package[-_]lock|package[-_]lock[-_]only|lockfile|frozen[-_]lockfile|prefer[-_]frozen[-_]lockfile|shrinkwrap)$/i.test(key)) delete environment[key];
+
+  const refuse = (reason: string): number => {
+    fail(`refused: ${reason}. Nothing was run.`);
+
+    return 1;
+  };
+
+  const found = projectLayout({ cwd: input.cwd, pm });
+
+  if (found.kind === "refused") return refuse(found.reason);
+  const layout = found.layout;
+
+  if (refuseProjectElsewhere({ cwd: input.cwd, layout, verb: "removing from" })) return 1;
+  const t = targets(layout);
+
+  if (pm === "bun") {
+    const version = (await runCmd(["bun", "--version"], { cwd: input.cwd, env: environment, quiet: true })).out.trim();
+
+    if (!Bun.semver.satisfies(version, ">=1.2.0")) return refuse(`bun ${version || "of unknown version"} does not read bun.lock, so apm cannot check what its removal installs; use bun 1.2 or later`);
+  }
+
+  const specs = declaredSpecs(layout.root, layout.members);
+
+  if (specs === null) return refuse("apm could not read every package.json of the project");
+  const fetched = specs.find((d) => fetchedSpec(d.spec));
+  const root = readManifest(join(layout.root, "package.json"));
+  const pnpmSettings = JsonObject.safeParse(root?.pnpm);
+  const redirect = REDIRECTS.find((key) => (key.startsWith("pnpm.") ? pnpmSettings.success && pnpmSettings.data[key.slice(5)] !== undefined : root?.[key] !== undefined)) ?? workspaceRedirect(layout.root) ?? (pm === "bun" ? bunfigWithoutLock(layout.root) : undefined);
+
+  // a .pnpmfile.cjs runs in apm's copy and again in the project, and could behave differently in each
+  if (pm === "pnpm" && existsSync(join(layout.root, ".pnpmfile.cjs"))) return refuse("the project has a .pnpmfile.cjs, whose hooks can make pnpm resolve packages apm remove does not check; run pnpm remove yourself");
+
+  if (redirect !== undefined) return refuse(`the project sets ${redirect}, which can make ${pm} resolve packages apm remove does not check; run ${pm} remove yourself`);
+
+  if (fetched !== undefined) return refuse(`${fetched.file} lists ${fetched.name} as ${fetched.spec}, which ${pm} would fetch before apm could check it; apm remove handles registry versions only`);
+  const lockPath = join(layout.root, t.lockfile);
+  const before = existsSync(lockPath) ? readLock({ pm, path: lockPath, cwd: join(layout.root, layout.member) }) : null;
+
+  if (before === null || before.kind !== "read") return refuse(`apm remove needs a lockfile it can read (${before === null ? `there is no ${t.lockfile}` : before.kind === "unreadable" ? before.reason : t.lockfile}), so ${pm} installs nothing apm has not checked`);
+  const had = new Set(before.nodes.map(artifactOf));
+
+  // npm builds a git dependency, running its prepare script, while it computes a lockfile, so for npm the lockfile must
+  // already hold registry packages only and pin every direct dependency, leaving npm nothing new to resolve in the copy
+  // (an optional peer it left out stays out: npm does not install one that nothing else needs)
+  if (pm === "npm") {
+    const local = before.nodes.find((n) => n.origin.kind !== "registry" && n.origin.kind !== "workspace");
+
+    if (local !== undefined) return refuse(`${t.lockfile} has ${idOf(local)} from ${local.resolved ?? local.origin.kind}, not a registry, and npm would build it while it computes the removal`);
+    const direct = specs.filter((d) => d.file === join(layout.root, t.manifest));
+    const pins = projectPins({ cwd: join(layout.root, layout.member), pm, names: direct.map((d) => d.name) });
+
+    const unpinned = direct.find((d) => {
+      const pin = pins.get(d.name);
+
+      if (pin === undefined) return !d.optionalPeer || direct.some((o) => o.name === d.name && !o.optionalPeer);
+
+      return pin.kind === "pinned" && isValidRange(d.spec) && !Bun.semver.satisfies(pin.version, d.spec);
+    });
+
+    if (unpinned !== undefined) return refuse(`package.json lists ${unpinned.name}@${unpinned.spec}, which ${t.lockfile} does not pin, so npm would resolve it while it computes the removal. Run apm add ${unpinned.name} first`);
+  }
+
+  const copy = copyProject(layout);
+  let empty: boolean;
+  let planned: Set<string>;
+
+  try {
+    const missing = withoutDependencies(join(copy.dir, t.manifest), names);
+
+    if (missing.length > 0) return refuse(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${t.manifest}`);
+    const cmd = [...installLockOnlyArgs(pm), ...(pm === "npm" ? ["--package-lock=true"] : pm === "pnpm" ? ["--no-frozen-lockfile", "--config.lockfile=true", "--config.ignore-pnpmfile=true"] : [])];
+
+    say(dim(`apm: removing ${names.join(", ")}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing into your project)`));
+    // bun 1.2 unpacks packages into its cache while it computes a lockfile, so the copy gets a cache of its own, deleted with it
+    const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pm === "bun" ? { ...environment, BUN_INSTALL_CACHE_DIR: join(copy.dir, ".apm-bun-cache") } : environment, stdoutToStderr: true });
+
+    if (run.code !== 0) {
+      fail(`apm remove: ${pm} could not compute the lockfile (exit ${run.code}). Your project is unchanged.`);
+
+      return run.code;
+    }
+
+    const computedPath = join(copy.dir, t.lockfile);
+    const copySpecs = declaredSpecs(copy.dir, layout.members);
+
+    // a package manager deletes the lockfile of a project left with no dependencies
+    empty = copySpecs !== null && copySpecs.length === 0;
+
+    if (!existsSync(computedPath) && !empty) return refuse(`${pm} computed no ${t.lockfile}, so apm cannot check what the removal installs`);
+
+    // a removal always changes the lockfile; an unchanged one is one the package manager did not compute
+    if (existsSync(computedPath) && Buffer.from(readFileSync(computedPath)).equals(Buffer.from(readFileSync(lockPath)))) return refuse(`${pm} did not rewrite ${t.lockfile} for the removal, so apm cannot check what it installs`);
+    const computed = existsSync(computedPath) ? readLock({ pm, path: computedPath, cwd: join(copy.dir, layout.member) }) : null;
+
+    if (computed !== null && computed.kind !== "read") return refuse(`apm could not read the ${t.lockfile} ${pm} computed`);
+    const notRegistry = (computed?.nodes ?? []).find((n) => n.origin.kind !== "registry" && n.origin.kind !== "workspace");
+
+    if (notRegistry !== undefined) return refuse(`the ${t.lockfile} ${pm} computed has ${idOf(notRegistry)} from ${notRegistry.resolved ?? notRegistry.origin.kind}, not a registry; apm remove handles registry versions only`);
+    const unpinned = (computed?.nodes ?? []).find((n) => n.origin.kind === "registry" && !n.bundled && n.integrity === null);
+
+    if (unpinned !== undefined) return refuse(`the ${t.lockfile} ${pm} computed has no integrity for ${idOf(unpinned)}, so apm cannot tell it is the package the lockfile has now`);
+    const added = [...new Set((computed?.nodes ?? []).filter((n) => !had.has(artifactOf(n))).map((n) => idOf(n)))];
+
+    planned = new Set((computed?.nodes ?? []).map(artifactOf));
+
+    if (added.length > 0) {
+      fail(`refused: removing ${names.join(", ")} would make ${pm} install ${added.slice(0, 5).join(", ")}${added.length > 5 ? ` and ${added.length - 5} more` : ""}, which ${t.lockfile} does not have, unchecked. Nothing was installed, and your project is unchanged.`);
+      say("Run apm add for what package.json lists that the lockfile lacks, then apm remove again.");
+
+      return 1;
+    }
+  } finally {
+    removeTemp(copy.dir);
+  }
+
+  // the project must still be what apm copied and checked
+  const changed = [...copy.copied].flatMap(([rel, bytes]) => (existsSync(join(layout.root, rel)) && Buffer.from(readFileSync(join(layout.root, rel))).equals(Buffer.from(bytes)) ? [] : [rel]));
+
+  if (changed.length > 0) return refuse(`${changed.join(", ")} changed while apm checked the removal; run apm remove again`);
+  // no install script runs: a removal adds nothing, and what it lays out again is what the lockfile already pins
+  const native = pm === "npm" ? ["npm", "uninstall", "--package-lock=true", "--ignore-scripts", ...names] : pm === "pnpm" ? ["pnpm", "remove", "--config.lockfile=true", "--config.ignore-pnpmfile=true", "--config.ignore-scripts=true", ...names] : ["bun", "remove", "--ignore-scripts", ...names];
+
+  say(dim(`→ ${native.join(" ")}  (it takes out only packages ${t.lockfile} has)`));
+  const code = (await runCmd(native, { cwd: join(layout.root, layout.member), env: environment, stdoutToStderr: jsonMode })).code;
+
+  if (code !== 0) return code;
+  const after = existsSync(lockPath) ? readLock({ pm, path: lockPath, cwd: join(layout.root, layout.member) }) : null;
+  const left = after === null ? (empty ? new Set<string>() : null) : after.kind === "read" ? new Set(after.nodes.map(artifactOf)) : null;
+  // the lockfile the removal left must be the one apm checked: nothing more, nothing it should have taken out
+  const extra = left === null ? null : [...left].filter((id) => !planned.has(id)).concat([...planned].filter((id) => !left.has(id)));
+
+  if (extra === null || extra.length > 0) {
+    fail(`apm remove: ${pm} left a ${t.lockfile} that is not the one apm checked (${extra === null ? "apm could not read it" : `it differs at ${extra.slice(0, 5).join(", ")}`}); check it before you install again.`);
+
+    return 1;
+  }
+
+  return 0;
+}
+
+/** Whether two paths name the same directory, symlinks resolved. */
+function samePath(a: string, b: string): boolean {
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+
+  return real(a) === real(b);
+}
+
+/**
+ * When the folder apm runs in has no package.json, the package manager changes the project of the nearest one above
+ * it: says which, before anything changes. The nearest one being the home folder's own (a stray ~/package.json) is
+ * refused: it is rarely the project anyone means, and an add there rewrites its lockfile and node_modules. Returns
+ * whether it refused.
+ */
+function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "adding to" | "removing from" }): boolean {
+  const project = join(input.layout.root, input.layout.member);
+
+  if (samePath(project, input.cwd)) {
+    // a workspace member: the lockfile the add or removal changes is the workspace's
+    if (input.layout.member !== "") say(dim(`apm: ${escapedPath(input.cwd)} is a member of the workspace at ${escapedPath(input.layout.root)}, whose lockfile this changes`));
+
+    return false;
+  }
+
+  if (samePath(project, homedir())) {
+    refuseHomeProject({ cwd: input.cwd, project });
+
+    return true;
+  }
+
+  say(yellow(`apm: no package.json in ${escapedPath(input.cwd)}; ${input.verb} the project at ${escapedPath(project)}${input.layout.member === "" ? "" : `, in the workspace at ${escapedPath(input.layout.root)}, whose lockfile this changes`}`));
+
+  return false;
+}
+
+/** The refusal for an add or removal whose nearest package.json is the home folder's, from a folder below it. */
+function refuseHomeProject(input: { cwd: string; project: string }): void {
+  fail(`refused: there is no package.json in ${escapedPath(input.cwd)}; the nearest one is ${escapedPath(join(input.project, "package.json"))}, in your home folder, and apm does not change that project from another folder. Nothing was changed.`);
+  say(`cd into your project first, or run npm init -y in ${escapedPath(input.cwd)} to start one there.`);
+}
+
+/** The nearest folder above `cwd` with a package.json when `cwd` has none: the package managers look upward, so that project may be the one that changes. */
+function projectAbove(cwd: string): string | null {
+  let above = existsSync(join(cwd, "package.json")) ? null : dirname(cwd);
+
+  while (above !== null && !existsSync(join(above, "package.json"))) above = dirname(above) === above ? null : dirname(above);
+
+  return above;
+}
+
+/**
+ * The line before a plain install of the project's dependencies (`apm install` or `apm ci` with no packages): apm
+ * checks nothing there, and the package manager installs from its own config and the lockfile's URLs. apm does not
+ * read that config (which files count depends on the package manager, its version and the workspace), so it names only
+ * the default and how to point it at apm.
+ */
+function plainInstallNote(input: { cwd: string; pm: Pm; command: string }): void {
+  const above = projectAbove(input.cwd);
+
+  if (above !== null) warn(yellow(`apm: no package.json in ${escapedPath(input.cwd)}; ${input.pm} may install the project at ${escapedPath(above)}${samePath(above, homedir()) ? ", your home folder," : ""} instead`));
+
+  // the copyable setting only for apm's own registry: any other URL could carry a credential
+  const shown = sameRegistry(process.env.APM_REGISTRY ?? DEFAULT_REGISTRY, DEFAULT_REGISTRY) ? DEFAULT_REGISTRY : null;
+  const hint = shown === null ? `point ${input.pm}'s registry setting at it` : input.pm === "bun" ? `set registry = "${shown}" under [install] in bunfig.toml` : input.pm === "yarn" ? `set registry=${shown} in .npmrc (yarn 1) or npmRegistryServer: "${shown}" in .yarnrc.yml (yarn 2 and later)` : `set registry=${shown} in .npmrc`;
+  const where = input.pm === "yarn" ? "yarn installs from the registry in its own config" : `${input.pm} installs from the registry in its own config (https://registry.npmjs.org/ unless that names another)`;
+
+  warn(dim(`apm: a plain ${input.pm} ${input.command}, which apm checks nothing in; ${where} and from the lockfile's own URLs. To install through apm's registry, ${hint}`));
+}
 async function cmdAdd(a: Args): Promise<number> {
   const cwd = process.cwd();
   const cfg = config(cwd);
@@ -1529,6 +1931,16 @@ async function cmdAdd(a: Args): Promise<number> {
   }
 
   if (specs.length === 0) {
+    const above = projectAbove(cwd);
+
+    // a plain install from below a stray home-folder package.json would install that project: refused like an add
+    if (above !== null && samePath(above, homedir())) {
+      refuseHomeProject({ cwd, project: above });
+      emitJson({ ok: false, det, results: [], error: lastError });
+
+      return 1;
+    }
+
     if (ignoreScripts && isLockPm(det.pm)) return installWithoutScripts({ cwd, det: { pm: det.pm, why: det.why } });
     const cmd = [det.pm, "install"];
 
@@ -1552,6 +1964,12 @@ async function cmdAdd(a: Args): Promise<number> {
 
   if (layout.kind === "refused") {
     fail(`refused: ${layout.reason}`);
+    emitJson({ ok: false, det, results: [], error: lastError });
+
+    return 1;
+  }
+
+  if (refuseProjectElsewhere({ cwd, layout: layout.layout, verb: "adding to" })) {
     emitJson({ ok: false, det, results: [], error: lastError });
 
     return 1;
@@ -1789,7 +2207,20 @@ async function cmdScore(a: Args): Promise<number> {
 
   const api = new Api(config(process.cwd()));
   const { name, range } = parseSpec(spec);
-  const s = await api.get(`-/apm/v1/score/${encodeName(name)}${range ? `/${encodeURIComponent(range)}` : ""}`, ScoreResponse);
+  let s: ScoreResponse;
+
+  try {
+    s = await api.get(`-/apm/v1/score/${encodeName(name)}${range ? `/${encodeURIComponent(range)}` : ""}`, ScoreResponse);
+  } catch (e) {
+    // no version named, and none tagged latest (a package with only a prerelease, tagged next): say which tags it has
+    const [first, ...rest] = e instanceof ApiError && e.status === 404 && (range === null || range === "latest") ? await tagsWithoutLatest(api, name) : [];
+
+    if (first === undefined) throw e;
+    fail(`apm: ${name} has no version tagged latest. Its versions are tagged ${[first, ...rest].map((t) => `${t.tag} (${t.version})`).join(", ")}`);
+    say(`To score what the tag ${first.tag} resolves to: apm score ${name}@${first.tag}`);
+
+    return 1;
+  }
 
   if (jsonMode) {
     emit({ ok: true, ...s });
@@ -1800,6 +2231,23 @@ async function cmdScore(a: Args): Promise<number> {
   if (s.previous) say(dim(`  previous ${s.previous.version}: ${s.previous.score}/100${s.changes.length ? `; changed: ${s.changes.join("; ")}` : ""}`));
   for (const n of s.notChecked ?? []) say(dim(`  not checked: ${n}`));
   return 0;
+}
+
+/** How long apm name waits for the registry's rules for new names: the name itself is already answered. */
+const NAME_POLICY_TIMEOUT_MS = 5_000;
+
+const AuthConfig = z.object({ namePolicy: z.enum(["scoped", "open"]) }).loose();
+
+/** The registry's policy for new names: "scoped" (only under your account name; on production, your GitHub login), "open", or null when unknown. */
+async function namePolicy(api: Api): Promise<"scoped" | "open" | null> {
+  try {
+    const answer = await api.raw("-/apm/v1/auth/config", {}, NAME_POLICY_TIMEOUT_MS);
+    const config = AuthConfig.safeParse(answer.body);
+
+    return answer.status === 200 && config.success ? config.data.namePolicy : null;
+  } catch {
+    return null;
+  }
 }
 
 async function cmdName(a: Args): Promise<number> {
@@ -1814,7 +2262,9 @@ async function cmdName(a: Args): Promise<number> {
   let user = "";
   if (cfg.token) {
     const me = await api.raw("-/whoami");
-    if (me.status === 200 && typeof me.body === "object" && me.body !== null && "username" in me.body) user = String(me.body.username);
+    // the username becomes a scope apm prints and suggests: only one in a scope's alphabet counts
+    const who = z.object({ username: z.string().regex(/^[a-z0-9][a-z0-9._~-]*$/i) }).safeParse(me.body);
+    if (me.status === 200 && who.success) user = who.data.username;
   }
   const r = await api.get(`-/apm/v1/names?q=${encodeURIComponent(q)}${user ? `&user=${encodeURIComponent(user)}` : ""}`, NameResponse);
 
@@ -1822,9 +2272,33 @@ async function cmdName(a: Args): Promise<number> {
     emit({ ok: true, ...r });
     return 0;
   }
-  if (!r.valid) say(red(`✗ ${r.query} is not a valid package name`));
+  const scope = /^@([^/]+)\//.exec(r.query)?.[1] ?? null;
+  const base = r.query.slice(scope === null ? 0 : scope.length + 2);
+  const yours = user === "" ? "@<your account name>" : `@${user.toLowerCase()}`;
+
+  // the registry reads the name lowercased; a new package's name must be lowercase as typed
+  if (r.valid && q.trim() !== r.query) {
+    say(red(`✗ ${q.trim()} is not a valid name for a new package: npm names are lowercase. Try ${r.query}: apm name ${r.query}`));
+
+    return 0;
+  }
+
+  if (!r.valid) say(red(`✗ ${r.query} is not a valid package name: a name is lowercase letters, digits and - . _ (and ~ in a scope), starts with a letter or digit, is at most 214 characters, and has at most one scope, as @scope/name`));
   else if (r.taken) say(`${red("✗")} ${bold(r.query)} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}`);
-  else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);
+  else if (r.available && (scope === null || scope !== user.toLowerCase())) {
+    // a scope is its owner's under every policy (access.ts newNameRefusal); a bare name depends on the registry's rules
+    // for new names: "scoped" (production) takes one only under its publisher's account name, and rules apm could not
+    // read are said so, never called available
+    const policy = scope === null ? await namePolicy(api) : null;
+    const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
+    const instead = user === "" ? `use ${yours}/${base} (log in with ${LOGIN_HINT}, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
+
+    if (scope === null && policy === "open") say(`${green("✓")} ${bold(r.query)} is available`);
+    else if (scope === null && policy === null) say(`${yellow("!")} ${bold(r.query)} is free, but apm could not read this registry's rules for new names, so it cannot say whether you may publish it (apm's own registry takes a new package only under your GitHub login)`);
+    else if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, ${instead}`);
+    else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Log in (${LOGIN_HINT}), then ask again to see whether that is you`);
+    else say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}`);
+  } else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);
   else say(`${yellow("!")} ${bold(r.query)} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}`);
   for (const s of r.similar ?? []) say(dim(`  similar: ${s.reason}`));
   const alts = r.suggestions.filter((s) => s.available).slice(0, 4);
@@ -2244,6 +2718,9 @@ async function cmdPublish(a: Args): Promise<number> {
     say(dim(`version ${pj.version} → ${version}${dry ? " (dry run, package.json unchanged)" : ""}`));
   }
 
+  // a dry run needs no login, but the real publish will: say so while nothing is at stake
+  if (dry && cfg.token === null) say(yellow(`apm: apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}; unless you have other publishing credentials for it, log in before the real publish (on an apm registry: ${LOGIN_HINT})`));
+
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
   process.once("exit", () => rmSync(dest, { recursive: true, force: true }));
@@ -2305,7 +2782,7 @@ async function cmdPublish(a: Args): Promise<number> {
   const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
-    fail(`apm publish: ${det.pm} publish failed for ${id}`);
+    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication, log in to this registry, then apm publish again (on an apm registry: ${LOGIN_HINT})` : ""}`);
     return pub.code;
   }
   // A login token stages the version: the registry answers with an approval link in its notice.
@@ -2353,8 +2830,15 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm restore <pkg>@<v>      undo a mistaken revoke (back to yanked)
   apm incident --since <time> [--dry-run]   account compromised: revoke tokens and recent versions
   apm login | whoami        sign in through the browser; publishes then wait for your approval
-  apm <anything else>        passed to your package manager (apm run dev = bun run dev)
-  apm <command> --help       that command's flags (also -h, or apm help <command>); runs nothing
+  apm run <script|file>      your package manager's run (bun: with --no-install)
+  apm <script>               a package.json script (apm dev = bun run dev)
+  apm remove <pkg>...        your package manager's removal, by name, once apm checked it installs nothing new
+                             (bun 1.2 and later, npm, pnpm; not yarn)
+  apm test                   your package manager's test; npm and pnpm also start, why, ls and outdated, yarn start
+  apm ci                     npm only: npm ci, with the switches apm install takes with no packages
+  apm <anything else>        refused: it could install packages apm cannot check
+  apm <command> --help       an apm command's flags (also -h, or apm help <command>; also ci and remove); runs nothing.
+                             After another command apm passes on, --help goes to the package manager or the script
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
   --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
@@ -2372,34 +2856,217 @@ const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebu
 // Commands that print one JSON document with --json (everything else is the package manager's).
 const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain", "search", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
 
+/**
+ * The package manager's commands apm passes on, besides the project's scripts: ones that install nothing new (removal,
+ * by package name alone, only while the lockfile pins every range package.json lists). bun runs a file or a script for a
+ * word that is not its own command (bun ls, bun start), and installs what that file imports, so with bun apm passes on fewer.
+ */
+const PASSTHROUGH = new Map<Pm, ReadonlySet<string>>([
+  ["bun", new Set(["run", "test", "remove", "rm", "uninstall"])],
+  ["npm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+  ["pnpm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+  ["yarn", new Set(["run", "test", "start", "remove", "rm", "uninstall"])],
+]);
+
+const REMOVALS = new Set(["remove", "rm", "uninstall"]);
+
+/** bun's own options before what `bun run` runs that apm passes on; the others can turn bun's auto-install back on. */
+const BUN_RUN_SWITCHES = new Set(["--silent", "--watch", "--hot", "--help", "-h"]);
+
+const ProjectScripts = z.object({ scripts: z.record(z.string(), z.unknown()).optional().catch(undefined) });
+
+/** The script names in the package.json of `cwd`. */
+function projectScripts(cwd: string): Set<string> {
+  try {
+    const m = ProjectScripts.safeParse(JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")));
+
+    return new Set(m.success ? Object.keys(m.data.scripts ?? {}) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+const BunfigRun = z.object({ run: z.object({ bun: z.unknown().optional() }).loose().optional() }).loose();
+
+/**
+ * Whether a bunfig.toml bun reads in `cwd` may set run.bun, which runs scripts' node under bun, and so with auto-install.
+ * A bunfig apm cannot read as TOML counts as one that does.
+ */
+function bunRunsNode(cwd: string): boolean {
+  const configs = [join(cwd, "bunfig.toml"), join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), ".bunfig.toml"), join(homedir(), ".bunfig.toml")];
+
+  return configs.some((file) => {
+    if (!existsSync(file)) return false;
+
+    try {
+      const parsed = BunfigRun.safeParse(Bun.TOML.parse(readFileSync(file, "utf8")));
+
+      return !parsed.success || (parsed.data.run?.bun !== undefined && parsed.data.run.bun !== false);
+    } catch {
+      return true;
+    }
+  });
+}
+
+/** Why apm refuses to pass these arguments on to `pm` for `cmd`, or null. */
+function passthroughError(cmd: string, args: readonly string[], end: number, pm: Pm, cwd: string): string | null {
+  const own = end === -1 ? args : args.slice(0, end);
+
+  if (REMOVALS.has(cmd)) {
+    const word = args.find((x) => x.startsWith("-") && x !== "--");
+
+    if (word !== undefined) return `apm ${cmd} takes only the names of the packages to remove, not ${word}`;
+
+    if (!args.some((x) => x !== "--")) return `apm ${cmd} needs the names of the packages to remove`;
+
+    return isLockPm(pm) ? null : "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new";
+  }
+
+  if (pm !== "bun") return null;
+
+  if (cmd === "test") {
+    const word = own.find((x) => x === "-i" || x === "--install" || x.startsWith("--install="));
+
+    return word === undefined ? null : `apm does not pass bun's ${word} on: bun would install what the tests import, unchecked`;
+  }
+
+  if (bunRunsNode(cwd)) return "a bunfig.toml sets run.bun (or apm cannot read it), so bun could run node as bun and install what the code imports, unchecked";
+
+  // bun's options come before what it runs; what follows is the script's own
+  const target = own.findIndex((x) => !x.startsWith("-"));
+  const word = (target === -1 ? own : own.slice(0, target)).find((x) => !BUN_RUN_SWITCHES.has(x));
+
+  return word === undefined ? null : `apm does not pass bun's ${word} on: bun could install what the code it runs imports, unchecked`;
+}
+
+/**
+ * A command apm does not run itself. apm passes on only commands that cannot install a package it has not checked
+ * (PASSTHROUGH; run with bun gets --no-install, so bun does not install what the code it runs imports) and the
+ * project's package.json scripts by name, run as `<pm> run <script>`. Anything else (an update and every alias of it,
+ * link, create, a capitalised spelling) is refused.
+ */
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
   // apm's --pm is taken out only before --; after it, every argument is the package manager's
   const end = a.raw.indexOf("--");
-  const own = end === -1 ? a.raw : a.raw.slice(0, end);
-  const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
+  const own = (end === -1 ? a.raw : a.raw.slice(0, end)).filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm="));
+  // bun runs a file of that name before a script, so a script that a path or a file could shadow is refused
+  const shadowed = a.cmd.includes("/") || a.cmd.startsWith(".") || ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"].some((ext) => existsSync(join(cwd, a.cmd + ext)));
+  const native = PASSTHROUGH.get(det.pm)?.has(a.cmd) === true;
+  const script = !native && !(det.pm === "bun" && shadowed) && projectScripts(cwd).has(a.cmd);
 
-  return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
+  if (!native && !script) {
+    fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
+    say(REMOVALS.has(a.cmd) ? (det.pm === "yarn" ? "apm cannot check a removal with yarn; run yarn remove <package> yourself." : "To remove a package, run apm remove <package>.") : `To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+
+    return 2;
+  }
+
+  const args = [...own, ...(end === -1 ? [] : a.raw.slice(end))];
+  const error = passthroughError(script ? "run" : a.cmd, script ? [a.cmd, ...args] : args, end === -1 ? -1 : own.length + (script ? 1 : 0), det.pm, cwd);
+
+  if (error !== null) {
+    fail(`apm: ${error}. Nothing was run.`);
+    say(REMOVALS.has(a.cmd) && det.pm === "yarn" ? "apm cannot check a removal with yarn; run yarn remove <package> yourself." : `To run it without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+
+    return 2;
+  }
+
+  if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return checkedRemoval({ cwd, det: { pm: det.pm, why: det.why }, names: args.filter((x) => x !== "--") });
+
+  const command = script ? ["run", a.cmd] : [a.cmd];
+
+  if (det.pm === "bun" && command[0] === "run") command.splice(1, 0, "--no-install");
+
+  // pnpm's verify-deps-before-run=install would install before it runs a script
+  if (det.pm === "pnpm" && !REMOVALS.has(a.cmd)) command.unshift("--config.verify-deps-before-run=false");
+
+  const childEnv = INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env();
+
+  if (det.pm === "pnpm") {
+    // pnpm reads its environment after the command line, so apm sets verify-deps-before-run there too
+    for (const key of Object.keys(childEnv)) if (/^(npm|pnpm)_config_verify[-_]deps[-_]before[-_]run$/i.test(key)) delete childEnv[key];
+    childEnv.pnpm_config_verify_deps_before_run = "false";
+  }
+
+  return (await runCmd([det.pm, ...command, ...args], { cwd, env: childEnv })).code;
 }
 
 /** `apm install` with no packages: the package manager's own install, with only arguments that cannot name a package. */
 async function bareInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const passed = bareInstallArgs(a, det.pm);
+  let passed = bareInstallArgs(a, det.pm);
 
-  if ("args" in passed) return (await runCmd([det.pm, "install", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  // yarn 1 ignores --immutable and rewrites a stale yarn.lock; only yarn 2 and later keep it
+  if ("args" in passed && det.pm === "yarn" && passed.args.includes("--immutable")) {
+    const line = await yarnLine({ cwd, env: withoutSecrets(process.env) });
+
+    if (line.kind !== "berry") passed = { error: `yarn ${line.kind === "classic" ? line.version : "(version unknown)"} ignores --immutable and may rewrite yarn.lock; use --frozen-lockfile` };
+  }
+
+  if ("args" in passed) {
+    plainInstallNote({ cwd, pm: det.pm, command: "install" });
+
+    return (await runCmd([det.pm, "install", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  }
+
   fail(`apm: ${passed.error}. Nothing was run.`);
   say(`To check and add a package, name it: apm add <package>. For other ${det.pm} install options, run ${det.pm} install yourself.`);
 
   return 2;
 }
 
+/**
+ * `apm update`, `up` and `upgrade`: refused. An update fetches new versions apm cannot check, and the package managers
+ * read these words differently (bun's upgrade replaces bun itself, and some run a project script of that name), so
+ * apm points to its checked add, or to the package manager's own update run knowingly.
+ */
+function update(a: Args): number {
+  const det = pmFor(a, process.cwd());
+
+  const native = det.pm === "yarn" ? "yarn upgrade (yarn 1) or yarn up (yarn 2 and later)" : `${det.pm} update`;
+
+  fail(`apm: apm ${a.cmd} would fetch new versions apm cannot check. Nothing was run.`);
+  say(`To check a dependency and move it to the newest version apm allows, run apm add <package>@latest. To update without apm's check, run ${native} yourself.`);
+
+  return 2;
+}
+
+/** `apm ci`: the package manager's clean install, with only the arguments a bare install passes on (none can name a package). */
+async function cleanInstall(a: Args): Promise<number> {
+  const cwd = process.cwd();
+  const det = pmFor(a, cwd);
+
+  // bun's ci differs by version (bun 1.1 runs a script of that name, and none of them needs a usable lockfile), so only npm's is passed on
+  const passed = det.pm === "npm" ? bareInstallArgs(a, det.pm) : { error: `${det.pm} has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile` };
+
+  if ("args" in passed) {
+    plainInstallNote({ cwd, pm: det.pm, command: "ci" });
+
+    return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  }
+
+  fail(`apm: ${passed.error}. Nothing was run.`);
+
+  if (det.pm === "npm") say("For other npm ci options, run npm ci yourself.");
+
+  return 2;
+}
+
+const CI_HELP = "usage: apm ci [switches]\n\nWith npm, npm ci with the switches apm install takes with no packages. With bun, pnpm and yarn, apm passes no ci\non: run apm install --frozen-lockfile.";
+
+const REMOVE_HELP = "usage: apm remove <package>... (also rm, uninstall)\n\nWith bun 1.2 and later, npm and pnpm, apm computes the removal in a copy of your project first and refuses it when\nthe package manager would install anything the lockfile does not have (a package.json entry the lockfile lacks,\nsay). Then it runs the package manager's own removal with the lockfile on and no install scripts. It needs a lockfile apm can read,\nregistry versions only in package.json (no URL, git or path specs) and no overrides, resolutions, catalogs or patched\ndependencies (with bun, a bunfig.toml that turns off install.lockfile.save or that apm cannot read; with pnpm, a .pnpmfile.cjs or a pnpmfile setting), and\ntakes package names only. With yarn, run yarn remove yourself.";
+
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
-  if (a.cmd === "help") return helpTopic(a.positional[0] ?? "")?.help ?? HELP;
+  if (a.cmd === "help") return a.positional[0] === "ci" ? CI_HELP : REMOVALS.has(a.positional[0] ?? "") ? REMOVE_HELP : (helpTopic(a.positional[0] ?? "")?.help ?? HELP);
   if (a.cmd === "--help" || a.cmd === "-h") return HELP;
+
+  if (a.cmd === "ci") return a.raw.includes("--help") || a.raw.includes("-h") ? CI_HELP : null;
+
+  if (REMOVALS.has(a.cmd)) return a.raw.includes("--help") || a.raw.includes("-h") ? REMOVE_HELP : null;
 
   return has(a, "help") ? (commandOf(a.cmd)?.help ?? null) : null;
 }
@@ -2438,6 +3105,12 @@ function refuseArgs(a: Args): boolean {
 async function main(a: Args): Promise<number> {
   if (refuseArgs(a)) return 2;
 
+  const lower = a.cmd.toLowerCase();
+
+  // npm reads an abbreviation or its typo alias udpate as its update, and some package managers read a command in any case
+  // (any other command apm does not run itself is refused in passthrough unless it is safe or a project script)
+  if (lower.length >= 2 && ["update", "upgrade", "udpate"].some((word) => word.startsWith(lower))) return update(a);
+
   switch (a.cmd) {
     case "--version":
     case "-v":
@@ -2448,6 +3121,8 @@ async function main(a: Args): Promise<number> {
     case "install":
     case "i":
       return a.positional.length > 0 ? cmdAdd(a) : bareInstall(a);
+    case "ci":
+      return cleanInstall(a);
     case "x": // also `apm exec` and `apm dlx` (args.ts)
       return cmdX(a);
     case "score":
