@@ -227,7 +227,15 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
     const user = (s: string) => `registry=https://registry.apmjs.dev/\n${s}`;
 
     // npm expands the name before it sets it, so ${HOST}:_authToken can be the very key being rotated
-    for (const [src, line] of [[user("${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 2], [user("[custom] \n${HOST}:_authToken = apm_oldoldoldoldoldold01\n"), 3]] as const) {
+    // the line reported is the one an editor shows, blank lines and CRLF endings counted (review of 9e3693b)
+    const cases = [
+      [user("${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 2],
+      [user("[custom] \n${HOST}:_authToken = apm_oldoldoldoldoldold01\n"), 3],
+      [user("\n\n# note\n\n${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 6],
+      [user("\r\n\r\n${HOST}:_authToken=apm_oldoldoldoldoldold01\r\n").replace("\n", "\r\n"), 4],
+    ] as const;
+
+    for (const [src, line] of cases) {
       const p = project({ user: src });
       const rc = join(p.env.HOME, ".npmrc");
 

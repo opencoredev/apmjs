@@ -4,7 +4,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { npmIniSections } from "./groups.ts";
-import { decodeIni, iniLines, readIniLine, type SectionSyntax } from "./ini.ts";
+import { decodeIni, readIniLine, type SectionSyntax } from "./ini.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -160,7 +160,8 @@ export function saveToken(userconfig: string, registry: string, token: string): 
   const key = `${authKey(registry)}:_authToken`;
   // a symlinked .npmrc (dotfiles repos) keeps its link: write next to the real file
   const target = existsSync(userconfig) ? realpathSync(userconfig) : userconfig;
-  const lines = existsSync(target) ? iniLines(readFileSync(target, "utf8")) : [];
+  // split as an editor numbers lines, so a refusal names the line to edit; the blank lines ini merges are skipped below
+  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r\n|\r|\n/) : [];
   // Every line that sets this key at the top level goes, read the way ini reads it (`key = x`, `"key"=x`, `key[]=x`).
   // Which npm reads the file later is not known here, so the top level runs to the first header both grammars open,
   // an exact one: under Debian's npm 9.2 (ini 3) a `[section] ` line is a key, and an old token after it would win over
