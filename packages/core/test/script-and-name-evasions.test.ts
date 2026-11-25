@@ -792,3 +792,11 @@ describe("node's exit flags never cost what fe2e641's eval reading finds", () =>
     expect(isInlineDownload("node --version -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
   });
 });
+
+describe("the added node reader reads the words the shell hands node", () => {
+  test("an exit option after quoted eval code with spaces, or written with a value, runs nothing", () => {
+    expect(isInlineDownload("node '--title' fetch -e 'console.log(\"MARKER HAS SPACE\")' --version")).toBe(false);
+    expect(isInlineDownload("node '--title' fetch -e 'console.log(12345)' --version=true")).toBe(false);
+    expect(isInlineDownload("node --conditions dev -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
+  });
+});

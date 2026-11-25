@@ -100,7 +100,12 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 // starts only after a non-space, as the sticky walk always does, so a search over a run of whitespace is linear too
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
-const NODE_EXITS = new Set(["-v", "--version", "-h", "--help", "--v8-options", "-c", "--check"]);
+
+// node prints and exits at these, written alone or with a value
+const NODE_EXIT = /^(?:--(?:version|help|v8-options|check)(?:=.*)?|-[vhc])$/;
+
+// an interpreter as the shell runs it (INTERPRETER), as one word
+const INTERPRETER_WORD = /^(?:node(?:js)?|bun|deno)(?:\.exe)?$/i;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
 
 // node's options that take the next word as their value (`--conditions dev`, `-r ./x`), from `node --help` (Node 18 to
@@ -152,42 +157,47 @@ function flagEval(cmd: string): boolean {
 }
 
 /**
- * What the flag reading misses: an eval flag after a flag whose value is the next word (`--conditions dev -e …`). Node
- * reads all its options before it runs anything, so an exit flag among them (`--version`) runs no code, wherever it is;
- * past an eval argument split over several words, where the options end is not known and the eval stands.
+ * What the flag reading misses: an eval flag after a flag whose value is the next word (`--conditions dev -e …`), read
+ * over the words the shell hands the interpreter, so a quoted eval argument is one word. Node reads all its options
+ * before it runs anything, so an exit option among them (`--version`, `--help=true`) runs no code, wherever it is.
  */
 function valueFlagEval(cmd: string): boolean {
-  const interpreter = new RegExp(INTERPRETER);
-  const word = new RegExp(NEXT_WORD);
+  // a cheap test first: the walk below builds the words of the whole command
+  if (!new RegExp(INTERPRETER).test(cmd)) return false;
+  let walking = false;
+  let value = false;
+  let evalValue = false;
+  let evals = false;
+  let exits = false;
 
-  for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
-    word.lastIndex = m.index + m[0].length;
-    let value = false;
-    let evalValue = false;
-    let evals = false;
-    let exits = false;
-
-    for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
-      // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
-      const raw = w[1] ?? "";
-      const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
-      const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
-
-      if (evalValue) {
-        evalValue = false;
-
-        if (/^['"]/.test(raw) && !quoted) break;
-      } else if (value) value = false;
-      else if (EVAL_FLAG.test(flag)) {
-        evals = true;
-        evalValue = !flag.includes("=");
-      } else if (NODE_EXITS.has(flag)) exits = true;
-      else if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
-      else break;
-      interpreter.lastIndex = word.lastIndex;
+  for (const t of [...shellWords(cmd), null]) {
+    if (walking && (t === null || t === "(" || t === ")" || (!value && !evalValue && t.expanded))) {
+      if (evals && !exits) return true;
+      walking = false;
     }
 
-    if (evals && !exits) return true;
+    if (t === null || t === "(" || t === ")") continue;
+    const w = t.word;
+
+    if (!walking) {
+      walking = INTERPRETER_WORD.test(w.slice(w.lastIndexOf("/") + 1));
+      value = evalValue = evals = exits = false;
+      continue;
+    }
+
+    if (evalValue || value) {
+      evalValue = value = false;
+    } else if (EVAL_FLAG.test(w)) {
+      evals = true;
+      evalValue = !w.includes("=");
+    } else if (NODE_EXIT.test(w)) {
+      exits = true;
+    } else if (OTHER_FLAG.test(w)) {
+      value = VALUE_FLAG.test(w);
+    } else {
+      if (evals && !exits) return true;
+      walking = false;
+    }
   }
 
   return false;
