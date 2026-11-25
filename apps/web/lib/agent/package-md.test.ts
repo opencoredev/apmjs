@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { handleMessage } from "./mcp";
 import { packageMarkdown } from "./package-md";
 import { loadPackageView } from "./package-view";
-import { fakeSource, INSTALL, INSTALLS, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED } from "./testing";
+import { fakeSource, INSTALL, INSTALLS, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED } from "./testing";
 import { codeBlock, inlineCode, oneLine } from "./text";
 import type { PackageInfo } from "../registry";
 import { parseResolve, type ResolveOutcome } from "./source";
@@ -355,11 +355,11 @@ describe("what the Markdown view says apm will not install, and how", () => {
     expect(calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
   });
 
-  test("two views of one version within a minute make one resolve, for the page, the .md and check_package alike", async () => {
+  test("each view makes its own one resolve: no answer is kept between views", async () => {
     const source = fakeSource({ packages: { ugent_uws: ugent("9.0.0") }, resolve: () => UGENT_REFUSED });
 
     for (let i = 0; i < 2; i++) await loadPackageView({ name: "ugent_uws", version: "10.9.11", registry: REGISTRY, source });
-    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11", "resolve ugent_uws@10.9.11"]);
   });
 
   test("a revoke between reads leaves no capability evidence from the earlier answer", async () => {
@@ -382,6 +382,29 @@ describe("what the Markdown view says apm will not install, and how", () => {
     }
   });
 
+  // Sol review of d55e6ff, finding 3: the score route saw the revoke first, the version and review reads did not
+  test("a score route that says redacted withholds the source, though the version and review reads say active", async () => {
+    const leak = "SCORE-ROUTE-FIRST-SECRET";
+    const p = pkg({ versions: [row("1.3.0"), row("1.2.0")] });
+    const active = score({ signals: [{ ...NETWORK, evidence: [`lib/index.js:12: fetch("https://x.example/${leak}")`] }] });
+    const redacted = score({ redacted: true, signals: [{ ...NETWORK, evidence: ["lib/index.js:12"] }] });
+
+    const source = fakeSource({
+      packages: { "left-pad": p },
+      versions: { "left-pad@1.2.0": { version: "1.2.0", status: "active", statusReason: null, deprecated: null, facts: null, score: active } },
+      scores: { "left-pad@1.2.0": redacted },
+      reviews: { "left-pad@1.2.0": REVIEW_CLEAN },
+    });
+
+    const loaded = await loadPackageView({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source });
+
+    if (loaded.kind !== "ok") throw new Error(JSON.stringify(loaded));
+    const answer = JSON.stringify(await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.2.0" } } }, source));
+
+    for (const out of [JSON.stringify(loaded.view.score), packageMarkdown(loaded.view), answer]) expect(out).not.toContain(leak);
+    expect(packageMarkdown(loaded.view)).toContain("- Source: withheld.");
+  });
+
   test("a refused default makes the one resolve and nothing more", async () => {
     const { md, calls } = await load(ugent("10.9.11"), null, (_, range) => (range === "10.9.11" ? UGENT_REFUSED : resolvedTo("9.0.0")));
 
@@ -402,7 +425,7 @@ describe("what the Markdown view says apm will not install, and how", () => {
     const listed = await load(p, null, () => BAD_TREE_LISTED);
     const confirmed = await load(p, null, () => BAD_TREE_CONFIRMED);
 
-    expect(listed.md).toContain("- Status: do not install. It depends on §evil@2.0.0§, which the OSSF malicious-packages feed lists as malicious (MAL-2026-1), so apm add refuses it. Advisory: https://osv.dev/vulnerability/MAL-2026-1".replaceAll("§", "`"));
+    expect(listed.md).toContain("- Status: do not install. It depends on §evil@2.0.0§, which the OSSF malicious-packages feed lists as malicious (§MAL-2026-1§), so apm add refuses it. Advisory: https://osv.dev/vulnerability/MAL-2026-1".replaceAll("§", "`"));
     expect(confirmed.md).toContain("- Status: do not install. It depends on §bad@0.1.0§, which apm reviewers confirmed is malicious, so apm add refuses it.".replaceAll("§", "`"));
 
     for (const { md } of [listed, confirmed]) {

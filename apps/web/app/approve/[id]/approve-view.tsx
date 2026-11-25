@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { ScoreBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, AuthConfig, call, passkeyConfirmation, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
+import { isSafeTag } from "@/lib/install-note";
 import { cn } from "@/lib/utils";
 
 type State =
@@ -30,7 +31,8 @@ type Decision = { status: "rejected" } | { status: "approved"; live: Live };
 function liveOf(tag: string | null | undefined): Live {
   if (tag === "latest") return { kind: "latest" };
 
-  return tag === null || tag === undefined ? { kind: "pinned" } : { kind: "tagged", tag };
+  // a tag that is not a plain name never goes into the command shown: the version is pinned instead
+  return tag === null || tag === undefined || !isSafeTag(tag) ? { kind: "pinned" } : { kind: "tagged", tag };
 }
 
 function fmtSize(n: number): string {

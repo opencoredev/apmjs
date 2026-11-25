@@ -7,7 +7,7 @@ import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
 import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
-import { advisoryUrl, dependencyWhy, noInstallableReason, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "../refusal";
+import { advisoryUrl, noInstallableReason, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "../refusal";
 import { basisNote, capabilityParts, scorerCapabilities, statusMark } from "../capabilities";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
@@ -199,7 +199,10 @@ function refusalText(r: Refusal): string {
   if (r.kind === "dependency") {
     const links = r.deps.flatMap((d) => d.ids ?? []).map((id) => linkUrl(advisoryUrl(id)));
 
-    return `It depends on ${r.deps.map((d) => `${inlineCode(`${d.name}@${d.version}`)}, which ${dependencyWhy(d)}`).join("; and on ")}, so apm add refuses it.${links.length > 0 ? ` Advisory: ${links.join(", ")}` : ""}`;
+    // the advisory ids are the registry's text: quoted, as the root's are
+    const why = (d: (typeof r.deps)[number]) => (d.ids === null ? "apm reviewers confirmed is malicious" : `the OSSF malicious-packages feed lists as malicious (${d.ids.map((id) => inlineCode(id)).join(", ")})`);
+
+    return `It depends on ${r.deps.map((d) => `${inlineCode(`${d.name}@${d.version}`)}, which ${why(d)}`).join("; and on ")}, so apm add refuses it.${links.length > 0 ? ` Advisory: ${links.join(", ")}` : ""}`;
   }
 
   return r.kind === "policy" ? `apm's install policy refuses it: ${inlineCode(r.reason)}` : refusalReason(r);

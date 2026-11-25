@@ -163,7 +163,14 @@ describe("published tags and tag targets the list does not hold", () => {
     const asked: string[] = [];
 
     await selectVersion({ pkg: p, asked: undefined, read: async (version) => (asked.push(version), { kind: "ok", value: details(version, "2026-01-01T00:00:00.000Z") }) });
-    expect(asked.toSorted()).toEqual(["10.0.0", "3.0.0", "9.1.0"]);
+    expect(asked).toEqual(["10.0.0", "9.1.0", "3.0.0"]);
+
+    // semver precedence, not text order: identifiers compare by ASCII, so -Z comes before -a
+    const pre = pkg({ latest: null, score: null, distTags: { a: "1.0.0-a", b: "1.0.0-b", c: "1.0.0-c", z: "1.0.0-Z", s: "2.0.0" }, versions: [row("0.1.0", { status: "yanked" })] });
+    const preAsked: string[] = [];
+
+    await selectVersion({ pkg: pre, asked: undefined, read: async (version) => (preAsked.push(version), { kind: "ok", value: details(version, "2026-01-01T00:00:00.000Z") }) });
+    expect(preAsked).toEqual(["2.0.0", "1.0.0-c", "1.0.0-b"]);
   });
 
   test("a prerelease tagged latest installs by name, as the published tag says", async () => {

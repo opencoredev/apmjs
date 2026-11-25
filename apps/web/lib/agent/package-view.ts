@@ -15,8 +15,9 @@ import { inCooldown } from "../install-note";
 import { readPolicy } from "../refusal";
 import type { Fetched } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
-import { selectVersion } from "../shown-version";
+import { isVersionNumber, selectVersion } from "../shown-version";
 import { isWithheld, withholdSource, type PackageView } from "./package-md";
+import { inlineCode } from "./text";
 import type { AgentSource, VersionInfo } from "./source";
 
 export type LoadedView = { kind: "ok"; view: PackageView } | { kind: "missing"; reason: string } | { kind: "unavailable" };
@@ -36,7 +37,8 @@ export async function loadPackageView(input: { name: string; version: string | n
     case "none":
       return { kind: "ok", view: { pkg, version: null, status: null, policy: { kind: "unknown" }, facts: null, score: null, unscorable: null, review: { kind: "missing" }, install: { kind: "none", why: selected.why }, registry: input.registry } };
     case "no-such-version":
-      return { kind: "missing", reason: `${name} has no version ${selected.asked}. Latest is ${pkg.latest ?? "unknown"}.` };
+      // the selector is the request's text: quoted unless it is a plain version number
+      return { kind: "missing", reason: `${name} has no version ${isVersionNumber(selected.asked) ? selected.asked : inlineCode(selected.asked)}. Latest is ${pkg.latest ?? "unknown"}.` };
     case "unavailable":
       return { kind: "unavailable" };
     case "shown":
@@ -68,7 +70,7 @@ export async function loadPackageView(input: { name: string; version: string | n
     review: review.kind === "ok" ? (review.value.review?.state ?? null) : null,
   }));
 
-  const policy = readPolicy({ name, version, status, risk, resolve: source.policyResolve });
+  const policy = readPolicy({ name, version, status, risk, resolve: source.resolve });
 
   if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
 
@@ -76,6 +78,8 @@ export async function loadPackageView(input: { name: string; version: string | n
   if (info.kind === "unavailable") return { kind: "unavailable" };
   const v = info.value;
   const routed = routeScore === null ? null : await routeScore;
+  // withheld when any read says so, the score route included: it can see a revoke the version and review reads did not
+  const withheld = withheldNow(v, review) || (routed?.kind === "ok" && routed.value.redacted);
 
   // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
@@ -86,9 +90,9 @@ export async function loadPackageView(input: { name: string; version: string | n
       status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated },
       policy: await policy,
       facts: v.facts,
-      // capabilities from another read only when that read and this view agree the version is not withheld: a revoke
-      // between them must not carry the earlier answer's evidence into this one
-      score: withheldNow(v, review) ? v.score : withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
+      // a withheld version's score is marked redacted, so withholdSource strips it whichever read saw the revoke; and
+      // capabilities come from another read only when no read says withheld
+      score: withheld ? (v.score && { ...v.score, redacted: true }) : withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
       unscorable: v.unscorable,
       review,
       install,

@@ -3,6 +3,7 @@
 // names it among the versions it skipped, with the reason, or picks it and refuses what its tree would install (a
 // dependency the OSSF feed lists or an apm reviewer confirmed). The package page, its Markdown view and the MCP tool
 // lead with this instead of install commands.
+import { POLICY_RESOLVE_TIMEOUT_MS } from "./agent/resolve-budget";
 import type { ResolveOutcome } from "./agent/source";
 import type { PublicState } from "./review-schema";
 
@@ -121,11 +122,23 @@ export function resolveRefusal(input: { name: string; version: string; outcome: 
   }
 }
 
+/** `read`, or "unavailable" once `ms` have passed without an answer. */
+function withinBudget(read: Promise<ResolveOutcome>, ms: number): Promise<ResolveOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const late = new Promise<ResolveOutcome>((done) => {
+    timer = setTimeout(() => done({ kind: "unavailable" }), ms);
+  });
+
+  return Promise.race([read, late]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Whether apm installs `version`: its status when that refuses it, then a public review apm reviewers confirmed, else,
  * when it looks risky (looksRisky, from `risk`), one resolve for exactly that version; otherwise resolve is not asked.
+ * A resolve that takes longer than `timeoutMs` (POLICY_RESOLVE_TIMEOUT_MS) counts as not answering.
  */
-export async function readPolicy(input: { name: string; version: string; status: string; risk: Promise<RiskInput>; resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome> }): Promise<PolicyRead> {
+export async function readPolicy(input: { name: string; version: string; status: string; risk: Promise<RiskInput>; resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome>; timeoutMs?: number }): Promise<PolicyRead> {
   const { name, version } = input;
   const byStatus = statusRefusal(input.status);
 
@@ -136,7 +149,8 @@ export async function readPolicy(input: { name: string; version: string; status:
   if (risk.review === "confirmed") return { kind: "refused", refusal: { kind: "confirmed-malicious" } };
 
   if (!looksRisky(risk)) return { kind: "not-asked" };
-  const refusal = resolveRefusal({ name, version, outcome: await input.resolve({ name, range: version }) });
+  const outcome = await withinBudget(input.resolve({ name, range: version }), input.timeoutMs ?? POLICY_RESOLVE_TIMEOUT_MS);
+  const refusal = resolveRefusal({ name, version, outcome });
 
   if (refusal === "unknown") return { kind: "unknown" };
 
@@ -171,7 +185,7 @@ export function noInstallableReason(input: { name: string; why: NoInstallable })
 }
 
 /** Why a refused dependency is refused, after "which": the advisories quoted, or an apm reviewer's confirmation. */
-export function dependencyWhy(d: MaliciousDependency): string {
+function dependencyWhy(d: MaliciousDependency): string {
   return d.ids === null ? "apm reviewers confirmed is malicious" : `the OSSF malicious-packages feed lists as malicious (${d.ids.join(", ")})`;
 }
 

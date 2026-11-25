@@ -13,6 +13,12 @@ export const RESOLVE_TIMEOUT_MS = 25_000;
 export const EXPLAIN_RESOLVE_WAIT_MS = 3_000;
 
 /**
+ * How long a package view (the page's install box, its Markdown view, check_package) waits for resolve before it
+ * treats the install policy as not answering: the conservative "apm may not serve this version" path, never "installs".
+ */
+export const POLICY_RESOLVE_TIMEOUT_MS = 5_000;
+
+/**
  * What the registry's two walks of a large tree may take besides the wait: each reads for at most the registry's
  * WALK_BUDGET_MS (6 s), and a walk cut short by it answers without the second (resolve-budget.test.ts checks it).
  */

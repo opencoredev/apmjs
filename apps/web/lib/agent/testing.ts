@@ -4,7 +4,6 @@ import type { Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { SearchAnswer } from "../search-schema";
 import type { PolicyRead } from "../refusal";
-import { cachedResolve } from "./policy-cache";
 import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome, type ScoreReport, type VersionInfo } from "./source";
 
 /** A view whose shown version apm installs, for tests about something else. */
@@ -77,8 +76,6 @@ export type Fake = Partial<{
   names: NameReport | null;
   excerpt: Fetched<ExcerptAnswer>;
   down: boolean;
-  /** The clock policyResolve keeps its answers by. */
-  now: () => number;
 }>;
 
 /** An AgentSource over in-memory answers; `calls` records what was asked, in order. */
@@ -133,8 +130,6 @@ export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
       return s ? { kind: "ok", value: s } : { kind: "missing" };
     },
     resolve,
-    // one store per fake, so a test sees only its own views
-    policyResolve: cachedResolve({ resolve, store: new Map(), now: f.now }),
     async search({ query }) {
       calls.push(`search ${query}`);
 

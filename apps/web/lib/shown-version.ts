@@ -3,6 +3,7 @@
 // the registry's per-version endpoint (getVersionInfo) before it decides, and says "no such version" when that answers
 // 404. Pure apart from that read, which the caller passes in, so the page, its Markdown view and the tests share it.
 import { isSafeTag, type InstallSpec } from "./install-note";
+import { bySemverDesc } from "./semver";
 import type { Fetched, PackageInfo } from "./registry";
 import { noInstallable, type NoInstallable } from "./refusal";
 
@@ -34,24 +35,6 @@ export const isVersionNumber = (asked: string): boolean => VERSION.test(asked);
 
 /** How many tag targets the package answer does not list one view reads from the per-version endpoint. */
 export const MAX_UNLISTED_READS = 3;
-
-/** Highest version first: numbers, then a release above its prereleases, then prerelease identifiers. */
-function byVersionDesc(a: string, b: string): number {
-  const parts = (v: string) => {
-    const [core = "", pre = ""] = v.replace(/\+.*$/, "").split(/-(.+)/);
-
-    return { nums: core.split(".").map(Number), pre };
-  };
-
-  const x = parts(a);
-  const y = parts(b);
-
-  for (let i = 0; i < 3; i++) if (x.nums[i] !== y.nums[i]) return (y.nums[i] ?? 0) - (x.nums[i] ?? 0);
-
-  if (x.pre === "" || y.pre === "") return (x.pre === "" ? 0 : 1) - (y.pre === "" ? 0 : 1);
-
-  return y.pre.localeCompare(x.pre, "en", { numeric: true });
-}
 
 /** The one rule for picking among tag targets: published last, then by tag name so the pick never depends on order. */
 function newest<T extends Tagged>(tagged: readonly T[]): T | undefined {
@@ -137,18 +120,18 @@ export async function selectVersion<V extends { version: string; status: string;
       return { kind: "none", why: noInstallable(pkg) };
     case "tagged-unlisted": {
       const eligible: (Tagged & { read: V | null })[] = choice.listed.map((t) => ({ ...t, read: null }));
-      const reads = new Map<string, Fetched<V>>();
-      // the publisher decides how many tags there are: only the highest few targets are read, once each
-      const read = new Set([...new Set(choice.unlisted.map((t) => t.version))].toSorted(byVersionDesc).slice(0, MAX_UNLISTED_READS));
+      // the publisher decides how many tags there are: only the highest few targets are read, highest first, once each
+      const targets = [...new Set(choice.unlisted.map((t) => t.version))].toSorted(bySemverDesc).slice(0, MAX_UNLISTED_READS);
 
-      for (const t of choice.unlisted.filter((u) => read.has(u.version))) {
-        const info = reads.get(t.version) ?? (await input.read(t.version));
+      for (const version of targets) {
+        const info = await input.read(version);
 
-        reads.set(t.version, info);
+        if (info.kind === "unavailable") return { kind: "unavailable", version };
 
-        if (info.kind === "unavailable") return { kind: "unavailable", version: t.version };
+        if (info.kind !== "ok" || info.value.status !== "active") continue;
+        const at = Date.parse(info.value.publishedAt ?? "") || 0;
 
-        if (info.kind === "ok" && info.value.status === "active") eligible.push({ tag: t.tag, version: info.value.version, at: Date.parse(info.value.publishedAt ?? "") || 0, read: info.value });
+        for (const t of choice.unlisted) if (t.version === version) eligible.push({ tag: t.tag, version: info.value.version, at, read: info.value });
       }
 
       const pick = newest(eligible);
