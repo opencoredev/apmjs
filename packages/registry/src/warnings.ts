@@ -78,7 +78,7 @@ export const MAX_REASONS = 3;
 
 /** The website's page for a version. */
 export function versionUrl(webUrl: string, name: string, version: string): string {
-  return `${webUrl}package/${name}/v/${encodeURIComponent(version)}`;
+  return `${webUrl}package/${name}?v=${encodeURIComponent(version)}`;
 }
 
 /** The heaviest signals that cost points, each as its label and its first piece of evidence (`file:line: …`). */

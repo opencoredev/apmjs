@@ -11,7 +11,7 @@ const report = (score: number, signals: { id: SignalId; points: number }[]): Pic
   signals: signals.map((s) => ({ ...s, label: s.id, evidence: [`index.js:1: ${s.id}`], confidence: "confirmed" as const })),
 });
 
-const where = { url: "https://apmjs.dev/package/dep/v/1.0.0", via: ["app@1.0.0"] };
+const where = { url: "https://apmjs.dev/package/dep?v=1.0.0", via: ["app@1.0.0"] };
 
 describe("warnings carry the lost signals of a scored version", () => {
   test("lostSignals: what cost points, heaviest first, with no evidence", () => {
