@@ -1,6 +1,6 @@
 // Where apm talks to and who it is: registry URL and token, read from the same files npm and bun use.
 import { randomBytes } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -127,6 +127,8 @@ export function saveToken(userconfig: string, registry: string, token: string): 
   const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/) : [];
   const kept = lines.filter((l) => !l.trim().startsWith(`${key}=`) && l.trim() !== "");
   kept.push(`${key}=${token}`);
+  // a user config in a folder that does not exist yet (~/.config/npm/npmrc): created, as npm config set does
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   const tmp = join(dirname(target), `.npmrc.${randomBytes(6).toString("hex")}.tmp`);
   try {
     writeFileSync(tmp, "", { mode: 0o600, flag: "wx" });

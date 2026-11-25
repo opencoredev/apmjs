@@ -2,7 +2,7 @@
 // registry apm checked, credentials never reach a registry a repo picked or the scripts a package runs,
 // audit says what it could not see, and --json always prints one document.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -291,6 +291,21 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     await evil.stop();
     expect(readFileSync(join(sb.home, ".npmrc"), "utf8")).toBe(before);
     expect(r.code, r.out).not.toBe(0);
+  });
+
+  test("apm login saves to a user config whose folder does not exist yet, as npm does: created, the file 0600", async () => {
+    // npm 11.21.1 `npm config set //host/:_authToken=x --location=user` creates the folder and writes the file 0600
+    const sb = makeSandbox(reg);
+    const userconfig = join(sb.home, ".config", "npm", "npmrc");
+    const env = { ...sb.env, npm_config_userconfig: userconfig };
+    const r = await apm(["login", "--username", "xdg-user", "--password-stdin"], { cwd: sb.home, env, stdin: "a-long-enough-password\n" });
+
+    expect(r.code, r.out).toBe(0);
+    expect(statSync(userconfig).mode & 0o777).toBe(0o600);
+    const who = await apm(["whoami"], { cwd: sb.home, env: { ...env, APM_TOKEN: "" } });
+
+    expect(who.code, who.out).toBe(0);
+    expect(who.out).toContain("xdg-user");
   });
 });
 
