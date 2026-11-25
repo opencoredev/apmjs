@@ -25,7 +25,7 @@ A version is served only when all of these hold:
 | Score floor | It scores under 40 out of 100. |
 | Scored | apm has not scored it yet, or can never score it. |
 
-The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason (410 when it is revoked or confirmed malicious), for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
+The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason (410 when it is revoked or confirmed malicious, 403 when the OSSF malicious-packages feed lists it), for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
 
 ## How `latest` moves
 

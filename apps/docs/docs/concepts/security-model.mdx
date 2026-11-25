@@ -43,6 +43,7 @@ Codes and passkeys protect every action that changes what people install or how 
 - Answers that belong to one user (account, sessions, staged uploads, tokens, login) are marked `Cache-Control: private, no-store`, so no shared cache keeps them.
 - Answers that can carry a version's source (file views, excerpts, readmes, scores, package answers, AI reviews) are marked `Cache-Control: private, no-store` too, and the website never caches them. The registry checks the version's status on every such request, so a revoke refuses the next one. A revoked version's score and review keep only what was found: paths, lines, rule ids, the reviewer's sentence and the revoke's reason.
 - Revoked versions answer 410 and appear as critical advisories to `bun audit` and `npm audit`.
+- Versions the OSSF malicious-packages feed lists (OSV `MAL-` advisories) are left out of every package document, plain and `~safe`, and their tarballs answer 403 with the `MAL-` id. Packages published on apm are not matched against the feed.
 
 ## How `apm add` installs what it checked
 
