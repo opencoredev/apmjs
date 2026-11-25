@@ -1,6 +1,7 @@
 import { pageMetadata } from "@/lib/agent/seo";
 import { MCP_URL, siteUrl } from "@/lib/agent/site";
 import { INSTRUCTIONS_LINE } from "@/lib/agent-prompt";
+import { clickEvent, copyEvent, type TrackedEvent } from "@/lib/databuddy-client";
 
 export const metadata = pageMetadata({
   title: "apm docs: setup, CLI, score and AI review",
@@ -10,6 +11,9 @@ export const metadata = pageMetadata({
 
 /** The documentation site, apps/docs, built with Blume. This page is its short overview. */
 const DOCS = "https://docs.apmjs.dev";
+
+/** What a link from this overview into the docs site sends to analytics. */
+const DOCS_CTA = clickEvent({ name: "docs_cta_clicked", props: { location: "docs_overview" } });
 
 /** The "Appeal a score" issue form (.github/ISSUE_TEMPLATE/appeal-a-score.yml). */
 const APPEAL_URL = "https://github.com/opencoredev/apmjs/issues/new?template=appeal-a-score.yml";
@@ -41,9 +45,10 @@ sh install.sh`,
   { id: "ai-review", title: "The AI review", body: "A language model reads each new release in scope and reports cited findings next to the score, never inside it. It cannot see dependencies, binaries or code downloaded at runtime.", href: `${DOCS}/concepts/ai-review`, link: "What the AI review reads and can't see" },
 ] as const;
 
-function Code({ children, label, wrap = false }: { children: string; label?: string; wrap?: boolean }) {
+/** A code block; text copied from it sends `event` to analytics. */
+function Code({ children, label, wrap = false, event }: { children: string; label?: string; wrap?: boolean; event?: TrackedEvent }) {
   return (
-    <figure className="overflow-hidden rounded-xl bg-surface">
+    <figure className="overflow-hidden rounded-xl bg-surface" {...(event ? copyEvent(event) : {})}>
       {label && <figcaption className="border-b border-background px-4 py-2 font-mono text-[13px] text-muted-foreground">{label}</figcaption>}
       <pre className={wrap ? "p-4 font-mono text-[13px] leading-6 whitespace-pre-wrap [overflow-wrap:anywhere]" : "overflow-x-auto p-4 font-mono text-[13px] leading-6"}>{children}</pre>
     </figure>
@@ -107,10 +112,10 @@ apm search "schema validation" --json`}</Code>
             If your agent already uses MCP, <code className="font-mono text-[14px] text-foreground">{MCP_URL}</code> answers the same questions as tools (search_packages, check_package,
             check_name, explain_install, get_file_excerpt). Read-only, no account, rate-limited. You do not need it.
           </p>
-          <Code label="Claude Code">{`claude mcp add --transport http apm ${MCP_URL}`}</Code>
-          <Code label="Codex: ~/.codex/config.toml">{`[mcp_servers.apm]
+          <Code label="Claude Code" event={{ name: "mcp_setup_copied", props: { agent: "claude", source: "docs" } }}>{`claude mcp add --transport http apm ${MCP_URL}`}</Code>
+          <Code label="Codex: ~/.codex/config.toml" event={{ name: "mcp_setup_copied", props: { agent: "codex", source: "docs" } }}>{`[mcp_servers.apm]
 url = "${MCP_URL}"`}</Code>
-          <Code label="Cursor: .cursor/mcp.json">{`{
+          <Code label="Cursor: .cursor/mcp.json" event={{ name: "mcp_setup_copied", props: { agent: "cursor", source: "docs" } }}>{`{
   "mcpServers": {
     "apm": { "url": "${MCP_URL}" }
   }
@@ -132,7 +137,7 @@ export default function Docs() {
         <p className="text-lg leading-8 text-pretty text-muted-foreground">
           apm is a registry that stock bun, npm and pnpm talk to, plus a small CLI that checks things before your package manager runs. The full documentation, with guides and reference, is
           at{" "}
-          <a href={DOCS} className="text-foreground underline underline-offset-4">
+          <a href={DOCS} {...DOCS_CTA} className="text-foreground underline underline-offset-4">
             docs.apmjs.dev
           </a>
           .
@@ -145,9 +150,17 @@ export default function Docs() {
             {s.title}
           </h2>
           <p className="text-[17px] leading-7 text-pretty text-muted-foreground">{s.body}</p>
-          {"code" in s && <Code label="Install the apm CLI">{s.code}</Code>}
-          {"brew" in s && <Code label="Or with Homebrew">{s.brew}</Code>}
-          <a href={s.href} className="self-start font-medium text-foreground underline underline-offset-4">
+          {"code" in s && (
+            <Code label="Install the apm CLI" event={{ name: "cli_install_copied", props: { method: "curl", source: "docs" } }}>
+              {s.code}
+            </Code>
+          )}
+          {"brew" in s && (
+            <Code label="Or with Homebrew" event={{ name: "cli_install_copied", props: { method: "brew", source: "docs" } }}>
+              {s.brew}
+            </Code>
+          )}
+          <a href={s.href} {...(s.href.startsWith(DOCS) ? DOCS_CTA : {})} className="self-start font-medium text-foreground underline underline-offset-4">
             {s.link}
           </a>
         </section>
