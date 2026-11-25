@@ -2295,15 +2295,44 @@ const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebu
 // Commands that print one JSON document with --json (everything else is the package manager's).
 const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain", "search", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
 
+/**
+ * The package manager's commands apm passes on: ones that install nothing new (remove may lay out what is left). Any
+ * other command could fetch packages apm never checks (an update, a link, a create, or one of their aliases in some
+ * package manager), so apm runs it only as a script of the project's package.json, and refuses it otherwise.
+ */
+const PASSTHROUGH = new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated", "info", "view"]);
+
+const ProjectScripts = z.object({ scripts: z.record(z.string(), z.unknown()).optional().catch(undefined) });
+
+/** The script names in the package.json of `cwd`. */
+function projectScripts(cwd: string): Set<string> {
+  try {
+    const m = ProjectScripts.safeParse(JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")));
+
+    return new Set(m.success ? Object.keys(m.data.scripts ?? {}) : []);
+  } catch {
+    return new Set();
+  }
+}
+
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
+  const script = !PASSTHROUGH.has(a.cmd) && projectScripts(cwd).has(a.cmd);
+
+  if (!PASSTHROUGH.has(a.cmd) && !script) {
+    fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
+    say(`To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+
+    return 2;
+  }
+
   // apm's --pm is taken out only before --; after it, every argument is the package manager's
   const end = a.raw.indexOf("--");
   const own = end === -1 ? a.raw : a.raw.slice(0, end);
   const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
 
-  return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
+  return (await runCmd([det.pm, ...(script ? ["run", a.cmd] : [a.cmd]), ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
 /** `apm install` with no packages: the package manager's own install, with only arguments that cannot name a package. */
@@ -2400,13 +2429,8 @@ async function main(a: Args): Promise<number> {
   const lower = a.cmd.toLowerCase();
 
   // npm reads an abbreviation or its typo alias udpate as its update, and some package managers read a command in any case
+  // (any other command apm does not run itself is refused in passthrough unless it is safe or a project script)
   if (lower.length >= 2 && ["update", "upgrade", "udpate"].some((word) => word.startsWith(lower))) return update(a);
-
-  if (lower !== a.cmd && (commandOf(lower) !== undefined || INSTALLS.has(lower))) {
-    fail(`apm: ${a.cmd} is not a command; apm's commands are lowercase (apm ${lower}). Nothing was run.`);
-
-    return 2;
-  }
 
   switch (a.cmd) {
     case "--version":

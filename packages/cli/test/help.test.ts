@@ -256,10 +256,12 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["bun install --frozen-lockfile"]);
   });
 
-  test("apm constructor --help is the package manager's, not a crash", async () => {
+  test("apm constructor --help is refused like any command apm does not pass on, not a crash", async () => {
     const r = await apm(["constructor", "--help"]);
 
-    expect(r.pmCalls).toEqual(["bun constructor --help"]);
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("apm does not pass constructor on to bun");
+    expect(r.pmCalls).toEqual([]);
   });
 
   test("apm's --pm is read only before --; after it, it is the package manager's", async () => {
@@ -420,11 +422,11 @@ describe("what still goes to the package manager", () => {
     expect(r.out + r.err).toContain("yarn upgrade (yarn 1) or yarn up (yarn 2 and later)");
   });
 
-  test.each([[["ADD", "zod"]], [["Install", "zod"]], [["CI"]], [["Remove", "zod"]], [["LINK", "left-pad"]]])("apm %p is refused: commands are lowercase", async (argv) => {
+  test.each([[["ADD", "zod"]], [["Install", "zod"]], [["CI"]], [["Remove", "zod"]], [["LINK", "left-pad"]], [["EXEC", "cowsay"]], [["u", "zod"]], [["upgrade-interactive"]], [["recursive", "update"]], [["link", "left-pad"]], [["rebuild"]], [["create", "vite"]], [["init", "vite"]]])("apm %p is refused: apm passes on only commands that cannot install an unchecked package", async (argv) => {
     const r = await apm(argv, "4.5.0", WITH_ZOD);
 
     expect(r.code, r.out + r.err).toBe(2);
-    expect(r.err).toContain("apm's commands are lowercase");
+    expect(r.err).toContain(`apm does not pass ${argv[0]} on to bun: it could install packages apm cannot check`);
     expect(r.pmCalls).toEqual([]);
   });
 
@@ -447,6 +449,19 @@ describe("what still goes to the package manager", () => {
     [["ci", "--pm", "pnpm", "--prod"], "pnpm ci --prod"],
   ])("apm %p is the package manager's clean install", async (argv, call) => {
     const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
+  });
+
+  test.each([
+    [["remove", "zod"], "bun remove zod"],
+    [["why", "zod"], "bun why zod"],
+    [["outdated"], "bun outdated"],
+    [["test", "--watch"], "bun test --watch"],
+    [["dev", "--port", "3000"], "bun run dev --port 3000"],
+  ])("apm %p is passed on: it installs nothing new, or it is a project script", async (argv, call) => {
+    const r = await apm(argv, "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "vite" }, dependencies: { zod: "^4.0.0" } })}\n`);
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
