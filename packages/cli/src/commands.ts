@@ -171,20 +171,17 @@ export function helpTopic(topic: string): Command | undefined {
  * The switches a bare install passes on to each package manager, by exact name: ones its install reads as switches of
  * the project's own install, so none names a package, takes the next word as its value, or installs somewhere else
  * (npm and pnpm read `--g`, `--gf` and `--local=false` as a global install, and `--quiet=false` as a package `false`).
- * A switch a package manager does not read is its own to refuse or ignore, as with 0.1.5.
+ * None of them may loosen a frozen install: npm ignores --frozen-lockfile, pnpm's --fix-lockfile rewrites the lockfile, and
+ * yarn 1's --force installs what the lockfile lacks, so those are refused. A switch a package manager does not read is
+ * its own to refuse or ignore. npm reads each of its switches here as a complete argument (--silent is --loglevel
+ * silent), so npm's --tag and --omit keep their values wherever they come.
  */
 const BARE_SWITCHES = new Map<Pm, ReadonlySet<string>>([
   ["bun", new Set(["frozen-lockfile", "production", "ignore-scripts", "dry-run", "no-save", "silent", "verbose", "force", "no-cache", "json", "legacy-peer-deps"])],
-  ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "prefer-online", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts", "force", "json", "package-lock-only", "no-package-lock", "workspaces", "include-workspace-root", "frozen-lockfile"])],
-  ["pnpm", new Set(["frozen-lockfile", "no-frozen-lockfile", "prod", "production", "dev", "ignore-scripts", "prefer-offline", "offline", "silent", "force", "lockfile-only", "fix-lockfile", "ignore-pnpmfile", "strict-peer-dependencies", "legacy-peer-deps"])],
-  ["yarn", new Set(["frozen-lockfile", "pure-lockfile", "production", "ignore-scripts", "ignore-engines", "ignore-optional", "ignore-platform", "prefer-offline", "offline", "non-interactive", "silent", "verbose", "force", "json", "immutable", "immutable-cache", "check-cache", "inline-builds", "legacy-peer-deps"])],
+  ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "prefer-online", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts", "force", "json", "package-lock-only", "no-package-lock", "workspaces", "include-workspace-root"])],
+  ["pnpm", new Set(["frozen-lockfile", "no-frozen-lockfile", "prod", "production", "dev", "ignore-scripts", "prefer-offline", "offline", "silent", "force", "lockfile-only", "ignore-pnpmfile", "strict-peer-dependencies", "legacy-peer-deps"])],
+  ["yarn", new Set(["frozen-lockfile", "pure-lockfile", "production", "ignore-scripts", "ignore-engines", "ignore-optional", "ignore-platform", "prefer-offline", "offline", "non-interactive", "silent", "verbose", "json", "immutable", "immutable-cache", "check-cache", "inline-builds", "legacy-peer-deps"])],
 ]);
-
-/**
- * npm's switches it reads as Boolean, so the word after one is read as what it is: npm's --tag and --omit may follow
- * only these (or come first). npm reads a switch it does not know (`--frozen-lockfile`) as taking the next word.
- */
-const NPM_BOOLEANS: ReadonlySet<string> = new Set([...(BARE_SWITCHES.get("npm") ?? [])].filter((name) => name !== "frozen-lockfile"));
 
 /** npm's install options that take a value, with the values passed on: a dist-tag, and what to omit. */
 const NPM_VALUES = new Map<string, (value: string) => boolean>([
@@ -198,13 +195,11 @@ const NPM_VALUES = new Map<string, (value: string) => boolean>([
  * as a package or turn it into another install: package managers read the word after an option they do not know, or
  * after a value-taking option, as a package (bun 1.1 to 1.3 install the word after --tag, unchecked). So a bare install
  * passes on only the switches BARE_SWITCHES lists for `pm`, with no value attached, and npm's --tag and --omit with a
- * checked value (written as two words, first or after one of NPM_BOOLEANS). apm's --pm and its value are taken out;
+ * checked value. apm's --pm and its value are taken out;
  * anything else, -- included, is refused.
  */
 export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: string } {
   const args: string[] = [];
-  /** Whether the word before this one is sure not to take it as its value. */
-  let free = true;
 
   for (let i = 0; i < a.raw.length; i++) {
     const word = a.raw[i] ?? "";
@@ -220,24 +215,22 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
 
     if (key !== null && eq === -1 && BARE_SWITCHES.get(pm)?.has(key) === true) {
       args.push(word);
-      free = pm !== "npm" || NPM_BOOLEANS.has(key);
       continue;
     }
 
     const value = eq === -1 ? a.raw[i + 1] : word.slice(eq + 1);
     const check = pm === "npm" && key !== null ? NPM_VALUES.get(key) : undefined;
 
+    if (pm === "npm" && key === "frozen-lockfile") return { error: `npm ignores ${word} and may rewrite package-lock.json, so apm ${a.cmd} with no packages does not pass it on; for a frozen install run npm ci` };
+
     if (check === undefined || value === undefined || !check(value)) return { error: `apm ${a.cmd} with no packages does not pass ${word} on to ${pm}: it checks nothing, and passes on only switches of ${pm}'s own install such as --frozen-lockfile` };
 
-    if (!free) return { error: `apm ${a.cmd} with no packages passes ${word} on to npm only first or after a plain npm switch; put it first` };
     args.push(word);
 
     if (eq === -1) {
       args.push(value);
       i++;
     }
-
-    free = true;
   }
 
   return { args };
