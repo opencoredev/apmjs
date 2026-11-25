@@ -57,6 +57,8 @@ const SHELL_WORD = /\S+/g;
 
 // quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
 const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
+// xargs appends words from its input to npm's, so they are not the words written either
+const ARGS_FROM_INPUT = /(?<!\S)xargs(?!\S)/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 
 // any case, as cmd.exe finds `NODE.EXE`
@@ -66,6 +68,8 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
+// a flag whose value may be the next word, as node takes `--conditions dev` and `-r ./x`
+const VALUE_FLAG = /^(?:--\w[\w-]*|-[rC])$/;
 
 /**
  * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
@@ -79,6 +83,7 @@ function inlineEval(cmd: string): boolean {
 
   for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
     word.lastIndex = m.index + m[0].length;
+    let value = false;
 
     for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
       // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
@@ -88,7 +93,9 @@ function inlineEval(cmd: string): boolean {
 
       if (EVAL_FLAG.test(flag)) return true;
 
-      if (!OTHER_FLAG.test(flag)) break;
+      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
+      else if (value) value = false;
+      else break;
       interpreter.lastIndex = word.lastIndex;
     }
   }
@@ -129,7 +136,7 @@ type ScriptRef = { name: string; alone: boolean };
  * make apm follow more.
  */
 function ignoreScriptsDoubt(cmd: string): number {
-  if (SHELL_SYNTAX.test(cmd)) return Number.POSITIVE_INFINITY;
+  if (SHELL_SYNTAX.test(cmd) || ARGS_FROM_INPUT.test(cmd)) return Number.POSITIVE_INFINITY;
   let last = -1;
   let bare = false;
 
@@ -163,6 +170,17 @@ function mainReferences(cmd: string, scripts: Scripts): string[] {
   return out;
 }
 
+/**
+ * Whether the words between npm and the script name set ignore-scripts and do nothing else: `run` or `run-script`, the
+ * two spellings that set it, and `--`. Any other word may be a flag that takes the next word as its value
+ * (`--registry --ignore-scripts` sets the registry), so npm may not have read the flag at all.
+ */
+function setsIgnoreScripts(words: string): boolean {
+  const ws = words.trim().split(/\s+/);
+
+  return IGNORE_SCRIPTS.test(words) && ws.every((w) => ENABLES.has(w) || w === "run" || w === "run-script" || w === "--");
+}
+
 /** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
 function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
   const out: ScriptRef[] = [];
@@ -177,9 +195,114 @@ function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
     // npm's flags before the name set ignore-scripts, and nothing from there on may unset it; the doubt is found once per
     // command, so a script of many such runs is still read in one pass
     const [nameAt] = m.indices?.[m[1] === undefined ? 2 : 1] ?? [m.index];
-    const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
+    const sets = npm !== undefined && setsIgnoreScripts(cmd.slice(m.index + m[0].length, nameAt));
 
     out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
+  }
+
+  const found = new Set(out.map((r) => r.name));
+
+  for (const name of shellRunReferences(cmd, scripts)) if (!found.has(name)) out.push({ name, alone: false });
+
+  return out;
+}
+
+const PACKAGE_MANAGERS = new Set(["npm", "yarn", "pnpm", "bun"]);
+const NPM_LIFECYCLE_COMMANDS = new Set(["start", "test", "stop", "restart"]);
+const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
+
+/**
+ * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
+ * `-s`, `'a b'` is one word), with `null` where a command ends: `;`, `&`, `|`, a newline, a parenthesis, `$(` or a
+ * backtick. One pass; quotes are not searched past the end of `cmd`.
+ */
+function* shellWords(cmd: string): Generator<string | null> {
+  let word: string | null = null;
+
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i] ?? "";
+
+    if (c === "'" || c === '"') {
+      let j = i + 1;
+      let body = "";
+
+      while (j < cmd.length && cmd[j] !== c) {
+        if (c === '"' && cmd[j] === "\\" && j + 1 < cmd.length) j++;
+        body += cmd[j];
+        j++;
+      }
+
+      word = (word ?? "") + body;
+      i = j;
+    } else if (c === "\\") {
+      if (cmd[i + 1] === "\n") i++;
+      else word = (word ?? "") + (cmd[++i] ?? "");
+    } else if (COMMAND_END.has(c) || (c === "$" && cmd[i + 1] === "(")) {
+      if (word !== null) yield word;
+      word = null;
+      yield null;
+    } else if (/\s|[<>]/.test(c)) {
+      if (word !== null) yield word;
+      word = null;
+    } else word = (word ?? "") + c;
+  }
+
+  if (word !== null) yield word;
+}
+
+/**
+ * Scripts a command runs through a package manager, read from the words the shell hands it, so quoted and escaped flags
+ * and names and flags that take the next word as their value (`npm --prefix . run x`, `npm run -w pkg x`) do not hide
+ * the run. Where a word after a flag may be its value or the name, both readings are followed: following a script npm
+ * does not run can only make the reading stricter. Each word is read once.
+ */
+function shellRunReferences(cmd: string, scripts: Scripts): string[] {
+  if (!/npm|yarn|bun/.test(cmd)) return [];
+  const out: string[] = [];
+  let pm: string | null = null;
+  let phase: "manager" | "run" | "named" = "manager";
+  let afterFlag = false;
+
+  const name = (w: string): void => {
+    if (Object.hasOwn(scripts, w)) out.push(w);
+
+    if (afterFlag) afterFlag = false;
+    else pm = null;
+  };
+
+  for (const w of shellWords(cmd)) {
+    if (w === null) {
+      pm = null;
+      continue;
+    }
+
+    if (PACKAGE_MANAGERS.has(w)) {
+      pm = w;
+      phase = "manager";
+      afterFlag = false;
+      continue;
+    }
+
+    if (pm === null) continue;
+
+    if (phase === "named") {
+      name(w);
+      pm = null;
+    } else if (w === "--") {
+      afterFlag = false;
+      if (phase === "run" || pm === "yarn" || pm === "pnpm") phase = "named";
+    } else if (w.length > 1 && w.startsWith("-")) {
+      afterFlag = !w.includes("=");
+    } else if (phase === "manager" && (w === "run" || (pm === "npm" && w === "run-script"))) {
+      phase = "run";
+      afterFlag = false;
+    } else if (phase === "run" || pm === "yarn" || pm === "pnpm" || (pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
+      name(w);
+    } else if (afterFlag) {
+      afterFlag = false;
+    } else {
+      pm = null;
+    }
   }
 
   return out;

