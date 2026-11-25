@@ -132,6 +132,17 @@ async function r2(bucket: BlocklistReader): Promise<{ r2: Check; blocklist: Heal
   return { r2: check, blocklist: { ...(check.status === "up" ? listed : { status: "unknown", detail: "R2 does not answer" }), ms: null, syncedAt } };
 }
 
+/** The probe record `text` holds, or null when it is not one: text that is not JSON is as unreadable as the wrong form. */
+function probeRecord(text: string): z.infer<typeof QueueProbeRecord> | null {
+  try {
+    const record = QueueProbeRecord.safeParse(JSON.parse(text));
+
+    return record.success ? record.data : null;
+  } catch {
+    return null;
+  }
+}
+
 async function queue(bucket: BlocklistReader, bound: boolean, now: number): Promise<Health["checks"]["queue"]> {
   if (!bound) return { status: "unknown", ms: null, detail: "no queue is bound", lastConsumedAt: null };
   let lastConsumedAt: string | null = null;
@@ -140,11 +151,11 @@ async function queue(bucket: BlocklistReader, bound: boolean, now: number): Prom
     const obj = await bucket.get(QUEUE_PROBE_KEY);
 
     if (obj === null) return { status: "unknown", detail: "no probe consumed yet: the cron sends one every 10 minutes" };
-    const record = QueueProbeRecord.safeParse(JSON.parse(await new Response(obj.body).text()));
+    const record = probeRecord(await new Response(obj.body).text());
 
-    if (!record.success) return { status: "unknown", detail: "the last probe's record is unreadable" };
-    lastConsumedAt = new Date(record.data.receivedAt).toISOString();
-    const age = now - record.data.receivedAt;
+    if (record === null) return { status: "unknown", detail: "the last probe's record is unreadable" };
+    lastConsumedAt = new Date(record.receivedAt).toISOString();
+    const age = now - record.receivedAt;
 
     return age <= QUEUE_STALE_MS ? { status: "up", detail: `the cron's probe was consumed ${Math.round(age / 60_000)} min ago` } : { status: "down", detail: `no probe consumed for ${Math.round(age / 60_000)} min: the consumer is stopped or far behind` };
   });
