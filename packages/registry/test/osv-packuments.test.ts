@@ -331,6 +331,34 @@ describe("what the review of 34ccf92 found", () => {
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
   });
 
+  test("a partial refresh after the kept answer expired keeps what both found, through its back-off", async () => {
+    const root = freshRoot();
+
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
+    setSystemTime(new Date(Date.now() + NAME_FRESH_MS + 1_000));
+    osv.unreadable.add("MAL-2026-1007");
+
+    for (let i = 0; i < 2; i++) expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
+  });
+
+  test("what a partial refresh read is OSV's word: an advisory it read as withdrawn is not taken back from the kept answer", async () => {
+    const root = freshRoot();
+    const advisory = VULNS.get("half-read")?.[0];
+
+    expect(advisory?.id).toBe("MAL-2026-1006");
+    await packument("half-read", { root });
+    setSystemTime(new Date(Date.now() + NAME_FRESH_MS + 1_000));
+    osv.unreadable.add("MAL-2026-1007");
+
+    try {
+      if (advisory) advisory.withdrawn = "2026-11-25T00:00:00Z";
+      // 1.2.0 (MAL-2026-1006, now withdrawn) is served again; 1.1.0 (MAL-2026-1007, unread) stays withheld
+      expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.2.0"]);
+    } finally {
+      if (advisory) delete advisory.withdrawn;
+    }
+  });
+
   test("after a failure the isolate does not ask OSV again for a while, so an outage costs one wait, not one per request", async () => {
     const root = freshRoot();
 
