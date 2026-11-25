@@ -64,6 +64,9 @@ const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
 // npm's flags that take no value, so the word after one is never read as its value
 const NPM_BOOLEAN_FLAGS = new Set(["--silent", "-s", "--quiet", "-q", "--verbose", "-d", "-dd", "-ddd", "--if-present", "--foreground-scripts", "--workspaces", "-ws", "--include-workspace-root"]);
 
+// npm's flags that take the next word as their value when it is not itself a flag
+const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", "-w", "--registry", "--userconfig", "--globalconfig", "--cache", "--script-shell", "--tag", "--otp", "--scope", "--node-options"]);
+
 // words that run the rest of the simple command as a command of its own, and the shell's words a command may follow
 const WRAPPERS = new Set(["env", "xargs", "exec", "command", "nohup", "time", "nice", "cross-env", "npx"]);
 const KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
@@ -202,13 +205,29 @@ function mainReferences(cmd: string, scripts: Scripts): string[] {
 
 /**
  * Whether the words between npm and the script name set ignore-scripts and do nothing else: `run` or `run-script`, the
- * two spellings that set it, npm's flags that take no value, and `--`. Any other word may be a flag that takes the next word as its value
- * (`--registry --ignore-scripts` sets the registry), so npm may not have read the flag at all.
+ * two spellings that set it, npm's flags that take no value, a flag with its value after `=`, a known value flag with
+ * its value, and `--`. Any other word may be a flag that takes the next word as its value (`--registry --ignore-scripts`
+ * sets the registry), so npm may not have read the flag at all.
  */
-function setsIgnoreScripts(words: string): boolean {
-  const ws = words.trim().split(/\s+/);
+function setsIgnoreScripts(ws: readonly string[]): boolean {
+  if (!ws.some((w) => ENABLES.has(w))) return false;
 
-  return IGNORE_SCRIPTS.test(words) && ws.every((w) => ENABLES.has(w) || NPM_BOOLEAN_FLAGS.has(w) || w === "run" || w === "run-script" || w === "--");
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i] ?? "";
+
+    if (ENABLES.has(w) || NPM_BOOLEAN_FLAGS.has(w) || w === "run" || w === "run-script" || w === "--") continue;
+
+    if (/^--?[\w-]+=/.test(w) && !/ig/i.test(w)) continue;
+
+    if (NPM_VALUE_FLAGS.has(w) && !(ws[i + 1] ?? "-").startsWith("-")) {
+      i++;
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
 }
 
 /** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
@@ -231,7 +250,7 @@ function flagReferences(cmd: string, scripts: Scripts): (ScriptRef & { aloneStri
     const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
     const alone = sets && (doubt ??= ignoreScriptsDoubt(cmd, false)) < m.index;
 
-    out.push({ name, alone, aloneStrictly: alone && setsIgnoreScripts(cmd.slice(m.index + m[0].length, nameAt)) && (strictDoubt ??= ignoreScriptsDoubt(cmd, true)) < m.index });
+    out.push({ name, alone, aloneStrictly: alone && setsIgnoreScripts(cmd.slice(m.index + m[0].length, nameAt).trim().split(/\s+/)) && (strictDoubt ??= ignoreScriptsDoubt(cmd, true)) < m.index });
   }
 
   return out;
@@ -261,10 +280,14 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 /**
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
  * `-s`, `'a b'` is one word), each with where it ends in `cmd` and whether an unquoted `*` makes it a glob, and `null`
- * where a command ends: `;`, `&`, `|`, a newline, a parenthesis, `$(` or a backtick. One pass; a quote left open runs
- * to the end of `cmd`.
+ * where a command ends: `;`, `&`, `|`, a newline or a group's parenthesis. A command substitution (`$(` or a backtick)
+ * is `"("`, its own commands, then `")"`, and the word around it goes on after it. A comment is skipped. One pass; a quote
+ * left open runs to the end of `cmd`.
  */
-export function* shellWords(cmd: string): Generator<{ word: string; end: number; glob: boolean } | null> {
+export type ShellToken = { word: string; end: number; glob: boolean } | null | "(" | ")";
+
+
+export function* shellWords(cmd: string): Generator<ShellToken> {
   let word: string | null = null;
   let glob = false;
   // the next word is a redirection's file (`> log`, `2>/dev/null`), which the command is not handed
@@ -272,8 +295,28 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
   // the word being read has a quoted or escaped character, so it is never a redirection's descriptor
   let quoted = false;
   let i = 0;
-  // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution
+  // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution, `G`
+  // a group, and the word each substitution interrupts
   const open: string[] = [];
+  const around: { word: string | null; glob: boolean; quoted: boolean; target: boolean }[] = [];
+
+  const enter = (c: string): "(" => {
+    around.push({ word, glob, quoted, target });
+    word = null;
+    glob = false;
+    quoted = false;
+    target = false;
+    open.push(c === "`" ? "`" : ")");
+
+    return "(";
+  };
+
+  const leave = (): ")" => {
+    open.pop();
+    ({ word, glob, quoted, target } = around.pop() ?? { word: null, glob: false, quoted: false, target: false });
+
+    return ")";
+  };
 
   const flush = function* (): Generator<{ word: string; end: number; glob: boolean }> {
     if (word !== null && !target) yield { word, end: i, glob };
@@ -295,9 +338,7 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
       else if (c === "\\" && next === "\n") i++;
       else if (c === "\\" && /[$`"\\]/.test(next)) word = (word ?? "") + (cmd[++i] ?? "");
       else if ((c === "$" && next === "(") || c === "`") {
-        yield* flush();
-        yield null;
-        open.push(c === "`" ? "`" : ")");
+        yield enter(c);
 
         if (c === "$") i++;
       } else word = (word ?? "") + c;
@@ -318,14 +359,15 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
         word = (word ?? "") + (cmd[++i] ?? "");
         quoted = true;
       }
-    } else if ((c === ")" || c === "`") && open.at(-1) === c) {
+    } else if (c === ")" && open.at(-1) === "G") {
       yield* flush();
       yield null;
       open.pop();
-    } else if ((c === "$" && next === "(") || c === "`") {
+    } else if ((c === ")" || c === "`") && open.at(-1) === c) {
       yield* flush();
-      yield null;
-      open.push(c === "`" ? "`" : ")");
+      yield leave();
+    } else if ((c === "$" && next === "(") || c === "`") {
+      yield enter(c);
 
       if (c === "$") i++;
     } else if (COMMAND_END.has(c)) {
@@ -334,7 +376,11 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
       target = false;
 
       // a group's `)` closes it, not the substitution around it
-      if (c === "(") open.push(")");
+      if (c === "(") open.push("G");
+    } else if (c === "#" && word === null) {
+      const j = cmd.indexOf("\n", i);
+
+      i = (j < 0 ? cmd.length : j) - 1;
     } else if (c === "<" || c === ">") {
       // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
       if (word !== null && !quoted && /^\d+$/.test(word)) word = null;
@@ -352,6 +398,20 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
   yield* flush();
 }
 
+/** A simple command as the shell reading reads it (shellRunReferences). */
+interface RunState {
+  open: { name: string; end: number; alone: boolean }[];
+  pm: string | null;
+  pmEnd: number;
+  phase: "manager" | "run" | "named";
+  after: "no" | "maybe" | "value";
+  before: string[];
+  atStart: boolean;
+  wrapper: string | null;
+  fromInput: boolean;
+  bare: boolean;
+}
+
 /**
  * Scripts a command runs through a package manager, read from the words the shell hands it, so quoted and escaped flags
  * and names and flags that take the next word as their value (`npm --prefix . run x`, `npm run -w pkg x`) do not hide
@@ -365,92 +425,88 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
-  // the references of the simple command being read, settled where it ends (a doubt after the name unsets `alone`)
-  let open: { name: string; end: number; alone: boolean }[] = [];
   const expands = /[$`]/.test(cmd);
-  let pm: string | null = null;
-  let pmEnd = 0;
-  let phase: "manager" | "run" | "named" = "manager";
-  let afterFlag = false;
-  let before: string[] = [];
-  let atStart = true;
-  let wrapped = false;
-  let fromInput = false;
-  let bare = false;
 
-  const takesName = (): boolean => pm !== null && (phase !== "manager" || pm === "yarn" || pm === "pnpm");
+  // the simple command being read; `open` holds its references, settled where it ends (a doubt after the name unsets
+  // `alone`), and `after` whether the word after a flag is its value (`value`), may be (`maybe`) or is not
+  const fresh = (): RunState => ({ open: [], pm: null, pmEnd: 0, phase: "manager", after: "no", before: [], atStart: true, wrapper: null, fromInput: false, bare: false });
+
+  let s = fresh();
+  // the commands a substitution interrupts, read on where it closes
+  const outer: RunState[] = [];
+
+  const takesName = (): boolean => s.pm !== null && (s.phase !== "manager" || s.pm === "yarn" || s.pm === "pnpm");
 
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w)) open.push({ name: w, end: pmEnd, alone: pm === "npm" && !expands && !fromInput && setsIgnoreScripts(before.join(" ")) });
+    if (Object.hasOwn(scripts, w)) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !expands && !s.fromInput && setsIgnoreScripts(s.before) });
 
-    if (afterFlag) afterFlag = false;
-    else pm = null;
-  };
-
-  const settle = (): void => {
-    out.push(...open);
-    open = [];
-    pm = null;
-    atStart = true;
-    wrapped = false;
-    fromInput = false;
-    bare = false;
+    if (s.after === "maybe") s.after = "no";
+    else s.pm = null;
   };
 
   for (const t of shellWords(cmd)) {
-    if (t === null) {
-      settle();
+    if (t === null || t === "(" || t === ")") {
+      out.push(...s.open);
+
+      if (t === "(") outer.push(s);
+      s = (t === ")" ? outer.pop() : undefined) ?? fresh();
       continue;
     }
 
     const w = t.word;
 
     // npm reads its flags anywhere in the invocation, the last one winning, and takes abbreviations and a separate `false`
-    if ((bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) for (const r of open) r.alone = false;
-    bare = w === "--ignore-scripts";
+    if ((s.bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) for (const r of s.open) r.alone = false;
+    s.bare = w === "--ignore-scripts";
 
-    if (pm === null) {
-      if (atStart && PACKAGE_MANAGERS.has(w)) {
-        pm = w;
-        pmEnd = t.end;
-        phase = "manager";
-        afterFlag = false;
-        before = [];
-      } else if (atStart && (/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || WRAPPERS.has(w.slice(w.lastIndexOf("/") + 1)) || (wrapped && w.startsWith("-")))) {
-        wrapped ||= WRAPPERS.has(w.slice(w.lastIndexOf("/") + 1));
-        fromInput ||= w.endsWith("xargs");
-      } else atStart = false;
+    if (s.pm === null) {
+      const base = w.slice(w.lastIndexOf("/") + 1);
+
+      if (!s.atStart) continue;
+
+      if (PACKAGE_MANAGERS.has(w)) {
+        Object.assign(s, { pm: w, pmEnd: t.end, phase: "manager", after: "no", before: [], atStart: false });
+      } else if (s.wrapper === "command" && /^-[pvV]*[vV]/.test(w)) {
+        // `command -v` looks a command up without running it
+        s.atStart = false;
+      } else if (WRAPPERS.has(base)) {
+        s.wrapper = base;
+        s.fromInput ||= base === "xargs";
+      } else if (!(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w.startsWith("-")))) s.atStart = false;
 
       continue;
     }
 
-    if (phase === "named") {
+    if (s.phase === "named") {
       name(w);
-      pm = null;
+      s.pm = null;
     } else if (w === "--") {
-      afterFlag = false;
-      before.push(w);
+      s.after = "no";
+      s.before.push(w);
 
-      if (phase === "run" || pm === "yarn" || pm === "pnpm") phase = "named";
+      if (s.phase === "run" || s.pm === "yarn" || s.pm === "pnpm") s.phase = "named";
     } else if (w.length > 1 && w.startsWith("-")) {
-      afterFlag = !w.includes("=") && !NPM_BOOLEAN_FLAGS.has(w) && !ENABLES.has(w);
-      before.push(w);
-    } else if (phase === "manager" && (w === "run" || (pm === "npm" && w === "run-script"))) {
-      phase = "run";
-      afterFlag = false;
-      before.push(w);
-    } else if (takesName() || (pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
+      s.after = w.includes("=") || NPM_BOOLEAN_FLAGS.has(w) || ENABLES.has(w) ? "no" : s.pm === "npm" && NPM_VALUE_FLAGS.has(w) ? "value" : "maybe";
+      s.before.push(w);
+    } else if (s.after === "value") {
+      s.after = "no";
+      s.before.push(w);
+    } else if (s.phase === "manager" && (w === "run" || (s.pm === "npm" && w === "run-script"))) {
+      s.phase = "run";
+      s.after = "no";
+      s.before.push(w);
+    } else if (takesName() || (s.pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
       name(w);
-      before.push(w);
-    } else if (afterFlag) {
-      afterFlag = false;
-      before.push(w);
+      s.before.push(w);
+    } else if (s.after === "maybe") {
+      s.after = "no";
+      s.before.push(w);
     } else {
-      pm = null;
+      s.pm = null;
     }
   }
 
-  settle();
+  out.push(...s.open, ...outer.flatMap((o) => o.open));
 
   return out;
 }
@@ -477,9 +533,14 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     // what the first two passes read, for the next to read its references in
     const read: { text: string; depth: number }[] = [];
     let cut: string | null = null;
+    let added = 0;
 
     /** Whether a command at this depth may be read, or the reading is cut, and why. */
-    const admits = (from: string, depth: number): boolean => {
+    const admits = (from: string, depth: number, pass: Pass): boolean => {
+      // the third pass only adds to what the first two read: past its own limits it stops, as if it had not read on, and
+      // the hook is no less complete than fe2e641 reads it
+      if (pass === 3) return depth <= MAX_DEPTH && added < MAX_COMMANDS;
+
       if (depth > MAX_DEPTH) {
         cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
 
@@ -503,11 +564,11 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
           const body = scripts[n];
           const from = `scripts.${n} (run by scripts.${hook})`;
 
-          // the third pass follows scripts at the depth that runs them: `followed` ends a cycle and MAX_COMMANDS the walk, so
-          // the depth cap is left to nested shells and decoded text, and a chain main's reading never reached is not cut short
+          // the third pass follows scripts at the depth that runs them: `followed` ends a cycle and its own command count the
+          // walk, so the depth cap is left to nested shells and decoded text
           const next = pass === 3 ? depth : depth + 1;
 
-          if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, next))) continue;
+          if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, next, pass))) continue;
           followed.add(n);
 
           if (pass === 3) addedScripts.push(n);
@@ -517,10 +578,12 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     };
 
     const visit = (text: string, from: string, depth: number, viaEval: boolean, pass: Pass): void => {
-      if (!admits(from, depth)) return;
+      if (!admits(from, depth, pass)) return;
 
       const evals = viaEval || inlineEval(text);
       commands.push({ from, text, viaEval: evals, added: pass === 3 });
+
+      if (pass === 3) added++;
 
       if (pass !== 3) read.push({ text, depth });
 
@@ -544,14 +607,13 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     }
 
     // the third over what either read, on a meter of its own: its work never spends what the analysis has, so running
-    // it out cannot cost a result the first two passes reach, and past it the hook is cut as any reading stopped is
+    // it out cannot cost a result the first two passes reach, and it then stops with what it has read
     try {
       withMeter(new Meter(MAX_SHELL_READING_WORK), () => {
         for (const { text, depth } of read) follow(shellReferences(text, scripts), depth, 3);
       });
     } catch (e) {
       if (!(e instanceof MeterExhausted)) throw e;
-      cut ??= `scripts.${hook}: the shell reading of its commands stopped at its work limit (${MAX_SHELL_READING_WORK} units)`;
     }
 
     out.push({ hook, kind, commands, scripts: [...followed], addedScripts, cut });

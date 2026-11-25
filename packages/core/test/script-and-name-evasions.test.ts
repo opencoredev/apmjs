@@ -642,3 +642,33 @@ describe("the shell reading follows only what npm runs", () => {
     expect(dropper.ids).toContain("install-download");
   });
 });
+
+describe("the shell reading keeps the shell's command boundaries and npm's options", () => {
+  const benign = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a manager's name after npm's own arguments, in a comment, after `command -v` or after a substitution in a word is an argument", () => {
+    for (const postinstall of ["npm run setup 'npm' run docs", "command -v 'npm' run docs || true", "echo setup # documentation; 'npm' run docs", 'echo "$(true)npm" run docs']) {
+      expect(benign({ postinstall, setup: "echo setup", docs: DROPPER })).not.toContain("install-download");
+    }
+  });
+
+  test("a run inside a substitution, after a comment's line, behind `command` or after an assignment from a substitution is read", () => {
+    for (const postinstall of ["echo $('npm' run docs)", "echo hi # note\n'npm' run docs", "command 'npm' run docs", "x=$(true); 'npm' run docs"]) {
+      expect(benign({ postinstall, docs: DROPPER })).toContain("install-download");
+    }
+  });
+
+  test("npm's value flags take their value, so neither the value nor what it hides reads as a script", () => {
+    expect(benign({ postinstall: "npm run --loglevel=silent --ignore-scripts setup", presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+    expect(benign({ postinstall: "npm run '--loglevel' 'silent' setup", silent: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+    expect(benign({ postinstall: "npm run --loglevel --ignore-scripts setup", presetup: DROPPER, setup: "echo setup" })).toContain("install-download");
+  });
+
+  test("the shell reading's own limits stop it without marking the hook incomplete", () => {
+    const steps = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`step${i}`, "echo setup"]));
+    const r = scoreOf({ scripts: { ...steps, postinstall: Array.from({ length: 200 }, (_, i) => `npm run '-s' step${i}`).join("; ") } }, {});
+
+    expect(r.ids).not.toContain("incomplete");
+    expect(r.score).toBeGreaterThanOrEqual(SCORE_FLOOR);
+  });
+});

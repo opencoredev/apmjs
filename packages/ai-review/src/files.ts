@@ -216,7 +216,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
 
         for (const c of h.commands) {
           for (const t of shellWords(c.text)) {
-            if (t === null) continue;
+            if (t === null || t === "(" || t === ")") continue;
             const w = stripDot(t.word.replace(/^\$\{?PWD\}?\//, "./"));
 
             if (!t.glob) {
