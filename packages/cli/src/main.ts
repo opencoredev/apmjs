@@ -2316,7 +2316,7 @@ const PASSTHROUGH = new Map<Pm, ReadonlySet<string>>([
 const REMOVALS = new Set(["remove", "rm", "uninstall"]);
 
 /** bun's own options before what `bun run` runs that apm passes on; the others can turn bun's auto-install back on. */
-const BUN_RUN_SWITCHES = new Set(["--silent", "--watch", "--hot"]);
+const BUN_RUN_SWITCHES = new Set(["--silent", "--watch", "--hot", "--help", "-h"]);
 
 const ProjectScripts = z.object({ scripts: z.record(z.string(), z.unknown()).optional().catch(undefined) });
 
@@ -2399,7 +2399,7 @@ async function passthrough(a: Args): Promise<number> {
 
   if (!native && !script) {
     fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
-    say(`To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+    say(REMOVALS.has(a.cmd) ? "To remove a package, run apm remove <package>." : `To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
 
     return 2;
   }
@@ -2421,7 +2421,15 @@ async function passthrough(a: Args): Promise<number> {
   // pnpm's verify-deps-before-run=install would install before it runs a script
   if (det.pm === "pnpm" && !REMOVALS.has(a.cmd)) command.unshift("--config.verify-deps-before-run=false");
 
-  return (await runCmd([det.pm, ...command, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
+  const childEnv = INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env();
+
+  if (det.pm === "pnpm") {
+    // pnpm reads its environment after the command line, so apm sets verify-deps-before-run there too
+    for (const key of Object.keys(childEnv)) if (/^(npm|pnpm)_config_verify[-_]deps[-_]before[-_]run$/i.test(key)) delete childEnv[key];
+    childEnv.pnpm_config_verify_deps_before_run = "false";
+  }
+
+  return (await runCmd([det.pm, ...command, ...args], { cwd, env: childEnv })).code;
 }
 
 /** `apm install` with no packages: the package manager's own install, with only arguments that cannot name a package. */
@@ -2460,6 +2468,15 @@ function update(a: Args): number {
   return 2;
 }
 
+/** Whether bun has a lockfile for `cwd`: a bun.lock or bun.lockb there or in a folder above it. */
+function hasBunLockfile(cwd: string): boolean {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) return true;
+
+    if (dirname(dir) === dir) return false;
+  }
+}
+
 /** `apm ci`: the package manager's clean install, with only the arguments a bare install passes on (none can name a package). */
 async function cleanInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
@@ -2468,6 +2485,14 @@ async function cleanInstall(a: Args): Promise<number> {
   const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
   // bun 1.1 has no ci (it runs a script of that name), so apm asks every bun for the frozen install by name
   const command = det.pm === "bun" ? ["install", "--frozen-lockfile"] : ["ci"];
+
+  // bun's --frozen-lockfile installs what package.json says when there is no lockfile at all
+  if ("args" in passed && det.pm === "bun" && !hasBunLockfile(cwd)) {
+    fail("apm: apm ci needs a bun.lock or bun.lockb: without one, bun would install the newest versions package.json allows, unchecked. Nothing was run.");
+    say("To check and add packages, run apm add <package>.");
+
+    return 2;
+  }
 
   if ("args" in passed) return (await runCmd([det.pm, ...command, ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   fail(`apm: ${passed.error}. Nothing was run.`);

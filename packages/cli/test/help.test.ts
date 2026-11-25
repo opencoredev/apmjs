@@ -436,6 +436,7 @@ describe("what still goes to the package manager", () => {
     [["ci", "left-pad"], "apm ci with no packages does not pass left-pad on to bun"],
     [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
     [["ci", "--pm", "yarn"], "yarn has no ci; for a frozen install run apm install --frozen-lockfile"],
+    [["ci"], "apm ci needs a bun.lock or bun.lockb"],
     [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci; for a frozen install run apm install --frozen-lockfile"],
     [["run", "-i", "build.ts"], "apm does not pass bun's -i on"],
     [["run", "--install=force", "build.ts"], "apm does not pass bun's --install=force on"],
@@ -465,7 +466,7 @@ describe("what still goes to the package manager", () => {
     [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
     [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
   ])("apm %p is the package manager's clean install", async (argv, call) => {
-    const r = await apm(argv);
+    const r = await apm(argv, "4.5.0", PACKAGE_JSON, { "bun.lock": "{}\n" });
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
@@ -482,6 +483,7 @@ describe("what still goes to the package manager", () => {
     [["start", "--pm", "npm"], "npm start"],
     [["run", "dev", "-i"], "bun run --no-install dev -i"],
     [["run", "--silent", "dev"], "bun run --no-install --silent dev"],
+    [["run", "--help"], "bun run --no-install --help"],
     [["test", "--watch"], "bun test --watch"],
     [["dev", "--port", "3000"], "bun run --no-install dev --port 3000"],
     [["run", "build.ts", "a"], "bun run --no-install build.ts a"],
@@ -521,6 +523,15 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.out).toContain("usage: apm ci");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm uninstall with yarn points to apm remove, not yarn's own uninstall", async () => {
+    const r = await apm(["uninstall", "--pm", "yarn", "zod"]);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.out + r.err).toContain("To remove a package, run apm remove <package>.");
+    expect(r.out + r.err).not.toContain("yarn uninstall");
     expect(r.pmCalls).toEqual([]);
   });
 
