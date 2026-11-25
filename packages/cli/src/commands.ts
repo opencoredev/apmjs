@@ -171,16 +171,17 @@ export function helpTopic(topic: string): Command | undefined {
  * The switches a bare install passes on to each package manager, by exact name: ones its install reads as switches of
  * the project's own install, so none names a package, takes the next word as its value, or installs somewhere else
  * (npm and pnpm read `--g`, `--gf` and `--local=false` as a global install, and `--quiet=false` as a package `false`).
- * None of them may loosen a frozen install: npm ignores --frozen-lockfile, pnpm's --fix-lockfile rewrites the lockfile, and
- * yarn 1's --force installs what the lockfile lacks, so those are refused. A switch a package manager does not read is
+ * None of them may loosen a frozen install or install what the lockfile lacks without recording it: npm ignores
+ * --frozen-lockfile, and pnpm's --fix-lockfile, --no-frozen-lockfile and --lockfile-only, yarn 1's --force and
+ * --pure-lockfile, and --no-save and --no-package-lock are refused. A switch a package manager does not read is
  * its own to refuse or ignore. npm reads each of its switches here as a complete argument (--silent is --loglevel
  * silent), so npm's --tag and --omit keep their values wherever they come.
  */
 const BARE_SWITCHES = new Map<Pm, ReadonlySet<string>>([
-  ["bun", new Set(["frozen-lockfile", "production", "ignore-scripts", "dry-run", "no-save", "silent", "verbose", "force", "no-cache", "json", "legacy-peer-deps"])],
-  ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "prefer-online", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts", "force", "json", "package-lock-only", "no-package-lock", "workspaces", "include-workspace-root"])],
-  ["pnpm", new Set(["frozen-lockfile", "no-frozen-lockfile", "prod", "production", "dev", "ignore-scripts", "prefer-offline", "offline", "silent", "force", "lockfile-only", "ignore-pnpmfile", "strict-peer-dependencies", "legacy-peer-deps"])],
-  ["yarn", new Set(["frozen-lockfile", "pure-lockfile", "production", "ignore-scripts", "ignore-engines", "ignore-optional", "ignore-platform", "prefer-offline", "offline", "non-interactive", "silent", "verbose", "json", "immutable", "immutable-cache", "check-cache", "inline-builds", "legacy-peer-deps"])],
+  ["bun", new Set(["frozen-lockfile", "production", "ignore-scripts", "dry-run", "silent", "verbose", "force", "no-cache", "json", "legacy-peer-deps"])],
+  ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "prefer-online", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "silent", "foreground-scripts", "force", "json", "package-lock-only"])],
+  ["pnpm", new Set(["frozen-lockfile", "prod", "production", "dev", "ignore-scripts", "prefer-offline", "offline", "silent", "force", "ignore-pnpmfile", "strict-peer-dependencies", "legacy-peer-deps"])],
+  ["yarn", new Set(["frozen-lockfile", "production", "ignore-scripts", "ignore-engines", "ignore-optional", "ignore-platform", "prefer-offline", "offline", "non-interactive", "silent", "verbose", "json", "immutable", "immutable-cache", "check-cache", "inline-builds", "legacy-peer-deps"])],
 ]);
 
 /** npm's install options that take a value, with the values passed on: a dist-tag, and what to omit. */
@@ -223,7 +224,7 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
 
     if (pm === "npm" && key === "frozen-lockfile") return { error: `npm ignores ${word} and may rewrite package-lock.json, so apm ${a.cmd} with no packages does not pass it on; for a frozen install run npm ci` };
 
-    if (check === undefined || value === undefined || !check(value)) return { error: `apm ${a.cmd} with no packages does not pass ${word} on to ${pm}: it checks nothing, and passes on only switches of ${pm}'s own install such as --frozen-lockfile` };
+    if (check === undefined || value === undefined || !check(value)) return { error: `apm ${a.cmd} with no packages does not pass ${word} on to ${pm}: it checks nothing, and passes on only switches of ${pm}'s own install such as --ignore-scripts` };
 
     args.push(word);
 
