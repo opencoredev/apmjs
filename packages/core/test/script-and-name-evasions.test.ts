@@ -587,3 +587,22 @@ describe("redirections and the third pass's own work meter", () => {
   });
 });
 
+
+describe("what the third pass reaches is read on a meter of its own", () => {
+  const enc = new TextEncoder();
+  const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+  const state = { publishedAt: 0, now: 1e12, deprecated: null, status: "active" as const, statusReason: null };
+
+  test("a chained target only the shell reading finds costs the analysis nothing at fe2e641's work limit", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node setup.txt" } };
+    const files = [file("package.json", JSON.stringify(manifest)), file("index.js", "module.exports = 1;\n"), file("setup.txt", "console.log('setting up');\n".repeat(30))];
+    const ample = finalize(analyze({ name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [] }), state);
+
+    expect(finalize(analyze({ name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [], maxWork: 700 }), state).score).toBe(ample.score);
+  });
+
+  test("a quoted number before a redirection is the script's name, not a file descriptor", () => {
+    expect(expandHooks({ scripts: { postinstall: "npm run '7'>log", "7": DROPPER, log: "true" } })[0]?.scripts).toContain("7");
+  });
+});
+

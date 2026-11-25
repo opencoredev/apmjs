@@ -262,6 +262,8 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
   let glob = false;
   // the next word is a redirection's file (`> log`, `2>/dev/null`), which the command is not handed
   let target = false;
+  // the word being read has a quoted or escaped character, so it is never a redirection's descriptor
+  let quoted = false;
   let i = 0;
   // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution
   const open: string[] = [];
@@ -272,6 +274,7 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
     if (word !== null) target = false;
     word = null;
     glob = false;
+    quoted = false;
   };
 
   for (; i < cmd.length; i++) {
@@ -296,13 +299,18 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
       const close = j < 0 ? cmd.length : j;
 
       word = (word ?? "") + cmd.slice(i + 1, close);
+      quoted = true;
       i = close;
     } else if (c === '"') {
       open.push('"');
       word ??= "";
+      quoted = true;
     } else if (c === "\\") {
       if (next === "\n") i++;
-      else word = (word ?? "") + (cmd[++i] ?? "");
+      else {
+        word = (word ?? "") + (cmd[++i] ?? "");
+        quoted = true;
+      }
     } else if ((c === ")" || c === "`") && open.at(-1) === c) {
       yield* flush();
       yield null;
@@ -322,7 +330,7 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
       if (c === "(") open.push(")");
     } else if (c === "<" || c === ">") {
       // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
-      if (word !== null && !glob && /^\d+$/.test(word)) word = null;
+      if (word !== null && !quoted && /^\d+$/.test(word)) word = null;
       else yield* flush();
 
       while (/[<>&|]/.test(cmd[i + 1] ?? "")) i++;

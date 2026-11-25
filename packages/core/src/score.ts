@@ -295,6 +295,9 @@ export type Grade = "A" | "B" | "C" | "D" | "F" | "P";
 export type ScoreReport = Analysis & { score: number; grade: Grade };
 
 export const SCORE_FLOOR = 40;
+
+/** Work units reading what only the shell reading of install hooks reaches may spend, on a meter of its own (analyze). */
+const MAX_ADDED_TARGET_WORK = MAX_ANALYSIS_WORK / 16;
 export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -2530,12 +2533,11 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   layer = "extra";
 
-  for (const p of later) if (!seen.has(p)) reach(p);
-
   for (const c of laterCommands) followCommand(c.f, c.line, c.value, c.reached);
 
   for (const sh of laterShell) walkShell(sh.f, new TextDecoder().decode(sh.f.data), sh.reached);
 
+  const readExtra = (): void => {
   // until nothing more is read: what a script or a command runs that production's walk read no text of (a native name,
   // an ELF file, data), read as source; what that reaches; and a file production's walk read as plain text, or through
   // a binary's plain view, that some file loads, read again as code (round 6 review of fbc6738: index.js -> lib/first
@@ -2582,11 +2584,29 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
       more = true;
     }
   }
+  };
+
+  const scoringUnits = (): number => [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0);
+
+  readExtra();
+  const baselineUnits = scoringUnits();
+
+  // what install hooks run that only the shell reading reaches (HookCommand.added), after the whole extra layer and on a
+  // meter of its own, with the scoring of what it adds: running it out stops only this reading, never one before it
+  try {
+    withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
+      for (const p of later) if (!seen.has(p)) reach(p);
+      readExtra();
+      charge("score", scoringUnits() - baselineUnits);
+    });
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+  }
 
   layer = "production";
 
   // scoring weighs every fact of every file, every edge between files and every piece of evidence
-  charge("score", [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0));
+  charge("score", baselineUnits);
 
   const assessInput = {
     edges,
