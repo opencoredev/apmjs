@@ -250,6 +250,8 @@ function fakeNpm() {
   // (holdLead); later reads answer at once, or when a test's gate for the package opens (holdLater)
   const held = new Set<string>();
   const leadGates = new Map<string, Promise<void>>();
+  // called when the first read of a held package reaches npm (holdLead's `reached`)
+  const leadArrived = new Map<string, () => void>();
   const gates = new Map<string, Promise<void>>();
   // packument reads per package name
   const reads = new Map<string, number>();
@@ -272,6 +274,7 @@ function fakeNpm() {
 
       if (name.startsWith("slow-") && !held.has(name)) {
         held.add(name);
+        leadArrived.get(name)?.();
         await (leadGates.get(name) ?? Bun.sleep(SLOW_LEAD_MS));
       } else {
         await gates.get(name);
@@ -309,8 +312,15 @@ function fakeNpm() {
   return {
     url: server.url.href,
     reads,
-    /** Holds the first read of `name` (a `slow-` package) until the returned function opens it, not SLOW_LEAD_MS. */
-    holdLead: (name: string) => gate(leadGates, name),
+    /**
+     * Holds the first read of `name` (a `slow-` package) until `open` is called, not SLOW_LEAD_MS; `reached` settles
+     * once that read is at npm, so a test starts its waiters behind a leader that holds the single flight.
+     */
+    holdLead: (name: string) => {
+      const reached = new Promise<void>((resolve) => leadArrived.set(name, resolve));
+
+      return { open: gate(leadGates, name), reached };
+    },
     /** Holds every later read of `name` until the returned function opens it. */
     holdLater: (name: string) => gate(gates, name),
     stop: () => server.stop(true),
@@ -476,10 +486,11 @@ describe("a wait for another request's read of the same packument (single flight
         ),
       );
 
-    const openLead = npm.holdLead("slow-busy");
+    const { open: openLead, reached } = npm.holdLead("slow-busy");
     const lead = timedRun(() => read(new MemoryPool()));
 
-    await Bun.sleep(200);
+    // the leader's read is at npm, so it holds the single flight before the waiter starts
+    await reached;
 
     // the isolate is busy 40 ms in every 50: each 25 ms poll takes about twice that or more, so 120 polls counted as
     // 3 s were 7 s and more of waiting (counted in polls, as on main, this test's waiter took 9.7 s)
@@ -511,11 +522,11 @@ describe("a wait for another request's read of the same packument (single flight
     // isolate's cache while a waiter whose own wait had not run out was still looking, and that waiter was served from
     // it (a 200, which is right), so the three answers depended on how far the waiters' timers drifted under load. It
     // is held until the other two have answered, and so is the leader's, so those two answered without either read.
-    const openLead = npm.holdLead("slow-many");
+    const { open: openLead, reached } = npm.holdLead("slow-many");
     const openExtra = npm.holdLater("slow-many");
     const lead = get("/slow-many", INSTALL_ACCEPT);
 
-    await Bun.sleep(200);
+    await reached;
     // three requests that come while the leader's read is held: each waits SINGLE_FLIGHT_WAIT_MS, then one reads npm
     let answered = 0;
 
