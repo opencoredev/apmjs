@@ -44,6 +44,8 @@ const LISTED = new Map(Object.entries({
   "plain-pkg@1.0.0": ["GHSA-xxxx-yyyy-zzzz"],
   // a name published on this registry: npm's advisory is not about it
   "@local/evil@1.0.0": ["MAL-2026-0005"],
+  // npm's 2.0.0 of a name this registry published 1.0.0 of: a different artifact, still npm's
+  "@local/evil@2.0.0": ["MAL-2026-0007"],
 }));
 
 /** Versions whose first batch answer has no MAL- id but a next page that has one. */
@@ -218,22 +220,29 @@ describe("the OSSF malicious-packages feed", () => {
     expect(out.blocked.some((b) => b.package === "half-evil" && b.version === "1.0.0")).toBe(false);
   });
 
-  // review of bb6c5ae, finding 1: npm's advisory for a name was applied to the package of that name published here
-  test("a package published on this registry is not matched against npm's advisories", async () => {
+  // review of bb6c5ae, finding 1, and of a02bd4b, finding 2: npm's advisory was applied to a version published here,
+  // and then a version published here hid npm's other versions of that name
+  test("a version published on this registry is not matched against npm's advisories; its name's other versions are", async () => {
     database ??= freshDatabase();
     const c = new Client({ connectionString: (await database).url });
 
     await c.connect();
 
     try {
+      await c.query(`INSERT INTO users (name, password_hash, email, created_at) VALUES ('u', 'x', 'u@example.test', 0)`);
       await c.query(`INSERT INTO packages (name, created_at, modified_at, dist_tags) VALUES ('@local/evil', 0, 0, '{"latest":"1.0.0"}'::jsonb)`);
+      await c.query(
+        `INSERT INTO versions (package, version, manifest, shasum, integrity, size, tarball_key, published_at, published_by)
+         VALUES ('@local/evil', '1.0.0', $1::jsonb, $2, 'sha1-x', 10, 'sha512/x', $3, 'u')`,
+        [JSON.stringify({ name: "@local/evil", version: "1.0.0" }), "0".repeat(40), NOW - 10 * DAY],
+      );
     } finally {
       await c.end();
     }
 
-    const out = await scan([{ name: "@local/evil", version: "1.0.0" }]);
+    const out = await scan([{ name: "@local/evil", version: "1.0.0" }, { name: "@local/evil", version: "2.0.0" }]);
 
-    expect(out.blocked.some((b) => b.kind === "malicious")).toBe(false);
+    expect(out.blocked.filter((b) => b.kind === "malicious").map((b) => b.version)).toEqual(["2.0.0"]);
   });
 
   // review of bb6c5ae, finding 2: each page and each pass of a resolve waited on OSV's timeout again
@@ -315,6 +324,21 @@ describe("osvFeed", () => {
     }
 
     expect(await lookup(root, pkgs)).toEqual([{ name: "paged-pkg", version: "1.0.0", ids: ["MAL-2026-0006"] }]);
+  });
+
+  // review of a02bd4b, finding 1: a page that could not be read dropped the batch's other hits
+  test("a version whose next page cannot be read does not hide another version's hit in the same batch", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+
+    osv.pagesDown = true;
+
+    try {
+      expect(await lookup(root, [{ name: "evil-root", version: "1.0.0" }, { name: "paged-pkg", version: "1.0.0" }])).toEqual([{ name: "evil-root", version: "1.0.0", ids: ["MAL-2026-0001"] }]);
+    } finally {
+      osv.pagesDown = false;
+    }
+
+    expect(await lookup(root, [{ name: "paged-pkg", version: "1.0.0" }])).toEqual([{ name: "paged-pkg", version: "1.0.0", ids: ["MAL-2026-0006"] }]);
   });
 
   test("more versions than one batch holds are asked in batches, the last one's included", async () => {

@@ -96,7 +96,10 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
 
     const queryOf = (p: PackageVersion): OsvQuery => ({ package: { name: p.name, ecosystem: "npm" }, version: p.version });
 
-    /** The MAL- ids for each of `chunk`, in order, every page read; fails when any part was not read. */
+    /**
+     * The MAL- ids for each of `chunk`, in order: null for a version whose later pages could not be read and that
+     * shows no MAL- id so far (unresolved: not kept). Fails only when the batch itself was not answered.
+     */
     const ask = (chunk: readonly PackageVersion[]) =>
       Effect.gen(function* () {
         const batch = yield* post("v1/querybatch", { queries: chunk.map(queryOf) }, BatchAnswer);
@@ -110,11 +113,16 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             let token = first?.next_page_token;
 
             for (let page = 0; token !== undefined && ids.length === 0; page++) {
-              if (page >= MAX_PAGES) return yield* Effect.fail(new Error("OSV has more pages than apm reads"));
-              const next = yield* post("v1/query", { ...queryOf(p), page_token: token }, QueryAnswer);
+              const next = page < MAX_PAGES ? yield* Effect.result(post("v1/query", { ...queryOf(p), page_token: token }, QueryAnswer)) : null;
 
-              ids.push(...malOnly(next.vulns));
-              token = next.next_page_token;
+              if (next === null || Result.isFailure(next)) {
+                console.error(JSON.stringify({ event: "osv-page", name: p.name, version: p.version, error: next === null ? "more pages than apm reads" : String(next.failure) }));
+
+                return null;
+              }
+
+              ids.push(...malOnly(next.success.vulns));
+              token = next.success.next_page_token;
             }
 
             return ids;
@@ -149,8 +157,9 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             }
 
             chunk.forEach((p, j) => {
-              const ids = got.success[j] ?? [];
+              const ids = got.success[j];
 
+              if (ids === null || ids === undefined) return;
               remember(cacheKey(p), ids, now + CACHE_MS);
               known.set(keyOf(p), ids);
             });

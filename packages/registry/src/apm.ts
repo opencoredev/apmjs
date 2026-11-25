@@ -2939,16 +2939,18 @@ const treeReviews = (tree: Tree) =>
   });
 
 /**
- * The versions among `pkgs` the OSSF malicious-packages feed lists (osv.ts), npm's only: a name published on this
- * registry is its own package, never npm's under that name, so the feed's advisories do not name it.
+ * The versions among `pkgs` the OSSF malicious-packages feed lists (osv.ts), npm's only: a version published on this
+ * registry is its own artifact, not npm's under that name and version, so the feed's advisories do not name it. Only
+ * that exact version is exempt: another version of the same name is still asked about (review of a02bd4b, finding 2).
  */
 const listedOnNpm = (pkgs: readonly { name: string; version: string }[]) =>
   Effect.gen(function* () {
     // no feed, no database read for it (a walk's statements are counted: tree-walk.test.ts)
     if (pkgs.length === 0 || Option.isNone(yield* Effect.serviceOption(KnownMalicious))) return [];
-    const local = yield* Effect.flatMap(Store, (store) => store.existingPackages([...new Set(pkgs.map((p) => p.name))]));
+    const rows = yield* Effect.flatMap(Store, (store) => store.versionSizes(pkgs.map((p) => ({ package: p.name, version: p.version }))));
+    const local = new Set(rows.map((r) => `${r.package}@${r.version}`));
 
-    return yield* listedMalicious(pkgs.filter((p) => !local.has(p.name)));
+    return yield* listedMalicious(pkgs.filter((p) => !local.has(`${p.name}@${p.version}`)));
   });
 
 /** Whether an apm reviewer confirmed this version malicious. False when this registry runs no AI review. */
