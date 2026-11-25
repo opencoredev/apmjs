@@ -13,6 +13,7 @@ import { z } from "zod";
 import { markdownResponse } from "../lib/agent/agent-http";
 import { handleMessage } from "../lib/agent/mcp";
 import { registrySource } from "../lib/agent/registry-source";
+import { inlineCode } from "../lib/agent/text";
 import { REGISTRY } from "../lib/registry-url";
 
 const Input = z.object({ name: z.string(), versions: z.array(z.string()), paths: z.array(z.string()), searches: z.array(z.string()) });
@@ -42,7 +43,8 @@ async function agentViews(input: z.infer<typeof Input>): Promise<AgentAnswer[]> 
     out.push(await tool({ name: "check_package", args: version ? { name, version } : { name }, echoes: [] }));
   }
 
-  for (const query of input.searches) out.push(await tool({ name: "search_packages", args: { query }, echoes: [`Nothing matches "${query}".`, ` for "${query}"`, `"query":"${query}"`] }));
+  // built with the tool's own quoting, so a change of its wording can't turn the query into a false leak
+  for (const query of input.searches) out.push(await tool({ name: "search_packages", args: { query }, echoes: [`Nothing matches ${inlineCode(query)}.`, ` for ${inlineCode(query)}`, `"query":"${query}"`] }));
 
   for (const version of input.versions) {
     for (const path of input.paths) out.push(await tool({ name: "get_file_excerpt", args: { name, version, path, line: 1 }, echoes: [`has no file \`${path}\`.`] }));
