@@ -2,7 +2,7 @@
 // packument passes only as the view asked for and for the package asked about, with a valid version left and latest
 // listed, and explain is asked again only for a transient answer.
 import { describe, expect, test } from "bun:test";
-import { BODY_CAP, boundedGet, largeExplain, LARGE, OSSF_LISTED, ossfListed, type Fetch, type ProbeDeps } from "../smoke-probes.ts";
+import { BODY_CAP, boundedGet, largeExplain, LARGE, NPM_CLIENT, OSSF_LISTED, ossfListed, type Fetch, type ProbeDeps } from "../smoke-probes.ts";
 import { z } from "zod";
 
 const REGISTRY = "https://registry.test/";
@@ -25,14 +25,21 @@ const refusedExplain: ExplainBody = { verdict: "do-not-install", name: OSSF_LIST
 const packument = (over: Partial<PackumentBody> = {}): PackumentBody => ({ name: OSSF_LISTED.name, versions: { "9.0.0": { version: "9.0.0" } }, "dist-tags": { latest: "9.0.0" }, ...over });
 
 /** A registry and website that answer as a healthy stage does, with `over` changing what a route answers. */
-function stage(over: { explain?: () => Response; packument?: (accept: string) => Response } = {}) {
+function stage(over: { explain?: () => Response; packument?: (accept: string) => Response; tarball?: (userAgent: string | undefined) => Response } = {}) {
   const calls: string[] = [];
+  const tarballs: { userAgent: string | undefined; redirect: string }[] = [];
   const sleeps: number[] = [];
 
   const fetch: Fetch = async (url, init) => {
     calls.push(url);
 
     if (url.includes("api/explain")) return over.explain?.() ?? answer(url.includes(OSSF_LISTED.name) ? refusedExplain : explained());
+
+    if (url.endsWith(".tgz")) {
+      tarballs.push({ userAgent: init.headers["user-agent"], redirect: init.redirect });
+
+      if (over.tarball) return over.tarball(init.headers["user-agent"]);
+    }
 
     if (url.endsWith(".tgz")) return answer({ error: `known malicious: the OSSF malicious-packages feed lists ${OSSF_LISTED.name}@${OSSF_LISTED.version} (${OSSF_LISTED.id})` }, 403);
     const accept = init.headers.accept ?? FULL;
@@ -42,7 +49,7 @@ function stage(over: { explain?: () => Response; packument?: (accept: string) =>
 
   const deps: ProbeDeps = { fetch, registry: REGISTRY, web: WEB, sleep: async (ms) => void sleeps.push(ms) };
 
-  return { deps, calls, sleeps };
+  return { deps, calls, sleeps, tarballs };
 }
 
 const stalled = (): Fetch => async () => new Response(new ReadableStream({ start: (c) => c.enqueue(new TextEncoder().encode('{"a":')) }), { headers: { "content-type": FULL } });
@@ -79,10 +86,38 @@ describe("ossfListed", () => {
   test("a healthy stage passes every check", async () => {
     const checks = await ossfListed(stage().deps);
 
-    expect(checks.map((c) => c.ok)).toEqual([true, true, true, true]);
+    expect(checks.map((c) => c.ok)).toEqual([true, true, true, true, true]);
   });
 
-  const packumentChecks = async (over: (accept: string) => Response) => (await ossfListed(stage({ packument: over }).deps)).slice(2).map((c) => c.ok);
+  test("the tarball is asked for as the default client and as npm, following no redirect", async () => {
+    const s = stage();
+
+    await ossfListed(s.deps);
+    expect(s.tarballs).toEqual([
+      { userAgent: undefined, redirect: "manual" },
+      { userAgent: NPM_CLIENT, redirect: "manual" },
+    ]);
+  });
+
+  test("a redirect of npm's tarball request to npm fails that check, and only that one", async () => {
+    const redirected = (userAgent: string | undefined) =>
+      userAgent === NPM_CLIENT
+        ? new Response(null, { status: 302, headers: { location: `https://registry.npmjs.org/${OSSF_LISTED.name}/-/${OSSF_LISTED.name}-${OSSF_LISTED.version}.tgz` } })
+        : answer({ error: `known malicious (${OSSF_LISTED.id})` }, 403);
+
+    const checks = await ossfListed(stage({ tarball: redirected }).deps);
+
+    expect(checks.slice(1, 3).map((c) => c.ok)).toEqual([true, false]);
+    expect(checks[2]?.detail).toContain("HTTP 302");
+  });
+
+  test("a 403 that does not cite the advisory fails", async () => {
+    const checks = await ossfListed(stage({ tarball: () => answer({ error: "forbidden" }, 403) }).deps);
+
+    expect(checks.slice(1, 3).map((c) => c.ok)).toEqual([false, false]);
+  });
+
+  const packumentChecks = async (over: (accept: string) => Response) => (await ossfListed(stage({ packument: over }).deps)).slice(3).map((c) => c.ok);
 
   test("a packument of another package fails", async () => {
     expect(await packumentChecks((accept) => answer(packument({ name: "other" }), 200, accept))).toEqual([false, false]);

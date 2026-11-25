@@ -99,6 +99,8 @@ const STUB: UpstreamApi = {
     search: () => Effect.succeed({ kind: "unavailable" }),
     probe: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     probeWithin: () => Effect.succeed({ kind: "found", pkg: pkg() }),
+    probeFor: () => Effect.succeed({ kind: "found", pkg: pkg() }),
+    probeWithinFor: () => Effect.succeed({ kind: "found", pkg: pkg() }),
     devDependencies: () => Effect.succeed(null),
     probeMany: (names) => Effect.succeed(new Map(names.map((n) => [n, { kind: "found" as const, pkg: pkg() }]))),
     summaries: (names, lease, keep) =>

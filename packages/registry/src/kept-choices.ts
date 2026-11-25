@@ -21,7 +21,7 @@ import { WEIGHTS } from "./packument-read.ts";
 import { jsonBound, SUMMARY_MANIFEST_FIELDS, summaryVersion, textReadWeight, versionAllowance, type Reserve } from "./walk-catalog.ts";
 
 /** One choice a reader makes of a package's versions, named by `key` (see above), newest first. */
-export type Choice = { readonly key: string; readonly choose: (pkg: { readonly distTags: Record<string, string>; readonly versions: readonly VersionRecord[] }) => readonly VersionRecord[] };
+export type Choice = { readonly key: string; readonly choose: <V extends Omit<VersionRecord, "score">>(pkg: { readonly distTags: Record<string, string>; readonly versions: readonly V[] }) => readonly V[] };
 
 /** What a reader is handed of a package: its name, dist-tags and the versions each of its choices took, by key. */
 export type Chosen = { readonly name: string; readonly distTags: Record<string, string>; readonly versions: ReadonlyMap<string, readonly VersionRecord[]> };
