@@ -2,7 +2,7 @@
 // attributes server components declare, and that nothing is sent or asked without the tracker on the page. The
 // tracker and Databuddy's flag endpoint are stand-ins here; scripts/analytics-browser.ts runs the real databuddy.js.
 import { afterEach, describe, expect, test } from "bun:test";
-import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, LINKED_KEY, linkAccount, track, trackInstallDefaultShown } from "./databuddy-client";
+import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, forgetAccount, installDefaultClient, LINKED_KEY, linkAccount, track, trackInstallDefaultShown } from "./databuddy-client";
 
 type Sent = { name: string; props: Readonly<Record<string, string | number>> };
 
@@ -178,30 +178,38 @@ describe("linking a signed-in visitor to their account", () => {
   const OTHER = "fedcba9876543210fedcba9876543210";
 
   /** A stand-in for databuddy.js's identity calls and the page's local storage, with `stored` already in it. */
-  function fakeIdentity(stored: Record<string, string> = {}, throws = false) {
+  function fakeIdentity(stored: Record<string, string> = {}, opts: { throws?: boolean; inMemory?: string } = {}) {
     const calls: string[] = [];
     const storage = new Map(Object.entries(stored));
+    const session = new Map<string, string>([["did_session", "sess_1"]]);
+    let profile = opts.inMemory ?? null;
+
+    const store = (m: Map<string, string>) => ({
+      getItem: (k: string) => m.get(k) ?? null,
+      setItem: (k: string, v: string) => m.set(k, v),
+      removeItem: (k: string) => m.delete(k),
+    });
 
     Reflect.set(globalThis, "window", {
       databuddy: {
         identify: (id: string) => {
-          if (throws) throw new Error("tracker bug");
+          if (opts.throws) throw new Error("tracker bug");
           calls.push(`identify ${id}`);
+          profile = id;
           storage.set("did_profile", id);
         },
         clear: () => {
           calls.push("clear");
+          profile = null;
           storage.delete("did_profile");
         },
+        getProfileId: () => profile,
       },
-      localStorage: {
-        getItem: (k: string) => storage.get(k) ?? null,
-        setItem: (k: string, v: string) => storage.set(k, v),
-        removeItem: (k: string) => storage.delete(k),
-      },
+      localStorage: store(storage),
+      sessionStorage: store(session),
     });
 
-    return { calls, storage };
+    return { calls, storage, session };
   }
 
   test("a signed-in visitor is identified by the account's analytics id, and databuddy.js keeps no copy for the next page load", async () => {
@@ -241,6 +249,21 @@ describe("linking a signed-in visitor to their account", () => {
     expect(anonymous.calls).toEqual([]);
   });
 
+  test("a tab still holding the profile in memory clears it on sign-out, even after another tab dropped the marker", async () => {
+    const { calls } = fakeIdentity({}, { inMemory: ID });
+
+    await linkAccount(null);
+    expect(calls).toEqual(["clear"]);
+  });
+
+  test("the sign-out button drops databuddy.js's stored visitor, session and profile ids and the link marker", () => {
+    const { storage, session } = fakeIdentity({ did: "anon_1", did_profile: ID, [LINKED_KEY]: ID, unrelated: "kept" });
+
+    forgetAccount();
+    expect([...storage.keys()]).toEqual(["unrelated"]);
+    expect([...session.keys()]).toEqual([]);
+  });
+
   test("a different account signing in starts new visitor ids before it is identified", async () => {
     const { calls, storage } = fakeIdentity({ [LINKED_KEY]: ID });
 
@@ -250,7 +273,7 @@ describe("linking a signed-in visitor to their account", () => {
   });
 
   test("a tracker that throws never reaches the page", async () => {
-    fakeIdentity({}, true);
+    fakeIdentity({}, { throws: true });
 
     await expect(linkAccount(ID)).resolves.toBeUndefined();
   });

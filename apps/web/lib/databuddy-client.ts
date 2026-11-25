@@ -183,6 +183,7 @@ export async function installDefaultClient({ clientId }: { clientId: string }): 
 const IdentityTracker = z.object({
   identify: z.custom<(profileId: string) => void>((v) => v instanceof Function),
   clear: z.custom<() => void>((v) => v instanceof Function),
+  getProfileId: z.custom<() => string | null>((v) => v instanceof Function),
 });
 
 type IdentityTracker = z.infer<typeof IdentityTracker>;
@@ -201,6 +202,27 @@ const SDK_PROFILE_KEY = "did_profile";
 
 /** This site's own note of which account this browser was last linked to, so a sign-out or switch can untie it. */
 export const LINKED_KEY = "apm_databuddy_linked";
+
+/** Every key databuddy.js keeps its visitor, session and profile ids under, in local and session storage. */
+const SDK_ID_KEYS = ["did", "did_profile", "did_session", "did_session_timestamp", "did_session_start", "did_profile_sent"] as const;
+
+/**
+ * Called by the sign-out button (a private page, where databuddy.js never runs): drops databuddy.js's stored visitor,
+ * session and profile ids and this site's link marker, so the next public page starts as a new anonymous visitor
+ * instead of under ids that were tied to the account. Never throws.
+ */
+export function forgetAccount(): void {
+  try {
+    for (const key of SDK_ID_KEYS) {
+      window.localStorage.removeItem(key);
+      window.sessionStorage.removeItem(key);
+    }
+
+    window.localStorage.removeItem(LINKED_KEY);
+  } catch {
+    // storage refused: the next public page's account check clears the ids instead
+  }
+}
 
 /**
  * Ties this browser's visits to the signed-in account, or unties them once the visitor is signed out. `analyticsId`
@@ -222,7 +244,8 @@ export async function linkAccount(analyticsId: string | null): Promise<void> {
     const linked = window.localStorage.getItem(LINKED_KEY);
 
     if (analyticsId === null) {
-      if (linked === null) return;
+      // another tab may have dropped the marker while this one still holds the profile in memory
+      if (linked === null && t.getProfileId() === null) return;
       t.clear();
       window.localStorage.removeItem(LINKED_KEY);
 
