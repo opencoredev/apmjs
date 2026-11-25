@@ -49,7 +49,8 @@ describe("packageMarkdown", () => {
     expect(md).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
     expect(md).toContain(`registry=${REGISTRY}\n`);
     expect(md).toContain(`For strict mode use registry=${REGISTRY}~safe/`);
-    expect(md).toContain('scanner = "@apm/bun-scanner"');
+    expect(md).toContain(`[install]\nregistry = "${REGISTRY}"\n`);
+    expect(md).not.toContain('scanner = "@apm/bun-scanner"');
   });
 
   test("lists what was not checked, and pulled versions", () => {

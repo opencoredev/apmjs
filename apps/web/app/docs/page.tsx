@@ -23,7 +23,7 @@ const AGENTS_GUIDE = "https://github.com/opencoredev/apmjs/blob/main/docs/AGENTS
 
 // The ids stay stable: package pages and the AI review section link to /docs#bun, #npm, #cli, #capabilities and #ai-review; llms.txt and the MCP server link to #agents.
 const SECTIONS = [
-  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at https://registry.apmjs.dev/, or use `apm add`. For strict mode use ~safe/ instead, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. The optional @apm/bun-scanner package is not on a registry yet; see the guide for trying it from a local checkout.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
+  { id: "bun", title: "Use it with Bun", body: "Point bunfig.toml at https://registry.apmjs.dev/, or use apm add. For strict mode use ~safe/ instead, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. The optional @apm/bun-scanner package is not on a registry yet; see the guide for trying it from a local checkout.", href: `${DOCS}/guides/bun-scanner`, link: "Bun scanner" },
   { id: "npm", title: "Use it with npm or pnpm", body: "Set registry=https://registry.apmjs.dev/ in .npmrc, and npm and pnpm install through apm. For strict mode use https://registry.apmjs.dev/~safe/ instead: it hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some large packages have no version there.", href: `${DOCS}/quickstart`, link: "Quick start" },
   {
     id: "cli",
