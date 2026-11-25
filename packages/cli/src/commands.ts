@@ -167,7 +167,7 @@ export function argsError(a: Args, command: Command): string | null {
     if (kind === "value" && (value === true || value === "")) return `${shown} needs a value`;
 
     // a dist-tag shaped like an option would reach the package manager's publish as one
-    if (key === "tag" && typeof value === "string" && value.startsWith("-")) return `${shown} cannot start with -`;
+    if (key === "tag" && value !== true && value.startsWith("-")) return `${shown} cannot start with -`;
 
     if (kind === "switch" && value !== true) return `${shown} takes no value`;
   }
