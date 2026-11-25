@@ -86,7 +86,7 @@ describe("tools", () => {
     });
 
     expect(r.isError).toBe(false);
-    expect(r.text).toContain('1 of 2 for "pad":');
+    expect(r.text).toContain("1 of 2 for `pad`:");
     expect(r.text).toContain("- left-pad@1.3.0 score 75/100 (B), 1000 downloads/week: `String left pad`");
     expect(r.text).not.toContain("right-pad");
     expect(r.calls).toEqual(["search pad"]);

@@ -79,3 +79,30 @@ describe("a missing version or package is named as data", () => {
     expect(types(md), md).not.toContain("heading");
   });
 });
+
+// search_packages repeats the query it was given, which an agent may have copied from a page an attacker wrote
+describe("search_packages names the query as data", () => {
+  const hit = { name: "left-pad", version: "1.3.0", description: "String left pad", date: null, source: "npm" as const, score: null, weeklyDownloads: null };
+
+  async function searchText(query: string, hits: (typeof hit)[]): Promise<string> {
+    const s = fakeSource({ search: { query, total: hits.length, upstreamFailed: false, hits } });
+    const answer = await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "search_packages", arguments: { query } } }, s);
+    const result = answer?.result && "content" in answer.result ? answer.result : null;
+
+    return result?.content[0]?.text ?? "";
+  }
+
+  for (const payload of PAYLOADS) {
+    for (const [label, hits] of [["no hits", []], ["one hit", [hit]]] as const) {
+      test(`${label}, query ${JSON.stringify(payload)}`, async () => {
+        const text = await searchText(payload, [...hits]);
+
+        expect(text).toContain(hits.length === 0 ? "Nothing matches" : "1 of 1 for");
+        expect(text).toContain("PWNED");
+        expect(spoofed(text), text).toEqual([]);
+        expect(types(text), text).not.toContain("heading");
+        expect(types(text), text).not.toContain("link");
+      });
+    }
+  }
+});
