@@ -78,6 +78,12 @@ describe("tar headers are read as npm and Bun install them", () => {
     { name: "a GNU long link name leaves the pending long name in place", bytes: tar([PJ, entry("././@LongLink", `${LONG}\0`, { type: "L" }), entry("././@LongLink", "target\0", { type: "K" }), entry("package/short.js", EVIL)]), installed: ["package.json", LONG.slice("package/".length)] },
     { name: "an old-style X PAX header names the next file", bytes: tar([PJ, entry("PaxHeader/a.js", paxRecord("path=package/evil.js"), { type: "X" }), entry("package/a.js", EVIL)]), installed: ["package.json", "evil.js"] },
     { name: "a global PAX header's path names no file", bytes: tar([PJ, entry("pax_global_header", paxRecord("path=package/other.js"), { type: "g" }), entry("package/evil.js", EVIL)]), installed: ["package.json", "evil.js"] },
+    // the later of a PAX path and a GNU long name names the file, whichever order they come in: reading the PAX path first
+    // listed this evil.js as harmless.txt, a file the scan skips
+    { name: "a GNU long name after a PAX path names the file", bytes: tar([PJ, entry("PaxHeader/a", paxRecord("path=package/harmless.txt"), { type: "x" }), entry("././@LongLink", "package/evil.js\0", { type: "L" }), entry("package/evil.js", EVIL)]), installed: ["package.json", "evil.js"] },
+    { name: "a GNU long name after an old-style X PAX path names the file", bytes: tar([PJ, entry("PaxHeader/a", paxRecord("path=package/harmless.txt"), { type: "X" }), entry("././@LongLink", "package/evil.js\0", { type: "L" }), entry("package/evil.js", EVIL)]), installed: ["package.json", "evil.js"] },
+    { name: "a PAX path after a GNU long name names the file", bytes: tar([PJ, entry("././@LongLink", "package/harmless.txt\0", { type: "L" }), entry("PaxHeader/a", paxRecord("path=package/evil.js"), { type: "x" }), entry("package/harmless.txt", EVIL)]), installed: ["package.json", "evil.js"] },
+    { name: "a PAX header that sets no path leaves a GNU long name in place", bytes: tar([PJ, entry("././@LongLink", "package/evil.js\0", { type: "L" }), entry("PaxHeader/a", paxRecord("mtime=1"), { type: "x" }), entry("package/harmless.txt", EVIL)]), installed: ["package.json", "evil.js"] },
   ];
 
   for (const c of cases) {
@@ -86,6 +92,15 @@ describe("tar headers are read as npm and Bun install them", () => {
       expect(pathsOf(streamed(c.bytes))).toEqual(c.installed);
     });
   }
+
+  // npm merges a PAX header that sets no path over the one before it, so the earlier path names the file; Bun refuses two
+  // PAX headers in a row. Reading the header's own name would list harmless.txt for what npm installs as evil.js
+  test("a PAX header that sets no path leaves an earlier PAX path in place", () => {
+    const bytes = tar([PJ, entry("PaxHeader/a", paxRecord("path=package/evil.js"), { type: "x" }), entry("PaxHeader/a", paxRecord("mtime=1"), { type: "x" }), entry("package/harmless.txt", EVIL)]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "evil.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "evil.js"]);
+  });
 
   test("the file after a lone zero block is read whole", () => {
     const [, evil] = readTar(tar([PJ, [zero()], entry("package/evil.js", EVIL)]));

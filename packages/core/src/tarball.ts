@@ -161,8 +161,10 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
   const entries: TarEntry[] = [];
   let off = 0;
   let headers = 0;
-  let longName: string | null = null;
-  let paxPath: string | null = null;
+  // the path the next entry takes from a GNU long name or a PAX path, whichever came last: npm and Bun both let a later
+  // one replace an earlier one (an X path then an L name installs under the L name), so the entry is listed under the
+  // name it is installed under, never the one a publisher put first to hide it
+  let nextPath: string | null = null;
   let sawZero = false;
 
   while (off + 512 <= tar.length) {
@@ -201,15 +203,15 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
 
     if (type === "L") {
       chargeText("tar", data.length);
-      longName = readString(data, 0, data.length);
+      nextPath = readString(data, 0, data.length);
       continue;
     }
 
     if (isPax(type) || type === "g") {
       const path = paxPathOf(data, off);
 
-      // a global header's path names no entry (npm and Bun ignore it)
-      if (type !== "g") paxPath = path;
+      // a global header's path names no entry (npm and Bun ignore it), and one that sets no path keeps the pending one
+      if (type !== "g" && path !== null) nextPath = path;
       continue;
     }
 
@@ -217,14 +219,12 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     if (type === "K") continue;
 
     if (type !== "0" && type !== "\0" && type !== "7") {
-      longName = null;
-      paxPath = null;
+      nextPath = null;
       continue;
     }
 
-    let full = paxPath ?? longName ?? headerPath(header);
-    longName = null;
-    paxPath = null;
+    let full = nextPath ?? headerPath(header);
+    nextPath = null;
     full = normalizeTarPath(full);
     // the entry's bytes are copied out of the archive
     chargeText("tar", size + full.length);
@@ -411,8 +411,8 @@ export class TarStream {
   /** Bytes of the archive read so far: where the header being filled starts, as readTar's `off`. */
   private offset = 0;
   private headers = 0;
-  private longName: string | null = null;
-  private paxPath: string | null = null;
+  /** As readTar's `nextPath`: the path the next entry takes from the last GNU long name or PAX path before it. */
+  private nextPath: string | null = null;
   private sawZero = false;
   private readonly entries: TarEntry[] = [];
   private readonly partial = new Set<TarEntry>();
@@ -600,19 +600,15 @@ export class TarStream {
     }
 
     if (type !== "0" && type !== "\0" && type !== "7") {
-      if (type !== "K") {
-        this.longName = null;
-        this.paxPath = null;
-      }
+      if (type !== "K") this.nextPath = null;
 
       this.pending = blocks > 0 ? { kind: "skip", required: size, pad, name } : { kind: "header" };
 
       return;
     }
 
-    let full = this.paxPath ?? this.longName ?? headerPath(header);
-    this.longName = null;
-    this.paxPath = null;
+    let full = this.nextPath ?? headerPath(header);
+    this.nextPath = null;
     full = normalizeTarPath(full);
     this.namesBytes += full.length;
 
@@ -665,11 +661,11 @@ export class TarStream {
   private readMeta(p: Extract<Pending, { kind: "meta" }>): void {
     if (p.type === "L") {
       chargeText("tar", p.buf.length);
-      this.longName = readString(p.buf, 0, p.buf.length);
+      this.nextPath = readString(p.buf, 0, p.buf.length);
     } else {
       const path = paxPathOf(p.buf, p.at);
 
-      if (p.type !== "g") this.paxPath = path;
+      if (p.type !== "g" && path !== null) this.nextPath = path;
     }
   }
 }
