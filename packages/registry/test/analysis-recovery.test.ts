@@ -130,6 +130,8 @@ function upstreamStub(names: readonly string[], failing: readonly string[] = [])
       search: () => Effect.succeed({ kind: "unavailable" }),
       probe: (name) => Effect.succeed(probeOf(name)),
       probeWithin: (name) => Effect.succeed(probeOf(name)),
+      probeFor: (name) => Effect.succeed(probeOf(name)),
+      probeWithinFor: (name) => Effect.succeed(probeOf(name)),
       devDependencies: () => Effect.succeed(null),
       probeMany: (names) => Effect.succeed(new Map(names.map((n) => [n, probeOf(n)]))),
       summaries: (names, lease, keep) =>

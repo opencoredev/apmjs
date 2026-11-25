@@ -1,7 +1,9 @@
 // Checks a deployed stage the way people use it: stock bun and npm install real npm packages through it, apm add
 // refuses a low-score package, a login token stages a publish that goes live only after a TOTP approval, and
 // bun audit reads advisories through it, and the stage's own CLI install script (/install) installs apm into a fresh
-// HOME after checking its SHA-256. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No package install
+// HOME after checking its SHA-256. The website's explain must answer a large package (next) and refuse a version the OSSF
+// malicious-packages feed lists, which the registry must withhold from its packuments and refuse as a tarball, all read
+// without installing. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No package install
 // it runs executes a package's install script, and the raw npm and bun installs install committed lockfiles (smoke-commands.ts,
 // smoke-fixtures/): what a registry answers never runs code here and cannot add a dependency. That the registry
 // resolves versions is checked by reading its metadata, without installing.
@@ -27,6 +29,7 @@ import { Client } from "pg";
 import { z } from "zod";
 import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
+import { largeExplain, ossfListed } from "./smoke-probes.ts";
 import { installCheck } from "./cli-check.ts";
 import { readCliReleases } from "./cli-ledger.ts";
 
@@ -177,6 +180,13 @@ async function resolution(): Promise<void> {
   }
 
   record(wrong.length === 0, "the registry resolves every locked version to the lockfile's integrity, tarball URL and dependencies, and latest is a listed version (metadata only, nothing installed)", wrong.length === 0 ? `${all.size} versions` : wrong.join("; "));
+}
+
+// ---------- install verdicts and the OSSF feed (smoke-probes.ts) ----------
+async function verdictProbes(): Promise<void> {
+  const deps = { fetch, registry, web };
+
+  for (const c of [await largeExplain(deps), ...(await ossfListed(deps))]) record(c.ok, c.name, c.detail);
 }
 
 /**
@@ -485,6 +495,8 @@ await cliInstall();
 await stockClients();
 
 await resolution();
+
+await verdictProbes();
 
 await apmWarning();
 
