@@ -563,6 +563,9 @@ function printResolved(r: Resolved): void {
 
   if (lookalike.target !== null) say(`  did you mean ${lookalike.target}?`);
   say(yellow(`A look-alike name alone does not make apm refuse a package. If you meant ${lookalike.target ?? "another package"}, stop here and use that name.`));
+
+  // the other warnings above keep their own closing, after the look-alike block
+  if (r.warnings.length > 0) say(yellow(EARLY_CLOSING));
 }
 
 /**
@@ -1892,7 +1895,7 @@ function plainInstallNote(input: { cwd: string; pm: Pm; command: string }): void
 
   // the copyable setting only for apm's own registry: any other URL could carry a credential
   const shown = sameRegistry(process.env.APM_REGISTRY ?? DEFAULT_REGISTRY, DEFAULT_REGISTRY) ? DEFAULT_REGISTRY : null;
-  const hint = shown === null ? `point ${input.pm}'s registry setting at it` : input.pm === "bun" ? `set [install] registry = "${shown}" in bunfig.toml` : input.pm === "yarn" ? `set registry=${shown} in .npmrc (yarn 1) or npmRegistryServer: "${shown}" in .yarnrc.yml (yarn 2 and later)` : `set registry=${shown} in .npmrc`;
+  const hint = shown === null ? `point ${input.pm}'s registry setting at it` : input.pm === "bun" ? `set registry = "${shown}" under [install] in bunfig.toml` : input.pm === "yarn" ? `set registry=${shown} in .npmrc (yarn 1) or npmRegistryServer: "${shown}" in .yarnrc.yml (yarn 2 and later)` : `set registry=${shown} in .npmrc`;
   const where = input.pm === "yarn" ? "yarn installs from the registry in its own config" : `${input.pm} installs from the registry in its own config (https://registry.npmjs.org/ unless that names another)`;
 
   warn(dim(`apm: a plain ${input.pm} ${input.command}, which apm checks nothing in; ${where} and from the lockfile's own URLs. To install through apm's registry, ${hint}`));

@@ -175,7 +175,7 @@ describe("apm's messages for first-time users", () => {
 
     const bun = await apm(["install", "--pm", "bun"], { cwd: folder("b4-bun", { "package.json": manifest }), registry: "https://registry.apmjs.dev/" });
 
-    expect(bun.text).toContain('To install through apm\'s registry, set [install] registry = "https://registry.apmjs.dev/" in bunfig.toml');
+    expect(bun.text).toContain('To install through apm\'s registry, set registry = "https://registry.apmjs.dev/" under [install] in bunfig.toml');
 
     // with no package.json in the folder, the package manager may install the one above: the note names it, the install still runs
     const home = folder("b4-home", { "package.json": manifest });

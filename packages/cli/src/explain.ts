@@ -369,7 +369,7 @@ const SHOWN = 3;
 
 /** Control characters (a terminal's escapes included), line breaks and bidi overrides: what can fake a line. */
 // oxlint-disable-next-line eslint/no-control-regex -- matching control characters is the point: they are removed
-const BREAKER = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]";
+const BREAKER = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u061c]";
 const LINE_BREAKERS = new RegExp(`${BREAKER}+`, "g");
 
 /** Registry text (which carries publisher text, such as a yank reason) on one line, so none can pose as apm's. */
