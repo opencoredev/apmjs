@@ -156,7 +156,7 @@ Checks every installed version with the same check `apm add` runs after an insta
 apm publish [--bump patch|minor|major|<version>] [--dry-run] [--tag <tag>]
 ```
 
-Checks, packs with your package manager, previews the score, then uploads. With a login token the version is staged and the command prints the approval link. See [Publish a package](/guides/publishing).
+Checks, packs with your package manager, previews the score, then uploads. With a login token the version is staged and the command prints the approval link. See [Publish a package](/guides/publishing). It uploads only to a registry you chose (`APM_REGISTRY`, else `registry=` in `~/.npmrc`, else the default) and refuses one a project `.npmrc` or `npm_config_registry` picked.
 
 | Flag | Meaning |
 | --- | --- |

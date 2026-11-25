@@ -1997,15 +1997,16 @@ function openBrowser(url: string): void {
 }
 
 /**
- * apm login signs in only to a registry the user chose (APM_REGISTRY, ~/.npmrc or the default): one a project .npmrc or
- * npm_config_registry picked would be handed the device code or the password, and then the token. True when it refused.
+ * apm login and apm publish hand credentials only to a registry the user chose (APM_REGISTRY, ~/.npmrc or the default):
+ * one a project .npmrc or npm_config_registry picked would get the device code, the password or, through the package
+ * manager's own `${VAR}` lines, the publish credentials. True when it refused.
  */
-function refuseRepoChosenLogin(cfg: Config): boolean {
+function refuseRepoChosenRegistry(cfg: Config, action: "sign in to" | "publish to"): boolean {
   const trusted = tokenRegistry(env());
 
   if (sameRegistry(cfg.registry, trusted)) return false;
-  fail(`refused: apm login would sign in to ${cfg.registry}, which a project .npmrc or npm_config_registry chose, not you.`);
-  say(`Nothing was sent. To log in there, run APM_REGISTRY=${cfg.registry} apm login, or put registry=${cfg.registry} in ~/.npmrc.`);
+  fail(`refused: apm would ${action} ${cfg.registry}, which a project .npmrc or npm_config_registry chose, not you.`);
+  say(`Nothing was sent. To use it, run with APM_REGISTRY=${cfg.registry}, or put registry=${cfg.registry} in ~/.npmrc.`);
 
   return true;
 }
@@ -2015,7 +2016,7 @@ async function cmdLogin(a: Args): Promise<number> {
   if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
   const cfg = config(process.cwd());
 
-  if (refuseRepoChosenLogin(cfg)) return 1;
+  if (refuseRepoChosenRegistry(cfg, "sign in to")) return 1;
   const api = new Api({ ...cfg, token: null });
   const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
   const d = DeviceStart.safeParse(start.body);
@@ -2062,7 +2063,7 @@ async function cmdLogin(a: Args): Promise<number> {
 async function cmdPasswordLogin(a: Args): Promise<number> {
   const cfg = config(process.cwd());
 
-  if (refuseRepoChosenLogin(cfg)) return 1;
+  if (refuseRepoChosenRegistry(cfg, "sign in to")) return 1;
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
     warn("usage: apm login --username <name> --password-stdin");
@@ -2146,6 +2147,9 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   const cfg = config(cwd);
+
+  // npm publish keeps credential variables and fills in the repo's own `${VAR}` auth lines for the registry it uploads to
+  if (refuseRepoChosenRegistry(cfg, "publish to")) return 1;
   const det = pmFor(a, cwd);
   const pj = Manifest.parse(JSON.parse(readFileSync(pjPath, "utf8")));
   // The upload goes to the registry apm checks and previews for, or nowhere: publishConfig and scoped

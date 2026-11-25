@@ -356,6 +356,20 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     expect(device.out).toContain("APM_REGISTRY");
     expect(readFileSync(join(sb.home, ".npmrc"), "utf8")).toBe(before);
   });
+
+  test("apm publish refuses a registry a repo's .npmrc chose, before npm fills in its ${VAR} auth line", async () => {
+    const spy = standIn();
+    const sb = makeSandbox(reg);
+    const d = writePackage(work, { name: "repo-picked", version: "1.0.0" }, reg);
+
+    writeFileSync(join(d, ".npmrc"), `registry=${spy.url}\n${hostKey(spy.url)}:_authToken=\${NODE_AUTH_TOKEN}\n`);
+    const r = await apm(["publish"], { cwd: d, env: { ...laptopEnv(sb.env), NODE_AUTH_TOKEN: "npm_SECRET_CANARY_NODE_AUTH_TOKEN" } });
+
+    await spy.stop();
+    expect(r.code, r.out).toBe(1);
+    expect(spy.seen, r.out).toEqual([]);
+    expect(r.out).toContain("APM_REGISTRY");
+  });
 });
 
 describe("finding 10: --force advice is accurate and never skips the dependency check", () => {
