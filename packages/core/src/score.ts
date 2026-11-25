@@ -295,6 +295,9 @@ export type Grade = "A" | "B" | "C" | "D" | "F" | "P";
 export type ScoreReport = Analysis & { score: number; grade: Grade };
 
 export const SCORE_FLOOR = 40;
+
+/** Work units reading what only the shell reading of install hooks reaches may spend, on a meter of its own (analyze). */
+const MAX_ADDED_TARGET_WORK = MAX_ANALYSIS_WORK / 16;
 export const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -598,6 +601,15 @@ function invokedFiles(manifest: AnalyzeInput["manifest"], byPath: ReadonlyMap<st
   for (const e of entryPoints(manifest)) if (e.field.startsWith("bin")) take(e.path);
 
   return out;
+}
+
+/** The hooks as the first two passes read them, without what only the shell reading adds (HookCommand.added). */
+function baselineHooks(hooks: readonly ExpandedHook[]): ExpandedHook[] {
+  return hooks.map((h) => {
+    const added = new Set(h.addedScripts);
+
+    return { ...h, commands: h.commands.filter((c) => !c.added), scripts: h.scripts.filter((s) => !added.has(s)), addedScripts: [] };
+  });
 }
 
 /** Images, fonts, archives and WebAssembly, recognised by their first bytes. JavaScript cannot start with these. */
@@ -1418,15 +1430,13 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   const first: string[] = [];
   const hooks = expandHooks(manifest);
 
-  for (const h of hooks) {
-    if (h.kind === "publish") continue;
+  // what only the shell reading reaches (HookCommand.added) is not production's: the second layer holds it (invokedFiles)
+  // from what production's plan leaves of the budget
+  for (const c of hooks.flatMap((h) => (h.kind === "publish" ? [] : h.commands.filter((x) => !x.added)))) {
+    for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
+      const f = resolveIn(byPath, w);
 
-    for (const c of h.commands) {
-      for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
-        const f = resolveIn(byPath, w);
-
-        if (f && f.path !== "package.json") first.push(f.path);
-      }
+      if (f && f.path !== "package.json") first.push(f.path);
     }
   }
 
@@ -1469,8 +1479,11 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
 
   for (const f of rest) take(f);
 
-  // the second layer's, from what is left: what scripts and bin run first, then what everything held reaches
-  const invoked = invokedFiles(manifest, byPath, hooks);
+  // the second layer's, from what is left: what scripts and bin run first, then what everything held reaches, as the
+  // first two passes of expandHooks read the hooks; then, from what that leaves, what only the shell reading adds
+  const baseline = invokedFiles(manifest, byPath, baselineHooks(hooks));
+  const all = invokedFiles(manifest, byPath, hooks);
+  let invoked = baseline;
 
   const takeExtra = (f: TarEntry): void => {
     if (held.has(f.path) || extra.has(f.path) || (!invoked.has(f.path) && !readAsTextBefore(f.path, f.data)) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
@@ -1480,25 +1493,34 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
 
   const shellRuns = input.shellRuns ?? new Map<string, readonly string[]>();
   const seenX = new Set<string>();
-  const queueX = [...invoked, ...held];
+  const queueX = [...baseline, ...held];
+  let qi = 0;
 
-  for (let qi = 0; qi < queueX.length; qi++) {
-    const path = queueX[qi] ?? "";
-    const f = byPath.get(path);
+  const walk = (): void => {
+    for (; qi < queueX.length; qi++) {
+      const path = queueX[qi] ?? "";
+      const f = byPath.get(path);
 
-    if (!f || seenX.has(path)) continue;
-    seenX.add(path);
-    takeExtra(f);
+      if (!f || seenX.has(path)) continue;
+      seenX.add(path);
+      takeExtra(f);
 
-    if (!held.has(path) && !extra.has(path)) continue;
+      if (!held.has(path) && !extra.has(path)) continue;
 
-    for (const spec of [...(imports.get(path) ?? []), ...(shellRuns.get(path) ?? [])]) {
-      charge("score", 1);
+      for (const spec of [...(imports.get(path) ?? []), ...(shellRuns.get(path) ?? [])]) {
+        charge("score", 1);
 
-      // beside the file, or from the package's folder, where npm runs a script's commands (as `analyze` resolves them)
-      for (const target of candidatesOf(byPath, path, spec)) if (!seenX.has(target.path)) queueX.push(target.path);
+        // beside the file, or from the package's folder, where npm runs a script's commands (as `analyze` resolves them)
+        for (const target of candidatesOf(byPath, path, spec)) if (!seenX.has(target.path)) queueX.push(target.path);
+      }
     }
-  }
+  };
+
+  walk();
+  invoked = all;
+
+  for (const p of all) if (!baseline.has(p)) queueX.push(p);
+  walk();
 
   return { production: held, extra };
 }
@@ -1804,9 +1826,15 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
+
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
-  const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
-  const hookCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands.map((c) => ({ text: c.text, kind: h.kind })));
+  // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
+  const hookCommands = hooks
+    .filter((h) => h.kind !== "publish")
+    .flatMap((h) => h.commands.map((c) => ({ ...c, kind: h.kind })))
+    .toSorted((a, b) => Number(a.added) - Number(b.added));
+
+  const installCommands = hookCommands;
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");
@@ -1856,14 +1884,22 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // what install hooks run as the second layer reads them (scriptTargets): production's roots are production's
   const installTargetsX = new Set<string>();
   const first: string[] = [];
+  // what install hooks run that only the shell reading reaches (HookCommand.added): the extra layer's, after production's
+  // whole walk
+  const later = new Set<string>();
 
   for (const c of installCommands) {
     for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, w);
 
       if (f && f.path !== "package.json") {
-        installTargets.add(f.path);
-        first.push(f.path);
+        if (c.added) {
+          later.add(f.path);
+          installTargetsX.add(f.path);
+        } else {
+          installTargets.add(f.path);
+          first.push(f.path);
+        }
       }
     }
 
@@ -2448,7 +2484,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     return read.imports;
   };
 
-  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld, invoked: new Set(), viewed: viewedWhole, viewImports });
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands: installCommands.filter((c) => !c.added), gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld, invoked: new Set(), viewed: viewedWhole, viewImports });
   // production's facts before its flows across files add theirs: the extra layer's assessment works those out again
   const productionFacts = new Map([...fileFacts].map(([path, list]) => [path, [...list]]));
 
@@ -2501,6 +2537,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
   for (const sh of laterShell) walkShell(sh.f, new TextDecoder().decode(sh.f.data), sh.reached);
 
+  const readExtra = (): void => {
   // until nothing more is read: what a script or a command runs that production's walk read no text of (a native name,
   // an ELF file, data), read as source; what that reaches; and a file production's walk read as plain text, or through
   // a binary's plain view, that some file loads, read again as code (round 6 review of fbc6738: index.js -> lib/first
@@ -2547,11 +2584,29 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
       more = true;
     }
   }
+  };
+
+  const scoringUnits = (): number => [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0);
+
+  readExtra();
+  const baselineUnits = scoringUnits();
+
+  // what install hooks run that only the shell reading reaches (HookCommand.added), after the whole extra layer and on a
+  // meter of its own, with the scoring of what it adds: running it out stops only this reading, never one before it
+  try {
+    withMeter(new Meter(MAX_ADDED_TARGET_WORK), () => {
+      for (const p of later) if (!seen.has(p)) reach(p);
+      readExtra();
+      charge("score", scoringUnits() - baselineUnits);
+    });
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+  }
 
   layer = "production";
 
   // scoring weighs every fact of every file, every edge between files and every piece of evidence
-  charge("score", [...fileFacts.values()].reduce((n, l) => n + l.length * 8, 0) + [...edges.values()].reduce((n, s) => n + s.size * 4, 0));
+  charge("score", baselineUnits);
 
   const assessInput = {
     edges,
