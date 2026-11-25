@@ -1661,6 +1661,25 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
 
   if (before === null || before.kind !== "read") return refuse(`apm remove needs a lockfile it can read (${before === null ? `there is no ${t.lockfile}` : before.kind === "unreadable" ? before.reason : t.lockfile}), so ${pm} installs nothing apm has not checked`);
   const had = new Set(before.nodes.map(artifactOf));
+
+  // npm builds a git dependency, running its prepare script, while it computes a lockfile, so for npm the lockfile must
+  // already hold registry packages only and pin every direct dependency, leaving npm nothing new to resolve in the copy
+  if (pm === "npm") {
+    const local = before.nodes.find((n) => n.origin.kind !== "registry" && n.origin.kind !== "workspace");
+
+    if (local !== undefined) return refuse(`${t.lockfile} has ${idOf(local)} from ${local.resolved ?? local.origin.kind}, not a registry, and npm would build it while it computes the removal`);
+    const direct = specs.filter((d) => d.file === join(layout.root, t.manifest));
+    const pins = projectPins({ cwd: join(layout.root, layout.member), pm, names: direct.map((d) => d.name) });
+
+    const unpinned = direct.find((d) => {
+      const pin = pins.get(d.name);
+
+      return pin === undefined || (pin.kind === "pinned" && isValidRange(d.spec) && !Bun.semver.satisfies(pin.version, d.spec));
+    });
+
+    if (unpinned !== undefined) return refuse(`package.json lists ${unpinned.name}@${unpinned.spec}, which ${t.lockfile} does not pin, so npm would resolve it while it computes the removal. Run apm add ${unpinned.name} first`);
+  }
+
   const copy = copyProject(layout);
   let empty: boolean;
   let planned: Set<string>;
