@@ -22,7 +22,7 @@ import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
-import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
+import { argsError, bareInstallArgs, commandOf, helpTopic, updateArgs } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2326,6 +2326,19 @@ async function bareInstall(a: Args): Promise<number> {
   return 2;
 }
 
+/** `apm update`, `up` and `upgrade`: the package manager's own, naming only the project's dependencies. */
+async function update(a: Args): Promise<number> {
+  const cwd = process.cwd();
+  const det = pmFor(a, cwd);
+  const passed = updateArgs(a, det.pm, new Set(projectNames(cwd)));
+
+  if ("args" in passed) return (await runCmd([det.pm, a.cmd, ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  fail(`apm: ${passed.error}. Nothing was run.`);
+  say(`For other ${det.pm} ${a.cmd} options, run ${det.pm} ${a.cmd} yourself.`);
+
+  return 2;
+}
+
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
   if (a.cmd === "help") return helpTopic(a.positional[0] ?? "")?.help ?? HELP;
@@ -2378,6 +2391,10 @@ async function main(a: Args): Promise<number> {
     case "install":
     case "i":
       return a.positional.length > 0 ? cmdAdd(a) : bareInstall(a);
+    case "update":
+    case "up":
+    case "upgrade":
+      return update(a);
     case "x": // also `apm exec` and `apm dlx` (args.ts)
       return cmdX(a);
     case "score":

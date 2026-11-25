@@ -31,7 +31,7 @@ afterAll(() => {
 
 type Run = { code: number; out: string; err: string; pmCalls: string[]; files: string[]; packageJson: string };
 
-async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
+async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_JSON): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), "apm-help-"));
   const cwd = join(root, "pkg");
   const bin = join(root, "bin");
@@ -39,7 +39,7 @@ async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
 
   mkdirSync(cwd);
   mkdirSync(bin);
-  writeFileSync(join(cwd, "package.json"), PACKAGE_JSON);
+  writeFileSync(join(cwd, "package.json"), packageJson);
   writeFileSync(join(cwd, "index.js"), "module.exports = 1;\n");
 
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
@@ -379,6 +379,43 @@ describe("what still goes to the package manager", () => {
     expect(r.code, r.out + r.err).toBe(2);
     expect(r.err).toContain("yarn 1.22.22 ignores --immutable and may rewrite yarn.lock; use --frozen-lockfile");
     expectNothingRan(r);
+  });
+
+  const WITH_ZOD = `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies: { zod: "^4.0.0" }, devDependencies: { "@types/node": "^24.0.0" } })}\n`;
+
+  test.each([
+    [["update", "left-pad"], "left-pad is not one of them: to check and add a package or a version, run apm add left-pad"],
+    [["update", "--tag", "left-pad"], "apm update does not pass --tag on to bun"],
+    [["up", "--cooldown", "left-pad"], "apm up does not pass --cooldown on to bun"],
+    [["upgrade", "--", "left-pad"], "apm upgrade does not pass -- on to bun"],
+    [["update", "zod@4"], "zod@4 is not one of them"],
+    [["update", "zod@npm:left-pad"], "zod@npm:left-pad is not one of them"],
+    [["update", "--pm", "npm", "--tag", "next"], "apm update does not pass --tag on to npm"],
+    [["update", "--pm", "npm", "-g"], "apm update does not pass -g on to npm"],
+    [["update", "--pm", "pnpm", "--latest=false"], "apm update does not pass --latest=false on to pnpm"],
+    [["update", "--pm", "", "--pm", "npm"], "--pm needs a value"],
+    [["update", "./left-pad"], "./left-pad is not one of them"],
+  ])("apm %p is refused: %s", async (argv, message) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(message);
+    expect(r.pmCalls).toEqual([]);
+    expect(r.packageJson).toBe(WITH_ZOD);
+  });
+
+  test.each([
+    [["update"], "bun update"],
+    [["update", "--latest"], "bun update --latest"],
+    [["update", "zod", "@types/node"], "bun update zod @types/node"],
+    [["up", "--pm", "pnpm", "-L", "-r", "zod"], "pnpm up -L -r zod"],
+    [["upgrade", "--pm=yarn", "--latest", "zod"], "yarn upgrade --latest zod"],
+    [["update", "--pm", "npm", "--save", "zod"], "npm update --save zod"],
+  ])("apm %p is the package manager's update of the project's own dependencies", async (argv, call) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
   });
 
   test("apm run dev --help is the package manager's", async () => {
