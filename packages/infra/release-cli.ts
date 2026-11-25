@@ -167,11 +167,13 @@ function startBrewUpdate(released: CliVersion): string {
   const manual = `gh workflow run update-apm.yml --repo ${BREW_TAP} -f version=${released}`;
 
   try {
-    const run = Bun.spawnSync(["gh", "workflow", "run", "update-apm.yml", "--repo", BREW_TAP, "-f", `version=${released}`], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+    const run = Bun.spawnSync(["gh", "workflow", "run", "update-apm.yml", "--repo", BREW_TAP, "-f", `version=${released}`], { stdout: "pipe", stderr: "pipe", timeout: 30_000, killSignal: "SIGKILL" });
 
     if (run.exitCode === 0) return `Homebrew: started the ${BREW_TAP} update for ${released} (https://github.com/${BREW_TAP}/actions)`;
 
-    return `Homebrew: could not start the tap update (${run.stderr.toString().trim() || `gh exited ${run.exitCode}`}); run: ${manual}`;
+    const why = run.exitCode === null ? "gh did not finish within 30 s and was stopped" : run.stderr.toString().trim() || `gh exited ${run.exitCode}`;
+
+    return `Homebrew: could not start the tap update (${why}); run: ${manual}`;
   } catch (error) {
     return `Homebrew: could not run gh (${error instanceof Error ? error.message : String(error)}), so the tap was not updated; run: ${manual}`;
   }
