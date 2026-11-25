@@ -356,7 +356,6 @@ describe("an install script's `npm run` is followed through quoted, escaped and 
     'npm run ""payload',
     "npm --prefix . run payload",
     "npm run --prefix . payload",
-    "npm run -w pkg payload",
     "npm --loglevel warn run payload",
     "yarn '--silent' payload",
     "pnpm run '-s' payload",
@@ -703,12 +702,30 @@ describe("npm's boolean and directory flags in the shell reading", () => {
   test("a boolean flag takes no value, so --ignore-scripts holds and the word after the name is an argument", () => {
     expect(ids({ postinstall: "npm run '--ignore-scripts' '--color' check", check: "echo check", precheck: DROPPER })).not.toContain("install-download");
     expect(ids({ postinstall: "npm run '--no-color' check report", check: "echo check", report: DROPPER })).not.toContain("install-download");
-    expect(ids({ postinstall: "npm run '--color' true check", check: DROPPER })).toContain("install-download");
+    expect(ids({ postinstall: "npm run '--color' check", check: DROPPER })).toContain("install-download");
   });
 
   test("--prefix to another directory runs that package's scripts, and to the package's own runs these", () => {
     for (const postinstall of ["npm '--prefix' tools run check", "npm '--prefix=tools' run check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
 
     expect(ids({ postinstall: "npm '--prefix' . run check", check: DROPPER })).toContain("install-download");
+  });
+});
+
+describe("the shell reading follows only what it can tell npm runs", () => {
+  const ids = (scripts: Record<string, string>, extra = {}) => scoreOf({ ...extra, scripts }, {}).ids;
+
+  test("a true or false after a flag, or a value after an option the tables do not list, may be the name: nothing is followed", () => {
+    expect(ids({ postinstall: "npm run '-s' true check", true: "echo", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm --loglevel warn run '--fetch-retries' 0 check", 0: DROPPER, check: "echo" })).not.toContain("install-download");
+  });
+
+  test("a workspace, or a --prefix after the name, runs another package's scripts", () => {
+    expect(ids({ postinstall: "npm '--workspace' tools run check", check: DROPPER }, { workspaces: ["tools"] })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm run --loglevel warn check '--prefix' tools", check: DROPPER })).not.toContain("install-download");
+  });
+
+  test("a --prefix of the package's own directory after the name, or one handed to the script, still runs these", () => {
+    for (const postinstall of ["npm run '-s' check '--prefix' .", "npm run '-s' check -- --prefix tools"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
   });
 });

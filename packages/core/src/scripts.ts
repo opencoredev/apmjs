@@ -79,6 +79,12 @@ function npmBoolean(w: string): boolean {
 // the package.json there, not these
 const NPM_PREFIX_FLAGS = new Set(["--prefix", "-C"]);
 
+// npm's flags that run the scripts of the workspaces instead of the root package's
+const NPM_WORKSPACE_FLAGS = new Set(["--workspace", "-w", "--workspaces", "-ws", "--include-workspace-root"]);
+
+// a --prefix that names the package's own directory
+const OWN_DIRECTORY = /^\.\/?$/;
+
 // npm's flags that take the next word as their value when it is not itself a flag
 const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", "-w", "--registry", "--userconfig", "--globalconfig", "--cache", "--script-shell", "--tag", "--otp", "--scope", "--node-options"]);
 
@@ -244,7 +250,8 @@ function setsIgnoreScripts(ws: readonly string[]): boolean {
     const w = ws[i] ?? "";
 
     if (ENABLES.has(w) || npmBoolean(w) || w === "run" || w === "run-script" || w === "--") {
-      if (npmBoolean(w) && /^(?:true|false)$/.test(ws[i + 1] ?? "")) i++;
+      // nopt takes a `true` or `false` after a long flag as its value but not after a shorthand, so it may be the name
+      if (npmBoolean(w) && /^(?:true|false)$/.test(ws[i + 1] ?? "")) return false;
       continue;
     }
 
@@ -443,9 +450,14 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
 interface RunState {
   open: { name: string; end: number; alone: boolean }[];
   pm: string | null;
+  /** The manager this simple command runs, kept after the name is read. */
+  mgr: string | null;
   pmEnd: number;
   phase: "manager" | "run" | "named";
-  after: "no" | "maybe" | "value" | "bool";
+  /** The next word is the last option's value (`value`), or its value only when it is true or false (`bool`). */
+  after: "no" | "value" | "bool";
+  /** The pending value is a --prefix's, so it says whose scripts npm runs. */
+  pendingPrefix: boolean;
   before: string[];
   atStart: boolean;
   wrapper: string | null;
@@ -456,26 +468,42 @@ interface RunState {
   /** A script was named, and a `--` after it hands the rest to the script, so npm reads none of it. */
   named: boolean;
   passed: boolean;
+  /** npm runs another package's scripts (a workspace or another --prefix), so none of these is run. */
+  dropped: boolean;
   /** The next word is the value of a wrapper's option. */
   wrapValue: boolean;
 }
 
+/** Whether an npm option runs another package's scripts: `now`, or `next` when its value is the next word. */
+function npmRedirect(w: string): "now" | "next" | null {
+  const key = w.split("=")[0] ?? w;
+
+  if (NPM_WORKSPACE_FLAGS.has(key)) return "now";
+
+  if (!NPM_PREFIX_FLAGS.has(key)) return null;
+
+  if (!w.includes("=")) return "next";
+
+  return OWN_DIRECTORY.test(w.slice(key.length + 1)) ? null : "now";
+}
+
 /**
  * Scripts a command runs through a package manager, read from the words the shell hands it, so quoted and escaped flags
- * and names and flags that take the next word as their value (`npm --prefix . run x`, `npm run -w pkg x`) do not hide
- * the run. A manager is read only where the shell runs a command: first in a simple command, after variable assignments
- * and wrappers that run the rest (`env`, `xargs`); a manager's name anywhere else is an argument. Where a word after a
- * flag may be its value or the name, both readings are followed: following a script npm does not run can only make the
- * reading stricter. `alone`: npm runs it without its pre and post scripts (setsIgnoreScripts), with nothing after the
- * name that may unset the flag, no xargs before it and no expansion in the command. `end` is where the manager's word ends.
+ * and names, and flags that take the next word as their value (`npm --prefix . run x`), do not hide the run. A manager
+ * is read only where the shell runs a command: first in a simple command, after variable assignments and wrappers that
+ * run the rest (`env`, `xargs`); a manager's name anywhere else is an argument. The reading follows only what it can
+ * tell npm runs: an option it does not know, a value that may be the name, or an option that runs another package's
+ * scripts ends it for that invocation, leaving it to the first two readings. `alone`: npm runs it without its pre and
+ * post scripts (setsIgnoreScripts), with nothing after the name that may unset the flag, no xargs before it and no
+ * expansion in the command. `end` is where the manager's word ends.
  */
 function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end: number; alone: boolean }[] {
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
   // the simple command being read; `open` holds its references, settled where it ends (a doubt after the name unsets
-  // `alone`), and `after` whether the word after a flag is its value (`value`), may be (`maybe`) or is not
-  const fresh = (): RunState => ({ open: [], pm: null, pmEnd: 0, phase: "manager", after: "no", before: [], atStart: true, wrapper: null, fromInput: false, bare: false, expands: false, named: false, passed: false, wrapValue: false });
+  // `alone`)
+  const fresh = (): RunState => ({ open: [], pm: null, mgr: null, pmEnd: 0, phase: "manager", after: "no", pendingPrefix: false, before: [], atStart: true, wrapper: null, fromInput: false, bare: false, expands: false, named: false, passed: false, dropped: false, wrapValue: false });
 
   let s = fresh();
   // the commands a substitution interrupts, read on where it closes
@@ -484,12 +512,16 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   const takesName = (): boolean => s.pm !== null && (s.phase !== "manager" || s.pm === "yarn" || s.pm === "pnpm");
 
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w)) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !s.expands && !s.fromInput && setsIgnoreScripts(s.before) });
+    if (Object.hasOwn(scripts, w) && !s.dropped) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !s.expands && !s.fromInput && setsIgnoreScripts(s.before) });
 
     s.named ||= Object.hasOwn(scripts, w);
+    s.pm = null;
+  };
 
-    if (s.after === "maybe") s.after = "no";
-    else s.pm = null;
+  const drop = (): void => {
+    s.open = [];
+    s.dropped = true;
+    s.pm = null;
   };
 
   const doubt = (): void => {
@@ -531,12 +563,26 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       const base = w.slice(w.lastIndexOf("/") + 1);
       const options = s.wrapper === null ? undefined : WRAPPER_OPTIONS.get(s.wrapper);
 
+      // npm's options after the name are still its own, and one may run another package's scripts
+      if (s.mgr === "npm" && s.named && !s.passed) {
+        if (s.pendingPrefix) {
+          s.pendingPrefix = false;
+
+          if (!OWN_DIRECTORY.test(w)) drop();
+        } else {
+          const r = npmRedirect(w);
+
+          if (r === "now") drop();
+          else s.pendingPrefix = r === "next";
+        }
+      }
+
       if (!s.atStart) continue;
 
       if (s.wrapValue) {
         s.wrapValue = false;
       } else if (PACKAGE_MANAGERS.has(w)) {
-        Object.assign(s, { pm: w, pmEnd: t.end, phase: "manager", after: "no", before: [], atStart: false });
+        Object.assign(s, { pm: w, mgr: w, pmEnd: t.end, phase: "manager", after: "no", before: [], atStart: false });
       } else if (s.wrapper !== null && w.startsWith("-") && w !== "--") {
         const key = w.split("=")[0] ?? w;
 
@@ -552,6 +598,15 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
     if (s.phase === "named") {
       name(w);
+    } else if (s.after === "value") {
+      // a flag where the value goes may be taken as the value or as a flag of its own
+      if (w.startsWith("-")) s.pm = null;
+      else if (s.pendingPrefix && !OWN_DIRECTORY.test(w)) drop();
+      s.pendingPrefix = false;
+      s.after = "no";
+      s.before.push(w);
+    } else if (s.after === "bool" && /^(?:true|false)$/.test(w)) {
+      // nopt takes it as a long flag's value but not as a shorthand's, so it may be the name
       s.pm = null;
     } else if (w === "--") {
       s.after = "no";
@@ -559,24 +614,23 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
       if (s.phase === "run" || s.pm === "yarn" || s.pm === "pnpm") s.phase = "named";
     } else if (w.length > 1 && w.startsWith("-")) {
-      s.after = w.includes("=") || ENABLES.has(w) ? "no" : npmBoolean(w) ? (s.pm === "npm" ? "bool" : "no") : s.pm === "npm" && NPM_VALUE_FLAGS.has(w) ? "value" : "maybe";
+      const r = s.pm === "npm" ? npmRedirect(w) : null;
+
       s.before.push(w);
 
-      if (s.pm === "npm" && NPM_PREFIX_FLAGS.has(w.split("=")[0] ?? w) && w.includes("=") && !/^-[\w-]+=\.\/?$/.test(w)) s.pm = null;
-    } else if (s.after === "value" || (s.after === "bool" && /^(?:true|false)$/.test(w))) {
-      // another directory's package runs its own scripts
-      if (s.after === "value" && NPM_PREFIX_FLAGS.has(s.before.at(-1) ?? "") && !/^\.\/?$/.test(w)) s.pm = null;
-      s.after = "no";
-      s.before.push(w);
+      if (r === "now") drop();
+      else if (r === "next") Object.assign(s, { after: "value", pendingPrefix: true });
+      else if (w.includes("=") || ENABLES.has(w)) s.after = "no";
+      else if (npmBoolean(w)) s.after = s.pm === "npm" ? "bool" : "no";
+      else if (s.pm === "npm" && NPM_VALUE_FLAGS.has(w)) s.after = "value";
+      // an option the tables do not list may take the next word as its value
+      else s.pm = null;
     } else if (s.phase === "manager" && (w === "run" || (s.pm === "npm" && w === "run-script"))) {
       s.phase = "run";
       s.after = "no";
       s.before.push(w);
     } else if (takesName() || (s.pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
       name(w);
-      s.before.push(w);
-    } else if (s.after === "maybe") {
-      s.after = "no";
       s.before.push(w);
     } else {
       s.pm = null;
