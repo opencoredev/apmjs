@@ -31,7 +31,7 @@ afterAll(() => {
 
 type Run = { code: number; out: string; err: string; pmCalls: string[]; files: string[]; packageJson: string };
 
-async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
+async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_JSON, files: Record<string, string> = {}): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), "apm-help-"));
   const cwd = join(root, "pkg");
   const bin = join(root, "bin");
@@ -39,11 +39,13 @@ async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
 
   mkdirSync(cwd);
   mkdirSync(bin);
-  writeFileSync(join(cwd, "package.json"), PACKAGE_JSON);
+  writeFileSync(join(cwd, "package.json"), packageJson);
   writeFileSync(join(cwd, "index.js"), "module.exports = 1;\n");
 
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(cwd, name), text);
+
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
-    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : "";
+    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : pm === "bun" ? `[ "$1" = --version ] && echo 1.4.4 && exit 0\n` : "";
 
     writeFileSync(join(bin, pm), `#!/bin/sh\n${version}echo "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
     chmodSync(join(bin, pm), 0o755);
@@ -256,10 +258,12 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["bun install --frozen-lockfile"]);
   });
 
-  test("apm constructor --help is the package manager's, not a crash", async () => {
+  test("apm constructor --help is refused like any command apm does not pass on, not a crash", async () => {
     const r = await apm(["constructor", "--help"]);
 
-    expect(r.pmCalls).toEqual(["bun constructor --help"]);
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("apm does not pass constructor on to bun");
+    expect(r.pmCalls).toEqual([]);
   });
 
   test("apm's --pm is read only before --; after it, it is the package manager's", async () => {
@@ -381,9 +385,223 @@ describe("what still goes to the package manager", () => {
     expectNothingRan(r);
   });
 
+  const WITH_ZOD = `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies: { zod: "^4.0.0" }, devDependencies: { "@types/node": "^24.0.0" } })}\n`;
+
+  test.each([
+    [["update"]],
+    [["update", "--latest"]],
+    [["update", "zod"]],
+    [["update", "left-pad"]],
+    [["update", "--tag", "left-pad"]],
+    [["up", "--cooldown", "left-pad"]],
+    [["upgrade", "--", "left-pad"]],
+    [["upgrade", "--pm", "bun", "--help"]],
+    [["up", "--pm", "pnpm", "-L", "-r", "zod"]],
+    [["upgrade", "--pm=yarn", "--latest", "zod"]],
+    [["update", "--pm", "npm", "--save", "zod"]],
+  ])("apm %p is refused: an update fetches versions apm cannot check", async (argv) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("would fetch new versions apm cannot check. Nothing was run.");
+    expect(r.out + r.err).toContain("apm add <package>@latest");
+    expect(r.pmCalls).toEqual([]);
+    expect(r.packageJson).toBe(WITH_ZOD);
+  });
+
+  test.each([[["udpate"]], [["upd"]], [["upgr"]], [["UPDATE"]], [["Up", "zod"]]])("apm %p is refused as an update", async (argv) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("would fetch new versions apm cannot check. Nothing was run.");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm upgrade with yarn names both of yarn's own update commands", async () => {
+    const r = await apm(["upgrade", "--pm", "yarn"], "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.out + r.err).toContain("yarn upgrade (yarn 1) or yarn up (yarn 2 and later)");
+  });
+
+  test.each([[["ADD", "zod"]], [["Install", "zod"]], [["CI"]], [["Remove", "zod"]], [["LINK", "left-pad"]], [["EXEC", "cowsay"]], [["u", "zod"]], [["upgrade-interactive"]], [["recursive", "update"]], [["link", "left-pad"]], [["rebuild"]], [["create", "vite"]], [["init", "vite"]]])("apm %p is refused: apm passes on only commands that cannot install an unchecked package", async (argv) => {
+    const r = await apm(argv, "4.5.0", WITH_ZOD);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(`apm does not pass ${argv[0]} on to bun: it could install packages apm cannot check`);
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([
+    [["ci", "--pm", "npm", "left-pad"], "apm ci with no packages does not pass left-pad on to npm"],
+    [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
+    [["ci", "--pm", "yarn"], "yarn has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
+    [["ci"], "bun has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
+    [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
+    [["run", "-i", "build.ts"], "apm does not pass bun's -i on"],
+    [["run", "--install=force", "build.ts"], "apm does not pass bun's --install=force on"],
+    [["run", "--bun", "dev"], "apm does not pass bun's --bun on"],
+    [["run", "--silent", "--bun", "dev"], "apm does not pass bun's --bun on"],
+    [["test", "--install=force"], "apm does not pass bun's --install=force on"],
+    [["start"], "apm does not pass start on to bun"],
+    [["ls"], "apm does not pass ls on to bun"],
+    [["why", "zod"], "apm does not pass why on to bun"],
+    [["/abs/dev"], "apm does not pass /abs/dev on to bun"],
+    [["rm", "--pm", "yarn", "zod"], "apm does not pass rm on to yarn"],
+    [["ls", "--pm", "yarn"], "apm does not pass ls on to yarn"],
+    [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove takes only the names of the packages to remove, not --no-package-lock"],
+    [["rm", "zod", "--", "--force"], "apm rm takes only the names of the packages to remove, not --force"],
+    [["index"], "apm does not pass index on to bun"],
+    [["info", "left-pad"], "apm does not pass info on to bun"],
+  ])("apm %p is refused: %s", async (argv, message) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(message);
+    expectNothingRan(r);
+  });
+
+  test.each([
+    [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
+    [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
+  ])("apm %p is the package manager's clean install", async (argv, call) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
+  });
+
+  test.each([
+    [["why", "--pm", "npm", "zod"], "npm why zod"],
+    [["outdated", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false outdated"],
+    [["dev", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false run dev"],
+    [["start", "--pm", "npm"], "npm start"],
+    [["run", "dev", "-i"], "bun run --no-install dev -i"],
+    [["run", "--silent", "dev"], "bun run --no-install --silent dev"],
+    [["run", "--help"], "bun run --no-install --help"],
+    [["test", "--watch"], "bun test --watch"],
+    [["dev", "--port", "3000"], "bun run --no-install dev --port 3000"],
+    [["run", "build.ts", "a"], "bun run --no-install build.ts a"],
+    [["run", "--pm", "npm", "dev"], "npm run dev"],
+  ])("apm %p is passed on: it installs nothing new, or it is a project script", async (argv, call) => {
+    const r = await apm(argv, "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "vite" }, dependencies: { zod: "^4.0.0" } })}\n`);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
+  });
+
+  test("apm dev is refused while a bunfig.toml runs node as bun", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nbun = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("a bunfig.toml sets run.bun");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([["[\"run\"]\nbun = true\n"], ["run = { bun = true }\n"]])("apm dev is refused while bunfig.toml %p may run node as bun", async (bunfig) => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": bunfig });
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("a bunfig.toml sets run.bun");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm dev runs under a bunfig.toml that leaves run.bun off", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nbun = false\nsilent = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev"]);
+  });
+
+  test.each([[["help", "remove"]], [["remove", "--help"]], [["rm", "-h"]]])("apm %p prints removal's help on stdout and runs nothing", async (argv) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm remove <package>...");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([[["help", "ci"]], [["ci", "--json", "--help"]]])("apm %p prints ci's help on stdout and runs nothing", async (argv) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm ci");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  const ZOD_LOCKS: [string, string, string][] = [
+    ["bun", "bun.lock", JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "help-probe", dependencies: { zod: "^4.0.0" } } }, packages: { zod: ["zod@4.1.0", "", {}, "sha512-zod"] } })],
+    ["npm", "package-lock.json", JSON.stringify({ name: "help-probe", lockfileVersion: 3, requires: true, packages: { "": { name: "help-probe", dependencies: { zod: "^4.0.0" } }, "node_modules/zod": { version: "4.1.0", resolved: "https://registry.npmjs.org/zod/-/zod-4.1.0.tgz", integrity: "sha512-zod" } } })],
+    ["pnpm", "pnpm-lock.yaml", JSON.stringify({ lockfileVersion: "9.0", importers: { ".": { dependencies: { zod: { specifier: "^4.0.0", version: "4.1.0" } } } }, packages: { "zod@4.1.0": { resolution: { integrity: "sha512-zod" } } }, snapshots: { "zod@4.1.0": {} } })],
+    ["yarn", "yarn.lock", 'zod@^4.0.0:\n  version "4.1.0"\n'],
+  ];
+
+  const withDeps = (dependencies: Record<string, string>): string => `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies })}\n`;
+
+  test.each(ZOD_LOCKS.filter(([pm]) => pm !== "yarn"))("apm remove with %s refuses when the package manager did not compute a new lockfile in the copy", async (pm, file, lock) => {
+    const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { [file]: lock });
+
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.err).toContain(`${pm} did not rewrite ${file} for the removal`);
+    expect(r.pmCalls.some((call) => call.includes(" remove ") || call.includes(" uninstall "))).toBe(false);
+  });
+
+  test.each([
+    [["remove", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no bun.lock)"],
+    [["remove", "--pm", "npm", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no package-lock.json)"],
+    [["remove", "--pm", "yarn", "zod"], withDeps({ zod: "^4.0.0" }), { "yarn.lock": ZOD_LOCKS[3]?.[2] ?? "" }, "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new"],
+    [["remove", "left-pad"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "refused: left-pad is not in package.json. Nothing was run."],
+    [["remove"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "apm remove needs the names of the packages to remove"],
+  ] as const)("apm %p is refused", async (argv, packageJson, files, message) => {
+    const r = await apm([...argv], "1.22.22", packageJson, files);
+
+    expect(r.code, r.out + r.err).not.toBe(0);
+    expect(r.err).toContain(message);
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm dev runs under a bunfig.toml whose run table leaves bun unset", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nsilent = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev"]);
+  });
+
+  test("apm remove with bun gets past a bunfig.toml whose lockfile table leaves save unset", async () => {
+    const r = await apm(["remove", "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "", "bunfig.toml": "[install.lockfile]\nprint = \"yarn\"\n" });
+
+    expect(r.err).not.toContain("install.lockfile.save");
+    expect(r.err).toContain("bun did not rewrite bun.lock for the removal");
+  });
+
+  test("apm remove with pnpm is refused when the project has a .pnpmfile.cjs", async () => {
+    const r = await apm(["remove", "--pm", "pnpm", "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { "pnpm-lock.yaml": ZOD_LOCKS[2]?.[2] ?? "", ".pnpmfile.cjs": "module.exports = {};\n" });
+
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.err).toContain("the project has a .pnpmfile.cjs");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm uninstall with yarn points to yarn remove, not yarn's own uninstall", async () => {
+    const r = await apm(["uninstall", "--pm", "yarn", "zod"]);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.out + r.err).toContain("apm cannot check a removal with yarn; run yarn remove <package> yourself.");
+    expect(r.out + r.err).not.toContain("yarn uninstall");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm ci --help prints ci's help and runs nothing", async () => {
+    const r = await apm(["ci", "--help"]);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm ci");
+    expect(r.pmCalls).toEqual([]);
+  });
+
   test("apm run dev --help is the package manager's", async () => {
     const r = await apm(["run", "dev", "--help"]);
 
-    expect(r.pmCalls).toEqual(["bun run dev --help"]);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev --help"]);
   });
 });
