@@ -244,4 +244,4 @@ Prints the user the current token belongs to, and the registry.
 | `APM_PENDING_WAIT_MS` | How long `apm add --strict` and `apm x --strict` keep asking about versions still being analysed. Default `90000`. |
 | `APM_STRICT` | `1` makes `apm add`, `apm x` and `apm explain` strict, as `--strict` does. |
 
-Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment.
+Without `APM_REGISTRY` or `npm_config_registry`, apm reads `registry=` from the nearest project `.npmrc`, then your user `.npmrc`, then uses `https://registry.apmjs.dev/`. The token is the `_authToken` line for that exact registry host; a `${VAR}` value is read from the environment. When a project `.npmrc` or `npm_config_registry` chose a registry other than the one `APM_TOKEN` belongs to, apm fills in a `${VAR}` token only from `~/.npmrc`, so a cloned repository cannot have apm send it one of your secrets. Set `APM_REGISTRY` to a registry you trust to lift this.

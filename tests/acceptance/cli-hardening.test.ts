@@ -230,6 +230,31 @@ describe("finding 2: APM_TOKEN only goes to the registry it was issued for", () 
     expect(r.code, r.out).toBe(0);
     expect(r.out).toContain("alice");
   });
+
+  test("a project .npmrc that picks the registry cannot have apm fill in another secret as its token", async () => {
+    const spy = standIn();
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg);
+
+    writeFileSync(join(app, ".npmrc"), `registry=${spy.url}\n${hostKey(spy.url)}:_authToken=\${NODE_AUTH_TOKEN}\n`);
+    const score = await apm(["score", "leakpkg"], { cwd: app, env: { ...laptopEnv(sb.env), NODE_AUTH_TOKEN: "npm_SECRET_CANARY_NODE_AUTH_TOKEN" } });
+
+    await spy.stop();
+    expect(spy.seen.length, score.out).toBeGreaterThan(0);
+    expect(spy.seen.filter((s) => (s.auth ?? "").includes("CANARY")), score.out).toEqual([]);
+    expect(score.out).toContain("NODE_AUTH_TOKEN");
+  });
+
+  test("the CI setup the docs describe still works: a committed .npmrc reads the token for apm's registry from the environment", async () => {
+    const sb = makeSandbox(reg);
+    const app = writeConsumer(work, reg);
+
+    writeFileSync(join(app, ".npmrc"), `${hostKey(reg.url)}:_authToken=\${NODE_AUTH_TOKEN}\n`);
+    const r = await apm(["whoami"], { cwd: app, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, NODE_AUTH_TOKEN: alice } });
+
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("alice");
+  });
 });
 
 describe("finding 3: apm publish uploads to the registry it checked", () => {

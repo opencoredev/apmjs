@@ -104,6 +104,8 @@ function config(cwd: string): Config {
 
   if (cfg.withheld) warn(yellow(`apm: APM_TOKEN is for ${cfg.withheld}, so it is not sent to ${cfg.registry} (set by a project .npmrc or npm_config_registry)`));
 
+  if (cfg.unexpanded) warn(yellow(`apm: ${cfg.registry} was chosen by a project .npmrc or npm_config_registry, so apm did not fill in the token ${cfg.unexpanded} asks for. Set APM_REGISTRY to that registry if you trust it.`));
+
   return cfg;
 }
 
