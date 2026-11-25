@@ -14,17 +14,17 @@ export const SECRET_CONTENT_RULES: { kind: string; re: RegExp }[] = [
   { kind: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/ },
   { kind: "OpenAI key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b/ },
   { kind: "Anthropic key", re: /\bsk-ant-[A-Za-z0-9_-]{32,}\b/ },
-  { kind: "registry auth token", re: /_authToken[ \t]*=[ \t]*[^\s$]{8,}/ },
+  { kind: "registry auth token", re: /_authToken[^\S\r\n]*=[^\S\r\n]*[^\s$]{8,}/ },
   // npm's basic auth: "//host/:_auth=base64(user:pass)" or ":_password=base64(pass)"
   // the host is matched looking back from `:_`, so each start is tried once (a forward `//[^\s:]+` from every `//` of
   // `////…` scanned to the end of the file from each)
-  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)[ \t]*=[ \t]*[^\s$]{4,}/ },
+  { kind: "registry password", re: /(?<=\/\/[^\s:]+):_(?:auth|password)[^\S\r\n]*=[^\S\r\n]*[^\s$]{4,}/ },
   { kind: "Slack webhook", re: /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_/-]{20,}/ },
   { kind: "Discord webhook", re: /https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9_-]{20,}/ },
 ];
 
 // In an .npmrc the auth keys need no registry prefix: "_auth=..." on its own line is a default credential.
-export const SECRET_NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)[ \t]*=[ \t]*[^\s$]{4,}/m }];
+export const SECRET_NPMRC_RULES: { kind: string; re: RegExp }[] = [{ kind: "registry password", re: /^[^\S\n]*_(?:auth|password)[^\S\r\n]*=[^\S\r\n]*[^\s$]{4,}/m }];
 
 // ---------- redaction ----------
 // Best effort, for the people who may read a flag's quoted lines: the package's owners and apm's reviewers. The public
@@ -49,7 +49,7 @@ const global = (re: RegExp): RegExp => new RegExp(re.source, `${re.flags.replace
  * fine, but a global scan runs that look-back from every position, which is quadratic. Masking drops the look-back and
  * masks any `:_auth=` or `:_password=` value, which is broader and linear.
  */
-const forMasking = (r: { kind: string; re: RegExp }): RegExp => (r.re.source.startsWith("(?<=") ? /:_(?:auth|password)[ \t]*=[ \t]*[^\s$]{4,}/g : global(r.re));
+const forMasking = (r: { kind: string; re: RegExp }): RegExp => (r.re.source.startsWith("(?<=") ? /:_(?:auth|password)[^\S\r\n]*=[^\S\r\n]*[^\s$]{4,}/g : global(r.re));
 
 const FORMAT_RULES: readonly Rule[] = [
   { re: KEY_BLOCK, secret: 0 },

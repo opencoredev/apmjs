@@ -23,6 +23,15 @@ describe("an .npmrc key with no value is not a secret", () => {
     expect(kinds(".npmrc", "//registry.npmjs.org/:_authToken=abcdef0123456789\n")).toEqual(["registry auth token"]);
     expect(kinds(".npmrc", "_auth = dXNlcjpwYXNz\n")).toEqual(["registry password"]);
   });
+
+  test("a form feed or vertical tab around =, which npm trims, still counts; a CRLF line end does not carry on", () => {
+    for (const ws of ["\f", "\v"]) {
+      expect(kinds(".npmrc", `//registry.npmjs.org/:_authToken${ws}=${ws}abcdef0123456789\n`)).toEqual(["registry auth token"]);
+      expect(kinds(".npmrc", `_auth${ws}=${ws}dXNlcjpwYXNz\n`)).toEqual(["registry password"]);
+    }
+
+    expect(kinds(".npmrc", "//registry.npmjs.org/:_authToken=\r\nregistry=https://registry.npmjs.org/\r\n")).toEqual([]);
+  });
 });
 
 describe("a Google API key is found whatever its last character", () => {
