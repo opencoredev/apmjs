@@ -204,26 +204,43 @@ describe("node's inline-eval flag is recognised after other flags", () => {
   }
 });
 
-describe("a script reached deep first and shallow later is read from the shallow reach", () => {
-  // `a` holds `npm run x` 7 levels of `sh -c` down, so that reach is past MAX_DEPTH; postinstall's own `npm run x` comes
-  // later and is shallow. What is read must not depend on which reach is found first
+describe("the flag-aware reading never costs a body main reads", () => {
+  // `a` holds a run of `x` 7 levels of `sh -c` down, past MAX_DEPTH; postinstall's own `npm run x` comes later and is
+  // shallow. Main's traversal runs first and whole, so a deep reach only the flag-aware reading finds cannot take `x`
   const deepRef = (ref: string) => Array.from({ length: 7 }).reduce<string>((s) => `sh -c ${JSON.stringify(s)}`, ref);
 
-  for (const { label, ref } of [{ label: "main's reading", ref: "npm run x" }, { label: "a flag-aware reading", ref: "npm run --silent x" }]) {
-    test(`the deep reach is ${label}`, () => {
-      const scripts = { postinstall: "npm run a && npm run x", a: deepRef(ref), x: DROPPER };
-      const [hook] = expandHooks({ scripts });
+  test("a deep flag-aware reach before main's shallow one", () => {
+    const scripts = { postinstall: "npm run --silent a && npm run x", a: deepRef("npm run --silent x"), x: DROPPER };
+    const [hook] = expandHooks({ scripts });
 
-      expect(hook?.commands.map((c) => c.from)).toContain("scripts.x (run by scripts.postinstall)");
-      expect(hook?.cut).toBeNull();
-      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
-    });
-  }
+    expect(hook?.commands.map((c) => c.from)).toContain("scripts.x (run by scripts.postinstall)");
+    expect(hook?.cut).toBeNull();
+    expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+  });
 
-  test("a reach past MAX_DEPTH with no shallower one is still cut", () => {
-    const [hook] = expandHooks({ scripts: { postinstall: "npm run a", a: deepRef("npm run x"), x: DROPPER } });
+  test("main's own deep reach first is main's result: the hook is cut, never read as complete", () => {
+    const [hook] = expandHooks({ scripts: { postinstall: "npm run a && npm run x", a: deepRef("npm run x"), x: DROPPER } });
 
     expect(hook?.cut).toContain("nested more than");
+  });
+
+  test("a flag-aware reach past what is left of the budget is cut, after main's commands are all read", () => {
+    // `a`, read first, reaches 200 more scripts through a run only the flag-aware reading finds; main reads `a` and the
+    // 150 scripts after it, which must all be read before that reach spends the budget
+    const main = Array.from({ length: 150 }, (_, i) => `s${i}`);
+    const extra = Array.from({ length: 200 }, (_, i) => `t${i}`);
+
+    const scripts = {
+      ...Object.fromEntries([...main, ...extra].map((n) => [n, "true"])),
+      postinstall: ["npm run a", ...main.map((n) => `npm run ${n}`)].join(" && "),
+      a: "npm run --silent big",
+      big: extra.map((n) => `npm run ${n}`).join(" && "),
+    };
+
+    const [hook] = expandHooks({ scripts });
+
+    expect(main.every((n) => hook?.commands.some((c) => c.from === `scripts.${n} (run by scripts.postinstall)`))).toBe(true);
+    expect(hook?.cut).toContain("more than 200 commands");
   });
 });
 

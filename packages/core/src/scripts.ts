@@ -137,33 +137,35 @@ function ignoreScriptsDoubt(cmd: string): number {
   return last;
 }
 
-/**
- * Scripts a command runs through the package manager, each once: first the ones main's reading finds (BARE_RUN_REF, then
- * npm-run-all), in its order, then the ones only the flag-aware reading adds. A script is run alone only when every
- * reading of it is.
- */
-function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
-  const alone = new Map<string, boolean>();
-  const add = (name: string, only: boolean): void => void alone.set(name, (alone.get(name) ?? true) && only);
-  let doubt: number | null = null;
+/** Scripts main's reading finds a command run, in its order: its regex, then npm-run-all. */
+function mainReferences(cmd: string, scripts: Scripts): string[] {
+  const out: string[] = [];
 
   for (const m of cmd.matchAll(BARE_RUN_REF)) {
     const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
 
-    if (name && Object.hasOwn(scripts, name)) add(name, false);
+    // `yarn add x` or `pnpm install` are package manager commands, not scripts
+    if (name && Object.hasOwn(scripts, name)) out.push(name);
   }
 
   for (const m of cmd.matchAll(RUN_ALL)) {
     for (const pattern of (m[1] ?? "").trim().split(/\s+/)) {
-      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) add(name, false);
+      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push(name);
     }
   }
+
+  return out;
+}
+
+/** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
+function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
+  const out: ScriptRef[] = [];
+  let doubt: number | null = null;
 
   for (const m of cmd.matchAll(RUN_REF)) {
     const npm = m[1] ?? m[2];
     const name = npm ?? m[3] ?? m[4] ?? m[5];
 
-    // `yarn add x` or `pnpm install` are package manager commands, not scripts
     if (!name || !Object.hasOwn(scripts, name)) continue;
 
     // npm's flags before the name set ignore-scripts, and nothing from there on may unset it; the doubt is found once per
@@ -171,13 +173,20 @@ function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
     const [nameAt] = m.indices?.[m[1] === undefined ? 2 : 1] ?? [m.index];
     const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
 
-    add(name, sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index);
+    out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
   }
 
-  return [...alone].map(([name, only]) => ({ name, alone: only }));
+  return out;
 }
 
-/** Every lifecycle hook in the manifest with the commands it reaches. */
+/**
+ * Every lifecycle hook in the manifest with the commands it reaches, read in two passes so main's coverage holds by
+ * construction. The first is main's traversal exactly: main's references only, with every pre and post script, its depth
+ * rule and its MAX_COMMANDS budget, so it reads the commands main reads and is cut where main is. The second goes back
+ * over each command the first read, at the depth it read it, and follows only what the flag-aware reading adds there,
+ * and everything that reaches, with the budget left. It reads no script the first did, so it pushes no command twice, and
+ * a script npm runs alone (`npm run --ignore-scripts x`) loses only pre and post scripts the first never read.
+ */
 export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
   const scripts = scriptsOf(manifest);
   const out: ExpandedHook[] = [];
@@ -187,57 +196,59 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
     if (own === undefined) continue;
     const commands: HookCommand[] = [];
-    // the shallowest depth each script was expanded at: one reached again shallower is expanded again, so what is read
-    // does not depend on the order references are found (a script first reached near MAX_DEPTH is read whole when a
-    // shorter path reaches it later). Depths only fall, so a script is expanded at most MAX_DEPTH + 1 times
-    const depthOf = new Map<string, number>([[hook, 0]]);
-    const pushed = new Set<string>();
-    // each cut with the scripts it was found under and their depths then: one under a script since expanded shallower
-    // was read again from there, so it stands only while every one of those depths does
-    const cuts: { why: string; under: readonly (readonly [string, number])[] }[] = [];
+    const followed = new Set<string>([hook]);
+    // what the first pass read, for the second to read the flag-aware references in
+    const read: { text: string; depth: number }[] = [];
+    let cut: string | null = null;
 
-    const visit = (text: string, from: string, depth: number, viaEval: boolean, under: readonly (readonly [string, number])[], again: boolean): void => {
+    const follow = (refs: readonly ScriptRef[], depth: number, first: boolean): void => {
+      for (const { name, alone } of refs) {
+        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
+          const body = scripts[n];
+
+          if (body === undefined || followed.has(n)) continue;
+          followed.add(n);
+          visit(body, `scripts.${n} (run by scripts.${hook})`, depth + 1, false, first);
+        }
+      }
+    };
+
+    const visit = (text: string, from: string, depth: number, viaEval: boolean, first: boolean): void => {
       if (depth > MAX_DEPTH) {
-        cuts.push({ why: `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`, under });
+        cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
+
+        return;
+      }
+
+      if (commands.length >= MAX_COMMANDS) {
+        cut ??= `${from}: more than ${MAX_COMMANDS} commands`;
 
         return;
       }
 
       const evals = viaEval || inlineEval(text);
-      const key = `${evals ? "e" : "-"}${from}\0${text}`;
+      commands.push({ from, text, viaEval: evals });
 
-      // a script expanded again pushes no command it already pushed, so the budget counts each once
-      if (!again || !pushed.has(key)) {
-        if (commands.length >= MAX_COMMANDS) {
-          cuts.push({ why: `${from}: more than ${MAX_COMMANDS} commands`, under: [] });
+      if (first) read.push({ text, depth });
 
-          return;
-        }
+      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, first);
 
-        pushed.add(key);
-        commands.push({ from, text, viaEval: evals });
-      }
+      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals, first);
 
-      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, under, again);
+      const main = mainReferences(text, scripts).map((name) => ({ name, alone: false }));
 
-      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals, under, again);
-
-      for (const { name, alone } of referencedScripts(text, scripts)) {
-        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
-          const body = scripts[n];
-          const at = depthOf.get(n);
-
-          if (body === undefined || (at !== undefined && at <= depth + 1)) continue;
-          depthOf.set(n, depth + 1);
-          visit(body, `scripts.${n} (run by scripts.${hook})`, depth + 1, false, [...under, [n, depth + 1]], again || at !== undefined);
-        }
-      }
+      follow(first ? main : [...main, ...flagReferences(text, scripts)], depth, first);
     };
 
-    visit(own, `scripts.${hook}`, 0, false, [], false);
-    const cut = cuts.find((c) => c.under.every(([n, d]) => depthOf.get(n) === d))?.why ?? null;
+    visit(own, `scripts.${hook}`, 0, false, true);
 
-    out.push({ hook, kind, commands, scripts: [...depthOf.keys()], cut });
+    for (const { text, depth } of read) {
+      const main = new Set(mainReferences(text, scripts));
+
+      follow(flagReferences(text, scripts).filter((r) => !main.has(r.name)), depth, false);
+    }
+
+    out.push({ hook, kind, commands, scripts: [...followed], cut });
   }
 
   return out;
