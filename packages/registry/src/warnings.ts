@@ -76,9 +76,9 @@ export const UNAVAILABLE_TEXT = "could not be checked: registry or upstream unav
 /** At most this many reasons per warning. */
 export const MAX_REASONS = 3;
 
-/** The website's page for a version. */
+/** The website's page for a version. A name ending in ".md" gets its dot escaped, or the site would serve another name's Markdown view. */
 export function versionUrl(webUrl: string, name: string, version: string): string {
-  return `${webUrl}package/${name}/v/${encodeURIComponent(version)}`;
+  return `${webUrl}package/${name.replace(/\.md$/, "%2Emd")}?v=${encodeURIComponent(version)}`;
 }
 
 /** The heaviest signals that cost points, each as its label and its first piece of evidence (`file:line: …`). */

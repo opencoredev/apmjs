@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { RecoveryCodes } from "@/app/account/account-view";
-import { StagedReview } from "@/app/approve/[id]/approve-view";
+import { DecisionScreen, StagedReview } from "@/app/approve/[id]/approve-view";
 import { Account, AuthConfig, StagedDetail } from "./account";
 
 const account = Account.parse({
@@ -90,6 +90,29 @@ describe("the approval page", () => {
 
     expect(html).toContain("Risk summary");
     expect(html).not.toContain('id="approve-heading"');
+  });
+});
+
+describe("after an approval", () => {
+  const screen = (live: Parameters<typeof DecisionScreen>[0]) => renderToStaticMarkup(<DecisionScreen {...live} />);
+
+  test("a version latest now names installs bare", () => {
+    expect(screen({ name: "@alice/widget", version: "1.2.3", status: "approved", live: { kind: "latest" } })).toContain("It installs with bun, npm and pnpm now.");
+  });
+
+  test("a version the registry tagged next names the tag", () => {
+    const html = screen({ name: "@alice/widget", version: "2.0.0-beta.1", status: "approved", live: { kind: "tagged", tag: "next" } });
+
+    expect(html).toContain("apm add @alice/widget@next");
+    expect(html).not.toContain("installs with bun, npm and pnpm now");
+  });
+
+  test("a backport, or a registry that does not say the tag, pins the version", () => {
+    const html = screen({ name: "@alice/widget", version: "1.0.5", status: "approved", live: { kind: "pinned" } });
+
+    expect(html).toContain("apm add @alice/widget@1.0.5");
+    expect(html).toContain("/package/@alice/widget?v=1.0.5");
+    expect(html).not.toContain("installs with bun, npm and pnpm now");
   });
 });
 

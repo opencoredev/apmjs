@@ -3,6 +3,7 @@ import { SearchHome } from "@/components/search-home";
 import { RecentActivity, RecentActivitySkeleton } from "@/components/recent-activity";
 import { PopularPackages } from "@/components/popular-packages";
 import { AgentSetup } from "@/components/agent-setup";
+import { CliInstall } from "@/components/cli-install";
 import { JsonLd } from "@/components/json-ld";
 import { pageMetadata, SITE_DESCRIPTION, SITE_TITLE, websiteJsonLd } from "@/lib/agent/seo";
 
@@ -19,6 +20,7 @@ export default function Home() {
       <SearchHome
         recent={
           <div className="flex flex-col gap-10">
+            <CliInstall />
             <PopularPackages />
             <AgentSetup />
             <Suspense fallback={<RecentActivitySkeleton />}>

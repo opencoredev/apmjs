@@ -241,7 +241,7 @@ let adminPublishToken: string;
 
 function reviewer(over: Partial<WorkerDeps> = {}): WorkerDeps {
   return {
-    registry: registryClient({ url: reg.url, token: SERVICE_TOKEN }),
+    registry: registryClient({ url: reg.url, token: SERVICE_TOKEN, log: silentLogger }),
     model: modelClient({ url: model.url, model: "fake-flash", key: () => "test-model-key", concurrency: 4, log: silentLogger, sleep: (ms) => Bun.sleep(Math.min(ms, 1000)) }),
     budget: new DailyBudget(stateDir, 10_000_000),
     log: silentLogger,

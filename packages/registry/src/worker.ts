@@ -8,6 +8,7 @@ import { Analysis, RUN_WINDOW_MS, type AnalysisJob } from "./analysis.ts";
 import { matureRevocations, refreshLatestScores, seedKeptPackages } from "./apm.ts";
 import { KeptRefresh, refreshKeptPackages, runRefresh } from "./kept-package.ts";
 import { sweepConfirmations, sweepStaged } from "./account.ts";
+import { accountEvents } from "./account-events.ts";
 import { Auth, type AuthOptions } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Blocklist, blockTruth } from "./blocklist.ts";
@@ -33,6 +34,7 @@ import { ReleaseHooks } from "./hooks.ts";
 import { considerUpstream, REVIEW_DEFAULTS, ReviewConfig, reviewLocalCommit, type ReviewSettings } from "./review.ts";
 import { Timing, type TimingApi, type TimingDetail } from "./timing.ts";
 import { Upstream } from "./upstream.ts";
+import { osvFeed } from "./osv.ts";
 
 const Method = z.instanceof(Function);
 
@@ -68,6 +70,8 @@ const WorkerEnv = z.object({
   APM_PUBLIC_URL: OptionalText,
   /** Public registry to proxy, or "off". */
   APM_UPSTREAM: OptionalText,
+  /** OSV's API root (https://api.osv.dev/): versions the OSSF malicious-packages feed lists are refused (osv.ts). Without it the feed is not read. */
+  APM_OSV_URL: OptionalText,
   /** How long an upstream answer is trusted, in milliseconds. Default 60000. */
   APM_UPSTREAM_TTL_MS: z.coerce.number().int().min(0).optional(),
   /** "upstream" lets a checked tarball request be redirected to the configured upstream (tests, the bench); default npm's own URL only. */
@@ -110,6 +114,8 @@ const WorkerEnv = z.object({
   APM_BUILD: OptionalText,
   /** Databuddy's public client id: unhandled 500s are reported to it (error-reports.ts). Production alone has one. */
   APM_DATABUDDY_CLIENT_ID: OptionalText,
+  /** Where sign-up and sign-in counts go (account-events.ts). For tests; production keeps Databuddy's own endpoint. */
+  APM_DATABUDDY_TRACK_URL: OptionalText,
   /**
    * What the install document and tarball redirect of a package only npm has check before their answer: "database"
    * (the default), one statement on every request; "edge", this isolate's read of the install block list, at most 4 s
@@ -280,14 +286,19 @@ function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
+  const withFeed = env.APM_OSV_URL === undefined ? base : Layer.provideMerge(osvFeed(withSlash(env.APM_OSV_URL), fetch, background), base);
+
   const withScoring =
     settings.upstreamUrl === null
-      ? Layer.provideMerge(Analysis.none, base)
-      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), base));
+      ? Layer.provideMerge(Analysis.none, withFeed)
+      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), withFeed));
 
   // one lease of the isolate's memory pool for the run (a request, a queue job, the sweep): every read of npm's
   // package metadata it makes takes from it, and a streamed answer keeps it until the last byte is sent
-  return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl }), withScoring), RequestMemory.layer(ISOLATE_POOL));
+  // sign-up and sign-in counts go to Databuddy after the answer, so only a request (with its waitUntil) sends them
+  const events = background === null ? null : accountEvents({ clientId: env.APM_DATABUDDY_CLIENT_ID ?? "", background, url: env.APM_DATABUDDY_TRACK_URL });
+
+  return Layer.mergeAll(Layer.provideMerge(Auth.layer({ databaseUrl, options: authOptions(env), baseURL: settings.webUrl, accountEvents: events }), withScoring), RequestMemory.layer(ISOLATE_POOL));
 }
 
 /**

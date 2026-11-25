@@ -4,7 +4,7 @@ import { z } from "zod";
 import { mcpGet, mcpOptions, mcpPost } from "./mcp-http";
 import type { Json } from "./json";
 import { PROTOCOL_VERSIONS, TOOLS } from "./mcp";
-import { fakeSource, NETWORK, pkg, REVIEW_CLEAN, type Fake } from "./testing";
+import { fakeSource, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED, type Fake } from "./testing";
 
 const allow = () => ({ ok: true }) as const;
 
@@ -201,5 +201,47 @@ describe("HTTP", () => {
     expect(pre.status).toBe(204);
     expect(pre.headers.get("access-control-allow-origin")).toBe("*");
     expect(pre.headers.get("access-control-allow-headers")).toContain("mcp-protocol-version");
+  });
+});
+
+// HOME-502 Sol review findings 6 and 9: check_package's text said "do not install" and "Network: seen" while its data
+// said active and not seen; check_name called a bare name "available" though apm publishes new packages under a scope
+describe("structured answers agree with the text", () => {
+  test("check_package: a version apm refuses carries the refusal, and capabilities match the scorer's list", async () => {
+    const p = pkg({ name: "ugent_uws", latest: "9.0.0", distTags: { latest: "9.0.0" } });
+    const base = p.score;
+
+    if (!base) throw new Error("pkg() has a score");
+    const score = { ...base, signals: [], scorer: "apm-score-v11", capabilities: [{ id: "network" as const, label: "Network: makes requests or opens sockets", status: "not-declared" as const, basis: "code" as const, evidence: ["package.json scripts.preinstall: wget"] }] };
+    const refused = { kind: "known-malicious" as const, ids: ["MAL-2026-20430"] };
+    const r = await call("check_package", { name: "ugent_uws", version: "10.9.11" }, { packages: { ugent_uws: p }, versions: { "ugent_uws@10.9.11": { version: "10.9.11", status: "active", statusReason: null, deprecated: null, facts: null, score } }, resolve: () => UGENT_REFUSED });
+
+    expect(r.text).toContain("- Status: do not install.");
+    expect(r.structured.refusal).toEqual(refused);
+    expect(r.structured.installPolicy).toBe("refused");
+    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused });
+    expect(r.text).toContain("- Network (makes requests or opens sockets): seen");
+    expect(r.structured.scorerCapabilities).toMatchObject({ kind: "listed", capabilities: [{ id: "network", basis: "code" }] });
+    expect(r.structured.capabilities).toContainEqual({ id: "network", label: "Network access", state: "seen" });
+  });
+
+  test("check_package: an installable version's commands are the text's", async () => {
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, resolve: () => resolvedTo("1.3.0") });
+
+    expect(r.structured.refusal).toBeNull();
+    // a clean, scored version: resolve is not asked (lib/refusal.ts looksRisky), and the commands are today's
+    expect(r.structured.installPolicy).toBe("not-asked");
+    expect(r.structured.install).toEqual({ kind: "commands", via: "default", commands: { apm: "apm add left-pad", bun: "bun add left-pad@1.3.0", npm: "npm install left-pad@1.3.0", pnpm: "pnpm add left-pad@1.3.0" } });
+    expect(r.text).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
+  });
+
+  test("check_name: a free bare name is free on npm and needs a scope on apm", async () => {
+    const r = await call("check_name", { name: "fresh-name" }, {
+      names: { query: "fresh-name", valid: true, taken: false, source: null, unknown: false, available: true, owners: [], latest: null, description: null, conflicts: [], lookalikes: [], similar: [], scope: null, suggestions: [] },
+    });
+
+    expect(r.text).toContain("fresh-name is not taken, needs a scope. New packages on apm go under your GitHub login, like @you/fresh-name.");
+    expect(r.structured.available).toBe(true);
+    expect(r.structured.publishable).toEqual({ kind: "needs-scope", suggestion: "@you/fresh-name" });
   });
 });

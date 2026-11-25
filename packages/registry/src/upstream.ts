@@ -7,7 +7,7 @@ import { Blobs } from "./blobs.ts";
 import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { upstreamPuts, type PendingPuts } from "./pending-puts.ts";
-import { Store, type KeptChoicesRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
+import { Store, type KeptChoicesRow, type StoreApi, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { readCapped, streamedJson, streamWeight, type StreamOptions } from "./http.ts";
@@ -18,7 +18,7 @@ import { verifiedStream } from "./verified-stream.ts";
 import { NO_RECORDED_PUBLISHER } from "./publishers.ts";
 import { ChoicesWriter, choiceHolds, isStrongEtag, KEPT_CHOICES_MAX_AGE_MS, keepPlans, KeptSide, keptPlan, keptRowsWithin, type Choice, type Chosen, type HeldRow, type PlanHandle } from "./kept-choices.ts";
 import { Clock } from "./clock.ts";
-import { reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
+import { keptVersion, reviewSummary, type Reserve, type Summary } from "./walk-catalog.ts";
 import { createHash } from "node:crypto";
 
 const Dist = z.object({ tarball: z.string(), shasum: z.string().optional(), integrity: z.string().optional() }).loose();
@@ -84,6 +84,15 @@ export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } |
 
 /** What Upstream.chosen answers for a package: a summary's answer, or "out-of-time" when its deadline came first. */
 export type ChosenAnswer<S> = Summarized<S> | { kind: "out-of-time" };
+
+/**
+ * What Upstream.chosen holds of a package between reading it and keeping it: the versions each choice took, cut down
+ * (summaryVersion) and unscored, their weight taken from the lease, and the kept row to plan once they are kept.
+ */
+type Picked = { readonly name: string; readonly distTags: Record<string, string>; readonly versions: ReadonlyMap<string, readonly VersionRecord[]>; readonly weight: number; readonly plan: { readonly etag: string; readonly at: number } | null };
+
+/** A package as Upstream.chosen reads it: picked from, or the answer it came to instead. */
+type Picking = { kind: "picked"; picked: Picked } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" } | { kind: "out-of-time" };
 
 // One object of the upstream's /-/v1/search answer. Read loosely: extra fields (downloads, flags, links)
 // pass through untouched so the merged answer keeps npm's wire format.
@@ -307,20 +316,35 @@ export function keptPackage(name: string, row: KeptChoicesRow): CachedPackage {
  * A cached package with its analyses: an analysis counts only for the exact bytes it read, by the current scorer; a
  * version it decided it can never score says why.
  */
-export function scoredPackage(pkg: CachedPackage, { scores, unscorable }: UpstreamAnalyses): Probe {
-  return {
-    kind: "found",
-    pkg: {
-      ...pkg,
-      versions: pkg.versions.map((v) => {
-        const d = digestOf(v);
-        const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
-        const why = score === null ? unscorable.get(v.version) : undefined;
+export function scoredPackage(pkg: CachedPackage, analyses: UpstreamAnalyses): Probe {
+  return { kind: "found", pkg: { ...pkg, versions: pkg.versions.map((v) => scoredVersion(v, analyses)) } };
+}
 
-        return why ? { ...v, score, unscorable: why } : { ...v, score };
-      }),
-    },
-  };
+/**
+ * Which versions' analyses a reader of a package reads, by version: whole, or trimmed (without PAGE_TRIMMED's members)
+ * for one that works out only a score and a grade from it. A version it does not name reads as not scored.
+ */
+export type Wanted = (pkg: { readonly distTags: Record<string, string>; readonly versions: readonly Omit<VersionRecord, "score">[] }) => ReadonlyMap<string, "whole" | "trimmed">;
+
+/** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
+export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> => {
+  const keys = versions.flatMap((v) => {
+    const form = want.get(v.version);
+    const d = digestOf(v);
+
+    return form === undefined ? [] : [{ package: name, version: v.version, digest: d ? digestLabel(d) : null, trimmed: form === "trimmed" }];
+  });
+
+  return Effect.map(store.upstreamAnalysesFor(keys), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() });
+};
+
+/** One version of scoredPackage: its stored analysis for its exact bytes, or why it can never be scored. */
+function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
+  const d = digestOf(v);
+  const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
+  const why = score === null ? unscorable.get(v.version) : undefined;
+
+  return why ? { ...v, score, unscorable: why } : { ...v, score };
 }
 
 /** How long an upstream answer is trusted before it is fetched again. */
@@ -649,11 +673,12 @@ const installKey = (input: { upstream: string; served: string; name: string }): 
 const npmEtag = (etag: string | null): string | null => (etag !== null && etag !== "" ? etag : null);
 
 /**
- * The stamp of a set of confirmed reviews (version and digest), as installRead reads them: the SHA-256 of their sorted
- * lines, so any change to the set changes it.
+ * The stamp of a set of confirmed reviews (version and digest), as installRead reads them, and of the OSSF feed's
+ * advisories for the name (`listed`, osv.ts advisoryLines): the SHA-256 of their sorted lines, so any change to either
+ * changes it. With no advisories it is the stamp of the confirmed set alone, as before the feed was read here.
  */
-export async function installStamp(rows: readonly { version: string; digest: string }[]): Promise<string> {
-  const lines = rows.map((r) => `${r.version} ${r.digest}`).toSorted().join("\n");
+export async function installStamp(rows: readonly { version: string; digest: string }[], listed: readonly string[] = []): Promise<string> {
+  const lines = [...rows.map((r) => `${r.version} ${r.digest}`), ...listed].toSorted().join("\n");
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(lines)));
 
   return [...hash].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -712,11 +737,17 @@ export type UpstreamApi = {
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
   /**
    * The package with its analyses, read under `lease` (memory.ts): what it holds stays taken from the lease until the
-   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here.
+   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here. It reads
+   * every stored analysis of the package whole; probeFor reads only those of the versions its `wanted` names
+   * (Store.upstreamAnalysesFor), each whole or trimmed, and every other version reads as not scored.
    */
   readonly probe: (name: string, lease: Lease) => Effect.Effect<Probe, StoreError>;
   /** probe, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
   readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
+  /** probe reading only the analyses `wanted` names (see probe). */
+  readonly probeFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<Probe, StoreError>;
+  /** probeWithin reading only the analyses `wanted` names (see probe). */
+  readonly probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
   /**
@@ -770,7 +801,9 @@ export type UpstreamApi = {
    * only the versions each choice took. What it chose is kept with npm's ETag, and answered from there while npm says
    * the packument has not changed (304), without reading it. `deadline` (Date.now() milliseconds): a package with no
    * answer by then is "out-of-time", its read stopped (its stream cancelled, its lease given back); the packages
-   * answered before it keep their choices as usual.
+   * answered before it keep their choices as usual. Each package's choices are made of it as it is read and held cut
+   * down (summaryVersion); once every package is read, the analyses of only the versions they took are read, in one
+   * statement (Store.upstreamAnalysesFor), and each package is kept.
    */
   readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; deadline?: number }) => Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError>;
   /**
@@ -1468,17 +1501,21 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           // a package that did not fit the lease could not be read: the caller asks again later
           Effect.map(listed(name, lease), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        const probeWithin = (name: string, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
+        const probeWithinFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
           Effect.gen(function* () {
             const l = yield* listed(name, lease);
 
             if (l.kind !== "found") return l;
 
-            return scoredPackage(l.pkg, yield* store.upstreamAnalyses(name));
+            return scoredPackage(l.pkg, wanted === undefined ? yield* store.upstreamAnalyses(name) : yield* wantedAnalyses(store, name, l.pkg.versions, wanted(l.pkg)));
           });
 
-        const probe = (name: string, lease: Lease): Effect.Effect<Probe, StoreError> =>
-          Effect.map(probeWithin(name, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+        const probeFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<Probe, StoreError> =>
+          Effect.map(probeWithinFor(name, wanted, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+
+        const probeWithin = (name: string, lease: Lease) => probeWithinFor(name, undefined, lease);
+
+        const probe = (name: string, lease: Lease) => probeFor(name, undefined, lease);
 
         const probeMany = (names: readonly string[], lease: Lease): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
@@ -1590,8 +1627,6 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           Effect.gen(function* () {
             const { lease, choices, keep } = input;
             const wanted = [...new Set(input.names)];
-            const analyses = yield* store.upstreamAnalysesOf(wanted);
-            const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
             const t = yield* keptNow;
             const wall = yield* now;
             const documentOf = (name: string): string => `${baseUrl}${encodeName(name)}`;
@@ -1622,122 +1657,96 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               // the rows now live only in `rows`, so one the pool takes back is no longer referenced (combined review of
               // 67d8658, finding 1)
               read.clear();
-              const plans: PlanHandle[] = [];
 
               /** Whether every choice asked of `name` holds in `row` now. */
               const holds = (name: string, row: KeptChoicesRow): boolean => choices(name).every((c) => choiceHolds(row.kept, c.key, t));
 
-              /** keep, handed the versions each of `name`'s choices takes of `pkg` (scored here), with the scored copy charged unless the read charged it. */
-              const keptOf = (name: string, pkg: CachedPackage, copyCharged: boolean, take: (scored: UpstreamPackage) => ReadonlyMap<string, readonly VersionRecord[]> | null): Summarized<S> => {
-                const copy = copyCharged ? 0 : pkg.versions.length * SCORED_WEIGHT;
+              /**
+               * The versions each of `name`'s choices took (a map of them by choice key, or null when one is missing), cut
+               * down as a row keeps them (summaryVersion) and reserved from `lease`, so the packument they came from can
+               * be let go before their analyses are read. `plan`: the row to plan once they are kept, if any.
+               */
+              const pickedOf = (name: string, distTags: Record<string, string>, taken: ReadonlyMap<string, readonly Omit<VersionRecord, "score">[]> | null, plan: Picked["plan"]): Picking => {
+                if (taken === null) return { kind: "unknown" };
+                const versions = new Map<string, VersionRecord[]>();
+                let weight = 0;
 
-                if (!lease.take(copy)) return { kind: "over-budget" };
-                const scored = scoredPackage(pkg, analyses.get(name) ?? none);
+                for (const [key, vs] of taken) {
+                  const cut: VersionRecord[] = [];
 
-                if (scored.kind !== "found") {
-                  lease.give(copy);
+                  for (const v of vs) {
+                    const one = keptVersion({ ...v, score: null }, lease);
 
-                  return { kind: "unknown" };
+                    if (one === null) {
+                      lease.give(weight);
+
+                      return { kind: "over-budget" };
+                    }
+
+                    weight += one.weight;
+                    cut.push(one.summary);
+                  }
+
+                  versions.set(key, cut);
                 }
 
-                const versions = take(scored.pkg);
-
-                if (versions === null) {
-                  lease.give(copy);
-
-                  return { kind: "unknown" };
-                }
-
-                const before = lease.taken;
-                const made = keep({ name, distTags: scored.pkg.distTags, versions }, lease);
-                lease.give(copy);
-
-                if (made === null) return { kind: "over-budget" };
-                const short = made.weight - (lease.taken + copy - before);
-
-                if (short > 0 && !lease.take(short)) {
-                  lease.give(made.weight - short);
-
-                  return { kind: "over-budget" };
-                }
-
-                return { kind: "found", summary: made.summary };
+                return { kind: "picked", picked: { name, distTags, versions, weight, plan } };
               };
 
               /**
-               * From a whole package: its choices made of it, and, once its answer is kept, a row planned on the side
-               * (one string: keptPlan) when npm gave it a strong ETag and the row is missing, for another packument, or
-               * lacks one of these choices or holds it past its age. Each choice is as old as the fetch of `pkg`'s
-               * packument (finding 2).
+               * From a whole package: its choices made of it, with the row to plan once they are kept (one string:
+               * keptPlan) when npm gave it a strong ETag and the row is missing, for another packument, or lacks one of
+               * these choices or holds it past its age. Each choice is as old as the fetch of `pkg`'s packument
+               * (finding 2).
                */
-              const fromPackage = (name: string, pkg: CachedPackage, copyCharged: boolean): Summarized<S> => {
-                let made: { versions: ReadonlyMap<string, readonly VersionRecord[]>; distTags: Record<string, string> } | null = null;
-
-                const answer = keptOf(name, pkg, copyCharged, (scored) => {
-                  const versions = new Map(choices(name).map((c) => [c.key, c.choose(scored)] as const));
-                  made = { versions, distTags: scored.distTags };
-
-                  return versions;
-                });
-
+              const fromPackage = (name: string, pkg: CachedPackage): Picking => {
                 const held = rows.get(name);
                 const etag = pkg.etag;
+                const plan = isStrongEtag(etag) && (held === undefined || held.row.etag !== etag || !holds(name, held.row)) ? { etag, at: t - Math.max(0, wall - pkg.fetchedAt) } : null;
 
-                if (answer.kind === "found" && made !== null && isStrongEtag(etag) && (held === undefined || held.row.etag !== etag || !holds(name, held.row))) {
-                  const { versions, distTags } = made;
-                  const at = t - Math.max(0, wall - pkg.fetchedAt);
-
-                  // only this read's choices, as one string; the database merges the older ones kept for the same ETag
-                  const plan = keptPlan({ document: documentOf(name), etag, distTags, versions, reserve: side, at });
-
-                  if (plan !== null) plans.push(side.holdPlan(plan));
-                }
-
-                return answer;
+                return pickedOf(name, pkg.distTags, new Map(choices(name).map((c) => [c.key, c.choose(pkg)] as const)), plan);
               };
 
-              /** From a kept row npm said still holds: each choice's versions, from the row's records, scored now. */
-              const fromRow = (name: string, entry: { row: HeldRow; holding: ReturnType<KeptSide["hold"]> }): Summarized<S> => {
+              /** From a kept row npm said still holds: each choice's versions, from the row's records. */
+              const fromRow = (name: string, entry: { row: HeldRow; holding: ReturnType<KeptSide["hold"]> }): Picking => {
                 const { row } = entry;
                 entry.holding.inUse = true;
 
                 try {
-                  return keptOf(name, keptPackage(name, row), false, (scored) => {
-                    const byVersion = new Map(scored.versions.map((v) => [v.version, v] as const));
-                    const versions = new Map<string, readonly VersionRecord[]>();
+                  const byVersion = new Map(Object.values(row.kept.records).map((v) => [v.version, v] as const));
+                  const taken = new Map<string, readonly Omit<VersionRecord, "score">[]>();
 
-                    for (const c of choices(name)) {
-                      const list = row.kept.lists[c.key]?.versions ?? [];
-                      const records = list.flatMap((v) => byVersion.get(v) ?? []);
+                  for (const c of choices(name)) {
+                    const list = row.kept.lists[c.key]?.versions ?? [];
+                    const records = list.flatMap((v) => byVersion.get(v) ?? []);
 
-                      if (records.length !== list.length) return null;
-                      versions.set(c.key, records);
-                    }
+                    if (records.length !== list.length) return pickedOf(name, row.kept.distTags, null, null);
+                    taken.set(c.key, records);
+                  }
 
-                    return versions;
-                  });
+                  return pickedOf(name, row.kept.distTags, taken, null);
                 } finally {
                   entry.holding.inUse = false;
                 }
               };
 
-              /** One read of `name` from npm (with `etag`, a conditional one), answered while what it read is held. */
-              const readOnce = (name: string, etag: string | null): Effect.Effect<Summarized<S> | "row-gone"> =>
+              /** One read of `name` from npm (with `etag`, a conditional one), picked from while what it read is held. */
+              const readOnce = (name: string, etag: string | null): Effect.Effect<Picking | "row-gone"> =>
                 Effect.suspend(() => {
                   const readLease = lease.child();
 
-                  return Effect.map(listedOrSame(name, readLease, etag), (l): Summarized<S> | "row-gone" => {
+                  return Effect.map(listedOrSame(name, readLease, etag), (l): Picking | "row-gone" => {
                     if (l.kind === "not-modified") {
                       const entry = rows.get(name);
 
                       return entry === undefined ? "row-gone" : fromRow(name, entry);
                     }
 
-                    return l.kind === "found" ? fromPackage(name, l.pkg, true) : l;
+                    return l.kind === "found" ? fromPackage(name, l.pkg) : l;
                   }).pipe(Effect.ensuring(Effect.sync(() => readLease.release())));
                 });
 
-              const one = (name: string): Effect.Effect<Summarized<S>> =>
+              const one = (name: string): Effect.Effect<Picking> =>
                 Effect.gen(function* () {
                   const cached = probeCacheFor(lease.pool, baseUrl, ttlMs).entry(name, yield* now);
 
@@ -1748,7 +1757,7 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                     if (cached.block !== null) pin.hold(cached.block);
 
                     try {
-                      return fromPackage(name, cached.value.pkg, false);
+                      return fromPackage(name, cached.value.pkg);
                     } finally {
                       pin.release();
                     }
@@ -1766,9 +1775,9 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
               /**
                * one, stopped at the batch's deadline: interrupting it cancels its read (joinedPromise) and gives back
-               * its lease. A package answered before then planned its row already (fromPackage), so it is kept.
+               * its lease. A package picked from before then is kept.
                */
-              const inTime = (name: string): Effect.Effect<ChosenAnswer<S>> => {
+              const inTime = (name: string): Effect.Effect<Picking> => {
                 const deadline = input.deadline;
 
                 if (deadline === undefined) return one(name);
@@ -1778,19 +1787,84 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
                   if (left <= 0) return Effect.succeed({ kind: "out-of-time" as const });
 
-                  return Effect.map(Effect.timeoutOption(one(name), Duration.millis(left)), (o): ChosenAnswer<S> => Option.getOrElse(o, () => ({ kind: "out-of-time" as const })));
+                  return Effect.map(Effect.timeoutOption(one(name), Duration.millis(left)), (o): Picking => Option.getOrElse(o, () => ({ kind: "out-of-time" as const })));
                 });
               };
 
-              const first = yield* Effect.forEach(wanted, (name) => Effect.map(inTime(name), (s) => [name, s] as const), { concurrency: PROBE_CONCURRENCY });
-              const out = new Map<string, ChosenAnswer<S>>(first);
+              const first = yield* Effect.forEach(wanted, (name) => Effect.map(inTime(name), (p) => [name, p] as const), { concurrency: PROBE_CONCURRENCY });
+              const picks = new Map<string, Picking>(first);
 
-              // a package that did not fit beside the others is read again alone: nothing keeping holds is in its way
-              for (const [name, s] of first) if (s.kind === "over-budget") out.set(name, yield* inTime(name));
+              // a package that did not fit beside the others is read again alone: only the others' picks are in its way
+              for (const [name, p] of first) if (p.kind === "over-budget") picks.set(name, yield* inTime(name));
 
-              // every package has its answer: no row is needed any more
+              // every package is picked from: no row is needed any more
               for (const entry of rows.values()) side.letGo(entry.holding);
               rows.clear();
+              const picked = [...picks.values()].flatMap((p) => (p.kind === "picked" ? [p.picked] : []));
+
+              // the analyses of exactly the versions picked, in one statement: what is read grows with the versions the
+              // choices took, never with a package's history (next: 61 analyses, 16 MB, for the one version a range picks).
+              // A version with no checksum is asked for too: its outcome (unavailable) is read by version
+              const keys = picked.flatMap((p) =>
+                [...p.versions.values()].flat().map((v) => {
+                  const d = digestOf(v);
+
+                  return { package: p.name, version: v.version, digest: d ? digestLabel(d) : null };
+                }),
+              );
+
+              const analyses = yield* store.upstreamAnalysesFor(keys).pipe(Effect.onError(() => Effect.sync(() => lease.give(picked.reduce((n, p) => n + p.weight, 0)))));
+              const none: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
+              const plans: PlanHandle[] = [];
+
+              /** keep, handed the versions picked of `p` scored, with their scored copies charged while it runs. */
+              const kept = (p: Picked): Summarized<S> => {
+                const a = analyses.get(p.name) ?? none;
+                const copy = [...p.versions.values()].reduce((n, vs) => n + vs.length, 0) * SCORED_WEIGHT;
+
+                if (!lease.take(copy)) return { kind: "over-budget" };
+                const versions = new Map([...p.versions].map(([key, vs]) => [key, vs.map((v) => scoredVersion(v, a))] as const));
+                const before = lease.taken;
+                const made = keep({ name: p.name, distTags: p.distTags, versions }, lease);
+                lease.give(copy);
+
+                if (made === null) return { kind: "over-budget" };
+                const short = made.weight - (lease.taken + copy - before);
+
+                if (short > 0 && !lease.take(short)) {
+                  lease.give(made.weight - short);
+
+                  return { kind: "over-budget" };
+                }
+
+                if (p.plan !== null) {
+                  const plan = keptPlan({ document: documentOf(p.name), etag: p.plan.etag, distTags: p.distTags, versions, reserve: side, at: p.plan.at });
+
+                  if (plan !== null) plans.push(side.holdPlan(plan));
+                }
+
+                return { kind: "found", summary: made.summary };
+              };
+
+              const again: Picked[] = [];
+
+              /**
+               * kept, handed `p`'s picks: their charge is given back as keep starts, since keep reserves all it keeps of
+               * them itself, as it did of a whole package, and taken again when it did not fit, for one more try alone.
+               */
+              const settled = (p: Picked, last: boolean): Summarized<S> => {
+                lease.give(p.weight);
+                const answer = kept(p);
+
+                if (answer.kind === "over-budget" && !last && lease.take(p.weight)) again.push(p);
+
+                return answer;
+              };
+
+              const out = new Map<string, ChosenAnswer<S>>([...picks].map(([name, p]) => [name, p.kind === "picked" ? settled(p.picked, false) : p] as const));
+
+              // a package whose answer did not fit beside the others is kept again alone, once every other is
+              for (const p of again) out.set(p.name, settled(p, true));
 
               if (plans.length === 0) return out;
               const writer = yield* Effect.serviceOption(ChoicesWriter);
@@ -2030,6 +2104,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }),
           probe,
           probeWithin,
+          probeFor: (name: string, wanted: Wanted, lease: Lease) => probeFor(name, wanted, lease),
+          probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => probeWithinFor(name, wanted, lease),
           listing,
           listingIfChanged: listedOrSame,
           installCopy,

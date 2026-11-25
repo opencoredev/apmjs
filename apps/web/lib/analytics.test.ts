@@ -8,7 +8,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { DOCS_ORIGIN, docsAnalytics, docsLoaderScript } from "../../docs/analytics";
 import { contentSecurityPolicy } from "./security-headers";
-import { DATABUDDY_INGEST_ORIGIN, DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
+import { DATABUDDY_FLAGS_ORIGIN, DATABUDDY_INGEST_ORIGIN, DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
 import { DATABUDDY_LOAD_GLOBAL, DATABUDDY_SCRIPT_URL, databuddyAttributes, databuddyLoaderScript, isPrivatePath, maySend, optedOut, PRIVATE_MASK_PATTERNS, PRIVATE_ROUTES, PRIVATE_SKIP_PATTERNS, SITE_ORIGINS, type BrowserView, type Site } from "./analytics";
 
 const WEB = join(import.meta.dir, "..");
@@ -112,10 +112,15 @@ describe("the databuddy.js tag", () => {
     expect(layout).toMatch(/<\/footer>\s*<DatabuddyNavigation \/>\s*<\/body>/);
     expect(layout.match(/<DatabuddyNavigation\b/g)).toHaveLength(1);
 
+    // custom events and the flag read go through lib/databuddy-client.ts alone, which only asks the tracker already
+    // on the page; nothing else sends to Databuddy or reads its tracker
+    const readsTracker = /window\??\.(databuddy|db)\b/;
+
+    expect(sources().filter(([, text]) => readsTracker.test(text)).map(([file]) => file)).toEqual(["lib/databuddy-client.ts"]);
+
     for (const [file, text] of sources()) {
       expect(text.includes("<PageView"), file).toBe(false);
       expect(text.includes(`${DATABUDDY_INGEST_ORIGIN}/`), file).toBe(false);
-      expect(/window\.(databuddy|db)\b/.test(text), file).toBe(false);
     }
   });
 
@@ -467,14 +472,15 @@ describe("the docs site's Blume config", () => {
 });
 
 describe("the CSP", () => {
-  test("loads scripts from the site and Databuddy's CDN, and lets fetches reach Databuddy's endpoint, nothing else of theirs", () => {
+  test("loads scripts from the site and Databuddy's CDN, and lets fetches reach Databuddy's event and flag endpoints, nothing else of theirs", () => {
     const csp = contentSecurityPolicy(false);
 
     expect(DATABUDDY_SCRIPT_ORIGIN).toBe("https://cdn.databuddy.cc");
     expect(DATABUDDY_INGEST_ORIGIN).toBe("https://basket.databuddy.cc");
+    expect(DATABUDDY_FLAGS_ORIGIN).toBe("https://api.databuddy.cc");
     expect(csp).toContain(`script-src 'self' 'unsafe-inline' ${DATABUDDY_SCRIPT_ORIGIN};`);
-    expect(csp).toContain(`connect-src 'self' ${DATABUDDY_INGEST_ORIGIN};`);
-    expect(csp.match(/databuddy/g)).toHaveLength(2);
+    expect(csp).toContain(`connect-src 'self' ${DATABUDDY_INGEST_ORIGIN} ${DATABUDDY_FLAGS_ORIGIN};`);
+    expect(csp.match(/databuddy/g)).toHaveLength(3);
     expect(csp).toContain("object-src 'none'");
     expect(csp).toContain("frame-ancestors 'none'");
   });

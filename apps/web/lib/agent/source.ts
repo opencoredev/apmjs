@@ -23,6 +23,8 @@ export type VersionInfo = {
   score: ScoreReport | null;
   /** Why apm can never score this version (the registry's reason and sentence); null when it has a score or may get one. */
   unscorable: { reason: string; text: string } | null;
+  /** When it was published; absent from an older registry. */
+  publishedAt?: string | null;
 };
 
 /** The whole name check (GET /-/apm/v1/names without `part`): the three parts in one answer. */
@@ -139,6 +141,7 @@ export const ResolveRefusedWire = z.object({
   skipped: Skipped,
   newest: z.object({ version: z.string() }).loose().nullish(),
   confirmed: z.array(DepRefWire).default([]),
+  knownMalicious: z.array(z.object({ name: z.string(), version: z.string(), ids: z.array(z.string()) })).default([]),
 });
 
 /**
@@ -147,7 +150,7 @@ export const ResolveRefusedWire = z.object({
  */
 export type ResolveOutcome =
   | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[]; coverage?: ReportCoverage | null; scorer: string | null } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable" };
 
@@ -180,7 +183,13 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
   if (status === 422) {
     const refused = ResolveRefusedWire.safeParse(body);
 
-    return refused.success ? { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped, confirmed: refused.data.confirmed } : { kind: "unavailable" };
+    if (!refused.success) return { kind: "unavailable" };
+
+    const out: Extract<ResolveOutcome, { kind: "refused" }> = { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped, confirmed: refused.data.confirmed };
+
+    if (refused.data.knownMalicious.length > 0) out.knownMalicious = refused.data.knownMalicious;
+
+    return out;
   }
 
   if (status === 404) {
@@ -202,6 +211,8 @@ export type AgentSource = {
   /** One version's state, facts and score, whatever its age; "missing" when the package has no such version. */
   version: (input: { name: string; version: string }) => Promise<Fetched<VersionInfo>>;
   review: (input: { name: string; version: string }) => Promise<Fetched<ReviewAnswer>>;
+  /** One version's score from the score route, which the package page reads for a version other than latest: it carries the capabilities the version answer leaves out. */
+  score: (input: { name: string; version: string }) => Promise<Fetched<ScoreReport>>;
   resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome>;
   search: (input: { query: string }) => Promise<SearchAnswer | null>;
   /** The name check; `scope` is the npm scope (without @) the alternatives are checked under. */

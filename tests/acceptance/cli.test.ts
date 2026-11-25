@@ -1,7 +1,7 @@
 // Spec: `apm` wraps whatever package manager the project uses (bun first, npm and pnpm too).
 // It adds a score gate before install, a preflight before publish, and one-step revoke and audit.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, apm, getJson, installedVersion, dig, type Registry } from "./harness";
@@ -125,7 +125,7 @@ describe("apm: install gate", () => {
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/WARNING.*evil-dep@1\.0\.0.*scores \d+\/100 \(F\), under the floor of 40/);
     expect(r.out).toMatch(/x\.js:1/);
-    expect(r.out).toContain("/package/evil-dep/v/1.0.0");
+    expect(r.out).toContain("/package/evil-dep?v=1.0.0");
     expect(r.out).toContain("--strict");
     expect(installedVersion(app, "evil-dep")).toBe("1.0.0");
   });
@@ -231,6 +231,15 @@ describe("apm: publish", () => {
     expect(status).toBe(404);
   });
 
+  // HOME-502 D2: a publish while logged out ended with bun's "run bunx npm login", which signs in to npm
+  test("apm publish without a login says to run apm login", async () => {
+    const sb = makeSandbox(reg);
+    const d = writePackage(work, { name: "no-login-pkg", version: "1.0.0" }, reg);
+    const r = await apm(["publish"], { cwd: d, env: { ...sb.env, TMPDIR: work } });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication, log in to this registry, then apm publish again (on an apm registry: apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords)`);
+  });
+
   test("apm publish refuses locally when a secret would ship, before any upload", async () => {
     const sb = makeSandbox(reg, alice);
     const d = writePackage(work, { name: "oops-secret", version: "1.0.0", files: { "index.js": "module.exports=1;\n", ".env.production": "STRIPE_SECRET_KEY=sk_live_51HxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxQ\n" } }, reg, alice);
@@ -262,6 +271,15 @@ describe("apm: publish", () => {
     const { body } = await getJson(`${reg.url}bumpy`);
     expect(dig(body, "dist-tags", "latest")).toBe("1.0.1");
     expect(r.out).toContain("bumpy@1.0.1");
+  });
+
+  test("apm publish --pm yarn packs with yarn 1 (which has no --out) and leaves no tarball in the project", async () => {
+    const sb = makeSandbox(reg, alice);
+    const d = writePackage(work, { name: "yarn-classic-lib", version: "1.0.0" }, reg, alice);
+    const r = await apm(["publish", "--pm", "yarn", "--dry-run"], { cwd: d, env: sb.env });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("index.js");
+    expect(readdirSync(d).filter((f) => f.endsWith(".tgz"))).toEqual([]);
   });
 
   test("apm publish works in a project that only has npm", async () => {

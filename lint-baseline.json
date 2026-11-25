@@ -31,10 +31,10 @@
     "packages/cli/src/main.ts": {
       "anti-slop/no-conditional-empty-object-spread": 1,
       "anti-slop/no-known-value-widening": 1,
-      "anti-slop/no-runtime-typeof": 8,
+      "anti-slop/no-runtime-typeof": 7,
       "anti-slop/no-unknown-parameters": 1,
       "anti-slop/no-unsafe-dictionary-type": 1,
-      "anti-slop/require-readable-spacing": 149
+      "anti-slop/require-readable-spacing": 148
     },
     "packages/cli/src/pm.ts": {
       "anti-slop/no-runtime-typeof": 2,

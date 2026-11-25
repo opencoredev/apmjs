@@ -25,6 +25,8 @@ A score informs; it does not block, so by default a low or missing score only wa
 registry=https://registry.apmjs.dev/~safe/
 ```
 
+The view also hides versions apm has not fully analysed, so a large package can fail to install through it.
+
 For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
 
 After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:

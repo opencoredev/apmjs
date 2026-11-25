@@ -1,11 +1,13 @@
 ---
 title: The ~safe registry view
-description: A registry URL that hides versions under 24 hours old, versions scoring under 40, and pulled versions, for any client with no extra tools.
+description: An opt-in strict registry URL that hides versions under 24 hours old, versions scoring under 40, versions not fully analysed, and pulled versions, for any client with no extra tools.
 ---
 
 `https://registry.apmjs.dev/~safe/` is the same registry with a filter in front. Any client that lets you set the registry URL gets the filter, with no apm tools installed.
 
 It is the strict option for npm and pnpm. `apm add`, the registry's resolve and scan answers and the Bun scanner warn about a low or missing score and install anyway; the view still hides such versions, because using it is the choice to filter them. It matches `apm add --strict`, and `APM_SCANNER_STRICT=1` for Bun.
+
+It is opt-in. The default for every client is the plain registry, `https://registry.apmjs.dev/` (see the [quick start](/quickstart)). Because the view hides every version apm has not fully analysed, a large package can have no version in it, and `npm install` then fails with `No versions available`.
 
 ```ini title=".npmrc"
 registry=https://registry.apmjs.dev/~safe/
@@ -19,10 +21,11 @@ A version is served only when all of these hold:
 | --- | --- |
 | Not pulled | It is revoked, waiting to be revoked, or yanked. |
 | Cooldown | It was published less than 24 hours ago. |
-| Score floor | It scores under 40 out of 100, which includes every analysis that is incomplete. |
+| Fully analysed | apm did not read all of it, whatever its score. |
+| Score floor | It scores under 40 out of 100. |
 | Scored | apm has not scored it yet, or can never score it. |
 
-The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason, for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
+The same rules apply everywhere in the view: the package document, a single version, and the tarball. A hidden version's tarball answers 404 with the reason (410 when it is revoked or confirmed malicious, otherwise 403 when the OSSF malicious-packages feed lists it), for example `some-package@2.0.0 is not in this view: published 3h ago (cooldown 24h).`
 
 ## How `latest` moves
 
@@ -39,7 +42,7 @@ Use `~safe` when you want the checks with stock tools and no CLI. Compared with 
 - `apm add` also checks every package of the lockfile your package manager computes for the add, before anything is installed, verifies the install matches it, and runs install scripts only after that.
 - `~safe` filters each version on its own. A package that depends on a hidden version fails to install, with the reason in the error.
 
-The view cannot be tuned. To install one version it hides, use the plain registry for that install, or `apm add <package> --force`, which lifts the floor and cooldown for that package only.
+The view cannot be tuned. To install one version it hides, use the plain registry for that install, or `apm add <package> --force`, which lifts the floor and cooldown for that package only. Neither installs a version the OSSF malicious-packages feed lists: the plain registry withholds those too.
 
 ## Related
 

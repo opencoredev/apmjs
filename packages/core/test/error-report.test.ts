@@ -56,6 +56,10 @@ describe("errorPayload", () => {
     }
   });
 
+  test("a report that does not know its status says status=-", () => {
+    expect(errorPayload({ ...E, status: null }, 7).stack).toBe("worker=registry code=db_error status=- route=GET_staged_detail colo=SJC build=b1");
+  });
+
   test("every code is lowercase words, so a message is never more than a code", () => {
     for (const c of ERROR_CODES) expect(c).toMatch(/^[a-z_]+$/);
   });

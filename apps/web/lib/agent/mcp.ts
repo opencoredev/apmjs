@@ -5,8 +5,12 @@ import { z } from "zod";
 import { isNotAllRead, NOT_ALL_READ } from "../coverage";
 import { packagePath } from "../package-route";
 import { looksLikePackageName } from "../search-schema";
+import { scorerCapabilities, type ScorerCapabilities } from "../capabilities";
+import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
+import { publishability, publishabilityText } from "../publish-name";
+import { noInstallableReason, type Refusal } from "../refusal";
 import { capabilitiesOf } from "./capabilities";
-import { packageMarkdown, unscorableOf } from "./package-md";
+import { packageMarkdown, refusalOf, unscorableOf, type PackageView } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { REGISTRY } from "../registry-url";
 import { siteUrl } from "./site";
@@ -52,7 +56,7 @@ const PackageName = z.string().trim().toLowerCase().refine(looksLikePackageName,
 
 const SearchInput = z.object({ query: z.string().trim().min(1).max(214).describe("Words or a package name"), limit: z.number().int().min(1).max(20).default(10).describe("How many hits to return") });
 
-const CheckPackageInput = z.object({ name: PackageName.describe("Package name, such as zod or @scope/name"), version: z.string().min(1).max(256).optional().describe("Exact version; latest when left out") });
+const CheckPackageInput = z.object({ name: PackageName.describe("Package name, such as zod or @scope/name"), version: z.string().min(1).max(256).optional().describe("Exact version or dist-tag; the version installs get by name when left out") });
 
 const CheckNameInput = z.object({
   name: PackageName.describe("The name to check"),
@@ -115,6 +119,51 @@ const searchPackages: Tool<typeof SearchInput> = {
   },
 };
 
+/**
+ * What check_package's text says about installing, as data: the commands it gives, that apm refuses the version (and
+ * why, with advisory ids), or that the package has no version to install. The same view writes both, so they agree.
+ */
+type InstallAnswer =
+  | { kind: "commands"; via: "default" | "tag" | "exact"; commands: Record<InstallClient, string> }
+  | { kind: "refused"; refusal: Refusal }
+  | { kind: "none"; reason: string };
+
+function installAnswer(view: PackageView): InstallAnswer {
+  const { pkg, install } = view;
+
+  if (install.kind === "none") return { kind: "none", reason: noInstallableReason({ name: pkg.name, why: install.why }) };
+  const refusal = refusalOf(view);
+
+  if (refusal !== null) return { kind: "refused", refusal };
+
+  const commands = { apm: "", bun: "", npm: "", pnpm: "" } satisfies Record<InstallClient, string>;
+
+  for (const client of INSTALL_CLIENTS) commands[client] = installCommand({ client, name: pkg.name, install });
+
+  return { kind: "commands", via: install.kind, commands };
+}
+
+/**
+ * The legacy four-capability list, from the signals, raised to what the scorer's own list says when it has one (the
+ * text reads that list), so the two answers never say "seen" and "not seen" about the same thing.
+ */
+function legacyCapabilities(input: { signals: Parameters<typeof capabilitiesOf>[0]; listed: ScorerCapabilities | null }) {
+  const fromSignals = capabilitiesOf(input.signals);
+  const { listed } = input;
+
+  if (fromSignals === null || listed?.kind !== "listed") return fromSignals;
+  const LISTED_ID = { network: "network", "shell-exec": "shell", eval: "eval", "credential-access": null } as const;
+  const RANK = { "not seen": 0, possible: 1, seen: 2 } as const;
+
+  return fromSignals.map((c) => {
+    const id = LISTED_ID[c.id];
+    const found = id === null ? undefined : listed.capabilities.find((l) => l.id === id);
+    const state = found === undefined || found.basis === "none" ? "not seen" : found.basis === "code" ? "seen" : "possible";
+
+    return RANK[state] > RANK[c.state] ? { ...c, state } : c;
+  });
+}
+
 const checkPackage: Tool<typeof CheckPackageInput> = {
   name: "check_package",
   title: "Check a package",
@@ -126,19 +175,29 @@ const checkPackage: Tool<typeof CheckPackageInput> = {
     if (loaded.kind === "missing") return text(loaded.reason, { name, version: version ?? null, found: false }, true);
 
     if (loaded.kind === "unavailable") return unavailable(name);
-    const { pkg, version: shown, status, facts, score, review } = loaded.view;
+    const { view } = loaded;
+    const { pkg, version: shown, status, facts, score, review } = view;
+    const install = installAnswer(view);
+    const listed = score ? scorerCapabilities(score) : null;
 
-    return text(packageMarkdown(loaded.view), {
+    return text(packageMarkdown(view), {
       name: pkg.name,
       version: shown,
       latest: pkg.latest,
-      // the shown version's own state and facts, read without a cache
+      // the shown version's own state and facts, read without a cache; `refusal` says when apm will not install it anyway
       status,
+      // null when apm installs the shown version; why it does not (withheld with advisory ids, revoked, yanked) otherwise
+      refusal: install.kind === "refused" ? install.refusal : null,
+      // what resolve said for exactly the shown version, as the text says it: "unknown" when it did not answer, so apm may not serve it
+      installPolicy: install.kind === "refused" ? "refused" : install.kind === "none" ? null : view.policy.kind,
+      install,
       score: score ? { score: score.score, grade: score.grade } : null,
       // why apm can never score the shown version ({ reason, text }, the registry's words); null when it has a score or may get one
-      unscorable: unscorableOf(loaded.view),
+      unscorable: unscorableOf(view),
       signals: score?.signals ?? [],
-      capabilities: capabilitiesOf(score?.signals ?? null),
+      capabilities: legacyCapabilities({ signals: score?.signals ?? null, listed }),
+      // the scorer's own capability list, as the text gives it: listed, not sent by this registry, or not listed by an older scorer
+      scorerCapabilities: listed?.kind === "listed" ? { kind: "listed", capabilities: [...listed.capabilities] } : listed,
       facts,
       notChecked: score?.notChecked ?? [],
       aiReview: review.kind === "ok" ? { status: review.value.status, job: review.value.job ?? null, state: review.value.review?.state ?? null, findings: review.value.review?.findings ?? [] } : null,
@@ -162,7 +221,7 @@ const checkName: Tool<typeof CheckNameInput> = {
     if (!r.valid) lines.push(`${name} is not a valid package name.`);
     else if (r.taken) lines.push(`${name} is taken${r.owners.length ? ` by ${r.owners.map((m) => inlineCode(m)).join(", ")}` : ""}${r.latest ? `; latest ${inlineCode(r.latest.version)}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}.`);
     else if (r.unknown) lines.push(`Could not check ${name}: npm did not answer.`);
-    else if (r.available) lines.push(`${name} is available.`);
+    else if (r.available) lines.push(publishabilityText({ name, publishable: publishability({ name, available: r.available, scope: bare }) }));
     else lines.push(`${name} is free but cannot be published: ${r.conflicts.map((c) => c.reason).join("; ")}`);
 
     for (const l of r.lookalikes) lines.push(`Look-alike: ${oneLine(l.reason)}`);
@@ -173,7 +232,8 @@ const checkName: Tool<typeof CheckNameInput> = {
     if (free.length > 0) lines.push(`Free${r.scope ? ` under @${r.scope}` : ""}: ${free.join(", ")}`);
     else if (!bare) lines.push("Pass scope (your GitHub login) to check names under your own scope; a scoped name is always yours.");
 
-    return text(lines.join("\n"), { ...r });
+    // `available` stays npm's answer about the name; `publishable` is whether apm lets you publish it
+    return text(lines.join("\n"), { ...r, publishable: publishability({ name, available: r.available && r.valid && !r.taken && !r.unknown, scope: bare }) });
   },
 };
 

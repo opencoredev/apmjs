@@ -49,6 +49,8 @@ jobs:
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web
+      - name: Reviewer unit tests
+        run: bun test apps/reviewer/test
       - name: Typecheck web (route types come from next typegen)
         run: bunx next typegen && bunx tsc --noEmit
         working-directory: apps/web

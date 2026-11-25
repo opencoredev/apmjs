@@ -5,7 +5,7 @@ sidebar:
   label: CLI
 ---
 
-`apm` 0.1.2 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
+`apm` 0.1.7 checks before you install, run or publish, then hands the work to the package manager your project uses. Other commands go to that package manager only when they cannot install a package apm has not checked: `run`, `test` and your package.json scripts by name (`apm dev` is `bun run dev` in a bun project), with npm and pnpm also `start`, `why`, `ls` (`list`) and `outdated`, and with yarn `start`. `apm remove` (`rm`, `uninstall`) works with bun 1.2 and later, npm and pnpm, and takes package names only. apm first computes it in a copy of your project, installing nothing into your project, and refuses it when the package manager would install anything the lockfile does not have (a package.json entry the lockfile lacks, say): run `apm add` for those first. Then, if the project's files are still the ones it copied, it runs the package manager's own removal, made to use the lockfile and run no install scripts, and confirms the lockfile gained nothing. It needs a lockfile apm can read, registry versions only in package.json (no URL, git or path specs) and no overrides, resolutions, catalogs or patched dependencies (and with bun, no bunfig.toml that turns off or cannot be read for `install.lockfile.save`; with pnpm, no .pnpmfile.cjs or pnpmfile setting), and the lockfile the removal leaves must be the one apm computed (each package's version and integrity), so it is refused with yarn (run `yarn remove` yourself), bun before 1.2 and bun's binary bun.lockb. With bun, apm runs files and scripts with `--no-install`, so bun doesn't install what the code imports; it passes on only bun's `--silent`, `--watch`, `--hot` and `--help` (`-h`) before the file or script (put the script's own options after its name), refuses a script name that is a path or that a file of the same name would shadow, and refuses to run scripts while a bunfig.toml sets `run.bun`. With pnpm, apm turns off `verify-deps-before-run` (on the command line and in the environment) for what it passes on, so pnpm doesn't install before it runs a script. apm refuses any other command, and says how to run it with your package manager directly. `apm update`, `apm up` and `apm upgrade` are refused, because an update fetches new versions apm cannot check: run `apm add <package>@latest` to check a dependency and move it to the newest version apm allows, or your package manager's own update to skip apm's check. With npm, `apm ci` is `npm ci`, and it passes on the same switches as `apm install` with no packages (below). With bun, pnpm and yarn, apm passes no `ci` on (bun's differs by version); use `apm install --frozen-lockfile`.
 
 Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks the binary's SHA-256 before it installs; see [Quick start](/quickstart#2-get-the-apm-cli) for what it checks and how to read it first.
 
@@ -14,20 +14,20 @@ Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks t
 | Flag | Meaning |
 | --- | --- |
 | `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then bun if it is installed, else npm. |
-| `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install`, `explain`, `search`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
+| `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install` with packages, `explain`, `search`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
 | `--otp <code>` | A six-digit code from your authenticator app, for commands that need a fresh second factor. |
-| `--help`, `-h` | Print the command list. |
+| `--help`, `-h` | Print the command list. After one of apm's own commands (`apm publish --help`), anywhere in its arguments, print that command's usage and flags and run nothing. `apm ci --help`, `apm remove --help`, `apm help ci` and `apm help remove` print apm's help for those. After a command apm passes on, it goes to the package manager (`apm run --help`) or, after a script name, to the script (`apm run dev --help`). |
 | `--version`, `-v` | Print the version. |
 
-Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A passed-through command exits with the package manager's code.
+Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A flag the command does not read is wrong usage: apm refuses it before it runs anything. A flag's value never starts with `-` (`--tag --dry-run` is a `--tag` with no value); write one that does as `--reason=-x`. A passed-through command exits with the package manager's code.
 
 ## apm add
 
 ```bash
-apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D] [--production]
+apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D | --save-dev] [--production]
 ```
 
-Resolves each package to the newest version that is not revoked, yanked or confirmed malicious and checks its whole dependency tree, including every platform's optional binaries (see [Platform](#platform)). Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package of that lockfile (see [Lockfile first](#lockfile-first)). Only a lockfile that passes is written to your project and installed, with install scripts held back until apm confirms the install matches it. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
+Resolves each package to the newest version that is not revoked, yanked or confirmed malicious and checks its whole dependency tree, including every platform's optional binaries (see [Platform](#platform)). Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package of that lockfile (see [Lockfile first](#lockfile-first)). Only a lockfile that passes is written to your project and installed, with install scripts held back until apm confirms the install matches it. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install and checks nothing, so it passes on only switches of that install that cannot name a package, install somewhere else or loosen a frozen lockfile. bun: `--frozen-lockfile`, `--production`, `--force`, `--ignore-scripts`, `--dry-run`, `--no-cache`, `--silent`, `--verbose`, `--json`. npm: `--production`, `--force`, `--ignore-scripts`, `--legacy-peer-deps`, `--strict-peer-deps`, `--offline`, `--prefer-offline`, `--prefer-online`, `--no-audit`, `--no-fund`, `--package-lock-only`, `--foreground-scripts`, `--dry-run`, `--silent`, `--json`, plus `--tag <tag>` and `--omit dev|optional|peer` (or `--tag=<tag>`, `--omit=<value>`). pnpm: `--frozen-lockfile`, `--prod`, `--production`, `--dev`, `--force`, `--ignore-scripts`, `--offline`, `--prefer-offline`, `--strict-peer-dependencies`, `--silent`. yarn: `--frozen-lockfile`, `--json`, `--immutable` (yarn 2 and later only), and yarn 1's `--production`, `--ignore-scripts`, `--ignore-engines`, `--ignore-optional`, `--ignore-platform`, `--offline`, `--prefer-offline`, `--non-interactive`, `--silent`, `--verbose` (yarn 2 and later refuse these itself). Anything else is refused, including a word that is not an option, a value attached to a switch (`--audit=off`), `--`, short flags such as `-g`, npm's `--frozen-lockfile` (npm ignores it; run `npm ci`) and yarn 1's `--immutable` (use `--frozen-lockfile`); run the package manager yourself for those. Each switch means what it means to that package manager: `--force`, `--legacy-peer-deps` and `--ignore-engines` relax its own checks as they always do, and `--json` asks it for its output, not apm's.
 
 A score informs; it does not block. When the package or a dependency was published inside the 24-hour cooldown ("published 5 hours ago, inside apm's 24-hour cooldown"), scores under 40, has an incomplete analysis, can never be scored, is still being analysed after the wait, or could not be looked up because the registry or npm did not answer, `apm add` prints a warning block for each, then installs:
 
@@ -35,7 +35,7 @@ A score informs; it does not block. When the package or a dependency was publish
 WARNING left-pad@1.3.0 scores 30/100 (F), under the floor of 40
   - Sends what it collected: index.js:12: fetch(…) (sends the whole environment in a request)
   - Starts processes at install time: package.json scripts.postinstall: node setup.js
-  https://apmjs.dev/package/left-pad/v/1.3.0
+  https://apmjs.dev/package/left-pad?v=1.3.0
 apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).
 ```
 
@@ -84,7 +84,7 @@ With yarn, which runs install scripts while it installs, `--strict` refuses befo
 With `--json`:
 
 ```json
-{ "ok": true, "pm": "bun", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 90, "grade": "A", "signals": [{ "id": "eval", "points": -10 }], "skipped": [], "unchecked": [], "warnings": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "touched": true, "stage": "done", "recovery": null } }
+{ "ok": true, "pm": "npm", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 100, "grade": "A", "signals": [], "skipped": [], "unchecked": [], "warnings": [], "projectPeers": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "touched": true, "stage": "done", "recovery": null } }
 ```
 
 `installed` is the check of the computed lockfile (null when apm stopped before it): `checked` counts its packages, `blocked` lists `{ name, version, reason }` refused in every mode, `warnings` its warnings, `touched` whether apm wrote to your project (never before the check passes), `stage` where the add stopped (`check`, `install`, `verify`, `scripts` or `done`), and `recovery` the commands that put the project back when it stopped after apm wrote the checked files. `source` is `node_modules` only under yarn 1.
@@ -120,7 +120,7 @@ apm x <package>[@version] [args...]
 
 Shows the package's score card, then in a temporary project of its own has your package manager (npm for yarn projects) compute the lockfile, checks every package of it as `apm add` does, and only then installs it with install scripts held back, confirms the install matches it, runs the install scripts and runs the package's binary (the only one, or the one named like the package) in your directory. The binary runs with the temporary project's `node_modules/.bin` first on `PATH`, so a helper binary it calls is one apm checked. The directory is removed afterwards. Aliases: `apm exec`, `apm dlx`. Takes the same `--strict`, `--force`, `--no-cooldown`, `--cooldown`, `--floor` and `--ignore-scripts` flags as `add`, warns the same way, and waits for a version still being analysed the same way. Those flags and `--pm` are apm's wherever they appear before `--`, and never reach the binary; anything else after the package goes to the binary. Everything after `--` goes to the binary unread, so `apm x tool -- --strict` passes `--strict` to `tool`. `apm exec` and `apm dlx` split their arguments exactly the same way.
 
-A binary given only flags gets them: `apm x tool --version` runs `tool --version`. `--json` depends on where it is. Before the package it is apm's: `apm x --json tool` moves apm's own lines (the score card, warnings, progress) to stderr and runs `tool` without `--json`. After the package it is the binary's: `apm x tool --json` passes `--json` to `tool` and also moves apm's lines to stderr, so the binary's output is alone on stdout. `apm x` prints no JSON document of its own either way.
+A binary given only flags gets them: `apm x tool --version` runs `tool --version`. `--help` and `-h` before `--` are apm's: `apm x tool --help` prints the help of `apm x` and runs nothing, and `apm x tool -- --help` prints the binary's. `--json` depends on where it is. Before the package it is apm's: `apm x --json tool` moves apm's own lines (the score card, warnings, progress) to stderr and runs `tool` without `--json`. After the package it is the binary's: `apm x tool --json` passes `--json` to `tool` and also moves apm's lines to stderr, so the binary's output is alone on stdout. `apm x` prints no JSON document of its own either way.
 
 ## apm score
 
@@ -206,7 +206,7 @@ apm login [--no-browser]
 apm login --username <name> --password-stdin [--email <address>]
 ```
 
-The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+The first form signs you in through the browser with a device code and saves a login token to your user `.npmrc`. A version published with it waits until you approve it on apmjs.dev. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
 
 ## apm explain
 

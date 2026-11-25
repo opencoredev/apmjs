@@ -329,7 +329,7 @@ const sha256 = (s: string): string => createHash("sha256").update(s).digest("hex
 
 function reviewer(): WorkerDeps {
   return {
-    registry: registryClient({ url: reg.url, token: SERVICE_TOKEN }),
+    registry: registryClient({ url: reg.url, token: SERVICE_TOKEN, log: silentLogger }),
     model: modelClient({ url: `${model.url.toString().replace(/\/$/, "")}/v1`, model: "stub", key: () => "stub-key", concurrency: 2, log: silentLogger, sleep: (ms) => Bun.sleep(Math.min(ms, 50)) }),
     budget: new DailyBudget(stateDir, 10_000_000),
     log: silentLogger,

@@ -164,7 +164,7 @@ export function readingOf(input: { scorer: string | null; signals: readonly { id
 }
 
 /** A skip that is a version pulled from installs (revoked, being revoked, yanked): not a score. */
-const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer)/;
+const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer|known malicious)/;
 
 /** Whether the registry refused because a version was pulled: every version it skipped was revoked or yanked. */
 export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean {
@@ -267,7 +267,7 @@ function commandsFor(name: string, version: string): Record<InstallClient, strin
   const out: Partial<Record<InstallClient, string>> = {};
 
   // apm add takes the exact version the policy picked, like the package manager it hands off to
-  for (const client of INSTALL_CLIENTS) out[client] = client === "apm" ? `apm add ${name}@${version}` : installCommand({ client, name, version });
+  for (const client of INSTALL_CLIENTS) out[client] = installCommand({ client, name, install: { kind: "exact", version } });
 
   return { apm: out.apm ?? "", bun: out.bun ?? "", npm: out.npm ?? "", pnpm: out.pnpm ?? "" };
 }
@@ -629,6 +629,14 @@ function decide(input: ExplainInput): Decided {
 
       if (resolve.confirmed.length > 0) {
         return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: it would install ${listed(resolve.confirmed)}, which apm reviewers confirmed ${resolve.confirmed.length === 1 ? "is" : "are"} malicious.`, reasons, commands: null, coverage: NOT_READ };
+      }
+
+      const bad = resolve.knownMalicious ?? [];
+
+      if (bad.length > 0) {
+        const cited = bad.map((m) => `${m.name}@${m.version} (${m.ids.join(", ")})`).join(", ");
+
+        return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: the OSSF malicious-packages feed lists ${quoted(cited)} as malicious.`, reasons: [...reasons, ...bad.flatMap((m) => m.ids.map((id) => `Advisory: https://osv.dev/vulnerability/${id}`))], commands: null, coverage: NOT_READ };
       }
 
       if (refusedAsPulled(resolve.skipped)) return { ...base, verdict: "do-not-install", version: resolve.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };

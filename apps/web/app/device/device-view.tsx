@@ -3,12 +3,11 @@
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import { z } from "zod";
-import "@/lib/zod-csp";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, authPost, call } from "@/lib/account";
+import { lookupDeviceCode } from "@/lib/device-code";
 
 type State =
   | { kind: "loading" }
@@ -17,8 +16,6 @@ type State =
   | { kind: "confirm"; code: string; account: Account }
   | { kind: "done"; approved: boolean }
   | { kind: "error"; message: string };
-
-const DeviceInfo = z.object({ user_code: z.string(), status: z.string() });
 
 function clean(code: string): string {
   return code.toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -41,13 +38,9 @@ export function DeviceView() {
     if (a.kind === "signed-out") return setState({ kind: "signed-out" });
 
     if (a.kind === "error") return setState({ kind: "error", message: a.message });
-    // Opening the code while signed in ties it to this browser's session.
-    const res = await fetch(`/api/auth/device?user_code=${encodeURIComponent(code)}`, { credentials: "same-origin" });
-    const info = DeviceInfo.safeParse(await res.json().catch(() => null));
+    const looked = await lookupDeviceCode(code);
 
-    if (!res.ok || !info.success) return setState({ kind: "error", message: "That code is not valid or has expired. Run apm login again for a new one." });
-
-    if (info.data.status !== "pending") return setState({ kind: "error", message: "That code was already used. Run apm login again for a new one." });
+    if (looked.kind === "error") return setState({ kind: "error", message: looked.message });
     setState({ kind: "confirm", code, account: a.value });
   }
 
