@@ -1,15 +1,25 @@
 // Unit tests for the pieces behind the CLI hardening: token binding, child env, scope overrides,
 // audit's directory walk and range parsing. The acceptance suite drives the same paths end to end.
-import { describe, test, expect } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, describe, test, expect } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { installedPackages, isValidRange } from "../src/audit.ts";
 import { childEnv, isSecretEnvKey, registryArgs, scopeOverrides, scopesOf } from "../src/child.ts";
 import { isApmToken, loadConfig } from "../src/config.ts";
 
+const dirs: string[] = [];
+
+afterAll(() => {
+  for (const d of dirs) rmSync(d, { recursive: true, force: true });
+});
+
 function dir(): string {
-  return mkdtempSync(join(tmpdir(), "apm-unit-"));
+  const d = mkdtempSync(join(tmpdir(), "apm-unit-"));
+
+  dirs.push(d);
+
+  return d;
 }
 
 function writeJson(path: string, value: { name: string; version: string }): void {

@@ -32,6 +32,17 @@ describe("splitXArgs", () => {
     expect(split("tool", "--version", "--tag", "next", "--json")).toEqual({ spec: "tool", flags: { json: true }, child: ["--version", "--tag", "next", "--json"] });
   });
 
+  test("help is apm's anywhere before --, and the binary's after it", () => {
+    expect(split("tool", "a", "--help")).toEqual({ spec: "tool", flags: { help: true }, child: ["a"] });
+    expect(split("-h", "tool")).toEqual({ spec: "tool", flags: { help: true }, child: [] });
+    expect(split("tool", "--", "--help", "-h")).toEqual({ spec: "tool", flags: {}, child: ["--help", "-h"] });
+  });
+
+  test("a value flag never takes an option as its value", () => {
+    expect(split("--pm", "--strict", "tool")).toEqual({ spec: "tool", flags: { pm: true, strict: true }, child: [] });
+    expect(split("tool", "--floor", "--force")).toEqual({ spec: "tool", flags: { floor: true, force: true }, child: [] });
+  });
+
   test("no package", () => {
     expect(split("--pm", "bun")).toEqual({ spec: null, flags: { pm: "bun" }, child: [] });
     expect(split("--", "tool")).toEqual({ spec: null, flags: {}, child: ["tool"] });

@@ -368,6 +368,30 @@ describe("the resolve walk bounds its database work", () => {
         expect(r.queries).toBeLessThanOrEqual(13);
       }));
 
+    // production, 2026-11-25: next's stored analyses as one value were tens of MB, which the connection dropped
+    test("a package with 16 MB of older analyses is still read in its level's one statement", () =>
+      withDatabase({ local: [root], upstream: [...leaves, ...mids] }, async (url) => {
+        const c = new Client({ connectionString: url });
+        await c.connect();
+
+        try {
+          await c.query(
+            "INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) SELECT 'up-mid0', '0.0.' || i, 'old' || i, $1, $2::jsonb, 0 FROM generate_series(1, 60) i",
+            [SCORER, JSON.stringify({ ...analysisOf({ name: "up-mid0" }), padding: "x".repeat(270_000) })],
+          );
+        } finally {
+          await c.end();
+        }
+
+        const r = await resolve({ url, name: "root", npm: npm.url });
+
+        report("100 npm packages, one with 16 MB of older analyses", r);
+        expect(r.status).toBe(200);
+        expect(r.body.tree.packages.length).toBe(100);
+        expect(r.body.tree.unchecked).toBe(0);
+        expect(r.queries).toBeLessThanOrEqual(13);
+      }));
+
     test("a dependency npm answers 404 for is reported as not existing, not as npm being unreachable", () =>
       withDatabase({ local: [{ name: "root", dependencies: { "up-leaf0": "^1.0.0", "no-such-dep": "^1.0.0" } }], upstream: [{ name: "up-leaf0" }] }, async (url) => {
         const r = await resolve({ url, name: "root", npm: npm.url });

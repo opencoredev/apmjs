@@ -1,6 +1,25 @@
 // How `apm x` splits its arguments between apm and the binary it runs (review of 96f0ba7, finding 6). apm's own flags
 // are consumed and never reach the binary; everything after `--` reaches the binary verbatim and is never read by apm.
 
+/**
+ * Never taken as a flag's value: anything shaped like an option. `apm publish --tag --dry-run` is refused for a tag with no
+ * value rather than publishing with the tag "--dry-run", and `--tag --help` prints help. A value that starts with a dash
+ * is written `--reason=-x`.
+ */
+export function takesValue(next: string | undefined): next is string {
+  return next !== undefined && !next.startsWith("-");
+}
+
+/**
+ * A short flag: -h is --help and -D is --dev; any other is kept under its own spelling (`-E`), so the command refuses
+ * it as unknown instead of reading it as a package name.
+ */
+export function shortFlag(a: string): string | null {
+  if (a.length < 2 || !a.startsWith("-") || a.startsWith("--")) return null;
+
+  return a === "-h" ? "help" : a === "-D" ? "dev" : a;
+}
+
 /** The flags `apm x` reads, and whether each takes a value. */
 export const X_FLAGS: ReadonlyMap<string, "switch" | "value"> = new Map([
   ["strict", "switch"],
@@ -44,12 +63,18 @@ export function splitXArgs(rest: readonly string[], valueFlags: ReadonlySet<stri
     const key = a.startsWith("--") ? (eq > 0 ? a.slice(2, eq) : a.slice(2)) : null;
 
     if (spec === null) {
-      if (key === null) {
+      const short = shortFlag(a);
+      const next = rest[i + 1];
+
+      if (short !== null) {
+        flags.set(short, true);
+      } else if (key === null) {
         spec = a;
       } else if (eq > 0) {
         flags.set(key, a.slice(eq + 1));
-      } else if (valueFlags.has(key) && i + 1 < rest.length) {
-        flags.set(key, rest[++i] ?? "");
+      } else if (valueFlags.has(key) && takesValue(next)) {
+        flags.set(key, next);
+        i++;
       } else {
         flags.set(key, true);
       }
@@ -57,11 +82,17 @@ export function splitXArgs(rest: readonly string[], valueFlags: ReadonlySet<stri
       continue;
     }
 
+    // help is apm's anywhere before --: `apm x tool -- --help` asks the binary for its own
+    if (a === "--help" || a === "-h") {
+      flags.set("help", true);
+      continue;
+    }
+
     const kind = key === null ? undefined : X_FLAGS.get(key);
 
     if (key !== null && kind !== undefined) {
       if (eq > 0) flags.set(key, a.slice(eq + 1));
-      else if (kind === "value" && i + 1 < rest.length) flags.set(key, rest[++i] ?? "");
+      else if (kind === "value" && takesValue(rest[i + 1])) flags.set(key, rest[++i] ?? "");
       else flags.set(key, true);
       continue;
     }

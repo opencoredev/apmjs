@@ -1609,29 +1609,33 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
           return got;
         };
 
-        // the analyses, the decided outcomes and the live dismissals in one round trip, as upstreamAnalyses reads them
-        // for one package: the walk reads them once a level
-        const row = yield* run(
+        // the analyses, the decided outcomes and the live dismissals in one statement, so from one snapshot, as
+        // upstreamAnalyses reads them for one package: the walk reads them once a level. Each is a row of its own, so a
+        // row holds one analysis at most: every stored analysis of next as one jsonb_agg value was tens of MB, which the
+        // connection dropped (production, 2026-11-25)
+        const items = yield* run(
           "upstreamAnalysesOf",
-          sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
-                   FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS decided,
-                (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
-                   FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL) AS dismissals`,
-          one(
-            z.object({
-              analyses: z.array(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
-              decided: z.array(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
-              dismissals: z.array(DismissalRow),
-            }),
+          sql`SELECT 'analysis' AS kind, u.package, u.version, u.digest, row_number() OVER (ORDER BY u.scorer) AS seq, u.analysis AS payload
+                FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+              UNION ALL
+              SELECT 'decided', o.package, o.version, o.digest, row_number() OVER (ORDER BY o.scorer), jsonb_build_object('outcome', o.outcome, 'detail', o.detail)
+                FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL
+              UNION ALL
+              SELECT 'dismissal', e.package, e.version, e.digest, row_number() OVER (ORDER BY e.dismissed_at, e.id), to_jsonb(e)
+                FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL
+              ORDER BY seq`,
+          all(
+            z.discriminatedUnion("kind", [
+              z.object({ kind: z.literal("analysis"), package: z.string(), version: z.string(), digest: z.string(), payload: z.unknown() }),
+              z.object({ kind: z.literal("decided"), package: z.string(), version: z.string(), digest: z.string().nullable(), payload: z.object({ outcome: UnscorableReason, detail: z.string().nullable() }) }),
+              z.object({ kind: z.literal("dismissal"), payload: DismissalRow }),
+            ]),
           ),
         );
 
-        const rows = row?.analyses ?? [];
-        const decided = row?.decided ?? [];
-        const dismissals = row?.dismissals ?? [];
+        const rows = items.flatMap((i) => (i.kind === "analysis" ? [{ package: i.package, version: i.version, digest: i.digest, analysis: i.payload }] : []));
+        const decided = items.flatMap((i) => (i.kind === "decided" ? [{ package: i.package, version: i.version, digest: i.digest, ...i.payload }] : []));
+        const dismissals = items.flatMap((i) => (i.kind === "dismissal" ? [i.payload] : []));
 
         for (const r of rows) for (const score of currentScore(r.analysis, dismissalsFor(dismissals.filter((d) => d.package === r.package), r.version, r.digest))) of(r.package).scores.set(`${r.version} ${r.digest}`, score);
 
