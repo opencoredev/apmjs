@@ -112,6 +112,17 @@ export class Lease {
     return Math.max(0, Math.min(this.limit - this.counted, this.parent?.headroom ?? Number.POSITIVE_INFINITY));
   }
 
+  /**
+   * Takes as much of `max` as fits, halving it down to `min`: what was taken, 0 when not even `min` fits. For a read
+   * bounded by an allowance (a statement that sends only what fits it): the allowance is reserved before it is sent, so
+   * neither this lease nor the pool can be passed by the reply, and settled to what the reply holds once it is read.
+   */
+  takeUpTo(max: number, min: number): number {
+    for (let n = Math.min(max, this.headroom); n >= min && n > 0; n = Math.floor(n / 2)) if (this.take(n)) return n;
+
+    return 0;
+  }
+
   /** Nothing more fits: a read would be refused at its first kept byte. */
   get exhausted(): boolean {
     return this.full() || !this.pool.hasRoom();

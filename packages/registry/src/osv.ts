@@ -22,7 +22,7 @@ import { z } from "zod";
 import { isPossibleNpmName, isValidPackageName } from "@apm/core";
 import { matchWithin, within } from "./deadline.ts";
 import { readCapped } from "./http.ts";
-import { type Lease, RequestMemory } from "./memory.ts";
+import { ISOLATE_POOL, type Lease, RequestMemory } from "./memory.ts";
 import { WEIGHTS } from "./packument-read.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
@@ -34,7 +34,8 @@ export type ListedMalicious = { name: string; version: string; ids: string[] };
 const RangeEvents = z.array(z.object({ introduced: z.string().optional(), fixed: z.string().optional(), last_affected: z.string().optional(), limit: z.string().optional() }));
 
 /** One MAL- advisory's affected versions of one npm name: the exact versions it lists and its ranges. */
-const AdvisorySchema = z.object({ id: z.string(), versions: z.array(z.string()), ranges: z.array(RangeEvents) });
+/** `every`: withheld unread by apm, so it names every version of the name (everyVersion), never one OSV wrote. */
+const AdvisorySchema = z.object({ id: z.string(), versions: z.array(z.string()), ranges: z.array(RangeEvents), every: z.literal(true).optional() });
 
 export type Advisory = z.infer<typeof AdvisorySchema>;
 
@@ -89,7 +90,7 @@ class OverCap extends Error {}
 class OverBudget extends Error {}
 
 /** What a MAL- advisory apm did not read for being past a bound is taken to name: every version of the name. */
-const everyVersion = (id: string): Advisory => ({ id, versions: [], ranges: [[{ introduced: "0" }]] });
+const everyVersion = (id: string): Advisory => ({ id, versions: [], ranges: [[{ introduced: "0" }]], every: true });
 
 /**
  * What reading one advisory holds of the request's lease (RequestMemory), per byte. While it is read: the chunks
@@ -179,6 +180,48 @@ type NameState = { complete: Stamp | null; readonly ids: Map<string, Observation
 /** The isolate's knowledge per name, by OSV root and name, least recently updated first. */
 const NAMES = new Map<string, NameState>();
 
+/**
+ * The most the isolate keeps of names' advisories, as weight (their text, PARSE_WEIGHT a character), taken from the
+ * isolate's pool while kept (Sol on fb84083: the kept advisories were bounded by count only, and charged to the request
+ * that read them, past its end). Oldest names go first; a name that does not fit is not kept.
+ */
+const NAMES_WEIGHT = 2 * 1024 * 1024;
+
+/** The weight each kept name holds, under `namesLease` (opened on first use). */
+const NAMES_HELD = new Map<string, number>();
+let namesLease: Lease | null = null;
+
+/** Lets go of the name under `key` and what it holds. */
+function forget(key: string): void {
+  namesLease?.give(NAMES_HELD.get(key) ?? 0);
+  NAMES_HELD.delete(key);
+  NAMES.delete(key);
+}
+
+/** `state` kept for `key`, newest, charged its weight; the oldest names let go of while it does not fit, and it too when it still does not. */
+function keep(key: string, state: NameState): void {
+  const lease = (namesLease ??= ISOLATE_POOL.cache(NAMES_WEIGHT));
+  const weight = [...state.ids].reduce((n, [id, o]) => n + (id.length + (o.advisory === null ? 0 : JSON.stringify(o.advisory).length)) * PARSE_WEIGHT, 0);
+
+  forget(key);
+
+  for (const oldest of NAMES.keys()) {
+    if (NAMES.size < MAX_NAMES && lease.take(weight)) {
+      NAMES.set(key, state);
+      NAMES_HELD.set(key, weight);
+
+      return;
+    }
+
+    forget(oldest);
+  }
+
+  if (lease.take(weight)) {
+    NAMES.set(key, state);
+    NAMES_HELD.set(key, weight);
+  }
+}
+
 /** The order of this isolate's asks of OSV about names; a copy from the data center's cache is 0. */
 let asks = 0;
 
@@ -188,7 +231,7 @@ let asks = 0;
  * else the newest complete answer, which said it was not listed. So an answer that lands after a newer one changes
  * nothing the newer one said. Observations and the complete stamp past NAME_STALE_MS are dropped.
  */
-function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): void {
+function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): NameState {
   const { key, stamp } = input;
   const state = NAMES.get(key) ?? { complete: null, ids: new Map<string, Observation>() };
 
@@ -203,13 +246,9 @@ function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; 
   for (const [id, o] of state.ids) if (input.now - o.at >= NAME_STALE_MS) state.ids.delete(id);
 
   if (state.complete !== null && input.now - state.complete.at >= NAME_STALE_MS) state.complete = null;
-  NAMES.delete(key);
-  NAMES.set(key, state);
+  keep(key, state);
 
-  for (const oldest of NAMES.keys()) {
-    if (NAMES.size <= MAX_NAMES) break;
-    NAMES.delete(oldest);
-  }
+  return state;
 }
 
 /** Whether the newest complete answer of the name under `key` was asked for at `stamp`. */
@@ -219,26 +258,48 @@ const newestComplete = (key: string, stamp: Stamp): boolean => {
   return c !== null && c.at === stamp.at && c.seq === stamp.seq;
 };
 
-/** The advisories of the name under `key` that its newest observations name at `now`, each while it is young enough. */
-function answerOf(key: string, now: number): Advisory[] {
-  return [...(NAMES.get(key)?.ids.values() ?? [])].flatMap((o) => (o.advisory !== null && o.at <= now && now - o.at < NAME_STALE_MS ? [o.advisory] : []));
+/** The advisories `state` (a name's) names by its newest observations at `now`, each while it is young enough. */
+function answerOf(state: NameState | undefined, now: number): Advisory[] {
+  return [...(state?.ids.values() ?? [])].flatMap((o) => (o.advisory !== null && o.at <= now && now - o.at < NAME_STALE_MS ? [o.advisory] : []));
 }
 
 /** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
 const sharedKey = (key: string): Request => new Request(`https://osv-cache.apmjs.internal/v2/${encodeURIComponent(key)}`);
 
 /** The data center's copy of a name's advisories, or null: none outside a Worker, a miss, a late or unreadable one. */
-async function sharedRead(key: string): Promise<NameEntry | null> {
+/**
+ * The most of a copy read from the data center's cache: past it, a miss. It is read under the request's `lease` as an
+ * advisory is (READ_WEIGHT, PARSE_WEIGHT), and is a miss when that does not fit (Sol on fb84083: read whole, uncharged).
+ */
+const SHARED_MAX_BYTES = 1024 * 1024;
+
+async function sharedRead(key: string, lease: Lease | null): Promise<NameEntry | null> {
   if (typeof caches === "undefined") return null;
-  const got = await matchWithin({ cache: caches.default, key: sharedKey(key), ms: SHARED_MS, operation: "osv-copy" });
+  const room = SHARED_MAX_BYTES * READ_WEIGHT;
 
-  if (got.kind !== "hit") return null;
-  const body = await within(got.res.json(), SHARED_MS);
+  if (lease !== null && !lease.take(room)) return null;
 
-  if (body.kind !== "done") return null;
-  const parsed = NameEntry.safeParse(body.value);
+  try {
+    const got = await matchWithin({ cache: caches.default, key: sharedKey(key), ms: SHARED_MS, operation: "osv-copy" });
 
-  return parsed.success ? parsed.data : null;
+    if (got.kind !== "hit") return null;
+    const bytes = await within(readCapped(got.res, SHARED_MAX_BYTES), SHARED_MS);
+
+    if (bytes.kind !== "done" || bytes.value === null) return null;
+    const parsing = bytes.value.length * PARSE_WEIGHT;
+
+    if (lease !== null && !lease.take(parsing)) return null;
+
+    try {
+      const parsed = NameEntry.safeParse(JSON.parse(new TextDecoder().decode(bytes.value)));
+
+      return parsed.success ? parsed.data : null;
+    } finally {
+      lease?.give(parsing);
+    }
+  } finally {
+    lease?.give(room);
+  }
 }
 
 /** What the Worker keeps running after the response (ctx.waitUntil), or null outside one. */
@@ -259,12 +320,14 @@ const WRITING = new Map<string, Promise<void>>();
 function sharedWrite(key: string, stamp: Stamp, entry: NameEntry, background: FeedBackground): void {
   if (typeof caches === "undefined" || !newestComplete(key, stamp)) return;
 
+  // the next write waits for this put itself, not for the response's wait on it: a put past SHARED_WRITE_MS keeps running,
+  // and one after it must not finish first (Sol on fb84083)
   const put = (WRITING.get(key) ?? Promise.resolve())
     .then(async () => {
       if (!newestComplete(key, stamp)) return;
       const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
 
-      await within(caches.default.put(sharedKey(key), res), SHARED_WRITE_MS);
+      await caches.default.put(sharedKey(key), res);
     })
     .catch(() => undefined);
 
@@ -273,7 +336,7 @@ function sharedWrite(key: string, stamp: Stamp, entry: NameEntry, background: Fe
     if (WRITING.get(key) === put) WRITING.delete(key);
   });
 
-  if (background !== null) background(put);
+  if (background !== null) background(within(put, SHARED_WRITE_MS).then(() => undefined));
 }
 
 
@@ -359,9 +422,13 @@ function inRange(events: z.infer<typeof RangeEvents>, version: string): boolean 
   return affected;
 }
 
-/** Whether one advisory names `version`: listed exactly, or within one of its ranges. */
+/**
+ * Whether one advisory names `version`: every version when apm withheld it unread (everyVersion), SemVer or not (Sol on
+ * fb84083: its range from 0 missed a version npm lists outside SemVer's grammar); else listed exactly, or within one of
+ * its ranges.
+ */
 function affects(a: Advisory, version: string): boolean {
-  if (a.versions.includes(version)) return true;
+  if (a.every === true || a.versions.includes(version)) return true;
   const valid = semver.valid(version);
 
   return valid !== null && a.ranges.some((events) => inRange(events, valid));
@@ -479,6 +546,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         /** The MAL- ids whose advisory was read: what OSV says of them now is in `advisories`, a withdrawal included. */
         const read = new Set<string>();
         const withheld = new Set<string>();
+        /** MAL- ids whose read failed and that no later page's read has recovered. */
+        const failed = new Set<string>();
         /** Advisory reads started, against MAX_ADVISORIES. */
         let reads = 0;
         let token: string | undefined;
@@ -525,6 +594,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           details.forEach((d, i) => {
             const id = ids[i] ?? "";
 
+            failed.delete(id);
+
             if (d.kind === "read") {
               read.add(id);
               advisories.push(...d.advisories);
@@ -532,9 +603,11 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
               return;
             }
 
-            complete = false;
-
-            if (d.kind === "withheld") withheld.add(id);
+            if (d.kind === "failed") failed.add(id);
+            else {
+              complete = false;
+              withheld.add(id);
+            }
           });
 
           token = first.next_page_token;
@@ -547,7 +620,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           }
         }
 
-        return { advisories, complete, read, withheld };
+        // a read that failed and was recovered on a later page leaves the answer complete (Sol on fb84083)
+        return { advisories, complete: complete && failed.size === 0, read, withheld };
       });
 
     /**
@@ -567,16 +641,23 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           const key = `${baseUrl} ${name}`;
           const lease = Option.getOrNull(yield* Effect.serviceOption(RequestMemory));
 
+          /**
+           * What is known of the name: the isolate's, else what this request took in and the isolate could not keep
+           * (keep), so an answer it read is never left out for want of room.
+           */
+          let mine: NameState | undefined;
+          const known = (): NameState | undefined => NAMES.get(key) ?? mine;
+
           const fresh = (now: number): boolean => {
-            const at = NAMES.get(key)?.complete?.at ?? null;
+            const at = known()?.complete?.at ?? null;
 
             return at !== null && at <= now && now - at < NAME_FRESH_MS;
           };
 
           const asked = Date.now();
 
-          if (fresh(asked)) return answerOf(key, asked);
-          const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
+          if (fresh(asked)) return answerOf(known(), asked);
+          const shared = yield* Effect.promise(() => sharedRead(key, lease).catch(() => null));
           // the cache read is waited for: what it found, and what another request learned meanwhile, is judged as of
           // when it came back (Sol on 6f206c5)
           const now = Date.now();
@@ -584,13 +665,13 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           // a copy from the data center's cache is a complete answer like this isolate's own, fresh or stale: it retires
           // what older answers said of the advisories it leaves out
           if (shared !== null && shared.fetchedAt <= now && now - shared.fetchedAt < NAME_STALE_MS) {
-            observe({ key, stamp: { at: shared.fetchedAt, seq: 0 }, read: new Set(shared.advisories.map((a) => a.id)), found: shared.advisories, complete: true, now });
+            mine = observe({ key, stamp: { at: shared.fetchedAt, seq: 0 }, read: new Set(shared.advisories.map((a) => a.id)), found: shared.advisories, complete: true, now });
           }
 
-          if (fresh(now)) return answerOf(key, now);
+          if (fresh(now)) return answerOf(known(), now);
 
           // OSV is not asked: what is known, each advisory while it is young enough (fail open past that)
-          if (stopped || spent() >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return answerOf(key, now);
+          if (stopped || spent() >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return answerOf(known(), now);
           // stamped as the ask starts
           const stamp: Stamp = { at: Date.now(), seq: ++asks };
           const got = yield* Effect.result(askName(name, lease));
@@ -601,10 +682,10 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           if (Result.isSuccess(got) && got.success.complete) {
             const { advisories, read } = got.success;
 
-            observe({ key, stamp, read, found: advisories, complete: true, now: after });
+            mine = observe({ key, stamp, read, found: advisories, complete: true, now: after });
             sharedWrite(key, stamp, { fetchedAt: stamp.at, advisories }, background);
 
-            return answerOf(key, after);
+            return answerOf(known(), after);
           }
 
           console.error(JSON.stringify({ event: "osv-name", name, error: Result.isSuccess(got) ? "partial answer" : String(got.failure) }));
@@ -615,7 +696,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             // the first page went unanswered: OSV is taken as down at this root for a while
             BACKOFF.set(baseUrl, stamp.at + NAME_BACKOFF_MS);
 
-            return answerOf(key, after);
+            return answerOf(known(), after);
           }
 
           // a partial answer is OSV's word on the advisories it read (a withdrawal included), never on the name: it is
@@ -623,8 +704,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           // here, whatever was known of it. The next request asks again
           const { read, advisories, withheld } = got.success;
 
-          observe({ key, stamp, read, found: advisories, complete: false, now: after });
-          const answer = [...answerOf(key, after).filter((a) => !withheld.has(a.id)), ...[...withheld].map(everyVersion)];
+          mine = observe({ key, stamp, read, found: advisories, complete: false, now: after });
+          const answer = [...answerOf(known(), after).filter((a) => !withheld.has(a.id)), ...[...withheld].map(everyVersion)];
 
           partials.set(name, answer);
 

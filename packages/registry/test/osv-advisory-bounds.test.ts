@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { Effect, Layer } from "effect";
 import { z } from "zod";
 import { readCapped } from "../src/http.ts";
-import { type Lease, MemoryPool, RequestMemory } from "../src/memory.ts";
+import { ISOLATE_POOL, type Lease, MemoryPool, RequestMemory } from "../src/memory.ts";
 import { KnownMalicious, listedAmong, MAX_ADVISORIES, MAX_ADVISORY_BYTES, osvFeed, type Advisory } from "../src/osv.ts";
 
 /**
@@ -146,6 +146,27 @@ describe("one name's advisory reads are bounded", () => {
       ["MAL-2026-11", ["1.0.0"]],
       ["MAL-2026-12", ["1.0.0"]],
     ]);
+    // Sol on fb84083: recovered, the answer is complete and kept, so the next request reads nothing
+    await s.ask();
+    expect(s.counts.reads.get("MAL-2026-11")).toBe(2);
+  });
+
+  // Sol on fb84083: a withheld advisory's range from 0 named only versions SemVer reads
+  test("an advisory withheld unread names every version npm lists, SemVer or not", async () => {
+    const s = standIn("odd-versions", { pages: [["MAL-2026-15"]], huge: new Set(["MAL-2026-15"]) });
+
+    expect([...listedAmong("odd-versions", await s.ask(), ["1.0.0", "1.0", "v2", "latest-build"]).keys()]).toEqual(["1.0.0", "1.0", "v2", "latest-build"]);
+  });
+
+  // Sol on fb84083: what the isolate kept of a name was charged to the request that read it, and to nothing after
+  test("what the isolate keeps of a name's advisories stays charged to its pool after the request", async () => {
+    const before = ISOLATE_POOL.charged;
+    const lease = ISOLATE_POOL.request();
+    const s = standIn("kept-charged", { pages: [["MAL-2026-16"]], lease });
+
+    await s.ask();
+    lease.release();
+    expect(ISOLATE_POOL.charged).toBeGreaterThan(before);
   });
 
   // Sol on de628d8: what a read of an advisory holds was charged to nothing

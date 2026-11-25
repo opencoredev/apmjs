@@ -65,7 +65,10 @@ function fakeNpm(initial: Record<string, Doc[]>) {
 
     const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(times.get(`${name}@${d.version}`) ?? NOW - (20 - i) * DAY).toISOString()]));
 
-    return JSON.stringify({ name, "dist-tags": { ...tags.get(name), latest: vs.at(-1)?.version ?? "" }, versions, time });
+    // a tag set to "" is left out: a package npm names no latest of
+    const distTags = Object.fromEntries(Object.entries({ latest: vs.at(-1)?.version ?? "", ...tags.get(name) }).filter(([, v]) => v !== ""));
+
+    return JSON.stringify({ name, "dist-tags": distTags, versions, time });
   };
 
   const server = Bun.serve({
@@ -110,13 +113,13 @@ const Body = z
 
 const settings = (npm: string) => ({ baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm, legacyAuth: false, namePolicy: "open", admins: [] }) as const;
 
-/** The OSSF feed, standing in: it lists each `name@version` of `listed` under MAL-TEST, and no advisory of a name. */
+/** The OSSF feed, standing in: it lists each `name@version` of `listed` under MAL-TEST, by version and by name. */
 const feedListing = (listed: readonly string[]) =>
   Layer.succeed(
     KnownMalicious,
     KnownMalicious.of({
       lookup: (pkgs) => Effect.succeed(pkgs.filter((p) => listed.includes(`${p.name}@${p.version}`)).map((p) => ({ name: p.name, version: p.version, ids: ["MAL-TEST"] }))),
-      advisoriesFor: () => Effect.succeed([]),
+      advisoriesFor: (name) => Effect.succeed(listed.flatMap((l) => (l.startsWith(`${name}@`) ? [{ id: "MAL-TEST", versions: [l.slice(name.length + 1)], ranges: [] }] : []))),
     }),
   );
 
@@ -1549,5 +1552,83 @@ describe("what needs no score is checked of a version whose analysis does not fi
       expect(r.status).toBe(503);
       expect(r.text).toContain(OVER_BUDGET_TEXT);
       expect(r.text).not.toContain("No package named");
+    }));
+
+  /** `path` through upstreamRoute with rigLayers. */
+  const route = async (input: { url: string; npm: string; path: string; viaSafe: boolean; store?: (s: StoreApi) => StoreApi; listed?: readonly string[] }) => {
+    const req = new Request(`http://registry.test${input.path}`);
+    const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), input.viaSafe), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
+  };
+
+  // Review of fb84083: the statement was sent the lease's headroom as its allowance, reserved from nothing, so a reply
+  // could pass the isolate's pool before it was charged
+  test("a read of analyses reserves its allowance before it is sent", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+      const lease = new MemoryPool().request();
+      const seen: { allowance: number; taken: number }[] = [];
+      const watched = (s: StoreApi): StoreApi => ({ ...s, upstreamAnalysesWithin: (input) => Effect.suspend(() => (seen.push({ allowance: input.allowance, taken: lease.taken }), s.upstreamAnalysesWithin(input))) });
+
+      try {
+        expect((await resolve({ url, npm: npm.url, name: "app", store: watched, lease })).status).toBe(200);
+        expect(seen.length).toBeGreaterThan(0);
+
+        for (const call of seen) {
+          // on fb84083: 72 MiB of headroom sent, about 0.1 MiB taken
+          expect(call.allowance).toBeLessThanOrEqual(16 * 1024 * 1024);
+          expect(call.taken).toBeGreaterThanOrEqual(call.allowance);
+        }
+      } finally {
+        lease.release();
+      }
+    }));
+
+  // Review of fb84083: an unread root was a 503 before its candidates' state was checked, so one the feed lists all of
+  // was not refused as such
+  test("a root whose analyses do not fit still has its candidates checked against the feed: all listed is a 422", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("rootlisted", [doc("rootlisted", "1.0.0"), doc("rootlisted", "1.1.0")]);
+      await scored(sql, "rootlisted", "1.1.0");
+      const listed = ["rootlisted@1.0.0", "rootlisted@1.1.0"];
+
+      for (const strict of [false, true]) {
+        const r = await resolve({ url, npm: npm.url, name: "rootlisted", range: "^1.0.0", strict, store: capped(0), listed });
+
+        // on fb84083: 503, the budget
+        expect(r.status).toBe(422);
+        expect(r.text).toContain("MAL-TEST");
+      }
+
+      // one not listed is a 503 naming the budget, never answered without its score
+      const one = await resolve({ url, npm: npm.url, name: "rootlisted", range: "^1.0.0", store: capped(0), listed: ["rootlisted@1.1.0"] });
+
+      expect(one.status).toBe(503);
+      expect(one.text).toContain(OVER_BUDGET_TEXT);
+    }));
+
+  // the plain tarball takes the fast path (fast-tarball.ts), which reads no score
+  test("a ~safe tarball the feed lists is refused as listed when its package's analyses do not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("tarlisted", [doc("tarlisted", "1.0.0")]);
+      await scored(sql, "tarlisted", "1.0.0");
+      const r = await route({ url, npm: npm.url, path: "/tarlisted/-/tarlisted-1.0.0.tgz", viaSafe: true, store: capped(0), listed: ["tarlisted@1.0.0"] });
+
+      // on fb84083: 503
+      expect(r.status).toBe(403);
+    }));
+
+  // Review of fb84083: with no latest tag from npm, latest was read as an exact version, so ~safe's fallback had no scores
+  test("~safe/latest of a package npm names no latest of answers the highest version the view keeps", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("nolatest", [doc("nolatest", "1.0.0")]);
+      npm.tags.set("nolatest", { latest: "" });
+      await scored(sql, "nolatest", "1.0.0");
+      const r = await route({ url, npm: npm.url, path: "/nolatest/latest", viaSafe: true });
+
+      // on fb84083: 404
+      expect(r.status).toBe(200);
+      expect(r.text).toContain('"_apmScore"');
     }));
 });

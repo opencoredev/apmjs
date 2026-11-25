@@ -342,6 +342,15 @@ function wantedKeys(name: string, versions: readonly Omit<VersionRecord, "score"
 
 const NO_ANALYSES: UpstreamAnalyses = { scores: new Map(), unscorable: new Map() };
 
+/**
+ * The most a read of analyses reserves before it is sent (Lease.takeUpTo), and the least worth sending it for: what
+ * does not fit is omitted, and its package answered as not checked. Twenty next-like dependencies, trimmed, hold 1.3
+ * MiB; a reservation is taken from the pool only for as long as the statement runs (Sol on fb84083: the lease's
+ * headroom was sent as the allowance without being reserved, so a reply could pass the pool before it was charged).
+ */
+const ANALYSES_READ_ALLOWANCE = 16 * 1024 * 1024;
+const ANALYSES_READ_MIN = 64 * 1024;
+
 /** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
 export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> =>
   Effect.map(store.upstreamAnalysesFor(wantedKeys(name, versions, want)), (got) => got.get(name) ?? NO_ANALYSES);
@@ -356,7 +365,11 @@ const wantedWithin = (store: StoreApi, name: string, versions: readonly Omit<Ver
     const keys = wantedKeys(name, versions, want);
 
     if (keys.length === 0) return NO_ANALYSES;
-    const read = yield* store.upstreamAnalysesWithin({ keys, allowance: lease.headroom, weights: KEPT_TEXT_WEIGHTS });
+    const allowance = lease.takeUpTo(ANALYSES_READ_ALLOWANCE, ANALYSES_READ_MIN);
+    const read = yield* store.upstreamAnalysesWithin({ keys, allowance, weights: KEPT_TEXT_WEIGHTS }).pipe(Effect.onError(() => Effect.sync(() => lease.give(allowance))));
+
+    // settled to what the reply holds: given back, and what is kept taken again at once
+    lease.give(allowance);
 
     if (read.omitted.has(name) || !lease.take((read.sizes.get(name) ?? []).reduce((n, s) => n + parsedWeight(s), 0))) return null;
 
@@ -1846,7 +1859,15 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
 
               // the statement sends only the analyses that fit the lease's headroom, smallest first, so the reply is
               // bounded before it is sent; on 216a4c7 it was held, parsed and kept with the tree charged to nothing
-              const got = yield* store.upstreamAnalysesWithin({ keys, allowance: lease.headroom, weights: KEPT_TEXT_WEIGHTS }).pipe(Effect.onError(() => Effect.sync(() => lease.give(picked.reduce((n, p) => n + p.weight, 0)))));
+              const pickedWeight = picked.reduce((n, p) => n + p.weight, 0);
+
+              picked.length = 0;
+              first.length = 0;
+              const allowance = lease.takeUpTo(ANALYSES_READ_ALLOWANCE, ANALYSES_READ_MIN);
+              const got = yield* store.upstreamAnalysesWithin({ keys, allowance, weights: KEPT_TEXT_WEIGHTS }).pipe(Effect.onError(() => Effect.sync(() => lease.give(pickedWeight + allowance))));
+
+              // settled to what the reply holds: given back, and what each package keeps taken again at once
+              lease.give(allowance);
               /** What each package's analyses hold once read, taken from `lease` while its answer holds them. */
               const held = new Map<string, number>();
               /**
@@ -1901,6 +1922,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               /**
                * kept, handed `p`'s picks: their charge is given back as keep starts, since keep reserves all it keeps of
                * them itself, as it did of a whole package, and taken again when it did not fit, for one more try alone.
+               * Its caller lets go of `p` as it settles it, so past keep nothing refers to what was given back (Sol on
+               * fb84083: the picks stayed reachable from the batch while later packages and plans were kept).
                */
               const settled = (p: Picked, last: boolean): ChosenAnswer<S> => {
                 lease.give(p.weight);
@@ -1924,10 +1947,16 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                 return unread.has(p.name) ? { kind: "unread", summary: answer.summary } : answer;
               };
 
-              const out = new Map<string, ChosenAnswer<S>>([...picks].map(([name, p]) => [name, p.kind === "picked" ? settled(p.picked, false) : p] as const));
+              const out = new Map<string, ChosenAnswer<S>>();
+
+              // each pick is let go of as it is settled, so what its charge was given back for is referred to no more
+              for (const [name, p] of picks) {
+                picks.delete(name);
+                out.set(name, p.kind === "picked" ? settled(p.picked, false) : p);
+              }
 
               // a package whose answer did not fit beside the others is kept again alone, once every other is
-              for (const p of again) out.set(p.name, settled(p, true));
+              for (let p = again.shift(); p !== undefined; p = again.shift()) out.set(p.name, settled(p, true));
 
               if (plans.length === 0) return out;
               const writer = yield* Effect.serviceOption(ChoicesWriter);

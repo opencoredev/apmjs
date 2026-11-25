@@ -3060,9 +3060,6 @@ const CONFIRMED_SKIP = "confirmed malicious by an apm reviewer";
 
 const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
 
-/** A resolve's root as read: one kept without its analyses is over budget, since the answer embeds its report whole. */
-const rootRead = (got: CatalogRead): Lookup => (got !== null && got !== "unknown" && got !== "over-budget" && got.kind === "unread" ? "over-budget" : got);
-
 /**
  * A resolve whose root could not be looked up, or did not fit the request: nothing to install and not a pass, so a 503 a
  * retry may get past, naming which (an absent root is a 404).
@@ -3093,7 +3090,8 @@ type ResolveMode = { strict: boolean; final: boolean };
 /** A later page of a resolve's root, read under `lease` (rootPage): the catalog, or why it could not be read. */
 type PageRead = (offset: number, lease: Lease) => ReturnType<typeof catalogWithin>;
 
-type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; mode: ResolveMode; lease: Lease; page: PageRead; allowance: QueueAllowance };
+/** `scored`: whether `src` was read with its analyses; one kept without them (unread) still has its candidates' state checked. */
+type PassInput = { name: string; range: string; policy: Policy; treePolicy: Policy; target: InstallTarget; project: ProjectDeps; src: Catalog; scored: boolean; mode: ResolveMode; lease: Lease; page: PageRead; allowance: QueueAllowance };
 
 const resolvePass = (input: PassInput) =>
   Effect.suspend(() => {
@@ -3198,6 +3196,7 @@ const resolveWalk = (input: PassInput) =>
     let looked = 0;
     let offset = 0;
     let page = src;
+    let scored = input.scored;
     let pageLease: Lease | null = null;
     const newest = src.versions[0];
     const knownMalicious: ListedMalicious[] = [];
@@ -3225,6 +3224,18 @@ const resolveWalk = (input: PassInput) =>
 
         if (!current.includes(v0)) break;
         looked++;
+
+        // the page's analyses did not fit: a candidate the feed or apm's reviewers refuse is skipped as ever, since that
+        // needs no score, and the first one left cannot be answered for (Sol on fb84083)
+        if (!scored) {
+          const listedHere = listed.get(v0.version);
+          const hard = confirmed.has(v0.version) ? CONFIRMED_SKIP : listedHere ? maliciousText(listedHere) : null;
+
+          if (hard === null) return answered(rootUnread(name, range, "over-budget"));
+          skip({ version: v0.version, reason: hard, revokeReason: null });
+          continue;
+        }
+
         // analyze a bounded number of candidates; upstream analysis means downloading the tarball
         // a capped resolve (anonymous) spends its root slot only on a candidate a score could still let through: one
         // apm has not scored or decided on, from npm, not confirmed malicious, and (strict) past the cooldown
@@ -3261,7 +3272,7 @@ const resolveWalk = (input: PassInput) =>
       pageLease?.release();
       pageLease = nextLease;
 
-      const read = rootRead(got);
+      const read = got;
 
       if (read === null || read === "unknown" || read === "over-budget") {
         const why = read === "over-budget" ? `: ${OVER_BUDGET_TEXT}, so` : ` ${UNAVAILABLE_TEXT}:`;
@@ -3269,7 +3280,8 @@ const resolveWalk = (input: PassInput) =>
         return answered(json({ error: `${name}${why} apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
       }
 
-      page = read;
+      scored = read.kind !== "unread";
+      page = read.kind === "unread" ? read.src : read;
     }
 
     const newestReport = newest ? reportFor(newest, at) : null;
@@ -3444,7 +3456,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
     const candidates: KeyedSelect = { key: rootKey(range, 0), select: (full) => rootPage(full, range, 0) };
     // a later page of the root's candidates, when the first is all skipped (review of 2fbf383, finding 4)
     const page: PageRead = (offset, under) => catalogWithin(name, under, { key: rootKey(range, offset), select: (full) => rootPage(full, range, offset) });
-    let src = rootRead(yield* catalogWithin(name, rootLease, candidates));
+    let src = yield* catalogWithin(name, rootLease, candidates);
 
     /** The root read afresh: the catalog it replaces is given back. */
     const reload = Effect.gen(function* () {
@@ -3453,7 +3465,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
       rootLease.release();
       rootLease = next;
 
-      return rootRead(got);
+      return got;
     });
 
     const configured = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
@@ -3465,7 +3477,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
       if (src === null) return fail(404, `No package named ${name}.`);
 
       if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
-      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease, allowance });
+      const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src: src.kind === "unread" ? src.src : src, scored: src.kind !== "unread", page, mode: { strict, final: false }, lease, allowance });
 
       if (pass.kind === "answer") return pass.response;
 
@@ -3485,7 +3497,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
         if (src === null) return fail(404, `No package named ${name}.`);
 
         if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
-        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease, allowance });
+        const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src: src.kind === "unread" ? src.src : src, scored: src.kind !== "unread", page, mode: { strict, final: true }, lease, allowance });
 
         if (last.kind === "answer") return last.response;
       }
@@ -4213,7 +4225,8 @@ const routeWanted = (input: { name: string; rest: readonly string[]; viaSafe: bo
   if (input.rest.length === 0 && input.abbreviated && !input.viaSafe) return () => new Map();
 
   return (pkg) => {
-    const exact = input.rest.length === 1 && spec !== undefined && tagTarget(pkg.distTags, spec) === undefined;
+    // latest is answered from the kept versions when npm's latest is not among them, or npm names none (filterDistTags)
+    const exact = input.rest.length === 1 && spec !== undefined && spec !== "latest" && tagTarget(pkg.distTags, spec) === undefined;
 
     return new Map((exact ? [spec] : pkg.versions.map((v) => v.version)).map((v) => [v, "trimmed"] as const));
   };
@@ -4269,8 +4282,19 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     const src = yield* lookupWithin(sp.name, lease, routeWanted({ name: sp.name, rest: sp.rest, viaSafe, abbreviated }));
 
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
-    // client retries, never "Not found", which npm reports as a package that does not exist
-    if (src === "unknown" || src === "over-budget") return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    // client retries, never "Not found", which npm reports as a package that does not exist. A version the request names
+    // that the OSSF feed lists is refused first, as it would be with the package read: that needs neither (Sol on fb84083)
+    if (src === "unknown" || src === "over-budget") {
+      const tarball = sp.rest[0] === "-" && sp.rest[1] !== undefined;
+      const named = tarball ? tarballVersion(sp.name, sp.rest[1] ?? "") : sp.rest.length === 1 ? (sp.rest[0] ?? null) : null;
+      const listedHere = named === null ? undefined : (yield* listedVersionsOf(sp.name, [named])).get(named);
+
+      if (listedHere && tarball) return fail(403, listedTarballText(listedHere), { knownMalicious: listedHere });
+
+      if (listedHere) return fail(404, `${maliciousText(listedHere)}, so apm does not serve it.`, { knownMalicious: listedHere });
+
+      return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    }
 
     if (!src || src.kind !== "upstream") return null;
     const at = yield* now;
