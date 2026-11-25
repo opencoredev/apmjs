@@ -5,6 +5,7 @@
 // DatabuddyRouteLoader adds it later when the visitor reaches a public page by the client router.
 import { Suspense } from "react";
 import { databuddyLoaderScript } from "@/lib/analytics";
+import { AnalyticsEvents } from "./analytics-events";
 import { DatabuddyRouteLoader } from "./databuddy-route-loader";
 
 /** Databuddy's client id, inlined at build time; "" on every build but production's. */
@@ -17,15 +18,19 @@ export function Databuddy() {
 }
 
 /**
- * The client-router half of the loader, for the body; nothing without a client id. usePathname suspends while a
- * route's params are unknown at prerender (Cache Components), so it sits in its own boundary with no fallback.
+ * The client-router half of the loader and the listener for declared click and copy events, for the body; nothing
+ * without a client id. usePathname suspends while a route's params are unknown at prerender (Cache Components), so
+ * the route loader sits in its own boundary with no fallback.
  */
 export function DatabuddyNavigation() {
   if (CLIENT_ID === "") return null;
 
   return (
-    <Suspense fallback={null}>
-      <DatabuddyRouteLoader />
-    </Suspense>
+    <>
+      <Suspense fallback={null}>
+        <DatabuddyRouteLoader />
+      </Suspense>
+      <AnalyticsEvents />
+    </>
   );
 }

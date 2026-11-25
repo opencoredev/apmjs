@@ -553,7 +553,7 @@ const CODE_EXT = /\.(?:[cm]?[jt]sx?|sh|bash|ps1|py|cmd|bat)$/i;
  * when code reaches them by a path apm can resolve; otherwise they are left out, or every README with
  * `curl ... | sh` in its install instructions would read as a dropper.
  */
-const NOT_CODE = /(?:^|\/)(?:readme|changelog|changes|history|license|licence|copying|authors|contributors|notice|security|code_of_conduct)(?:\.[\w.-]*)?$|\.(?:md|markdown|mdx|txt|rst|adoc|d\.[cm]?ts|map|json|jsonc|json5|ya?ml|toml|css|scss|sass|less|styl|html?|svg|xml|csv|tsv|lock|flow)$/i;
+const NOT_CODE = /(?:^|\/)(?:readme|changelog|changes|history|license|licence|copying|authors|contributors|notice|security|code_of_conduct)(?:\.(?!(?:[\w.-]*\.)?(?:[cm]?[jt]sx?|sh|bash|ps1|py|cmd|bat)$)[\w.-]*)?$|\.(?:md|markdown|mdx|txt|rst|adoc|d\.[cm]?ts|map|json|jsonc|json5|ya?ml|toml|css|scss|sass|less|styl|html?|svg|xml|csv|tsv|lock|flow)$/i;
 
 /**
  * Executables and native modules, listed as `binary` and not read as code: a native name, or an ELF or Mach-O file
