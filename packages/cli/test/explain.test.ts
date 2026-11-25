@@ -230,6 +230,14 @@ describe("the CLI against a stand-in registry", () => {
             );
           }
 
+          // a dependency the OSSF malicious-packages feed lists (registry osv.ts): a 422 with nothing skipped
+          if (name === "feeddep") {
+            return Response.json(
+              { error: "feeddep@1.2.3 would install evil-dep@6.6.6 (MAL-2026-1), which the OSSF malicious-packages feed lists as malicious.", name, range: "latest", version: null, skipped: [], newest: { version: "1.2.3", report: null }, knownMalicious: [{ name: "evil-dep", version: "6.6.6", ids: ["MAL-2026-1"] }] },
+              { status: 422 },
+            );
+          }
+
           // the agent-native policy: the newest version is inside the cooldown, the one below it is past it
           if (name === "hono") {
             const range = url.searchParams.get("range") ?? "";
@@ -317,6 +325,14 @@ describe("the CLI against a stand-in registry", () => {
 
     expect(text.code).toBe(1);
     expect(text.out).not.toContain("run: ");
+  });
+
+  // 2026-11-25: a dependency on the OSSF malicious-packages list read as review-first, since nothing was skipped
+  test("apm explain refuses a package whose dependency the OSSF malicious-packages feed lists, citing the advisory", async () => {
+    const r = await apm(["explain", "feeddep"]);
+
+    expect(r.code).toBe(1);
+    expect(r.json).toMatchObject({ verdict: "do-not-install", commands: null, reasons: expect.arrayContaining(["Advisory: https://osv.dev/vulnerability/MAL-2026-1"]) });
   });
 
   // re-review finding 2: publisher text (a yank reason) in the verdict was a live Markdown link and HTML

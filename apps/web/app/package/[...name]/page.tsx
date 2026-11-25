@@ -16,6 +16,7 @@ import { RegistryUnavailable } from "@/components/registry-unavailable";
 import { FileView } from "@/components/file-view";
 import { OpenDetailsLink } from "@/components/open-details-link";
 import { citeEvidence } from "@/lib/evidence";
+import { clickEvent } from "@/lib/databuddy-client";
 import { citedLine } from "@/lib/file-excerpt";
 import { limitationCount, sortLimitations, splitPossible, splitTestFile, summarizeLimitations, type ReadingLimit } from "@/lib/limitations";
 import { fileHref, packagePath, parsePackageRoute } from "@/lib/package-route";
@@ -111,7 +112,7 @@ function Evidence(props: { signal: string; evidence: string; name: string; versi
 
   return (
     // a full page load: the file view reads the #L anchor when it starts
-    <a href={link.href} className={`group -mr-2 block rounded-r-md py-1 pr-2 transition-colors hover:border-inverse-muted hover:bg-inverse-raised ${row}`}>
+    <a href={link.href} {...clickEvent({ name: "evidence_opened", props: { package: props.name, signal: props.signal } })} className={`group -mr-2 block rounded-r-md py-1 pr-2 transition-colors hover:border-inverse-muted hover:bg-inverse-raised ${row}`}>
       <span className="text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] group-hover:decoration-inverse-foreground">{link.cite}</span>
       {link.rest}
       {note}
@@ -237,7 +238,7 @@ function NoteEvidence(props: { signal: string; evidence: string; name: string; v
   return (
     <>
       {" ("}
-      <a href={link.href} className="font-mono text-[12.5px] text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground [overflow-wrap:anywhere]">
+      <a href={link.href} {...clickEvent({ name: "evidence_opened", props: { package: props.name, signal: props.signal } })} className="font-mono text-[12.5px] text-inverse-foreground underline decoration-inverse-muted/60 underline-offset-[3px] hover:decoration-inverse-foreground [overflow-wrap:anywhere]">
         {link.cite}
       </a>
       <span className="[overflow-wrap:anywhere]">{link.rest})</span>

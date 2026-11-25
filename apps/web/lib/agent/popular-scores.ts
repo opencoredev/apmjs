@@ -27,7 +27,17 @@ export function popularScores(input: { load: () => Promise<Fetched<PopularScores
       const scores = await all.get(
         "all",
         async () => {
-          const r = await input.load();
+          // a load that rejects (the 12 badges of a HEAD and a GET of / on 2026-11-25 did) is a miss like an outage,
+          // so no badge throws into the render
+          let r: Fetched<PopularScoresAnswer>;
+
+          try {
+            r = await input.load();
+          } catch (error) {
+            console.error(JSON.stringify({ event: "popular_scores_failed", error: error instanceof Error ? `${error.name}: ${error.message}` : "not an Error" }));
+
+            return null;
+          }
 
           if (r.kind !== "ok") return null;
           const out = new Map<string, PopularScore>();

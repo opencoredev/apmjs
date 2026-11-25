@@ -134,7 +134,7 @@ describe("reportRequestError", () => {
         message: "internal",
         errorType: "internal",
         filename: "web@b1",
-        stack: "worker=web code=internal status=500 route=GET_render_package colo=SJC build=b1",
+        stack: "worker=web code=internal status=- route=GET_render_package colo=SJC build=b1",
       },
     ]);
   });

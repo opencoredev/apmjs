@@ -139,6 +139,7 @@ export const ResolveRefusedWire = z.object({
   skipped: Skipped,
   newest: z.object({ version: z.string() }).loose().nullish(),
   confirmed: z.array(DepRefWire).default([]),
+  knownMalicious: z.array(z.object({ name: z.string(), version: z.string(), ids: z.array(z.string()) })).default([]),
 });
 
 /**
@@ -147,7 +148,7 @@ export const ResolveRefusedWire = z.object({
  */
 export type ResolveOutcome =
   | { kind: "ok"; version: string; source: string; report: { score: number; grade: string; signals: Signal[]; notChecked: string[]; coverage?: ReportCoverage | null; scorer: string | null } | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable" };
 
@@ -180,7 +181,13 @@ export function parseResolve(status: number, body: Json | null): ResolveOutcome 
   if (status === 422) {
     const refused = ResolveRefusedWire.safeParse(body);
 
-    return refused.success ? { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped, confirmed: refused.data.confirmed } : { kind: "unavailable" };
+    if (!refused.success) return { kind: "unavailable" };
+
+    const out: Extract<ResolveOutcome, { kind: "refused" }> = { kind: "refused", reason: refused.data.error, newest: refused.data.newest?.version ?? null, skipped: refused.data.skipped, confirmed: refused.data.confirmed };
+
+    if (refused.data.knownMalicious.length > 0) out.knownMalicious = refused.data.knownMalicious;
+
+    return out;
   }
 
   if (status === 404) {
