@@ -591,6 +591,8 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(1);
     expect(r.err.includes("package.json lists react@^19.0.0, which package-lock.json does not pin")).toBe(refused);
+    expect(r.err.includes("npm did not rewrite package-lock.json for the removal")).toBe(!refused);
+    expect(r.pmCalls.some((call) => call.includes("npm install --package-lock-only"))).toBe(!refused);
     expect(r.pmCalls.some((call) => call.includes(" remove ") || call.includes(" uninstall "))).toBe(false);
   });
 
