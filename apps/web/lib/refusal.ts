@@ -4,6 +4,7 @@
 // dependency the OSSF feed lists or an apm reviewer confirmed). The package page, its Markdown view and the MCP tool
 // lead with this instead of install commands.
 import type { ResolveOutcome } from "./agent/source";
+import type { PublicState } from "./review-schema";
 
 export type Refusal =
   | { readonly kind: "revoked"; readonly pending: boolean }
@@ -24,22 +25,29 @@ export type MaliciousDependency = { readonly name: string; readonly version: str
  */
 export type PolicyRead = { readonly kind: "installs" } | { readonly kind: "not-asked" } | { readonly kind: "refused"; readonly refusal: Refusal } | { readonly kind: "unknown" };
 
-/** What the page already has of the shown version, which decides whether resolve is asked about it (looksRisky). */
-export type RiskInput = { readonly score: { readonly score: number; readonly grade: string; readonly signals: readonly { readonly id: string }[] } | null; readonly installScripts: boolean | null };
+/**
+ * What the page already has of the shown version, which decides whether resolve is asked about it (looksRisky): its
+ * score, whether it runs install scripts, and its public AI review's state (null when it has none or it was not read).
+ */
+export type RiskInput = {
+  readonly score: { readonly score: number; readonly grade: string; readonly signals: readonly { readonly id: string }[] } | null;
+  readonly installScripts: boolean | null;
+  readonly review: PublicState | null;
+};
 
 // a signal about install scripts (install-script, install-download, install-network, install-shell) or malware
 const RISKY_SIGNAL = /^install-|malicious/;
 
 /**
  * Whether the shown version looks risky from what the page has: no score yet, a score under 40 (grade F), an install
- * script, or a signal about install scripts or malware. Only then is resolve asked: one resolve is a dependency walk on
+ * script, a signal about install scripts or malware, or an AI review flag a person is checking. Only then is resolve asked: one resolve is a dependency walk on
  * the registry, too much to add to every view of react or next. A clean, scored version that the registry refuses
  * anyway (a malicious release with a high score) is refused by apm add, as before.
  */
 export function looksRisky(input: RiskInput): boolean {
   const { score } = input;
 
-  if (score === null || input.installScripts === true) return true;
+  if (score === null || input.installScripts === true || input.review === "under-review") return true;
 
   return score.score < 40 || score.grade === "F" || score.signals.some((s) => RISKY_SIGNAL.test(s.id));
 }
@@ -114,16 +122,20 @@ export function resolveRefusal(input: { name: string; version: string; outcome: 
 }
 
 /**
- * Whether apm installs `version`: its status when that refuses it, else, when it looks risky (looksRisky, from `risk`),
- * one resolve for exactly that version; otherwise resolve is not asked.
+ * Whether apm installs `version`: its status when that refuses it, then a public review apm reviewers confirmed, else,
+ * when it looks risky (looksRisky, from `risk`), one resolve for exactly that version; otherwise resolve is not asked.
  */
 export async function readPolicy(input: { name: string; version: string; status: string; risk: Promise<RiskInput>; resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome> }): Promise<PolicyRead> {
   const { name, version } = input;
   const byStatus = statusRefusal(input.status);
 
   if (byStatus) return { kind: "refused", refusal: byStatus };
+  const risk = await input.risk;
 
-  if (!looksRisky(await input.risk)) return { kind: "not-asked" };
+  // apm reviewers confirmed it, as the page's header says: resolve skips such a version whatever its score
+  if (risk.review === "confirmed") return { kind: "refused", refusal: { kind: "confirmed-malicious" } };
+
+  if (!looksRisky(risk)) return { kind: "not-asked" };
   const refusal = resolveRefusal({ name, version, outcome: await input.resolve({ name, range: version }) });
 
   if (refusal === "unknown") return { kind: "unknown" };

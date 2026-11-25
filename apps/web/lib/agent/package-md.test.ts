@@ -171,6 +171,23 @@ describe("loadPackageView", () => {
     for (const p of risky) expect(await calls(p)).toEqual(["resolve left-pad@1.3.0"]);
   });
 
+  test("a high-scoring version apm reviewers confirmed: do not install, no commands, and no resolve call", async () => {
+    const clean = pkg();
+
+    if (!clean.score || !REVIEW_CLEAN.review) throw new Error("fixtures have a score and a review");
+    const p = pkg({ score: { ...clean.score, score: 96, grade: "A", signals: [] } });
+    const confirmed = { ...REVIEW_CLEAN, review: { ...REVIEW_CLEAN.review, state: "confirmed" as const } };
+    const source = fakeSource({ packages: { "left-pad": p }, reviews: { "left-pad@1.3.0": confirmed }, resolve: () => resolvedTo("1.3.0") });
+    const loaded = await loadPackageView({ name: "left-pad", version: null, registry: REGISTRY, source });
+
+    if (loaded.kind !== "ok") throw new Error(JSON.stringify(loaded));
+    const md = packageMarkdown(loaded.view);
+
+    expect(md).toContain("- Status: do not install. apm reviewers confirmed it is malicious, so apm add refuses it.");
+    expect(md).not.toContain("npm install left-pad");
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual([]);
+  });
+
   test("an older version reads that version's score", async () => {
     const score = pkg().score;
 

@@ -942,7 +942,8 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const versionScoreRead = shown && !isLatest ? reads.score(shown) : Promise.resolve(none);
   // apm's install policy for exactly this version (the read /api/explain makes), asked only when its score marks it risky
   // (lib/refusal.ts looksRisky); only the install box waits for it
-  const risk = isLatest ? Promise.resolve({ score: pkg.score, installScripts: pkg.facts?.installScripts ?? null }) : versionScoreRead.then((s) => ({ score: s.kind === "ok" ? s.value : null, installScripts: null }));
+  const reviewState = review.then((r) => (r.kind === "ok" ? (r.value.review?.state ?? null) : null));
+  const risk = Promise.all([isLatest ? Promise.resolve(pkg.score) : versionScoreRead.then((s) => (s.kind === "ok" ? s.value : null)), reviewState]).then(([score, state]) => ({ score, installScripts: isLatest ? (pkg.facts?.installScripts ?? null) : null, review: state }));
   const policy = readPolicy({ name: pkg.name, version, status, risk, resolve: registrySource.resolve });
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
   const [versionScore, detailsRead] = await Promise.all([versionScoreRead, versionDetails]);
