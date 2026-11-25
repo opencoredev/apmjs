@@ -1,9 +1,13 @@
 // How `apm x` splits its arguments between apm and the binary it runs (review of 96f0ba7, finding 6). apm's own flags
 // are consumed and never reach the binary; everything after `--` reaches the binary verbatim and is never read by apm.
 
-/** Never taken as a flag's value: `apm publish --tag --help` prints help rather than publishing with the tag "--help". */
+/**
+ * Never taken as a flag's value: anything shaped like an option. `apm publish --tag --dry-run` is refused for a tag with no
+ * value rather than publishing with the tag "--dry-run", and `--tag --help` prints help. A value that starts with a dash
+ * is written `--reason=-x`.
+ */
 export function takesValue(next: string | undefined): next is string {
-  return next !== undefined && next !== "--help" && next !== "-h" && next !== "--";
+  return next !== undefined && !next.startsWith("-");
 }
 
 /**
@@ -75,6 +79,12 @@ export function splitXArgs(rest: readonly string[], valueFlags: ReadonlySet<stri
         flags.set(key, true);
       }
 
+      continue;
+    }
+
+    // help is apm's anywhere before --: `apm x tool -- --help` asks the binary for its own
+    if (a === "--help" || a === "-h") {
+      flags.set("help", true);
       continue;
     }
 

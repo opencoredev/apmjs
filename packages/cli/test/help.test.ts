@@ -109,11 +109,13 @@ describe("--help and -h", () => {
   for (const cmd of NAMES) {
     const real = REAL[cmd] ?? [];
 
-    // x reads flags only before the package: after it, --help is the binary's (apm x tool --help runs tool --help)
     const placements: [string, string[]][] = [
       ["first", ["--help", ...real]],
       ["-h first", ["-h", ...real]],
-      ...(cmd === "x" ? [] : ([["last", [...real, "--help"]], ["-h last", [...real, "-h"]]] satisfies [string, string[]][])),
+      ["last", [...real, "--help"]],
+      ["-h last", [...real, "-h"]],
+      // after --, apm x's arguments are the binary's (apm x tool -- --help is the binary's help)
+      ...(["x", "exec", "dlx"].includes(cmd) ? [] : ([["after --", [...real, "--", "--help"]]] satisfies [string, string[]][])),
       ["with --json", ["--json", "--help", ...real]],
     ];
 
@@ -143,11 +145,20 @@ describe("--help and -h", () => {
     expectNothingRan(r);
   });
 
-  test("apm help publish is apm publish --help", async () => {
-    const [a, b] = [await apm(["help", "publish"]), await apm(["publish", "--help"])];
+  test.each([["publish"], ["exec"], ["dlx"], ["i"]])("apm help %s is apm %s --help", async (cmd) => {
+    const [a, b] = [await apm(["help", cmd]), await apm([cmd, "--help"])];
 
     expect(a.out).toBe(b.out);
+    expect(a.out).toStartWith("usage: apm ");
     expectNothingRan(a);
+  });
+
+  test("apm x tool --help is apm x's help; the binary's help is after --", async () => {
+    const r = await apm(["x", "cowsay", "--help"]);
+
+    expect(r.out).toStartWith("usage: apm x");
+    expect(r.out).toContain("apm x tool -- --help");
+    expectNothingRan(r);
   });
 });
 
@@ -171,6 +182,15 @@ describe("a flag a command does not read", () => {
     [["revoke", "a@1.0.0", "b@1.0.0", "--reason", "x"], "apm revoke takes one argument"],
     [["audit", "--reason", "x"], "unknown flag --reason for apm audit"],
     [["add", "zod", "--save-dev"], "unknown flag --save-dev for apm add"],
+    [["publish", "--bump", "patch", "--tag", "--dry-run"], "--tag needs a value"],
+    [["publish", "--tag", "--bogus"], "--tag needs a value"],
+    [["incident", "--since", "2026-11-01T00:00:00Z", "--reason", "--dry-run"], "--reason needs a value"],
+    [["publish", "--constructor", "--bump", "patch"], "unknown flag --constructor for apm publish"],
+    [["publish", "--__proto__"], "unknown flag --__proto__ for apm publish"],
+    [["add", "zod", "--", "zod2"], "unknown flag -- for apm add"],
+    [["install", "--size", "zod"], "unknown flag --size for apm install"],
+    [["install", "--pm"], "--pm needs a value"],
+    [["run", "dev", "--pm"], "--pm needs a value"],
   ])("apm %p: %s", async (argv, message) => {
     const r = await apm(argv);
 
@@ -220,6 +240,18 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code).toBe(0);
     expect(r.pmCalls).toEqual(["bun install --frozen-lockfile"]);
+  });
+
+  test("apm constructor --help is the package manager's, not a crash", async () => {
+    const r = await apm(["constructor", "--help"]);
+
+    expect(r.pmCalls).toEqual(["bun constructor --help"]);
+  });
+
+  test("apm's --pm is read only before --; after it, it is the package manager's", async () => {
+    const r = await apm(["run", "--pm", "npm", "dev", "--", "--pm", "pnpm"]);
+
+    expect(r.pmCalls).toEqual(["npm run dev -- --pm pnpm"]);
   });
 
   test("apm run dev --help is the package manager's", async () => {

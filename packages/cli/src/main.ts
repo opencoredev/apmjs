@@ -22,7 +22,7 @@ import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
-import { argsError, COMMANDS } from "./commands.ts";
+import { argsError, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2298,17 +2298,20 @@ const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain"
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const args = a.raw.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm");
+  // apm's --pm is taken out only before --; after it, every argument is the package manager's
+  const end = a.raw.indexOf("--");
+  const own = end === -1 ? a.raw : a.raw.slice(0, end);
+  const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
 
   return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
-  if (a.cmd === "help") return COMMANDS[a.positional[0] ?? ""]?.help ?? HELP;
+  if (a.cmd === "help") return helpTopic(a.positional[0] ?? "")?.help ?? HELP;
   if (a.cmd === "--help" || a.cmd === "-h") return HELP;
 
-  return COMMANDS[a.cmd] !== undefined && has(a, "help") ? (COMMANDS[a.cmd]?.help ?? null) : null;
+  return has(a, "help") ? (commandOf(a.cmd)?.help ?? null) : null;
 }
 
 /**
@@ -2322,7 +2325,13 @@ function refuseArgs(a: Args): boolean {
     return true;
   }
 
-  const command = COMMANDS[a.cmd];
+  if (a.flags.get("pm") === true) {
+    fail("apm: --pm needs a value (bun, npm, pnpm or yarn). Nothing was run.");
+
+    return true;
+  }
+
+  const command = commandOf(a.cmd);
 
   if (command === undefined || ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0)) return false;
   const error = argsError(a, command);

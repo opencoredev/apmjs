@@ -48,8 +48,9 @@ export const COMMANDS: Readonly<Record<string, Command>> = {
     help: `usage: apm x [flags] <package>[@version] [args...] [-- args...]   (also apm exec, apm dlx)
 
 Shows the package's risk card and any warning, then runs its binary (bunx / npx). Flags before the package are apm's.
-After it, apm's own flags below are still apm's; every other argument is the binary's (apm x tool --help runs
-tool --help), and after -- every argument goes to the binary unread.
+After it, apm's own flags below and --help and -h are still apm's; every other argument is the binary's
+(apm x tool --version runs tool --version), and after -- every argument goes to the binary unread
+(apm x tool -- --help prints the binary's help).
 
   --strict, --force, --no-cooldown, --cooldown <duration>, --floor <n>, --ignore-scripts   as for apm add
   --pm bun|npm|pnpm|yarn   the package manager to run
@@ -133,11 +134,28 @@ then uploads it. With a login token the version is staged until you approve it.
   },
 };
 
+/** The command apm runs itself under this name, by own property only (`apm constructor` is the package manager's). */
+export function commandOf(name: string): Command | undefined {
+  return Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
+}
+
+/** The flags that take the next argument as their value: the command's own, or only --pm for a package manager's command. */
+export function valueFlagsOf(name: string): ReadonlySet<string> {
+  const flags = commandOf(name)?.flags ?? COMMON;
+
+  return new Set(Object.entries(flags).flatMap(([key, kind]) => (kind === "value" ? [key] : [])));
+}
+
+/** The help `apm help <topic>` prints: exec and dlx are x. */
+export function helpTopic(topic: string): Command | undefined {
+  return commandOf(topic === "exec" || topic === "dlx" ? "x" : topic);
+}
+
 /** Why apm refuses these arguments before running anything, or null when it runs them. */
 export function argsError(a: Args, command: Command): string | null {
   for (const [key, value] of a.flags) {
     const shown = key.startsWith("-") ? key : `--${key}`;
-    const kind = command.flags[key];
+    const kind = Object.hasOwn(command.flags, key) ? command.flags[key] : undefined;
 
     if (kind === undefined) return `unknown flag ${shown} for apm ${a.cmd}`;
     if (kind === "value" && value === true) return `${shown} needs a value`;
