@@ -20,7 +20,8 @@ import { cachedAuthConfig } from "@/lib/auth-config";
 import { cliDownload, isCliRoute, type CliBucket } from "@/lib/cli-download";
 import { forwardingHeaders } from "@/lib/client-ip";
 import { fileStatus, packageStatus } from "@/lib/package-status";
-import { parsePackageRoute, type PackageRoute } from "@/lib/package-route";
+import { canonicalPackagePath } from "@/lib/agent/site";
+import { parsePackageRoute, parseVersionRoute } from "@/lib/package-route";
 import { forwardToRegistry, isRegistryPath } from "@/lib/registry-proxy";
 import { REGISTRY } from "@/lib/registry-url";
 import { securityHeaders } from "@/lib/security-headers";
@@ -30,14 +31,27 @@ function forwardedHeaders(request: NextRequest): Headers {
   return forwardingHeaders(request.headers);
 }
 
-/** The package route a /package/... path names; null when it names none. */
-function packageRoute(pathname: string): PackageRoute | null {
+/** The path segments after /package/, still percent-encoded. */
+function packageSegments(pathname: string): string[] {
   const segs = pathname.slice("/package/".length).split("/");
 
   // "/package/zod/" is the same page as "/package/zod"
   if (segs.length > 1 && segs.at(-1) === "") segs.pop();
 
-  return parsePackageRoute(segs);
+  return segs;
+}
+
+/** /package/<name>/v/<version> to the version's page, /package/<name>?v=<version>, keeping the rest of the query. */
+function versionRedirect(request: NextRequest): Response | null {
+  const { pathname } = request.nextUrl;
+  const version = pathname.startsWith("/package/") ? parseVersionRoute(packageSegments(pathname)) : null;
+
+  if (!version) return null;
+  const target = new URL(canonicalPackagePath(version.name), request.url);
+  target.search = request.nextUrl.search;
+  target.searchParams.set("v", version.version);
+
+  return NextResponse.redirect(target, 308);
 }
 
 const BucketBinding = z.object({ get: z.instanceof(Function), head: z.instanceof(Function) });
@@ -68,13 +82,17 @@ export async function proxy(request: NextRequest): Promise<Response> {
     return (await cachedAuthConfig(request, { registry: REGISTRY, dev })) ?? forwardToRegistry(request, { registry: REGISTRY, headers, dev });
   }
 
+  const moved = versionRedirect(request);
+
+  if (moved) return moved;
+
   // /package/<name>.md and ?format=md: the Markdown view for agents, rendered by app/api/package-md
   const md = request.method === "GET" || request.method === "HEAD" ? markdownRoute(request.nextUrl) : null;
 
   if (md) return NextResponse.rewrite(new URL(markdownApiPath(md), request.url), { request: { headers } });
   const prefetch = request.headers.has("next-router-prefetch") || request.headers.get("purpose") === "prefetch";
   const checked = pathname.startsWith("/package/") && (request.method === "GET" || request.method === "HEAD") && !prefetch;
-  const route = checked ? packageRoute(pathname) : undefined;
+  const route = checked ? parsePackageRoute(packageSegments(pathname)) : undefined;
   const missing = () => NextResponse.rewrite(new URL("/package-missing", request.url), { status: 404, request: { headers } });
 
   if (route === null) return missing();
