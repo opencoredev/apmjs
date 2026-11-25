@@ -1,7 +1,9 @@
 // Checks a deployed stage the way people use it: stock bun and npm install real npm packages through it, apm add
 // refuses a low-score package, a login token stages a publish that goes live only after a TOTP approval, and
 // bun audit reads advisories through it, and the stage's own CLI install script (/install) installs apm into a fresh
-// HOME after checking its SHA-256. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No package install
+// HOME after checking its SHA-256. The website's explain must answer a large package (next) and refuse a version the OSSF
+// malicious-packages feed lists, which the registry must withhold from its packuments and refuse as a tarball, all read
+// without installing. Prints one PASS/FAIL line per check; exits non-zero on any FAIL. No package install
 // it runs executes a package's install script, and the raw npm and bun installs install committed lockfiles (smoke-commands.ts,
 // smoke-fixtures/): what a registry answers never runs code here and cannot add a dependency. That the registry
 // resolves versions is checked by reading its metadata, without installing.
@@ -177,6 +179,70 @@ async function resolution(): Promise<void> {
   }
 
   record(wrong.length === 0, "the registry resolves every locked version to the lockfile's integrity, tarball URL and dependencies, and latest is a listed version (metadata only, nothing installed)", wrong.length === 0 ? `${all.size} versions` : wrong.join("; "));
+}
+
+// ---------- install verdicts and the OSSF feed ----------
+/**
+ * A read-only GET, bounded: its status (null when none came in time, the text then saying why), its text, and its body
+ * read as `schema` (null when it is not that).
+ */
+async function boundedGet<T>(url: string, timeoutMs: number, schema: z.ZodType<T>, accept = "application/json"): Promise<{ status: number | null; text: string; data: T | null }> {
+  try {
+    const res = await fetch(url, { headers: { accept, "cache-control": "no-cache" }, signal: AbortSignal.timeout(timeoutMs) });
+    const text = await res.clone().text();
+    const parsed = schema.safeParse(await res.json().catch(() => null));
+
+    return { status: res.status, text, data: parsed.success ? parsed.data : null };
+  } catch (e) {
+    return { status: null, text: e instanceof Error ? e.message : String(e), data: null };
+  }
+}
+
+/** A cold explain of a large package (next) takes about 10 s: it walks the whole dependency tree. */
+const EXPLAIN_MS = 30_000;
+const REGISTRY_MS = 15_000;
+const Explained = z.object({ verdict: z.string(), version: z.string().nullable(), reasons: z.array(z.string()) });
+const Refused = z.object({ error: z.string() });
+const Packument = z.object({ versions: z.record(z.string(), z.unknown()), "dist-tags": z.record(z.string(), z.string()) });
+
+/** What a failed bounded read says: the status and the start of the answer, or why none came. */
+const answerOf = (r: { status: number | null; text: string }): string => (r.status === null ? `no answer: ${r.text}` : `HTTP ${r.status} ${r.text.slice(0, 160)}`);
+
+/** The website's explain of a large package answers install with a version (a 503 on next went unnoticed before this). */
+async function largeExplain(): Promise<void> {
+  const t0 = Date.now();
+  const r = await boundedGet(`${web}api/explain?package=next`, EXPLAIN_MS, Explained);
+  const ok = r.status === 200 && r.data?.verdict === "install" && Boolean(r.data.version);
+
+  record(ok, "explain answers install with a version for a large package (next)", `${r.data ? `verdict ${r.data.verdict}, version ${r.data.version}` : answerOf(r)}, ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+}
+
+/**
+ * A version the OSSF malicious-packages feed lists (OSV MAL-2026-20430 lists ugent_uws 10.9.9 to 10.9.11; npm still
+ * serves them, 10.9.11 as latest): explain says do-not-install citing the id, the registry refuses its tarball with
+ * a 403 citing it (registry osv.ts listedTarballText), and neither packument view lists it or tags it latest.
+ */
+const OSSF_LISTED = { name: "ugent_uws", version: "10.9.11", id: "MAL-2026-20430" } as const;
+
+async function ossfListed(): Promise<void> {
+  const { name, version, id } = OSSF_LISTED;
+  const spec = `${name}@${version}`;
+  const explained = await boundedGet(`${web}api/explain?package=${encodeURIComponent(spec)}`, EXPLAIN_MS, Explained);
+  const cited = explained.data?.reasons.some((r) => r.includes(id)) === true;
+
+  record(explained.status === 200 && explained.data?.verdict === "do-not-install" && cited, `explain says do-not-install for an OSSF-listed version (${spec}), citing ${id}`, explained.data ? `verdict ${explained.data.verdict}, ${cited ? "cites" : "does not cite"} ${id}` : answerOf(explained));
+  const tarball = await boundedGet(`${registry}${name}/-/${name}-${version}.tgz`, REGISTRY_MS, Refused);
+  const refused = tarball.status === 403 && tarball.data?.error.includes(id) === true;
+
+  record(refused, `the registry refuses its tarball with 403, citing ${id}`, refused ? `HTTP 403, ${tarball.data?.error.slice(0, 120)}` : answerOf(tarball));
+
+  for (const [view, accept] of [["full", "application/json"], ["install", "application/vnd.npm.install-v1+json"]] as const) {
+    const r = await boundedGet(`${registry}${name}`, REGISTRY_MS, Packument, accept);
+    const listed = r.data ? Object.keys(r.data.versions) : [];
+    const latest = r.data?.["dist-tags"].latest;
+
+    record(r.status === 200 && listed.length > 0 && !listed.includes(version) && latest !== version, `the registry's ${view} packument of ${name} withholds ${version}: not in versions, not latest`, r.data ? `versions ${listed.join(", ")}, latest ${latest ?? "none"}` : answerOf(r));
+  }
 }
 
 /**
@@ -485,6 +551,10 @@ await cliInstall();
 await stockClients();
 
 await resolution();
+
+await largeExplain();
+
+await ossfListed();
 
 await apmWarning();
 
