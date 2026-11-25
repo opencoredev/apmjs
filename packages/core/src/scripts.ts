@@ -124,12 +124,46 @@ const VALUE_FLAG = new RegExp(
  * the flags after it (the regex did, in time quadratic in the script), and no list of a long command's words is built.
  */
 function inlineEval(cmd: string): boolean {
+  return flagEval(cmd) || valueFlagEval(cmd);
+}
+
+/** fe2e641's reading: an eval flag after any flags, each written as one word. */
+function flagEval(cmd: string): boolean {
+  const interpreter = new RegExp(INTERPRETER);
+  const word = new RegExp(NEXT_WORD);
+
+  for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
+    word.lastIndex = m.index + m[0].length;
+
+    for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
+      // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
+      const raw = w[1] ?? "";
+      const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
+      const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
+
+      if (EVAL_FLAG.test(flag)) return true;
+
+      if (!OTHER_FLAG.test(flag)) break;
+      interpreter.lastIndex = word.lastIndex;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * What the flag reading misses: an eval flag after a flag whose value is the next word (`--conditions dev -e …`). Node
+ * reads all its options before it runs anything, so an exit flag among them (`--version`) runs no code, wherever it is;
+ * past an eval argument split over several words, where the options end is not known and the eval stands.
+ */
+function valueFlagEval(cmd: string): boolean {
   const interpreter = new RegExp(INTERPRETER);
   const word = new RegExp(NEXT_WORD);
 
   for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
     word.lastIndex = m.index + m[0].length;
     let value = false;
+    let evalValue = false;
     let evals = false;
     let exits = false;
 
@@ -139,11 +173,14 @@ function inlineEval(cmd: string): boolean {
       const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
       const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
 
-      // node reads all its options before running anything, and prints and exits at these wherever they are
-      if (value) value = false;
+      if (evalValue) {
+        evalValue = false;
+
+        if (/^['"]/.test(raw) && !quoted) break;
+      } else if (value) value = false;
       else if (EVAL_FLAG.test(flag)) {
         evals = true;
-        value = !flag.includes("=");
+        evalValue = !flag.includes("=");
       } else if (NODE_EXITS.has(flag)) exits = true;
       else if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
       else break;

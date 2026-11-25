@@ -785,3 +785,10 @@ describe("words npm or node may not read as written", () => {
     expect(isInlineDownload("node '--title' fetch -e 'console.log(12345)' --version")).toBe(false);
   });
 });
+
+describe("node's exit flags never cost what fe2e641's eval reading finds", () => {
+  test("an eval fe2e641 reads stands, and an exit flag inside the eval code is code", () => {
+    expect(isInlineDownload("node '-e' 'fetch(\"data:,inline --help marker\").then(r=>r.text())'")).toBe(true);
+    expect(isInlineDownload("node --version -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
+  });
+});
