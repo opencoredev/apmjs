@@ -310,6 +310,22 @@ describe("osvFeed", () => {
     }
   });
 
+  // Greptile on ac3383b: the budget was wall-clock from the first lookup, so a walk slower than it skipped the feed
+  test("time spent outside OSV does not use the request's budget", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+
+    const slowWalk = Effect.gen(function* () {
+      const k = yield* KnownMalicious;
+      const first = yield* k.lookup([{ name: "evil-root", version: "1.0.0" }]);
+
+      yield* Effect.promise(() => Bun.sleep(REQUEST_BUDGET_MS + 200));
+
+      return [first, yield* k.lookup([{ name: "evil-dep", version: "1.0.0" }])];
+    });
+
+    expect(await Effect.runPromise(slowWalk.pipe(Effect.provide(osvFeed(root))))).toEqual([[{ name: "evil-root", version: "1.0.0", ids: ["MAL-2026-0001"] }], [{ name: "evil-dep", version: "1.0.0", ids: ["MAL-2026-0003"] }]]);
+  });
+
   // review of bb6c5ae, finding 3: a result with more pages was read as its first page alone, and kept as clean
   test("a version's next pages are read, and an answer missing a page is not kept", async () => {
     const root = `${osvServer.url.href}${crypto.randomUUID()}/`;

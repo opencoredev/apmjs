@@ -5,8 +5,8 @@
 // is not. A package published on this registry is not npm's, so callers ask only about npm's (listedOnNpm in apm.ts).
 //
 // One request spends at most REQUEST_BUDGET_MS waiting on OSV, across every lookup it makes (a resolve's root pages,
-// its walk and the walk again after a wait): the feed is built per request, and once the budget is spent, or OSV failed
-// once, the request reads only what is cached. A lookup OSV does not answer in full is logged, reads as nothing listed
+// its walk and the walk again after a wait): the feed is built per request, and only time spent waiting on OSV counts,
+// so a slow walk does not use it up. Once it is spent, or OSV failed once, the request reads only what is cached. A lookup OSV does not answer in full is logged, reads as nothing listed
 // (an outage of the feed must not stop installs) and is not kept; a full answer is kept per isolate for CACHE_MS.
 import { Context, Effect, Layer, Option, Result } from "effect";
 import { z } from "zod";
@@ -67,29 +67,36 @@ const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v
 /** The live feed at `baseUrl` (OSV's API root, ending in a slash), with one request's budget. */
 export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.Layer<KnownMalicious> {
   return Layer.sync(KnownMalicious, () => {
-    let deadline: number | null = null;
+    /** Time this request has spent waiting on OSV, and whether it stopped asking (a failure). */
+    let spentMs = 0;
+    let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
     /** POSTs `body` to OSV within the request's budget and parses the answer with `schema`. */
     const post = <S extends z.ZodType>(path: "v1/querybatch" | "v1/query", body: OsvBatchQuery | OsvPageQuery, schema: S) =>
       Effect.tryPromise({
         try: async (): Promise<z.output<S>> => {
-          deadline ??= Date.now() + REQUEST_BUDGET_MS;
-          const left = deadline - Date.now();
+          const left = REQUEST_BUDGET_MS - spentMs;
 
           if (left <= 0) throw new Error("the request's OSV budget is spent");
-          const res = await fetcher(`${baseUrl}${path}`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) });
+          const t0 = Date.now();
 
-          if (res.status !== 200) {
-            await res.body?.cancel();
-            throw new Error(`OSV answered ${res.status}`);
+          try {
+            const res = await fetcher(`${baseUrl}${path}`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) });
+
+            if (res.status !== 200) {
+              await res.body?.cancel();
+              throw new Error(`OSV answered ${res.status}`);
+            }
+
+            const parsed = schema.safeParse(await res.json());
+
+            if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
+
+            return parsed.data;
+          } finally {
+            spentMs += Date.now() - t0;
           }
-
-          const parsed = schema.safeParse(await res.json());
-
-          if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
-
-          return parsed.data;
         },
         catch: (cause) => cause,
       });
@@ -145,14 +152,14 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             else missing.push(p);
           }
 
-          for (let i = 0; i < missing.length && (deadline === null || deadline > Date.now()); i += OSV_BATCH) {
+          for (let i = 0; i < missing.length && !stopped && spentMs < REQUEST_BUDGET_MS; i += OSV_BATCH) {
             const chunk = missing.slice(i, i + OSV_BATCH);
             const got = yield* Effect.result(ask(chunk));
 
             if (Result.isFailure(got)) {
               console.error(JSON.stringify({ event: "osv-lookup", packages: chunk.length, error: String(got.failure) }));
               // no more waiting on OSV in this request: what is cached still counts
-              deadline = 0;
+              stopped = true;
               break;
             }
 
