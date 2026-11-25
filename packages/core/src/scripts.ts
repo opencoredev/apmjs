@@ -101,26 +101,7 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 
-// node prints and exits at these, written alone or with a value
-const NODE_EXIT = /^(?:--(?:version|help|v8-options|check)(?:=.*)?|-[vhc])$/;
-
-// an interpreter as the shell runs it (INTERPRETER), as one word
-const INTERPRETER_WORD = /^(?:node(?:js)?|bun|deno)(?:\.exe)?$/i;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
-
-// node's options that take the next word as their value (`--conditions dev`, `-r ./x`), from `node --help` (Node 18 to
-// 24); any other flag takes none, so the first other word is the program node runs and what follows is its own
-const VALUE_FLAG = new RegExp(
-  String.raw`^(?:-[rC]|--(?:${[
-    "conditions", "require", "import", "loader", "experimental-loader", "experimental-default-type", "input-type", "redirect-warnings", "title",
-    "env-file", "env-file-if-exists", "disable-warning", "watch-path", "watch-kill-signal", "unhandled-rejections", "dns-result-order",
-    "icu-data-dir", "openssl-config", "tls-cipher-list", "tls-keylog", "secure-heap", "secure-heap-min", "max-http-header-size",
-    "heapsnapshot-signal", "heapsnapshot-near-heap-limit", "trace-event-categories", "trace-event-file-pattern", "use-largepages",
-    "localstorage-file", "experimental-config-file", "report-dir", "report-directory", "report-filename", "report-signal", "diagnostic-dir",
-    "cpu-prof-dir", "cpu-prof-name", "cpu-prof-interval", "heap-prof-dir", "heap-prof-name", "heap-prof-interval", "inspect-port", "debug-port",
-    "test-reporter", "test-reporter-destination", "test-name-pattern", "test-skip-pattern", "test-concurrency", "test-shard", "test-timeout",
-  ].join("|")}))$`,
-);
 
 /**
  * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
@@ -129,11 +110,6 @@ const VALUE_FLAG = new RegExp(
  * the flags after it (the regex did, in time quadratic in the script), and no list of a long command's words is built.
  */
 function inlineEval(cmd: string): boolean {
-  return flagEval(cmd) || valueFlagEval(cmd);
-}
-
-/** fe2e641's reading: an eval flag after any flags, each written as one word. */
-function flagEval(cmd: string): boolean {
   const interpreter = new RegExp(INTERPRETER);
   const word = new RegExp(NEXT_WORD);
 
@@ -150,53 +126,6 @@ function flagEval(cmd: string): boolean {
 
       if (!OTHER_FLAG.test(flag)) break;
       interpreter.lastIndex = word.lastIndex;
-    }
-  }
-
-  return false;
-}
-
-/**
- * What the flag reading misses: an eval flag after a flag whose value is the next word (`--conditions dev -e …`), read
- * over the words the shell hands the interpreter, so a quoted eval argument is one word. Node reads all its options
- * before it runs anything, so an exit option among them (`--version`, `--help=true`) runs no code, wherever it is.
- */
-function valueFlagEval(cmd: string): boolean {
-  // a cheap test first: the walk below builds the words of the whole command
-  if (!new RegExp(INTERPRETER).test(cmd)) return false;
-  let walking = false;
-  let value = false;
-  let evalValue = false;
-  let evals = false;
-  let exits = false;
-
-  for (const t of [...shellWords(cmd), null]) {
-    if (walking && (t === null || t === "(" || t === ")" || (!value && !evalValue && t.expanded))) {
-      if (evals && !exits) return true;
-      walking = false;
-    }
-
-    if (t === null || t === "(" || t === ")") continue;
-    const w = t.word;
-
-    if (!walking) {
-      walking = INTERPRETER_WORD.test(w.slice(w.lastIndexOf("/") + 1));
-      value = evalValue = evals = exits = false;
-      continue;
-    }
-
-    if (evalValue || value) {
-      evalValue = value = false;
-    } else if (EVAL_FLAG.test(w)) {
-      evals = true;
-      evalValue = !w.includes("=");
-    } else if (NODE_EXIT.test(w)) {
-      exits = true;
-    } else if (OTHER_FLAG.test(w)) {
-      value = VALUE_FLAG.test(w);
-    } else {
-      if (evals && !exits) return true;
-      walking = false;
     }
   }
 

