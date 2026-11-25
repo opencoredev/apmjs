@@ -187,7 +187,8 @@ describe("a flag a command does not read", () => {
     [["publish", "./dist"], "apm publish takes no arguments"],
     [["revoke", "a@1.0.0", "b@1.0.0", "--reason", "x"], "apm revoke takes one argument"],
     [["audit", "--reason", "x"], "unknown flag --reason for apm audit"],
-    [["add", "zod", "--save-dev"], "unknown flag --save-dev for apm add"],
+    [["add", "zod", "--save-prod"], "unknown flag --save-prod for apm add"],
+    [["add", "zod", "--tag", "next"], "--tag is read only by your package manager's own install"],
     [["publish", "--bump", "patch", "--tag", "--dry-run"], "--tag needs a value"],
     [["publish", "--tag", "--bogus"], "--tag needs a value"],
     [["incident", "--since", "2026-11-01T00:00:00Z", "--reason", "--dry-run"], "--reason needs a value"],
@@ -263,6 +264,13 @@ describe("what still goes to the package manager", () => {
     const r = await apm(["run", "--pm", "npm", "dev", "--", "--pm", "pnpm"]);
 
     expect(r.pmCalls).toEqual(["npm run dev -- --pm pnpm"]);
+  });
+
+  test("apm install --tag next with no packages is the package manager's install, as on 0.1.3", async () => {
+    const r = await apm(["install", "--pm", "npm", "--tag", "next"]);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual(["npm install --tag next"]);
   });
 
   test("apm run dev --help is the package manager's", async () => {
