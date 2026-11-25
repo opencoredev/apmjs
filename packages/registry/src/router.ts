@@ -21,6 +21,10 @@ export const route = (req: Request) =>
     // a read the GET table (routes.ts) does not list is answered here, before any module could answer it
     if ((req.method === "GET" || req.method === "HEAD") && getRouteOf(url.pathname) === null) return fail(404, NO_GET_ROUTE);
 
+    // Postgres refuses a NUL in text, so a name carrying one (%00) ended as a store error: a 500 and an infra report for
+    // bad input
+    if (/%00/i.test(url.pathname) || [...url.searchParams.values()].some((v) => v.includes("\0"))) return fail(400, "The request must not contain a NUL character");
+
     if (isAuth) return yield* (yield* Auth).handler(req);
 
     const caller = yield* callerOf(req);
