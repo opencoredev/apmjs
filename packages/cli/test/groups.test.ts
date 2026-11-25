@@ -172,11 +172,8 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
 
     const config = (path: string | undefined) => {
       const p = project({ user });
-      const env: Record<string, string> = { HOME: p.env.HOME };
 
-      if (path !== undefined) env.PATH = path;
-
-      return loadConfig(p.root, env);
+      return loadConfig(p.root, path === undefined ? { HOME: p.env.HOME } : { HOME: p.env.HOME, PATH: path });
     };
 
     // Debian's npm 9.2 reads `[custom] ` as a key, so both lines below it are top-level, as npm itself uses them
