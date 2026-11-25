@@ -305,7 +305,7 @@ describe("default: a score, an incomplete or missing score, or a pending version
 
       expect(scored.status).toBe(200);
       expect(scored.body.tree?.blocks).toEqual([]);
-      expect(w).toMatchObject({ name: "cold-evil", version: "1.0.0", kind: "low-score", url: "http://web.test/package/cold-evil/v/1.0.0" });
+      expect(w).toMatchObject({ name: "cold-evil", version: "1.0.0", kind: "low-score", url: "http://web.test/package/cold-evil?v=1.0.0" });
       expect(w?.score ?? 100).toBeLessThan(40);
       expect(w?.grade).toBe("F");
       expect(w?.text).toContain(`scores ${w?.score}/100 (F)`);
@@ -376,7 +376,7 @@ describe("default: a score, an incomplete or missing score, or a pending version
 
       expect(warned.body.advisories.map((a) => a.level)).toEqual(["warn"]);
       expect(warned.body.advisories[0]?.description).toContain("cold-evil@1.0.0: scores");
-      expect(warned.body.warnings[0]?.url).toBe("http://web.test/package/cold-evil/v/1.0.0");
+      expect(warned.body.warnings[0]?.url).toBe("http://web.test/package/cold-evil?v=1.0.0");
       expect(warned.body.warnings.map((w) => w.kind)).toEqual(["low-score"]);
       expect(strict.body.advisories.map((a) => a.level)).toEqual(["fatal"]);
     }));

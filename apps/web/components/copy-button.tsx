@@ -3,6 +3,7 @@
 import { Fragment, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { cn } from "cn";
+import { track, type TrackedEvent } from "@/lib/databuddy-client";
 
 /** Clipboard API needs a secure context (HTTPS); fall back to a hidden textarea on plain HTTP. */
 export async function copyText(text: string): Promise<boolean> {
@@ -39,7 +40,7 @@ export async function copyText(text: string): Promise<boolean> {
 export type CopyState = "idle" | "copied" | "manual";
 
 /** What useCopy hands back: the last copy's outcome, and the function that copies. */
-export type Copier = { state: CopyState; copy: (text: string, onFail?: () => void) => void };
+export type Copier = { state: CopyState; copy: (text: string, onFail?: () => void, onCopied?: () => void) => void };
 
 /** Copies on demand and holds the outcome long enough to show it: a tick for a copy, a hint when it failed. */
 export function useCopy(): Copier {
@@ -47,11 +48,12 @@ export function useCopy(): Copier {
 
   return {
     state,
-    copy(text, onFail) {
+    copy(text, onFail, onCopied) {
       void copyText(text).then((ok) => {
         setState(ok ? "copied" : "manual");
 
-        if (!ok) onFail?.();
+        if (ok) onCopied?.();
+        else onFail?.();
         setTimeout(() => setState("idle"), ok ? 1500 : 3000);
       });
     },
@@ -92,9 +94,24 @@ function SettingBreaks({ text }: { text: string }) {
 /**
  * Text in a filled block with a copy button on its right edge. Lines wrap at spaces and after "=" (the copied text
  * has no breaks added); a longer word scrolls sideways. `wrap` breaks long words anywhere, for prose;
- * `oneLine` keeps a single setting on one line (smaller on phones, scrolling if it still does not fit).
+ * `oneLine` keeps a single setting on one line (smaller on phones, scrolling if it still does not fit). `event` is sent
+ * to analytics when the copy button's copy succeeds.
  */
-export function CopyBlock({ text, label, caption, wrap = false, oneLine = false }: { text: string; label: string; caption?: ReactNode; wrap?: boolean; oneLine?: boolean }) {
+export function CopyBlock({
+  text,
+  label,
+  caption,
+  wrap = false,
+  oneLine = false,
+  event,
+}: {
+  text: string;
+  label: string;
+  caption?: ReactNode;
+  wrap?: boolean;
+  oneLine?: boolean;
+  event?: TrackedEvent;
+}) {
   const { state, copy } = useCopy();
   const preRef = useRef<HTMLPreElement>(null);
 
@@ -120,9 +137,15 @@ export function CopyBlock({ text, label, caption, wrap = false, oneLine = false 
             "hover:bg-background",
           )}
           onClick={() =>
-            copy(text, () => {
-              if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-            })
+            copy(
+              text,
+              () => {
+                if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+              },
+              () => {
+                if (event) track(event);
+              },
+            )
           }
         >
           <CopyGlyph copied={state === "copied"} />

@@ -1433,7 +1433,7 @@
             "reasons": [
               "Runs code built at runtime: index.js:7: eval(body)"
             ],
-            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "url": "https://apmjs.dev/package/x?v=1.0.0",
             "via": []
           }
         ],
@@ -1985,7 +1985,7 @@
             "version": "1.0.0",
             "kind": "pending",
             "text": "This version is not scored yet: its tarball is queued for analysis.",
-            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "url": "https://apmjs.dev/package/x?v=1.0.0",
             "via": []
           }
         ],
@@ -2009,7 +2009,7 @@
           "dependencies": "complete"
         },
         "evidence": [],
-        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "url": "https://apmjs.dev/package/x?v=1.0.0",
         "notes": [
           {
             "kind": "no-ai-review",
@@ -2125,7 +2125,7 @@
             "reasons": [
               "Runs code built at runtime: index.js:7: eval(body)"
             ],
-            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "url": "https://apmjs.dev/package/x?v=1.0.0",
             "via": []
           }
         ],
@@ -2154,7 +2154,7 @@
         "evidence": [
           "`Runs code built at runtime: index.js:7: eval(body)`"
         ],
-        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "url": "https://apmjs.dev/package/x?v=1.0.0",
         "notes": [
           {
             "kind": "no-ai-review",
@@ -2236,7 +2236,7 @@
             "version": "1.0.0",
             "kind": "pending",
             "text": "This version is not scored yet: its tarball is queued for analysis.",
-            "url": "https://apmjs.dev/package/x/v/1.0.0",
+            "url": "https://apmjs.dev/package/x?v=1.0.0",
             "via": []
           }
         ],
@@ -2260,7 +2260,7 @@
           "dependencies": "complete"
         },
         "evidence": [],
-        "url": "https://apmjs.dev/package/x/v/1.0.0",
+        "url": "https://apmjs.dev/package/x?v=1.0.0",
         "notes": [
           {
             "kind": "no-ai-review",

@@ -57,4 +57,25 @@ describe("popularScores", () => {
     await popular.score("react", 1_500);
     expect(loads).toBe(2);
   });
+
+  test("a read that rejects is a miss: no badge throws, and it is remembered briefly too", async () => {
+    let loads = 0;
+
+    const popular = popularScores({
+      load: async () => {
+        loads++;
+
+        throw new Error("Network connection lost.");
+      },
+      ttlMs: 60_000,
+      missTtlMs: 1_000,
+    });
+
+    const scores = await Promise.all(POPULAR_PACKAGES.map((p) => popular.score(p.name, 0)));
+
+    expect(scores.every((s) => s === null)).toBe(true);
+    expect(loads).toBe(1);
+    expect(await popular.score("react", 500)).toBeNull();
+    expect(loads).toBe(1);
+  });
 });

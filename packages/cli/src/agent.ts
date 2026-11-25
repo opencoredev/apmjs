@@ -123,9 +123,19 @@ async function resolvedFor(input: { api: Api; name: string; range: string | null
   }
 
   if (r.status === 422) {
-    const f = ResolveFail.extend({ newest: z.object({ version: z.string() }).loose().nullish(), confirmed: z.array(z.object({ name: z.string(), version: z.string() })).default([]) }).safeParse(r.body);
+    const f = ResolveFail.extend({
+      newest: z.object({ version: z.string() }).loose().nullish(),
+      confirmed: z.array(z.object({ name: z.string(), version: z.string() })).default([]),
+      knownMalicious: z.array(z.object({ name: z.string(), version: z.string(), ids: z.array(z.string()) })).default([]),
+    }).safeParse(r.body);
 
-    return f.success ? { kind: "refused", reason: f.data.error, newest: f.data.newest?.version ?? null, skipped: f.data.skipped, confirmed: f.data.confirmed } : { kind: "unavailable", reason: UNREADABLE };
+    if (!f.success) return { kind: "unavailable", reason: UNREADABLE };
+
+    const out: Extract<ResolvedInput, { kind: "refused" }> = { kind: "refused", reason: f.data.error, newest: f.data.newest?.version ?? null, skipped: f.data.skipped, confirmed: f.data.confirmed };
+
+    if (f.data.knownMalicious.length > 0) out.knownMalicious = f.data.knownMalicious;
+
+    return out;
   }
 
   if (r.status === 404) return { kind: "missing", reason: error.success ? error.data.error : `No package named ${name}.` };

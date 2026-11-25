@@ -12,12 +12,16 @@ export function siteUrl(path: string): string {
   return `${SITE_URL}${path}`;
 }
 
-/** A package page's public path with the scope's "@" kept readable (/package/@scope/name), for canonical URLs and the sitemap. */
+/**
+ * A package page's public path with the scope's "@" kept readable (/package/@scope/name), for canonical URLs and the
+ * sitemap. A name ending in ".md" gets its dot escaped, or the path would ask for the Markdown view of another name.
+ */
 export function canonicalPackagePath(name: string): string {
   return `/package/${name
     .split("/")
     .map((part) => encodeURIComponent(part).replace(/^%40/, "@"))
-    .join("/")}`;
+    .join("/")
+    .replace(/\.md$/, "%2Emd")}`;
 }
 
 /** A popular npm package the home page shows with its score, and the sitemap lists. */
