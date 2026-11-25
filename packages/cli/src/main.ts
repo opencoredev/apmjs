@@ -22,7 +22,7 @@ import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
-import { argsError, bareInstallArgs, commandOf, helpTopic, updateArgs } from "./commands.ts";
+import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2326,15 +2326,16 @@ async function bareInstall(a: Args): Promise<number> {
   return 2;
 }
 
-/** `apm update`, `up` and `upgrade`: the package manager's own, naming only the project's dependencies. */
-async function update(a: Args): Promise<number> {
-  const cwd = process.cwd();
-  const det = pmFor(a, cwd);
-  const passed = updateArgs(a, det.pm, new Set(projectNames(cwd)));
+/**
+ * `apm update`, `up` and `upgrade`: refused. An update fetches new versions apm cannot check, and the package managers
+ * read these words differently (bun's upgrade replaces bun itself, and some run a project script of that name), so
+ * apm points to its checked add, or to the package manager's own update run knowingly.
+ */
+function update(a: Args): number {
+  const det = pmFor(a, process.cwd());
 
-  if ("args" in passed) return (await runCmd([det.pm, a.cmd, ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
-  fail(`apm: ${passed.error}. Nothing was run.`);
-  say(`For other ${det.pm} ${a.cmd} options, run ${det.pm} ${a.cmd} yourself.`);
+  fail(`apm: apm ${a.cmd} would fetch new versions apm cannot check. Nothing was run.`);
+  say(`To check and move a dependency to its newest version, run apm add <package>@latest. To update without apm's check, run ${det.pm} update yourself.`);
 
   return 2;
 }

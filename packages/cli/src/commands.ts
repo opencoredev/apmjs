@@ -238,51 +238,6 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
   return { args };
 }
 
-/**
- * The switches `apm update` (and up and upgrade) passes on to each package manager, by exact name: ones its update reads
- * as switches, so none takes the next word as its value or names a package (bun 1.1 to 1.3 add the word after an
- * option they do not know, unchecked).
- */
-const UPDATE_SWITCHES = new Map<Pm, ReadonlySet<string>>([
-  ["bun", new Set(["--help", "--latest", "--force", "--dry-run", "--production", "--ignore-scripts", "--silent", "--verbose", "--interactive", "--recursive", "-i"])],
-  ["npm", new Set(["--help", "--save", "--dry-run", "--ignore-scripts", "--legacy-peer-deps", "--strict-peer-deps", "--force", "--no-audit", "--no-fund", "--silent", "--json"])],
-  ["pnpm", new Set(["--help", "--latest", "--recursive", "--interactive", "--prod", "--dev", "--no-optional", "--ignore-scripts", "--silent", "-L", "-r", "-i", "-P", "-D"])],
-  ["yarn", new Set(["--help", "--latest", "--exact", "--tilde", "--caret", "--ignore-engines", "--silent", "--interactive", "--recursive", "-i", "-R", "-E", "-T", "-C"])],
-]);
-
-/**
- * What `apm update` passes on to `pm`'s update, or why apm refuses it. apm checks nothing on an update, and bun 1.1 to
- * 1.3 add a package an update names that the project does not have yet, so an update names only the project's own
- * dependencies (`declared`), by name alone, with the switches UPDATE_SWITCHES lists for `pm`. A new package or a
- * version goes through apm add, which checks it. apm's --pm and its value are taken out; anything else is refused.
- */
-export function updateArgs(a: Args, pm: Pm, declared: ReadonlySet<string>): { args: string[] } | { error: string } {
-  const args: string[] = [];
-
-  for (let i = 0; i < a.raw.length; i++) {
-    const word = a.raw[i] ?? "";
-
-    if (word === "--pm" || word.startsWith("--pm=")) {
-      if (word === "--pm" ? !takesValue(a.raw[i + 1]) || a.raw[i + 1] === "" : word === "--pm=") return { error: "--pm needs a value" };
-
-      if (word === "--pm") i++;
-      continue;
-    }
-
-    if (UPDATE_SWITCHES.get(pm)?.has(word) === true) {
-      args.push(word);
-      continue;
-    }
-
-    if (word.startsWith("-")) return { error: `apm ${a.cmd} does not pass ${word} on to ${pm}: it checks nothing, and passes on only switches of ${pm}'s own update such as --${pm === "npm" ? "save" : "latest"}` };
-
-    if (!declared.has(word)) return { error: `apm ${a.cmd} updates only this project's own dependencies, by name, and ${word} is not one of them: to check and add a package or a version, run apm add ${word}` };
-    args.push(word);
-  }
-
-  return { args };
-}
-
 /** Why apm refuses these arguments before running anything, or null when it runs them. */
 export function argsError(a: Args, command: Command): string | null {
   for (const [key, value] of a.flags) {

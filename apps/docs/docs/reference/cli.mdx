@@ -5,7 +5,7 @@ sidebar:
   label: CLI
 ---
 
-`apm` 0.1.7 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project. `apm update`, `apm up` and `apm upgrade` check nothing either, so they name only your project's own dependencies, by name, with that package manager's everyday update switches (`--latest`, `--interactive`, `--recursive`; npm `--save`). A new package or a version goes through `apm add`, which checks it.
+`apm` 0.1.7 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project. `apm update`, `apm up` and `apm upgrade` are refused, because an update fetches new versions apm cannot check: run `apm add <package>@latest` to check and move a dependency to its newest version, or your package manager's own update to skip apm's check.
 
 Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks the binary's SHA-256 before it installs; see [Quick start](/quickstart#2-get-the-apm-cli) for what it checks and how to read it first.
 

@@ -384,38 +384,25 @@ describe("what still goes to the package manager", () => {
   const WITH_ZOD = `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies: { zod: "^4.0.0" }, devDependencies: { "@types/node": "^24.0.0" } })}\n`;
 
   test.each([
-    [["update", "left-pad"], "left-pad is not one of them: to check and add a package or a version, run apm add left-pad"],
-    [["update", "--tag", "left-pad"], "apm update does not pass --tag on to bun"],
-    [["up", "--cooldown", "left-pad"], "apm up does not pass --cooldown on to bun"],
-    [["upgrade", "--", "left-pad"], "apm upgrade does not pass -- on to bun"],
-    [["update", "zod@4"], "zod@4 is not one of them"],
-    [["update", "zod@npm:left-pad"], "zod@npm:left-pad is not one of them"],
-    [["update", "--pm", "npm", "--tag", "next"], "apm update does not pass --tag on to npm"],
-    [["update", "--pm", "npm", "-g"], "apm update does not pass -g on to npm"],
-    [["update", "--pm", "pnpm", "--latest=false"], "apm update does not pass --latest=false on to pnpm"],
-    [["update", "--pm", "", "--pm", "npm"], "--pm needs a value"],
-    [["update", "./left-pad"], "./left-pad is not one of them"],
-  ])("apm %p is refused: %s", async (argv, message) => {
+    [["update"]],
+    [["update", "--latest"]],
+    [["update", "zod"]],
+    [["update", "left-pad"]],
+    [["update", "--tag", "left-pad"]],
+    [["up", "--cooldown", "left-pad"]],
+    [["upgrade", "--", "left-pad"]],
+    [["upgrade", "--pm", "bun", "--help"]],
+    [["up", "--pm", "pnpm", "-L", "-r", "zod"]],
+    [["upgrade", "--pm=yarn", "--latest", "zod"]],
+    [["update", "--pm", "npm", "--save", "zod"]],
+  ])("apm %p is refused: an update fetches versions apm cannot check", async (argv) => {
     const r = await apm(argv, "4.5.0", WITH_ZOD);
 
     expect(r.code, r.out + r.err).toBe(2);
-    expect(r.err).toContain(message);
+    expect(r.err).toContain("would fetch new versions apm cannot check. Nothing was run.");
+    expect(r.out + r.err).toContain("apm add <package>@latest");
     expect(r.pmCalls).toEqual([]);
     expect(r.packageJson).toBe(WITH_ZOD);
-  });
-
-  test.each([
-    [["update"], "bun update"],
-    [["update", "--latest"], "bun update --latest"],
-    [["update", "zod", "@types/node"], "bun update zod @types/node"],
-    [["up", "--pm", "pnpm", "-L", "-r", "zod"], "pnpm up -L -r zod"],
-    [["upgrade", "--pm=yarn", "--latest", "zod"], "yarn upgrade --latest zod"],
-    [["update", "--pm", "npm", "--save", "zod"], "npm update --save zod"],
-  ])("apm %p is the package manager's update of the project's own dependencies", async (argv, call) => {
-    const r = await apm(argv, "4.5.0", WITH_ZOD);
-
-    expect(r.code, r.out + r.err).toBe(0);
-    expect(r.pmCalls).toEqual([call]);
   });
 
   test("apm run dev --help is the package manager's", async () => {
