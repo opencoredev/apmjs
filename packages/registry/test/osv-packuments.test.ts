@@ -409,6 +409,43 @@ describe("what the review of 34ccf92 found", () => {
     }
   });
 
+  // Sol on #44, finding 1: an advisory a partial answer read was kept for that request alone, so an outage right after
+  // it served the version it had withheld
+  test("what a partial answer read stays withheld through an outage, until a complete answer replaces it or it is a day old", async () => {
+    const root = freshRoot();
+    const advisory = VULNS.get("half-read")?.[0];
+    const tarball = async () => (await get("/half-read/-/half-read-1.2.0.tgz", { root }))?.status;
+    const t0 = Date.now();
+
+    expect(advisory?.id).toBe("MAL-2026-1006");
+    osv.unreadable.add("MAL-2026-1007");
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    osv.down = true;
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    expect(await tarball()).toBe(403);
+    // a day after it was read, an outage fails open again, as for a name never answered
+    const aDayOn = t0 + NAME_STALE_MS + 60_000;
+
+    setSystemTime(new Date(aDayOn));
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0", "1.2.0"]);
+    // a complete answer replaces what partial answers read: once OSV withdraws the advisory, the version is served
+    osv.down = false;
+    osv.unreadable.clear();
+    setSystemTime(new Date(aDayOn + 60_000));
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
+
+    try {
+      if (advisory) advisory.withdrawn = "2026-11-25T00:00:00Z";
+      setSystemTime(new Date(aDayOn + 60_000 + NAME_FRESH_MS + 1_000));
+      expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.2.0"]);
+      osv.down = true;
+      setSystemTime(new Date(aDayOn + 60_000 + 2 * NAME_FRESH_MS + 2_000));
+      expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.2.0"]);
+    } finally {
+      if (advisory) delete advisory.withdrawn;
+    }
+  });
+
   test("after a failure the isolate does not ask OSV again for a while, so an outage costs one wait, not one per request", async () => {
     const root = freshRoot();
 
