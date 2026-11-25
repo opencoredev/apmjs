@@ -59,6 +59,7 @@ export async function loadPackageView(input: { name: string; version: string | n
   const [info, review] = agree(...first) ? first : await read();
 
   if (!agree(info, review)) return { kind: "unavailable" };
+
   // as on the page: a review apm reviewers confirmed refuses it, and resolve is asked only when the version's score or
   // review marks it risky (lib/refusal.ts readPolicy)
   const risk = (routeScore === null ? Promise.resolve(pkg.score) : routeScore.then((s) => (s.kind === "ok" ? s.value : null))).then((score) => ({
@@ -66,6 +67,7 @@ export async function loadPackageView(input: { name: string; version: string | n
     installScripts: routeScore === null ? (pkg.facts?.installScripts ?? null) : null,
     review: review.kind === "ok" ? (review.value.review?.state ?? null) : null,
   }));
+
   const policy = readPolicy({ name, version, status, risk, resolve: source.resolve });
 
   if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
