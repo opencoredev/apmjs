@@ -40,6 +40,25 @@ test("an incident sweep leaves an older version's pending revoke pending, as apm
   expect(Status.parse(await reg.query("SELECT status FROM versions WHERE package = 'pend-lib' AND version = '1.0.0'"))[0]?.status).toBe("revoke-pending");
 });
 
+test("a pending revoke past its 24 h is revoked to an incident sweep, as to every other read, not reported as pending", async () => {
+  const dana = await addUser(reg, "dana", PASSWORD);
+  const since = new Date(clock - DAY).toISOString();
+
+  expect((await putPublish(reg, dana, { name: "matured-lib", version: "1.0.0" })).status).toBe(201);
+  expect((await putPublish(reg, dana, { name: "matured-lib", version: "1.0.1" })).status).toBe(201);
+  clock += 4 * DAY;
+  expect(dig((await api("revoke", dana, { name: "matured-lib", version: "1.0.0", reason: "bad", password: PASSWORD })).body, "status")).toBe("revoke-pending");
+  // past the window, before the cron writes it
+  clock += DAY + 60 * 60 * 1000;
+
+  const incident = await api("incident", dana, { since: new Date(Date.parse(since) - 4 * DAY).toISOString(), reason: "phished", password: PASSWORD });
+
+  expect(incident.status).toBe(200);
+  expect(dig(incident.body, "statuses", "matured-lib@1.0.0")).toBeUndefined();
+  expect(JSON.stringify(dig(incident.body, "revoked"))).not.toContain("matured-lib@1.0.0");
+  expect(dig(incident.body, "statuses", "matured-lib@1.0.1")).toBe("revoke-pending");
+});
+
 // the reason goes into the version's status_reason, an advisory and the event log, which refuse a NUL or an unpaired
 // surrogate: the write failed inside the transaction and the change answered 500
 test.each([

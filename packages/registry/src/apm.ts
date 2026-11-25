@@ -1232,7 +1232,8 @@ const handleIncident = (req: Request, caller: Caller) =>
     const command: LiveAction = { kind: "incident", since: canonicalSince(body.since), dryRun: body.dryRun === true };
     const user = yield* reauth(caller, { password: body.password, otp: body.otp }, command);
     const reason = body.reason ?? "account compromised";
-    const published = (yield* store.publishedSince(user, since)).filter((v) => v.status !== "revoked");
+    // read as every other read does (atTime): a pending revoke past its 24 h is revoked, not reported as still pending
+    const published = (yield* store.publishedSince(user, since)).map((v) => atTime(v, at)).filter((v) => v.status !== "revoked");
     // only packages the account still owns: a former owner's old publishes are the current owners' call
     const owned = new Set<string>();
 
