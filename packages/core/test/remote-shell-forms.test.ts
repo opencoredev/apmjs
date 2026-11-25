@@ -104,6 +104,10 @@ describe("commands that do not run what they download are not", () => {
     `printf '%s\\n' 'FOO=1 sudo -u root bash <(curl ${URL})'`,
     // only a shell's -c takes a command: grep -c counts lines
     `grep -c bash <(curl -s ${URL})`,
+    // a pipe after an unquoted ; or & belongs to another command, not to curl
+    `curl -s 'https://example.invalid/list' -o out.txt; printf 'echo local' | sh`,
+    `curl -s ${URL} -o out.txt && echo local | sh`,
+    `curl -s ${URL} -o out.txt & echo local | bash`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
