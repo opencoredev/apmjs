@@ -40,6 +40,10 @@ const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
 const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
+
+// npm's own reading of the flag, last one winning: `--ignore-scripts` and `--ignore-scripts=true` set it, `=false` and
+// `--no-ignore-scripts` clear it, and any other value makes npm refuse the command, so it runs nothing at all
+const IGNORE_SCRIPTS = /(?<!\S)--(no-)?ignore-scripts(?:=(\S*))?(?!\S)/g;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
 
@@ -90,20 +94,41 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
   return out;
 }
 
-/** Script names a command runs through the package manager, in order. */
-function referencedScripts(cmd: string, scripts: Scripts): string[] {
-  const out: string[] = [];
+/**
+ * A script a command runs through the package manager. `alone`: npm runs it without its pre and post scripts, as it does
+ * for `npm run --ignore-scripts x` (npm docs, config `ignore-scripts`: commands that run a particular script still run it,
+ * "but they will not run any pre- or post-scripts").
+ */
+type ScriptRef = { name: string; alone: boolean };
+
+/** Whether npm's flags before the script name leave `ignore-scripts` set. */
+function ignoresScripts(flags: string): boolean {
+  let set = false;
+
+  for (const m of flags.matchAll(IGNORE_SCRIPTS)) set = m[1] === undefined && (m[2] === undefined || m[2] === "true");
+
+  return set;
+}
+
+/** Scripts a command runs through the package manager, in order. */
+function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
+  const out: ScriptRef[] = [];
 
   for (const m of cmd.matchAll(RUN_REF)) {
-    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+    const npm = m[1] ?? m[2];
+    const name = npm ?? m[3] ?? m[4] ?? m[5];
 
     // `yarn add x` or `pnpm install` are package manager commands, not scripts
-    if (name && Object.hasOwn(scripts, name)) out.push(name);
+    if (!name || !Object.hasOwn(scripts, name)) continue;
+
+    // the match ends with the name, so what comes before it is npm's flags (and `run`): only those are read, and a
+    // flag after the name, which npm reads too, leaves the pre and post scripts followed, the stricter reading
+    out.push({ name, alone: npm !== undefined && ignoresScripts(m[0].slice(0, m[0].length - name.length)) });
   }
 
   for (const m of cmd.matchAll(RUN_ALL)) {
     for (const pattern of (m[1] ?? "").trim().split(/\s+/)) {
-      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push(name);
+      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push({ name, alone: false });
     }
   }
 
@@ -143,8 +168,8 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
       for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals);
 
-      for (const name of referencedScripts(text, scripts)) {
-        for (const n of [`pre${name}`, name, `post${name}`]) {
+      for (const { name, alone } of referencedScripts(text, scripts)) {
+        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
           const body = scripts[n];
 
           if (body === undefined || followed.has(n)) continue;

