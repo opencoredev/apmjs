@@ -68,8 +68,9 @@ export function registryClient(input: { url: string; token: string; log: Logger 
       const { jobs, unreadable } = readLease(await res.json());
 
       // a job this side cannot read would fail the same way every time, so it is failed on its own and the rest of
-      // the batch is reviewed; one whose lease cannot be read either returns to the queue when its lease expires
-      await Promise.all(
+      // the batch is reviewed at once, without waiting on those releases; one whose lease cannot be read either
+      // returns to the queue when its lease expires
+      void Promise.all(
         unreadable.map(async ({ lease, why }) => {
           input.log("error", "job.unreadable", { job: lease?.id ?? null, why: why.slice(0, 300) });
 

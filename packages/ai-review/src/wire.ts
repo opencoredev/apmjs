@@ -17,17 +17,16 @@ export type EnqueueReason = (typeof ENQUEUE_REASONS)[number];
  * Where the registry serves the tarball, relative to its root ("debug/-/debug-4.4.3.tgz"). The reviewer
  * joins it to its own configured registry URL, so a job can never point it at another host. The name is any
  * name npm can hold, old names included (isPossibleNpmName), so npm's placeholder named "-" leases like any
- * other; every segment is URL-safe as written and none is a dot segment.
+ * other. Every character is one encodeURIComponent leaves as it is (the file may also carry a version's "+build"),
+ * which is checked first because encodeURIComponent throws on a lone surrogate, and no segment is a dot segment.
  */
 export const TarballPath = z
   .string()
   .max(600)
   .refine((path) => {
-    const m = /^((?:@[^/]+\/)?[^/]+)\/-\/([^/]+\.tgz)$/.exec(path);
+    const m = /^((?:@[\w.!~*'()-]+\/)?[\w.!~*'()-]+)\/-\/([\w.!~*'()+-]+\.tgz)$/.exec(path);
 
-    if (!m?.[1] || !m[2] || !isPossibleNpmName(m[1]) || encodeURIComponent(m[2]) !== m[2]) return false;
-
-    return path.split("/").every((segment) => segment !== "." && segment !== "..");
+    return m?.[1] !== undefined && isPossibleNpmName(m[1]) && path.split("/").every((segment) => segment !== "." && segment !== "..");
   }, "not a tarball path of an npm name");
 
 const TarballRef = z.object({ version: Version, digest: DigestLabel, tarballPath: TarballPath });
