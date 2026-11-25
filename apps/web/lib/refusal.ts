@@ -38,32 +38,43 @@ export function statusRefusal(status: string): Refusal | null {
   }
 }
 
+/** The refusal resolve gives a version it skipped: listed by the OSSF feed, confirmed by a reviewer, or its own words. */
+function skipRefusal(input: { name: string; version: string; reason: string; knownMalicious?: readonly { name: string; version: string; ids: string[] }[]; confirmed?: readonly { name: string; version: string }[] }): Refusal {
+  const { name, version } = input;
+  const listed = input.knownMalicious?.find((k) => k.name === name && k.version === version);
+
+  if (listed) return { kind: "known-malicious", ids: listed.ids };
+
+  if (CONFIRMED_REASON.test(input.reason) || input.confirmed?.some((c) => c.name === name && c.version === version)) return { kind: "confirmed-malicious" };
+
+  return { kind: "policy", reason: input.reason };
+}
+
 /**
- * resolve's answer for exactly `version`. A 422 refuses it when it skipped that version, or when it picked it
- * (`newest`) and refused its tree; a 422 that says neither is not about this version, so the answer is unknown, as it is
- * when the registry could not say.
+ * resolve's answer for exactly `version`. Any answer that skipped that version refuses it, a 200 among them (it can pick
+ * a sibling of equal precedence, 1.0.0+b for 1.0.0+a). A 200 installs it only when it picked exactly that version. A 422
+ * also refuses it when it picked it (`newest`) and refused its tree. Any other answer is not about this version, so it is
+ * unknown, as it is when the registry could not say.
  */
 export function resolveRefusal(input: { name: string; version: string; outcome: ResolveOutcome }): Refusal | null | "unknown" {
   const { name, version, outcome } = input;
 
   switch (outcome.kind) {
-    case "ok":
-      return null;
+    case "ok": {
+      const skipped = outcome.skipped.find((s) => s.version === version);
+
+      if (skipped !== undefined) return skipRefusal({ name, version, reason: skipped.reason });
+
+      return outcome.version === version ? null : "unknown";
+    }
+
     case "missing":
     case "unavailable":
       return "unknown";
     case "refused": {
       const skipped = outcome.skipped.find((s) => s.version === version);
 
-      if (skipped !== undefined) {
-        const listed = outcome.knownMalicious?.find((k) => k.name === name && k.version === version);
-
-        if (listed) return { kind: "known-malicious", ids: listed.ids };
-
-        if (CONFIRMED_REASON.test(skipped.reason) || outcome.confirmed.some((c) => c.name === name && c.version === version)) return { kind: "confirmed-malicious" };
-
-        return { kind: "policy", reason: skipped.reason };
-      }
+      if (skipped !== undefined) return skipRefusal({ name, version, reason: skipped.reason, knownMalicious: outcome.knownMalicious, confirmed: outcome.confirmed });
 
       if (outcome.newest !== version) return "unknown";
       const deps: MaliciousDependency[] = [...(outcome.knownMalicious ?? []).map((k) => ({ name: k.name, version: k.version, ids: k.ids })), ...outcome.confirmed.map((c) => ({ name: c.name, version: c.version, ids: null }))];
