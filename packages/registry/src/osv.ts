@@ -115,71 +115,65 @@ function remember(key: string, ids: string[], until: number): void {
 
 const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-"));
 
-/** A name's advisories as kept: when OSV gave them (wall clock), in the isolate and in the data center's cache. */
-/** A name's complete answer as kept: when it was asked for (wall clock), in the isolate and in the data center's cache. */
+/** A name's complete answer as kept in the data center's cache: when it was asked for (wall clock), and its advisories. */
 const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema) });
 
 type NameEntry = z.infer<typeof NameEntry>;
 
-/** The isolate's answers per name, by OSV root and name, oldest first. */
-const NAMES = new Map<string, NameEntry>();
+/**
+ * OSV's newest word on one MAL- advisory of a name, and when it was asked for (`at`, wall clock; `seq` orders asks
+ * made in the same millisecond, a copy from the data center's cache before this isolate's own): the versions it names
+ * here, or null when it was read withdrawn or naming nothing here, or a complete answer asked for later left it out.
+ */
+type Observation = { readonly at: number; readonly seq: number; readonly advisory: Advisory | null };
 
 /**
- * Keeps `entry` as the name's answer unless one asked for later is kept already (a slower request's answer must not
- * replace a newer one), and returns the answer kept.
+ * What the isolate knows of a name's advisories, by OSV root and name: when its newest complete answer was asked for,
+ * and the newest observation of each advisory, from complete and partial answers alike. A partial answer is OSV's word
+ * on the advisories it read, though not on the name; so each advisory is decided by the newest answer that read it
+ * (Sol on #59: a whole answer per name let an older complete answer undo a newer partial one, either way).
  */
-function rememberName(key: string, entry: NameEntry): NameEntry {
-  const current = NAMES.get(key);
+type NameState = { complete: number | null; readonly ids: Map<string, Observation> };
 
-  if (current !== undefined && current.fetchedAt > entry.fetchedAt) return current;
+/** The isolate's knowledge per name, by OSV root and name, least recently updated first. */
+const NAMES = new Map<string, NameState>();
+
+/** The order of this isolate's asks of OSV about names; a copy from the data center's cache is 0. */
+let asks = 0;
+
+/**
+ * Takes in what an answer asked for at `at` (`seq`) read: `found`, the advisories among the `read` ids that name the
+ * name, and with `complete`, that no other advisory does. Each advisory takes the newest observation of it, so an
+ * answer that lands after a newer one changes nothing the newer one read. Observations past NAME_STALE_MS are dropped.
+ */
+function observe(input: { key: string; at: number; seq: number; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): NameState {
+  const { key, at, seq } = input;
+  const state = NAMES.get(key) ?? { complete: null, ids: new Map<string, Observation>() };
+  const newer = (o: Observation | undefined): boolean => o === undefined || at > o.at || (at === o.at && seq > o.seq);
+
+  for (const id of input.read) if (newer(state.ids.get(id))) state.ids.set(id, { at, seq, advisory: input.found.find((a) => a.id === id) ?? null });
+
+  if (input.complete) {
+    for (const [id, o] of state.ids) if (!input.read.has(id) && newer(o)) state.ids.set(id, { at, seq, advisory: null });
+
+    if (state.complete === null || at > state.complete) state.complete = at;
+  }
+
+  for (const [id, o] of state.ids) if (input.now - o.at >= NAME_STALE_MS) state.ids.delete(id);
   NAMES.delete(key);
-  NAMES.set(key, entry);
+  NAMES.set(key, state);
 
   for (const oldest of NAMES.keys()) {
     if (NAMES.size <= MAX_NAMES) break;
     NAMES.delete(oldest);
   }
 
-  return entry;
+  return state;
 }
 
-/**
- * MAL- advisories a partial answer read, by OSV root and name, each with when it was read. They are OSV's word on those
- * ids though the answer as a whole was not complete, so they are not kept as the name's answer; they are kept beside it
- * so an outage after a partial answer does not serve a version the isolate already knew to withhold. Each counts until
- * NAME_STALE_MS, until a later read says it is withdrawn or names nothing here, or until a complete answer asked for
- * after it replaces it.
- */
-const LEARNED = new Map<string, { at: number; advisory: Advisory }[]>();
-
-/** Keeps what a partial answer asked for at `at` read: `found`, the advisories among the `read` ids that still name the name. */
-function learn(key: string, at: number, read: ReadonlySet<string>, found: readonly Advisory[]): void {
-  const kept = (LEARNED.get(key) ?? []).filter((l) => !read.has(l.advisory.id) || l.at > at);
-  const next = [...kept, ...found.flatMap((advisory) => (kept.some((l) => l.advisory.id === advisory.id) ? [] : [{ at, advisory }]))];
-
-  LEARNED.delete(key);
-
-  if (next.length > 0) LEARNED.set(key, next);
-
-  for (const oldest of LEARNED.keys()) {
-    if (LEARNED.size <= MAX_NAMES) break;
-    LEARNED.delete(oldest);
-  }
-}
-
-/** Drops what partial answers read up to `at`: a complete answer asked for at `at` says all there is. */
-function forget(key: string, at: number): void {
-  const kept = (LEARNED.get(key) ?? []).filter((l) => l.at > at);
-
-  if (kept.length === 0) LEARNED.delete(key);
-  else LEARNED.set(key, kept);
-}
-
-/** `answer` (the name's, as of `since`, or none) with what partial answers read after it, while that is young enough. */
-function withLearned(key: string, answer: readonly Advisory[], since: number | null, now: number): readonly Advisory[] {
-  const learned = (LEARNED.get(key) ?? []).filter((l) => (since === null || l.at > since) && l.at <= now && now - l.at < NAME_STALE_MS && !answer.some((a) => a.id === l.advisory.id));
-
-  return learned.length === 0 ? answer : [...answer, ...learned.map((l) => l.advisory)];
+/** The advisories of the name under `key` that its newest observations name at `now`, each while it is young enough. */
+function answerOf(key: string, now: number): Advisory[] {
+  return [...(NAMES.get(key)?.ids.values() ?? [])].flatMap((o) => (o.advisory !== null && o.at <= now && now - o.at < NAME_STALE_MS ? [o.advisory] : []));
 }
 
 /** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
@@ -414,7 +408,10 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         return { advisories, complete, read };
       });
 
-    /** This request's partial answers by name: kept for it alone, never in the isolate's or the data center's cache. */
+    /**
+     * What this request answered for a name after a partial answer: every later read in it gets the same. What the
+     * partial answer read is kept in the isolate per advisory (observe), never in the data center's cache.
+     */
     const partials = new Map<string, Advisory[]>();
 
     return KnownMalicious.of({
@@ -427,35 +424,39 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           if (partial !== undefined) return partial;
           const key = `${baseUrl} ${name}`;
           const now = Date.now();
-          const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
-          const local = NAMES.get(key) ?? null;
 
-          if (local !== null && youngerThan(local, NAME_FRESH_MS)) return withLearned(key, local.advisories, local.fetchedAt, now);
+          const fresh = (): boolean => {
+            const at = NAMES.get(key)?.complete ?? null;
+
+            return at !== null && at <= now && now - at < NAME_FRESH_MS;
+          };
+
+          if (fresh()) return answerOf(key, now);
           const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
 
-          if (shared !== null && youngerThan(shared, NAME_FRESH_MS)) {
-            const fresh = rememberName(key, shared);
-
-            return withLearned(key, fresh.advisories, fresh.fetchedAt, now);
+          // a copy from the data center's cache is a complete answer like this isolate's own, fresh or stale: it retires
+          // what older answers said of the advisories it leaves out
+          if (shared !== null && shared.fetchedAt <= now && now - shared.fetchedAt < NAME_STALE_MS) {
+            observe({ key, at: shared.fetchedAt, seq: 0, read: new Set(shared.advisories.map((a) => a.id)), found: shared.advisories, complete: true, now });
           }
 
-          // the newest answer kept, while it is young enough: what is answered when OSV is not asked (fail open past that)
-          const newest = [local, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0] ?? null;
-          const kept = withLearned(key, newest?.advisories ?? [], newest?.fetchedAt ?? null, now);
+          if (fresh()) return answerOf(key, now);
 
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
+          // OSV is not asked: what is known, each advisory while it is young enough (fail open past that)
+          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return answerOf(key, now);
+          const seq = ++asks;
           const got = yield* Effect.result(askName(name));
+          // the answer is taken in as of when it was asked for, and what is answered is read from the state after it, so
+          // an answer asked for later that landed first is neither undone nor left out (Sol on #59, finding 3)
+          const after = Date.now();
 
           if (Result.isSuccess(got) && got.success.complete) {
-            const entry = { fetchedAt: now, advisories: got.success.advisories };
-            const winner = rememberName(key, entry);
+            const { advisories, read } = got.success;
+            const state = observe({ key, at: now, seq, read, found: advisories, complete: true, now: after });
 
-            if (winner === entry) {
-              forget(key, now);
-              sharedWrite(key, entry, background);
-            }
+            if (state.complete === now) sharedWrite(key, { fetchedAt: now, advisories }, background);
 
-            return withLearned(key, winner.advisories, winner.fetchedAt, now);
+            return answerOf(key, after);
           }
 
           console.error(JSON.stringify({ event: "osv-name", name, error: Result.isSuccess(got) ? "partial answer" : String(got.failure) }));
@@ -466,15 +467,13 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             // the first page went unanswered: OSV is taken as down at this root for a while
             BACKOFF.set(baseUrl, now + NAME_BACKOFF_MS);
 
-            return kept;
+            return answerOf(key, after);
           }
 
-          // a partial answer is not kept, so the next request asks again; this one withholds what it read (OSV's word,
-          // a withdrawal included) and, for what it could not read, what the kept answer says
-          const { advisories: found, read } = got.success;
-
-          learn(key, now, read, found);
-          const answer = [...found, ...kept.filter((a) => !read.has(a.id))];
+          // a partial answer is OSV's word on the advisories it read (a withdrawal included), never on the name: it is
+          // kept for those, and for the rest what was known stands. The next request asks again
+          observe({ key, at: now, seq, read: got.success.read, found: got.success.advisories, complete: false, now: after });
+          const answer = answerOf(key, after);
 
           partials.set(name, answer);
 
