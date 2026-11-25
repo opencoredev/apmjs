@@ -27,6 +27,7 @@ describe("link sanitizing", () => {
     expect(repositoryUrl({ url: "javascript:alert(1)", directory: null })).toBeNull();
     // a browser resolves github.com/../.. to github.com itself
     expect(repositoryUrl({ url: "git+https://github.com/../..", directory: null })).toBeNull();
+    expect(repositoryUrl({ url: "https://github.com./../..", directory: null })).toBeNull();
     expect(repositoryUrl(null)).toBeNull();
   });
 });

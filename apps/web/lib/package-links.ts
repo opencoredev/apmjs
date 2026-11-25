@@ -41,8 +41,9 @@ export function repositoryUrl(field: RepositoryField | null | undefined): string
 
   const url = safeHttpUrl(field?.url.trim().replace(/^git\+/, "").replace(/\.git$/, ""));
 
-  // A GitHub URL githubRepo could not read names no repository (github.com/../.. is github.com itself).
-  return url !== null && /^(?:www\.)?github\.com$/i.test(new URL(url).hostname) ? null : url;
+  // A GitHub URL githubRepo could not read names no repository (github.com/../.. is github.com itself). A trailing dot
+  // is the same host.
+  return url !== null && /^(?:www\.)?github\.com\.?$/i.test(new URL(url).hostname) ? null : url;
 }
 
 /** A URL as people read it: host without "www.", then the path, without a trailing slash. */
