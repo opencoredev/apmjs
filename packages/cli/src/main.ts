@@ -3,7 +3,7 @@
 // then hands the real work to the package manager the project already uses.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
@@ -2031,26 +2031,32 @@ function refuseUserconfigInProject(cfg: Config): boolean {
 
   if (file === join(home, ".npmrc")) return false;
 
+  // by path component: a file named `..pwn` inside the folder is inside it
   const inside = (dir: string): boolean => {
     const rel = relative(dir, file);
 
-    return !rel.startsWith("..") && !isAbsolute(rel);
+    return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
   };
 
   const cwd = process.cwd();
-  let root = cwd;
 
+  // a folder that holds the home folder (a dotfiles repo in git) is not a project
+  const holdsHome = (dir: string): boolean => {
+    const rel = relative(dir, home);
+
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+
+  let root: string | null = null;
+
+  // the outermost folder with .git that is not a dotfiles home: a submodule's .git file does not end the project there
   for (let dir = cwd; ; dir = dirname(dir)) {
-    if (existsSync(join(dir, ".git"))) {
-      root = dir;
-      break;
-    }
+    if (existsSync(join(dir, ".git")) && !holdsHome(dir)) root = dir;
 
     if (dirname(dir) === dir) break;
   }
 
-  // a home folder kept in git (dotfiles) is not the project: there only the current folder counts
-  const projectRoot = relative(root, home).startsWith("..") ? root : cwd;
+  const projectRoot = root ?? cwd;
 
   if (!inside(projectRoot)) return false;
   fail(`refused: apm login would save the token to ${file}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);

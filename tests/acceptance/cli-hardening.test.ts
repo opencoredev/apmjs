@@ -411,6 +411,22 @@ describe("finding 9: apm login only saves a well-formed token", () => {
 
     expect(fromMember.code, fromMember.out).toBe(1);
     expect(existsSync(steered), fromMember.out).toBe(false);
+
+    // a file in the project whose name starts with "..", and a submodule (a .git file) inside the clone
+    const dotted = join(app, "..pwn");
+    const env = { ...laptopEnv(sb.env), APM_REGISTRY: reg.url };
+    const named = await apm(["login", "--username", "mallory4", "--password-stdin"], { cwd: app, env: { ...env, npm_config_userconfig: dotted }, stdin: "a-long-enough-password\n" });
+
+    expect(named.code, named.out).toBe(1);
+    expect(existsSync(dotted), named.out).toBe(false);
+    const submodule = join(app, "vendor", "lib");
+
+    mkdirSync(submodule, { recursive: true });
+    writeFileSync(join(submodule, ".git"), "gitdir: ../../.git/modules/lib\n");
+    const fromSubmodule = await apm(["login", "--username", "mallory5", "--password-stdin"], { cwd: submodule, env: { ...env, npm_config_userconfig: steered }, stdin: "a-long-enough-password\n" });
+
+    expect(fromSubmodule.code, fromSubmodule.out).toBe(1);
+    expect(existsSync(steered), fromSubmodule.out).toBe(false);
   });
 });
 
