@@ -142,8 +142,11 @@ function header(input: { name: string; version: string; previous: string | null;
   ].join("\n");
 }
 
-/** A not-read path as the result records it: the wire contract (wire.ts WireNotRead) holds paths to MAX_PATH_CHARS. */
-const recordedPath = (path: string): string => cutAt(path, MAX_PATH_CHARS);
+/** How an empty path or dependency name is recorded: the wire refuses empty strings, which would lose the whole result. */
+const EMPTY_NAME = '""';
+
+/** A not-read path as the result records it: the wire contract (wire.ts WireNotRead) holds paths to 1..MAX_PATH_CHARS. */
+const recordedPath = (path: string): string => (path === "" ? EMPTY_NAME : cutAt(path, MAX_PATH_CHARS));
 
 /** npm's longest package name. */
 const MAX_DEPENDENCY_NAME = 214;
@@ -157,7 +160,7 @@ function notReadOf(b: Budget, input: { binaries: readonly TarEntry[]; tooLarge: 
   ];
 
   // a name is a publisher's package.json key; the wire holds it to npm's longest (wire.ts WireNotRead)
-  const deps = dependencyNamesOf(input.pkg.manifest).map((name): NotRead => ({ kind: "dependency", name: cutAt(name, MAX_DEPENDENCY_NAME) }));
+  const deps = dependencyNamesOf(input.pkg.manifest).map((name): NotRead => ({ kind: "dependency", name: name === "" ? EMPTY_NAME : cutAt(name, MAX_DEPENDENCY_NAME) }));
 
   return [...files, ...deps];
 }

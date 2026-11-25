@@ -69,14 +69,14 @@ const WithVerdict = z.object({ verdict: z.unknown() }).loose();
  * disagrees. A reply that starts with prose is taken from its first `{` to its last `}`, as before: a verdict object
  * after prose may be one the model quoted from the package, so it is never picked out of the prose on its own.
  */
-function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
+function jsonIn(content: string): { ok: true; value: unknown; inProse: boolean } | { ok: false } {
   const s = content
     .trim()
     .replace(/^```(?:json)?\s*/, "")
     .replace(/```\s*$/, "");
 
   try {
-    return { ok: true, value: JSON.parse(s) };
+    return { ok: true, value: JSON.parse(s), inProse: false };
   } catch {
     const objects = s.startsWith("{") ? topLevelObjects(s) : [];
     const answers = objects.flatMap((text) => verdictObject(text) ?? []);
@@ -84,7 +84,7 @@ function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
     const opening = first === undefined ? null : verdictObject(first);
 
     // the reply opens with its answer: keep it, unless a verdict later in the reply disagrees with it
-    if (opening !== null) return answers.every((x) => x.verdict === opening.verdict) ? { ok: true, value: opening } : { ok: false };
+    if (opening !== null) return answers.every((x) => x.verdict === opening.verdict) ? { ok: true, value: opening, inProse: false } : { ok: false };
 
     const a = s.indexOf("{");
     const b = s.lastIndexOf("}");
@@ -92,7 +92,7 @@ function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
     if (a < 0 || b <= a) return { ok: false };
 
     try {
-      return { ok: true, value: JSON.parse(s.slice(a, b + 1)) };
+      return { ok: true, value: JSON.parse(s.slice(a, b + 1)), inProse: true };
     } catch {
       return { ok: false };
     }
@@ -119,6 +119,10 @@ export function parseReply(content: string, finishReason: string | null = null):
   const reply = RawReply.safeParse(json.value);
 
   if (!reply.success) return { kind: "empty", reason: "bad-verdict" };
+
+  // a benign object after prose may be one the package planted and the model quoted: it is not an answer, so it
+  // cannot settle the review on its own (decide.ts asks again). A flag from prose still has to pass the citation check.
+  if (json.inProse && reply.data.verdict === "benign") return { kind: "empty", reason: "no-json" };
   const findings: RawFinding[] = [];
   let malformed = 0;
 

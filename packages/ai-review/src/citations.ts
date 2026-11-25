@@ -98,18 +98,18 @@ export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
  * `a\\nb.js`, or two paths cut to the same length), so a citation of a shared name is checked against each of them.
  */
 function shownNames(files: readonly TarEntry[]): Map<string, string[]> {
-  const out = new Map<string, string[]>();
+  const out = new Map<string, Set<string>>();
 
   for (const f of files) {
-    for (const s of new Set([f.path, singleLine(f.path), shownPath(f.path)])) {
+    for (const s of [f.path, singleLine(f.path), shownPath(f.path)]) {
       const named = out.get(s);
 
-      if (!named) out.set(s, [f.path]);
-      else if (!named.includes(f.path)) named.push(f.path);
+      if (named) named.add(f.path);
+      else out.set(s, new Set([f.path]));
     }
   }
 
-  return out;
+  return new Map([...out].map(([s, named]) => [s, [...named]]));
 }
 
 export function verifyCitations(findings: readonly RawFinding[], files: readonly TarEntry[]): Verified {
@@ -161,8 +161,9 @@ export function verifyCitations(findings: readonly RawFinding[], files: readonly
     }
 
     const { file, line } = found;
-    // recorded as the wire holds it (wire.ts WireFinding): a path past its limit is cut there, as the prompt showed it
-    const recorded = cutAt(file, MAX_PATH_CHARS);
+    // recorded as the wire holds it (wire.ts WireFinding): a path past its limit is cut there, as the prompt showed it,
+    // and an empty one (a `package/` entry) is named so the wire, which refuses empty strings, keeps the result
+    const recorded = file === "" ? '""' : cutAt(file, MAX_PATH_CHARS);
 
     if (kept.some((k) => k.file === recorded && k.line === raw.line)) continue;
     kept.push({ file: recorded, line: raw.line, quote: quoteCore(raw.quote), excerpt: excerptOf(line, raw.quote), issue: oneSentence(raw.issue), severity: raw.severity });
