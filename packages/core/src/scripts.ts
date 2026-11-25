@@ -90,20 +90,27 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
   return out;
 }
 
-/** Script names a command runs through the package manager, in order. */
-function referencedScripts(cmd: string, scripts: Scripts): string[] {
-  const out: string[] = [];
+/** `--ignore-scripts` (or `=true`) among a matched npm command's flags. */
+const IGNORE_SCRIPTS = /\s--ignore-scripts(?:=true)?(?=\s|$)/;
+
+/**
+ * Script names a command runs through the package manager, in order. `prePost` is false when npm is told
+ * `--ignore-scripts`: it still runs the script it is asked to run, but not that script's pre and post scripts.
+ */
+function referencedScripts(cmd: string, scripts: Scripts): { name: string; prePost: boolean }[] {
+  const out: { name: string; prePost: boolean }[] = [];
 
   for (const m of cmd.matchAll(RUN_REF)) {
     const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+    const npm = m[1] !== undefined || m[2] !== undefined;
 
     // `yarn add x` or `pnpm install` are package manager commands, not scripts
-    if (name && Object.hasOwn(scripts, name)) out.push(name);
+    if (name && Object.hasOwn(scripts, name)) out.push({ name, prePost: !(npm && IGNORE_SCRIPTS.test(m[0])) });
   }
 
   for (const m of cmd.matchAll(RUN_ALL)) {
     for (const pattern of (m[1] ?? "").trim().split(/\s+/)) {
-      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push(name);
+      for (const name of Object.keys(scripts)) if (wildcardMatch(name, pattern)) out.push({ name, prePost: true });
     }
   }
 
@@ -143,8 +150,8 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
       for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals);
 
-      for (const name of referencedScripts(text, scripts)) {
-        for (const n of [`pre${name}`, name, `post${name}`]) {
+      for (const { name, prePost } of referencedScripts(text, scripts)) {
+        for (const n of prePost ? [`pre${name}`, name, `post${name}`] : [name]) {
           const body = scripts[n];
 
           if (body === undefined || followed.has(n)) continue;

@@ -55,6 +55,28 @@ describe("an install script's `npm run` is followed whatever flags or quotes it 
   }
 });
 
+describe("npm's --ignore-scripts runs the named script, not its pre and post scripts", () => {
+  // checked with npm 11.19.1: `npm run --ignore-scripts payload` prints only payload's output
+  const scriptsOf = (cmd: string) => expandHooks({ scripts: { postinstall: cmd, prepayload: DROPPER, payload: "echo ok", postpayload: DROPPER } })[0]?.scripts;
+
+  for (const cmd of ["npm run --ignore-scripts payload", "npm --ignore-scripts run payload", "npm run --ignore-scripts=true payload"]) {
+    test(`${cmd}: payload only`, () => {
+      expect(scriptsOf(cmd)).toEqual(["postinstall", "payload"]);
+      expect(scoreOf({ scripts: { postinstall: cmd, prepayload: DROPPER, payload: "echo ok", postpayload: DROPPER } }, {}).ids).not.toContain("install-download");
+    });
+  }
+
+  test("the named script itself is still read", () => {
+    expect(scoreOf({ scripts: { postinstall: "npm run --ignore-scripts payload", payload: DROPPER } }, {}).ids).toContain("install-download");
+  });
+
+  for (const cmd of ["npm run payload", "npm run --ignore-scripts=false payload", "yarn run --ignore-scripts payload"]) {
+    test(`${cmd}: pre and post scripts still followed`, () => {
+      expect(scriptsOf(cmd)).toEqual(["postinstall", "prepayload", "payload", "postpayload"]);
+    });
+  }
+});
+
 describe("node's inline-eval flag is recognised after other flags", () => {
   const code = "\"require('https').get('https://example.invalid/x')\"";
   const plain = scoreOf({ scripts: { postinstall: `node -e ${code}` } }, {});
