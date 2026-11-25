@@ -744,3 +744,20 @@ describe("the shell reading leaves npm's run to the first two readings where npm
     for (const postinstall of ["FOO=1 npm run '-s' check", "npm run '-s' check --loglevel warn"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
   });
 });
+
+describe("the shell reading leaves a moved shell and heredocs to the first two readings, and reads npm's options to the end", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("after a cd, or in a heredoc's body, no run is read", () => {
+    expect(ids({ postinstall: "cd tools && npm '--loglevel' warn run check", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "cat <<DOC\nnpm --loglevel warn run check\nDOC", check: DROPPER })).not.toContain("install-download");
+  });
+
+  test("--ignore-scripts after the name keeps the run alone, unless it is handed to the script or unset", () => {
+    expect(ids({ postinstall: "npm run --loglevel warn check '--ignore-scripts'", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+
+    for (const postinstall of ["npm run '-s' check -- '--ignore-scripts'", "npm run '-s' check '--ignore-scripts' --no-ignore-scripts"]) {
+      expect(ids({ postinstall, check: "echo", precheck: DROPPER })).toContain("install-download");
+    }
+  });
+});

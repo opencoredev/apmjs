@@ -82,6 +82,9 @@ const NPM_PREFIX_FLAGS = new Set(["--prefix", "-C"]);
 // npm's flags that run the scripts of the workspaces instead of the root package's
 const NPM_WORKSPACE_FLAGS = new Set(["--workspace", "-w", "--workspaces", "-ws", "--include-workspace-root"]);
 
+// commands that move the shell to another directory
+const CHANGES_DIRECTORY = new Set(["cd", "pushd", "popd"]);
+
 // a --prefix that names the package's own directory
 const OWN_DIRECTORY = /^\.\/?$/;
 
@@ -448,7 +451,8 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
 
 /** A simple command as the shell reading reads it (shellRunReferences). */
 interface RunState {
-  open: { name: string; end: number; alone: boolean }[];
+  /** `eligible`: npm runs it from words as written (no xargs, no expansion), so its options can say it runs alone. */
+  open: { name: string; end: number; alone: boolean; eligible: boolean; doubted: boolean }[];
   pm: string | null;
   /** The manager this simple command runs, kept after the name is read. */
   mgr: string | null;
@@ -507,19 +511,26 @@ function npmRedirect(w: string): "now" | "next" | null {
 function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end: number; alone: boolean }[] {
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
+
+  // a heredoc's body is text the shell hands a command, not commands, and the reading does not tell them apart
+  if (/<<(?!<)/.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
   // the simple command being read; `open` holds its references, settled where it ends (a doubt after the name unsets
   // `alone`)
   const fresh = (): RunState => ({ open: [], pm: null, mgr: null, pmEnd: 0, phase: "manager", after: "no", pendingPrefix: false, before: [], atStart: true, wrapper: null, fromInput: false, bare: false, expands: false, named: false, passed: false, dropped: false, wrapValue: false });
 
   let s = fresh();
+  // a `cd` moves the shell to another directory, whose package.json then holds the scripts npm runs
+  let moved = false;
   // the commands a substitution interrupts, read on where it closes
   const outer: RunState[] = [];
 
   const takesName = (): boolean => s.pm !== null && (s.phase !== "manager" || s.pm === "yarn" || s.pm === "pnpm");
 
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w) && !s.dropped) s.open.push({ name: w, end: s.pmEnd, alone: s.pm === "npm" && !s.expands && !s.fromInput && setsIgnoreScripts(s.before) });
+    const eligible = s.pm === "npm" && !s.expands && !s.fromInput;
+
+    if (Object.hasOwn(scripts, w) && !s.dropped) s.open.push({ name: w, end: s.pmEnd, alone: eligible && setsIgnoreScripts(s.before), eligible, doubted: false });
 
     s.named ||= Object.hasOwn(scripts, w);
     s.pm = null;
@@ -533,7 +544,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   };
 
   const doubt = (): void => {
-    if (!s.passed) for (const r of s.open) r.alone = false;
+    if (s.passed) return;
+
+    for (const r of s.open) Object.assign(r, { alone: false, doubted: true });
   };
 
   for (const t of shellWords(cmd)) {
@@ -578,19 +591,28 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
           if (w.startsWith("-") || (s.pendingPrefix && !OWN_DIRECTORY.test(w))) drop();
           s.after = "no";
           s.pendingPrefix = false;
+          s.before.push(w);
         } else if (w.length > 1 && w.startsWith("-") && w !== "--") {
           const r = npmRedirect(w);
+
+          s.before.push(w);
 
           if (r === "next") Object.assign(s, { after: "value", pendingPrefix: true });
           else if (NPM_VALUE_FLAGS.has(w)) s.after = "value";
           else if (r === "now" || !(ENABLES.has(w) || npmBoolean(w) || npmKnownAssignment(w) || /ig/i.test(w))) drop();
         }
+
+        // npm reads its options through the whole invocation, so one after the name may set ignore-scripts too
+        for (const r of s.open) if (r.eligible && !r.doubted) r.alone = setsIgnoreScripts(s.before);
       }
 
       if (!s.atStart) continue;
 
       if (s.wrapValue) {
         s.wrapValue = false;
+      } else if (moved || CHANGES_DIRECTORY.has(base)) {
+        moved = true;
+        s.atStart = false;
       } else if (PACKAGE_MANAGERS.has(w)) {
         Object.assign(s, { pm: w, mgr: w, pmEnd: t.end, phase: "manager", after: "no", before: [], atStart: false });
       } else if (s.wrapper !== null && w.startsWith("-") && w !== "--") {
@@ -644,7 +666,6 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       s.before.push(w);
     } else if (takesName() || (s.pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
       name(w);
-      s.before.push(w);
     } else {
       s.pm = null;
     }
