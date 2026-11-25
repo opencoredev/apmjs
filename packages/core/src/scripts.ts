@@ -37,9 +37,64 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]+)|(start|test|stop|restart)\b)|yarn(?:\s+run)?\s+([\w:.@/-]+)|pnpm(?:\s+run)?\s+([\w:.@/-]+)|bun\s+run\s+([\w:.@/-]+))/g;
+const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()'"\\$\`{}<>]*)?)*(?:[ \t]+--)?`;
+const SCRIPT = String.raw`[ \t]+["']?([\w:.@/-]+)`;
+
+// a match takes only the package manager's word: its flags and the script name are read ahead without being consumed, so
+// the scan goes on from the next word, and a run held in a flag value or taken for the name (`npm --x=`npm run payload``,
+// `yarn --silent npm run payload`) is still found, as main's regex, which read no flags, found it. A flag value stops at
+// any separator, quote, escape or expansion, a newline ends the command, and a command may start a backtick substitution.
+// A bare `--` ends the flags, as it ends npm's options: the next word is the name, and a flag after it is the script's
+const RUN_REF = new RegExp(String.raw`(?:^|[;&|(\`]\s*|\s)(?:npm(?=${FLAGS}[ \t]+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b))|yarn(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|pnpm(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|bun(?=${FLAGS}[ \t]+run${FLAGS}${SCRIPT}))`, "dg");
+
+// main's reading, which takes no flags, beside it: every script it finds is still followed, with its pre and post scripts
+const BARE_RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]+)|(start|test|stop|restart)\b)|yarn(?:\s+run)?\s+([\w:.@/-]+)|pnpm(?:\s+run)?\s+([\w:.@/-]+)|bun\s+run\s+([\w:.@/-]+))/g;
+
+// the only spellings read as setting npm's ignore-scripts; anything else that might touch it is a doubt (ignoreScriptsDoubt)
+const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
+const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
+const SHELL_WORD = /\S+/g;
+
+// quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
+const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
-const INLINE_EVAL = /\b(?:node|bun|deno)\s+(?:-e|--eval|-p|--print|eval)\b/;
+
+// any case, as cmd.exe finds `NODE.EXE`
+const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
+
+// starts only after a non-space, as the sticky walk always does, so a search over a run of whitespace is linear too
+const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
+const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
+const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
+
+/**
+ * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
+ * may start anywhere a word boundary is, as in the regex this replaces; its flags are then read a word at a time and the
+ * search goes on after the last one, so no byte is read twice: `--conditions=node` repeated cannot make each one rescan
+ * the flags after it (the regex did, in time quadratic in the script), and no list of a long command's words is built.
+ */
+function inlineEval(cmd: string): boolean {
+  const interpreter = new RegExp(INTERPRETER);
+  const word = new RegExp(NEXT_WORD);
+
+  for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
+    word.lastIndex = m.index + m[0].length;
+
+    for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
+      // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
+      const raw = w[1] ?? "";
+      const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
+      const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
+
+      if (EVAL_FLAG.test(flag)) return true;
+
+      if (!OTHER_FLAG.test(flag)) break;
+      interpreter.lastIndex = word.lastIndex;
+    }
+  }
+
+  return false;
+}
 
 /** package.json `scripts`, as npm reads it: entries that are not strings run nothing and are dropped. */
 const ScriptsSchema = z.record(z.string(), z.string().catch("")).catch({});
@@ -57,11 +112,42 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
   return out;
 }
 
-/** Script names a command runs through the package manager, in order. */
-function referencedScripts(cmd: string, scripts: Scripts): string[] {
+/**
+ * A script a command runs through the package manager. `alone`: npm runs it without its pre and post scripts, as it does
+ * for `npm run --ignore-scripts x` (npm docs, config `ignore-scripts`: commands that run a particular script still run it,
+ * "but they will not run any pre- or post-scripts").
+ */
+type ScriptRef = { name: string; alone: boolean };
+
+/**
+ * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set: -1 when none does, and
+ * Infinity when the command has any quote, escape, expansion, grouping or redirection, since then the words npm gets are
+ * not the words written (`--foo="a --ignore-scripts"` is one argument). npm reads its flags anywhere in the invocation,
+ * the last one winning (`npm run --ignore-scripts x --no-ignore-scripts` runs prex), and takes abbreviations (`--no-ig`)
+ * and a separate `false` after the flag. So any word with "ig" in a flag other than the two spellings that set it, and a
+ * `false` after a bare `--ignore-scripts`, is a doubt, read to the end of the command: past the invocation it can only
+ * make apm follow more.
+ */
+function ignoreScriptsDoubt(cmd: string): number {
+  if (SHELL_SYNTAX.test(cmd)) return Number.POSITIVE_INFINITY;
+  let last = -1;
+  let bare = false;
+
+  for (const m of cmd.matchAll(SHELL_WORD)) {
+    const w = m[0];
+
+    if ((bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) last = m.index;
+    bare = w === "--ignore-scripts";
+  }
+
+  return last;
+}
+
+/** Scripts main's reading finds a command run, in its order: its regex, then npm-run-all. */
+function mainReferences(cmd: string, scripts: Scripts): string[] {
   const out: string[] = [];
 
-  for (const m of cmd.matchAll(RUN_REF)) {
+  for (const m of cmd.matchAll(BARE_RUN_REF)) {
     const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
 
     // `yarn add x` or `pnpm install` are package manager commands, not scripts
@@ -77,7 +163,36 @@ function referencedScripts(cmd: string, scripts: Scripts): string[] {
   return out;
 }
 
-/** Every lifecycle hook in the manifest with the commands it reaches. */
+/** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
+function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
+  const out: ScriptRef[] = [];
+  let doubt: number | null = null;
+
+  for (const m of cmd.matchAll(RUN_REF)) {
+    const npm = m[1] ?? m[2];
+    const name = npm ?? m[3] ?? m[4] ?? m[5];
+
+    if (!name || !Object.hasOwn(scripts, name)) continue;
+
+    // npm's flags before the name set ignore-scripts, and nothing from there on may unset it; the doubt is found once per
+    // command, so a script of many such runs is still read in one pass
+    const [nameAt] = m.indices?.[m[1] === undefined ? 2 : 1] ?? [m.index];
+    const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
+
+    out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
+  }
+
+  return out;
+}
+
+/**
+ * Every lifecycle hook in the manifest with the commands it reaches, read in two passes so main's coverage holds by
+ * construction. The first is main's traversal exactly: main's references only, with every pre and post script, its depth
+ * rule and its MAX_COMMANDS budget, so it reads the commands main reads and is cut where main is. The second goes back
+ * over each command the first read, at the depth it read it, and follows only what the flag-aware reading adds there,
+ * and everything that reaches, with the budget left. It reads no script the first did, so it pushes no command twice, and
+ * a script npm runs alone (`npm run --ignore-scripts x`) loses only pre and post scripts the first never read.
+ */
 export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
   const scripts = scriptsOf(manifest);
   const out: ExpandedHook[] = [];
@@ -88,40 +203,67 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     if (own === undefined) continue;
     const commands: HookCommand[] = [];
     const followed = new Set<string>([hook]);
+    // what the first pass read, for the second to read the flag-aware references in
+    const read: { text: string; depth: number }[] = [];
     let cut: string | null = null;
 
-    const visit = (text: string, from: string, depth: number, viaEval: boolean): void => {
+    /** Whether a command at this depth may be read, or the reading is cut, and why. */
+    const admits = (from: string, depth: number): boolean => {
       if (depth > MAX_DEPTH) {
         cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
 
-        return;
+        return false;
       }
 
       if (commands.length >= MAX_COMMANDS) {
         cut ??= `${from}: more than ${MAX_COMMANDS} commands`;
 
-        return;
+        return false;
       }
 
-      const evals = viaEval || INLINE_EVAL.test(text);
-      commands.push({ from, text, viaEval: evals });
+      return true;
+    };
 
-      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals);
-
-      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals);
-
-      for (const name of referencedScripts(text, scripts)) {
-        for (const n of [`pre${name}`, name, `post${name}`]) {
+    // the first pass marks a script followed before its body is admitted, as main does; the second only once it is, so a
+    // script it reached but could not read stays one no hook reaches and keeps its standalone reading (otherScripts)
+    const follow = (refs: readonly ScriptRef[], depth: number, first: boolean): void => {
+      for (const { name, alone } of refs) {
+        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
           const body = scripts[n];
+          const from = `scripts.${n} (run by scripts.${hook})`;
 
-          if (body === undefined || followed.has(n)) continue;
+          if (body === undefined || followed.has(n) || (!first && !admits(from, depth + 1))) continue;
           followed.add(n);
-          visit(body, `scripts.${n} (run by scripts.${hook})`, depth + 1, false);
+          visit(body, from, depth + 1, false, first);
         }
       }
     };
 
-    visit(own, `scripts.${hook}`, 0, false);
+    const visit = (text: string, from: string, depth: number, viaEval: boolean, first: boolean): void => {
+      if (!admits(from, depth)) return;
+
+      const evals = viaEval || inlineEval(text);
+      commands.push({ from, text, viaEval: evals });
+
+      if (first) read.push({ text, depth });
+
+      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, first);
+
+      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals, first);
+
+      const main = mainReferences(text, scripts).map((name) => ({ name, alone: false }));
+
+      follow(first ? main : [...main, ...flagReferences(text, scripts)], depth, first);
+    };
+
+    visit(own, `scripts.${hook}`, 0, false, true);
+
+    for (const { text, depth } of read) {
+      const main = new Set(mainReferences(text, scripts));
+
+      follow(flagReferences(text, scripts).filter((r) => !main.has(r.name)), depth, false);
+    }
+
     out.push({ hook, kind, commands, scripts: [...followed], cut });
   }
 
@@ -183,9 +325,9 @@ export function isInlineDownload(cmd: string, ctx: DownloadContext = {}): boolea
   if (/\|\s*(?:ba|z)?sh\b/.test(cmd)) return true;
 
   if (npxPackages(cmd).some((p) => !ctx.localBins?.has(p))) return true;
-  const inlineEval = ctx.viaEval === true || INLINE_EVAL.test(cmd);
+  const evals = ctx.viaEval === true || inlineEval(cmd);
 
-  return inlineEval && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
+  return evals && /https?|fetch|\bnet\b|child_process|exec/.test(cmd);
 }
 
 /** Words a reading of a command or script found: all of them, or the first few and a cut, past which it read no more. */
