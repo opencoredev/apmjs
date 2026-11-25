@@ -61,7 +61,7 @@ export const NAME_FRESH_MS = 5 * 60_000;
 export const NAME_STALE_MS = 24 * 60 * 60_000;
 const MAX_NAMES = 20_000;
 
-/** How long an isolate stops asking OSV about names after a failed or partial answer, using what it kept instead. */
+/** How long an isolate stops asking OSV at a root about names once a first page went unanswered, using what it kept. */
 const NAME_BACKOFF_MS = 30_000;
 
 /** Until when this isolate does not ask OSV at each root about names (wall clock), after a first page went unanswered. */
@@ -116,18 +116,22 @@ function remember(key: string, ids: string[], until: number): void {
 const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-"));
 
 /** A name's advisories as kept: when OSV gave them (wall clock), in the isolate and in the data center's cache. */
-/**
- * A name's advisories as kept: when OSV gave them (wall clock), and whether that was all of them. Only a complete answer
- * is fresh or shared with the data center; a partial one keeps what it found for while OSV is not asked again.
- */
-const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema), complete: z.boolean(), retryAt: z.number() });
+/** A name's complete answer as kept: when it was asked for (wall clock), in the isolate and in the data center's cache. */
+const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema) });
 
 type NameEntry = z.infer<typeof NameEntry>;
 
 /** The isolate's answers per name, by OSV root and name, oldest first. */
 const NAMES = new Map<string, NameEntry>();
 
-function rememberName(key: string, entry: NameEntry): void {
+/**
+ * Keeps `entry` as the name's answer unless one asked for later is kept already (a slower request's answer must not
+ * replace a newer one), and returns the answer kept.
+ */
+function rememberName(key: string, entry: NameEntry): NameEntry {
+  const current = NAMES.get(key);
+
+  if (current !== undefined && current.fetchedAt > entry.fetchedAt) return current;
   NAMES.delete(key);
   NAMES.set(key, entry);
 
@@ -135,6 +139,8 @@ function rememberName(key: string, entry: NameEntry): void {
     if (NAMES.size <= MAX_NAMES) break;
     NAMES.delete(oldest);
   }
+
+  return entry;
 }
 
 /** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
@@ -378,32 +384,24 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
           const local = NAMES.get(key) ?? null;
 
-          if (local !== null && local.complete && youngerThan(local, NAME_FRESH_MS)) return local.advisories;
+          if (local !== null && youngerThan(local, NAME_FRESH_MS)) return local.advisories;
           const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
 
-          // the data center's copy is always a complete answer, and answers only when it is newer than this isolate's
-          if (shared !== null && youngerThan(shared, NAME_FRESH_MS) && (local === null || shared.fetchedAt > local.fetchedAt)) {
-            rememberName(key, shared);
-
-            return shared.advisories;
-          }
-
-          // the newest answer kept, complete or partial, while it is young enough: what is answered when OSV is not asked
-          // (fail open past that)
+          if (shared !== null && youngerThan(shared, NAME_FRESH_MS)) return rememberName(key, shared).advisories;
+          // the newest answer kept, while it is young enough: what is answered when OSV is not asked (fail open past that)
           const newest = [local, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0] ?? null;
           const kept = newest?.advisories ?? [];
 
-          // OSV down at this root, or this name's last answer partial: wait out the back-off instead of asking again
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now || (local?.retryAt ?? 0) > now) return kept;
+          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
           const got = yield* Effect.result(askName(name));
 
           if (Result.isSuccess(got) && got.success.complete) {
-            const entry = { fetchedAt: now, advisories: got.success.advisories, complete: true, retryAt: 0 };
+            const entry = { fetchedAt: now, advisories: got.success.advisories };
+            const winner = rememberName(key, entry);
 
-            rememberName(key, entry);
-            sharedWrite(key, entry, background);
+            if (winner === entry) sharedWrite(key, entry, background);
 
-            return entry.advisories;
+            return winner.advisories;
           }
 
           console.error(JSON.stringify({ event: "osv-name", name, error: Result.isSuccess(got) ? "partial answer" : String(got.failure) }));
@@ -417,14 +415,11 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             return kept;
           }
 
-          // a partial answer: what it read is OSV's word now, and what it could not read is taken from the newest answer
-          // kept. It is kept as this name's newest answer, never fresh, so the requests during its back-off withhold it too
+          // a partial answer is not kept, so the next request asks again; this one withholds what it read (OSV's word,
+          // a withdrawal included) and, for what it could not read, what the kept answer says
           const { advisories: found, read } = got.success;
-          const advisories = [...found, ...kept.filter((a) => !read.has(a.id))];
 
-          rememberName(key, { fetchedAt: now, advisories, complete: false, retryAt: now + NAME_BACKOFF_MS });
-
-          return advisories;
+          return [...found, ...kept.filter((a) => !read.has(a.id))];
         }),
       lookup: (pkgs) =>
         Effect.gen(function* () {

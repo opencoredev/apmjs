@@ -47,6 +47,8 @@ const NPM = new Map(Object.entries<NpmPackage>({
   "orphan-tag": { versions: ["1.0.0"], tags: { beta: "2.0.0" } },
   // two advisories, one of which OSV fails to send
   "half-read": { versions: ["1.0.0", "1.1.0", "1.2.0"] },
+  // listed while a slower request about it is still out
+  flip: { versions: ["1.0.0", "1.1.0"] },
 } satisfies Record<string, NpmPackage>));
 
 /** OSV's advisories per name: ids only in the batch answer, then each one read whole. */
@@ -72,6 +74,7 @@ const VULNS = new Map(Object.entries<Vuln[]>({
   withdrawn: [{ id: "MAL-2026-1003", withdrawn: "2026-11-24T00:00:00Z", affected: [{ package: { name: "withdrawn", ecosystem: "npm" }, versions: ["1.0.0"] }] }],
   "Legacy-Name": [{ id: "MAL-2026-1004", affected: [{ package: { name: "Legacy-Name", ecosystem: "npm" }, versions: ["1.1.0"] }] }],
   "orphan-tag": [{ id: "MAL-2026-1005", affected: [{ package: { name: "orphan-tag", ecosystem: "npm" }, versions: ["2.0.0"] }] }],
+  flip: [],
   "half-read": [
     { id: "MAL-2026-1006", affected: [{ package: { name: "half-read", ecosystem: "npm" }, versions: ["1.2.0"] }] },
     { id: "MAL-2026-1007", affected: [{ package: { name: "half-read", ecosystem: "npm" }, versions: ["1.1.0"] }] },
@@ -118,9 +121,18 @@ const osvServer = Bun.serve({
   hostname: "127.0.0.1",
   async fetch(req): Promise<Response> {
     osv.attempts++;
+    // the answer is what OSV listed when it was asked; a stall delays it, as a slow network would
+    const stall = osv.stallMs;
+    const res = await respond(req);
 
-    if (osv.stallMs > 0) await Bun.sleep(osv.stallMs);
+    if (stall > 0) await Bun.sleep(stall);
 
+    return res;
+  },
+});
+
+/** What the OSV stand-in answers `req` with, from what it lists now. */
+async function respond(req: Request): Promise<Response> {
     if (osv.down) return new Response("unavailable", { status: 503 });
     const path = new URL(req.url).pathname;
     const read = /\/v1\/vulns\/(.+)$/.exec(path);
@@ -141,8 +153,7 @@ const osvServer = Bun.serve({
     osv.names++;
 
     return Response.json({ results: q.data.queries.map((one) => ({ vulns: (VULNS.get(one.package.name) ?? []).map((v) => ({ id: v.id, modified: "2026-11-24T00:00:00Z" })) })) });
-  },
-});
+}
 
 let db: Awaited<ReturnType<typeof freshDatabase>>;
 
@@ -318,20 +329,39 @@ describe("what the review of 34ccf92 found", () => {
 
     osv.unreadable.add("MAL-2026-1007");
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
-    // within the name's back-off, what the partial answer found is still withheld, and OSV is not asked about it
+    // a partial answer is not kept: the next request asks again, finds the same, and withholds it too
     const attempts = osv.attempts;
 
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
-    expect(osv.attempts).toBe(attempts);
-    // the back-off is this name's: another name is still asked about
+    expect(osv.attempts).toBeGreaterThan(attempts);
+    // another name is still asked about, and once OSV sends everything the whole answer is kept
     expect(Object.keys((await packument("evil-tagged", { root })).body.versions)).toEqual(["9.0.0"]);
     osv.unreadable.clear();
-    // the isolate waits out its back-off before it asks again, then keeps the whole answer
-    setSystemTime(new Date(Date.now() + 31_000));
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
   });
 
-  test("a partial refresh after the kept answer expired keeps what both found, through its back-off", async () => {
+  test("a slower request's older answer does not replace a newer one the isolate kept", async () => {
+    const root = freshRoot();
+    const flipped = VULNS.get("flip") ?? [];
+
+    osv.stallMs = 300;
+    const slow = packument("flip", { root });
+
+    await Bun.sleep(100);
+    osv.stallMs = 0;
+    flipped.push({ id: "MAL-2026-1008", affected: [{ package: { name: "flip", ecosystem: "npm" }, versions: ["1.1.0"] }] });
+
+    try {
+      expect(Object.keys((await packument("flip", { root })).body.versions)).toEqual(["1.0.0"]);
+      // the slow request asked before the listing: the newer answer the isolate kept meanwhile wins, for it too
+      expect(Object.keys((await slow).body.versions)).toEqual(["1.0.0"]);
+      expect(Object.keys((await packument("flip", { root })).body.versions)).toEqual(["1.0.0"]);
+    } finally {
+      flipped.length = 0;
+    }
+  });
+
+  test("a partial refresh after the kept answer expired keeps what both found, request after request", async () => {
     const root = freshRoot();
 
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
