@@ -446,6 +446,8 @@ describe("what still goes to the package manager", () => {
     [["ls"], "apm does not pass ls on to bun"],
     [["why", "zod"], "apm does not pass why on to bun"],
     [["/abs/dev"], "apm does not pass /abs/dev on to bun"],
+    [["rm", "--pm", "yarn", "zod"], "apm does not pass rm on to yarn"],
+    [["ls", "--pm", "yarn"], "apm does not pass ls on to yarn"],
     [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove passes on only the names of the packages to remove, not --no-package-lock"],
     [["rm", "zod", "--", "--force"], "apm rm passes on only the names of the packages to remove, not --force"],
     [["index"], "apm does not pass index on to bun"],
@@ -473,7 +475,10 @@ describe("what still goes to the package manager", () => {
     [["remove", "zod"], "bun remove zod"],
     [["remove", "--pm", "npm", "zod"], "npm remove zod"],
     [["why", "--pm", "npm", "zod"], "npm why zod"],
-    [["outdated", "--pm", "pnpm"], "pnpm outdated"],
+    [["outdated", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false outdated"],
+    [["dev", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false run dev"],
+    [["remove", "--pm", "pnpm", "zod"], "pnpm remove zod"],
+    [["remove", "--pm", "yarn", "zod"], "yarn remove zod"],
     [["start", "--pm", "npm"], "npm start"],
     [["run", "dev", "-i"], "bun run --no-install dev -i"],
     [["run", "--silent", "dev"], "bun run --no-install --silent dev"],
@@ -493,6 +498,29 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(2);
     expect(r.err).toContain("a bunfig.toml sets run.bun");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([["[\"run\"]\nbun = true\n"], ["run = { bun = true }\n"]])("apm dev is refused while bunfig.toml %p may run node as bun", async (bunfig) => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": bunfig });
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("a bunfig.toml sets run.bun");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm dev runs under a bunfig.toml that leaves run.bun off", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nbun = false\nsilent = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev"]);
+  });
+
+  test.each([[["help", "ci"]], [["ci", "--json", "--help"]]])("apm %p prints ci's help on stdout and runs nothing", async (argv) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm ci");
     expect(r.pmCalls).toEqual([]);
   });
 

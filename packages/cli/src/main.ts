@@ -2279,10 +2279,11 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm run <script|file>      your package manager's run (bun: with --no-install)
   apm <script>               a package.json script (apm dev = bun run dev)
   apm remove <pkg>...        your package manager's removal, by name only
-  apm test                   your package manager's test; npm, pnpm and yarn also start, why, ls and outdated
+  apm test                   your package manager's test; npm and pnpm also start, why, ls and outdated, yarn start and why
   apm ci                     bun and npm: a frozen install, with the switches apm install takes with no packages
   apm <anything else>        refused: it could install packages apm cannot check
-  apm <command> --help       that command's flags (also -h, or apm help <command>); runs nothing
+  apm <command> --help       an apm command's flags (also -h, or apm help <command>); runs nothing. After a command
+                             apm passes on, --help goes to the package manager or the script
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
   --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
@@ -2309,7 +2310,7 @@ const PASSTHROUGH = new Map<Pm, ReadonlySet<string>>([
   ["bun", new Set(["run", "test", "remove", "rm", "uninstall"])],
   ["npm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
   ["pnpm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
-  ["yarn", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+  ["yarn", new Set(["run", "test", "start", "remove", "why"])],
 ]);
 
 const REMOVALS = new Set(["remove", "rm", "uninstall"]);
@@ -2330,17 +2331,24 @@ function projectScripts(cwd: string): Set<string> {
   }
 }
 
-/** Whether a bunfig.toml bun reads in `cwd` sets run.bun, which runs scripts' node under bun, and so with auto-install. */
+const BunfigRun = z.object({ run: z.object({ bun: z.unknown() }).loose().optional() }).loose();
+
+/**
+ * Whether a bunfig.toml bun reads in `cwd` may set run.bun, which runs scripts' node under bun, and so with auto-install.
+ * A bunfig apm cannot read as TOML counts as one that does.
+ */
 function bunRunsNode(cwd: string): boolean {
   const configs = [join(cwd, "bunfig.toml"), join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), ".bunfig.toml"), join(homedir(), ".bunfig.toml")];
 
   return configs.some((file) => {
-    try {
-      const text = readFileSync(file, "utf8");
+    if (!existsSync(file)) return false;
 
-      return /^\s*\[run\][^[]*^\s*bun\s*=\s*true/m.test(text) || /^\s*run\.bun\s*=\s*true/m.test(text);
+    try {
+      const parsed = BunfigRun.safeParse(Bun.TOML.parse(readFileSync(file, "utf8")));
+
+      return !parsed.success || (parsed.data.run?.bun !== undefined && parsed.data.run.bun !== false);
     } catch {
-      return false;
+      return true;
     }
   });
 }
@@ -2363,7 +2371,7 @@ function passthroughError(cmd: string, args: readonly string[], end: number, pm:
     return word === undefined ? null : `apm does not pass bun's ${word} on: bun would install what the tests import, unchecked`;
   }
 
-  if (bunRunsNode(cwd)) return "a bunfig.toml sets run.bun, so bun would run node as bun and install what the code imports, unchecked";
+  if (bunRunsNode(cwd)) return "a bunfig.toml sets run.bun (or apm cannot read it), so bun could run node as bun and install what the code imports, unchecked";
 
   // bun's options come before what it runs; what follows is the script's own
   const target = own.findIndex((x) => !x.startsWith("-"));
@@ -2410,6 +2418,9 @@ async function passthrough(a: Args): Promise<number> {
 
   if (det.pm === "bun" && command[0] === "run") command.splice(1, 0, "--no-install");
 
+  // pnpm's verify-deps-before-run=install would install before it runs a script
+  if (det.pm === "pnpm" && !REMOVALS.has(a.cmd)) command.unshift("--config.verify-deps-before-run=false");
+
   return (await runCmd([det.pm, ...command, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
@@ -2454,12 +2465,6 @@ async function cleanInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
 
-  if (a.raw.includes("--help") || a.raw.includes("-h")) {
-    say("usage: apm ci [switches]\n\nWith bun and npm, a frozen install from the lockfile (bun install --frozen-lockfile, npm ci), with the switches\napm install takes with no packages. pnpm and yarn have no ci: run apm install --frozen-lockfile.");
-
-    return 0;
-  }
-
   const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
   // bun 1.1 has no ci (it runs a script of that name), so apm asks every bun for the frozen install by name
   const command = det.pm === "bun" ? ["install", "--frozen-lockfile"] : ["ci"];
@@ -2472,10 +2477,14 @@ async function cleanInstall(a: Args): Promise<number> {
   return 2;
 }
 
+const CI_HELP = "usage: apm ci [switches]\n\nWith bun and npm, a frozen install from the lockfile (bun install --frozen-lockfile, npm ci), with the switches\napm install takes with no packages. pnpm and yarn have no ci: run apm install --frozen-lockfile.";
+
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
-  if (a.cmd === "help") return helpTopic(a.positional[0] ?? "")?.help ?? HELP;
+  if (a.cmd === "help") return a.positional[0] === "ci" ? CI_HELP : (helpTopic(a.positional[0] ?? "")?.help ?? HELP);
   if (a.cmd === "--help" || a.cmd === "-h") return HELP;
+
+  if (a.cmd === "ci") return a.raw.includes("--help") || a.raw.includes("-h") ? CI_HELP : null;
 
   return has(a, "help") ? (commandOf(a.cmd)?.help ?? null) : null;
 }
