@@ -150,6 +150,13 @@ function messagesOf(errors: readonly unknown[]): string {
 
 type Answer = { status: number; result: unknown; success: boolean | null };
 
+/** A body that is not JSON reads as null; one cut short by the request's timeout rethrows, since that read did not complete. */
+function nullUnlessCutShort(e: Error): null {
+  if (e.name === "TimeoutError" || e.name === "AbortError") throw e;
+
+  return null;
+}
+
 /**
  * One request. A genuine failure throws CloudflareError: a status that is not 2xx, `success: false`, or any error in the
  * answer. Anything else comes back with its result unparsed; a body that is not Cloudflare's envelope comes back with no
@@ -169,7 +176,8 @@ async function request(cf: Cloudflare, path: string, init: { method?: string; bo
   });
 
   // a body that is not JSON is reported by its status
-  const raw: unknown = await res.json().catch(() => null);
+  const raw: unknown = await res.json().catch(nullUnlessCutShort);
+
   const success = SuccessField.safeParse(raw);
   const errors = ErrorsField.safeParse(raw);
   const result = ResultField.safeParse(raw);
