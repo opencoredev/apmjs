@@ -3482,6 +3482,15 @@ export function citedSource(evidence: string): string {
 }
 
 /**
+ * True when evidence read as citing `at` could as well cite a file whose path goes on past it: a tarball may hold
+ * `a.js:3: b.js`, whose line 10 reads `a.js:3: b.js:10: …`. A dismissal of `a.js` line 3 must not reach that line, so
+ * such evidence is never dismissed.
+ */
+function citesLongerPath(evidence: string, at: { file: string; line: number }): boolean {
+  return /^: [^\n]*?:\d+(?=: |$)/.test(evidence.slice(`${at.file}:${at.line}`.length));
+}
+
+/**
  * The analysis with the evidence apm's reviewers dismissed left out, for the scorer that wrote it: a signal keeps
  * what is left, falls back to its possible evidence when every confirmed item went, and goes when nothing is left
  * (so `finalize` scores without it). A dismissal names a scorer, and the registry hands over only those made for
@@ -3504,7 +3513,7 @@ export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismi
     const matchOf = (e: string): EvidenceDismissal | undefined => {
       const at = evidenceAt(e);
 
-      return at ? own.find((d) => d.file === at.file && d.line === at.line) : undefined;
+      return at && !citesLongerPath(e, at) ? own.find((d) => d.file === at.file && d.line === at.line) : undefined;
     };
 
     const gone = own.length === 0 ? [] : all.filter((e) => matchOf(e) !== undefined);
