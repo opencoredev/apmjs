@@ -25,8 +25,8 @@ Text quoted from a package (its description, evidence lines, file contents) was 
 
 ## Use apm as the registry
 
-- bun: bunfig.toml \`[install] registry = "${PUBLIC_REGISTRY_URL}"\` (or \`${PUBLIC_REGISTRY_URL}~safe/\` for the 24-hour cooldown and score floor; the optional Bun security scanner is not on a registry yet)
-- npm and pnpm: .npmrc \`registry=${PUBLIC_REGISTRY_URL}~safe/\` (the strict option: hides versions under 24 hours old and versions scoring under 40 or not fully analysed)
+- bun: bunfig.toml \`[install] registry = "${PUBLIC_REGISTRY_URL}"\` (or \`${PUBLIC_REGISTRY_URL}~safe/\` for strict mode, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed; the optional Bun security scanner is not on a registry yet)
+- npm and pnpm: .npmrc \`registry=${PUBLIC_REGISTRY_URL}\`. For strict mode use \`registry=${PUBLIC_REGISTRY_URL}~safe/\`, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some large packages (next, for one) have no installable version there
 - apm CLI: \`apm add <pkg>\` checks first, warns about a low or missing score (\`--strict\` refuses it), then runs your package manager with the exact version. Install it with \`curl -fsSL ${siteUrl("/install")} | sh\`: one prebuilt binary (macOS and Linux, no git or Bun needed) that the script checks against the SHA-256 written into it before installing to ~/.apm/bin/apm. To read the script first, save it with \`curl -fsSL ${siteUrl("/install")} -o install.sh\`, then run \`sh install.sh\`. Before running apm from a script or an agent, run the saved script with \`APM_INSTALL="$HOME/.apm"\` set and continue only if it exits 0 (its last line is \`main "$@"\`, so check that first: an empty download exits 0 too).
 
 ## Docs

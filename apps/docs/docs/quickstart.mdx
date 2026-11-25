@@ -26,17 +26,17 @@ Pick your package manager. Each setting goes in the project folder, so it applie
     The scanner is not on a registry yet. Until it is, install it from a clone of apm; see [Bun scanner](/guides/bun-scanner#install-it). Without it, the `registry` line alone still works.
   </Tab>
   <Tab title="npm">
-    Add this to `.npmrc`. The `~safe` view hides versions under 24 hours old and versions scoring under 40.
+    Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions, and the tarballs of revoked and confirmed-malicious versions answer 410 even to an existing lockfile.
 
     ```ini title=".npmrc"
-    registry=https://registry.apmjs.dev/~safe/
+    registry=https://registry.apmjs.dev/
     ```
   </Tab>
   <Tab title="pnpm">
     pnpm reads the same `.npmrc` as npm.
 
     ```ini title=".npmrc"
-    registry=https://registry.apmjs.dev/~safe/
+    registry=https://registry.apmjs.dev/
     ```
   </Tab>
 </Tabs>
@@ -46,16 +46,29 @@ Then install as usual (`bun install`, `npm install`, `pnpm install`). Packages c
 apm's package documents leave out fields npm's have and no install reads from them: each version keeps its install fields, scripts, links and checksums, and drops the rest (`licenseText`, `readme`, the `exports` map, npm's signatures), and the abbreviated form installs use has no `devDependencies`. `npm view <package> devDependencies` still works. The full list is in [What apm's packuments leave out](/reference/http-api#what-apms-packuments-leave-out).
 
 :::tip
-For npm and pnpm, the plain registry URL (without `~safe/`) serves every version npm has. Use it when you only want `apm add` to apply the checks.
+For a strict mode with stock npm or pnpm, use `registry=https://registry.apmjs.dev/~safe/` instead. The [`~safe` view](/guides/safe-view) hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed, so some large packages have no version it can install.
 :::
 
 ## 2. Get the apm CLI
 
-Install it with one command. It downloads one prebuilt binary for macOS or Linux (x64 or arm64, and musl systems such as Alpine on x64). Running it needs no git, Bun or Node.
+Install it with one command. The install script downloads one prebuilt binary for macOS or Linux (x64 or arm64, and musl systems such as Alpine on x64). Running it needs no git, Bun or Node.
 
-```bash
-curl -fsSL https://apmjs.dev/install | sh
-```
+<Tabs>
+  <Tab title="Install script">
+    ```bash
+    curl -fsSL https://apmjs.dev/install | sh
+    ```
+  </Tab>
+  <Tab title="Homebrew">
+    Coming with launch: the `opencoredev/tap` tap is not published yet.
+
+    ```bash
+    brew install opencoredev/tap/apm
+    ```
+  </Tab>
+</Tabs>
+
+The rest of this section describes the install script.
 
 The script installs to `~/.apm/bin/apm`, never uses sudo and does not edit your shell profile. It prints the line to add to your PATH instead:
 
