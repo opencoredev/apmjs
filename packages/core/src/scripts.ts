@@ -38,9 +38,10 @@ export type HookCommand = { from: string; text: string; viaEval: boolean; added:
 export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[]; addedScripts: string[]; cut: string | null };
 
 const MAX_DEPTH = 8;
+const MAX_COMMANDS = 200;
+
 /** Work units the third pass (the shell reading) may spend per hook, on a meter of its own (expandHooks). */
 const MAX_SHELL_READING_WORK = MAX_ANALYSIS_WORK / 16;
-const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
 const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()'"\\$\`{}<>]*)?)*(?:[ \t]+--)?`;
