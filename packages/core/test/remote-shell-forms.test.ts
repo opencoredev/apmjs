@@ -2,7 +2,10 @@
 // by its path or reached through env or sudo, dash, and the `sh -c "$(curl …)"` and `sh <(curl …)` forms. Each scored a
 // clean 100. Payloads are harmless stand-ins (example.invalid).
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { analyze, finalize, SCORE_FLOOR, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { slowOn } from "./fixtures/regex-timing.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -106,4 +109,18 @@ describe("commands that do not run what they download are not", () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
     });
   }
+});
+
+describe("the rule reads hostile text in linear time", () => {
+  // the rule as written in facts.ts (not exported), read from its literal
+  const src = readFileSync(join(import.meta.dir, "..", "src", "facts.ts"), "utf8");
+  const literal = /^const REMOTE_SHELL =\n\s*\/(.+)\/([a-z]*);$/m.exec(src);
+  const re = new RegExp(literal?.[1] ?? "", literal?.[2]);
+
+  test("short runs with no spaces, where every separator starts a command, do not make it quadratic", () => {
+    expect(literal).not.toBeNull();
+    const units = ["x=|", "x=;", ";a=b", "|sudo -u x", "|env -ix=", "curl x|env a=", "|sudo --user="];
+
+    expect(slowOn("REMOTE_SHELL", re, (_re, n) => units.map((u) => u.repeat(Math.ceil(n / u.length)).slice(0, n)), 64_000)).toEqual([]);
+  });
 });
