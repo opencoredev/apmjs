@@ -54,7 +54,7 @@ import {
 } from "@apm/core";
 import { liveChangeRefusal, secondFactor } from "./access.ts";
 import { canonicalSince, type LiveAction } from "./actions.ts";
-import { Analysis, hasResult, SEED_PER_PACKAGE, versionsToSeed, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
+import { Analysis, hasResult, RECENT_SEED_MS, SEED_PER_PACKAGE, versionsToSeed, WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { Seeding } from "./seeding.ts";
 import { Auth } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
@@ -97,11 +97,11 @@ import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarnin
 import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
 import { timed as timedOf, timingOrNull } from "./timing.ts";
-import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, pageScores, type PageNeed } from "./kept-package.ts";
+import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, pageScores, previousVersion, type PageNeed } from "./kept-package.ts";
 import { newestPublishersFirst } from "./publishers.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
-import { installStamp, scoredPackage, Upstream, type ChosenAnswer, type UpstreamApi, type UpstreamPackage } from "./upstream.ts";
+import { installStamp, scoredPackage, Upstream, type ChosenAnswer, type UpstreamApi, type UpstreamPackage, type Wanted } from "./upstream.ts";
 import { jsonBound, keptSummary, keptVersion, textReadWeight, type Catalog, type Reserve, type Summary } from "./walk-catalog.ts";
 import {
   eventDetailShown,
@@ -281,8 +281,20 @@ const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
     return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
   });
 
+/** Upstream.probe's wanted for a reader of no score: whether npm has the package, and its versions. */
+const NO_SCORES: Wanted = () => new Map();
+
+/**
+ * Upstream.probe's wanted for a reader of latest's score and grade and of which versions it may queue (versionsToSeed:
+ * those a dist-tag names and the ones published in the last RECENT_SEED_MS), all of them trimmed.
+ */
+const latestWanted =
+  (at: number): Wanted =>
+  (pkg) =>
+    new Map([...Object.values(pkg.distTags), ...pkg.versions.filter((v) => v.published_at >= at - RECENT_SEED_MS).map((v) => v.version)].map((v) => [v, "trimmed"] as const));
+
 /** Like lookupOrUnknown, with a package that did not fit `lease` kept apart as "over-budget". */
-const lookupWithin = (name: string, lease: Lease) =>
+const lookupWithin = (name: string, lease: Lease, wanted?: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -290,7 +302,7 @@ const lookupWithin = (name: string, lease: Lease) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const p = yield* upstream.probeWithin(name, lease);
+    const p = yield* (wanted === undefined ? upstream.probeWithin(name, lease) : upstream.probeWithinFor(name, wanted, lease));
 
     switch (p.kind) {
       case "found":
@@ -467,7 +479,7 @@ const catalogWithin = (name: string, lease: Lease, choice: KeyedSelect) =>
   });
 
 /** Like lookup, but keeps "upstream could not be asked" apart from "nobody has it". */
-const lookupOrUnknown = (name: string, lease: Lease) =>
+const lookupOrUnknown = (name: string, lease: Lease, wanted?: Wanted) =>
   Effect.gen(function* () {
     const pkg = yield* (yield* Store).getPackage(name);
 
@@ -475,7 +487,7 @@ const lookupOrUnknown = (name: string, lease: Lease) =>
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* upstream.probe(name, lease);
+    const probe = yield* (wanted === undefined ? upstream.probe(name, lease) : upstream.probeFor(name, wanted, lease));
 
     if (probe.kind === "unknown") return "unknown" as const;
 
@@ -952,7 +964,7 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
 
       if (upstream) {
         // only whether npm has the name is kept, so its catalog is given back at once
-        const probe = yield* briefly((lease) => Effect.map(upstream.probe(name, lease), (p) => p.kind));
+        const probe = yield* briefly((lease) => Effect.map(upstream.probeFor(name, NO_SCORES, lease), (p) => p.kind));
 
         if (probe === "found") {
           return {
@@ -1321,9 +1333,7 @@ const handleOwners = (req: Request, caller: Caller) =>
 
 // ---------- read APIs ----------
 function previousOf(src: Source, v: VersionRecord): VersionRecord | null {
-  const all = src.versions.filter((x) => x.version !== v.version && x.published_at <= v.published_at && x.status !== "revoked");
-
-  return all[all.length - 1] ?? null;
+  return previousVersion(src.versions, v);
 }
 
 const scoreResponse = (src: Source, v0: VersionRecord) =>
@@ -1633,8 +1643,8 @@ const workOutLatestScore = (name: string, known: boolean) =>
 
       // a name apm never scored (no local package, no stored upstream analysis) is null without asking upstream. One
       // with a kept score (`known`) is read through: its analyses may only be waiting for the current scorer
-      if (!local && !known && (yield* store.upstreamAnalyses(name)).scores.size === 0) return { kind: "unanalysed", score: none } satisfies WorkedOut;
-      const src = yield* lookupWithin(name, lease);
+      if (!local && !known && !(yield* store.upstreamScored(name))) return { kind: "unanalysed", score: none } satisfies WorkedOut;
+      const src = yield* lookupWithin(name, lease, latestWanted(at));
 
       if (src === "unknown" || src === "over-budget") return { kind: "unavailable" } satisfies WorkedOut;
       const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
@@ -1822,7 +1832,7 @@ const eventsResponse = (name: string) =>
     // and still answers 200 with an empty events list when it exists upstream
     if (events.length === 0 && !pkg) {
       const upstream = yield* upstreamOrNull;
-      const existsUpstream = upstream ? yield* lookupWithin(name, yield* RequestMemory) : null;
+      const existsUpstream = upstream ? yield* lookupWithin(name, yield* RequestMemory, NO_SCORES) : null;
 
       if (!existsUpstream || existsUpstream === "unknown" || existsUpstream === "over-budget") return fail(404, "Not found");
     }
@@ -1864,7 +1874,7 @@ const exactPart = (query: string, valid: boolean) =>
   Effect.gen(function* () {
     const store = yield* Store;
     const at = yield* now;
-    const found = valid ? yield* lookupOrUnknown(query, yield* RequestMemory) : null;
+    const found = valid ? yield* lookupOrUnknown(query, yield* RequestMemory, (pkg) => new Map(Object.hasOwn(pkg.distTags, "latest") ? [[pkg.distTags.latest ?? "", "trimmed"]] : [])) : null;
     // When npm can't be asked, the name is neither taken nor available: say so instead of "available".
     const unknown = found === "unknown";
     const src = found === "unknown" ? null : found;
@@ -1911,7 +1921,7 @@ const alternativesPart = (query: string, user: string | null) =>
 
     const check = (name: string) =>
       briefly((lease) =>
-        Effect.map(lookupOrUnknown(name, lease), (hit): Suggestion => {
+        Effect.map(lookupOrUnknown(name, lease, NO_SCORES), (hit): Suggestion => {
           const taken = hit !== null && hit !== "unknown";
           const cc = taken ? [] : typoConflicts(name);
 
@@ -4332,7 +4342,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
       const sp = splitPath(p.slice("/-/package".length));
 
       if (sp && sp.rest[0] === "dist-tags" && sp.rest.length === 1 && !(yield* (yield* Store).getPackage(sp.name))) {
-        const src = yield* lookupWithin(sp.name, yield* RequestMemory);
+        const src = yield* lookupWithin(sp.name, yield* RequestMemory, NO_SCORES);
 
         if (src === "unknown" || src === "over-budget") return fail(503, `The upstream registry could not be read for ${sp.name}. Try again shortly.`);
 
