@@ -2867,6 +2867,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       packages.push(platform === null ? { name: dep.name, version: picked.v.version } : { name: dep.name, version: picked.v.version, platform });
       const digest = digestOf(picked.v);
       digests.push(digest ? digestLabel(digest) : null);
+
       if (picked.kind === "unread") {
         // its score did not fit the request: unchecked, never pending or clean. It stays listed, so the OSSF feed and
         // apm's reviewers still decide on it, and what it installs is walked
@@ -2875,6 +2876,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         children.set(key, installedChildren(picked.v.manifest));
 
         for (const e of installEdges(picked.v.manifest)) queue.push({ dep: e.spec, edge: e.edge, via: [...item.via, key], installedAs: [...item.installedAs, dep.key], level: item.level + 1 });
+
         continue;
       }
 
@@ -3059,7 +3061,7 @@ const CONFIRMED_SKIP = "confirmed malicious by an apm reviewer";
 const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
 
 /** A resolve's root as read: one kept without its analyses is over budget, since the answer embeds its report whole. */
-const rootRead = (got: CatalogRead): Lookup => (got !== null && typeof got === "object" && got.kind === "unread" ? "over-budget" : got);
+const rootRead = (got: CatalogRead): Lookup => (got !== null && got !== "unknown" && got !== "over-budget" && got.kind === "unread" ? "over-budget" : got);
 
 /**
  * A resolve whose root could not be looked up, or did not fit the request: nothing to install and not a pass, so a 503 a

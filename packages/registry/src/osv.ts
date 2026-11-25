@@ -21,6 +21,9 @@ import semver from "semver";
 import { z } from "zod";
 import { isPossibleNpmName, isValidPackageName } from "@apm/core";
 import { matchWithin, within } from "./deadline.ts";
+import { readCapped } from "./http.ts";
+import { type Lease, RequestMemory } from "./memory.ts";
+import { WEIGHTS } from "./packument-read.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
 
@@ -69,6 +72,33 @@ const BACKOFF = new Map<string, number>();
 
 /** How long a read of, or a write to, the data center's copy of a name's advisories is waited for. */
 const SHARED_MS = 150;
+
+/**
+ * The most MAL- advisories of one name read whole (advisoriesFor), and the most of one read. A page's advisories are
+ * read all at once, so none of them starts after the request's OSV budget is spent. An advisory past these bounds is not
+ * read, so which versions it names is not known: it withholds every version of the name (everyVersion), and the answer
+ * is partial, so it is not kept.
+ */
+export const MAX_ADVISORIES = 64;
+export const MAX_ADVISORY_BYTES = 256 * 1024;
+
+/** An answer from OSV over the bytes the read allows. */
+class OverCap extends Error {}
+
+/** An advisory's answer the request had no room left to hold. */
+class OverBudget extends Error {}
+
+/** What a MAL- advisory apm did not read for being past a bound is taken to name: every version of the name. */
+const everyVersion = (id: string): Advisory => ({ id, versions: [], ranges: [[{ introduced: "0" }]] });
+
+/**
+ * What reading one advisory holds of the request's lease (RequestMemory), per byte. While it is read: the chunks
+ * readCapped holds and the copy it joins them into, MAX_ADVISORY_BYTES of each, so a last chunk past the cap of up to as
+ * many again fits. Then, while it is decoded, parsed and the advisory taken out of it: its text, and at most a container
+ * for every two bytes (WEIGHTS). What is taken out of it is kept for the rest of the request, charged the same.
+ */
+const READ_WEIGHT = 2 * WEIGHTS.text;
+const PARSE_WEIGHT = 2 * WEIGHTS.text + WEIGHTS.parse * WEIGHTS.text + WEIGHTS.container / 2;
 
 /** Pages of one version's advisories followed past the batch answer's first. */
 const MAX_PAGES = 3;
@@ -121,19 +151,30 @@ const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(Advisory
 type NameEntry = z.infer<typeof NameEntry>;
 
 /**
- * OSV's newest word on one MAL- advisory of a name, and when it was asked for (`at`, wall clock; `seq` orders asks
- * made in the same millisecond, a copy from the data center's cache before this isolate's own): the versions it names
- * here, or null when it was read withdrawn or naming nothing here, or a complete answer asked for later left it out.
+ * When an answer was asked of OSV (`at`, wall clock), and `seq`, which orders the asks made in the same millisecond: a
+ * copy from the data center's cache is 0, before this isolate's own. Complete answers and the observations of each
+ * advisory are ordered by the same stamp.
  */
-type Observation = { readonly at: number; readonly seq: number; readonly advisory: Advisory | null };
+type Stamp = { readonly at: number; readonly seq: number };
+
+/** Whether `a` was asked for after `b`; anything is after nothing. */
+const newerThan = (a: Stamp, b: Stamp | null | undefined): boolean => b === null || b === undefined || a.at > b.at || (a.at === b.at && a.seq > b.seq);
 
 /**
- * What the isolate knows of a name's advisories, by OSV root and name: when its newest complete answer was asked for,
- * and the newest observation of each advisory, from complete and partial answers alike. A partial answer is OSV's word
- * on the advisories it read, though not on the name; so each advisory is decided by the newest answer that read it
- * (Sol on #59: a whole answer per name let an older complete answer undo a newer partial one, either way).
+ * OSV's newest word on one MAL- advisory of a name, and when it was asked for: the versions it names here, or null when
+ * it was read withdrawn or naming nothing here, or a complete answer asked for later left it out.
  */
-type NameState = { complete: number | null; readonly ids: Map<string, Observation> };
+type Observation = Stamp & { readonly advisory: Advisory | null };
+
+/**
+ * What the isolate knows of a name's advisories, by OSV root and name: its newest complete answer's stamp, and the
+ * newest observation of each advisory, from complete and partial answers alike. A partial answer is OSV's word on the
+ * advisories it read, though not on the name; so each advisory is decided by the newest answer that read it (Sol on
+ * #59: a whole answer per name let an older complete answer undo a newer partial one, either way). A complete answer
+ * is also OSV's word on every advisory it does not list, seen here before or not: an older answer that lands after it
+ * cannot bring back one it left out (Sol on 6f206c5).
+ */
+type NameState = { complete: Stamp | null; readonly ids: Map<string, Observation> };
 
 /** The isolate's knowledge per name, by OSV root and name, least recently updated first. */
 const NAMES = new Map<string, NameState>();
@@ -142,24 +183,26 @@ const NAMES = new Map<string, NameState>();
 let asks = 0;
 
 /**
- * Takes in what an answer asked for at `at` (`seq`) read: `found`, the advisories among the `read` ids that name the
- * name, and with `complete`, that no other advisory does. Each advisory takes the newest observation of it, so an
- * answer that lands after a newer one changes nothing the newer one read. Observations past NAME_STALE_MS are dropped.
+ * Takes in what an answer asked for at `stamp` read: `found`, the advisories among the `read` ids that name the name,
+ * and with `complete`, that no other advisory does. Each advisory takes the newest word on it: its newest observation,
+ * else the newest complete answer, which said it was not listed. So an answer that lands after a newer one changes
+ * nothing the newer one said. Observations and the complete stamp past NAME_STALE_MS are dropped.
  */
-function observe(input: { key: string; at: number; seq: number; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): NameState {
-  const { key, at, seq } = input;
+function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): void {
+  const { key, stamp } = input;
   const state = NAMES.get(key) ?? { complete: null, ids: new Map<string, Observation>() };
-  const newer = (o: Observation | undefined): boolean => o === undefined || at > o.at || (at === o.at && seq > o.seq);
 
-  for (const id of input.read) if (newer(state.ids.get(id))) state.ids.set(id, { at, seq, advisory: input.found.find((a) => a.id === id) ?? null });
+  for (const id of input.read) if (newerThan(stamp, state.ids.get(id) ?? state.complete)) state.ids.set(id, { ...stamp, advisory: input.found.find((a) => a.id === id) ?? null });
 
   if (input.complete) {
-    for (const [id, o] of state.ids) if (!input.read.has(id) && newer(o)) state.ids.set(id, { at, seq, advisory: null });
+    for (const [id, o] of state.ids) if (!input.read.has(id) && newerThan(stamp, o)) state.ids.set(id, { ...stamp, advisory: null });
 
-    if (state.complete === null || at > state.complete) state.complete = at;
+    if (newerThan(stamp, state.complete)) state.complete = stamp;
   }
 
   for (const [id, o] of state.ids) if (input.now - o.at >= NAME_STALE_MS) state.ids.delete(id);
+
+  if (state.complete !== null && input.now - state.complete.at >= NAME_STALE_MS) state.complete = null;
   NAMES.delete(key);
   NAMES.set(key, state);
 
@@ -167,9 +210,14 @@ function observe(input: { key: string; at: number; seq: number; read: ReadonlySe
     if (NAMES.size <= MAX_NAMES) break;
     NAMES.delete(oldest);
   }
-
-  return state;
 }
+
+/** Whether the newest complete answer of the name under `key` was asked for at `stamp`. */
+const newestComplete = (key: string, stamp: Stamp): boolean => {
+  const c = NAMES.get(key)?.complete ?? null;
+
+  return c !== null && c.at === stamp.at && c.seq === stamp.seq;
+};
 
 /** The advisories of the name under `key` that its newest observations name at `now`, each while it is young enough. */
 function answerOf(key: string, now: number): Advisory[] {
@@ -199,16 +247,34 @@ export type FeedBackground = ((work: Promise<void>) => void) | null;
 /** How long a copy written to the data center's cache is kept running after the response. */
 const SHARED_WRITE_MS = 5_000;
 
-/** Gives the data center a copy of a name's advisories after the response, in the request's waitUntil when it has one. */
-function sharedWrite(key: string, entry: NameEntry, background: FeedBackground): void {
-  if (typeof caches === "undefined") return;
-  const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
-  const put = within(caches.default.put(sharedKey(key), res), SHARED_WRITE_MS).then(() => undefined);
+/** Each name's copy being written to the data center's cache, by key: a write starts once the one before it is done. */
+const WRITING = new Map<string, Promise<void>>();
 
-  if (background === null) void put;
-  else background(put);
+/**
+ * Gives the data center a copy of a name's complete answer asked for at `stamp`, after the response, in the request's
+ * waitUntil when it has one. The writes of one name run one after another, each only while its answer is still the
+ * isolate's newest complete one, so this isolate never leaves an older answer's copy over a newer one's (Sol on
+ * 6f206c5: two answers of one millisecond were told apart by their time only).
+ */
+function sharedWrite(key: string, stamp: Stamp, entry: NameEntry, background: FeedBackground): void {
+  if (typeof caches === "undefined" || !newestComplete(key, stamp)) return;
+
+  const put = (WRITING.get(key) ?? Promise.resolve())
+    .then(async () => {
+      if (!newestComplete(key, stamp)) return;
+      const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
+
+      await within(caches.default.put(sharedKey(key), res), SHARED_WRITE_MS);
+    })
+    .catch(() => undefined);
+
+  WRITING.set(key, put);
+  void put.then(() => {
+    if (WRITING.get(key) === put) WRITING.delete(key);
+  });
+
+  if (background !== null) background(put);
 }
-
 
 
 /** What one advisory OSV sent says about npm's `name`: nothing when it is withdrawn or names no version of it. */
@@ -220,6 +286,46 @@ function advisoryOf(name: string, vuln: z.infer<typeof VulnAnswer>): Advisory[] 
 
   return versions.length === 0 && ranges.length === 0 ? [] : [{ id: vuln.id, versions, ranges }];
 }
+
+/** An answer of OSV, read whole and parsed with `schema`. */
+const parsedWith =
+  <S extends z.ZodType>(schema: S) =>
+  async (res: Response): Promise<z.output<S>> => {
+    const parsed = schema.safeParse(await res.json());
+
+    if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
+
+    return parsed.data;
+  };
+
+/**
+ * What one MAL- advisory's answer says of npm's `name`, read under `lease` (none outside a request): at most
+ * MAX_ADVISORY_BYTES of it (OverCap past that), decoded and parsed while what that holds is charged (OverBudget when it
+ * does not fit), and what is taken out of it charged for the rest of the request.
+ */
+const advisoryRead =
+  (name: string, lease: Lease | null) =>
+  async (res: Response): Promise<Advisory[]> => {
+    const bytes = await readCapped(res, MAX_ADVISORY_BYTES);
+
+    if (bytes === null) throw new OverCap(`OSV answered more than ${MAX_ADVISORY_BYTES} bytes`);
+    const parsing = bytes.length * PARSE_WEIGHT;
+
+    if (lease !== null && !lease.take(parsing)) throw new OverBudget("no room left in the request to read the advisory");
+
+    try {
+      const parsed = VulnAnswer.safeParse(JSON.parse(new TextDecoder().decode(bytes)));
+
+      if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
+      const found = advisoryOf(name, parsed.data);
+
+      if (lease !== null && !lease.take(JSON.stringify(found).length * PARSE_WEIGHT)) throw new OverBudget("no room left in the request to keep the advisory");
+
+      return found;
+    } finally {
+      lease?.give(parsing);
+    }
+  };
 
 /** An event's bound as a version, "0" lowest of all; null when it is not one. */
 const boundOf = (v: string): string | null => (v === "0" ? "0.0.0-0" : semver.valid(v));
@@ -281,17 +387,25 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
   return Layer.sync(KnownMalicious, () => {
     /** Time this request has spent waiting on OSV, and whether it stopped asking (a failure). */
     let spentMs = 0;
+    /** Reads of OSV in flight, and since when one has been (wall clock): waits that overlap count once. */
+    let inFlight = 0;
+    let busySince = 0;
+    const spent = (): number => spentMs + (inFlight > 0 ? Date.now() - busySince : 0);
     let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
-    /** Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer with `schema`. */
-    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S) =>
+    /**
+     * Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget, its answer read by
+     * `take` (parsedWith, advisoryRead).
+     */
+    const post = <T>(path: string, body: OsvBatchQuery | OsvPageQuery | null, take: (res: Response) => Promise<T>) =>
       Effect.tryPromise({
-        try: async (): Promise<z.output<S>> => {
-          const left = REQUEST_BUDGET_MS - spentMs;
+        try: async (): Promise<T> => {
+          const left = REQUEST_BUDGET_MS - spent();
 
           if (left <= 0) throw new Error("the request's OSV budget is spent");
-          const t0 = Date.now();
+
+          if (inFlight++ === 0) busySince = Date.now();
 
           try {
             const init: RequestInit =
@@ -306,13 +420,9 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
               throw new Error(`OSV answered ${res.status}`);
             }
 
-            const parsed = schema.safeParse(await res.json());
-
-            if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
-
-            return parsed.data;
+            return await take(res);
           } finally {
-            spentMs += Date.now() - t0;
+            if (--inFlight === 0) spentMs += Date.now() - busySince;
           }
         },
         catch: (cause) => cause,
@@ -326,7 +436,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
      */
     const ask = (chunk: readonly PackageVersion[]) =>
       Effect.gen(function* () {
-        const batch = yield* post("v1/querybatch", { queries: chunk.map(queryOf) }, BatchAnswer);
+        const batch = yield* post("v1/querybatch", { queries: chunk.map(queryOf) }, parsedWith(BatchAnswer));
 
         if (batch.results.length !== chunk.length) return yield* Effect.fail(new Error("OSV answered in an unexpected shape"));
 
@@ -337,7 +447,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             let token = first?.next_page_token;
 
             for (let page = 0; token !== undefined && ids.length === 0; page++) {
-              const next = page < MAX_PAGES ? yield* Effect.result(post("v1/query", { ...queryOf(p), page_token: token }, QueryAnswer)) : null;
+              const next = page < MAX_PAGES ? yield* Effect.result(post("v1/query", { ...queryOf(p), page_token: token }, parsedWith(QueryAnswer))) : null;
 
               if (next === null || Result.isFailure(next)) {
                 console.error(JSON.stringify({ event: "osv-page", name: p.name, version: p.version, error: next === null ? "more pages than apm reads" : String(next.failure) }));
@@ -357,22 +467,41 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
     /**
      * The MAL- advisories OSV has for npm's `name`, with the versions each names, and whether that is all of them. Each
      * page's MAL- ids are read before the next page is asked for, so a slow later page cannot spend the budget before
-     * what was found is known. A later page or an advisory that could not be read leaves the answer partial, keeping
-     * every advisory that was read. Fails only when the first page was not answered.
+     * what was found is known; a page's are read all at once, under `lease` (advisoryRead). A later page or an advisory
+     * that could not be read leaves the answer partial, keeping every advisory that was read. One past MAX_ADVISORIES
+     * reads, over MAX_ADVISORY_BYTES or with no room left in the request is `withheld`: which versions it names is not
+     * known. One that failed otherwise is read again when a later page lists it, while reads are left (Sol on #58).
+     * Fails only when the first page was not answered.
      */
-    const askName = (name: string) =>
+    const askName = (name: string, lease: Lease | null) =>
       Effect.gen(function* () {
         const advisories: Advisory[] = [];
         /** The MAL- ids whose advisory was read: what OSV says of them now is in `advisories`, a withdrawal included. */
         const read = new Set<string>();
+        const withheld = new Set<string>();
+        /** Advisory reads started, against MAX_ADVISORIES. */
+        let reads = 0;
         let token: string | undefined;
         let complete = true;
+
+        /** One advisory's read: room for its bytes is taken from `lease` before it starts, and given back once it is read. */
+        const readOne = (id: string) =>
+          Effect.gen(function* () {
+            const room = MAX_ADVISORY_BYTES * READ_WEIGHT;
+
+            if (lease !== null && !lease.take(room)) return { kind: "withheld" } as const;
+            const got = yield* Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, advisoryRead(name, lease))).pipe(Effect.ensuring(Effect.sync(() => lease?.give(room))));
+
+            if (Result.isSuccess(got)) return { kind: "read", advisories: got.success } as const;
+
+            return got.failure instanceof OverCap || got.failure instanceof OverBudget ? ({ kind: "withheld" } as const) : ({ kind: "failed" } as const);
+          });
 
         for (let page = 0; ; page++) {
           const query: OsvNameQuery = { package: { name, ecosystem: "npm" } };
 
           if (token !== undefined) query.page_token = token;
-          const asked = yield* Effect.result(post("v1/querybatch", { queries: [query] }, BatchAnswer));
+          const asked = yield* Effect.result(post("v1/querybatch", { queries: [query] }, parsedWith(BatchAnswer)));
           const first = Result.isSuccess(asked) && asked.success.results.length === 1 ? asked.success.results[0] : undefined;
 
           if (first === undefined) {
@@ -381,18 +510,31 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             break;
           }
 
-          const ids = malOnly(first.vulns).filter((id) => !read.has(id));
-          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
+          const unsettled = [...new Set(malOnly(first.vulns))].filter((id) => !read.has(id) && !withheld.has(id));
+          const ids = unsettled.slice(0, Math.max(0, MAX_ADVISORIES - reads));
 
-          details.forEach((r, i) => {
-            if (Result.isFailure(r)) {
-              complete = false;
+          reads += ids.length;
+
+          for (const id of unsettled.slice(ids.length)) {
+            complete = false;
+            withheld.add(id);
+          }
+
+          const details = yield* Effect.forEach(ids, readOne, { concurrency: "unbounded" });
+
+          details.forEach((d, i) => {
+            const id = ids[i] ?? "";
+
+            if (d.kind === "read") {
+              read.add(id);
+              advisories.push(...d.advisories);
 
               return;
             }
 
-            read.add(ids[i] ?? "");
-            advisories.push(...advisoryOf(name, r.success));
+            complete = false;
+
+            if (d.kind === "withheld") withheld.add(id);
           });
 
           token = first.next_page_token;
@@ -405,7 +547,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           }
         }
 
-        return { advisories, complete, read };
+        return { advisories, complete, read, withheld };
       });
 
     /**
@@ -423,38 +565,44 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           // this request already had a partial answer for the name: every later read in it gets the same
           if (partial !== undefined) return partial;
           const key = `${baseUrl} ${name}`;
-          const now = Date.now();
+          const lease = Option.getOrNull(yield* Effect.serviceOption(RequestMemory));
 
-          const fresh = (): boolean => {
-            const at = NAMES.get(key)?.complete ?? null;
+          const fresh = (now: number): boolean => {
+            const at = NAMES.get(key)?.complete?.at ?? null;
 
             return at !== null && at <= now && now - at < NAME_FRESH_MS;
           };
 
-          if (fresh()) return answerOf(key, now);
+          const asked = Date.now();
+
+          if (fresh(asked)) return answerOf(key, asked);
           const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
+          // the cache read is waited for: what it found, and what another request learned meanwhile, is judged as of
+          // when it came back (Sol on 6f206c5)
+          const now = Date.now();
 
           // a copy from the data center's cache is a complete answer like this isolate's own, fresh or stale: it retires
           // what older answers said of the advisories it leaves out
           if (shared !== null && shared.fetchedAt <= now && now - shared.fetchedAt < NAME_STALE_MS) {
-            observe({ key, at: shared.fetchedAt, seq: 0, read: new Set(shared.advisories.map((a) => a.id)), found: shared.advisories, complete: true, now });
+            observe({ key, stamp: { at: shared.fetchedAt, seq: 0 }, read: new Set(shared.advisories.map((a) => a.id)), found: shared.advisories, complete: true, now });
           }
 
-          if (fresh()) return answerOf(key, now);
+          if (fresh(now)) return answerOf(key, now);
 
           // OSV is not asked: what is known, each advisory while it is young enough (fail open past that)
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return answerOf(key, now);
-          const seq = ++asks;
-          const got = yield* Effect.result(askName(name));
+          if (stopped || spent() >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return answerOf(key, now);
+          // stamped as the ask starts
+          const stamp: Stamp = { at: Date.now(), seq: ++asks };
+          const got = yield* Effect.result(askName(name, lease));
           // the answer is taken in as of when it was asked for, and what is answered is read from the state after it, so
           // an answer asked for later that landed first is neither undone nor left out (Sol on #59, finding 3)
           const after = Date.now();
 
           if (Result.isSuccess(got) && got.success.complete) {
             const { advisories, read } = got.success;
-            const state = observe({ key, at: now, seq, read, found: advisories, complete: true, now: after });
 
-            if (state.complete === now) sharedWrite(key, { fetchedAt: now, advisories }, background);
+            observe({ key, stamp, read, found: advisories, complete: true, now: after });
+            sharedWrite(key, stamp, { fetchedAt: stamp.at, advisories }, background);
 
             return answerOf(key, after);
           }
@@ -465,15 +613,18 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
 
           if (Result.isFailure(got)) {
             // the first page went unanswered: OSV is taken as down at this root for a while
-            BACKOFF.set(baseUrl, now + NAME_BACKOFF_MS);
+            BACKOFF.set(baseUrl, stamp.at + NAME_BACKOFF_MS);
 
             return answerOf(key, after);
           }
 
           // a partial answer is OSV's word on the advisories it read (a withdrawal included), never on the name: it is
-          // kept for those, and for the rest what was known stands. The next request asks again
-          observe({ key, at: now, seq, read: got.success.read, found: got.success.advisories, complete: false, now: after });
-          const answer = answerOf(key, after);
+          // kept for those, and for the rest what was known stands, but for one it withheld, which names every version
+          // here, whatever was known of it. The next request asks again
+          const { read, advisories, withheld } = got.success;
+
+          observe({ key, stamp, read, found: advisories, complete: false, now: after });
+          const answer = [...answerOf(key, after).filter((a) => !withheld.has(a.id)), ...[...withheld].map(everyVersion)];
 
           partials.set(name, answer);
 
@@ -493,7 +644,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             else missing.push(p);
           }
 
-          for (let i = 0; i < missing.length && !stopped && spentMs < REQUEST_BUDGET_MS; i += OSV_BATCH) {
+          for (let i = 0; i < missing.length && !stopped && spent() < REQUEST_BUDGET_MS; i += OSV_BATCH) {
             const chunk = missing.slice(i, i + OSV_BATCH);
             const got = yield* Effect.result(ask(chunk));
 

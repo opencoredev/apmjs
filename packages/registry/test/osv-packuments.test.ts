@@ -732,4 +732,100 @@ describe("each advisory of a name is what the newest answer that read it says", 
       Reflect.deleteProperty(globalThis, "caches");
     }
   });
+
+  /** The data center's cache, standing in: its copies by URL, and with `gated`, the first read held until `release`. */
+  function sharedCache(gated = false) {
+    const copies = new Map<string, Response>();
+    const reading = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    let holding = gated;
+
+    const cache = {
+      match: async (key: Request) => {
+        if (holding) {
+          holding = false;
+          reading.resolve();
+          await gate.promise;
+        }
+
+        return copies.get(key.url)?.clone();
+      },
+      put: async (key: Request, res: Response) => {
+        copies.set(key.url, res);
+      },
+    };
+
+    Object.defineProperty(globalThis, "caches", { value: { default: cache }, configurable: true });
+
+    return { copies, reading: reading.promise, release: () => gate.resolve(), restore: () => Reflect.deleteProperty(globalThis, "caches") };
+  }
+
+  // Sol on 6f206c5: the freshness check after the cache read, the backoff's and the answer used the time from before it
+  test("a request whose cache read lands after another request's answer answers with that answer, in a backoff too", async () => {
+    const root = freshRoot();
+    const shared = sharedCache(true);
+
+    try {
+      const first = asked(root);
+
+      await shared.reading;
+      at(t + 1_000);
+      expect(await asked(root)).toEqual({ [X]: ["1.0.0"], [Y]: ["1.1.0"] });
+      // OSV goes down at the root: a name asked about next starts its backoff
+      osv.down = true;
+      await Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor("observed-other")).pipe(Effect.provide(osvFeed(root))));
+      shared.release();
+      // on 6f206c5: {}, the newer answer read as not yet asked for
+      expect(await first).toEqual({ [X]: ["1.0.0"], [Y]: ["1.1.0"] });
+    } finally {
+      shared.restore();
+    }
+  });
+
+  // Sol on 6f206c5: the data center's copy was written when an answer's time matched the newest complete one's, so an
+  // older answer of the same millisecond, landing last, overwrote the newer one's copy
+  test("of two complete answers asked for in one millisecond, the newer one's is the data center's copy", async () => {
+    const root = freshRoot();
+    const shared = sharedCache();
+
+    try {
+      VULNS.set("observed", []);
+      const slow = held("querybatch");
+      const first = asked(root, slow.fetcher);
+
+      await slow.asked;
+      VULNS.set("observed", [naming(X, ["1.0.0"])]);
+      expect(await asked(root)).toEqual({ [X]: ["1.0.0"] });
+      slow.release();
+      expect(await first).toEqual({ [X]: ["1.0.0"] });
+      await Bun.sleep(20);
+      const copy = shared.copies.get(`https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} observed`)}`);
+
+      // on 6f206c5: the empty answer's
+      expect(await copy?.clone().json()).toEqual({ fetchedAt: t, advisories: [{ id: X, versions: ["1.0.0"], ranges: [] }] });
+    } finally {
+      shared.restore();
+    }
+  });
+
+  // Sol on 6f206c5: a complete answer spoke only for the advisories the isolate had seen, so an older answer landing
+  // after it could add one it left out
+  test("an older answer that lands after a newer complete one does not bring back an advisory the newer one left out", async () => {
+    const root = freshRoot();
+
+    VULNS.set("observed", [naming(X, ["1.0.0"])]);
+    const slow = held(`vulns/${X}`);
+    const first = asked(root, slow.fetcher);
+
+    await slow.asked;
+    at(t + 1_000);
+    VULNS.set("observed", []);
+    expect(await asked(root)).toEqual({});
+    slow.release();
+    // on 6f206c5: X, from the listing the newer answer superseded
+    expect(await first).toEqual({});
+    osv.down = true;
+    at(t + 60_000);
+    expect(await asked(root)).toEqual({});
+  });
 });
