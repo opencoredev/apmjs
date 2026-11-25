@@ -10,7 +10,7 @@ This page lists every setting apm reads, grouped by where you set it. The first 
 | File | Setting | Effect |
 | --- | --- | --- |
 | `.npmrc` | `registry=https://registry.apmjs.dev/` | npm, pnpm and yarn 1 install through apm. |
-| `.npmrc` | `registry=https://registry.apmjs.dev/~safe/` | The same, with the [`~safe` view](/guides/safe-view) filter. |
+| `.npmrc` | `registry=https://registry.apmjs.dev/~safe/` | Opt-in strict mode: the [`~safe` view](/guides/safe-view) hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. |
 | `.npmrc` | `//registry.apmjs.dev/:_authToken=<token>` | The token `apm login` writes to your user `.npmrc`. `${VAR}` reads it from the environment. |
 | `bunfig.toml` | `[install] registry = "https://registry.apmjs.dev/"` | Bun installs through apm. |
 | `bunfig.toml` | `[install.security] scanner = "@apm/bun-scanner"` | Turns on the [Bun scanner](/guides/bun-scanner). |

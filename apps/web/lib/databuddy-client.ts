@@ -14,7 +14,7 @@ import { InstallClient } from "./install-note";
 export const EVENTS = {
   install_command_copied: ["client", "package"],
   registry_setup_copied: ["client"],
-  cli_install_copied: ["source"],
+  cli_install_copied: ["method", "source"],
   agent_prompt_copied: ["package"],
   agent_setup_copied: ["kind"],
   mcp_setup_copied: ["agent", "source"],

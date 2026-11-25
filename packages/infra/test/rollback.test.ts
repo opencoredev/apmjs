@@ -772,6 +772,28 @@ describe("deploy-record.ts, after a deploy whose smoke check passed", () => {
     expect((await done).kind).toBe("not-recorded");
     expect(written).toEqual([]);
   });
+
+  test("a Cloudflare read failing for a moment (503) is read again within the deadline, and the live build is recorded", async () => {
+    versionVars.set("rv3", stamp(B5));
+    versionVars.set("wv2", stamp(B5));
+    failLists = 503;
+    setTimeout(() => (failLists = null), 60);
+    const { written, done } = record();
+
+    expect((await done).kind).toBe("recorded");
+    expect(written.map((r) => r.build)).toEqual([B5]);
+  });
+
+  test("Cloudflare failing until the deadline records nothing and says why, without throwing", async () => {
+    versionVars.set("rv3", stamp(B5));
+    versionVars.set("wv2", stamp(B5));
+    failLists = 503;
+    const { written, done } = record({ deadlineMs: 150 });
+    const got = await done;
+
+    expect(got).toEqual({ kind: "not-recorded", why: expect.stringContaining("503") });
+    expect(written).toEqual([]);
+  });
 });
 
 describe("deploy.ts after Alchemy (deploy-finish.ts)", () => {
@@ -832,6 +854,29 @@ describe("deploy.ts after Alchemy (deploy-finish.ts)", () => {
     expect(await s.run).toBe(1);
     expect(s.lines.join("\n")).toContain("deploy FAILED: the smoke check passed, but recording the release failed (Cloudflare answered 503");
     expect(s.lines.join("\n")).toContain("nothing recorded, nothing rolled back. ADVICE");
+  });
+
+  test("a smoke check that cannot even start is a failed deploy with the advice, not a crash", async () => {
+    const lines: string[] = [];
+    let recorded = 0;
+
+    const code = await finishDeploy({
+      alchemyExit: 0,
+      smoke: async () => {
+        throw new Error("spawn bun ENOENT");
+      },
+      record: async () => {
+        recorded += 1;
+
+        return { kind: "not-recorded", why: "unreachable" };
+      },
+      advice: async () => "ADVICE",
+      log: (l) => void lines.push(l),
+    });
+
+    expect(code).toBe(1);
+    expect(recorded).toBe(0);
+    expect(lines.join("\n")).toContain("deploy FAILED: the smoke check could not run (spawn bun ENOENT); nothing recorded, nothing rolled back. ADVICE");
   });
 
   test("a live deploy that could not be recorded fails, with the advice", async () => {
