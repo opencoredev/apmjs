@@ -36,6 +36,17 @@ const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs
 const { stage, build, subdomain } = parseSmokeArgs(process.argv.slice(2));
 const { registry, web, docs } = smokeTargets(stage, subdomain);
 const work = mkdtempSync(join(tmpdir(), "apm-smoke-"));
+
+// the workspace holds a login token in publish/.npmrc, so it goes however the run ends: a thrown check, an exit or a signal
+const removeWork = (): void => rmSync(work, { recursive: true, force: true });
+
+process.on("exit", removeWork);
+
+// SIGHUP: an operator's SSH session dropping. SIGKILL cannot be caught; nothing here can clean up after it.
+const SIGNAL_EXITS = [["SIGHUP", 129], ["SIGINT", 130], ["SIGQUIT", 131], ["SIGABRT", 134], ["SIGTERM", 143]] as const;
+
+for (const [signal, code] of SIGNAL_EXITS) process.on(signal, () => process.exit(code));
+
 const results: { ok: boolean; name: string; detail: string }[] = [];
 
 function record(ok: boolean, name: string, detail: string): void {
@@ -486,8 +497,6 @@ await bunAudit();
 await concurrentPages();
 
 await identity("after");
-
-rmSync(work, { recursive: true, force: true });
 
 const failed = results.filter((r) => !r.ok).length;
 

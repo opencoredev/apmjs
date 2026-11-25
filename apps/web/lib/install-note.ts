@@ -74,13 +74,13 @@ export function installNote({ client, registry }: { client: InstallClient; regis
 
     case "npm":
     case "pnpm": {
-      const effect = "~safe hides versions under 24 hours old and versions scoring under 40.";
+      const effect = `New installs skip revoked, yanked and confirmed malicious versions. For strict mode use registry=${url}~safe/, which hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed.`;
 
       return {
         kind: "needs-setup",
-        lead: `Plain ${client} skips apm’s checks. Set its registry to apm’s ~safe view in .npmrc:`,
+        lead: `Plain ${client} skips apm’s checks. Point its registry at apm in .npmrc:`,
         file: ".npmrc",
-        config: `registry=${url}~safe/`,
+        config: `registry=${url}`,
         effect,
         checks: `${effect} ${APM_ADD_CHECKS}`,
         docs: "/docs#npm",
