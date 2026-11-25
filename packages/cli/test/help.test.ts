@@ -192,6 +192,9 @@ describe("a flag a command does not read", () => {
     [["add", "zod", "--", "zod2"], "unknown flag -- for apm add"],
     [["install", "--size", "zod"], "unknown flag --size for apm install"],
     [["install", "--pm"], "--pm needs a value"],
+    [["publish", "--tag="], "--tag needs a value"],
+    [["publish", "--pm="], "--pm needs a value"],
+    [["publish", "--tag=--registry=http://127.0.0.1:9/"], "--tag cannot start with -"],
     [["run", "dev", "--pm"], "--pm needs a value"],
   ])("apm %p: %s", async (argv, message) => {
     const r = await apm(argv);
