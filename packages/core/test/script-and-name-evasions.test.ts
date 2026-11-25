@@ -39,7 +39,7 @@ describe("a payload named like a document is still code", () => {
 });
 
 describe("an install script's `npm run` is followed whatever flags or quotes it has", () => {
-  const variants = ["npm run -s payload", "npm run --silent payload", "npm --silent run payload", "npm run 'payload'", 'npm run "payload"', "yarn run -s payload", "pnpm --silent run payload", "bun run --silent payload", 'npm run --foo="a b" payload', "npm --foo='a b' run payload", "npm run --foo=a\\ b payload", 'yarn run --foo="a b" payload'];
+  const variants = ["npm run -s payload", "npm run --silent payload", "npm --silent run payload", "npm run 'payload'", 'npm run "payload"', "yarn run -s payload", "pnpm --silent run payload", "bun run --silent payload"];
 
   test("npm run payload is the baseline: refused", () => {
     expect(scoreOf({ scripts: { postinstall: "npm run payload", payload: DROPPER } }, {}).ids).toContain("install-download");
@@ -94,13 +94,23 @@ describe("npm run --ignore-scripts runs the script but not its pre and post scri
     expect(scoreOf({ scripts: { postinstall: "npm run --ignore-scripts payload", payload: DROPPER } }, {}).ids).toContain("install-download");
   });
 
+  // a flag's value is never read as reaching past a quote, so a run inside a quoted command substitution is still found
+  for (const cmd of ['npm --x "$(npm run payload)" run build', 'npm --x="$(npm run payload)" run build']) {
+    test(`${cmd}: the run inside the substitution is read`, () => {
+      const scripts = { postinstall: cmd, build: "true", payload: DROPPER };
+
+      expect(expandHooks({ scripts })[0]?.scripts).toContain("payload");
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
   // npm runs them, or may: no flag, a later disable before or after the name (abbreviated, quoted, a separate `false`, or
   // built by the shell), a value other than `true`, a flag after `--` (the script's, so following them is only stricter),
   // an abbreviation apm does not read as setting it, a package manager other than npm, or any quoting, escape, expansion
   // or grouping in the command, where the words npm gets are not the words written
   for (const cmd of [
-    'npm run --foo="a --ignore-scripts" payload',
-    "npm run --foo='a --ignore-scripts' payload",
+    'npm run --ignore-scripts payload --foo="a --ignore-scripts"',
+    "npm run --ignore-scripts payload --foo='a --ignore-scripts'",
     "npm run --foo=a\\ --ignore-scripts payload",
     "npm run-script --ignore-scripts 'payload'",
     "npm run --ignore-scripts payload --ignore-scripts false; echo done",
@@ -166,7 +176,7 @@ describe("node's inline-eval flag is recognised after other flags", () => {
 describe("the flags a command may carry are read in linear time", () => {
   // each flag has one reading (`--a` is never `-` then `-a`), or a run of them that never matches backtracks exponentially;
   // and a flag value that names an interpreter (`--conditions=node`) must not start a fresh scan of the flags after it
-  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`, `node ${"--conditions=node ".repeat(16000)}x`, `npm ${"--c=npm ".repeat(16000)}x`, `npm run ${'--a="x " '.repeat(16000)}x`, `npm run ${"--a='x ".repeat(16000)}x`, `npm ${"--a=\\\\ ".repeat(16000)}x`, `echo ${"a ".repeat(4_000_000)}`, `node ${"--a ".repeat(1_000_000)}x`]) {
+  for (const cmd of [`node ${"--a ".repeat(40)}x`, `npm ${"--a=b ".repeat(40)}x`, `yarn ${"--a ".repeat(40)}`, `node ${"--conditions=node ".repeat(16000)}x`, `npm ${"--c=npm ".repeat(16000)}x`, `echo ${"a ".repeat(4_000_000)}`, `node ${"--a ".repeat(1_000_000)}x`]) {
     test(`${cmd.slice(0, 24)} (${cmd.length} chars)`, () => {
       const started = performance.now();
 

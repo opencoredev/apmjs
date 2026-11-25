@@ -37,10 +37,7 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-
-// a flag's value may be quoted or hold escapes (`--foo="a b"`, `--foo=a\ b`): each part starts with its own character, so
-// a value has one reading and a run of flags that does not match fails in linear time
-const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=(?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s;&|()"'\\])*)?)*`;
+const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 
