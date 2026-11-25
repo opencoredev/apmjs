@@ -273,6 +273,38 @@ describe("apm: publish", () => {
     expect(readdirSync(d).filter((f) => f.endsWith(".tgz"))).toEqual([]);
   });
 
+  test("apm publish --bump on a prerelease gives the version npm version would: its release", async () => {
+    const sb = makeSandbox(reg, alice);
+
+    // npm 11.21.1's `npm version <kind>`: 1.2.0-beta.1 minor -> 1.2.0, 2.0.0-beta.1 major -> 2.0.0, 1.2.3-beta.1 minor -> 1.3.0
+    const cases = [
+      ["1.2.0-beta.1", "minor", "1.2.0"],
+      ["2.0.0-beta.1", "major", "2.0.0"],
+      ["1.2.3-beta.1", "minor", "1.3.0"],
+      ["1.2.3-beta.1", "patch", "1.2.3"],
+    ] as const;
+
+    for (const [from, kind, to] of cases) {
+      const d = writePackage(work, { name: `pre-bump-${kind}-${from.replace(/\W/g, "")}`, version: from }, reg, alice);
+      const r = await apm(["publish", "--bump", kind, "--dry-run"], { cwd: d, env: sb.env });
+
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toContain(`version ${from} → ${to}`);
+    }
+  });
+
+  test("apm publish --bump <version> refuses a version that is not semver, and leaves package.json alone", async () => {
+    const sb = makeSandbox(reg, alice);
+    const d = writePackage(work, { name: "bad-bump", version: "1.0.0" }, reg, alice);
+    const before = readFileSync(join(d, "package.json"), "utf8");
+    const r = await apm(["publish", "--bump", "1.2.3garbage"], { cwd: d, env: sb.env });
+
+    expect(r.code, r.out).toBe(2);
+    expect(readFileSync(join(d, "package.json"), "utf8")).toBe(before);
+    const { status } = await getJson(`${reg.url}bad-bump`);
+    expect(status).toBe(404);
+  });
+
   test("apm publish works in a project that only has npm", async () => {
     const sb = makeSandbox(reg, alice);
     const d = writePackage(work, { name: "npm-only-lib", version: "0.1.0" }, reg, alice);

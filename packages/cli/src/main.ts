@@ -2083,15 +2083,22 @@ async function cmdWhoami(): Promise<number> {
 }
 
 // ---------- publish ----------
-function bump(version: string, kind: string): string {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * The version `npm version <kind>` gives (semver's inc): a prerelease is bumped to its own release when that release is
+ * of the kind asked for (1.2.0-beta.1 minor -> 1.2.0, 2.0.0-beta.1 major -> 2.0.0), else past it. An exact version must
+ * be semver. null when `kind` is neither.
+ */
+function bump(version: string, kind: string): string | null {
+  const m = /^(\d+)\.(\d+)\.(\d+)(-[^+]*)?/.exec(version);
   if (!m) throw new Error(`cannot bump version ${version}`);
   const [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  if (kind === "major") return `${maj + 1}.0.0`;
-  if (kind === "minor") return `${maj}.${min + 1}.0`;
-  if (kind === "patch") return version.includes("-") ? `${maj}.${min}.${pat}` : `${maj}.${min}.${pat + 1}`;
-  if (/^\d+\.\d+\.\d+/.test(kind)) return kind;
-  throw new Error("--bump takes patch, minor, major or an exact version");
+  const pre = m[4] !== undefined;
+  if (kind === "major") return pre && min === 0 && pat === 0 ? `${maj}.0.0` : `${maj + 1}.0.0`;
+  if (kind === "minor") return pre && pat === 0 ? `${maj}.${min}.0` : `${maj}.${min + 1}.0`;
+  if (kind === "patch") return pre ? `${maj}.${min}.${pat}` : `${maj}.${min}.${pat + 1}`;
+  return SEMVER.test(kind) ? kind : null;
 }
 
 function walkFiles(root: string, limit = 5000): FileLike[] {
@@ -2144,7 +2151,15 @@ async function cmdPublish(a: Args): Promise<number> {
   if (refuseOverrides(scopeOverrides({ cwd, env: env(), registry: cfg.registry, scopes }), cfg.registry, "publish")) return 1;
   const bumpKind = flag(a, "bump");
   const dry = has(a, "dry-run");
-  const version = bumpKind ? bump(pj.version, bumpKind) : pj.version;
+  const bumped = bumpKind ? bump(pj.version, bumpKind) : pj.version;
+
+  if (bumped === null) {
+    warn(`usage: apm publish --bump patch|minor|major|<version>: ${bumpKind} is none of them (an exact version must be semver, like 1.2.3 or 2.0.0-rc.1)`);
+
+    return 2;
+  }
+
+  const version = bumped;
   const id = `${pj.name}@${version}`;
 
   // 1. Without a "files" allowlist, what ships depends on the package manager (npm ships .env.production,
