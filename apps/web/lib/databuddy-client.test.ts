@@ -2,7 +2,7 @@
 // attributes server components declare, and that nothing is sent or asked without the tracker on the page. The
 // tracker and Databuddy's flag endpoint are stand-ins here; scripts/analytics-browser.ts runs the real databuddy.js.
 import { afterEach, describe, expect, test } from "bun:test";
-import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, track, trackInstallDefaultShown } from "./databuddy-client";
+import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, linkAccount, track, trackInstallDefaultShown } from "./databuddy-client";
 
 type Sent = { name: string; props: Readonly<Record<string, string | number>> };
 
@@ -170,5 +170,78 @@ describe("the install-default-client flag", () => {
 
     expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
     expect(bodies).toEqual([]);
+  }, 10_000);
+});
+
+describe("linking a signed-in visitor to their account", () => {
+  const ID = "0123456789abcdef0123456789abcdef";
+
+  /** A stand-in for databuddy.js's identity calls, starting with `profileId` identified. */
+  function fakeIdentity(profileId: string | null) {
+    const calls: string[] = [];
+    let current = profileId;
+
+    Reflect.set(globalThis, "window", {
+      databuddy: {
+        identify: (id: string) => {
+          calls.push(`identify ${id}`);
+          current = id;
+        },
+        clearProfile: () => {
+          calls.push("clearProfile");
+          current = null;
+        },
+        getProfileId: () => current,
+      },
+    });
+
+    return calls;
+  }
+
+  test("a signed-in visitor is identified by the account's analytics id, once", async () => {
+    const calls = fakeIdentity(null);
+
+    await linkAccount(ID);
+    await linkAccount(ID);
+    expect(calls).toEqual([`identify ${ID}`]);
+  });
+
+  test("anything but an analytics id (an email, a login, free text) is never sent", async () => {
+    const calls = fakeIdentity(null);
+
+    for (const bad of ["someone@example.com", "octocat", "0123456789ABCDEF0123456789ABCDEF", `${ID}0`, ""]) await linkAccount(bad);
+    expect(calls).toEqual([]);
+  });
+
+  test("a signed-out visitor is untied from the account the browser was linked to, and an anonymous one is left alone", async () => {
+    const linked = fakeIdentity(ID);
+
+    await linkAccount(null);
+    expect(linked).toEqual(["clearProfile"]);
+
+    const anonymous = fakeIdentity(null);
+
+    await linkAccount(null);
+    expect(anonymous).toEqual([]);
+  });
+
+  test("a tracker that throws never reaches the page", async () => {
+    Reflect.set(globalThis, "window", {
+      databuddy: {
+        identify: () => {
+          throw new Error("tracker bug");
+        },
+        clearProfile: () => {},
+        getProfileId: () => null,
+      },
+    });
+
+    await expect(linkAccount(ID)).resolves.toBeUndefined();
+  });
+
+  test("without the tracker (an opt-out, a private page) it waits briefly and sends nothing", async () => {
+    Reflect.set(globalThis, "window", {});
+
+    await expect(linkAccount(ID)).resolves.toBeUndefined();
   }, 10_000);
 });

@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Menu } from "@base-ui/react/menu";
 import { Account, call } from "@/lib/account";
-import { clickEvent } from "@/lib/databuddy-client";
+import { clickEvent, linkAccount } from "@/lib/databuddy-client";
 
 const MENU = [
   { href: "/account/packages", label: "Your packages" },
@@ -24,6 +24,10 @@ export function AccountButton() {
     void call("account", Account).then((r) => {
       if (!live) return;
       setState(r.kind === "ok" ? { kind: "signed-in", account: r.value } : { kind: "signed-out" });
+
+      // a registry error says nothing about who is signed in, so it leaves Databuddy's link as it is
+      if (r.kind === "ok") void linkAccount(r.value.analyticsId);
+      else if (r.kind === "signed-out") void linkAccount(null);
     });
 
     return () => {

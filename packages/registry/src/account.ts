@@ -6,6 +6,7 @@ import { z } from "zod";
 import { finalize, parseAnalysis, readTarball, SCORE_FLOOR } from "@apm/core";
 import { publishRefusal } from "./access.ts";
 import { actionKey, commandLine, LiveAction, SessionAction, sessionActionKey } from "./actions.ts";
+import { analyticsId } from "./account-events.ts";
 import { Auth, PasskeyAssertion, type ConfirmFactor } from "./auth.ts";
 import { Blobs } from "./blobs.ts";
 import { Clock } from "./clock.ts";
@@ -289,6 +290,8 @@ export const accountRoute = (req: Request, url: URL) =>
         canPublish: user !== null && (factors.totp || factors.passkeys > 0),
         tokens,
         pending,
+        // the opaque id the website hands Databuddy's identify() on public pages (account-events.ts)
+        analyticsId: analyticsId(s.authUserId),
       });
     }
 

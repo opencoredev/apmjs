@@ -118,17 +118,22 @@ const FlagsResponse = z.object({ flags: z.record(z.string(), z.unknown()) });
 /** How long a flag read waits for databuddy.js, which loads after the page, before it keeps the default. */
 const TRACKER_WAIT_MS = 3000;
 
-async function loadedTracker(): Promise<Tracker | null> {
+/** What `read` finds once databuddy.js has loaded, or null when it has not within TRACKER_WAIT_MS. */
+async function loaded<T>(read: () => T | null): Promise<T | null> {
   const deadline = Date.now() + TRACKER_WAIT_MS;
 
   while (Date.now() < deadline) {
-    const t = tracker();
+    const t = read();
 
     if (t) return t;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   return null;
+}
+
+async function loadedTracker(): Promise<Tracker | null> {
+  return loaded(tracker);
 }
 
 /** Reports that the install box opened on `client` because of the flag, for Databuddy's experiment results. */
@@ -169,5 +174,53 @@ export async function installDefaultClient({ clientId }: { clientId: string }): 
     return client.success ? client.data : null;
   } catch {
     return null;
+  }
+}
+
+// ---------- linking a signed-in visitor to their account ----------
+
+/** The part of window.databuddy that ties this browser to an account. */
+const IdentityTracker = z.object({
+  identify: z.custom<(profileId: string) => void>((v) => v instanceof Function),
+  clearProfile: z.custom<() => void>((v) => v instanceof Function),
+  getProfileId: z.custom<() => string | null>((v) => v instanceof Function),
+});
+
+type IdentityTracker = z.infer<typeof IdentityTracker>;
+
+function identityTracker(): IdentityTracker | null {
+  const parsed = IdentityTracker.safeParse(globalThis.window?.databuddy);
+
+  return parsed.success ? parsed.data : null;
+}
+
+/** An account's analytics id as the registry makes it (packages/registry/src/account-events.ts): 32 hex characters. */
+const AnalyticsId = z.string().regex(/^[0-9a-f]{32}$/);
+
+/**
+ * Ties this browser's visits to the signed-in account, or unties them once the visitor is signed out. `analyticsId`
+ * is the account's opaque id from the registry (a hash of its internal id: never an email, name or login), or null
+ * when the visitor is signed out. Only where the tracker loaded, so a visitor who opted out, or a private page, sends
+ * nothing; anonymous visitors are never identified. Databuddy then counts the account's sign-up with the page views
+ * that led to it. Never throws.
+ */
+export async function linkAccount(analyticsId: string | null): Promise<void> {
+  try {
+    const t = await loaded(identityTracker);
+
+    if (!t) return;
+    const current = t.getProfileId();
+
+    if (analyticsId === null) {
+      if (current !== null) t.clearProfile();
+
+      return;
+    }
+
+    const id = AnalyticsId.safeParse(analyticsId);
+
+    if (id.success && current !== id.data) t.identify(id.data);
+  } catch {
+    // analytics never breaks the page
   }
 }

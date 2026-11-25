@@ -9,6 +9,7 @@ import { timingSafeEqual } from "node:crypto";
 import { Context, Duration, Effect, Layer, Result, Scope } from "effect";
 import type { PublicKeyCredentialRequestOptionsJSON } from "@simplewebauthn/server";
 import type { BetterAuthInstance } from "./auth-engine.ts";
+import type { AccountEvents } from "./account-events.ts";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type Linked, type User } from "./db.ts";
@@ -183,7 +184,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
    * Better Auth over the same Postgres. The instance (and its connection) is made on first use in a request,
    * so routes that never touch sign-in pay nothing for it, and the connection closes when the request ends.
    */
-  static layer(input: { databaseUrl: string; options: AuthOptions; baseURL: string }): Layer.Layer<Auth, never, Store | Clock> {
+  static layer(input: { databaseUrl: string; options: AuthOptions; baseURL: string; accountEvents?: AccountEvents | null }): Layer.Layer<Auth, never, Store | Clock> {
     return Layer.effect(
       Auth,
       Effect.gen(function* () {
@@ -199,7 +200,7 @@ export class Auth extends Context.Service<Auth, AuthApi>()("@apm/registry/Auth")
               // sign-in waits on Postgres no longer than the Store does (db-health.ts)
               const pool = new engine.Pool({ connectionString: input.databaseUrl, max: 1, connectionTimeoutMillis: Duration.toMillis(CONNECT_TIMEOUT), query_timeout: STATEMENT_TIMEOUT_MS });
 
-              return { pool, auth: engine.buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs, cliClientId: CLI_CLIENT_ID }) };
+              return { pool, auth: engine.buildBetterAuth({ pool, options: input.options, baseURL: input.baseURL, store, now: () => nowMs, cliClientId: CLI_CLIENT_ID, accountEvents: input.accountEvents ?? null }) };
             }),
             ({ pool }) => Effect.promise(() => pool.end()).pipe(Effect.ignore),
           ).pipe(
