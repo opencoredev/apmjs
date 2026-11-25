@@ -21,6 +21,7 @@ import semver from "semver";
 import { z } from "zod";
 import { isPossibleNpmName, isValidPackageName } from "@apm/core";
 import { matchWithin, within } from "./deadline.ts";
+import { readCapped } from "./http.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
 
@@ -69,6 +70,14 @@ const BACKOFF = new Map<string, number>();
 
 /** How long a read of, or a write to, the data center's copy of a name's advisories is waited for. */
 const SHARED_MS = 150;
+
+/**
+ * The most MAL- advisories of one name read whole (advisoriesFor), how many are read at once, and the most of one read.
+ * An advisory past these is not read, so the answer is partial: what was read still withholds, and it is not kept.
+ */
+export const MAX_ADVISORIES = 64;
+const ADVISORY_CONCURRENCY = 8;
+export const MAX_ADVISORY_BYTES = 256 * 1024;
 
 /** Pages of one version's advisories followed past the batch answer's first. */
 const MAX_PAGES = 3;
@@ -251,8 +260,11 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
     let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
-    /** Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer with `schema`. */
-    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S) =>
+    /**
+     * Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer
+     * with `schema`, reading at most `maxBytes` of it when given.
+     */
+    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S, maxBytes: number | null = null) =>
       Effect.tryPromise({
         try: async (): Promise<z.output<S>> => {
           const left = REQUEST_BUDGET_MS - spentMs;
@@ -273,7 +285,10 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
               throw new Error(`OSV answered ${res.status}`);
             }
 
-            const parsed = schema.safeParse(await res.json());
+            const bytes = maxBytes === null ? null : await readCapped(res, maxBytes);
+
+            if (maxBytes !== null && bytes === null) throw new Error(`OSV answered more than ${maxBytes} bytes`);
+            const parsed = schema.safeParse(bytes === null ? await res.json() : JSON.parse(new TextDecoder().decode(bytes)));
 
             if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
 
@@ -332,6 +347,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         const advisories: Advisory[] = [];
         /** The MAL- ids whose advisory was read: what OSV says of them now is in `advisories`, a withdrawal included. */
         const read = new Set<string>();
+        /** Every MAL- id whose advisory was asked for, read or not: at most MAX_ADVISORIES. */
+        const requested = new Set<string>();
         let token: string | undefined;
         let complete = true;
 
@@ -348,8 +365,12 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             break;
           }
 
-          const ids = malOnly(first.vulns).filter((id) => !read.has(id));
-          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
+          const fresh = [...new Set(malOnly(first.vulns))].filter((id) => !read.has(id) && !requested.has(id));
+          const ids = fresh.slice(0, Math.max(0, MAX_ADVISORIES - requested.size));
+
+          if (ids.length < fresh.length) complete = false;
+          ids.forEach((id) => requested.add(id));
+          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer, MAX_ADVISORY_BYTES)), { concurrency: ADVISORY_CONCURRENCY });
 
           details.forEach((r, i) => {
             if (Result.isFailure(r)) {
