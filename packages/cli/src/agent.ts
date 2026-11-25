@@ -1,7 +1,7 @@
 // `apm explain` and `apm search`, the commands agents lean on. main.ts hands in its output functions, so with
 // --json each prints one document on stdout and everything else goes to stderr, like every apm command.
 import { z } from "zod";
-import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, type RawAnswer } from "./api.ts";
+import { Api, ResolveFail, ResolveOk, encodeName, parseSpec, tagsWithoutLatest, type RawAnswer } from "./api.ts";
 import { EXIT, explain, resolveForVerdict, type ResolvedInput, type ReviewInput } from "./explain.ts";
 
 type Paint = (s: string) => string;
@@ -134,6 +134,13 @@ async function resolvedFor(input: { api: Api; name: string; range: string | null
     const out: Extract<ResolvedInput, { kind: "refused" }> = { kind: "refused", reason: f.data.error, newest: f.data.newest?.version ?? null, skipped: f.data.skipped, confirmed: f.data.confirmed };
 
     if (f.data.knownMalicious.length > 0) out.knownMalicious = f.data.knownMalicious;
+
+    // nothing at all matched latest: the package may have only other tags (a prerelease tagged next)
+    if ((range ?? "latest") === "latest" && out.skipped.length === 0 && out.newest === null) {
+      const tags = await tagsWithoutLatest(api, name);
+
+      if (tags.length > 0) out.tags = tags;
+    }
 
     return out;
   }
