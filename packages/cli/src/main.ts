@@ -2335,7 +2335,18 @@ function refuseArgs(a: Args): boolean {
 
   const command = commandOf(a.cmd);
 
-  if (command === undefined || ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0)) return false;
+  if ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0) {
+    // only npm's install reads --tag; bun takes the word after it for a package and installs it with no check of apm's
+    const pm = a.flags.has("tag") ? pmFor(a, process.cwd()).pm : "npm";
+
+    if (pm === "npm") return false;
+    fail(`apm: --tag is read only by npm's own install, not ${pm}'s. Nothing was run.`);
+    say("To check and add a package, name it: apm add <package>.");
+
+    return true;
+  }
+
+  if (command === undefined) return false;
   const error = argsError(a, command);
 
   if (error === null) return false;

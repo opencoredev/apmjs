@@ -14,6 +14,7 @@ type Command = {
   /**
    * Value flags only the package manager's own command reads (`apm install --tag next` with no packages is npm's
    * install): parsed with their value so it is not taken for a package, and refused when apm runs the command itself.
+   * A bare install passes --tag on only to npm (main.ts refuseArgs): bun reads the word after it as a package.
    */
   native?: readonly string[];
 };

@@ -273,6 +273,21 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["npm install --tag next"]);
   });
 
+  test.each([
+    [["install", "--tag", "left-pad"], "bun"],
+    [["i", "--tag", "left-pad"], "bun"],
+    [["install", "--pm", "bun", "--tag", "left-pad"], "bun"],
+    [["install", "--pm", "pnpm", "--tag", "left-pad"], "pnpm"],
+    [["install", "--pm=yarn", "--tag", "left-pad"], "yarn"],
+    [["install", "--tag=next"], "bun"],
+  ])("apm %p is refused: only npm's install reads --tag, and bun would install the word after it unchecked", async (argv, pm) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(`--tag is read only by npm's own install, not ${pm}'s`);
+    expectNothingRan(r);
+  });
+
   test("apm run dev --help is the package manager's", async () => {
     const r = await apm(["run", "dev", "--help"]);
 
