@@ -447,7 +447,7 @@ describe("what still goes to the package manager", () => {
     [["ls"], "apm does not pass ls on to bun"],
     [["why", "zod"], "apm does not pass why on to bun"],
     [["/abs/dev"], "apm does not pass /abs/dev on to bun"],
-    [["rm", "--pm", "yarn", "zod"], "apm does not pass rm on to yarn"],
+    [["rm", "--pm", "yarn", "zod"], "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new"],
     [["ls", "--pm", "yarn"], "apm does not pass ls on to yarn"],
     [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove takes only the names of the packages to remove, not --no-package-lock"],
     [["rm", "zod", "--", "--force"], "apm rm takes only the names of the packages to remove, not --force"],
@@ -579,6 +579,26 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(1);
     expect(r.err).toContain("the project has a .pnpmfile.cjs");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test.each([
+    [{ react: { optional: true } }, false],
+    [{}, true],
+  ])("apm remove with npm and a peer the lockfile lacks, peerDependenciesMeta %p: refused as unpinned %p", async (peerDependenciesMeta, refused) => {
+    const packageJson = `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies: { zod: "^4.0.0" }, peerDependencies: { react: "^19.0.0" }, peerDependenciesMeta })}\n`;
+    const r = await apm(["remove", "--pm", "npm", "zod"], "1.22.22", packageJson, { "package-lock.json": ZOD_LOCKS[1]?.[2] ?? "" });
+
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.err.includes("package.json lists react@^19.0.0, which package-lock.json does not pin")).toBe(refused);
+    expect(r.pmCalls.some((call) => call.includes(" remove ") || call.includes(" uninstall "))).toBe(false);
+  });
+
+  test.each([["rm"], ["uninstall"]])("apm %s with yarn is refused like remove, even with a script of that name", async (cmd) => {
+    const r = await apm([cmd, "--pm", "yarn", "zod"], "1.22.22", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { [cmd]: "echo ran" } })}\n`);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("apm cannot read yarn's lockfile");
     expect(r.pmCalls).toEqual([]);
   });
 
