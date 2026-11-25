@@ -18,6 +18,9 @@ function closest(target: EventTarget | Node | null, selector: string): HTMLEleme
 export function AnalyticsEvents() {
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
+      // auxclick also fires for the right button, which opens a menu, not the link
+      if (e.button > 1) return;
+
       const el = closest(e.target, "[data-event]");
       const event = el && eventFromAttributes({ name: el.dataset.event, props: el.dataset.eventProps });
 
