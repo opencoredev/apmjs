@@ -434,6 +434,11 @@ describe("what still goes to the package manager", () => {
     [["ci", "left-pad"], "apm ci with no packages does not pass left-pad on to bun"],
     [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
     [["ci", "--pm", "yarn"], "yarn has no ci; for a frozen install run apm install --frozen-lockfile"],
+    [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci; for a frozen install run apm install --frozen-lockfile"],
+    [["run", "-i", "build.ts"], "apm does not pass bun's --install or -i on"],
+    [["run", "--install=force", "build.ts"], "apm does not pass bun's --install or -i on"],
+    [["index"], "apm does not pass index on to bun"],
+    [["info", "left-pad"], "apm does not pass info on to bun"],
   ])("apm %p is refused: %s", async (argv, message) => {
     const r = await apm(argv);
 
@@ -446,7 +451,6 @@ describe("what still goes to the package manager", () => {
     [["ci"], "bun ci"],
     [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
     [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
-    [["ci", "--pm", "pnpm", "--prod"], "pnpm ci --prod"],
   ])("apm %p is the package manager's clean install", async (argv, call) => {
     const r = await apm(argv);
 
@@ -459,7 +463,9 @@ describe("what still goes to the package manager", () => {
     [["why", "zod"], "bun why zod"],
     [["outdated"], "bun outdated"],
     [["test", "--watch"], "bun test --watch"],
-    [["dev", "--port", "3000"], "bun run dev --port 3000"],
+    [["dev", "--port", "3000"], "bun run --no-install dev --port 3000"],
+    [["run", "build.ts", "a"], "bun run --no-install build.ts a"],
+    [["run", "--pm", "npm", "dev"], "npm run dev"],
   ])("apm %p is passed on: it installs nothing new, or it is a project script", async (argv, call) => {
     const r = await apm(argv, "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "vite" }, dependencies: { zod: "^4.0.0" } })}\n`);
 
@@ -470,6 +476,6 @@ describe("what still goes to the package manager", () => {
   test("apm run dev --help is the package manager's", async () => {
     const r = await apm(["run", "dev", "--help"]);
 
-    expect(r.pmCalls).toEqual(["bun run dev --help"]);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev --help"]);
   });
 });

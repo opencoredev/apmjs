@@ -2276,7 +2276,8 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm restore <pkg>@<v>      undo a mistaken revoke (back to yanked)
   apm incident --since <time> [--dry-run]   account compromised: revoke tokens and recent versions
   apm login | whoami        sign in through the browser; publishes then wait for your approval
-  apm <anything else>        passed to your package manager (apm run dev = bun run dev)
+  apm run|test|start|remove|why|ls|outdated, apm ci, or a package.json script (apm dev = bun run dev):
+                             passed to your package manager; apm refuses any other command it does not run itself
   apm <command> --help       that command's flags (also -h, or apm help <command>); runs nothing
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
@@ -2300,7 +2301,7 @@ const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain"
  * other command could fetch packages apm never checks (an update, a link, a create, or one of their aliases in some
  * package manager), so apm runs it only as a script of the project's package.json, and refuses it otherwise.
  */
-const PASSTHROUGH = new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated", "info", "view"]);
+const PASSTHROUGH = new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"]);
 
 const ProjectScripts = z.object({ scripts: z.record(z.string(), z.unknown()).optional().catch(undefined) });
 
@@ -2318,7 +2319,17 @@ function projectScripts(cwd: string): Set<string> {
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const script = !PASSTHROUGH.has(a.cmd) && projectScripts(cwd).has(a.cmd);
+  // apm's --pm is taken out only before --; after it, every argument is the package manager's
+  const end = a.raw.indexOf("--");
+  // bun runs a file of the same name before a script, and installs what a file it runs imports unless told --no-install
+  const shadowed = det.pm === "bun" && ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"].some((ext) => existsSync(join(cwd, a.cmd + ext)));
+  const script = !PASSTHROUGH.has(a.cmd) && !shadowed && projectScripts(cwd).has(a.cmd);
+
+  if (det.pm === "bun" && a.raw.slice(0, end === -1 ? undefined : end).some((x) => x === "-i" || x === "--install" || x.startsWith("--install="))) {
+    fail("apm: apm does not pass bun's --install or -i on: bun would install what the code it runs imports, unchecked. Nothing was run.");
+
+    return 2;
+  }
 
   if (!PASSTHROUGH.has(a.cmd) && !script) {
     fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
@@ -2327,12 +2338,14 @@ async function passthrough(a: Args): Promise<number> {
     return 2;
   }
 
-  // apm's --pm is taken out only before --; after it, every argument is the package manager's
-  const end = a.raw.indexOf("--");
   const own = end === -1 ? a.raw : a.raw.slice(0, end);
   const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
 
-  return (await runCmd([det.pm, ...(script ? ["run", a.cmd] : [a.cmd]), ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
+  const command = script ? ["run", a.cmd] : [a.cmd];
+
+  if (det.pm === "bun" && command[0] === "run") command.splice(1, 0, "--no-install");
+
+  return (await runCmd([det.pm, ...command, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
 /** `apm install` with no packages: the package manager's own install, with only arguments that cannot name a package. */
@@ -2375,11 +2388,12 @@ function update(a: Args): number {
 async function cleanInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const passed = det.pm === "yarn" ? { error: "yarn has no ci; for a frozen install run apm install --frozen-lockfile" } : bareInstallArgs(a, det.pm);
+  const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
 
   if ("args" in passed) return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   fail(`apm: ${passed.error}. Nothing was run.`);
-  say(`For other ${det.pm} ci options, run ${det.pm} ci yourself.`);
+
+  if (det.pm === "bun" || det.pm === "npm") say(`For other ${det.pm} ci options, run ${det.pm} ci yourself.`);
 
   return 2;
 }
