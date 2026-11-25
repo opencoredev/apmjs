@@ -1,4 +1,5 @@
 // The HTTP contract between the registry and the reviewer process. Both sides parse with these schemas.
+import { isPossibleNpmName } from "@apm/core";
 import { z } from "zod";
 import { SEVERITIES } from "./reply.ts";
 
@@ -14,9 +15,19 @@ export type EnqueueReason = (typeof ENQUEUE_REASONS)[number];
 
 /**
  * Where the registry serves the tarball, relative to its root ("debug/-/debug-4.4.3.tgz"). The reviewer
- * joins it to its own configured registry URL, so a job can never point it at another host.
+ * joins it to its own configured registry URL, so a job can never point it at another host. The name is any
+ * name npm can hold, old names included (isPossibleNpmName), so npm's placeholder named "-" leases like any
+ * other. Every character is one encodeURIComponent leaves as it is (the file may also carry a version's "+build"),
+ * which is checked first because encodeURIComponent throws on a lone surrogate, and no segment is a dot segment.
  */
-export const TarballPath = z.string().max(600).regex(/^(?:@[a-z0-9][\w.~-]*\/)?[a-z0-9][\w.~-]*\/-\/[\w.~-]+\.tgz$/i);
+export const TarballPath = z
+  .string()
+  .max(600)
+  .refine((path) => {
+    const m = /^((?:@[\w.!~*'()-]+\/)?[\w.!~*'()-]+)\/-\/([\w.!~*'()+-]+\.tgz)$/.exec(path);
+
+    return m?.[1] !== undefined && isPossibleNpmName(m[1]) && path.split("/").every((segment) => segment !== "." && segment !== "..");
+  }, "not a tarball path of an npm name");
 
 const TarballRef = z.object({ version: Version, digest: DigestLabel, tarballPath: TarballPath });
 
@@ -37,6 +48,40 @@ export type ReviewJob = z.infer<typeof ReviewJob>;
 export const LeaseResponse = z.object({ jobs: z.array(ReviewJob).max(64) });
 
 export type LeaseResponse = z.infer<typeof LeaseResponse>;
+
+/** A lease as the reviewer parses it at the boundary: the batch only, with each job read on its own by readLease. */
+export const LeaseBatch = z.object({ jobs: z.array(z.unknown()).max(64) });
+
+export type LeaseBatch = z.infer<typeof LeaseBatch>;
+
+const LeaseHandle = z.object({ id: ReviewJob.shape.id, leaseId: ReviewJob.shape.leaseId });
+
+/** A leased job this side cannot read: with its lease when that much could be read, so it can be given back. */
+export type UnreadableJob = { lease: z.infer<typeof LeaseHandle> | null; why: string };
+
+export type LeaseRead = { jobs: ReviewJob[]; unreadable: UnreadableJob[] };
+
+/** The jobs of a lease batch, each parsed on its own, so one job the reviewer cannot read never discards the rest. */
+export function readLease(batch: LeaseBatch): LeaseRead {
+  const jobs: ReviewJob[] = [];
+  const unreadable: UnreadableJob[] = [];
+
+  for (const raw of batch.jobs) {
+    const job = ReviewJob.safeParse(raw);
+
+    if (job.success) {
+      jobs.push(job.data);
+      continue;
+    }
+
+    const handle = LeaseHandle.safeParse(raw);
+    const why = job.error.issues.map((i) => `${i.path.join(".") || "job"}: ${i.message}`).join("; ");
+
+    unreadable.push({ lease: handle.success ? handle.data : null, why });
+  }
+
+  return { jobs, unreadable };
+}
 
 export const WireFinding = z.object({
   file: z.string().min(1).max(1000),
