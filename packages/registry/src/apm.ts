@@ -6,7 +6,6 @@ import { z } from "zod";
 import {
   analyze,
   ArchiveError,
-  dependencySpecs,
   describeDependency,
   installEdges,
   isTargetValue,
@@ -32,7 +31,6 @@ import {
   isValidPackageName,
   isPossibleNpmName,
   isValidVersion,
-  dependencyNames,
   missingEntries,
   COOLDOWN_MS,
   coverageText,
@@ -806,6 +804,15 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: 
   return { load, pick };
 }
 
+/**
+ * What a publish checks and compares: every dependency the package manager installs with the package (installEdges),
+ * required peers included. dependencySpecs leaves peers out, so a release adding a low-scoring or new required peer
+ * carried neither risky-dependency nor new-dependency, while the install-time walk checked it.
+ */
+const installedSpecs = (manifest: InstallManifest) => installEdges(manifest).map((e) => e.spec);
+
+const installedNames = (manifest: InstallManifest): string[] => [...new Set(installedSpecs(manifest).map((d) => (isRegistryDependency(d) ? d.name : d.key)))];
+
 /** Each checked dependency may mean an upstream download and analysis, so publish checks a bounded number. */
 const MAX_PUBLISH_DEPS = 50;
 
@@ -815,7 +822,7 @@ const checkDependencies = (manifest: Record<string, unknown>) =>
     const at = yield* now;
     const risky: DependencyRisk[] = [];
     const unchecked: string[] = [];
-    const specs = dependencySpecs(manifest);
+    const specs = installedSpecs(manifest);
 
     for (const dep of specs.slice(0, MAX_PUBLISH_DEPS)) {
       if (!isRegistryDependency(dep)) {
@@ -979,8 +986,8 @@ const onPublish: PublishHook = ({ name, version, manifest, tarball, user, existi
 
     const previous = existing ? yield* versionsOf(name) : [];
     const last = previous[previous.length - 1];
-    const prevDeps = last ? new Set(dependencyNames(last.manifest)) : null;
-    const addedDependencies = prevDeps ? dependencyNames(tarManifest).filter((d) => !prevDeps.has(d)) : [];
+    const prevDeps = last ? new Set(installedNames(last.manifest)) : null;
+    const addedDependencies = prevDeps ? installedNames(tarManifest).filter((d) => !prevDeps.has(d)) : [];
     const deps = yield* checkDependencies(tarManifest);
 
     const analysis = analyze({

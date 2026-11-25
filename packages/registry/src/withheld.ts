@@ -5,7 +5,7 @@
 import {
   NOT_CHECKED,
   READING_LIMITS,
-  dependencySpecs,
+  installEdges,
   describeDependency,
   isRegistryDependency,
   isValidPackageName,
@@ -140,7 +140,7 @@ export function withheldLimitations(notChecked: readonly string[], manifest: Ver
   const deps = notChecked.filter((n) => n.startsWith("dependency "));
   let named = 0;
 
-  for (const d of dependencySpecs(manifest)) {
+  for (const d of installEdges(manifest).map((e) => e.spec)) {
     const said = [`dependency ${describeDependency(d)}:`, ...(isRegistryDependency(d) ? [`dependency ${d.name}@`] : [])];
 
     if (!deps.some((n) => said.some((p) => n.startsWith(p)))) continue;
