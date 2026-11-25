@@ -298,6 +298,7 @@ function versionsText(versions: readonly VersionShare[]): string {
 export async function confirmLive(input: { cf: Cloudflare; script: string; versions: readonly VersionShare[]; expected: Expected; deadlineMs?: number; intervalMs?: number }): Promise<Confirmation> {
   const end = Date.now() + (input.deadlineMs ?? CONFIRM_DEADLINE_MS);
   let last = "nothing was read in time";
+  let answered = false;
 
   for (;;) {
     try {
@@ -305,8 +306,12 @@ export async function confirmLive(input: { cf: Cloudflare; script: string; versi
 
       if (live !== undefined && isExpected(live, input.expected) && sameVersions(live.versions, input.versions)) return { kind: "confirmed", live };
       last = live === undefined ? "it has no deployment" : `its live deployment is ${live.id} of ${live.created_on}, running ${versionsText(live.versions)}`;
+      answered = true;
     } catch (e) {
-      last = `its deployment list could not be read (${e instanceof Error ? e.message : String(e)})`;
+      // a read cut short by the deadline itself says nothing new: keep what the last answered read showed
+      const cutShort = e instanceof Error && e.name === "TimeoutError" && end - Date.now() <= 0;
+
+      if (!cutShort || !answered) last = `its deployment list could not be read (${e instanceof Error ? e.message : String(e)})`;
     }
 
     const left = end - Date.now();

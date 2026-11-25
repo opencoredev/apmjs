@@ -55,6 +55,10 @@ let failLists: number | null;
 /** How long the stand-in takes to answer each request: a slow API. */
 let delayMs: number;
 
+/** After a Worker has been posted to, this many list reads answer at once and every later one takes 400 ms: Cloudflare going slow mid-confirmation. */
+let hangListsAfterPost: number | null;
+let listsAfterPost: number;
+
 /** A change the stand-in makes to a Worker's deployments on the nth list of them: someone deploying mid-rollback. */
 let onList: Map<string, { at: number; change: () => void }>;
 let lists: Map<string, number>;
@@ -96,6 +100,8 @@ function reset(): void {
   versionVars = new Map();
   failLists = null;
   delayMs = 0;
+  hangListsAfterPost = null;
+  listsAfterPost = 0;
   // one line per deploy run: rv2 and wv1 went out together, rv3 and wv2, rv4 and wv3; rv1 was built before the newest
   // migration existed
   releases = [
@@ -143,6 +149,8 @@ beforeAll(() => {
         if (onList.get(script)?.at === n) onList.get(script)?.change();
 
         const stale = posted.some((p) => p.script === script) ? staleAfterPost.get(script) : undefined;
+
+        if (hangListsAfterPost !== null && posted.some((p) => p.script === script) && ++listsAfterPost > hangListsAfterPost) await Bun.sleep(400);
 
         return Response.json({ success: true, result: { deployments: [...(stale ?? deployments.get(script) ?? list)].reverse() } });
       }
@@ -1004,6 +1012,19 @@ describe("Cloudflare's answers", () => {
       );
       expect(lines.some((l) => l.startsWith("rolled back"))).toBe(false);
     }
+  });
+
+  test("a read cut short by the deadline does not hide what the last answered read showed", async () => {
+    // CI run 45555060547: on a slow runner the last read before the deadline timed out, and the reason became
+    // "could not be read (The operation timed out.)" instead of the stale list every earlier read had shown
+    answer = "no-id";
+    applyPosts = false;
+    staleAfterPost.set("apmjs-web-production", [dep("w1", "wv1", "2026-11-15T10:01:00Z")]);
+    hangListsAfterPost = 1;
+    const lines: string[] = [];
+
+    expect(await rollBack(cf(), [web()], "m", (l) => lines.push(l), { confirm: { deadlineMs: 300, intervalMs: 50 } })).toBe(false);
+    expect(lines[1]).toBe("FAILED to roll back apmjs-web-production: Cloudflare's answer named no deployment, and after 300 ms no deployment newer than w2 runs version wv1 (its live deployment is w1 of 2026-11-15T10:01:00Z, running wv1)");
   });
 
   test("an accepted id confirms only on that deployment: a newer one running the target under another id does not count", async () => {
