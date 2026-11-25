@@ -39,3 +39,21 @@ test("an incident sweep leaves an older version's pending revoke pending, as apm
   expect(dig(incident.body, "statuses", "pend-lib@1.0.0")).toBe("revoke-pending");
   expect(Status.parse(await reg.query("SELECT status FROM versions WHERE package = 'pend-lib' AND version = '1.0.0'"))[0]?.status).toBe("revoke-pending");
 });
+
+// the reason goes into the version's status_reason, an advisory and the event log, which refuse a NUL or an unpaired
+// surrogate: the write failed inside the transaction and the change answered 500
+test.each([
+  ["revoke", "a\u0000b"],
+  ["revoke", "a\ud800b"],
+  ["yank", "a\u0000b"],
+  ["incident", "a\u0000b"],
+] as const)("apm %s with a reason apm cannot store (%j) is refused, and the version is unchanged", async (action, reason) => {
+  const carol = await addUser(reg, `carol-${action}-${reason.charCodeAt(1)}`, PASSWORD);
+  const name = `reason-${action}-${reason.charCodeAt(1)}`;
+
+  expect((await putPublish(reg, carol, { name, version: "1.0.0" })).status).toBe(201);
+  const body: Record<string, string> = action === "incident" ? { since: new Date(clock - DAY).toISOString(), reason, password: PASSWORD } : { name, version: "1.0.0", reason, password: PASSWORD };
+
+  expect((await api(action, carol, body)).status).toBe(400);
+  expect(Status.parse(await reg.query("SELECT status FROM versions WHERE package = $1", [name]))[0]?.status).toBe("active");
+});

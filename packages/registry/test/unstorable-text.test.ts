@@ -31,7 +31,7 @@ test.each([
 test("a NUL in a file path inside the tarball still publishes, as before", async () => {
   const res = await putPublish(reg, token, { name: "nul-path", version: "1.0.0", main: "index.js" }, { files: { "a\u0000b.txt": "x", "index.js": "1" } });
 
-  expect(res.status).toBeLessThan(500);
+  expect(res.status).toBe(201);
 });
 
 test.each([

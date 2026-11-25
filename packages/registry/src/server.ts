@@ -789,7 +789,7 @@ function deprecationOf(manifest: { readonly deprecated?: unknown }): string | nu
 const UNSTORABLE = "a NUL character or an unpaired surrogate";
 
 /** Whether Postgres can store this JSON text in jsonb or text: storableJson changes exactly what it cannot. */
-function storableText(json: string): boolean {
+export function storableText(json: string): boolean {
   return storableJson(json) === json;
 }
 

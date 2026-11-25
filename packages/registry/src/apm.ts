@@ -79,6 +79,7 @@ import {
   searchPaging,
   servedVersions,
   splitPath,
+  storableText,
   tagTarget,
   tarballUrl,
   tarballVersion,
@@ -1078,11 +1079,14 @@ const revokeVersion = (v: VersionRecord, actor: string, reason: string, opts: { 
     return status;
   });
 
+// every string here reaches a text or jsonb column (a status reason, an advisory, the event log, a confirmation's
+// action): one Postgres cannot store is refused with the body, not a 500 from the write, and before a factor is spent
+const Stored = z.string().refine((s) => storableText(JSON.stringify(s)), "must not hold a NUL character or an unpaired surrogate");
 const Password = z.string().min(1).optional();
 const Otp = z.string().min(1).optional();
-const StateBody = z.object({ name: z.string(), version: z.string(), reason: z.string().optional(), password: Password, otp: Otp });
-const IncidentBody = z.object({ since: z.string(), reason: z.string().optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
-const OwnerBody = z.object({ name: z.string(), user: z.string(), password: Password, otp: Otp });
+const StateBody = z.object({ name: Stored, version: Stored, reason: Stored.optional(), password: Password, otp: Otp });
+const IncidentBody = z.object({ since: Stored, reason: Stored.optional(), password: Password, otp: Otp, dryRun: z.boolean().optional() });
+const OwnerBody = z.object({ name: Stored, user: Stored, password: Password, otp: Otp });
 
 /** Destructive actions need a fresh second factor for this exact action on top of the bearer token (a password only in legacy mode). */
 const reauth = (caller: Caller, proof: { password?: string | undefined; otp?: string | undefined }, action: LiveAction) =>
