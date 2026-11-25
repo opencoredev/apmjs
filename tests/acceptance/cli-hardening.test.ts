@@ -401,6 +401,16 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     expect(r.code, r.out).toBe(1);
     expect(existsSync(steered), r.out).toBe(false);
     expect(r.out).toContain("npm_config_userconfig");
+
+    // a workspace folder of a monorepo: npm runs there and exports its .npmrc, so the path may climb to the repo root
+    mkdirSync(join(app, ".git"));
+    const member = join(app, "packages", "web");
+
+    mkdirSync(member, { recursive: true });
+    const fromMember = await apm(["login", "--username", "mallory3", "--password-stdin"], { cwd: member, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, npm_config_userconfig: steered }, stdin: "a-long-enough-password\n" });
+
+    expect(fromMember.code, fromMember.out).toBe(1);
+    expect(existsSync(steered), fromMember.out).toBe(false);
   });
 });
 

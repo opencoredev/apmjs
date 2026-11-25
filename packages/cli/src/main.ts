@@ -2020,17 +2020,39 @@ function refuseRepoChosenRegistry(cfg: Config, action: string): boolean {
 
 /**
  * apm login saves the token to the user config, which npm_config_userconfig names, and `npm run` and `npx` set that
- * variable from a project .npmrc's `userconfig=`. A token saved inside the current directory could be committed with the
- * project, so that is refused; ~/.npmrc itself always counts as the user's. True when it refused.
+ * variable from a project .npmrc's `userconfig=` (a workspace's too, run from its folder). A token saved inside the
+ * project could be committed with it, so a path inside the repository (the nearest folder with .git, else the current
+ * one) is refused; ~/.npmrc itself always counts as the user's. True when it refused.
  */
 function refuseUserconfigInProject(cfg: Config): boolean {
   const file = resolve(cfg.userconfig);
+  const home = resolve(env().HOME ?? homedir());
 
-  if (file === resolve(join(env().HOME ?? homedir(), ".npmrc"))) return false;
-  const rel = relative(process.cwd(), file);
+  if (file === join(home, ".npmrc")) return false;
 
-  if (rel.startsWith("..") || isAbsolute(rel)) return false;
-  fail(`refused: apm login would save the token to ${file}, inside this directory (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
+  const inside = (dir: string): boolean => {
+    const rel = relative(dir, file);
+
+    return !rel.startsWith("..") && !isAbsolute(rel);
+  };
+
+  const cwd = process.cwd();
+  let root = cwd;
+
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) {
+      root = dir;
+      break;
+    }
+
+    if (dirname(dir) === dir) break;
+  }
+
+  // a home folder kept in git (dotfiles) is not the project: there only the current folder counts
+  const projectRoot = relative(root, home).startsWith("..") ? root : cwd;
+
+  if (!inside(projectRoot)) return false;
+  fail(`refused: apm login would save the token to ${file}, inside this project (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
   say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
 
   return true;
