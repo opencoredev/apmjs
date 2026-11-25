@@ -8,6 +8,7 @@ import { registryFetch } from "../registry-transport";
 import { REGISTRY } from "../registry-url";
 import { AlternativesPart, ExactPart, LookalikePart } from "../search-schema";
 import { parseJson } from "./json";
+import { cachedResolve, type PolicyStore } from "./policy-cache";
 import { EXPLAIN_RESOLVE_WAIT_MS, RESOLVE_TIMEOUT_MS } from "./resolve-budget";
 import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome } from "./source";
 
@@ -49,6 +50,13 @@ async function names(input: { name: string; scope: string | null }): Promise<Nam
   return r.kind === "ok" ? r.value : null;
 }
 
+declare global {
+  /** The package views' resolve answers, on globalThis so the page and the .md and MCP routes share one isolate's store. */
+  var apmPolicyStore: PolicyStore | undefined;
+}
+
+globalThis.apmPolicyStore ??= new Map();
+
 /** The agent views read version state, the AI review and file excerpts without the edge cache: see AgentSource. */
 export const registrySource: AgentSource = {
   package: getPackage,
@@ -56,6 +64,7 @@ export const registrySource: AgentSource = {
   review: ({ name, version }) => getReview(name, version),
   score: ({ name, version }) => getVersionScore(name, version),
   resolve,
+  policyResolve: cachedResolve({ resolve, store: globalThis.apmPolicyStore }),
   // the website's search: an answer with a local package is read from the registry every time (a revoke changes its
   // description); only one made entirely of npm's packages is served from the cache (lib/registry.ts)
   search: ({ query }) => search(query),

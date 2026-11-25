@@ -56,6 +56,12 @@ export function specSuffix(install: InstallSpec): string | null {
   }
 }
 
+/**
+ * Whether a dist-tag name may go into a shell command or the agent prompt as it is. npm's tags reach the web unchecked
+ * (apm checks only its own packages' tags), so any other tag is not offered: the command pins the version instead.
+ */
+export const isSafeTag = (tag: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(tag);
+
 /** How long apm's cooldown holds a new version back (packages/core DEFAULT_POLICY.cooldownMs). */
 export const COOLDOWN_MS = 24 * 60 * 60_000;
 

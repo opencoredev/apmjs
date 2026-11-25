@@ -70,7 +70,17 @@ function evidenceWithoutSource(signal: string, evidence: string): string[] {
  */
 export function withholdSource(view: PackageView): PackageView {
   if (!sourceWithheld(view)) return view;
-  const score = view.score ? { ...view.score, signals: view.score.signals.map((s) => ({ ...s, evidence: s.evidence.flatMap((e) => evidenceWithoutSource(s.id, e)) })), dismissed: view.score.dismissed.map((d) => ({ ...d, evidence: [] })) } : null;
+
+  const score = view.score
+    ? {
+        ...view.score,
+        signals: view.score.signals.map((s) => ({ ...s, evidence: s.evidence.flatMap((e) => evidenceWithoutSource(s.id, e)) })),
+        dismissed: view.score.dismissed.map((d) => ({ ...d, evidence: [] })),
+        // what each capability rests on quotes the tarball (lines, variable names, the declaration's words): none of it
+        capabilities: view.score.capabilities?.map(({ declared: _declared, names: _names, outside: _outside, ...c }) => ({ ...c, evidence: [] })),
+      }
+    : null;
+
   const status = view.status ? { ...view.status, deprecated: null } : null;
   const r = view.review;
 

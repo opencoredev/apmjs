@@ -68,7 +68,7 @@ export async function loadPackageView(input: { name: string; version: string | n
     review: review.kind === "ok" ? (review.value.review?.state ?? null) : null,
   }));
 
-  const policy = readPolicy({ name, version, status, risk, resolve: source.resolve });
+  const policy = readPolicy({ name, version, status, risk, resolve: source.policyResolve });
 
   if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
 
@@ -86,7 +86,9 @@ export async function loadPackageView(input: { name: string; version: string | n
       status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated },
       policy: await policy,
       facts: v.facts,
-      score: withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
+      // capabilities from another read only when that read and this view agree the version is not withheld: a revoke
+      // between them must not carry the earlier answer's evidence into this one
+      score: withheldNow(v, review) ? v.score : withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
       unscorable: v.unscorable,
       review,
       install,
@@ -107,6 +109,11 @@ function withCapabilities(input: { score: VersionInfo["score"]; from: VersionInf
   if (score === null || from === null || score.capabilities !== undefined) return score;
 
   return { ...score, capabilities: from.capabilities, declaration: from.declaration };
+}
+
+/** Whether the freshest reads say the version is withheld: its own status, its score's redaction, or its review's. */
+function withheldNow(v: VersionInfo, review: Fetched<ReviewAnswer>): boolean {
+  return isWithheld(v.status) || v.score?.redacted === true || (review.kind === "ok" && review.value.redacted);
 }
 
 /**

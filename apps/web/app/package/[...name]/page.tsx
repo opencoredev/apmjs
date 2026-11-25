@@ -944,7 +944,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // (lib/refusal.ts looksRisky); only the install box waits for it
   const reviewState = review.then((r) => (r.kind === "ok" ? (r.value.review?.state ?? null) : null));
   const risk = Promise.all([isLatest ? Promise.resolve(pkg.score) : versionScoreRead.then((s) => (s.kind === "ok" ? s.value : null)), reviewState]).then(([score, state]) => ({ score, installScripts: isLatest ? (pkg.facts?.installScripts ?? null) : null, review: state }));
-  const policy = readPolicy({ name: pkg.name, version, status, risk, resolve: registrySource.resolve });
+  const policy = readPolicy({ name: pkg.name, version, status, risk, resolve: registrySource.policyResolve });
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
   const [versionScore, detailsRead] = await Promise.all([versionScoreRead, versionDetails]);
 
@@ -1092,10 +1092,10 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             <SectionTitle
               id="facts"
               aside={
-                isLatest || tag ? undefined : glance.of === "shown" ? (
-                  <span className="font-mono text-sm text-muted-foreground">{version}</span>
-                ) : (
+                glance.of === "latest" ? (
                   <span className="text-sm text-muted-foreground">latest version, {pkg.latest}</span>
+                ) : isLatest || tag ? undefined : (
+                  <span className="font-mono text-sm text-muted-foreground">{version}</span>
                 )
               }
             >

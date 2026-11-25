@@ -355,6 +355,33 @@ describe("what the Markdown view says apm will not install, and how", () => {
     expect(calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
   });
 
+  test("two views of one version within a minute make one resolve, for the page, the .md and check_package alike", async () => {
+    const source = fakeSource({ packages: { ugent_uws: ugent("9.0.0") }, resolve: () => UGENT_REFUSED });
+
+    for (let i = 0; i < 2; i++) await loadPackageView({ name: "ugent_uws", version: "10.9.11", registry: REGISTRY, source });
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
+  });
+
+  test("a revoke between reads leaves no capability evidence from the earlier answer", async () => {
+    const secret = "package.json scripts.preinstall: SECRET-SOURCE-LINE";
+    const p = pkg({ latest: "1.3.0", distTags: { latest: "1.3.0" }, versions: [row("1.3.0")] });
+    const before = p.score;
+
+    if (!before) throw new Error("pkg() has a score");
+    const withCaps = { ...p, score: { ...before, scorer: "apm-score-v11", capabilities: [{ id: "network" as const, label: "Network: makes requests or opens sockets", status: "not-declared" as const, basis: "code" as const, evidence: [secret], names: ["SECRET_ENV"] }] } };
+    const { capabilities: _none, ...revokedScore } = { ...withCaps.score, redacted: true };
+    const source = fakeSource({ packages: { "left-pad": withCaps }, versions: { "left-pad@1.3.0": { version: "1.3.0", status: "revoked", statusReason: null, deprecated: null, facts: null, score: revokedScore } } });
+    const loaded = await loadPackageView({ name: "left-pad", version: null, registry: REGISTRY, source });
+
+    if (loaded.kind !== "ok") throw new Error(JSON.stringify(loaded));
+    const answer = JSON.stringify(await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad" } } }, source));
+
+    for (const out of [JSON.stringify(loaded.view.score), packageMarkdown(loaded.view), answer]) {
+      expect(out).not.toContain("SECRET-SOURCE-LINE");
+      expect(out).not.toContain("SECRET_ENV");
+    }
+  });
+
   test("a refused default makes the one resolve and nothing more", async () => {
     const { md, calls } = await load(ugent("10.9.11"), null, (_, range) => (range === "10.9.11" ? UGENT_REFUSED : resolvedTo("9.0.0")));
 

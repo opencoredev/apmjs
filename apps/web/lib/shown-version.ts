@@ -2,7 +2,7 @@
 // only the newest 200 versions (version-count.ts), so a version missing from that list may still exist: the page asks
 // the registry's per-version endpoint (getVersionInfo) before it decides, and says "no such version" when that answers
 // 404. Pure apart from that read, which the caller passes in, so the page, its Markdown view and the tests share it.
-import type { InstallSpec } from "./install-note";
+import { isSafeTag, type InstallSpec } from "./install-note";
 import type { Fetched, PackageInfo } from "./registry";
 import { noInstallable, type NoInstallable } from "./refusal";
 
@@ -31,6 +31,27 @@ const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /** Whether `asked` is a version number rather than a dist-tag: one the per-version endpoint can be asked about as it is. */
 export const isVersionNumber = (asked: string): boolean => VERSION.test(asked);
+
+/** How many tag targets the package answer does not list one view reads from the per-version endpoint. */
+export const MAX_UNLISTED_READS = 3;
+
+/** Highest version first: numbers, then a release above its prereleases, then prerelease identifiers. */
+function byVersionDesc(a: string, b: string): number {
+  const parts = (v: string) => {
+    const [core = "", pre = ""] = v.replace(/\+.*$/, "").split(/-(.+)/);
+
+    return { nums: core.split(".").map(Number), pre };
+  };
+
+  const x = parts(a);
+  const y = parts(b);
+
+  for (let i = 0; i < 3; i++) if (x.nums[i] !== y.nums[i]) return (y.nums[i] ?? 0) - (x.nums[i] ?? 0);
+
+  if (x.pre === "" || y.pre === "") return (x.pre === "" ? 0 : 1) - (y.pre === "" ? 0 : 1);
+
+  return y.pre.localeCompare(x.pre, "en", { numeric: true });
+}
 
 /** The one rule for picking among tag targets: published last, then by tag name so the pick never depends on order. */
 function newest<T extends Tagged>(tagged: readonly T[]): T | undefined {
@@ -83,7 +104,7 @@ export function chooseVersion(input: { pkg: Answer; asked: string | undefined })
 function installFor(input: { pkg: Answer; version: string; tag: string }): InstallSpec {
   const { pkg, version, tag } = input;
 
-  if (!Object.hasOwn(pkg.distTags, tag) || pkg.distTags[tag] !== version) return { kind: "exact", version };
+  if (!Object.hasOwn(pkg.distTags, tag) || pkg.distTags[tag] !== version || !isSafeTag(tag)) return { kind: "exact", version };
 
   return tag === "latest" ? { kind: "default", version } : { kind: "tag", tag };
 }
@@ -117,8 +138,10 @@ export async function selectVersion<V extends { version: string; status: string;
     case "tagged-unlisted": {
       const eligible: (Tagged & { read: V | null })[] = choice.listed.map((t) => ({ ...t, read: null }));
       const reads = new Map<string, Fetched<V>>();
+      // the publisher decides how many tags there are: only the highest few targets are read, once each
+      const read = new Set([...new Set(choice.unlisted.map((t) => t.version))].toSorted(byVersionDesc).slice(0, MAX_UNLISTED_READS));
 
-      for (const t of choice.unlisted) {
+      for (const t of choice.unlisted.filter((u) => read.has(u.version))) {
         const info = reads.get(t.version) ?? (await input.read(t.version));
 
         reads.set(t.version, info);

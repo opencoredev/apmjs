@@ -214,6 +214,8 @@ export type AgentSource = {
   /** One version's score from the score route, which the package page reads for a version other than latest: it carries the capabilities the version answer leaves out. */
   score: (input: { name: string; version: string }) => Promise<Fetched<ScoreReport>>;
   resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome>;
+  /** resolve as the package views read it for the version they show: the same answer, kept a minute (policy-cache.ts). */
+  policyResolve: (input: { name: string; range: string }) => Promise<ResolveOutcome>;
   search: (input: { query: string }) => Promise<SearchAnswer | null>;
   /** The name check; `scope` is the npm scope (without @) the alternatives are checked under. */
   names: (input: { name: string; scope: string | null }) => Promise<NameReport | null>;
