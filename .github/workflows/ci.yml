@@ -43,6 +43,9 @@ jobs:
           for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Unit tests
         run: bun test packages/cli/test packages/core/test packages/registry/test packages/infra/test
+      - name: Unit tests (bun-scanner, ai-review and its eval harness, launch audit)
+        # packages/infra/test/ci-coverage.test.ts fails when a tracked test file runs in no CI step
+        run: bun test --timeout 90000 packages/bun-scanner/test packages/ai-review/src tools/ai-review tests/launch-audit
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web
