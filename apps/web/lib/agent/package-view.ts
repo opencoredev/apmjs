@@ -18,7 +18,7 @@ import type { ReviewAnswer } from "../review-schema";
 import { isVersionNumber, selectVersion } from "../shown-version";
 import { isWithheld, withholdSource, type PackageView } from "./package-md";
 import { inlineCode } from "./text";
-import type { AgentSource, VersionInfo } from "./source";
+import type { AgentSource, ScoreReport, VersionInfo } from "./source";
 
 export type LoadedView = { kind: "ok"; view: PackageView } | { kind: "missing"; reason: string } | { kind: "unavailable" };
 
@@ -52,34 +52,34 @@ export async function loadPackageView(input: { name: string; version: string | n
 
   const { version, install } = selected;
   const isLatest = version === pkg.latest;
-  const status = selected.read?.status ?? pkg.versions.find((r) => r.version === version)?.status ?? "active";
   // the page's score for a version other than latest comes from the score route, with its capabilities: so does this one
-  const routeScore = isLatest ? null : source.score({ name, version });
-  const read = () => Promise.all([source.version({ name, version }), source.review({ name, version })]);
-  // a version the package answer does not list was just read to find it: only its review is new
-  const first: Awaited<ReturnType<typeof read>> = selected.read ? [{ kind: "ok", value: selected.read }, await source.review({ name, version })] : await read();
-  const [info, review] = agree(...first) ? first : await read();
+  const scoreRead = (): Promise<Fetched<ScoreReport> | null> => (isLatest ? Promise.resolve(null) : source.score({ name, version }));
+  const read = () => Promise.all([source.version({ name, version }), source.review({ name, version }), scoreRead()]);
+  // a version the package answer does not list was just read to find it: only its review and score are new
+  const first: Awaited<ReturnType<typeof read>> = selected.read ? await Promise.all([{ kind: "ok", value: selected.read } as const, source.review({ name, version }), scoreRead()]) : await read();
+  const [info, review, routed] = agree(...first) ? first : await read();
 
-  if (!agree(info, review)) return { kind: "unavailable" };
-
-  // as on the page: a review apm reviewers confirmed refuses it, and resolve is asked only when the version's score or
-  // review marks it risky (lib/refusal.ts readPolicy)
-  const risk = (routeScore === null ? Promise.resolve(pkg.score) : routeScore.then((s) => (s.kind === "ok" ? s.value : null))).then((score) => ({
-    score,
-    installScripts: routeScore === null ? (pkg.facts?.installScripts ?? null) : null,
-    review: review.kind === "ok" ? (review.value.review?.state ?? null) : null,
-  }));
-
-  const policy = readPolicy({ name, version, status, risk, resolve: source.resolve });
+  // the reads still disagree about a revoke: build no view at all, rather than one mixing answers from both sides of it
+  if (!agree(info, review, routed)) return { kind: "unavailable" };
 
   if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
 
   // without the version's own answer the view would show another version's facts or a stale status: say so instead
   if (info.kind === "unavailable") return { kind: "unavailable" };
   const v = info.value;
-  const routed = routeScore === null ? null : await routeScore;
-  // withheld when any read says so, the score route included: it can see a revoke the version and review reads did not
-  const withheld = withheldNow(v, review) || (routed?.kind === "ok" && routed.value.redacted);
+  // the reads agree, so any one saying withheld means all do: the view then has only the withheld answers' fields
+  const withheld = versionSays(info) === true || redactedSays(review) === true || redactedSays(routed) === true;
+  const routedScore = routed?.kind === "ok" ? routed.value : null;
+
+  // as on the page: a withdrawal or a review apm reviewers confirmed refuses it, and resolve is asked only when the
+  // version's score or review marks it risky (lib/refusal.ts readPolicy)
+  const policy = readPolicy({
+    name,
+    version,
+    status: v.status,
+    risk: Promise.resolve({ score: isLatest ? pkg.score : routedScore, installScripts: isLatest ? (pkg.facts?.installScripts ?? null) : null, review: review.kind === "ok" ? (review.value.review?.state ?? null) : null, withheld }),
+    resolve: source.resolve,
+  });
 
   // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
@@ -90,9 +90,8 @@ export async function loadPackageView(input: { name: string; version: string | n
       status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated },
       policy: await policy,
       facts: v.facts,
-      // a withheld version's score is marked redacted, so withholdSource strips it whichever read saw the revoke; and
       // capabilities come from another read only when no read says withheld
-      score: withheld ? (v.score && { ...v.score, redacted: true }) : withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
+      score: withheld ? v.score : withCapabilities({ score: v.score, from: isLatest ? pkg.score : routedScore }),
       unscorable: v.unscorable,
       review,
       install,
@@ -115,17 +114,18 @@ function withCapabilities(input: { score: VersionInfo["score"]; from: VersionInf
   return { ...score, capabilities: from.capabilities, declaration: from.declaration };
 }
 
-/** Whether the freshest reads say the version is withheld: its own status, its score's redaction, or its review's. */
-function withheldNow(v: VersionInfo, review: Fetched<ReviewAnswer>): boolean {
-  return isWithheld(v.status) || v.score?.redacted === true || (review.kind === "ok" && review.value.redacted);
-}
+/** What the version answer says about a revoke: withheld (its status or its score's redaction), not, or nothing. */
+const versionSays = (read: Fetched<VersionInfo>): boolean | null => (read.kind === "ok" ? isWithheld(read.value.status) || read.value.score?.redacted === true : null);
+
+/** What a review or score-route answer says about a revoke: redacted, not, or nothing when there is no answer. */
+const redactedSays = (read: Fetched<{ redacted: boolean }> | null): boolean | null => (read?.kind === "ok" ? read.value.redacted : null);
 
 /**
- * Whether the version answer and the review answer saw the version in the same state: both withheld or neither. A
- * review the registry did not send (missing, unreadable) has nothing of the version's to disagree with.
+ * Whether the version, review and score-route answers saw the version in the same state: all withheld or none. A read
+ * the registry did not answer (missing, unreadable, not made) has nothing of the version's to disagree with.
  */
-function agree(info: Fetched<VersionInfo>, review: Fetched<ReviewAnswer>): boolean {
-  if (info.kind !== "ok" || review.kind !== "ok") return true;
+function agree(info: Fetched<VersionInfo>, review: Fetched<ReviewAnswer>, routed: Fetched<ScoreReport> | null): boolean {
+  const said = [versionSays(info), redactedSays(review), redactedSays(routed)].filter((s) => s !== null);
 
-  return isWithheld(info.value.status) === review.value.redacted;
+  return said.every((s) => s === said[0]);
 }

@@ -1,5 +1,6 @@
 // The package page as Markdown, for agents: every section an agent needs, publisher text kept inert.
 import { describe, expect, test } from "bun:test";
+import { markdownResponse } from "./agent-http";
 import { handleMessage } from "./mcp";
 import { packageMarkdown } from "./package-md";
 import { loadPackageView } from "./package-view";
@@ -382,28 +383,64 @@ describe("what the Markdown view says apm will not install, and how", () => {
     }
   });
 
-  // Sol review of d55e6ff, finding 3: the score route saw the revoke first, the version and review reads did not
-  test("a score route that says redacted withholds the source, though the version and review reads say active", async () => {
-    const leak = "SCORE-ROUTE-FIRST-SECRET";
+  // Sol reviews of d55e6ff and 14aa9b9: the score route saw the revoke first, the version and review reads did not. The
+  // reads disagree, so no view is built: no commands and none of the earlier answers' fields, on any surface
+  test("a score route that says redacted while the version and review reads say active: no view and no commands", async () => {
+    const stale = ["SCORE-ROUTE-FIRST-SECRET", "stale-file.js", "STALE-NOT-CHECKED", "STALE-LICENSE"];
     const p = pkg({ versions: [row("1.3.0"), row("1.2.0")] });
-    const active = score({ signals: [{ ...NETWORK, evidence: [`lib/index.js:12: fetch("https://x.example/${leak}")`] }] });
+
+    if (!p.facts) throw new Error("pkg() has facts");
+    const active = score({ notChecked: ["STALE-NOT-CHECKED"], signals: [{ ...NETWORK, evidence: ['lib/stale-file.js:12: fetch("https://x.example/SCORE-ROUTE-FIRST-SECRET")'] }] });
+    const redacted = score({ redacted: true, signals: [{ ...NETWORK, evidence: [] }] });
+
+    const source = fakeSource({
+      packages: { "left-pad": p },
+      versions: { "left-pad@1.2.0": { version: "1.2.0", status: "active", statusReason: null, deprecated: null, facts: { ...p.facts, license: "STALE-LICENSE" }, score: active } },
+      scores: { "left-pad@1.2.0": redacted },
+      reviews: { "left-pad@1.2.0": REVIEW_CLEAN },
+      resolve: () => resolvedTo("1.2.0"),
+    });
+
+    const loaded = await loadPackageView({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source });
+    const md = await (await markdownResponse({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source })).text();
+    const answer = JSON.stringify(await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.2.0" } } }, source));
+
+    expect(loaded.kind).toBe("unavailable");
+
+    for (const out of [JSON.stringify(loaded), md, answer]) {
+      for (const s of stale) expect(out).not.toContain(s);
+      expect(out).not.toContain("npm install left-pad");
+    }
+
+    expect(answer).not.toContain('"commands"');
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual([]);
+  });
+
+  test("every read says withheld: refused before any resolve, with only the withheld answers' fields", async () => {
+    const p = pkg({ versions: [row("1.3.0"), row("1.2.0")] });
     const redacted = score({ redacted: true, signals: [{ ...NETWORK, evidence: ["lib/index.js:12"] }] });
 
     const source = fakeSource({
       packages: { "left-pad": p },
-      versions: { "left-pad@1.2.0": { version: "1.2.0", status: "active", statusReason: null, deprecated: null, facts: null, score: active } },
+      versions: { "left-pad@1.2.0": { version: "1.2.0", status: "revoked", statusReason: null, deprecated: null, facts: null, score: redacted } },
       scores: { "left-pad@1.2.0": redacted },
-      reviews: { "left-pad@1.2.0": REVIEW_CLEAN },
+      reviews: { "left-pad@1.2.0": { ...REVIEW_CLEAN, redacted: true } },
+      resolve: () => resolvedTo("1.2.0"),
     });
 
-    const loaded = await loadPackageView({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source });
+    const md = await (await markdownResponse({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source })).text();
+    const r = await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.2.0" } } }, source);
+    const answer = JSON.stringify(r);
 
-    if (loaded.kind !== "ok") throw new Error(JSON.stringify(loaded));
-    const answer = JSON.stringify(await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.2.0" } } }, source));
-
-    for (const out of [JSON.stringify(loaded.view.score), packageMarkdown(loaded.view), answer]) expect(out).not.toContain(leak);
-    expect(packageMarkdown(loaded.view)).toContain("- Source: withheld.");
+    expect(md).toContain("- Status: revoked. New installs skip it.");
+    expect(md).toContain("- Source: withheld.");
+    expect(md).toContain("No install command: apm refuses this version.");
+    expect(md).not.toContain("npm install left-pad");
+    expect(answer).toContain('"installPolicy":"refused"');
+    expect(answer).not.toContain('"commands"');
+    expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual([]);
   });
+
 
   test("a refused default makes the one resolve and nothing more", async () => {
     const { md, calls } = await load(ugent("10.9.11"), null, (_, range) => (range === "10.9.11" ? UGENT_REFUSED : resolvedTo("9.0.0")));

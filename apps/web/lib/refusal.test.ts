@@ -33,8 +33,19 @@ describe("a resolve 200 for exactly the shown version", () => {
 describe("a resolve that takes too long", () => {
   test("is unknown once the view's budget runs out", async () => {
     const never = new Promise<ResolveOutcome>(() => {});
-    const policy = await readPolicy({ name: "pkg", version: "1.0.0", status: "active", risk: Promise.resolve({ score: null, installScripts: null, review: null }), resolve: () => never, timeoutMs: 20 });
+    const policy = await readPolicy({ name: "pkg", version: "1.0.0", status: "active", risk: Promise.resolve({ score: null, installScripts: null, review: null, withheld: false }), resolve: () => never, timeoutMs: 20 });
 
     expect(policy).toEqual({ kind: "unknown" });
+  });
+});
+
+// Sol review of 14aa9b9: a read that already says withheld decides, before any resolve (the page's input included)
+describe("a version a read says is withheld", () => {
+  test("is refused without asking resolve", async () => {
+    const asked: string[] = [];
+    const policy = await readPolicy({ name: "pkg", version: "1.0.0", status: "active", risk: Promise.resolve({ score: null, installScripts: null, review: null, withheld: true }), resolve: async ({ range }) => (asked.push(range), ok("1.0.0")) });
+
+    expect(policy).toEqual({ kind: "refused", refusal: { kind: "revoked", pending: false } });
+    expect(asked).toEqual([]);
   });
 });

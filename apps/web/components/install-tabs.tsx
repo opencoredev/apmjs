@@ -246,7 +246,7 @@ export function InstallTabs({ name, version, install, inCooldown, registry }: { 
       <CopyStatus state={state} manual="Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." />
       {inCooldown && (
         <p className="rounded-xl bg-warn-soft px-4 py-3 text-sm leading-6 text-pretty">
-          <span className="font-medium text-warn">{version} was published under 24 hours ago, inside apm&apos;s cooldown.</span> apm add warns before it installs it and <code className="font-mono text-[13px] whitespace-nowrap">--strict</code> refuses it; plain bun, npm and pnpm install it without that check.
+          <span className="font-medium text-warn">{version} was published under 24 hours ago, inside apm&apos;s cooldown.</span> apm add warns about it and <code className="font-mono text-[13px] whitespace-nowrap">--strict</code> refuses it; plain bun, npm and pnpm install it without that check.
         </p>
       )}
       <Note note={installNote({ client, registry })} client={client} />

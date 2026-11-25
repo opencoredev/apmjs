@@ -34,6 +34,8 @@ export type RiskInput = {
   readonly score: { readonly score: number; readonly grade: string; readonly signals: readonly { readonly id: string }[] } | null;
   readonly installScripts: boolean | null;
   readonly review: PublicState | null;
+  /** A read of the shown version (its score, its review) already says the registry withholds it: a revoke. */
+  readonly withheld: boolean;
 };
 
 // a signal about install scripts (install-script, install-download, install-network, install-shell) or malware
@@ -144,6 +146,9 @@ export async function readPolicy(input: { name: string; version: string; status:
 
   if (byStatus) return { kind: "refused", refusal: byStatus };
   const risk = await input.risk;
+
+  // a withdrawal any read has seen decides it: nothing resolve says, or a timeout, could make it installable
+  if (risk.withheld) return { kind: "refused", refusal: { kind: "revoked", pending: false } };
 
   // apm reviewers confirmed it, as the page's header says: resolve skips such a version whatever its score
   if (risk.review === "confirmed") return { kind: "refused", refusal: { kind: "confirmed-malicious" } };
