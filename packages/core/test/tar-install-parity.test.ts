@@ -2,11 +2,13 @@
 // a path apm never scanned, or not be scanned at all. Each case here was extracted with npm and with `bun install` and
 // lists what both put on disk; readTar and TarStream must read the same files, or refuse the archive.
 import { describe, expect, test } from "bun:test";
-import { ArchiveError, MAX_META_ENTRY_BYTES, readTar, TarStream, type TarEntry } from "../src/index.ts";
+import { readFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
+import { ArchiveError, MAX_META_ENTRY_BYTES, readTar, readTarball, TarStream, type TarEntry } from "../src/index.ts";
 
 const enc = new TextEncoder();
 
-function header(o: { name: string; size: number; type?: string; magic?: string; prefix?: string }): Uint8Array {
+function header(o: { name: string; size: number; type?: string; magic?: string; prefix?: string; link?: string }): Uint8Array {
   const h = new Uint8Array(512);
   const put = (s: string, at: number): void => h.set(enc.encode(s), at);
   put(o.name, 0);
@@ -17,6 +19,8 @@ function header(o: { name: string; size: number; type?: string; magic?: string; 
   put("00000000000\0", 136);
   put("        ", 148);
   put(o.type ?? "0", 156);
+
+  if (o.link !== undefined) put(o.link, 157);
   put(o.magic ?? "ustar\x0000", 257);
 
   if (o.prefix !== undefined) put(o.prefix, 345);
@@ -25,7 +29,7 @@ function header(o: { name: string; size: number; type?: string; magic?: string; 
   return h;
 }
 
-function entry(name: string, body: string, o: { type?: string; magic?: string; prefix?: string } = {}): Uint8Array[] {
+function entry(name: string, body: string, o: { type?: string; magic?: string; prefix?: string; link?: string } = {}): Uint8Array[] {
   const data = enc.encode(body);
 
   return [header({ name, size: data.length, ...o }), data, new Uint8Array((512 - (data.length % 512)) % 512)];
@@ -91,6 +95,11 @@ describe("tar headers are read as npm and Bun install them", () => {
     { name: "a ustar header's prefix is", bytes: tar([PJ, entry("a.js", "x", { prefix: "package/lib" })]), installed: ["package.json", "lib/a.js"] },
     { name: "a GNU long link name leaves the pending long name in place", bytes: tar([PJ, entry("././@LongLink", `${LONG}\0`, { type: "L" }), entry("././@LongLink", "target\0", { type: "K" }), entry("package/short.js", EVIL)]), installed: ["package.json", LONG.slice("package/".length)] },
     { name: "an old-style X PAX header names the next file", bytes: tar([PJ, entry("PaxHeader/a.js", paxRecord("path=package/evil.js"), { type: "X" }), entry("package/a.js", EVIL)]), installed: ["package.json", "evil.js"] },
+    // npm 9.2, npm 11 and Bun write every name over 100 bytes this way, the ustar prefix holding "package"; npm and Bun both
+    // install the PAX path or long name and drop the prefix
+    { name: "a PAX path names the file whatever the ustar prefix", bytes: tar([PJ, entry("PaxHeader/a", paxRecord("path=package/evil.js"), { type: "x" }), entry("a.js", EVIL, { prefix: "package/lib" })]), installed: ["package.json", "evil.js"] },
+    { name: "a GNU long name names the file whatever the ustar prefix", bytes: tar([PJ, entry("././@LongLink", "package/evil.js\0", { type: "L" }), entry("a.js", EVIL, { prefix: "package/lib" })]), installed: ["package.json", "evil.js"] },
+    { name: "a symlink with a target is passed over", bytes: tar([PJ, entry("package/s", "", { type: "2", link: "a.js" }), entry("package/a.js", EVIL)]), installed: ["package.json", "a.js"] },
     { name: "a global PAX header's path names no file", bytes: tar([PJ, entry("pax_global_header", paxRecord("path=package/other.js"), { type: "g" }), entry("package/evil.js", EVIL)]), installed: ["package.json", "evil.js"] },
     // the later of a PAX path and a GNU long name names the file, whichever order they come in: reading the PAX path first
     // listed this evil.js as harmless.txt, a file the scan skips
@@ -183,6 +192,17 @@ describe("tar headers are read as npm and Bun install them", () => {
     ["a file entry whose GNU long name ends in a slash, with a body", [PJ, entry("././@LongLink", "package/lib/\0", { type: "L" }), rawEntry("package/lib", hidden, "0"), a]],
     ["a PAX header with a record after a NUL", [PJ, rawEntry("PaxHeader/a", afterNul, "x"), entry("package/a.js", EVIL)]],
     ["a global PAX header with a record after a NUL", [PJ, rawEntry("pax_global_header", afterNul, "g"), entry("package/a.js", EVIL)]],
+    // npm drops each of these headers (TAR_ENTRY_INVALID) and reads the blocks after it as the next headers, run on evo-1:
+    // a file with no path or a link target, and a link with none, install the hidden evil.js with npm (a hard or symbolic
+    // link with Bun too); a dropped PAX header or long name loses its path for npm and not for Bun. An empty PAX path
+    // installs a.txt with both, which apm would list with no path, so it is refused with the rest
+    ["a file with no path", [PJ, rawEntry("", hidden, "0"), a]],
+    ["a file whose PAX path is empty", [PJ, entry("PaxHeader/a", paxRecord("path="), { type: "x" }), rawEntry("package/a.txt", hidden, "0"), a]],
+    ["a PAX header with no path of its own", [PJ, entry("", paxRecord("path=package/a.txt"), { type: "x" }), entry("package/a.txt", EVIL)]],
+    ["a file with a link target", [PJ, [header({ name: "package/a.txt", size: hidden.length, link: "x" }), hidden], a]],
+    ["a GNU long name with a link target", [PJ, entry("././@LongLink", "package/a.txt\0", { type: "L", link: "x" }), entry("package/a.txt", EVIL)]],
+    ["a symlink with no target", [PJ, rawEntry("package/s", hidden, "2"), a]],
+    ["a hard link with no target", [PJ, rawEntry("package/s", hidden, "1"), a]],
   ];
 
   for (const [name, parts] of hiding) {
@@ -238,6 +258,51 @@ describe("tar headers are read as npm and Bun install them", () => {
 
       expect(() => readTar(bytes)).toThrow(ArchiveError);
       expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
+
+  // npm writes a PAX size equal to the header's with every PAX path, so that one has a single reading and is read
+  test("a PAX size equal to the header's is read, a GNU long name between them or not", () => {
+    for (const parts of [
+      [PJ, entry("PaxHeader/a", paxRecord("path=package/long.js") + paxRecord("size=000017"), { type: "x" }), entry("package/a.js", "module.exports=1\n")],
+      [PJ, entry("PaxHeader/a", paxRecord("size=17"), { type: "x" }), entry("././@LongLink", "package/long.js\0", { type: "L" }), entry("package/a.js", "module.exports=1\n")],
+    ]) {
+      const bytes = tar(parts);
+
+      expect(pathsOf(readTar(bytes))).toEqual(["package.json", "long.js"]);
+      expect(pathsOf(streamed(bytes))).toEqual(["package.json", "long.js"]);
+    }
+  });
+
+  test("a PAX size that differs from the header's is refused across a GNU long name too", () => {
+    const bytes = tar([PJ, entry("PaxHeader/a", paxRecord("size=16"), { type: "x" }), entry("././@LongLink", "package/long.js\0", { type: "L" }), entry("package/a.js", "module.exports=1\n")]);
+
+    expect(() => readTar(bytes)).toThrow(ArchiveError);
+    expect(() => streamed(bytes)).toThrow(ArchiveError);
+  });
+
+  for (const value of ["", "+17", "17.0", "0x11", "1e1", "1234567890123"]) {
+    test(`a PAX size of "${value}" is refused`, () => {
+      const bytes = tar([PJ, entry("PaxHeader/a", paxRecord(`size=${value}`), { type: "x" }), entry("package/a.js", "module.exports=1\n")]);
+
+      expect(() => readTar(bytes)).toThrow(ArchiveError);
+      expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
+});
+
+// Real packs, made on evo-1, of a package with a 130-character ASCII file name, a 186-byte UTF-8 one and a deep path that
+// fits the ustar prefix. npm 9.2.0 and 11.21.3 give each long name a PAX header with `path`, `mtime` and a `size` equal
+// to the header's; Bun 1.4.4 gives `path` and `hdrcharset=BINARY`. npm and Bun install all four files from each
+describe("real packs with long file names are read", () => {
+  const files = ["package.json", `${"a".repeat(127)}.js`, `${"é".repeat(60)}-ünïcödé-文件名-${"ß".repeat(20)}.js`, `deep/${"d".repeat(90)}/${"f".repeat(60)}.js`].sort();
+
+  for (const pack of ["npm-9.2.0", "npm-11.21.3", "bun-1.4.4"]) {
+    test(pack, () => {
+      const tgz = new Uint8Array(readFileSync(new URL(`./fixtures/long-names/${pack}.tgz`, import.meta.url)));
+
+      expect(pathsOf(readTarball(tgz)).sort()).toEqual(files);
+      expect(pathsOf(streamed(new Uint8Array(gunzipSync(tgz)))).sort()).toEqual(files);
     });
   }
 });

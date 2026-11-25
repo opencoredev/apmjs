@@ -16,6 +16,9 @@ function header(name: string, size: number, type: string): Uint8Array {
   put("00000000000\0", 136);
   put("        ", 148);
   put(type, 156);
+
+  // a symlink names its target, or npm drops the header (refuseDroppedEntry)
+  if (type === "2") put("target", 157);
   put("ustar\0", 257);
   put("00", 263);
   put(`${h.reduce((n, b) => n + b, 0).toString(8).padStart(6, "0")}\0 `, 148);
