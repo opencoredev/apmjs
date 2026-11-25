@@ -257,6 +257,10 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
   return Layer.sync(KnownMalicious, () => {
     /** Time this request has spent waiting on OSV, and whether it stopped asking (a failure). */
     let spentMs = 0;
+    /** Reads of OSV in flight, and since when one has been (wall clock): waits that overlap count once. */
+    let inFlight = 0;
+    let busySince = 0;
+    const spent = (): number => spentMs + (inFlight > 0 ? Date.now() - busySince : 0);
     let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
@@ -267,10 +271,11 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
     const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S, maxBytes: number | null = null) =>
       Effect.tryPromise({
         try: async (): Promise<z.output<S>> => {
-          const left = REQUEST_BUDGET_MS - spentMs;
+          const left = REQUEST_BUDGET_MS - spent();
 
           if (left <= 0) throw new Error("the request's OSV budget is spent");
-          const t0 = Date.now();
+
+          if (inFlight++ === 0) busySince = Date.now();
 
           try {
             const init: RequestInit =
@@ -294,7 +299,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
 
             return parsed.data;
           } finally {
-            spentMs += Date.now() - t0;
+            if (--inFlight === 0) spentMs += Date.now() - busySince;
           }
         },
         catch: (cause) => cause,
@@ -420,7 +425,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           const newest = [local, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0] ?? null;
           const kept = newest?.advisories ?? [];
 
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
+          if (stopped || spent() >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return kept;
           const got = yield* Effect.result(askName(name));
 
           if (Result.isSuccess(got) && got.success.complete) {
@@ -466,7 +471,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
             else missing.push(p);
           }
 
-          for (let i = 0; i < missing.length && !stopped && spentMs < REQUEST_BUDGET_MS; i += OSV_BATCH) {
+          for (let i = 0; i < missing.length && !stopped && spent() < REQUEST_BUDGET_MS; i += OSV_BATCH) {
             const chunk = missing.slice(i, i + OSV_BATCH);
             const got = yield* Effect.result(ask(chunk));
 
