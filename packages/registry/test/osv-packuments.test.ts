@@ -34,19 +34,25 @@ const NPM_CLIENT = "npm/11.6.0 node/v24.11.0 linux x64 workspaces/false";
 /** npm's packages: versions oldest first, and dist-tags besides latest (the newest). */
 type NpmPackage = { versions: string[]; tags?: Record<string, string> };
 
-const NPM = new Map<string, NpmPackage>(Object.entries({
+const NPM = new Map(Object.entries<NpmPackage>({
   // shaped like ugent_uws: an empty 9.0.0, then inflated versions that are all listed
   "evil-tagged": { versions: ["9.0.0", "10.9.9", "10.9.10", "10.9.11"], tags: { next: "10.9.11", old: "9.0.0" } },
   ranged: { versions: ["1.0.0", "1.5.0", "1.6.0", "2.0.0"] },
   "all-listed": { versions: ["1.0.0", "1.1.0"] },
   clean: { versions: ["1.0.0", "1.1.0"] },
   withdrawn: { versions: ["1.0.0"] },
+  // an old npm name the proxy accepts (capitals): the feed is asked about it as written
+  "Legacy-Name": { versions: ["1.0.0", "1.1.0"] },
+  // a tag naming a version npm's packument does not list (its document unreadable or gone)
+  "orphan-tag": { versions: ["1.0.0"], tags: { beta: "2.0.0" } },
+  // two advisories, one of which OSV fails to send
+  "half-read": { versions: ["1.0.0", "1.1.0", "1.2.0"] },
 } satisfies Record<string, NpmPackage>));
 
 /** OSV's advisories per name: ids only in the batch answer, then each one read whole. */
 type Vuln = { id: string; withdrawn?: string; affected?: unknown[] };
 
-const VULNS = new Map<string, Vuln[]>(Object.entries({
+const VULNS = new Map(Object.entries<Vuln[]>({
   "evil-tagged": [
     { id: "MAL-2026-1000", affected: [{ package: { name: "evil-tagged", ecosystem: "npm" }, versions: ["10.9.9", "10.9.10", "10.9.11", "10.9.8"] }] },
     { id: "GHSA-aaaa-bbbb-cccc", affected: [{ package: { name: "evil-tagged", ecosystem: "npm" }, versions: ["9.0.0"] }] },
@@ -64,6 +70,12 @@ const VULNS = new Map<string, Vuln[]>(Object.entries({
   "all-listed": [{ id: "MAL-2026-1002", affected: [{ package: { name: "all-listed", ecosystem: "npm" }, ranges: [{ type: "SEMVER", events: [{ introduced: "0" }] }] }] }],
   clean: [{ id: "GHSA-xxxx-yyyy-zzzz", affected: [{ package: { name: "clean", ecosystem: "npm" }, versions: ["1.0.0"] }] }],
   withdrawn: [{ id: "MAL-2026-1003", withdrawn: "2026-11-24T00:00:00Z", affected: [{ package: { name: "withdrawn", ecosystem: "npm" }, versions: ["1.0.0"] }] }],
+  "Legacy-Name": [{ id: "MAL-2026-1004", affected: [{ package: { name: "Legacy-Name", ecosystem: "npm" }, versions: ["1.1.0"] }] }],
+  "orphan-tag": [{ id: "MAL-2026-1005", affected: [{ package: { name: "orphan-tag", ecosystem: "npm" }, versions: ["2.0.0"] }] }],
+  "half-read": [
+    { id: "MAL-2026-1006", affected: [{ package: { name: "half-read", ecosystem: "npm" }, versions: ["1.2.0"] }] },
+    { id: "MAL-2026-1007", affected: [{ package: { name: "half-read", ecosystem: "npm" }, versions: ["1.1.0"] }] },
+  ],
 } satisfies Record<string, Vuln[]>));
 
 const tgz = (name: string, v: string): Uint8Array => new TextEncoder().encode(`tarball of ${name}@${v}`);
@@ -99,7 +111,7 @@ const npm = Bun.serve({
 const NameQuery = z.object({ queries: z.array(z.strictObject({ package: z.object({ name: z.string(), ecosystem: z.literal("npm") }) })).length(1) });
 
 /** OSV, standing in: counts the name queries and advisory reads, fails while `down`, answers late while `stallMs`. */
-const osv = { names: 0, reads: 0, down: false, stallMs: 0 };
+const osv = { names: 0, reads: 0, down: false, stallMs: 0, unreadable: new Set<string>() };
 
 const osvServer = Bun.serve({
   port: 0,
@@ -114,6 +126,8 @@ const osvServer = Bun.serve({
     if (read?.[1]) {
       osv.reads++;
       const id = decodeURIComponent(read[1]);
+
+      if (osv.unreadable.has(id)) return new Response("unavailable", { status: 503 });
       const vuln = [...VULNS.values()].flat().find((v) => v.id === id);
 
       return vuln ? Response.json(vuln) : Response.json({ code: 5, message: "Bug not found." }, { status: 404 });
@@ -141,6 +155,7 @@ afterAll(async () => {
 });
 
 afterEach(() => {
+  osv.unreadable.clear();
   osv.down = false;
   osv.stallMs = 0;
   setSystemTime();
@@ -284,6 +299,45 @@ describe("packuments leave out what the feed lists", () => {
     expect(osv.names - before.names).toBe(2);
     // MAL-2026-1000 once; the GHSA ids are never read
     expect(osv.reads - before.reads).toBe(1);
+  });
+});
+
+describe("what the review of 34ccf92 found", () => {
+  test("an old npm name with capitals is asked about as written", async () => {
+    expect(Object.keys((await packument("Legacy-Name")).body.versions)).toEqual(["1.0.0"]);
+  });
+
+  test("a tag naming a listed version npm's packument does not list is dropped", async () => {
+    expect((await packument("orphan-tag")).body["dist-tags"]).toEqual({ latest: "1.0.0" });
+  });
+
+  test("an advisory OSV fails to send does not hide the one it sent, and the partial answer is not kept", async () => {
+    const root = freshRoot();
+
+    osv.unreadable.add("MAL-2026-1007");
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    osv.unreadable.clear();
+    // the isolate waits out its back-off before it asks again, then keeps the whole answer
+    setSystemTime(new Date(Date.now() + 31_000));
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0"]);
+  });
+
+  test("after a failure the isolate does not ask OSV again for a while, so an outage costs one wait, not one per request", async () => {
+    const root = freshRoot();
+
+    osv.down = true;
+    await packument("clean", { root });
+    const asked = osv.names;
+
+    await packument("evil-tagged", { root });
+    expect(osv.names).toBe(asked);
+  });
+
+  test("a range's limit bounds it, \"*\" bounding nothing", () => {
+    const hit = (events: Advisory["ranges"][number]) => [...listedAmong("p", [{ id: "MAL-1", versions: [], ranges: [events] }], ["1.0.0", "2.0.0", "3.0.0"]).keys()];
+
+    expect(hit([{ introduced: "0" }, { limit: "2.0.0" }])).toEqual(["1.0.0"]);
+    expect(hit([{ introduced: "0" }, { limit: "*" }])).toEqual(["1.0.0", "2.0.0", "3.0.0"]);
   });
 });
 

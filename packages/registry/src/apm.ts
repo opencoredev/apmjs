@@ -3845,6 +3845,12 @@ const ABBREV = [
   "deprecated",
 ];
 
+/**
+ * The versions of an npm package the OSSF feed is matched against: every version npm lists, and every dist-tag's
+ * target, so a tag naming a listed version whose document apm could not read is dropped too.
+ */
+export const versionsAndTags = (src: { versions: readonly { version: string }[]; distTags: Readonly<Record<string, string>> }): string[] => [...src.versions.map((v) => v.version), ...Object.values(src.distTags)];
+
 function filterDistTags(distTags: Record<string, string>, keptIds: ReadonlySet<string>) {
   const tags: Record<string, string> = {};
 
@@ -4078,7 +4084,7 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     const src = { kind: "upstream" as const, name: probe.pkg.name, distTags: probe.pkg.distTags, versions: probe.pkg.versions, pkg: probe.pkg };
     const at = yield* now;
     const confirmed = confirmedIn(read.confirmed, src.versions);
-    const listed = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
+    const listed = listedAmong(src.name, advisories, versionsAndTags(src));
     // what an answer holds while it is sent, charged before it is made (as upstreamRoute charges it)
     const serving = listing.pkg.serveCost.versionDocs + src.versions.length * SERVED_VERSION_WEIGHT + streamWeight(listing.pkg.serveCost.maxPieceChars + SERVED_EXTRA_CHARS);
 
@@ -4232,7 +4238,7 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // GET /<upstream-pkg>/<version|tag>: npm view and tools that fetch a single version manifest
     if (sp.rest.length === 1) {
       const spec = sp.rest[0] ?? "";
-      const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, src.versions.map((x) => x.version))], { concurrency: "unbounded" });
+      const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, versionsAndTags(src))], { concurrency: "unbounded" });
       const offered = src.versions.filter((v) => !confirmed.has(v.version) && !listed.has(v.version));
       const view = viaSafe ? safeView(at) : null;
       const keptIds = new Set<string>();
@@ -4265,18 +4271,21 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     if (sp.rest.length > 0) return null;
     const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
 
+    const [confirmed, advisories] = yield* Effect.all([confirmedVersions(src.name, src.versions), advisoriesOf(src.name)], { concurrency: "unbounded" });
+    const listed = listedAmong(src.name, advisories, versionsAndTags(src));
+
     if (viaSafe) {
       // score the newest cooled versions before answering; anything left unscored stays hidden. Only versions that still
-      // need an analysis take one of the five: scored ones used to fill them, so an older unscored one was never queued
+      // need an analysis take one of the five: scored ones used to fill them, so an older unscored one was never queued,
+      // and withheld ones are never served, so they take none either
       const cooled = src.versions
-        .filter((v) => at - v.published_at >= DEFAULT_POLICY.cooldownMs && !parseAnalysis(v.score) && !v.unscorable)
+        .filter((v) => at - v.published_at >= DEFAULT_POLICY.cooldownMs && !parseAnalysis(v.score) && !v.unscorable && !confirmed.has(v.version) && !listed.has(v.version))
         .sort((a, b) => newestFirst(a.version, b.version))
         .slice(0, 5);
 
       yield* Effect.forEach(cooled, (v) => ensureAnalyzed(src, v), { concurrency: "unbounded" });
     }
 
-    const [confirmed, advisories] = yield* Effect.all([confirmedVersions(src.name, src.versions), advisoriesOf(src.name)], { concurrency: "unbounded" });
     const headers = { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache", ...noticeHeaders(src.name, advisories) };
 
     // a HEAD sends no body, so nothing is read or written for one
@@ -4293,7 +4302,6 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
     }
 
-    const listed = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
     const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed, listed, devDependencies: dev?.byVersion ?? null });
 
     // the request's lease stays open until the last byte is sent: the stream refers to the package until then
@@ -4322,7 +4330,7 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
         if (src === "unknown" || src === "over-budget") return fail(503, `The upstream registry could not be read for ${sp.name}. Try again shortly.`);
 
         if (src && src.kind === "upstream") {
-          const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, src.versions.map((v) => v.version))], { concurrency: "unbounded" });
+          const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, versionsAndTags(src))], { concurrency: "unbounded" });
           const offeredIds = new Set<string>();
 
           for (const v of src.versions) if (!confirmed.has(v.version) && !listed.has(v.version)) offeredIds.add(v.version);

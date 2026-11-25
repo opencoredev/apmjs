@@ -6,7 +6,7 @@
 // Scores live in the database, so none is sent: every packument says scores are unknown (`_apmDegraded`, and the
 // x-apm-scores header). The ~safe view filters by score, so it is refused. Nothing is queued for analysis.
 import { Effect, Option, Result } from "effect";
-import { SERVED_EXTRA_CHARS, SERVED_VERSION_WEIGHT, UPSTREAM_RETRY_AFTER_S, upstreamPackument, upstreamSource } from "./apm.ts";
+import { SERVED_EXTRA_CHARS, SERVED_VERSION_WEIGHT, UPSTREAM_RETRY_AFTER_S, upstreamPackument, upstreamSource, versionsAndTags } from "./apm.ts";
 import { Blocklist, verdictFor } from "./blocklist.ts";
 import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
@@ -169,7 +169,7 @@ export const degradedRoute = (req: Request) =>
 
     const at = yield* (yield* Clock).now;
     const { baseUrl } = yield* RegistryConfig;
-    const withheld = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
+    const withheld = listedAmong(src.name, advisories, versionsAndTags(src));
     const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: null, at, confirmed, listed: withheld, devDependencies: dev?.byVersion ?? null });
 
     // read by apm's CLI and by people: these versions carry no score because none could be read, not because none exists

@@ -296,10 +296,6 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     const refuse = (outcome: FastTarball) => Effect.as(letGo, outcome);
 
     if (read.local) return yield* refuse({ kind: "local" });
-
-    // listed by the OSSF malicious-packages feed: refused before any byte is sent, a version npm has since removed
-    // included (osv.ts)
-    if (listedHere) return yield* refuse(answered(req, fail(403, listedTarballText(listedHere), { knownMalicious: listedHere }), timing));
     const servable = servableOf(npm);
 
     if (servable === null || list === null) return yield* refuse(PACKUMENT);
@@ -312,6 +308,10 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     if (read.confirmed.includes(label) || (verdict.kind === "upstream" && verdict.confirmed.some((e) => e.version === version && e.digest === label))) {
       return yield* refuse(answered(req, fail(410, confirmedText(name, version), { confirmed: true }), timing));
     }
+
+    // listed by the OSSF malicious-packages feed: refused before any byte is sent (osv.ts); one npm has since removed
+    // has no document, so the packument route refuses it the same way
+    if (listedHere) return yield* refuse(answered(req, fail(403, listedTarballText(listedHere), { knownMalicious: listedHere }), timing));
 
     // published here by the list (a publish whose transaction may still be committing): the packument route decides
     if (verdict.kind === "local") return yield* refuse(PACKUMENT);

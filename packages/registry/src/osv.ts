@@ -19,7 +19,7 @@
 import { Context, Effect, Layer, Option, Result } from "effect";
 import semver from "semver";
 import { z } from "zod";
-import { isValidPackageName } from "@apm/core";
+import { isPossibleNpmName, isValidPackageName } from "@apm/core";
 import { matchWithin, within } from "./deadline.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
@@ -28,7 +28,7 @@ export type PackageVersion = { readonly name: string; readonly version: string }
 export type ListedMalicious = { name: string; version: string; ids: string[] };
 
 /** One range of an advisory's affected versions, as OSV writes its events (SEMVER and ECOSYSTEM ranges). */
-const RangeEvents = z.array(z.object({ introduced: z.string().optional(), fixed: z.string().optional(), last_affected: z.string().optional() }));
+const RangeEvents = z.array(z.object({ introduced: z.string().optional(), fixed: z.string().optional(), last_affected: z.string().optional(), limit: z.string().optional() }));
 
 /** One MAL- advisory's affected versions of one npm name: the exact versions it lists and its ranges. */
 const AdvisorySchema = z.object({ id: z.string(), versions: z.array(z.string()), ranges: z.array(RangeEvents) });
@@ -60,6 +60,12 @@ export const NAME_FRESH_MS = 5 * 60_000;
 /** How old a name's kept advisories may be and still be used while OSV cannot be asked. */
 export const NAME_STALE_MS = 24 * 60 * 60_000;
 const MAX_NAMES = 20_000;
+
+/** How long an isolate stops asking OSV about names after a failed or partial answer, using what it kept instead. */
+const NAME_BACKOFF_MS = 30_000;
+
+/** Until when this isolate does not ask OSV at each root about names (wall clock), after a failure. */
+const BACKOFF = new Map<string, number>();
 
 /** How long a read of, or a write to, the data center's copy of a name's advisories is waited for. */
 const SHARED_MS = 150;
@@ -128,7 +134,7 @@ function rememberName(key: string, entry: NameEntry): void {
 }
 
 /** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
-const sharedKey = (key: string): Request => new Request(`https://osv-cache.apmjs.internal/v1/${encodeURIComponent(key)}`);
+const sharedKey = (key: string): Request => new Request(`https://osv-cache.apmjs.internal/v2/${encodeURIComponent(key)}`);
 
 /** The data center's copy of a name's advisories, or null: none outside a Worker, a miss, a late or unreadable one. */
 async function sharedRead(key: string): Promise<NameEntry | null> {
@@ -144,12 +150,12 @@ async function sharedRead(key: string): Promise<NameEntry | null> {
   return parsed.success ? parsed.data : null;
 }
 
-/** Gives the data center a copy of a name's advisories, waiting for it SHARED_MS at most. Never rejects. */
-async function sharedWrite(key: string, entry: NameEntry): Promise<void> {
+/** Gives the data center a copy of a name's advisories, best effort: the request does not wait for it. */
+function sharedWrite(key: string, entry: NameEntry): void {
   if (typeof caches === "undefined") return;
   const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
 
-  await within(caches.default.put(sharedKey(key), res), SHARED_MS);
+  caches.default.put(sharedKey(key), res).catch(() => undefined);
 }
 
 /** What one advisory OSV sent says about npm's `name`: nothing when it is withdrawn or names no version of it. */
@@ -165,8 +171,17 @@ function advisoryOf(name: string, vuln: z.infer<typeof VulnAnswer>): Advisory[] 
 /** An event's bound as a version, "0" lowest of all; null when it is not one. */
 const boundOf = (v: string): string | null => (v === "0" ? "0.0.0-0" : semver.valid(v));
 
+/** Whether `version` (valid semver) is below one of a range's limits ("*" is none), as OSV requires when it has any. */
+function beforeLimits(events: z.infer<typeof RangeEvents>, version: string): boolean {
+  const limits = events.flatMap((e) => (e.limit === undefined ? [] : [e.limit]));
+
+  return limits.length === 0 || limits.some((l) => l === "*" || (semver.valid(l) !== null && semver.lt(version, l)));
+}
+
 /** Whether `version` (valid semver) is in one range, by OSV's rule: the last event at or below it decides. */
 function inRange(events: z.infer<typeof RangeEvents>, version: string): boolean {
+  if (!beforeLimits(events, version)) return false;
+
   const points = events.flatMap((e) => {
     const raw = e.introduced ?? e.fixed ?? e.last_affected;
     const at = raw === undefined ? null : boundOf(raw);
@@ -286,38 +301,51 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
         );
       });
 
-    /** Every MAL- advisory OSV has for npm's `name`, with the versions each names. Fails when OSV did not answer in full. */
+    /**
+     * The MAL- advisories OSV has for npm's `name`, with the versions each names, and whether that is all of them: a
+     * later page or an advisory that could not be read leaves it partial, keeping every advisory that was read. Fails
+     * only when the first page was not answered.
+     */
     const askName = (name: string) =>
       Effect.gen(function* () {
         const ids = new Set<string>();
         let token: string | undefined;
+        let complete = true;
 
         for (let page = 0; ; page++) {
           const query: OsvNameQuery = { package: { name, ecosystem: "npm" } };
 
           if (token !== undefined) query.page_token = token;
-          const batch = yield* post("v1/querybatch", { queries: [query] }, BatchAnswer);
-          const first = batch.results[0];
+          const asked = yield* Effect.result(post("v1/querybatch", { queries: [query] }, BatchAnswer));
+          const first = Result.isSuccess(asked) && asked.success.results.length === 1 ? asked.success.results[0] : undefined;
 
-          if (batch.results.length !== 1 || first === undefined) return yield* Effect.fail(new Error("OSV answered in an unexpected shape"));
+          if (first === undefined) {
+            if (page === 0) return yield* Effect.fail(Result.isFailure(asked) ? asked.failure : new Error("OSV answered in an unexpected shape"));
+            complete = false;
+            break;
+          }
 
           for (const id of malOnly(first.vulns)) ids.add(id);
           token = first.next_page_token;
 
           if (token === undefined) break;
 
-          if (page >= MAX_PAGES) return yield* Effect.fail(new Error("more pages than apm reads"));
+          if (page >= MAX_PAGES) {
+            complete = false;
+            break;
+          }
         }
 
-        const vulns = yield* Effect.forEach([...ids], (id) => post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer), { concurrency: "unbounded" });
+        const read = yield* Effect.forEach([...ids], (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
+        const advisories = read.flatMap((r) => (Result.isSuccess(r) ? advisoryOf(name, r.success) : []));
 
-        return vulns.flatMap((v) => advisoryOf(name, v));
+        return { advisories, complete: complete && read.every(Result.isSuccess) };
       });
 
     return KnownMalicious.of({
       advisoriesFor: (name) =>
         Effect.gen(function* () {
-          if (!isValidPackageName(name)) return [];
+          if (!isPossibleNpmName(name)) return [];
           const key = `${baseUrl} ${name}`;
           const now = Date.now();
           const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
@@ -332,27 +360,31 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             return shared.advisories;
           }
 
-          if (!stopped && spentMs < REQUEST_BUDGET_MS) {
-            const got = yield* Effect.result(askName(name));
+          // what OSV cannot be asked for now is answered from the newest answer kept, if it is young enough (fail open)
+          const stale = [kept, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0]?.advisories ?? [];
 
-            if (Result.isSuccess(got)) {
-              const entry = { fetchedAt: now, advisories: got.success };
+          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return stale;
+          const got = yield* Effect.result(askName(name));
 
-              rememberName(key, entry);
-              yield* Effect.promise(() => sharedWrite(key, entry).catch(() => undefined));
+          if (Result.isSuccess(got) && got.success.complete) {
+            const entry = { fetchedAt: now, advisories: got.success.advisories };
 
-              return entry.advisories;
-            }
+            rememberName(key, entry);
+            sharedWrite(key, entry);
 
-            console.error(JSON.stringify({ event: "osv-name", name, error: String(got.failure) }));
-            // no more waiting on OSV in this request: what is cached still counts
-            stopped = true;
+            return entry.advisories;
           }
 
-          // OSV could not be asked: the newest answer kept, if it is young enough, else nothing (fail open)
-          const stale = [kept, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0];
+          console.error(JSON.stringify({ event: "osv-name", name, error: Result.isSuccess(got) ? "partial answer" : String(got.failure) }));
+          // no more waiting on OSV in this request, nor in this isolate for a while: what is kept still counts
+          stopped = true;
+          BACKOFF.set(baseUrl, now + NAME_BACKOFF_MS);
 
-          return stale?.advisories ?? [];
+          if (Result.isFailure(got)) return stale;
+          // a partial answer is not kept, but what it found is withheld, beside what the kept answer found
+          const found = new Set(got.success.advisories.map((a) => a.id));
+
+          return [...got.success.advisories, ...stale.filter((a) => !found.has(a.id))];
         }),
       lookup: (pkgs) =>
         Effect.gen(function* () {
