@@ -33,6 +33,7 @@ import { ReleaseHooks } from "./hooks.ts";
 import { considerUpstream, REVIEW_DEFAULTS, ReviewConfig, reviewLocalCommit, type ReviewSettings } from "./review.ts";
 import { Timing, type TimingApi, type TimingDetail } from "./timing.ts";
 import { Upstream } from "./upstream.ts";
+import { osvFeed } from "./osv.ts";
 
 const Method = z.instanceof(Function);
 
@@ -68,6 +69,8 @@ const WorkerEnv = z.object({
   APM_PUBLIC_URL: OptionalText,
   /** Public registry to proxy, or "off". */
   APM_UPSTREAM: OptionalText,
+  /** OSV's API root (https://api.osv.dev/): versions the OSSF malicious-packages feed lists are refused (osv.ts). Without it the feed is not read. */
+  APM_OSV_URL: OptionalText,
   /** How long an upstream answer is trusted, in milliseconds. Default 60000. */
   APM_UPSTREAM_TTL_MS: z.coerce.number().int().min(0).optional(),
   /** "upstream" lets a checked tarball request be redirected to the configured upstream (tests, the bench); default npm's own URL only. */
@@ -280,10 +283,12 @@ function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
+  const withFeed = env.APM_OSV_URL === undefined ? base : Layer.provideMerge(osvFeed(env.APM_OSV_URL), base);
+
   const withScoring =
     settings.upstreamUrl === null
-      ? Layer.provideMerge(Analysis.none, base)
-      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), base));
+      ? Layer.provideMerge(Analysis.none, withFeed)
+      : Layer.provideMerge(Analysis.layer(analysisQueue), Layer.provideMerge(Upstream.layer(settings.upstreamUrl, env.APM_UPSTREAM_TTL_MS, background), withFeed));
 
   // one lease of the isolate's memory pool for the run (a request, a queue job, the sweep): every read of npm's
   // package metadata it makes takes from it, and a streamed answer keeps it until the last byte is sent

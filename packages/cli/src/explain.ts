@@ -704,7 +704,7 @@ function uniqueWarnings(ws: readonly WarningInput[]): WarningInput[] {
 }
 
 /** A skip that is a version pulled from installs (revoked, being revoked, yanked) or confirmed malicious: not a score. */
-const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer)/;
+const PULLED_REASON = /^(?:revoked by its owner|revocation pending|yanked|confirmed malicious by an apm reviewer|known malicious)/;
 
 /** Whether the registry refused because a version was pulled: every version it skipped was revoked or yanked. */
 export function refusedAsPulled(skipped: readonly { reason: string }[]): boolean {

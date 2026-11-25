@@ -90,6 +90,8 @@ export default Alchemy.Stack(
         APM_REGISTRY_URL: registryUrl,
         APM_PUBLIC_URL: webUrl,
         APM_UPSTREAM: "https://registry.npmjs.org/",
+        // versions the OSSF malicious-packages feed lists are refused (registry osv.ts)
+        APM_OSV_URL: "https://api.osv.dev/",
         APM_NAME_POLICY: "scoped",
         APM_LEGACY_AUTH: "0",
         APM_AUTH_SECRET: yield* Config.Redacted("AUTH_SECRET"),

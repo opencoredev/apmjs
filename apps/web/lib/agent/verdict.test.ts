@@ -218,6 +218,42 @@ describe("explainInstall", () => {
   });
 });
 
+// 2026-11-25: ticket-symbol-stream-native@1.0.0 is in the OSSF malicious-packages feed (MAL-2026-20520) and was
+// answered "install" at 100/A. The registry now refuses a listed version, or one that installs a listed version.
+describe("the OSSF malicious-packages feed", () => {
+  const NONE: ReviewInput = { kind: "reviewed", state: "found-nothing", findings: 0 };
+
+  test("a refusal citing a listed root is do-not-install, with the advisory", () => {
+    const body = {
+      error: "No version of ticket-symbol-stream-native matching latest passes the policy.",
+      skipped: [{ version: "1.0.0", reason: "known malicious: the OSSF malicious-packages feed lists ticket-symbol-stream-native@1.0.0 (MAL-2026-20520)", revokeReason: null }],
+      newest: { version: "1.0.0" },
+      knownMalicious: [{ name: "ticket-symbol-stream-native", version: "1.0.0", ids: ["MAL-2026-20520"] }],
+    };
+
+    const v = explainInstall({ name: "ticket-symbol-stream-native", range: null, resolve: parseResolve(422, body), review: NONE });
+
+    expect(v.verdict).toBe("do-not-install");
+    expect(v.commands).toBeNull();
+    expect(v.summary).toContain("MAL-2026-20520");
+    expect(v.reasons).toContain("Advisory: https://osv.dev/vulnerability/MAL-2026-20520");
+  });
+
+  test("a refusal for a listed dependency is do-not-install too", () => {
+    const body = { error: "x@1.0.0 would install evil@2.0.0 (MAL-2026-1), which the OSSF malicious-packages feed lists as malicious.", skipped: [], newest: { version: "1.0.0" }, knownMalicious: [{ name: "evil", version: "2.0.0", ids: ["MAL-2026-1"] }] };
+    const v = explainInstall({ name: "x", range: null, resolve: parseResolve(422, body), review: NONE });
+
+    expect(v.verdict).toBe("do-not-install");
+    expect(v.summary).toContain("evil@2.0.0 (MAL-2026-1)");
+  });
+
+  test("a skip for a listed version alone reads as pulled, for a registry answer without the list", () => {
+    const v = explainInstall({ name: "x", range: null, resolve: { kind: "refused", reason: "none", newest: "1.0.0", skipped: [{ version: "1.0.0", reason: "known malicious: the OSSF malicious-packages feed lists x@1.0.0 (MAL-2026-2)" }], confirmed: [] }, review: NONE });
+
+    expect(v.verdict).toBe("do-not-install");
+  });
+});
+
 describe("parseResolve", () => {
   test("reads 200, 422 and 404 answers; anything else is unavailable", () => {
     expect(parseResolve(200, { name: "zod", version: "4.1.0", report: null, skipped: [], tree: { unchecked: 7, uncheckedDeps: [{ dependency: "a@1", reason: "r", via: [] }], reviews: { kind: "off" } } })).toMatchObject({
