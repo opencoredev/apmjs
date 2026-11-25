@@ -70,8 +70,34 @@ export function tarballBase(name: string): string {
   return i >= 0 ? name.slice(i + 1) : name;
 }
 
+/**
+ * The version a tarball file of `name` names. `<base>-<version>.tgz` is read by its prefix: reading after the last dash
+ * took 1.0.0-0.3.7 (a valid prerelease) as 0.3.7 and served that version's bytes. A file without the prefix keeps the
+ * older reading, so links that worked before still do.
+ */
+export function tarballVersion(name: string, file: string): string | null {
+  const prefix = `${tarballBase(name)}-`;
+
+  if (file.startsWith(prefix) && file.endsWith(".tgz")) {
+    const version = file.slice(prefix.length, -".tgz".length);
+
+    if (isValidVersion(version)) return version;
+  }
+
+  return /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(file)?.[2] ?? null;
+}
+
 export function tarballUrl(base: string, name: string, version: string): string {
   return `${base}${name}/-/${tarballBase(name)}-${version}.tgz`;
+}
+
+/** A path segment decoded, or null when its escapes are malformed. */
+function decodedOrNull(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
 }
 
 /** Splits a request path into a package name and the remaining segments. */
@@ -695,6 +721,14 @@ export const commitVersion = (v: {
           if (!owners.includes(v.publisher)) return yield* Effect.fail(refuse(403, `You do not have permission to publish "${v.name}". Owners: ${owners.join(", ")}`));
         }
 
+        // semver ignores build metadata, so 1.0.0+a, 1.0.0+b and 1.0.0 are one version; the database key compares the
+        // whole text, so each was stored with its own bytes. Checked under the package's lock, for approvals too.
+        const core = (version: string): string => version.split("+")[0] ?? version;
+        const heads = (yield* store.localHeadsOf([v.name])).get(v.name)?.heads ?? [];
+        const same = heads.find((h) => h.version !== v.version && core(h.version) === core(v.version));
+
+        if (same) return yield* Effect.fail(refuse(409, `Cannot publish ${v.name}@${v.version}: ${same.version} is the same version (semver ignores build metadata). Versions are immutable; bump the version.`));
+
         const inserted = yield* store.insertVersion({
           package: v.name,
           version: v.version,
@@ -1058,7 +1092,16 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
     if (path === "/-/whoami") return caller.kind === "user" ? json({ username: caller.user }) : fail(401, "Not logged in");
 
     if (path.startsWith("/-/user/token/") && req.method === "DELETE") {
-      if (caller.kind === "user") yield* store.revokeToken(caller.tokenHash, yield* (yield* Clock).now);
+      if (caller.kind === "user") {
+        // the token the path names is the one revoked (npm logout names its own), and only by its own account: this
+        // revoked the caller's token whatever the path named, so a leaked token stayed live behind an ok
+        const named = decodedOrNull(path.slice("/-/user/token/".length));
+        const target = named === null ? null : hashToken(named);
+        const token = target === null ? null : yield* store.getToken(target);
+
+        if (target === null || token?.user !== caller.user) return fail(404, "No such token");
+        yield* store.revokeToken(target, yield* (yield* Clock).now);
+      }
 
       return json({ ok: true });
     }
@@ -1101,10 +1144,10 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
 
     // tarball
     if (rest[0] === "-" && rest[1]) {
-      const m = /^(.*)-(\d+\.\d+\.\d+.*)\.tgz$/.exec(rest[1]);
+      const version = tarballVersion(name, rest[1]);
 
-      if (!pkg || !m?.[2] || !isValidVersion(m[2])) return fail(404, "Not found");
-      const v = yield* versionOf(name, m[2]);
+      if (!pkg || !version || !isValidVersion(version)) return fail(404, "Not found");
+      const v = yield* versionOf(name, version);
 
       if (!v) return fail(404, "Not found");
 

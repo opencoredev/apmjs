@@ -4,11 +4,14 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, scriptTargets, type TarEntry, findingsOf } from "@apm/core";
+import { analyze, runTargets, type TarEntry, findingsOf } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
-const DOC = /\.(?:d\.[cm]?ts|map|md|markdown|txt|css|scss|less|svg|html?)$|(?:^|\/)(?:LICENSE|LICENCE|COPYING|CHANGELOG|HISTORY|AUTHORS|NOTICE)[^/]*$/i;
+
+/** Declarations and source maps, which end in a code extension (`.d.ts`) or sit beside code, are docs before code. */
+const NOT_CODE = /\.(?:d\.[cm]?ts|map)$/i;
+const DOC = /\.(?:md|markdown|txt|css|scss|less|svg|html?)$|(?:^|\/)(?:LICENSE|LICENCE|COPYING|CHANGELOG|HISTORY|AUTHORS|NOTICE)[^/]*$/i;
 const DATA = /\.(?:json|ya?ml|toml|ini|cfg|conf|env|gyp|gypi)$|(?:^|\/)(?:\.npmrc|\.env[^/]*|Dockerfile|Makefile)$/;
 const BINARY_EXT = /\.(?:node|exe|dll|so|dylib|wasm|bin|dat|zip|gz|tgz|tar|7z|jar|png|jpe?g|gif|ico|webp|woff2?|ttf|otf|eot|pdf|mp[34]|wav)$/i;
 
@@ -28,9 +31,12 @@ function hasNul(data: Uint8Array): boolean {
 export function kindOf(f: TarEntry): FileKind {
   if (BINARY_EXT.test(f.path) || hasNul(f.data)) return "binary";
 
-  if (DOC.test(f.path)) return "doc";
+  if (NOT_CODE.test(f.path)) return "doc";
 
+  // before the doc names: `lib/history.js` and `notice.js` are code, whatever their names start with
   if (CODE.test(f.path)) return "code";
+
+  if (DOC.test(f.path)) return "doc";
 
   if (DATA.test(f.path) || !f.path.slice(f.path.lastIndexOf("/") + 1).includes(".")) return "data";
 
@@ -162,7 +168,8 @@ export type Tier = { tier: number; sub: number };
 export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f: TarEntry) => Tier {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const resolved = (raw: string): string | undefined => resolveIn(byPath, stripDot(raw))?.path;
-  const targets = new Set(installScripts(manifest).flatMap((s) => scriptTargets(s.command).map(resolved)));
+  // a script after an interpreter, and a program run directly (`./setup.txt` with a shebang)
+  const targets = new Set(installScripts(manifest).flatMap((s) => runTargets(s.command).map(resolved)));
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
   // npm's default entry when `main` is absent
@@ -191,10 +198,19 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   };
 }
 
-/** Reviewable files (code and data, not package.json) in reading order; ties break on `prefer`, then size. */
+/**
+ * What the model reads, in reading order: code and data, and any install-script target or Node entry point that is not
+ * binary, whatever its name (`node setup.txt` runs it as JavaScript); never package.json, which is shown on its own.
+ * Ties break on `prefer`, then size.
+ */
 export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: readonly TarEntry[], prefer: (f: TarEntry) => boolean = () => false): TarEntry[] {
   const rank = readingOrder(manifest, all);
-  const keyed = pick.flatMap((f) => (f.path !== "package.json" && isReviewable(f) ? [{ f, r: rank(f), p: prefer(f) ? 0 : 1 }] : []));
+
+  const keyed = pick.flatMap((f) => {
+    const r = rank(f);
+
+    return f.path !== "package.json" && (isReviewable(f) || (r.tier <= 1 && kindOf(f) !== "binary")) ? [{ f, r, p: prefer(f) ? 0 : 1 }] : [];
+  });
 
   keyed.sort((a, b) => a.r.tier - b.r.tier || a.r.sub - b.r.sub || a.p - b.p || a.f.size - b.f.size || (a.f.path < b.f.path ? -1 : 1));
 
