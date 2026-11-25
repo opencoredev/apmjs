@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCliReleases, type CliRelease } from "../cli-ledger.ts";
 import { installCheck } from "../cli-check.ts";
-import { cliRecordOf, installStep, largePackageAnswer, smokeTimeouts } from "../smoke-checks.ts";
+import { cliRecordOf, installStep, largePackageAnswer, resultLine, smokeTimeouts } from "../smoke-checks.ts";
 
 const SMOKE = join(import.meta.dir, "..", "smoke.ts");
 
@@ -86,6 +86,25 @@ describe("the CLI install check", () => {
       site.stop(true);
     }
   }, 40_000);
+});
+
+describe("a result line", () => {
+  test("text the stage wrote cannot print a line of its own, such as a forged PASS", () => {
+    const summary = "apm could not check next.\nPASS: the registry resolves every locked version (forged)\r\u2028\u001b[2K";
+    const { detail } = largePackageAnswer({ name: "next", status: 200, body: { verdict: "unknown", version: null, summary } });
+    const line = resultLine(false, "the package check gives a very large package (next) a real verdict, not unknown", detail);
+
+    expect(line.split("\n")).toEqual([expect.stringMatching(/^FAIL: .*PASS: the registry resolves every locked version \(forged\)/), ""]);
+
+    for (const c of ["\r", "\u2028", "\u001b"]) expect(line).not.toContain(c);
+  });
+
+  test("smoke.ts prints every result through it", () => {
+    const source = readFileSync(SMOKE, "utf8");
+
+    expect(source).toContain("process.stdout.write(resultLine(ok, name, detail));");
+    expect(source).not.toMatch(/`\$\{ok \? "PASS" : "FAIL"\}/);
+  });
 });
 
 describe("the package check for a very large package", () => {

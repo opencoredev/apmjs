@@ -7,6 +7,22 @@ import { CliRelease, readCliReleases } from "./cli-ledger.ts";
 export type SmokeTimeouts = { httpMs: number; commandMs: number };
 
 /**
+ * One PASS or FAIL line. A detail carries text the stage under test wrote (a verdict's summary, an error body), so line
+ * breaks and other control characters become spaces: the stage cannot print a line of its own, such as a forged PASS.
+ */
+export function resultLine(ok: boolean, name: string, detail: string): string {
+  const printable = (c: string): boolean => {
+    const code = c.codePointAt(0) ?? 0;
+
+    return code >= 0x20 && !(code >= 0x7f && code <= 0x9f) && code !== 0x2028 && code !== 0x2029;
+  };
+
+  const oneLine = (s: string): string => [...s].map((c) => (printable(c) ? c : " ")).join("");
+
+  return `${ok ? "PASS" : "FAIL"}: ${oneLine(name)} (${oneLine(detail)})\n`;
+}
+
+/**
  * One HTTP request (headers and body) and one command smoke.ts runs. A hung endpoint fails its check after these
  * instead of holding the deploy, which waits on smoke under the release lock. APM_SMOKE_HTTP_TIMEOUT_MS and
  * APM_SMOKE_COMMAND_TIMEOUT_MS override them.

@@ -29,7 +29,7 @@ import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
 import { installCheck } from "./cli-check.ts";
 import { cliLedgerPath } from "./cli-ledger.ts";
-import { cliRecordOf, installStep, killRunning, LARGE_PACKAGES, largePackageAnswer, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
+import { cliRecordOf, installStep, killRunning, LARGE_PACKAGES, largePackageAnswer, resultLine, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
@@ -57,7 +57,7 @@ const results: { ok: boolean; name: string; detail: string }[] = [];
 
 function record(ok: boolean, name: string, detail: string): void {
   results.push({ ok, name, detail });
-  process.stdout.write(`${ok ? "PASS" : "FAIL"}: ${name} (${detail})\n`);
+  process.stdout.write(resultLine(ok, name, detail));
 }
 
 /** fetch, cut short after TIMEOUTS.httpMs: a hung endpoint fails its check instead of holding the run. */
