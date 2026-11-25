@@ -273,21 +273,34 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["npm install --tag next"]);
   });
 
-  // a bare install's arguments must not name a package: bun 1.1 to 1.3 skip an option they do not know and install the
-  // word after it, with none of apm's checks
+  // a bare install checks nothing, so no word of it may reach the package manager as a package: bun 1.1 to 1.3 install
+  // the word after an option they do not know, npm reads --audit=off as a package off, and a value-taking option apm does
+  // not know takes the next option as its value. Only plain switches, and npm's --tag and --omit with a checked value, pass.
+  const refusedBare = (word: string, pm: string) => `apm install with no packages does not pass ${word} on to ${pm}`;
+
   test.each([
-    [["install", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
-    [["i", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
-    [["install", "--pm", "bun", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
-    [["install", "--pm", "pnpm", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not pnpm's"],
-    [["install", "--pm=yarn", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not yarn's"],
-    [["install", "--omit", "dev"], "--omit with a separate value is read only by npm's own install, not bun's"],
-    [["install", "--cooldown", "left-pad"], "--cooldown is apm's own check flag, and apm install with no packages checks nothing"],
-    [["install", "--pm", "npm", "--floor", "left-pad"], "--floor is apm's own check flag, and apm install with no packages checks nothing"],
+    [["install", "--tag", "left-pad"], refusedBare("--tag", "bun")],
+    [["i", "--tag", "left-pad"], "apm i with no packages does not pass --tag on to bun"],
+    [["install", "--pm", "bun", "--tag", "left-pad"], refusedBare("--tag", "bun")],
+    [["install", "--pm", "pnpm", "--tag", "left-pad"], refusedBare("--tag", "pnpm")],
+    [["install", "--pm=yarn", "--tag", "left-pad"], refusedBare("--tag", "yarn")],
+    [["install", "--tag=next"], refusedBare("--tag=next", "bun")],
+    [["install", "--omit", "dev"], refusedBare("--omit", "bun")],
+    [["install", "--omit=dev"], refusedBare("--omit=dev", "bun")],
+    [["install", "--cooldown", "left-pad"], refusedBare("--cooldown", "bun")],
+    [["install", "--pm", "npm", "--floor", "left-pad"], refusedBare("--floor", "npm")],
+    [["install", "--pm", "npm", "--audit=off"], refusedBare("--audit=off", "npm")],
+    [["install", "--pm", "npm", "--prefix", "--tag", "left-pad"], refusedBare("--prefix", "npm")],
+    [["install", "--pm", "npm", "---", "left-pad"], "unknown flag - for apm install"],
+    [["install", "--pm", "npm", "---"], refusedBare("---", "npm")],
+    [["install", "--pm", "npm", "--tag", "1.x"], refusedBare("--tag", "npm")],
+    [["install", "--pm", "npm", "--omit", "left-pad"], refusedBare("--omit", "npm")],
+    [["install", "--pm", "pnpm", "--force=off"], refusedBare("--force=off", "pnpm")],
+    [["install", "--pm", "--pm", "npm", "--tag", "left-pad"], "--pm needs a value"],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
-    [["install", "--", "--cooldown", "left-pad"], "apm install with no packages passes nothing after --"],
-    [["i", "--frozen-lockfile", "--", "--cooldown", "left-pad"], "apm i with no packages passes nothing after --"],
+    [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
+    [["i", "--frozen-lockfile", "--"], "apm i with no packages does not pass -- on to bun"],
   ])("apm %p is refused: %s", async (argv, message) => {
     const r = await apm(argv);
 
@@ -298,9 +311,10 @@ describe("what still goes to the package manager", () => {
 
   test.each([
     [["install", "--pm", "npm", "--omit", "dev"], "npm install --omit dev"],
-    [["install", "--tag=next"], "bun install --tag=next"],
-    [["install", "--omit=dev"], "bun install --omit=dev"],
-    [["install", "--"], "bun install --"],
+    [["install", "--pm", "npm", "--omit=peer", "--tag=beta", "--no-audit"], "npm install --omit=peer --tag=beta --no-audit"],
+    [["i", "--frozen-lockfile", "--production"], "bun install --frozen-lockfile --production"],
+    [["install", "--pm=pnpm", "--frozen-lockfile", "--prod"], "pnpm install --frozen-lockfile --prod"],
+    [["install", "--pm", "yarn", "--immutable"], "yarn install --immutable"],
   ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
     const r = await apm(argv);
 
