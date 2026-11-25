@@ -5,7 +5,7 @@ sidebar:
   label: CLI
 ---
 
-`apm` 0.1.2 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
+`apm` 0.1.3 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
 
 Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks the binary's SHA-256 before it installs; see [Quick start](/quickstart#2-get-the-apm-cli) for what it checks and how to read it first.
 
@@ -35,7 +35,7 @@ A score informs; it does not block. When the package or a dependency was publish
 WARNING left-pad@1.3.0 scores 30/100 (F), under the floor of 40
   - Sends what it collected: index.js:12: fetch(…) (sends the whole environment in a request)
   - Starts processes at install time: package.json scripts.postinstall: node setup.js
-  https://apmjs.dev/package/left-pad/v/1.3.0
+  https://apmjs.dev/package/left-pad?v=1.3.0
 apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).
 ```
 

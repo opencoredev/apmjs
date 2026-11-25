@@ -1,6 +1,6 @@
 // Response headers for every route, and the cache policy for per-user routes proxied to the registry.
 // Used by next.config.ts; kept here so the tests can check the exact values.
-import { DATABUDDY_INGEST_ORIGIN, DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
+import { DATABUDDY_FLAGS_ORIGIN, DATABUDDY_INGEST_ORIGIN, DATABUDDY_SCRIPT_ORIGIN } from "./databuddy-origin";
 
 type Header = { key: string; value: string };
 
@@ -9,7 +9,7 @@ type Header = { key: string; value: string };
  * prerendered, so Next.js can't put a per-request nonce on its inline bootstrap and flight scripts
  * (node_modules/next/dist/docs/01-app/02-guides/content-security-policy.md). The policy still blocks
  * framing, plugins, <base> hijacking, off-site form posts, scripts from other origins except Databuddy's
- * tracker (databuddy.js on its CDN), and fetches to other origins except Databuddy's event endpoint
+ * tracker (databuddy.js on its CDN), and fetches to other origins except Databuddy's event and flag endpoints
  * (lib/databuddy-origin.ts).
  * Avatars come from the OAuth providers, so images may load from any https origin.
  */
@@ -21,7 +21,7 @@ export function contentSecurityPolicy(dev: boolean): string {
     "img-src 'self' data: blob: https:",
     "font-src 'self'",
     // The dev server's hot reload uses a WebSocket on the same host.
-    `connect-src 'self' ${DATABUDDY_INGEST_ORIGIN}${dev ? " ws: wss:" : ""}`,
+    `connect-src 'self' ${DATABUDDY_INGEST_ORIGIN} ${DATABUDDY_FLAGS_ORIGIN}${dev ? " ws: wss:" : ""}`,
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",

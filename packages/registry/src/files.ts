@@ -20,7 +20,8 @@ import { ArchiveError, readTarball, type TarEntry } from "@apm/core";
 import { WORKER_MAX_UNPACKED_BYTES } from "./analysis.ts";
 import { Blobs } from "./blobs.ts";
 import { Store, type VersionRecord } from "./db.ts";
-import { refuse } from "./errors.ts";
+import { refuse, type BlobError } from "./errors.ts";
+import { DeadlinePassed } from "./deadline.ts";
 import { sha256Hex, sha512 } from "./hash.ts";
 import { json } from "./http.ts";
 import { countLines, ExcerptLine, isUtf8, pickReadme, sliceLines } from "./file-text.ts";
@@ -63,9 +64,17 @@ export function fileBody(data: Uint8Array): FileBody {
 const indexKey = (label: string) => `files/${label}/index.json`;
 const bodyKey = (label: string, path: string) => `files/${label}/${sha256Hex(path)}.json`;
 
+/**
+ * A failed read or write of the view's cache is logged and otherwise ignored: its copies are rebuilt from the verified
+ * tarball, so R2 answering late or with an error of its own costs a rebuild, not the answer. Before, a cache read past
+ * R2_GET_MS (a HEAD of a file, 2026-11-24) and R2's 10001 errors (a readme, 2026-11-22) each made the view a 500,
+ * though the tarball's own cached copy already treated them as a miss (upstream.ts, cacheRead).
+ */
+const cacheFailed = (e: BlobError) => Effect.sync(() => console.warn(JSON.stringify({ level: "warn", event: "file-cache", error: e.cause instanceof DeadlinePassed ? "late" : "failed", operation: e.operation })));
+
 const readCached = <S extends z.ZodType>(key: string, schema: S) =>
   Effect.gen(function* () {
-    const got = yield* (yield* Blobs).bytes(key);
+    const got = yield* (yield* Blobs).bytes(key).pipe(Effect.catchTag("BlobError", (e) => Effect.as(cacheFailed(e), Option.none())));
 
     if (Option.isNone(got)) return null;
     let raw: unknown;
@@ -81,7 +90,8 @@ const readCached = <S extends z.ZodType>(key: string, schema: S) =>
     return parsed.success ? parsed.data : null;
   });
 
-const writeCached = (key: string, value: FileIndex | FileBody | LineCount | Block) => Effect.flatMap(Blobs, (b) => b.put(key, new TextEncoder().encode(JSON.stringify(value))));
+const writeCached = (key: string, value: FileIndex | FileBody | LineCount | Block) =>
+  Effect.flatMap(Blobs, (b) => b.put(key, new TextEncoder().encode(JSON.stringify(value)))).pipe(Effect.catchTag("BlobError", cacheFailed));
 
 /** The version, local first, then upstream. */
 const findVersion = (name: string, version: string) =>
