@@ -104,6 +104,7 @@ describe("ossfListed", () => {
       userAgent === NPM_CLIENT
         ? new Response(null, { status: 302, headers: { location: `https://registry.npmjs.org/${OSSF_LISTED.name}/-/${OSSF_LISTED.name}-${OSSF_LISTED.version}.tgz` } })
         : answer({ error: `known malicious (${OSSF_LISTED.id})` }, 403);
+
     const checks = await ossfListed(stage({ tarball: redirected }).deps);
 
     expect(checks.slice(1, 3).map((c) => c.ok)).toEqual([true, false]);

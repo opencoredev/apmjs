@@ -57,8 +57,11 @@ export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutM
 
   stopped.catch(() => undefined);
 
+  const plain = { accept: input.accept ?? "application/json", "cache-control": "no-cache" };
+  const headers = input.userAgent === undefined ? plain : { ...plain, "user-agent": input.userAgent };
+
   try {
-    const res = await Promise.race([fetch(url, { headers: { accept: input.accept ?? "application/json", "cache-control": "no-cache", ...(input.userAgent ? { "user-agent": input.userAgent } : {}) }, signal, redirect: input.manual ? "manual" : "follow" }), stopped]);
+    const res = await Promise.race([fetch(url, { headers, signal, redirect: input.manual ? "manual" : "follow" }), stopped]);
     const media = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? null;
     const chunks: Uint8Array[] = [];
     let size = 0;
