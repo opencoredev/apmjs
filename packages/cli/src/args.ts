@@ -32,6 +32,7 @@ export function parseArgs(argv: readonly string[]): Args {
     // gets everything after it, and apm reads none of that (no --pm from there)
     if (a === "--") {
       flags.set("--", true);
+
       if (owned) continue;
       break;
     }

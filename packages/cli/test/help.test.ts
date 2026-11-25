@@ -48,6 +48,7 @@ async function apm(argv: string[]): Promise<Run> {
   }
 
   requests = [];
+
   const proc = Bun.spawn([process.execPath, CLI, ...argv], {
     cwd,
     env: { PATH: `${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: root, NO_COLOR: "1", APM_REGISTRY: server?.url.href ?? "" },
@@ -55,6 +56,7 @@ async function apm(argv: string[]): Promise<Run> {
     stdout: "pipe",
     stderr: "pipe",
   });
+
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 
   return {
@@ -77,7 +79,7 @@ function expectNothingRan(r: Run): void {
 }
 
 /** Arguments each command would act on, so help is asked for among real ones and not only alone. */
-const REAL: Record<string, string[]> = {
+const REAL = new Map(Object.entries({
   add: ["zod", "-D", "--pm", "bun"],
   install: ["zod", "--strict"],
   i: ["zod"],
@@ -97,17 +99,17 @@ const REAL: Record<string, string[]> = {
   publish: ["--bump", "patch", "--tag", "next"],
   login: ["--no-browser"],
   whoami: [],
-};
+}));
 
 const NAMES = [...Object.keys(COMMANDS), "exec", "dlx"];
 
 describe("--help and -h", () => {
   test("every command apm runs itself has arguments here", () => {
-    expect(Object.keys(REAL).sort()).toEqual([...NAMES].sort());
+    expect([...REAL.keys()].sort()).toEqual([...NAMES].sort());
   });
 
   for (const cmd of NAMES) {
-    const real = REAL[cmd] ?? [];
+    const real = REAL.get(cmd) ?? [];
 
     const placements: [string, string[]][] = [
       ["first", ["--help", ...real]],
@@ -166,7 +168,7 @@ describe("a flag a command does not read", () => {
   for (const cmd of NAMES) {
     for (const bad of ["--bogus", "-E", "--yes=1"]) {
       test(`apm ${cmd} ${bad} is refused before anything runs`, async () => {
-        const r = await apm([cmd, bad, ...(REAL[cmd] ?? [])]);
+        const r = await apm([cmd, bad, ...(REAL.get(cmd) ?? [])]);
 
         expect(r.code, r.out + r.err).toBe(2);
         expect(r.err).toContain("Nothing was run");

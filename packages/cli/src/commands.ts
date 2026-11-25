@@ -14,11 +14,11 @@ type Command = {
 };
 
 /** Read by every command apm runs itself. */
-const COMMON: Readonly<Record<string, FlagKind>> = { pm: "value", json: "switch", help: "switch" };
+const COMMON = { pm: "value", json: "switch", help: "switch" } satisfies Readonly<Record<string, FlagKind>>;
 
-const CHECKS: Readonly<Record<string, FlagKind>> = { strict: "switch", force: "switch", "no-cooldown": "switch", cooldown: "value", floor: "value", "ignore-scripts": "switch" };
+const CHECKS = { strict: "switch", force: "switch", "no-cooldown": "switch", cooldown: "value", floor: "value", "ignore-scripts": "switch" } satisfies Readonly<Record<string, FlagKind>>;
 
-const PROOF: Readonly<Record<string, FlagKind>> = { otp: "value", password: "value", "password-stdin": "switch" };
+const PROOF = { otp: "value", password: "value", "password-stdin": "switch" } satisfies Readonly<Record<string, FlagKind>>;
 
 const ADD: Command = {
   help: `usage: apm add <package>[@range]... [flags]   (also apm install, apm i)
@@ -40,7 +40,7 @@ the exact versions. With no packages, apm install runs your package manager's ow
   maxPositional: null,
 };
 
-export const COMMANDS: Readonly<Record<string, Command>> = {
+export const COMMANDS = {
   add: ADD,
   install: ADD,
   i: ADD,
@@ -132,11 +132,16 @@ then uploads it. With a login token the version is staged until you approve it.
     flags: COMMON,
     maxPositional: 0,
   },
-};
+} satisfies Readonly<Record<string, Command>>;
 
-/** The command apm runs itself under this name, by own property only (`apm constructor` is the package manager's). */
+/** By own property only: `apm constructor` is the package manager's. */
+function isCommandName(name: string): name is keyof typeof COMMANDS {
+  return Object.hasOwn(COMMANDS, name);
+}
+
+/** The command apm runs itself under this name. */
 export function commandOf(name: string): Command | undefined {
-  return Object.hasOwn(COMMANDS, name) ? COMMANDS[name] : undefined;
+  return isCommandName(name) ? COMMANDS[name] : undefined;
 }
 
 /** The flags that take the next argument as their value: the command's own, or only --pm for a package manager's command. */
@@ -158,7 +163,9 @@ export function argsError(a: Args, command: Command): string | null {
     const kind = Object.hasOwn(command.flags, key) ? command.flags[key] : undefined;
 
     if (kind === undefined) return `unknown flag ${shown} for apm ${a.cmd}`;
+
     if (kind === "value" && value === true) return `${shown} needs a value`;
+
     if (kind === "switch" && value !== true) return `${shown} takes no value`;
   }
 
