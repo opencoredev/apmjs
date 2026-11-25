@@ -76,14 +76,14 @@ const GROUPS: readonly Group[] = [
   {
     title: "Names",
     rows: [
-      { label: "Typosquats", npm: "Blocks punctuation variants only.", apm: "Refuses one-edit look-alikes of popular packages. Search shows them next to your query." },
+      { label: "Typosquats", npm: "Blocks punctuation variants only.", apm: "Refuses look-alikes of popular packages on publish: a scoped name whose bare part swaps two neighbouring letters of a popular name (`@you/raect`) or adds `.js`, `js`, `-js` or `.mjs` to one (`@you/expressjs`), and a near miss of a popular scoped name (`@type/node`). Search shows them next to your query." },
       { label: "Dependency confusion", npm: "Unscoped names are first come, first served.", apm: "New packages are scoped to your GitHub login. A bare name always means the npm package." },
     ],
   },
   {
     title: "Compatibility",
     rows: [
-      { label: "Bun", npm: "Just another client.", apm: "One `bunfig.toml` line makes plain `bun install` refuse revoked and confirmed-malicious versions and warn about low scores." },
+      { label: "Bun", npm: "Just another client.", apm: "One `bunfig.toml` line points plain `bun install` at apm, so new installs skip revoked, yanked and confirmed-malicious versions. The optional Bun scanner, which also warns about low scores, is not on a registry yet." },
       { label: "Coverage", npm: "Everything on npm.", apm: "Same packages, proxied from npm and scored on first request.", same: true },
     ],
   },

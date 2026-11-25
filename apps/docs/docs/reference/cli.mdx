@@ -84,7 +84,7 @@ With yarn, which runs install scripts while it installs, `--strict` refuses befo
 With `--json`:
 
 ```json
-{ "ok": true, "pm": "bun", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 90, "grade": "A", "signals": [{ "id": "eval", "points": -10 }], "skipped": [], "unchecked": [], "warnings": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "touched": true, "stage": "done", "recovery": null } }
+{ "ok": true, "pm": "npm", "error": null, "packages": [{ "name": "zod", "version": "4.6.7", "score": 100, "grade": "A", "signals": [], "skipped": [], "unchecked": [], "warnings": [], "projectPeers": [], "blocked": false, "reason": null, "forceable": false }], "installed": { "source": "lockfile", "checked": 1, "blocked": [], "warnings": [], "refused": false, "touched": true, "stage": "done", "recovery": null } }
 ```
 
 `installed` is the check of the computed lockfile (null when apm stopped before it): `checked` counts its packages, `blocked` lists `{ name, version, reason }` refused in every mode, `warnings` its warnings, `touched` whether apm wrote to your project (never before the check passes), `stage` where the add stopped (`check`, `install`, `verify`, `scripts` or `done`), and `recovery` the commands that put the project back when it stopped after apm wrote the checked files. `source` is `node_modules` only under yarn 1.
@@ -206,7 +206,7 @@ apm login [--no-browser]
 apm login --username <name> --password-stdin [--email <address>]
 ```
 
-The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+The first form signs you in through the browser with a device code and saves a login token to your user `.npmrc`. A version published with it waits until you approve it on apmjs.dev. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
 
 ## apm explain
 
