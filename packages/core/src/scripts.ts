@@ -23,8 +23,11 @@ export const LIFECYCLE = {
   prepublishOnly: "publish",
 } as const satisfies Record<string, HookKind>;
 
-/** One command a hook runs, after following script references. `from` says how it was reached. */
-export type HookCommand = { from: string; text: string; viaEval: boolean };
+/**
+ * One command a hook runs, after following script references. `from` says how it was reached. `second`: only the
+ * flag-aware reading reaches it (expandHooks' second pass), so a reading budget takes it after every command main reads.
+ */
+export type HookCommand = { from: string; text: string; viaEval: boolean; second: boolean };
 
 /**
  * A lifecycle hook, the commands it reaches and the names of the scripts it runs (itself included). `cut` says why the
@@ -58,7 +61,7 @@ const SHELL_WORD = /\S+/g;
 // quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
 const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
 // xargs appends words from its input to npm's, so they are not the words written either
-const ARGS_FROM_INPUT = /(?<!\S)xargs(?!\S)/;
+const ARGS_FROM_INPUT = /(?<![\w.-])xargs(?![\w.-])/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 
 // any case, as cmd.exe finds `NODE.EXE`
@@ -68,8 +71,8 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
-// a flag whose value may be the next word, as node takes `--conditions dev` and `-r ./x`
-const VALUE_FLAG = /^(?:--\w[\w-]*|-[rC])$/;
+// node's options that take the next word as their value (`--conditions dev`, `-r ./x`); any other flag takes none
+const VALUE_FLAG = /^(?:-[rC]|--(?:conditions|require|import|(?:experimental-)?loader|input-type|redirect-warnings|title|env-file|disable-warning|watch-path|test-reporter(?:-destination)?|report-dir|report-filename|diagnostic-dir|cpu-prof-dir|heap-prof-dir|inspect-port|debug-port|stack-trace-limit))$/;
 
 /**
  * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
@@ -200,9 +203,13 @@ function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
     out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
   }
 
-  const found = new Set(out.map((r) => r.name));
+  // the regex's reading of an invocation stands for it; any other invocation the shell reading finds runs its script with
+  // the pre and post scripts, whether or not the same name was run alone elsewhere
+  const read = new Set<string>();
 
-  for (const name of shellRunReferences(cmd, scripts)) if (!found.has(name)) out.push({ name, alone: false });
+  for (const m of cmd.matchAll(RUN_REF)) read.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
+
+  for (const r of shellRunReferences(cmd, scripts)) if (!read.has(`${r.end}\0${r.name}`)) out.push({ name: r.name, alone: false });
 
   return out;
 }
@@ -213,23 +220,29 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 
 /**
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
- * `-s`, `'a b'` is one word), with `null` where a command ends: `;`, `&`, `|`, a newline, a parenthesis, `$(` or a
- * backtick. One pass; quotes are not searched past the end of `cmd`.
+ * `-s`, `'a b'` is one word), each with where it ends in `cmd`, and `null` where a command ends: `;`, `&`, `|`, a
+ * newline, a parenthesis, `$(` or a backtick. One pass; a quote left open runs to the end of `cmd`.
  */
-function* shellWords(cmd: string): Generator<string | null> {
+function* shellWords(cmd: string): Generator<{ word: string; end: number } | null> {
   let word: string | null = null;
+  let i = 0;
 
-  for (let i = 0; i < cmd.length; i++) {
+  const flush = function* (): Generator<{ word: string; end: number }> {
+    if (word !== null) yield { word, end: i };
+    word = null;
+  };
+
+  for (; i < cmd.length; i++) {
     const c = cmd[i] ?? "";
 
     if (c === "'" || c === '"') {
       let j = i + 1;
       let body = "";
 
-      while (j < cmd.length && cmd[j] !== c) {
-        if (c === '"' && cmd[j] === "\\" && j + 1 < cmd.length) j++;
+      for (; j < cmd.length && cmd[j] !== c; j++) {
+        // inside double quotes a backslash escapes only $, `, ", \ and a newline, as the shell reads it
+        if (c === '"' && cmd[j] === "\\" && /[$`"\\\n]/.test(cmd[j + 1] ?? "")) j++;
         body += cmd[j];
-        j++;
       }
 
       word = (word ?? "") + body;
@@ -238,46 +251,52 @@ function* shellWords(cmd: string): Generator<string | null> {
       if (cmd[i + 1] === "\n") i++;
       else word = (word ?? "") + (cmd[++i] ?? "");
     } else if (COMMAND_END.has(c) || (c === "$" && cmd[i + 1] === "(")) {
-      if (word !== null) yield word;
-      word = null;
+      yield* flush();
       yield null;
-    } else if (/\s|[<>]/.test(c)) {
-      if (word !== null) yield word;
-      word = null;
-    } else word = (word ?? "") + c;
+    } else if (/\s|[<>]/.test(c)) yield* flush();
+    else word = (word ?? "") + c;
   }
 
-  if (word !== null) yield word;
+  yield* flush();
 }
 
 /**
  * Scripts a command runs through a package manager, read from the words the shell hands it, so quoted and escaped flags
  * and names and flags that take the next word as their value (`npm --prefix . run x`, `npm run -w pkg x`) do not hide
  * the run. Where a word after a flag may be its value or the name, both readings are followed: following a script npm
- * does not run can only make the reading stricter. Each word is read once.
+ * does not run can only make the reading stricter. Each word is read once. `end` is where the manager's word ends.
  */
-function shellRunReferences(cmd: string, scripts: Scripts): string[] {
-  if (!/npm|yarn|bun/.test(cmd)) return [];
-  const out: string[] = [];
+function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end: number }[] {
+  // a manager's word is in the text as written unless quotes or escapes split it
+  if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
+  const out: { name: string; end: number }[] = [];
   let pm: string | null = null;
+  let pmEnd = 0;
   let phase: "manager" | "run" | "named" = "manager";
   let afterFlag = false;
 
+  const takesName = (): boolean => pm !== null && (phase !== "manager" || pm === "yarn" || pm === "pnpm");
+
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w)) out.push(w);
+    if (Object.hasOwn(scripts, w)) out.push({ name: w, end: pmEnd });
 
     if (afterFlag) afterFlag = false;
     else pm = null;
   };
 
-  for (const w of shellWords(cmd)) {
-    if (w === null) {
+  for (const t of shellWords(cmd)) {
+    if (t === null) {
       pm = null;
       continue;
     }
 
+    const w = t.word;
+
     if (PACKAGE_MANAGERS.has(w)) {
+      // a manager's name may also be the script's (`npm run --silent npm`)
+      if (takesName() && Object.hasOwn(scripts, w)) out.push({ name: w, end: pmEnd });
       pm = w;
+      pmEnd = t.end;
       phase = "manager";
       afterFlag = false;
       continue;
@@ -296,7 +315,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): string[] {
     } else if (phase === "manager" && (w === "run" || (pm === "npm" && w === "run-script"))) {
       phase = "run";
       afterFlag = false;
-    } else if (phase === "run" || pm === "yarn" || pm === "pnpm" || (pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
+    } else if (takesName() || (pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
       name(w);
     } else if (afterFlag) {
       afterFlag = false;
@@ -366,7 +385,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
       if (!admits(from, depth)) return;
 
       const evals = viaEval || inlineEval(text);
-      commands.push({ from, text, viaEval: evals });
+      commands.push({ from, text, viaEval: evals, second: !first });
 
       if (first) read.push({ text, depth });
 

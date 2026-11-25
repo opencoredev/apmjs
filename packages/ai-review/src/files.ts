@@ -5,7 +5,7 @@
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
 import { analyze, expandHooks, runTargets, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
-import { type Manifest } from "./manifest.ts";
+import { installScripts, type Manifest } from "./manifest.ts";
 
 // any case, as Windows and macOS file systems resolve `require('./x.JS')`
 const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/i;
@@ -15,6 +15,9 @@ const NOT_CODE = /\.(?:d\.[cm]?ts|map)$/i;
 const DOC = /\.(?:md|markdown|txt|css|scss|less|svg|html?)$|(?:^|\/)(?:LICENSE|LICENCE|COPYING|CHANGELOG|HISTORY|AUTHORS|NOTICE)[^/]*$/i;
 const DATA = /\.(?:json|ya?ml|toml|ini|cfg|conf|env|gyp|gypi)$|(?:^|\/)(?:\.npmrc|\.env[^/]*|Dockerfile|Makefile)$/;
 const BINARY_EXT = /\.(?:node|exe|dll|so|dylib|wasm|bin|dat|zip|gz|tgz|tar|7z|jar|png|jpe?g|gif|ico|webp|woff2?|ttf|otf|eot|pdf|mp[34]|wav)$/i;
+
+/** Globs in install commands matched against the tarball's files; past this many the rest are not expanded. */
+const MAX_GLOBS = 8;
 
 /** Files larger than this are not decoded at all; they are listed as not read. */
 export const MAX_DECODED_BYTES = 16 * 1024 * 1024;
@@ -179,24 +182,27 @@ export type Tier = { tier: number; sub: number };
 export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f: TarEntry) => Tier {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const resolved = (raw: string): string | undefined => resolveIn(byPath, stripDot(raw))?.path;
-  // a script after an interpreter, and a program run directly (`./setup.txt` with a shebang), in every command an install
-  // hook reaches (`npm run setup` included), read as written and with the shell's quotes, escapes and `$PWD/` removed
-  const commands = expandHooks({ scripts: Object.fromEntries(manifest.scripts) }).flatMap((h) => (h.kind === "install" ? h.commands.map((c) => c.text) : []));
-  const targets = new Set<string | undefined>();
+  // a script after an interpreter, and a program run directly (`./setup.txt` with a shebang)
+  const targets = new Set(installScripts(manifest).flatMap((s) => runTargets(s.command).map(resolved)));
+  // the same in every command an install hook reaches (`npm run setup` too), read with the shell's quotes, escapes and
+  // `$PWD/` removed, and an unquoted glob expanded over the tarball's files (`node ./pay*.txt`): read after the targets
+  // above and the entries, so a guess never takes their place in the budget
+  const reached = new Set<string | undefined>();
+  const globs = new Set<string>();
 
-  for (const cmd of commands) {
-    const plain = cmd.replace(/\$\{?PWD\}?\//g, "./").replace(/\\(.)/g, "$1").replace(/['"]/g, "");
+  for (const h of expandHooks({ scripts: Object.fromEntries(manifest.scripts) })) {
+    if (h.kind !== "install") continue;
 
-    for (const t of [...runTargets(cmd), ...runTargets(plain)]) targets.add(resolved(t));
+    for (const c of h.commands) {
+      const plain = c.text.replace(/\$\{?PWD\}?\//g, "./").replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 
-    // a glob the shell expands to the tarball's files: `node ./pay*.txt`
-    for (const w of plain.split(/[\s;&|()]+/)) {
-      if (!/[*?]/.test(w)) continue;
-      const pattern = stripDot(w);
+      for (const t of [...runTargets(c.text), ...runTargets(plain)]) reached.add(resolved(t));
 
-      for (const f of files) if (wildcardMatch(f.path, pattern)) targets.add(f.path);
+      for (const m of c.text.matchAll(/(?<=^|[\s;&|()])[\w@./$-]*\*[\w@./*-]*(?=$|[\s;&|()])/g)) if (globs.size < MAX_GLOBS) globs.add(stripDot(m[0].replace(/^\$\{?PWD\}?\//, "")));
     }
   }
+
+  for (const f of globs.size > 0 ? files : []) for (const g of globs) if (f.path.split("/").length === g.split("/").length && wildcardMatch(f.path, g)) reached.add(f.path);
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
   // npm's default entry when `main` is absent
@@ -211,6 +217,8 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
     if (targets.has(p)) return { tier: 0, sub: 0 };
 
     if (nodeEntries.has(p)) return { tier: 1, sub: 0 };
+
+    if (reached.has(p)) return { tier: 1, sub: 1 };
 
     if (signals.has(p)) return { tier: 2, sub: 0 };
     const d = reach.get(p);
@@ -236,7 +244,7 @@ export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: read
   const keyed = pick.flatMap((f) => {
     const r = rank(f);
 
-    return f.path !== "package.json" && (isReviewable(f) || (r.tier <= 1 && !isMachineCode(f.data))) ? [{ f, r, p: prefer(f) ? 0 : 1 }] : [];
+    return f.path !== "package.json" && (isReviewable(f) || (r.tier <= 1 && (kindOf(f) !== "binary" || !isMachineCode(f.data)))) ? [{ f, r, p: prefer(f) ? 0 : 1 }] : [];
   });
 
   keyed.sort((a, b) => a.r.tier - b.r.tier || a.r.sub - b.r.sub || a.p - b.p || a.f.size - b.f.size || (a.f.path < b.f.path ? -1 : 1));

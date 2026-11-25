@@ -1418,15 +1418,12 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   const first: string[] = [];
   const hooks = expandHooks(manifest);
 
-  for (const h of hooks) {
-    if (h.kind === "publish") continue;
+  // what main's reading reaches in every hook before what only the flag-aware reading adds, so the budget holds those first
+  for (const c of hooks.flatMap((h) => (h.kind === "publish" ? [] : h.commands)).toSorted((a, b) => Number(a.second) - Number(b.second))) {
+    for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
+      const f = resolveIn(byPath, w);
 
-    for (const c of h.commands) {
-      for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
-        const f = resolveIn(byPath, w);
-
-        if (f && f.path !== "package.json") first.push(f.path);
-      }
+      if (f && f.path !== "package.json") first.push(f.path);
     }
   }
 
@@ -1805,8 +1802,9 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
-  const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
-  const hookCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands.map((c) => ({ text: c.text, kind: h.kind })));
+  // main's reading of every hook first, then what only the flag-aware reading adds (HookCommand.second)
+  const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands).toSorted((a, b) => Number(a.second) - Number(b.second));
+  const hookCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands.map((c) => ({ text: c.text, kind: h.kind, second: c.second }))).toSorted((a, b) => Number(a.second) - Number(b.second));
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");

