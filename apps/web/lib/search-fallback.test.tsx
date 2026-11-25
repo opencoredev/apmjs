@@ -6,9 +6,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 let pathname = "/package/next";
 
+// a module mock holds for every later test file in the process, so it carries every hook the app imports: one missing
+// (useParams) failed lib/approval-ui.test.tsx whenever the runner ordered it after this file
 void mock.module("next/navigation", () => ({
   usePathname: () => pathname,
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
+  useParams: () => ({}),
+  useSearchParams: () => new URLSearchParams(),
 }));
 
 const { SearchBar } = await import("@/components/search-bar");
