@@ -1,12 +1,12 @@
 // The OSSF feed's reads of one name's advisories (osv.ts advisoriesFor) are bounded: each MAL- id is read once, at most
-// MAX_ADVISORIES of them across every page, a few at a time, and none past MAX_ADVISORY_BYTES. What is past a bound is
-// not read, so the answer is partial: what was read still withholds its versions, and the answer is not kept, so the
-// next request asks again. Reads that overlap spend the request's OSV budget once, not once each. OSV is a stand-in
+// MAX_ADVISORIES of them across every page, a few at a time, and none past MAX_ADVISORY_BYTES. An advisory past a bound
+// is not read, so it withholds every version of the name; the answer is partial and not kept, so the next request asks
+// again. Reads that overlap spend the request's OSV budget once, not once each. OSV is a stand-in
 // fetcher; no network and no database.
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { z } from "zod";
-import { KnownMalicious, MAX_ADVISORIES, MAX_ADVISORY_BYTES, osvFeed, type Advisory } from "../src/osv.ts";
+import { KnownMalicious, listedAmong, MAX_ADVISORIES, MAX_ADVISORY_BYTES, osvFeed, type Advisory } from "../src/osv.ts";
 
 /** `pages`: the MAL- ids of each page of the name's answer, in order, duplicates kept. */
 type Stand = { pages: string[][]; huge?: ReadonlySet<string>; readMs?: number };
@@ -65,13 +65,15 @@ describe("one name's advisory reads are bounded", () => {
     expect(reads(s.counts)).toBe(2);
   });
 
-  test("past MAX_ADVISORIES ids, only that many are read, a few at a time; what was read withholds, and the partial answer is not kept", async () => {
+  test("past MAX_ADVISORIES ids, only that many are read, a few at a time; the rest withhold every version, and the partial answer is not kept", async () => {
     const ids = idsFrom(1000, MAX_ADVISORIES + 36);
     const s = standIn("many-listed", { pages: [ids] });
     const first = await s.ask();
 
-    expect(first.map((a) => a.id)).toEqual(ids.slice(0, MAX_ADVISORIES));
-    expect(first.every((a) => a.versions.includes("1.0.0"))).toBe(true);
+    expect(first.map((a) => a.id).toSorted()).toEqual(ids.toSorted());
+    expect(first.filter((a) => a.versions.includes("1.0.0")).map((a) => a.id)).toEqual(ids.slice(0, MAX_ADVISORIES));
+    // a version only an unread advisory could name is withheld too
+    expect(listedAmong("many-listed", first.filter((a) => a.id === ids.at(-1)), ["2.0.0", "0.0.1-beta"]).size).toBe(2);
     expect(reads(s.counts)).toBe(MAX_ADVISORIES);
     expect(s.counts.maxInFlight).toBeLessThanOrEqual(8);
     // not kept: the next request asks OSV again
@@ -85,13 +87,16 @@ describe("one name's advisory reads are bounded", () => {
 
     expect(reads(s.counts)).toBe(MAX_ADVISORIES);
     expect([...s.counts.reads.values()].every((n) => n === 1)).toBe(true);
-    expect(got.map((a) => a.id)).toEqual([...idsFrom(2000, 40), ...idsFrom(3000, MAX_ADVISORIES - 40)]);
+    expect(got.filter((a) => a.versions.length > 0).map((a) => a.id)).toEqual([...idsFrom(2000, 40), ...idsFrom(3000, MAX_ADVISORIES - 40)]);
+    expect(got.filter((a) => a.versions.length === 0).map((a) => a.id)).toEqual(idsFrom(3000 + MAX_ADVISORIES - 40, 40 - (MAX_ADVISORIES - 40)));
   });
 
-  test("an advisory over MAX_ADVISORY_BYTES is not read; the other one still withholds, and the partial answer is not kept", async () => {
+  test("an advisory over MAX_ADVISORY_BYTES is not read and withholds every version; the other one still withholds its own, and the partial answer is not kept", async () => {
     const s = standIn("one-huge", { pages: [["MAL-2026-7", "MAL-2026-8"]], huge: new Set(["MAL-2026-8"]) });
+    const got = await s.ask();
 
-    expect((await s.ask()).map((a) => a.id)).toEqual(["MAL-2026-7"]);
+    expect(got.map((a) => a.id).toSorted()).toEqual(["MAL-2026-7", "MAL-2026-8"]);
+    expect([...listedAmong("one-huge", got, ["1.0.0", "3.1.4"]).values()].map((m) => m.ids)).toEqual([["MAL-2026-7", "MAL-2026-8"], ["MAL-2026-8"]]);
     await s.ask();
     expect(s.counts.reads.get("MAL-2026-7")).toBe(2);
   });

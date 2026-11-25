@@ -73,11 +73,18 @@ const SHARED_MS = 150;
 
 /**
  * The most MAL- advisories of one name read whole (advisoriesFor), how many are read at once, and the most of one read.
- * An advisory past these is not read, so the answer is partial: what was read still withholds, and it is not kept.
+ * An advisory past these is not read, so which versions it names is not known: it withholds every version of the name
+ * (everyVersion), and the answer is partial, so it is not kept.
  */
 export const MAX_ADVISORIES = 64;
 const ADVISORY_CONCURRENCY = 8;
 export const MAX_ADVISORY_BYTES = 256 * 1024;
+
+/** An answer from OSV over the bytes the read allows. */
+class OverCap extends Error {}
+
+/** What a MAL- advisory apm did not read for being past a bound is taken to name: every version of the name. */
+const everyVersion = (id: string): Advisory => ({ id, versions: [], ranges: [[{ introduced: "0" }]] });
 
 /** Pages of one version's advisories followed past the batch answer's first. */
 const MAX_PAGES = 3;
@@ -292,7 +299,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
 
             const bytes = maxBytes === null ? null : await readCapped(res, maxBytes);
 
-            if (maxBytes !== null && bytes === null) throw new Error(`OSV answered more than ${maxBytes} bytes`);
+            if (maxBytes !== null && bytes === null) throw new OverCap(`OSV answered more than ${maxBytes} bytes`);
             const parsed = schema.safeParse(bytes === null ? await res.json() : JSON.parse(new TextDecoder().decode(bytes)));
 
             if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
@@ -352,7 +359,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         const advisories: Advisory[] = [];
         /** The MAL- ids whose advisory was read: what OSV says of them now is in `advisories`, a withdrawal included. */
         const read = new Set<string>();
-        /** Every MAL- id whose advisory was asked for, read or not: at most MAX_ADVISORIES. */
+        /** Every MAL- id whose advisory was asked for (at most MAX_ADVISORIES), read or not, or withheld whole past that bound. */
         const requested = new Set<string>();
         let token: string | undefined;
         let complete = true;
@@ -373,13 +380,19 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           const fresh = [...new Set(malOnly(first.vulns))].filter((id) => !read.has(id) && !requested.has(id));
           const ids = fresh.slice(0, Math.max(0, MAX_ADVISORIES - requested.size));
 
-          if (ids.length < fresh.length) complete = false;
-          ids.forEach((id) => requested.add(id));
+          for (const id of fresh.slice(ids.length)) {
+            complete = false;
+            advisories.push(everyVersion(id));
+          }
+
+          fresh.forEach((id) => requested.add(id));
           const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer, MAX_ADVISORY_BYTES)), { concurrency: ADVISORY_CONCURRENCY });
 
           details.forEach((r, i) => {
             if (Result.isFailure(r)) {
               complete = false;
+
+              if (r.failure instanceof OverCap) advisories.push(everyVersion(ids[i] ?? ""));
 
               return;
             }
