@@ -28,8 +28,8 @@ import { z } from "zod";
 import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
 import { installCheck } from "./cli-check.ts";
-import { cliLedgerPath, readCliReleases } from "./cli-ledger.ts";
-import { installStep, LARGE_PACKAGES, largePackageAnswer, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
+import { cliLedgerPath } from "./cli-ledger.ts";
+import { cliRecordOf, installStep, killRunning, LARGE_PACKAGES, largePackageAnswer, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
@@ -39,10 +39,14 @@ const { stage, build, subdomain } = parseSmokeArgs(process.argv.slice(2));
 const { registry, web, docs } = smokeTargets(stage, subdomain);
 const work = mkdtempSync(join(tmpdir(), "apm-smoke-"));
 
-// the workspace holds a login token in publish/.npmrc, so it goes however the run ends: a thrown check, an exit or a signal
+// the workspace holds a login token in publish/.npmrc, so it goes however the run ends: a thrown check, an exit or a
+// signal; so do the commands still running, whose process groups outlive this one
 const removeWork = (): void => rmSync(work, { recursive: true, force: true });
 
-process.on("exit", removeWork);
+process.on("exit", () => {
+  killRunning();
+  removeWork();
+});
 
 // SIGHUP: an operator's SSH session dropping. SIGKILL cannot be caught; nothing here can clean up after it.
 const SIGNAL_EXITS = [["SIGHUP", 129], ["SIGINT", 130], ["SIGQUIT", 131], ["SIGABRT", 134], ["SIGTERM", 143]] as const;
@@ -126,14 +130,13 @@ async function identity(when: "before" | "after"): Promise<void> {
  * The documented install, `curl -fsSL <site>/install | sh`, into a fresh HOME (cli-check.ts): it must install, the
  * installed apm must print the version, and the fingerprint the script printed must be the installed file's SHA-256 and
  * the one the version's SHA256SUMS lists. A stage with no CLI release yet answers /install with 404 and a sentence
- * saying so; that passes only while this machine's CLI release record (cli-ledger.ts) exists and has no release for the
+ * saying so; that passes only while this machine's CLI release record (cli-ledger.ts) exists, parses, and has no release for the
  * stage (smoke-checks.ts, installStep).
  */
 async function cliInstall(): Promise<void> {
   const site = web.replace(/\/$/, "");
   const res = await bounded(`${site}/install`, { method: "HEAD" });
-  const ledger = cliLedgerPath();
-  const step = installStep({ status: res.status, stage, record: existsSync(ledger) ? { kind: "read", releases: readCliReleases(stage, ledger) } : { kind: "absent", path: ledger } });
+  const step = installStep({ status: res.status, stage, record: cliRecordOf(stage, cliLedgerPath()) });
 
   if (step.kind !== "install") {
     record(step.kind === "skip", "the CLI install script", step.detail);

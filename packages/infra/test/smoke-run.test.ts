@@ -2,11 +2,12 @@
 // the timeout, not hold the deploy waiting on smoke; a 404 from /install passes only where the CLI release record is;
 // and the package check must give a very large package a real verdict (issue #1).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCliReleases, type CliRelease } from "../cli-ledger.ts";
-import { installStep, largePackageAnswer, smokeTimeouts } from "../smoke-checks.ts";
+import { installCheck } from "../cli-check.ts";
+import { cliRecordOf, installStep, largePackageAnswer, smokeTimeouts } from "../smoke-checks.ts";
 
 const SMOKE = join(import.meta.dir, "..", "smoke.ts");
 
@@ -47,6 +48,44 @@ describe("a 404 from /install", () => {
   test("any other answer runs the install, record or not", () => {
     for (const record of [{ kind: "absent", path: "x" } as const, { kind: "read", releases: [] } as const]) expect(installStep({ status: 200, stage: "production", record })).toEqual({ kind: "install" });
   });
+
+  test("a record with a line that does not parse (a write torn by a crash) cannot vouch for no release, so a 404 fails", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apm-torn-ledger-"));
+    const path = join(dir, "cli-releases.jsonl");
+
+    try {
+      writeFileSync(path, `${JSON.stringify(release)}\n{"version":"0.1.3","stage":"produc`);
+      // what smoke read before: the torn production line is dropped, and production looks like it never had a release
+      expect(readCliReleases("production", path)).toEqual([]);
+      const record = cliRecordOf("production", path);
+
+      expect(record).toEqual({ kind: "unreadable", path, broken: 1 });
+      expect(installStep({ status: 404, stage: "production", record }).kind).toBe("fail");
+      writeFileSync(path, `${JSON.stringify(release)}\n`);
+      expect(cliRecordOf("staging", path)).toEqual({ kind: "read", releases: [release] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the CLI install check", () => {
+  test("an installed apm that hangs on --version fails the check within the command timeout", async () => {
+    // an install script that installs an apm which never answers, and says what the real script says
+    const script = ['mkdir -p "$HOME/.apm/bin"', `printf '#!/bin/sh\\nsleep 30\\n' > "$HOME/.apm/bin/apm"`, 'chmod +x "$HOME/.apm/bin/apm"', 'echo "apm 0.1.2 (linux-x64) installed to $HOME/.apm/bin/apm"', `echo "SHA-256 ${"0".repeat(64)}, checked against this script"`].join("\n");
+    const site = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (req) => (new URL(req.url).pathname === "/install" ? new Response(script) : new Response("not found", { status: 404 })) });
+    const started = Date.now();
+
+    try {
+      const r = await installCheck(`http://127.0.0.1:${site.port}`, { httpMs: 1000, commandMs: 500 });
+
+      expect(r.ok).toBe(false);
+      expect(r.detail).toContain("apm --version gave no result within 500 ms");
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      site.stop(true);
+    }
+  }, 40_000);
 });
 
 describe("the package check for a very large package", () => {
@@ -103,6 +142,40 @@ describe("smoke.ts against a stage that accepts connections and never answers", 
     expect(out).toMatch(/^0\/\d+ passed$/m);
     expect(Date.now() - started).toBeLessThan(60_000);
   }, 90_000);
+
+  test("stopping the run kills the command it was waiting on, not only itself", async () => {
+    // the commands smoke runs work in its workspace, under TMPDIR: any process whose cwd is there is one of them
+    const commands = (): number[] =>
+      readdirSync("/proc")
+        .filter((p) => /^\d+$/.test(p))
+        .filter((p) => {
+          try {
+            return readlinkSync(`/proc/${p}/cwd`).startsWith(dir);
+          } catch {
+            return false;
+          }
+        })
+        .map(Number);
+
+    const proc = Bun.spawn(["bun", SMOKE, "--stage", "staging", "--subdomain", `x@127.0.0.1:${silent.port}/#`], {
+      env: { PATH: process.env.PATH ?? "", TMPDIR: dir, APM_SECRETS_DIR: join(dir, "secrets"), APM_CLI_RELEASES_LEDGER: join(dir, "cli-releases.jsonl"), APM_SMOKE_HTTP_TIMEOUT_MS: "300", APM_SMOKE_COMMAND_TIMEOUT_MS: "60000" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    try {
+      // the docs and install checks time out in 600 ms, then bun install of the first locked project waits on the socket
+      for (let i = 0; i < 200 && commands().length === 0; i++) await Bun.sleep(25);
+      expect(commands().length).toBeGreaterThan(0);
+      proc.kill("SIGTERM");
+      expect(await proc.exited).toBe(143);
+
+      for (let i = 0; i < 40 && commands().length > 0; i++) await Bun.sleep(25);
+      expect(commands()).toEqual([]);
+    } finally {
+      for (const pid of commands()) process.kill(pid, "SIGKILL");
+    }
+  }, 30_000);
 });
 
 test("smoke.ts sends every request through its bounded fetch", () => {

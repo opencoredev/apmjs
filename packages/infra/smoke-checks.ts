@@ -1,7 +1,8 @@
 // The decisions smoke.ts makes that do not need a network: how long a request or a command may take, whether a 404 from
 // /install can pass, and whether the package check's answer for a very large package is a real verdict.
+import { existsSync, readFileSync } from "node:fs";
 import { z } from "zod";
-import type { CliRelease } from "./cli-ledger.ts";
+import { CliRelease, readCliReleases } from "./cli-ledger.ts";
 
 export type SmokeTimeouts = { httpMs: number; commandMs: number };
 
@@ -26,20 +27,47 @@ export function smokeTimeouts(env: Readonly<Record<string, string | undefined>>)
   return { httpMs: ms("APM_SMOKE_HTTP_TIMEOUT_MS", 30_000), commandMs: ms("APM_SMOKE_COMMAND_TIMEOUT_MS", 600_000) };
 }
 
-/** What this machine's CLI release record says, or that it has none (smoke.ts running away from the deploy machine). */
-export type CliRecord = { kind: "absent"; path: string } | { kind: "read"; releases: readonly CliRelease[] };
+/**
+ * What this machine's CLI release record says: absent (smoke.ts running away from the deploy machine), unreadable (a
+ * line that does not parse, such as one torn by a crash, so the record cannot vouch that a release never happened), or
+ * read.
+ */
+export type CliRecord = { kind: "absent"; path: string } | { kind: "unreadable"; path: string; broken: number } | { kind: "read"; releases: readonly CliRelease[] };
+
+function parsesAsRelease(line: string): boolean {
+  try {
+    return CliRelease.safeParse(JSON.parse(line)).success;
+  } catch {
+    return false;
+  }
+}
+
+/** The record at `path` for `stage`. readCliReleases drops a broken line; here one makes the whole record unreadable. */
+export function cliRecordOf(stage: CliRelease["stage"], path: string): CliRecord {
+  if (!existsSync(path)) return { kind: "absent", path };
+
+  const broken = readFileSync(path, "utf8")
+    .split("\n")
+    .filter((l) => l.trim() !== "" && !parsesAsRelease(l)).length;
+
+  return broken > 0 ? { kind: "unreadable", path, broken } : { kind: "read", releases: readCliReleases(stage, path) };
+}
 
 export type InstallStep = { kind: "install" } | { kind: "skip"; detail: string } | { kind: "fail"; detail: string };
 
 /**
- * A stage with no CLI release yet answers /install with 404, which passes only while the record says so. Without a
- * record a 404 proves nothing: a stage that never had a CLI release cannot be told from one whose install broke.
+ * A stage with no CLI release yet answers /install with 404, which passes only while a readable record says so. Without
+ * one a 404 proves nothing: a stage that never had a CLI release cannot be told from one whose install broke.
  */
 export function installStep(input: { status: number; stage: string; record: CliRecord }): InstallStep {
   if (input.status !== 404) return { kind: "install" };
 
   if (input.record.kind === "absent") {
     return { kind: "fail", detail: `/install answers 404 and this machine has no CLI release record (${input.record.path}), so a stage that never had a CLI release cannot be told from a broken install. Run the smoke check where release-cli.ts runs, or set APM_CLI_RELEASES_LEDGER to that record` };
+  }
+
+  if (input.record.kind === "unreadable") {
+    return { kind: "fail", detail: `/install answers 404 and the CLI release record (${input.record.path}) has ${input.record.broken} line(s) that do not parse, so it cannot show that ${input.stage} never had a CLI release` };
   }
 
   if (input.record.releases.length === 0) return { kind: "skip", detail: `skipped: no CLI release on ${input.stage} yet (bun packages/infra/release-cli.ts --stage ${input.stage})` };
@@ -50,6 +78,20 @@ export function installStep(input: { status: number; stage: string; record: CliR
 /** What the command printed and how it ended; `stopped` when it ran past its time and was killed. */
 export type Ran = { code: number; stdout: string; stderr: string; stopped: boolean };
 
+/** Process groups spawnBounded started that have not ended yet. */
+const running = new Set<number>();
+
+/** Kills every group still running. smoke.ts calls it on exit: a detached group outlives its parent and its timer. */
+export function killRunning(): void {
+  for (const pid of running) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // the group already ended
+    }
+  }
+}
+
 /**
  * Runs `cmd` in a process group of its own and kills the whole group with SIGKILL after `ms`. Bun's spawn timeout sends
  * one signal to one process: npm ignores SIGTERM while a request hangs, and in `curl | sh` the pipeline's children
@@ -58,6 +100,8 @@ export type Ran = { code: number; stdout: string; stderr: string; stopped: boole
 export async function spawnBounded(cmd: string[], options: { cwd: string; env: Record<string, string> }, ms: number): Promise<Ran> {
   const proc = Bun.spawn(cmd, { ...options, stdout: "pipe", stderr: "pipe", detached: true });
   let stopped = false;
+
+  running.add(proc.pid);
 
   const timer = setTimeout(() => {
     stopped = true;
@@ -75,6 +119,7 @@ export async function spawnBounded(cmd: string[], options: { cwd: string; env: R
     return { code, stdout, stderr, stopped };
   } finally {
     clearTimeout(timer);
+    running.delete(proc.pid);
   }
 }
 

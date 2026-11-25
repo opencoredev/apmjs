@@ -68,14 +68,14 @@ export async function installCheck(site: string, timeouts: SmokeTimeouts = smoke
 
     if (installed !== bin || !existsSync(bin)) return { ok: false, detail: `apm was not installed at ${bin} (the script said ${installed})` };
     const version = CliVersion.parse(versionText);
-    const ran = Bun.spawnSync([bin, "--version"], { env, cwd: home });
-    const reported = ran.stdout.toString().trim();
+    const ran = await spawnBounded([bin, "--version"], { env, cwd: home }, timeouts.commandMs);
+    const reported = ran.stdout.trim();
     const actual = await sha256File(bin);
     const sumsRes = await fetch(`${site}/cli/${version}/SHA256SUMS`, { signal: AbortSignal.timeout(timeouts.httpMs) });
     const published = sumsRes.ok ? (parseSums(version, await sumsRes.text()).find((s) => s.target === target)?.sha256 ?? null) : null;
 
     const problems = [
-      ran.exitCode === 0 && reported === version ? null : `apm --version exited ${ran.exitCode} and printed "${reported}"`,
+      ran.stopped ? `apm --version gave no result within ${timeouts.commandMs} ms` : ran.code === 0 && reported === version ? null : `apm --version exited ${ran.code} and printed "${reported}"`,
       actual === printed ? null : `the installed file's SHA-256 is ${actual}, not the ${printed} the script printed`,
       published === printed ? null : `SHA256SUMS of ${version} lists ${published ?? "nothing"} for ${target} (HTTP ${sumsRes.status})`,
       target === hostTarget() ? null : `the script installed ${target} on a ${hostTarget() ?? "unknown"} machine`,
