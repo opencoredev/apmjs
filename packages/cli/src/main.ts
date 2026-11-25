@@ -2325,7 +2325,9 @@ function refuseArgs(a: Args): boolean {
     return true;
   }
 
-  if (a.flags.get("pm") === true) {
+  const pm = a.flags.get("pm");
+
+  if (pm === true || pm === "") {
     fail("apm: --pm needs a value (bun, npm, pnpm or yarn). Nothing was run.");
 
     return true;

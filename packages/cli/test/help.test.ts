@@ -3,7 +3,7 @@
 // refuses a flag it does not read, before anything else. Each run here is in a fresh folder, with a recording registry
 // and a package manager stand-in on PATH that logs every call: help and a refusal must reach neither, and change no file.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMMANDS } from "../src/commands.ts";
@@ -49,24 +49,28 @@ async function apm(argv: string[]): Promise<Run> {
 
   requests = [];
 
-  const proc = Bun.spawn([process.execPath, CLI, ...argv], {
-    cwd,
-    env: { PATH: `${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: root, NO_COLOR: "1", APM_REGISTRY: server?.url.href ?? "" },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  try {
+    const proc = Bun.spawn([process.execPath, CLI, ...argv], {
+      cwd,
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: root, TMPDIR: root, NO_COLOR: "1", APM_REGISTRY: server?.url.href ?? "" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
-  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 
-  return {
-    code,
-    out,
-    err,
-    pmCalls: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [],
-    files: readdirSync(cwd).sort(),
-    packageJson: readFileSync(join(cwd, "package.json"), "utf8"),
-  };
+    return {
+      code,
+      out,
+      err,
+      pmCalls: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [],
+      files: readdirSync(cwd).sort(),
+      packageJson: readFileSync(join(cwd, "package.json"), "utf8"),
+    };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 function expectNothingRan(r: Run): void {
@@ -196,6 +200,8 @@ describe("a flag a command does not read", () => {
     [["publish", "--pm="], "--pm needs a value"],
     [["publish", "--tag=--registry=http://127.0.0.1:9/"], "--tag cannot start with -"],
     [["run", "dev", "--pm"], "--pm needs a value"],
+    [["install", "--pm="], "--pm needs a value"],
+    [["run", "dev", "--pm="], "--pm needs a value"],
   ])("apm %p: %s", async (argv, message) => {
     const r = await apm(argv);
 
