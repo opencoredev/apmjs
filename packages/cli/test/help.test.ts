@@ -433,11 +433,11 @@ describe("what still goes to the package manager", () => {
   });
 
   test.each([
-    [["ci", "left-pad"], "apm ci with no packages does not pass left-pad on to bun"],
+    [["ci", "--pm", "npm", "left-pad"], "apm ci with no packages does not pass left-pad on to npm"],
     [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
-    [["ci", "--pm", "yarn"], "yarn has no ci; for a frozen install run apm install --frozen-lockfile"],
-    [["ci"], "apm ci needs a bun.lock or bun.lockb"],
-    [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci; for a frozen install run apm install --frozen-lockfile"],
+    [["ci", "--pm", "yarn"], "yarn has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
+    [["ci"], "bun has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
+    [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile"],
     [["run", "-i", "build.ts"], "apm does not pass bun's -i on"],
     [["run", "--install=force", "build.ts"], "apm does not pass bun's --install=force on"],
     [["run", "--bun", "dev"], "apm does not pass bun's --bun on"],
@@ -462,24 +462,19 @@ describe("what still goes to the package manager", () => {
   });
 
   test.each([
-    [["ci"], "bun install --frozen-lockfile"],
     [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
     [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
   ])("apm %p is the package manager's clean install", async (argv, call) => {
-    const r = await apm(argv, "4.5.0", PACKAGE_JSON, { "bun.lock": "{}\n" });
+    const r = await apm(argv);
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
   });
 
   test.each([
-    [["remove", "zod"], "bun remove zod"],
-    [["remove", "--pm", "npm", "zod"], "npm remove zod"],
     [["why", "--pm", "npm", "zod"], "npm why zod"],
     [["outdated", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false outdated"],
     [["dev", "--pm", "pnpm"], "pnpm --config.verify-deps-before-run=false run dev"],
-    [["remove", "--pm", "pnpm", "zod"], "pnpm remove zod"],
-    [["remove", "--pm", "yarn", "zod"], "yarn remove zod"],
     [["start", "--pm", "npm"], "npm start"],
     [["run", "dev", "-i"], "bun run --no-install dev -i"],
     [["run", "--silent", "dev"], "bun run --no-install --silent dev"],
@@ -523,6 +518,34 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.out).toContain("usage: apm ci");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  const ZOD_LOCKS: [string, string, string][] = [
+    ["bun", "bun.lock", JSON.stringify({ lockfileVersion: 1, workspaces: { "": { name: "help-probe", dependencies: { zod: "^4.0.0" } } }, packages: { zod: ["zod@4.1.0", "", {}, "sha512-zod"] } })],
+    ["npm", "package-lock.json", JSON.stringify({ name: "help-probe", lockfileVersion: 3, requires: true, packages: { "": { name: "help-probe", dependencies: { zod: "^4.0.0" } }, "node_modules/zod": { version: "4.1.0", resolved: "https://registry.npmjs.org/zod/-/zod-4.1.0.tgz", integrity: "sha512-zod" } } })],
+    ["pnpm", "pnpm-lock.yaml", JSON.stringify({ lockfileVersion: "9.0", importers: { ".": { dependencies: { zod: { specifier: "^4.0.0", version: "4.1.0" } } } }, packages: { "zod@4.1.0": { resolution: { integrity: "sha512-zod" } } }, snapshots: { "zod@4.1.0": {} } })],
+    ["yarn", "yarn.lock", 'zod@^4.0.0:\n  version "4.1.0"\n'],
+  ];
+
+  const withDeps = (dependencies: Record<string, string>): string => `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies })}\n`;
+
+  test.each(ZOD_LOCKS)("apm remove with %s passes the removal on while the lockfile pins every range package.json lists", async (pm, file, lock) => {
+    const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { [file]: lock });
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([`${pm} remove zod`]);
+  });
+
+  test.each(ZOD_LOCKS.flatMap(([pm, file, lock]) => [
+    [pm, "a range the lockfile lacks", withDeps({ zod: "^4.0.0", "is-number": "^7.0.0" }), { [file]: lock }, "package.json lists is-number@^7.0.0, which the lockfile does not pin"],
+    [pm, "a range the locked version does not satisfy", withDeps({ zod: "^5.0.0" }), { [file]: lock }, "package.json lists zod@^5.0.0, which the lockfile does not pin"],
+    [pm, "no lockfile", withDeps({ zod: "^4.0.0" }), {}, "package.json lists zod@^4.0.0, which the lockfile does not pin"],
+  ] as const))("apm remove with %s is refused for %s: the package manager would install it unchecked", async (pm, _why, packageJson, files, message) => {
+    const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", packageJson, files);
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain(message);
     expect(r.pmCalls).toEqual([]);
   });
 

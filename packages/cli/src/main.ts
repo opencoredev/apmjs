@@ -12,7 +12,7 @@ import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
-import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
+import { isLockPm, isRegistryVersion, LOCKFILES, lockedTree, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
 import { addArgs, detectPm, frozenInstallArgs, installLockOnlyArgs, lockOnlyArgs, packArgs, publishArgs, runCmd, yarnLine, type Detection, type Pm } from "./pm.ts";
 import { checkedCount, checkGraph, DEFAULT_CHECK, idOf, lockGraph, type Blocked, type CheckPolicy, type InstalledPackage, type LocalPackage, type LockGraph, type Member } from "./installed.ts";
@@ -2280,7 +2280,7 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm <script>               a package.json script (apm dev = bun run dev)
   apm remove <pkg>...        your package manager's removal, by name only
   apm test                   your package manager's test; npm and pnpm also start, why, ls and outdated, yarn start and why
-  apm ci                     bun and npm: a frozen install, with the switches apm install takes with no packages
+  apm ci                     npm only: npm ci, with the switches apm install takes with no packages
   apm <anything else>        refused: it could install packages apm cannot check
   apm <command> --help       an apm command's flags (also -h, or apm help <command>); runs nothing. After a command
                              apm passes on, --help goes to the package manager or the script
@@ -2303,8 +2303,8 @@ const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain"
 
 /**
  * The package manager's commands apm passes on, besides the project's scripts: ones that install nothing new (removal,
- * by package name alone, lays out only what the lockfile pins). bun runs a file or a script for a word that is not its
- * own command (bun ls, bun start), and installs what that file imports, so with bun apm passes on fewer.
+ * by package name alone, only while the lockfile pins every range package.json lists). bun runs a file or a script for a
+ * word that is not its own command (bun ls, bun start), and installs what that file imports, so with bun apm passes on fewer.
  */
 const PASSTHROUGH = new Map<Pm, ReadonlySet<string>>([
   ["bun", new Set(["run", "test", "remove", "rm", "uninstall"])],
@@ -2353,6 +2353,62 @@ function bunRunsNode(cwd: string): boolean {
   });
 }
 
+const DeclaredDeps = z.record(z.string(), z.string()).optional().catch(undefined);
+const Declared = z.object({ dependencies: DeclaredDeps, devDependencies: DeclaredDeps, optionalDependencies: DeclaredDeps }).loose();
+
+/** The entries of a yarn.lock: each `name@range` it resolves (yarn 1), or `name@npm:range` (yarn 2 and later). */
+function yarnLockKeys(path: string): Set<string> {
+  const text = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const heads = text.split("\n").filter((line) => /^[^\s#].*:$/.test(line));
+
+  return new Set(heads.flatMap((line) => line.slice(0, -1).split(",").map((key) => key.trim().replace(/^"|"$/g, ""))));
+}
+
+/**
+ * The semver ranges the project's package.json files list that its lockfile does not pin, which the package manager
+ * would resolve afresh, unchecked, during a removal; or why apm cannot tell. Other specs (workspace:, file:, git, a tag)
+ * are not apm's to check.
+ */
+function unlockedDeps(cwd: string, pm: Pm): { kind: "ok"; unlocked: string[] } | { kind: "unknown"; why: string } {
+  const layout = projectLayout({ cwd, pm });
+
+  if (layout.kind === "refused") return { kind: "unknown", why: layout.reason };
+  const { root, members } = layout.layout;
+
+  if (isLockPm(pm)) {
+    const read = lockedTree({ cwd: root, pm, roots: { kind: "all" } });
+
+    if (read.kind === "unreadable") return { kind: "unknown", why: `apm could not read ${read.path}: ${read.reason}` };
+  }
+
+  const yarnKeys = pm === "yarn" ? yarnLockKeys(join(root, "yarn.lock")) : null;
+  const unlocked: string[] = [];
+
+  for (const dir of new Set(["", ...members.map((m) => m.dir)])) {
+    const file = join(root, dir, "package.json");
+    let parsed;
+
+    try {
+      parsed = Declared.safeParse(JSON.parse(readFileSync(file, "utf8")));
+    } catch {
+      return { kind: "unknown", why: `apm could not read ${file}` };
+    }
+
+    if (!parsed.success) return { kind: "unknown", why: `apm could not read ${file}` };
+    const deps = Object.entries({ ...parsed.data.optionalDependencies, ...parsed.data.devDependencies, ...parsed.data.dependencies }).filter(([, range]) => isValidRange(range));
+    const pins = yarnKeys === null ? projectPins({ cwd: join(root, dir), pm, names: deps.map(([name]) => name) }) : null;
+
+    for (const [name, range] of deps) {
+      const pin = pins?.get(name);
+      const locked = yarnKeys !== null ? yarnKeys.has(`${name}@${range}`) || yarnKeys.has(`${name}@npm:${range}`) : pin !== undefined && (pin.kind === "unknown" || Bun.semver.satisfies(pin.version, range));
+
+      if (!locked) unlocked.push(`${name}@${range}`);
+    }
+  }
+
+  return { kind: "ok", unlocked };
+}
+
 /** Why apm refuses to pass these arguments on to `pm` for `cmd`, or null. */
 function passthroughError(cmd: string, args: readonly string[], end: number, pm: Pm, cwd: string): string | null {
   const own = end === -1 ? args : args.slice(0, end);
@@ -2360,7 +2416,13 @@ function passthroughError(cmd: string, args: readonly string[], end: number, pm:
   if (REMOVALS.has(cmd)) {
     const word = args.find((x) => x.startsWith("-") && x !== "--");
 
-    return word === undefined ? null : `apm ${cmd} passes on only the names of the packages to remove, not ${word}, which could make ${pm} install versions its lockfile does not pin`;
+    if (word !== undefined) return `apm ${cmd} passes on only the names of the packages to remove, not ${word}, which could make ${pm} install versions its lockfile does not pin`;
+    // a removal brings the project in line with package.json, so what package.json lists and the lockfile lacks would be installed unchecked
+    const deps = unlockedDeps(cwd, pm);
+
+    if (deps.kind === "unknown") return `apm ${cmd} needs a lockfile it can read, so ${pm} installs nothing it does not pin, and ${deps.why}`;
+
+    return deps.unlocked.length === 0 ? null : `package.json lists ${deps.unlocked.join(", ")}, which the lockfile does not pin, so ${pm} would install it unchecked while it removes. Run apm add for it first`;
   }
 
   if (pm !== "bun") return null;
@@ -2468,41 +2530,23 @@ function update(a: Args): number {
   return 2;
 }
 
-/** Whether bun has a lockfile for `cwd`: a bun.lock or bun.lockb there or in a folder above it. */
-function hasBunLockfile(cwd: string): boolean {
-  for (let dir = cwd; ; dir = dirname(dir)) {
-    if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) return true;
-
-    if (dirname(dir) === dir) return false;
-  }
-}
-
 /** `apm ci`: the package manager's clean install, with only the arguments a bare install passes on (none can name a package). */
 async function cleanInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
 
-  const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
-  // bun 1.1 has no ci (it runs a script of that name), so apm asks every bun for the frozen install by name
-  const command = det.pm === "bun" ? ["install", "--frozen-lockfile"] : ["ci"];
+  // bun's ci differs by version (bun 1.1 runs a script of that name, and none of them needs a usable lockfile), so only npm's is passed on
+  const passed = det.pm === "npm" ? bareInstallArgs(a, det.pm) : { error: `${det.pm} has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile` };
 
-  // bun's --frozen-lockfile installs what package.json says when there is no lockfile at all
-  if ("args" in passed && det.pm === "bun" && !hasBunLockfile(cwd)) {
-    fail("apm: apm ci needs a bun.lock or bun.lockb: without one, bun would install the newest versions package.json allows, unchecked. Nothing was run.");
-    say("To check and add packages, run apm add <package>.");
-
-    return 2;
-  }
-
-  if ("args" in passed) return (await runCmd([det.pm, ...command, ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  if ("args" in passed) return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   fail(`apm: ${passed.error}. Nothing was run.`);
 
-  if (det.pm === "bun" || det.pm === "npm") say(`For other ${det.pm} ci options, run ${det.pm} ci yourself.`);
+  if (det.pm === "npm") say("For other npm ci options, run npm ci yourself.");
 
   return 2;
 }
 
-const CI_HELP = "usage: apm ci [switches]\n\nWith bun and npm, a frozen install from the lockfile (bun install --frozen-lockfile, npm ci), with the switches\napm install takes with no packages. pnpm and yarn have no ci: run apm install --frozen-lockfile.";
+const CI_HELP = "usage: apm ci [switches]\n\nWith npm, npm ci with the switches apm install takes with no packages. With bun, pnpm and yarn, apm passes no ci\non: run apm install --frozen-lockfile.";
 
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
