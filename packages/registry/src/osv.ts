@@ -116,7 +116,11 @@ function remember(key: string, ids: string[], until: number): void {
 const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-"));
 
 /** A name's advisories as kept: when OSV gave them (wall clock), in the isolate and in the data center's cache. */
-const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema) });
+/**
+ * A name's advisories as kept: when OSV gave them (wall clock), and whether that was all of them. Only a complete answer
+ * is fresh or shared with the data center; a partial one keeps what it found for while OSV is not asked again.
+ */
+const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema), complete: z.boolean() });
 
 type NameEntry = z.infer<typeof NameEntry>;
 
@@ -150,12 +154,29 @@ async function sharedRead(key: string): Promise<NameEntry | null> {
   return parsed.success ? parsed.data : null;
 }
 
-/** Gives the data center a copy of a name's advisories, best effort: the request does not wait for it. */
-function sharedWrite(key: string, entry: NameEntry): void {
+/** What the Worker keeps running after the response (ctx.waitUntil), or null outside one. */
+export type FeedBackground = ((work: Promise<void>) => void) | null;
+
+/** How long a copy written to the data center's cache is kept running after the response. */
+const SHARED_WRITE_MS = 5_000;
+
+/** Gives the data center a copy of a name's advisories after the response, in the request's waitUntil when it has one. */
+function sharedWrite(key: string, entry: NameEntry, background: FeedBackground): void {
   if (typeof caches === "undefined") return;
   const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
+  const put = within(caches.default.put(sharedKey(key), res), SHARED_WRITE_MS).then(() => undefined);
 
-  caches.default.put(sharedKey(key), res).catch(() => undefined);
+  if (background === null) void put;
+  else background(put);
+}
+
+/** The advisories of several answers, each id once, the first answer's copy of it kept. */
+function union(answers: readonly (readonly Advisory[])[]): Advisory[] {
+  const out = new Map<string, Advisory>();
+
+  for (const a of answers.flat()) if (!out.has(a.id)) out.set(a.id, a);
+
+  return [...out.values()];
 }
 
 /** What one advisory OSV sent says about npm's `name`: nothing when it is withdrawn or names no version of it. */
@@ -223,8 +244,8 @@ export function listedAmong(name: string, advisories: readonly Advisory[], versi
   return out;
 }
 
-/** The live feed at `baseUrl` (OSV's API root, ending in a slash), with one request's budget. */
-export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.Layer<KnownMalicious> {
+/** The live feed at `baseUrl` (OSV's API root, ending in a slash), with one request's budget; `background` keeps its cache writes. */
+export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, background: FeedBackground = null): Layer.Layer<KnownMalicious> {
   return Layer.sync(KnownMalicious, () => {
     /** Time this request has spent waiting on OSV, and whether it stopped asking (a failure). */
     let spentMs = 0;
@@ -302,13 +323,14 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
       });
 
     /**
-     * The MAL- advisories OSV has for npm's `name`, with the versions each names, and whether that is all of them: a
-     * later page or an advisory that could not be read leaves it partial, keeping every advisory that was read. Fails
-     * only when the first page was not answered.
+     * The MAL- advisories OSV has for npm's `name`, with the versions each names, and whether that is all of them. Each
+     * page's MAL- ids are read before the next page is asked for, so a slow later page cannot spend the budget before
+     * what was found is known. A later page or an advisory that could not be read leaves the answer partial, keeping
+     * every advisory that was read. Fails only when the first page was not answered.
      */
     const askName = (name: string) =>
       Effect.gen(function* () {
-        const ids = new Set<string>();
+        const advisories: Advisory[] = [];
         let token: string | undefined;
         let complete = true;
 
@@ -325,7 +347,14 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             break;
           }
 
-          for (const id of malOnly(first.vulns)) ids.add(id);
+          const ids = malOnly(first.vulns).filter((id) => !advisories.some((a) => a.id === id));
+          const read = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
+
+          for (const r of read) {
+            if (Result.isSuccess(r)) advisories.push(...advisoryOf(name, r.success));
+            else complete = false;
+          }
+
           token = first.next_page_token;
 
           if (token === undefined) break;
@@ -336,10 +365,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
           }
         }
 
-        const read = yield* Effect.forEach([...ids], (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer)), { concurrency: "unbounded" });
-        const advisories = read.flatMap((r) => (Result.isSuccess(r) ? advisoryOf(name, r.success) : []));
-
-        return { advisories, complete: complete && read.every(Result.isSuccess) };
+        return { advisories, complete };
       });
 
     return KnownMalicious.of({
@@ -351,7 +377,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
           const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
           const kept = NAMES.get(key) ?? null;
 
-          if (kept !== null && youngerThan(kept, NAME_FRESH_MS)) return kept.advisories;
+          if (kept !== null && kept.complete && youngerThan(kept, NAME_FRESH_MS)) return kept.advisories;
           const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
 
           if (shared !== null && youngerThan(shared, NAME_FRESH_MS)) {
@@ -360,31 +386,43 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             return shared.advisories;
           }
 
-          // what OSV cannot be asked for now is answered from the newest answer kept, if it is young enough (fail open)
-          const stale = [kept, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0]?.advisories ?? [];
+          // what OSV cannot be asked for now is answered from what was kept, complete or partial, while it is young
+          // enough (fail open past that); a partial answer kept is never fresh, so it is asked again after its back-off
+          const usable = [kept, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : []));
+          const stale = union(usable.toSorted((a, b) => b.fetchedAt - a.fetchedAt).map((e) => e.advisories));
 
-          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now) return stale;
+          // OSV down at this root, or this name's last answer partial: wait out the back-off instead of asking again
+          if (stopped || spentMs >= REQUEST_BUDGET_MS || (BACKOFF.get(baseUrl) ?? 0) > now || (BACKOFF.get(key) ?? 0) > now) return stale;
           const got = yield* Effect.result(askName(name));
 
           if (Result.isSuccess(got) && got.success.complete) {
-            const entry = { fetchedAt: now, advisories: got.success.advisories };
+            const entry = { fetchedAt: now, advisories: got.success.advisories, complete: true };
 
             rememberName(key, entry);
-            sharedWrite(key, entry);
+            sharedWrite(key, entry, background);
 
             return entry.advisories;
           }
 
           console.error(JSON.stringify({ event: "osv-name", name, error: Result.isSuccess(got) ? "partial answer" : String(got.failure) }));
-          // no more waiting on OSV in this request, nor in this isolate for a while: what is kept still counts
+          // no more waiting on OSV in this request: what is kept still counts
           stopped = true;
-          BACKOFF.set(baseUrl, now + NAME_BACKOFF_MS);
 
-          if (Result.isFailure(got)) return stale;
-          // a partial answer is not kept, but what it found is withheld, beside what the kept answer found
-          const found = new Set(got.success.advisories.map((a) => a.id));
+          if (Result.isFailure(got)) {
+            // the first page went unanswered: OSV is taken as down at this root for a while
+            BACKOFF.set(baseUrl, now + NAME_BACKOFF_MS);
 
-          return [...got.success.advisories, ...stale.filter((a) => !found.has(a.id))];
+            return stale;
+          }
+
+          // a partial answer: what it found is withheld, beside what was kept, and kept as partial so the requests
+          // during this name's back-off withhold it too
+          const advisories = union([got.success.advisories, stale]);
+
+          BACKOFF.set(key, now + NAME_BACKOFF_MS);
+          rememberName(key, { fetchedAt: kept?.fetchedAt ?? shared?.fetchedAt ?? now, advisories, complete: false });
+
+          return advisories;
         }),
       lookup: (pkgs) =>
         Effect.gen(function* () {

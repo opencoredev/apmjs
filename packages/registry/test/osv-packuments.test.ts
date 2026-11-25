@@ -111,12 +111,14 @@ const npm = Bun.serve({
 const NameQuery = z.object({ queries: z.array(z.strictObject({ package: z.object({ name: z.string(), ecosystem: z.literal("npm") }) })).length(1) });
 
 /** OSV, standing in: counts the name queries and advisory reads, fails while `down`, answers late while `stallMs`. */
-const osv = { names: 0, reads: 0, down: false, stallMs: 0, unreadable: new Set<string>() };
+const osv = { attempts: 0, names: 0, reads: 0, down: false, stallMs: 0, unreadable: new Set<string>() };
 
 const osvServer = Bun.serve({
   port: 0,
   hostname: "127.0.0.1",
   async fetch(req): Promise<Response> {
+    osv.attempts++;
+
     if (osv.stallMs > 0) await Bun.sleep(osv.stallMs);
 
     if (osv.down) return new Response("unavailable", { status: 503 });
@@ -316,6 +318,13 @@ describe("what the review of 34ccf92 found", () => {
 
     osv.unreadable.add("MAL-2026-1007");
     expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    // within the name's back-off, what the partial answer found is still withheld, and OSV is not asked about it
+    const attempts = osv.attempts;
+
+    expect(Object.keys((await packument("half-read", { root })).body.versions)).toEqual(["1.0.0", "1.1.0"]);
+    expect(osv.attempts).toBe(attempts);
+    // the back-off is this name's: another name is still asked about
+    expect(Object.keys((await packument("evil-tagged", { root })).body.versions)).toEqual(["9.0.0"]);
     osv.unreadable.clear();
     // the isolate waits out its back-off before it asks again, then keeps the whole answer
     setSystemTime(new Date(Date.now() + 31_000));
@@ -326,11 +335,11 @@ describe("what the review of 34ccf92 found", () => {
     const root = freshRoot();
 
     osv.down = true;
-    await packument("clean", { root });
-    const asked = osv.names;
+    const before = osv.attempts;
 
+    await packument("clean", { root });
     await packument("evil-tagged", { root });
-    expect(osv.names).toBe(asked);
+    expect(osv.attempts - before).toBe(1);
   });
 
   test("a range's limit bounds it, \"*\" bounding nothing", () => {
