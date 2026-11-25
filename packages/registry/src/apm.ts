@@ -4303,7 +4303,17 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
 
       if (listedHere) return fail(404, `${maliciousText(listedHere)}, so apm does not serve it.`, { knownMalicious: listedHere });
 
-      return json({ error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+      if (named !== null) return json({ error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+      // the whole packument: what apm's reviewers and the feed refuse of it is named in the 503, with the feed's notice
+      // (Sol on dd47451: neither was asked)
+      const [confirmed, advisories] = yield* Effect.all([confirmedVersions(name, versions), advisoriesOf(name)], { concurrency: "unbounded" });
+      const listed = listedAmong(name, advisories, versionsAndTags(src.src));
+
+      return json(
+        { error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.`, confirmed: [...confirmed].toSorted(), knownMalicious: [...listed.values()] },
+        503,
+        { "retry-after": String(UPSTREAM_RETRY_AFTER_S), ...noticeHeaders(name, advisories) },
+      );
     }
 
     if (src === "unknown" || src === "over-budget") {

@@ -1651,6 +1651,35 @@ describe("what needs no score is checked of a version whose analysis does not fi
       expect(other.text).toContain(OVER_BUDGET_TEXT);
     }));
 
+  // Review of dd47451: the whole packument skipped both checks when only its scores did not fit
+  test("a ~safe packument whose analyses do not fit still asks the reviewers and the feed, and names what they refuse in its 503", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("pkgrev", [doc("pkgrev", "1.0.0"), doc("pkgrev", "1.1.0")]);
+      await scored(sql, "pkgrev", "1.0.0");
+      await scored(sql, "pkgrev", "1.1.0");
+      let asked = 0;
+
+      const reviewed = (s: StoreApi): StoreApi => ({
+        ...capped(0)(s),
+        confirmedReviews: (name) => {
+          if (name !== "pkgrev") return s.confirmedReviews(name);
+          asked++;
+
+          return Effect.succeed([{ version: "1.0.0", digest: label("pkgrev", "1.0.0") }]);
+        },
+      });
+
+      const r = await route({ url, npm: npm.url, path: "/pkgrev", viaSafe: true, store: reviewed, listed: ["pkgrev@1.1.0"] });
+      const body = z.object({ error: z.string(), confirmed: z.array(z.string()), knownMalicious: z.array(z.object({ version: z.string() })) }).parse(JSON.parse(r.text));
+
+      expect(r.status).toBe(503);
+      expect(body.error).toContain(OVER_BUDGET_TEXT);
+      // on dd47451: neither asked
+      expect(asked).toBeGreaterThan(0);
+      expect(body.confirmed).toEqual(["1.0.0"]);
+      expect(body.knownMalicious.map((m) => m.version)).toEqual(["1.1.0"]);
+    }));
+
   // Review of fb84083: with no latest tag from npm, latest was read as an exact version, so ~safe's fallback had no scores
   test("~safe/latest of a package npm names no latest of answers the highest version the view keeps", () =>
     withRig(async ({ url, npm, sql }) => {

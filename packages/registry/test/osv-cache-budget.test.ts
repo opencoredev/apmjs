@@ -9,7 +9,7 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { Effect, Layer } from "effect";
 import { z } from "zod";
 import { ISOLATE_POOL, type Lease, RequestMemory } from "../src/memory.ts";
-import { KnownMalicious, listedAmong, NAME_FRESH_MS, osvFeed, type Advisory } from "../src/osv.ts";
+import { KnownMalicious, listedAmong, listedNotice, listedTarballText, maliciousText, NAME_FRESH_MS, osvFeed, type Advisory } from "../src/osv.ts";
 
 const X = "MAL-2026-90001";
 const VERSIONS = ["1.0.0", "2.0.0"];
@@ -49,9 +49,16 @@ function osv(name: string) {
   return { stand, ask, copyUrl: `https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} ${name}`)}` };
 }
 
-/** The data center's cache, standing in: `copy` answers a read of a URL, `put` takes a write. */
-function sharedCache(input: { copy: (url: string) => Response | undefined; put?: (url: string, res: Response) => Promise<void> }) {
-  const cache = { match: async (key: Request) => input.copy(key.url), put: async (key: Request, res: Response) => input.put?.(key.url, res) };
+/** The data center's cache, standing in: `copy` answers a read of a URL, after `matchMs`; `put` takes a write. */
+function sharedCache(input: { copy: (url: string) => Response | undefined; put?: (url: string, res: Response) => Promise<void>; matchMs?: number }) {
+  const cache = {
+    match: async (key: Request) => {
+      if (input.matchMs !== undefined) await Bun.sleep(input.matchMs);
+
+      return input.copy(key.url);
+    },
+    put: async (key: Request, res: Response) => input.put?.(key.url, res),
+  };
 
   Object.defineProperty(globalThis, "caches", { value: { default: cache }, configurable: true });
 }
@@ -233,5 +240,42 @@ describe("OSV advisories under memory budgets", () => {
     expect(puts).toEqual([t, t + 2 * (NAME_FRESH_MS + 1_000)]);
     // the copy being written and the one waiting were charged until written; on c752a16 neither was
     expect(ISOLATE_POOL.charged).toBeLessThan(waiting);
+  });
+
+  // Sol on dd47451: a lookup past its deadline was read as no copy
+  test("a copy whose lookup passes its deadline withholds every version while OSV is down", async () => {
+    const o = osv("late-lookup");
+
+    sharedCache({ copy: (url) => (url === o.copyUrl ? Response.json({ fetchedAt: Date.now() - NAME_FRESH_MS - 60_000, advisories: [{ id: X, versions: ["1.0.0"], ranges: [] }] }) : undefined), matchMs: 300 });
+    o.stand.down = true;
+    // on dd47451: [], served as unlisted
+    expect(listed("late-lookup", await o.ask())).toEqual(VERSIONS);
+  });
+
+  // Sol on dd47451: the read's room was given back before what it read was parsed
+  test("a copy read keeps its room until what it read is parsed", async () => {
+    const o = osv("handoff");
+
+    sharedCache({ copy: (url) => (url === o.copyUrl ? Response.json({ fetchedAt: Date.now() - 1_000, advisories: [{ id: X, versions: ["1.0.0"], ranges: [] }] }) : undefined) });
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      expect(listed("handoff", await o.ask(lease))).toEqual(["1.0.0"]);
+      // the read's room (1 MiB, twice) and the parse at once; on dd47451 only the read's
+      expect(lease.peakTaken).toBeGreaterThan(2 * 1024 * 1024);
+    } finally {
+      lease.release();
+    }
+  });
+
+  // Sol on dd47451: a hold read as the feed listing the version, linking to no advisory
+  test("a version only apm's hold withholds is said not to be checked, never listed by the feed", () => {
+    const held = { name: "held-pkg", version: "1.0.0", ids: ["APM-OSV-COPY-UNREAD"] };
+
+    expect(maliciousText(held)).toStartWith("not checked:");
+    expect(listedTarballText(held)).not.toContain("osv.dev");
+    expect(listedNotice("held-pkg", [{ id: "APM-OSV-COPY-UNREAD", versions: [], ranges: [[{ introduced: "0" }]], every: true }])).toContain("could not check");
+    // a real advisory beside it is still cited
+    expect(maliciousText({ ...held, ids: [X, "APM-OSV-HELD"] })).toBe(`known malicious: the OSSF malicious-packages feed lists held-pkg@1.0.0 (${X})`);
   });
 });

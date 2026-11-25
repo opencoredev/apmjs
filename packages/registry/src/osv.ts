@@ -163,10 +163,9 @@ const newerThan = (a: Stamp, b: Stamp | null | undefined): boolean => b === null
 
 /**
  * OSV's newest word on one MAL- advisory of a name, and when it was asked for: the versions it names here, or null when
- * it was read withdrawn or naming nothing here, or a complete answer asked for later left it out; or "held" when it
- * named some and the isolate had no room to keep which (keep): then it names every version.
+ * it was read withdrawn or naming nothing here.
  */
-type Observation = Stamp & { readonly advisory: Advisory | null | "held" };
+type Observation = Stamp & { readonly advisory: Advisory | null };
 
 /**
  * What the isolate knows of a name's advisories, by OSV root and name: its newest complete answer's stamp, and the
@@ -174,22 +173,35 @@ type Observation = Stamp & { readonly advisory: Advisory | null | "held" };
  * advisories it read, though not on the name; so each advisory is decided by the newest answer that read it (Sol on
  * #59: a whole answer per name let an older complete answer undo a newer partial one, either way). A complete answer
  * is also OSV's word on every advisory it does not list, seen here before or not: an older answer that lands after it
- * cannot bring back one it left out (Sol on 6f206c5).
+ * cannot bring back one it left out (Sol on 6f206c5). An advisory with no observation newer than the complete answer
+ * is what that answer said of it, so none is kept for it (Sol on dd47451: each complete answer stamped every advisory
+ * it left out anew, and they were kept for ever). `hold`: the newest stamp of what the isolate had no room to keep of
+ * the name (shed): until a complete answer asked for after it, the name is withheld whole.
  */
-type NameState = { complete: Stamp | null; readonly ids: Map<string, Observation> };
+type NameState = { complete: Stamp | null; hold: Stamp | null; readonly ids: Map<string, Observation> };
 
 /** The isolate's knowledge per name, by OSV root and name, least recently updated first. */
 const NAMES = new Map<string, NameState>();
 
 /**
- * The most the isolate keeps of names' advisories' text, and of its copies being written, as weight (PARSE_WEIGHT a
- * character), under a lease of its own from the isolate's pool, apart from npm's cache and its limit (Sol on fb84083
- * and c752a16). What a name's state says besides that text, its stamps and ids, is bounded by count (MAX_NAMES): a name
- * short of room keeps its order and has its advisories held (shed), so no older answer can undo a newer one.
+ * The most the isolate keeps of names' observations and of its copies being written, as weight (PARSE_WEIGHT a
+ * character, and OBSERVATION_WEIGHT each), under a lease of its own from the isolate's pool, apart from npm's cache and
+ * its limit (Sol on fb84083 and c752a16). A name short of room is held (shed): its stamps are kept, so no older answer
+ * can undo a newer one, and it is withheld whole.
  */
 const NAMES_WEIGHT = 2 * 1024 * 1024;
 
-/** The block of each kept name's advisories' text under names(); a request that answers from it holds it too (answerOf). */
+/** What one kept observation holds besides its text: its entry in the map and the object. */
+const OBSERVATION_WEIGHT = 2 * WEIGHTS.container;
+
+/** What advisoriesFor answers with for a name it has held (shed) or whose copy it could not read: every version. */
+export const HELD = "APM-OSV-HELD";
+const UNREAD_COPY = "APM-OSV-COPY-UNREAD";
+
+/** Whether `id` is one of apm's holds (HELD, UNREAD_COPY), not an advisory OSV wrote. */
+export const isHold = (id: string): boolean => id === HELD || id === UNREAD_COPY;
+
+/** The block of each kept name's observations under names(); a request that answers from it holds it too (answerOf). */
 const BLOCKS = new Map<string, Block>();
 
 /** The names a request is asking OSV about now, and how many: none of them is forgotten for MAX_NAMES (keep). */
@@ -215,10 +227,13 @@ function names(): Lease {
   return made;
 }
 
-/**
- * Lets go of the text of the advisories of the name under `key`, its order kept: each advisory it names is held, so it
- * names every version until OSV is asked again (fresh). What the pool got back.
- */
+/** `state` held: its observations let go of, `hold` the newest stamp among them, so the name is withheld whole. */
+function holdWhole(state: NameState): void {
+  for (const o of state.ids.values()) if (newerThan(o, state.hold)) state.hold = { at: o.at, seq: o.seq };
+  state.ids.clear();
+}
+
+/** Lets go of what the name under `key` holds, its stamps kept: it is held (holdWhole). What the pool got back. */
 function shed(key: string): number {
   const block = BLOCKS.get(key);
 
@@ -230,7 +245,7 @@ function shed(key: string): number {
   BLOCKS.delete(key);
   const state = NAMES.get(key);
 
-  if (state !== undefined) for (const [id, o] of state.ids) if (o.advisory !== null) state.ids.set(id, { ...o, advisory: "held" });
+  if (state !== undefined) holdWhole(state);
 
   return freed;
 }
@@ -245,10 +260,9 @@ function forget(key: string): void {
 }
 
 /**
- * `state` kept for `key`, newest, its advisories' text charged as a block; past MAX_NAMES the oldest names not being
- * asked about are let go of. When the text does not fit, the oldest names' text is shed, and when it still does not, this
- * name's advisories are held: its order is kept all the same (Sol on c752a16: a name that did not fit lost its newest
- * stamp, so an older answer landing after it undid it).
+ * `state` kept for `key`, newest, its observations charged as a block; past MAX_NAMES the oldest names not being asked
+ * about are let go of. When they do not fit, the oldest names are shed, and when they still do not, this one is held:
+ * its stamps are kept all the same (Sol on c752a16: a name that did not fit lost its newest stamp).
  */
 function keep(key: string, state: NameState): void {
   const lease = names();
@@ -265,7 +279,7 @@ function keep(key: string, state: NameState): void {
     if (!ASKING.has(oldest)) forget(oldest);
   }
 
-  const weight = [...state.ids].reduce((n, [id, o]) => n + (o.advisory === null || o.advisory === "held" ? 0 : (id.length + JSON.stringify(o.advisory).length) * PARSE_WEIGHT), 0);
+  const weight = [...state.ids].reduce((n, [id, o]) => n + OBSERVATION_WEIGHT + (id.length + (o.advisory === null ? 0 : JSON.stringify(o.advisory).length)) * PARSE_WEIGHT, 0);
 
   if (weight === 0) return;
   let taken = lease.take(weight);
@@ -277,7 +291,7 @@ function keep(key: string, state: NameState): void {
   }
 
   if (taken) BLOCKS.set(key, lease.seal(weight));
-  else for (const [id, o] of state.ids) if (o.advisory !== null) state.ids.set(id, { ...o, advisory: "held" });
+  else holdWhole(state);
 }
 
 /** The order of this isolate's asks of OSV about names; a copy from the data center's cache is 0. */
@@ -287,23 +301,30 @@ let asks = 0;
  * Takes in what an answer asked for at `stamp` read: `found`, the advisories among the `read` ids that name the name,
  * and with `complete`, that no other advisory does. Each advisory takes the newest word on it: its newest observation,
  * else the newest complete answer, which said it was not listed. So an answer that lands after a newer one changes
- * nothing the newer one said. Observations and the complete stamp past NAME_STALE_MS are dropped.
+ * nothing the newer one said. A complete answer asked for after the name was held ends the hold. Observations, the
+ * complete stamp and the hold past NAME_STALE_MS are dropped.
  */
 function observe(input: { key: string; stamp: Stamp; read: ReadonlySet<string>; found: readonly Advisory[]; complete: boolean; now: number }): void {
   const { key, stamp } = input;
-  const state = NAMES.get(key) ?? { complete: null, ids: new Map<string, Observation>() };
+  const state = NAMES.get(key) ?? { complete: null, hold: null, ids: new Map<string, Observation>() };
 
   for (const id of input.read) if (newerThan(stamp, state.ids.get(id) ?? state.complete)) state.ids.set(id, { ...stamp, advisory: input.found.find((a) => a.id === id) ?? null });
 
   if (input.complete) {
-    for (const [id, o] of state.ids) if (!input.read.has(id) && newerThan(stamp, o)) state.ids.set(id, { ...stamp, advisory: null });
+    // what it leaves out it says is not listed: the complete stamp says so, once it is the newest
+    for (const [id, o] of state.ids) if (!input.read.has(id) && newerThan(stamp, o)) state.ids.delete(id);
 
     if (newerThan(stamp, state.complete)) state.complete = stamp;
+
+    if (state.hold !== null && newerThan(stamp, state.hold)) state.hold = null;
   }
 
-  for (const [id, o] of state.ids) if (input.now - o.at >= NAME_STALE_MS) state.ids.delete(id);
+  // an advisory not listed, no newer than the newest complete answer: that answer says as much
+  for (const [id, o] of state.ids) if (input.now - o.at >= NAME_STALE_MS || (o.advisory === null && state.complete !== null && !newerThan(o, state.complete))) state.ids.delete(id);
 
   if (state.complete !== null && input.now - state.complete.at >= NAME_STALE_MS) state.complete = null;
+
+  if (state.hold !== null && input.now - state.hold.at >= NAME_STALE_MS) state.hold = null;
   keep(key, state);
 }
 
@@ -315,15 +336,18 @@ const newestComplete = (key: string, stamp: Stamp): boolean => {
 };
 
 /**
- * The advisories the name under `key` names by its newest observations at `now`, each while it is young enough. The
- * request's `lease` holds their text's block, so it stays charged while the request refers to it (Sol on c752a16); with
- * no room for it, each names every version, as a held one does.
+ * The advisories the name under `key` names by its newest observations at `now`, each while it is young enough, and
+ * HELD while it is held. The request's `lease` holds their block, so it stays charged while the request refers to it
+ * (Sol on c752a16); with no room for it, each names every version.
  */
 function answerOf(key: string, now: number, lease: Lease | null): Advisory[] {
+  const state = NAMES.get(key);
   const block = BLOCKS.get(key);
-  const held = block !== undefined && lease !== null && !lease.hold(block);
+  const unheld = block !== undefined && lease !== null && !lease.hold(block);
+  const young = (s: Stamp): boolean => s.at <= now && now - s.at < NAME_STALE_MS;
+  const named = [...(state?.ids ?? [])].flatMap(([id, o]) => (o.advisory !== null && young(o) ? [unheld ? everyVersion(id) : o.advisory] : []));
 
-  return [...(NAMES.get(key)?.ids ?? [])].flatMap(([id, o]) => (o.advisory !== null && o.at <= now && now - o.at < NAME_STALE_MS ? [o.advisory === "held" || held ? everyVersion(id) : o.advisory] : []));
+  return state?.hold != null && young(state.hold) ? [...named, everyVersion(HELD)] : named;
 }
 
 /** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
@@ -342,19 +366,19 @@ const SHARED_MAX_BYTES = 1024 * 1024;
  */
 type SharedCopy = { kind: "miss" } | { kind: "hit"; entry: NameEntry } | { kind: "unread" };
 
-/** What advisoriesFor answers with, beside what it knows, for a name whose copy could not be read: every version. */
-const UNREAD_COPY = "APM-OSV-COPY-UNREAD";
-
 /**
- * The copy of the name under `key`. Its read holds its room, and the request's lease open, until it has ended: one past
- * SHARED_MS is cancelled first (Sol on c752a16: its room was given back while it still read). A copy read stays charged
- * to the request until it ends, as an advisory does.
+ * The copy of the name under `key`. Its read holds its room, and the request's lease open, until it has ended and what
+ * it read is parsed: one past SHARED_MS is cancelled first (Sol on c752a16: its room was given back while it still read).
+ * A copy read stays charged to the request until it ends, as an advisory does.
  */
 async function sharedRead(key: string, lease: Lease | null): Promise<SharedCopy> {
   if (typeof caches === "undefined") return { kind: "miss" };
   const got = await matchWithin({ cache: caches.default, key: sharedKey(key), ms: SHARED_MS, operation: "osv-copy" });
 
-  if (got.kind !== "hit") return { kind: "miss" };
+  // a lookup past its deadline may have found one (Sol on dd47451)
+  if (got.kind === "late") return { kind: "unread" };
+
+  if (got.kind === "miss") return { kind: "miss" };
   const room = SHARED_MAX_BYTES * READ_WEIGHT;
 
   if (lease !== null && !lease.take(room)) {
@@ -364,33 +388,44 @@ async function sharedRead(key: string, lease: Lease | null): Promise<SharedCopy>
   }
 
   const letGo = lease?.retain() ?? (() => undefined);
-  const stop = new AbortController();
 
-  const reading = readCapped(got.res, SHARED_MAX_BYTES, stop.signal).finally(() => {
+  const settle = (): void => {
     lease?.give(room);
     letGo();
-  });
+  };
 
+  const stop = new AbortController();
+  const reading = readCapped(got.res, SHARED_MAX_BYTES, stop.signal);
   const bytes = await within(reading, SHARED_MS);
 
-  if (bytes.kind === "late") stop.abort();
+  if (bytes.kind === "late") {
+    stop.abort();
+    void reading.finally(settle).catch(() => undefined);
 
-  if (bytes.kind !== "done" || bytes.value === null) return { kind: "unread" };
-  const parsing = bytes.value.length * PARSE_WEIGHT;
-
-  if (lease !== null && !lease.take(parsing)) return { kind: "unread" };
-
-  try {
-    const parsed = NameEntry.safeParse(JSON.parse(new TextDecoder().decode(bytes.value)));
-
-    if (parsed.success) return { kind: "hit", entry: parsed.data };
-  } catch {
-    // not JSON: unread
+    return { kind: "unread" };
   }
 
-  lease?.give(parsing);
+  // the read has ended; its room is kept until what it read is parsed or let go of (Sol on dd47451)
+  try {
+    if (bytes.kind !== "done" || bytes.value === null) return { kind: "unread" };
+    const parsing = bytes.value.length * PARSE_WEIGHT;
 
-  return { kind: "unread" };
+    if (lease !== null && !lease.take(parsing)) return { kind: "unread" };
+
+    try {
+      const parsed = NameEntry.safeParse(JSON.parse(new TextDecoder().decode(bytes.value)));
+
+      if (parsed.success) return { kind: "hit", entry: parsed.data };
+    } catch {
+      // not JSON: unread
+    }
+
+    lease?.give(parsing);
+
+    return { kind: "unread" };
+  } finally {
+    settle();
+  }
 }
 
 /** What the Worker keeps running after the response (ctx.waitUntil), or null outside one. */
@@ -751,12 +786,12 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
     /** What advisoriesFor answers for npm's `name`, kept in the isolate under `key`, asked about under the request's `lease`. */
     const lookupName = (name: string, key: string, lease: Lease | null) =>
       Effect.gen(function* () {
-        // a name whose advisories' text was shed (keep) is asked about again
+        // a name held (keep) is asked about again
         const fresh = (now: number): boolean => {
           const state = NAMES.get(key);
           const at = state?.complete?.at ?? null;
 
-          return state !== undefined && at !== null && at <= now && now - at < NAME_FRESH_MS && ![...state.ids.values()].some((o) => o.advisory === "held");
+          return state !== undefined && state.hold === null && at !== null && at <= now && now - at < NAME_FRESH_MS;
         };
 
         const asked = Date.now();
@@ -914,14 +949,23 @@ export const advisoriesOf = (name: string) =>
 export const listedVersionsOf = (name: string, versions: readonly string[]) =>
   Effect.map(advisoriesOf(name), (advisories) => listedAmong(name, advisories, versions));
 
-/** Why a listed version is refused, citing its advisories. */
+/**
+ * Why a listed version is refused, citing its advisories; or, when only apm's holds name it (isHold), that it could not
+ * be checked against the feed, never that the feed lists it (Sol on dd47451).
+ */
 export function maliciousText(m: ListedMalicious): string {
-  return `known malicious: the OSSF malicious-packages feed lists ${m.name}@${m.version} (${m.ids.join(", ")})`;
+  const listed = m.ids.filter((id) => !isHold(id));
+
+  return listed.length > 0
+    ? `known malicious: the OSSF malicious-packages feed lists ${m.name}@${m.version} (${listed.join(", ")})`
+    : `not checked: apm could not check ${m.name}@${m.version} against the OSSF malicious-packages feed just now (${m.ids.join(", ")})`;
 }
 
-/** What the tarball routes answer for a listed version: 403, citing its advisories. */
+/** What the tarball routes answer for a listed version: 403, citing its advisories, and the first one's page at OSV. */
 export function listedTarballText(m: ListedMalicious): string {
-  return `${maliciousText(m)}, so apm does not serve it. See https://osv.dev/vulnerability/${m.ids[0] ?? ""}`;
+  const first = m.ids.find((id) => !isHold(id));
+
+  return first === undefined ? `${maliciousText(m)}, so apm does not serve it. Try again shortly.` : `${maliciousText(m)}, so apm does not serve it. See https://osv.dev/vulnerability/${first}`;
 }
 
 /** The header npm prints (as "npm notice") from any registry answer: the packument routes name what they withheld. */
@@ -936,8 +980,10 @@ const NOTICE_MAX = 400;
 export function listedNotice(name: string, advisories: readonly Advisory[]): string | null {
   if (advisories.length === 0) return null;
   const range = (events: Advisory["ranges"][number]) => events.map((e) => (e.introduced !== undefined ? `>=${e.introduced}` : e.fixed !== undefined ? `<${e.fixed}` : `<=${e.last_affected ?? ""}`)).join(" ");
-  const each = advisories.map((a) => `${a.id}: ${[...a.versions, ...a.ranges.map(range)].join(", ")}`).join("; ");
-  const text = `apm withholds ${name} versions the OSSF malicious-packages feed lists as malicious (${each})`.replace(/[^\x20-\x7e]/g, "?");
+  const listed = advisories.filter((a) => !isHold(a.id));
+  const each = listed.map((a) => `${a.id}: ${[...a.versions, ...a.ranges.map(range)].join(", ")}`).join("; ");
+  const parts = [...(listed.length > 0 ? [`versions the OSSF malicious-packages feed lists as malicious (${each})`] : []), ...(listed.length < advisories.length ? ["every version for now, as it could not check them against the OSSF malicious-packages feed"] : [])];
+  const text = `apm withholds ${name} ${parts.join(", and ")}`.replace(/[^\x20-\x7e]/g, "?");
 
   return text.length <= NOTICE_MAX ? text : `${text.slice(0, NOTICE_MAX - 3)}...`;
 }
