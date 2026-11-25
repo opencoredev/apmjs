@@ -237,7 +237,7 @@ describe("apm: publish", () => {
     const d = writePackage(work, { name: "no-login-pkg", version: "1.0.0" }, reg);
     const r = await apm(["publish"], { cwd: d, env: sb.env });
     expect(r.code).not.toBe(0);
-    expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication, run apm login (an npm login signs in to npm, not apm), then apm publish again`);
+    expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication and this is an apm registry, run apm login (an npm login does not sign in to apm), then apm publish again; for another registry, use its own login`);
   });
 
   test("apm publish refuses locally when a secret would ship, before any upload", async () => {

@@ -9,7 +9,7 @@ import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPa
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, tagsWithoutLatest, type Capability, type DistTag, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
-import { oneLine } from "./explain.ts";
+import { escapedPath, oneLine } from "./explain.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
 import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
@@ -685,7 +685,7 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean):
   for (const b of blocked) {
     const [first] = b.tags;
 
-    if (first !== undefined) say(`To ${verb === "add" ? "install" : "run"} the version tagged ${first.tag}: apm ${verb} ${b.name}@${first.tag}`);
+    if (first !== undefined) say(`To ${verb === "add" ? "install" : "run"} the version tagged ${first.tag}, run the same command with ${b.name}@${first.tag} in place of ${b.name}`);
   }
 
   if (forceable.length > 0) {
@@ -1841,21 +1841,35 @@ function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "add
 
   if (samePath(project, input.cwd)) {
     // a workspace member: the lockfile the add or removal changes is the workspace's
-    if (input.layout.member !== "") say(dim(`apm: ${input.cwd} is a member of the workspace at ${input.layout.root}, whose lockfile this changes`));
+    if (input.layout.member !== "") say(dim(`apm: ${escapedPath(input.cwd)} is a member of the workspace at ${escapedPath(input.layout.root)}, whose lockfile this changes`));
 
     return false;
   }
 
   if (samePath(project, homedir())) {
-    fail(`refused: there is no package.json in ${input.cwd}; the nearest one is ${join(project, "package.json")}, in your home folder, and apm does not change that project from another folder. Nothing was changed.`);
-    say(`cd into your project first, or run npm init -y in ${input.cwd} to start one there.`);
+    refuseHomeProject({ cwd: input.cwd, project });
 
     return true;
   }
 
-  say(yellow(`apm: no package.json in ${input.cwd}; ${input.verb} the project at ${project}${input.layout.member === "" ? "" : `, in the workspace at ${input.layout.root}, whose lockfile this changes`}`));
+  say(yellow(`apm: no package.json in ${escapedPath(input.cwd)}; ${input.verb} the project at ${escapedPath(project)}${input.layout.member === "" ? "" : `, in the workspace at ${escapedPath(input.layout.root)}, whose lockfile this changes`}`));
 
   return false;
+}
+
+/** The refusal for an add or removal whose nearest package.json is the home folder's, from a folder below it. */
+function refuseHomeProject(input: { cwd: string; project: string }): void {
+  fail(`refused: there is no package.json in ${escapedPath(input.cwd)}; the nearest one is ${escapedPath(join(input.project, "package.json"))}, in your home folder, and apm does not change that project from another folder. Nothing was changed.`);
+  say(`cd into your project first, or run npm init -y in ${escapedPath(input.cwd)} to start one there.`);
+}
+
+/** The nearest folder above `cwd` with a package.json when `cwd` has none: the package managers look upward, so that project may be the one that changes. */
+function projectAbove(cwd: string): string | null {
+  let above = existsSync(join(cwd, "package.json")) ? null : dirname(cwd);
+
+  while (above !== null && !existsSync(join(above, "package.json"))) above = dirname(above) === above ? null : dirname(above);
+
+  return above;
 }
 
 /**
@@ -1865,12 +1879,9 @@ function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "add
  * the default and how to point it at apm.
  */
 function plainInstallNote(input: { cwd: string; pm: Pm; command: string }): void {
-  // with no package.json here, the package managers look upward for one, so the project that changes may be another
-  let above = existsSync(join(input.cwd, "package.json")) ? null : dirname(input.cwd);
+  const above = projectAbove(input.cwd);
 
-  while (above !== null && !existsSync(join(above, "package.json"))) above = dirname(above) === above ? null : dirname(above);
-
-  if (above !== null) warn(yellow(`apm: no package.json in ${input.cwd}; ${input.pm} may install the project at ${above}${samePath(above, homedir()) ? ", your home folder," : ""} instead`));
+  if (above !== null) warn(yellow(`apm: no package.json in ${escapedPath(input.cwd)}; ${input.pm} may install the project at ${escapedPath(above)}${samePath(above, homedir()) ? ", your home folder," : ""} instead`));
 
   // the copyable setting only for apm's own registry: any other URL could carry a credential
   const shown = sameRegistry(process.env.APM_REGISTRY ?? DEFAULT_REGISTRY, DEFAULT_REGISTRY) ? DEFAULT_REGISTRY : null;
@@ -1905,6 +1916,16 @@ async function cmdAdd(a: Args): Promise<number> {
   }
 
   if (specs.length === 0) {
+    const above = projectAbove(cwd);
+
+    // a plain install from below a stray home-folder package.json would install that project: refused like an add
+    if (above !== null && samePath(above, homedir())) {
+      refuseHomeProject({ cwd, project: above });
+      emitJson({ ok: false, det, results: [], error: lastError });
+
+      return 1;
+    }
+
     if (ignoreScripts && isLockPm(det.pm)) return installWithoutScripts({ cwd, det: { pm: det.pm, why: det.why } });
     const cmd = [det.pm, "install"];
 
@@ -2669,7 +2690,7 @@ async function cmdPublish(a: Args): Promise<number> {
   const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
-    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication, run apm login (an npm login signs in to npm, not apm), then apm publish again` : ""}`);
+    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication and this is an apm registry, run apm login (an npm login does not sign in to apm), then apm publish again; for another registry, use its own login` : ""}`);
     return pub.code;
   }
   // A login token stages the version: the registry answers with an approval link in its notice.

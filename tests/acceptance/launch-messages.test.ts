@@ -75,7 +75,7 @@ describe("apm add, as first-time users met it", () => {
     expect(r.code).toBe(1);
     expect(r.out).toContain("pre-only-pkg has no version tagged latest");
     expect(r.out).toContain("Its versions are tagged next (0.0.1-test.1)");
-    expect(r.out).toContain("To install the version tagged next: apm add pre-only-pkg@next");
+    expect(r.out).toContain("To install the version tagged next, run the same command with pre-only-pkg@next in place of pre-only-pkg");
     expect(r.out).not.toContain("--force does not help");
     expect(r.out).not.toContain("score unknown");
 

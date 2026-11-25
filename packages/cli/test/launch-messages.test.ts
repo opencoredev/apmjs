@@ -184,6 +184,20 @@ describe("apm's messages for first-time users", () => {
     expect(stray.code).toBe(7);
     expect(stray.text).toContain(`apm: no package.json in ${join(home, "new")}; npm may install the project at ${home}, your home folder, instead`);
     expect(r.text).not.toContain("may install the project at");
+
+    // apm add with no packages is a plain install too: from below the home folder's package.json it is refused, like an add
+    const bareAdd = await apm(["add", "--pm", "npm"], { cwd: folder("b4-home/new"), home });
+
+    expect(bareAdd.code).toBe(1);
+    expect(bareAdd.text).toContain("in your home folder, and apm does not change that project from another folder");
+
+    // a folder name cannot add a line or a terminal control to the note
+    folder("b4-odd", { "package.json": manifest });
+    const odd = folder("b4-odd/a\nb\u001b[31m");
+    const escaped = await apm(["install", "--pm", "npm"], { cwd: odd, home: folder("b4-odd-home") });
+
+    expect(escaped.text).toContain("a\\u{a}b\\u{1b}[31m; npm may install the project at");
+    expect(escaped.text).not.toContain("\u001b");
   });
 
   test("D15: with no version tagged latest, apm add, apm explain and apm score name the tag to ask for", async () => {
@@ -193,7 +207,7 @@ describe("apm's messages for first-time users", () => {
     expect(add.code).toBe(1);
     expect(add.text).toContain("✗ pre-only  no version is tagged latest");
     expect(add.text).toContain("refused: pre-only has no version tagged latest, the one apm installs when no version is named. Its versions are tagged next (0.0.1-test.1)");
-    expect(add.text).toContain("To install the version tagged next: apm add pre-only@next");
+    expect(add.text).toContain("To install the version tagged next, run the same command with pre-only@next in place of pre-only");
     expect(add.text).not.toContain("score unknown");
     expect(add.text).not.toContain("--force does not help");
 

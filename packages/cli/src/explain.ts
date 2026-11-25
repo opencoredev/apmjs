@@ -369,11 +369,17 @@ const SHOWN = 3;
 
 /** Control characters (a terminal's escapes included), line breaks and bidi overrides: what can fake a line. */
 // oxlint-disable-next-line eslint/no-control-regex -- matching control characters is the point: they are removed
-const LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g;
+const BREAKER = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]";
+const LINE_BREAKERS = new RegExp(`${BREAKER}+`, "g");
 
 /** Registry text (which carries publisher text, such as a yank reason) on one line, so none can pose as apm's. */
 export function oneLine(text: string): string {
   return text.replace(LINE_BREAKERS, " ").replace(/\s+/g, " ").trim();
+}
+
+/** A local path for the terminal: line breaks, controls and bidi overrides shown as escapes, so the path stays readable and none can pose as apm's. */
+export function escapedPath(path: string): string {
+  return path.replace(new RegExp(BREAKER, "g"), (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
 }
 
 /** The longest run of backticks in `text`, in one pass: a spread into Math.max overflows the stack on big input. */
