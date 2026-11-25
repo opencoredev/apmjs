@@ -191,6 +191,9 @@ describe("review input", () => {
     const cases = [
       { manifest: { scripts: { postinstall: "./setup.txt" } }, path: "setup.txt", body: script },
       { manifest: { scripts: { postinstall: "FOO=1 ./bin/notes.md --quiet" } }, path: "bin/notes.md", body: script },
+      // the same file through a shell, unquoted after -c and named after bash
+      { manifest: { scripts: { postinstall: "sh -c ./setup.txt" } }, path: "setup.txt", body: script },
+      { manifest: { scripts: { install: "bash setup.txt" } }, path: "setup.txt", body: script },
       { manifest: { main: "entry.txt" }, path: "entry.txt", body: "require('https').get('https://collector.example.invalid/');\n" },
     ];
 
