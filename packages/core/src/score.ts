@@ -3482,12 +3482,14 @@ export function citedSource(evidence: string): string {
 }
 
 /**
- * True when evidence read as citing `at` could as well cite a file whose path goes on past it: a tarball may hold
- * `a.js:3: b.js`, whose line 10 reads `a.js:3: b.js:10: …`. A dismissal of `a.js` line 3 must not reach that line, so
- * such evidence is never dismissed.
+ * True when evidence read as citing a file and line could as well cite a file whose path goes on past them: a tarball
+ * may hold `a.js:3: b.js` (or `a.js:03: b.js`, or one with a newline in its name), whose line 10 reads
+ * `a.js:3: b.js:10: …`. A dismissal of `a.js` line 3 must not reach that line, so such evidence is never dismissed.
  */
-function citesLongerPath(evidence: string, at: { file: string; line: number }): boolean {
-  return /^: [^\n]*?:\d+(?=: |$)/.test(evidence.slice(`${at.file}:${at.line}`.length));
+function citesLongerPath(evidence: string): boolean {
+  const at = CITED_LINE.exec(evidence);
+
+  return at !== null && /^: [\s\S]*?:\d+(?=: |$)/.test(evidence.slice(at[0].length));
 }
 
 /**
@@ -3513,7 +3515,7 @@ export function applyDismissals(analysis: Analysis, list: readonly EvidenceDismi
     const matchOf = (e: string): EvidenceDismissal | undefined => {
       const at = evidenceAt(e);
 
-      return at && !citesLongerPath(e, at) ? own.find((d) => d.file === at.file && d.line === at.line) : undefined;
+      return at && !citesLongerPath(e) ? own.find((d) => d.file === at.file && d.line === at.line) : undefined;
     };
 
     const gone = own.length === 0 ? [] : all.filter((e) => matchOf(e) !== undefined);

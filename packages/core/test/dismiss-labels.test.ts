@@ -89,6 +89,15 @@ describe("dismissed evidence", () => {
     expect(both.signals.find((s) => s.id === "capture-endpoint")?.evidence).toHaveLength(2);
     expect(left.signals.find((s) => s.id === "capture-endpoint")?.evidence).toEqual([expect.stringMatching(/^a\.js:3: b\.js:2: /)]);
     expect(left.dismissed?.flatMap((d) => d.evidence)).toEqual([expect.stringMatching(/^a\.js:3: const docs/)]);
+
+    // nor a name whose line number is zero-padded, or that has a newline in it
+    for (const name of ["a.js:03: b.js", "a.js:3: b\nc.js"]) {
+      const odd = scored({ "index.js": "require('./a.js');\n", "a.js": "// one\n// two\n// three\n", [name]: payload });
+      const kept = applyDismissals(odd, [{ scorer: odd.scorer, signal: "capture-endpoint", file: "a.js", line: 3, reason: "a docs link", at: 1 }]);
+
+      expect(odd.signals.find((s) => s.id === "capture-endpoint")?.evidence).toEqual([expect.stringMatching(/^a\.js:0?3: b/)]);
+      expect(kept.signals.some((s) => s.id === "capture-endpoint")).toBe(true);
+    }
   });
 
   test("a fact like an install script cannot be dismissed", () => {
