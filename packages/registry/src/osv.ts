@@ -232,9 +232,11 @@ function names(): Lease {
   ISOLATE_POOL.onPressure((need) => {
     let freed = 0;
 
-    for (const key of BLOCKS.keys()) {
+    // only a block no request holds gives the pool room: one a request holds stays precise (Sol on 91901e5)
+    for (const [key, block] of BLOCKS) {
       if (freed >= need) return;
-      freed += shed(key);
+
+      if (made.soleHolder(block)) freed += shed(key);
     }
   });
 
@@ -544,9 +546,6 @@ const advisoryRead =
   (name: string, lease: Lease | null) =>
   async (res: Response, signal: AbortSignal): Promise<Advisory[]> => {
     const bytes = await readCapped(res, MAX_ADVISORY_BYTES, signal);
-
-    // stopped (the request's OSV budget, or the lookup interrupted): a failed read, not one over the cap
-    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("the advisory read was stopped");
 
     if (bytes === null) throw new OverCap(`OSV answered more than ${MAX_ADVISORY_BYTES} bytes`);
     const parsing = bytes.length * PARSE_WEIGHT;

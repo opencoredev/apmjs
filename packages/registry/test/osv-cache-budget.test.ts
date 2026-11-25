@@ -9,19 +9,20 @@ import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { Effect, Fiber, Layer } from "effect";
 import { z } from "zod";
 import { ISOLATE_POOL, type Lease, RequestMemory } from "../src/memory.ts";
-import { KnownMalicious, listedAmong, listedNotice, listedTarballText, maliciousText, NAME_FRESH_MS, osvFeed, type Advisory } from "../src/osv.ts";
+import { KnownMalicious, listedAmong, listedNotice, listedTarballText, maliciousText, NAME_FRESH_MS, osvFeed, REQUEST_BUDGET_MS, type Advisory } from "../src/osv.ts";
 
 const X = "MAL-2026-90001";
 const VERSIONS = ["1.0.0", "2.0.0"];
 
 /**
  * OSV for one name: each query answers the ids its `answers` entry gives (shifted, the last kept), each advisory naming
- * `versions` (1.0.0); with `down`, every call is a 503; with `stalled`, an advisory's body never ends.
+ * `versions` (1.0.0); with `down`, every call is a 503; with `stalled`, an advisory's body never ends; with
+ * `slowCancelMs`, it is past MAX_ADVISORY_BYTES and its cancel slow.
  */
 function osv(name: string) {
   const answers: (() => Promise<string[]>)[] = [];
   const ids: string[] = [];
-  const stand = { down: false, answers, ids, queries: 0, versions: ["1.0.0"], stalled: false, cancels: 0 };
+  const stand = { down: false, answers, ids, queries: 0, versions: ["1.0.0"], stalled: false, cancels: 0, slowCancelMs: 0 };
 
   // SAFETY: osvFeed calls its fetcher only with a URL string and RequestInit, the call shape this stand-in reads
   const fetcher = (async (input: string | URL): Promise<Response> => {
@@ -30,6 +31,20 @@ function osv(name: string) {
 
     if (read?.[1] !== undefined) {
       const id = decodeURIComponent(read[1]);
+
+      if (stand.slowCancelMs > 0) {
+        // a detail past MAX_ADVISORY_BYTES whose cancel takes `slowCancelMs` to settle
+        const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start: (c) => {
+              for (let i = 0; i < 6; i++) c.enqueue(chunk);
+            },
+            cancel: () => Bun.sleep(stand.slowCancelMs),
+          }),
+        );
+      }
 
       if (!stand.stalled) return Response.json({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: stand.versions }] });
 
@@ -345,5 +360,38 @@ describe("OSV advisories under memory budgets", () => {
     // on 18281c9: "known malicious: the OSSF malicious-packages feed lists ..."
     expect(m === undefined ? "" : maliciousText(m)).toStartWith("not checked:");
     expect(m === undefined ? "" : listedTarballText(m)).not.toContain("osv.dev");
+  });
+
+  // Sol on 91901e5: the OSV budget passing while a read over the cap was cancelled made it an ordinary failure
+  test("an advisory known to be over the cap withholds every version even when the budget passes while it is cancelled", async () => {
+    const o = osv("over-cap-slow-cancel");
+
+    o.stand.ids = [X];
+    o.stand.slowCancelMs = REQUEST_BUDGET_MS + 300;
+    // on 91901e5: [], the advisory read as failed
+    expect(listed("over-cap-slow-cancel", await o.ask())).toEqual(VERSIONS);
+  }, 10_000);
+
+  // Sol on 91901e5: the pool's pressure shed a name a request held, freeing nothing
+  test("the pool's pressure leaves a name a request holds precise", async () => {
+    const o = osv("pinned-precise");
+
+    o.stand.ids = [X];
+    const request = ISOLATE_POOL.request();
+    const hog = ISOLATE_POOL.request(Number.POSITIVE_INFINITY);
+
+    try {
+      expect(listed("pinned-precise", await o.ask(request))).toEqual(["1.0.0"]);
+      // more than the pool holds: it asks every holder for room first
+      expect(hog.take(ISOLATE_POOL.limit)).toBe(false);
+    } finally {
+      hog.release();
+      request.release();
+    }
+
+    setSystemTime(Date.now() + NAME_FRESH_MS + 1_000);
+    o.stand.down = true;
+    // on 91901e5: both, the name shed and held whole
+    expect(listed("pinned-precise", await o.ask())).toEqual(["1.0.0"]);
   });
 });
