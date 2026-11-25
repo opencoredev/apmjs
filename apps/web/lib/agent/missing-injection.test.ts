@@ -49,6 +49,7 @@ describe("a missing version or package is named as data", () => {
       const md = await res.text();
 
       expect(res.status).toBe(404);
+      expect(md).toContain("has no version");
       expect(spoofed(md), md).toEqual([]);
       expect(types(md), md).not.toContain("heading");
       expect(types(md), md).not.toContain("link");
@@ -58,6 +59,9 @@ describe("a missing version or package is named as data", () => {
     test(`check_package for version ${JSON.stringify(payload)}`, async () => {
       const text = await toolText({ name: "left-pad", version: payload });
 
+      // the real not-found answer, not an empty or unrelated reply
+      expect(text).toContain("has no version");
+      expect(text).toContain("PWNED");
       expect(spoofed(text), text).toEqual([]);
       expect(types(text), text).not.toContain("heading");
       expect(types(text), text).not.toContain("link");
@@ -69,6 +73,8 @@ describe("a missing version or package is named as data", () => {
     const md = await res.text();
 
     expect(res.status).toBe(404);
+    expect(md).toContain("No package named");
+    expect(md).toContain("PWNED");
     expect(spoofed(md), md).toEqual([]);
     expect(types(md), md).not.toContain("heading");
   });
