@@ -1,9 +1,10 @@
 // Sign-up and sign-in counts (src/account-events.ts): which routes count, what an event carries, and that sending can
 // never reach the request. tests/acceptance/account-events.test.ts runs them through a real sign-in.
 import { describe, expect, test } from "bun:test";
+import { rateLimiter } from "@apm/core/error-report";
 import { accountEvents, analyticsId, optedOut, signInMethod, trackPayload } from "../src/account-events.ts";
 
-const CLIENT_ID = "f01a8a38-a972-4554-92c9-71cadebf5640";
+const CLIENT_ID = "00000000-0000-4000-8000-000000000001";
 
 describe("analyticsId", () => {
   test("is 32 hex characters, the same for the same account, different for another, and shows nothing of the id", () => {
@@ -38,6 +39,7 @@ describe("optedOut", () => {
   test("Sec-GPC: 1 or DNT: 1 opts out; anything else, or no request, does not", () => {
     expect(optedOut(new Headers({ "sec-gpc": "1" }))).toBe(true);
     expect(optedOut(new Headers({ dnt: "1" }))).toBe(true);
+    expect(optedOut(new Headers({ dnt: "yes" }))).toBe(true);
     expect(optedOut(new Headers({ dnt: "0" }))).toBe(false);
     expect(optedOut(new Headers())).toBe(false);
     expect(optedOut(undefined)).toBe(false);
@@ -55,6 +57,27 @@ describe("trackPayload", () => {
 
 describe("accountEvents", () => {
   const event = { name: "account_created", method: "github", authUserId: "user-1", optedOut: false } as const;
+
+  test("past the limit, events are dropped before anything is queued", async () => {
+    const held: Promise<void>[] = [];
+    let posts = 0;
+
+    const events = accountEvents({
+      clientId: CLIENT_ID,
+      background: (work) => held.push(work),
+      take: rateLimiter({ max: 2, windowMs: 60_000 }, () => 0),
+      fetch: async () => {
+        posts += 1;
+
+        return new Response("ok");
+      },
+    });
+
+    for (let i = 0; i < 5; i++) events?.send(event);
+    await Promise.all(held);
+    expect(held).toHaveLength(2);
+    expect(posts).toBe(2);
+  });
 
   test("are off without a well-formed client id", () => {
     expect(accountEvents({ clientId: "", background: () => {} })).toBeNull();

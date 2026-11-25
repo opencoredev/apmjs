@@ -10,7 +10,7 @@
 // waits on; the task posts only once waitUntil has taken it, gives up after SEND_TIMEOUT_MS and swallows every
 // failure. On only when the Worker has APM_DATABUDDY_CLIENT_ID (production alone, packages/infra/analytics.ts).
 import { createHash } from "node:crypto";
-import { REPORT_ORIGINS, REPORT_USER_AGENT } from "@apm/core/error-report";
+import { rateLimiter, REPORT_ORIGINS, REPORT_USER_AGENT } from "@apm/core/error-report";
 import { z } from "zod";
 
 export const DATABUDDY_TRACK_URL = "https://basket.databuddy.cc/track";
@@ -57,11 +57,14 @@ export function analyticsId(authUserId: string): string {
   return createHash("sha256").update(`apm-analytics:${authUserId}`).digest("hex").slice(0, 32);
 }
 
+/** The Do Not Track values browsers send for on: "1", and "yes" in older Firefox (the website's loader reads the same). */
+const DNT_ON: ReadonlySet<string> = new Set(["1", "yes"]);
+
 /** Whether a request asks not to be tracked: Global Privacy Control, or Do Not Track. */
 export function optedOut(headers: Headers | undefined): boolean {
   if (headers === undefined) return false;
 
-  return headers.get("sec-gpc")?.trim() === "1" || headers.get("dnt")?.trim() === "1";
+  return headers.get("sec-gpc")?.trim() === "1" || DNT_ON.has(headers.get("dnt")?.trim().toLowerCase() ?? "");
 }
 
 export type AccountEvent = {
@@ -83,6 +86,15 @@ export function trackPayload(e: AccountEvent): TrackPayload {
   return payload;
 }
 
+/**
+ * Events one isolate sends per window, so a script looping the sign-in cannot flood the collector. Real sign-ups are
+ * far below it; past it events are dropped, as the error reports are.
+ */
+export const EVENT_LIMIT = { max: 30, windowMs: 60_000 } as const;
+
+/** One limit for the isolate: every request's events count against it. */
+const isolateLimit = rateLimiter(EVENT_LIMIT, Date.now);
+
 /** How long a send may take before it is dropped, so waitUntil never waits on a slow collector. */
 const SEND_TIMEOUT_MS = 3_000;
 
@@ -103,11 +115,14 @@ export function accountEvents(input: {
   readonly background: (work: Promise<void>) => void;
   readonly url?: string | undefined;
   readonly fetch?: (url: string, init: RequestInit) => Promise<Response>;
+  /** Takes one send from the limit; the isolate's EVENT_LIMIT unless a test gives its own. */
+  readonly take?: () => boolean;
 }): AccountEvents | null {
   const clientId = input.clientId.trim();
 
   if (!CLIENT_ID.test(clientId)) return null;
   const doFetch = input.fetch ?? ((url, init) => fetch(url, init));
+  const take = input.take ?? isolateLimit;
   const url = `${input.url ?? DATABUDDY_TRACK_URL}?website_id=${encodeURIComponent(clientId)}`;
 
   const deliver = async (event: AccountEvent): Promise<void> => {
@@ -130,6 +145,7 @@ export function accountEvents(input: {
   return {
     send: (event) => {
       try {
+        if (!take()) return;
         // the post starts on a later microtask, and only if waitUntil took the task without throwing
         let held = false;
 
