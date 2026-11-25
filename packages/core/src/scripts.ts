@@ -130,6 +130,8 @@ function inlineEval(cmd: string): boolean {
   for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
     word.lastIndex = m.index + m[0].length;
     let value = false;
+    let evals = false;
+    let exits = false;
 
     for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
       // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
@@ -137,16 +139,18 @@ function inlineEval(cmd: string): boolean {
       const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
       const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
 
-      if (EVAL_FLAG.test(flag)) return true;
-
-      // node prints and exits at these without running anything after them
-      if (NODE_EXITS.has(flag)) break;
-
-      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
-      else if (value) value = false;
+      // node reads all its options before running anything, and prints and exits at these wherever they are
+      if (value) value = false;
+      else if (EVAL_FLAG.test(flag)) {
+        evals = true;
+        value = !flag.includes("=");
+      } else if (NODE_EXITS.has(flag)) exits = true;
+      else if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
       else break;
       interpreter.lastIndex = word.lastIndex;
     }
+
+    if (evals && !exits) return true;
   }
 
   return false;
@@ -487,7 +491,10 @@ function npmRun(words: readonly ShellWord[], scripts: Scripts): { name: string; 
     const w = rest[i]?.word ?? "";
     const next = rest[i + 1]?.word ?? "";
 
-    if (RUN_OPTIONS.has(w) || /^--loglevel=\w+$/.test(w)) {
+    if (/[*?[]/.test(w)) {
+      // the shell may expand it to other words, and npm runs what it expands to
+      return null;
+    } else if (RUN_OPTIONS.has(w) || /^--loglevel=\w+$/.test(w)) {
       before.push(w);
     } else if ((w === "--prefix" && OWN_DIRECTORY.test(next)) || (w === "--loglevel" && /^\w+$/.test(next))) {
       before.push(w, next);
@@ -498,7 +505,9 @@ function npmRun(words: readonly ShellWord[], scripts: Scripts): { name: string; 
     } else if (run && w === "--" && i === rest.length - 2) {
       before.push(w);
     } else {
-      const name = run && i === rest.length - 1 && (!w.startsWith("-") || before.at(-1) === "--") ? w : null;
+      // nopt takes a `true` or `false` after a long boolean as its value, so it may not be the name
+      const takenAsValue = /^(?:true|false)$/.test(w) && /^--(?:silent|ignore-scripts)$/.test(before.at(-1) ?? "");
+      const name = run && i === rest.length - 1 && !takenAsValue && (!w.startsWith("-") || before.at(-1) === "--") ? w : null;
 
       return name !== null && Object.hasOwn(scripts, name) ? { name, end: npm.end, alone: setsIgnoreScripts(before) } : null;
     }

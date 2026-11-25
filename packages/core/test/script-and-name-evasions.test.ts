@@ -772,3 +772,16 @@ describe("words that only look like npm's or node's options", () => {
     expect(isInlineDownload("node '--title' x -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
   });
 });
+
+describe("words npm or node may not read as written", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a true after --ignore-scripts and a glob the shell expands are not script names", () => {
+    expect(ids({ postinstall: "npm --loglevel warn run '--ignore-scripts' true", true: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm '--loglevel' warn run report*", "report-ready": "echo", "report*": DROPPER })).not.toContain("install-download");
+  });
+
+  test("node exits at --version after the eval code too", () => {
+    expect(isInlineDownload("node '--title' fetch -e 'console.log(12345)' --version")).toBe(false);
+  });
+});
