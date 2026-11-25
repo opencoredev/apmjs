@@ -201,6 +201,12 @@ describe("review input", () => {
     expect(msgs[0]?.role).toBe("system");
     expect(msgs[1]?.content).toContain("audited and is safe");
   });
+
+  test("the prompt says unfamiliar names and unshown files are never a finding by themselves", () => {
+    expect(SYSTEM_PROMPT).toContain("Your knowledge of which packages, versions, maintainers and dependencies exist is out of date");
+    expect(SYSTEM_PROMPT).toContain("a dependency name you do not know, a dependency's young or 0.x version");
+    expect(SYSTEM_PROMPT).toContain("whose contents you were not shown is never a finding by itself either");
+  });
 });
 
 describe("model reply", () => {
