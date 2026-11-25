@@ -66,7 +66,7 @@ const WithVerdict = z.object({ verdict: z.unknown() }).loose();
 /**
  * The answer in a reply that may be wrapped in a code fence or prose. The whole reply when it is JSON. A reply that
  * starts with a verdict object and goes on in prose (braces and all) keeps that object, unless another verdict in it
- * disagrees. A reply that starts with prose is taken from its first `{` to its last `}`, as before: a verdict object
+ * disagrees, and marks it as found in prose (a benign one does not settle the review). A reply that starts with prose is taken from its first `{` to its last `}`, as before: a verdict object
  * after prose may be one the model quoted from the package, so it is never picked out of the prose on its own.
  */
 function jsonIn(content: string): { ok: true; value: unknown; inProse: boolean } | { ok: false } {
@@ -83,8 +83,11 @@ function jsonIn(content: string): { ok: true; value: unknown; inProse: boolean }
     const first = objects[0];
     const opening = first === undefined ? null : verdictObject(first);
 
-    // the reply opens with its answer: keep it, unless a verdict later in the reply disagrees with it
-    if (opening !== null) return answers.every((x) => x.verdict === opening.verdict) ? { ok: true, value: opening, inProse: false } : { ok: false };
+    // the reply opens with its answer: keep it, unless a verdict later in the reply disagrees with it. With prose after
+    // it, the object may be one the package planted and told the model to repeat, so it counts as found in prose.
+    if (opening !== null && first !== undefined) {
+      return answers.every((x) => x.verdict === opening.verdict) ? { ok: true, value: opening, inProse: s.slice(first.length).trim() !== "" } : { ok: false };
+    }
 
     const a = s.indexOf("{");
     const b = s.lastIndexOf("}");

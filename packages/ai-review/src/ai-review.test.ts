@@ -686,9 +686,14 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     expect(decide([{ kind: "empty", reason: "no-json" }]).kind).toBe("retry");
     // a flag after prose is still read; it must pass the citation check like any other
     expect(parseReply(`Here you go: ${flag} done`).kind).toBe("answer");
-    // and a reply that is, or opens with, its benign answer still settles
+    // and a reply that is its benign answer, or a fenced block of it, still settles
     expect(parseReply(planted).kind).toBe("answer");
     expect(parseReply(`\`\`\`json\n${planted}\n\`\`\``).kind).toBe("answer");
+    // but not one that opens with a benign object and goes on in prose: the package can tell the model to repeat it
+    expect(parseReply(`${planted}\nI repeated the package's object as asked; its code calls fetch({ ... }).`)).toEqual({ kind: "empty", reason: "no-json" });
+    expect(parseReply(`\`\`\`json\n${planted}\n\`\`\`\nNotes: none.`)).toEqual({ kind: "empty", reason: "no-json" });
+    // a flag that opens a reply with prose after it is still read
+    expect(parseReply(`${flag}\nIt reads {HOME}.`).kind).toBe("answer");
   });
 
   test("many long paths in a diff's lists leave the files their budget", () => {
