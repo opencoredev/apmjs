@@ -1,5 +1,5 @@
 // The OSSF feed's reads of one name's advisories (osv.ts advisoriesFor) are bounded: each MAL- id is read once, at most
-// MAX_ADVISORIES of them across every page, a few at a time, and none past MAX_ADVISORY_BYTES. An advisory past a bound
+// MAX_ADVISORIES of them across every page, a page's all at once, and none past MAX_ADVISORY_BYTES. An advisory past a bound
 // is not read, so it withholds every version of the name; the answer is partial and not kept, so the next request asks
 // again. Reads that overlap spend the request's OSV budget once, not once each. OSV is a stand-in
 // fetcher; no network and no database.
@@ -80,7 +80,7 @@ describe("one name's advisory reads are bounded", () => {
     expect(reads(s.counts)).toBe(2);
   });
 
-  test("past MAX_ADVISORIES ids, only that many are read, a few at a time; the rest withhold every version, and the partial answer is not kept", async () => {
+  test("past MAX_ADVISORIES ids, only that many are read, all at once; the rest withhold every version, and the partial answer is not kept", async () => {
     const ids = idsFrom(1000, MAX_ADVISORIES + 36);
     const s = standIn("many-listed", { pages: [ids] });
     const first = await s.ask();
@@ -90,7 +90,7 @@ describe("one name's advisory reads are bounded", () => {
     // a version only an unread advisory could name is withheld too
     expect(listedAmong("many-listed", first.filter((a) => a.id === ids.at(-1)), ["2.0.0", "0.0.1-beta"]).size).toBe(2);
     expect(reads(s.counts)).toBe(MAX_ADVISORIES);
-    expect(s.counts.maxInFlight).toBeLessThanOrEqual(8);
+    expect(s.counts.maxInFlight).toBe(MAX_ADVISORIES);
     // not kept: the next request asks OSV again
     await s.ask();
     expect(reads(s.counts)).toBe(2 * MAX_ADVISORIES);
@@ -131,12 +131,13 @@ describe("one name's advisory reads are bounded", () => {
     expect(await readCapped(source, 2048)).toBeNull();
   });
 
-  // Sol on c4a535c: reads that overlap were each charged their whole wait, so two rounds of slow reads spent the budget
-  test("reads that overlap spend the budget once: 16 advisories of 650 ms each, two rounds, are all read", async () => {
-    const ids = idsFrom(4000, 16);
+  // Sol on c4a535c and Greptile on cc2bd34: reads that overlapped were each charged their whole wait, and reads queued
+  // behind a concurrency cap could start after the budget was spent, leaving listed advisories unread
+  test("a page's advisories are read at once and spend the budget once: 64 advisories of 650 ms each are all read", async () => {
+    const ids = idsFrom(4000, MAX_ADVISORIES);
     const s = standIn("slow-listed", { pages: [ids], readMs: 650 });
 
     expect((await s.ask()).map((a) => a.id)).toEqual(ids);
-    expect(s.counts.maxInFlight).toBe(8);
+    expect(s.counts.maxInFlight).toBe(MAX_ADVISORIES);
   });
 });

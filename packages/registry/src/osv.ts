@@ -72,12 +72,12 @@ const BACKOFF = new Map<string, number>();
 const SHARED_MS = 150;
 
 /**
- * The most MAL- advisories of one name read whole (advisoriesFor), how many are read at once, and the most of one read.
- * An advisory past these is not read, so which versions it names is not known: it withholds every version of the name
- * (everyVersion), and the answer is partial, so it is not kept.
+ * The most MAL- advisories of one name read whole (advisoriesFor), and the most of one read. A page's advisories are
+ * read all at once, so none of them starts after the request's OSV budget is spent. An advisory past these bounds is not
+ * read, so which versions it names is not known: it withholds every version of the name (everyVersion), and the answer
+ * is partial, so it is not kept.
  */
 export const MAX_ADVISORIES = 64;
-const ADVISORY_CONCURRENCY = 8;
 export const MAX_ADVISORY_BYTES = 256 * 1024;
 
 /** An answer from OSV over the bytes the read allows. */
@@ -386,7 +386,7 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           }
 
           fresh.forEach((id) => requested.add(id));
-          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer, MAX_ADVISORY_BYTES)), { concurrency: ADVISORY_CONCURRENCY });
+          const details = yield* Effect.forEach(ids, (id) => Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer, MAX_ADVISORY_BYTES)), { concurrency: "unbounded" });
 
           details.forEach((r, i) => {
             if (Result.isFailure(r)) {
