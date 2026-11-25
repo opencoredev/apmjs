@@ -2,7 +2,7 @@
 // range, and its quote is on that line. The eval kept 270 of 275 findings this way; the ones it drops
 // are the model misremembering, and a flag with no surviving citation is not treated as a flag.
 import type { TarEntry } from "@apm/core";
-import { linesOf, singleLine, textOf } from "./files.ts";
+import { cutAt, linesOf, MAX_PATH_CHARS, shownPath, singleLine, textOf } from "./files.ts";
 import type { RawFinding, Severity } from "./reply.ts";
 
 export type Finding = {
@@ -86,10 +86,32 @@ function normalizePath(raw: string, paths: ReadonlySet<string>, shown: ReadonlyM
 
 export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
 
+/**
+ * Each path the prompt showed other than as it is (escaped onto one line, or cut to a citation's length), and the file
+ * it names. A shown form two files share names neither: a citation of it is dropped rather than given to one of them.
+ */
+function shownPaths(files: readonly TarEntry[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const shared = new Set<string>();
+
+  for (const f of files) {
+    for (const s of new Set([singleLine(f.path), shownPath(f.path)])) {
+      if (s === f.path) continue;
+
+      if (out.has(s) && out.get(s) !== f.path) shared.add(s);
+      else out.set(s, f.path);
+    }
+  }
+
+  for (const s of shared) out.delete(s);
+
+  return out;
+}
+
 export function verifyCitations(findings: readonly RawFinding[], files: readonly TarEntry[]): Verified {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const paths = new Set(byPath.keys());
-  const shown = new Map(files.flatMap((f) => (singleLine(f.path) === f.path ? [] : [[singleLine(f.path), f.path] as const])));
+  const shown = shownPaths(files);
   const lineCache = new Map<string, string[]>();
   const kept: Finding[] = [];
   const dropped: DroppedFinding[] = [];
@@ -122,8 +144,11 @@ export function verifyCitations(findings: readonly RawFinding[], files: readonly
       continue;
     }
 
-    if (kept.some((k) => k.file === file && k.line === raw.line)) continue;
-    kept.push({ file, line: raw.line, quote: quoteCore(raw.quote), excerpt: excerptOf(line, raw.quote), issue: oneSentence(raw.issue), severity: raw.severity });
+    // recorded as the wire holds it (wire.ts WireFinding): a path past its limit is cut there, as the prompt showed it
+    const recorded = cutAt(file, MAX_PATH_CHARS);
+
+    if (kept.some((k) => k.file === recorded && k.line === raw.line)) continue;
+    kept.push({ file: recorded, line: raw.line, quote: quoteCore(raw.quote), excerpt: excerptOf(line, raw.quote), issue: oneSentence(raw.issue), severity: raw.severity });
   }
 
   return { kept: kept.slice(0, MAX_FINDINGS), dropped };

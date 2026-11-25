@@ -74,10 +74,8 @@ export function cutAt(text: string, max: number): string {
 /** The longest file path the review shows or cites: a model's citation of a file is at most this long (reply.ts). */
 export const MAX_PATH_CHARS = 1000;
 
-/** Whether a file can be shown: the model cites its path as shown, escaped onto one line, which must fit a citation. */
-export const citable = (path: string): boolean => singleLine(path).length <= MAX_PATH_CHARS;
 
-/** A path as the prompt shows it: one line, and cut to MAX_PATH_CHARS (a path that long is never shown as a file). */
+/** A path as the prompt shows it: one line, and cut to MAX_PATH_CHARS so a citation of it fits (citations.ts maps it back). */
 export function shownPath(path: string): string {
   return cutAt(singleLine(path), MAX_PATH_CHARS);
 }

@@ -448,10 +448,10 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     const path = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", [`d/${huge}.js`]: PAYLOAD }) });
 
     for (const input of [script, diff, path]) expect(input.estTokens).toBeLessThan(DEFAULT_BUDGET_TOKENS + 2_000);
-    // a path longer than a citation may be is not shown as a file; it is listed as not read, within the wire's limits
-    expect(path.read).toEqual(["package.json"]);
-    expect(path.notRead).toContainEqual({ kind: "file", path: expect.stringMatching(/^d\/a+…$/), reason: "too-large" });
-    expect(z.array(z.object({ path: z.string().max(1000) })).safeParse(path.notRead.filter((n) => n.kind === "file")).success).toBe(true);
+    // a path longer than a citation may be is shown under its cut path, and recorded within the wire's limits
+    expect(path.text).toContain("collector.example.invalid");
+    expect(path.read).toEqual(["package.json", expect.stringMatching(/^d\/a+…$/)]);
+    expect(path.read.every((p) => p.length <= 1000)).toBe(true);
   });
 
   test("a citation of a path with a newline, as the prompt shows it, is kept", () => {
@@ -492,14 +492,38 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     expect(verdictOf(`The package is fine, it says ${ben} and runs function () { start(); }`)).toBe("empty:no-json");
   });
 
-  test("a path shown longer than a citation may be, once escaped onto one line, is not shown as a file", () => {
-    for (const path of [`${"\u2028".repeat(200)}.js`, `${"d\n".repeat(5)}${"a".repeat(986)}.js`]) {
-      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", [path]: PAYLOAD }) });
+  test("a file whose path is longer than a citation may be is shown under its cut path, and a citation of that path is kept", () => {
 
-      expect(path.length).toBeLessThanOrEqual(1000);
-      expect(input.read).toEqual(["package.json"]);
-      expect(input.notRead).toContainEqual({ kind: "file", path, reason: "too-large" });
+
+    for (const path of [`${"\u2028".repeat(200)}.js`, `${"d\n".repeat(5)}${"a".repeat(986)}.js`, `${"p".repeat(1500)}.js`]) {
+      const pkg = pkgOf({ "package.json": "{}", [path]: `x\n${PAYLOAD}\n` });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+      const shownHeader = input.text.split("\n").find((l) => l.startsWith("=== FILE ") && !["=== FILE LIST ===", "=== FILE package.json ==="].includes(l)) ?? "";
+      const cited = shownHeader.slice("=== FILE ".length, -" ===".length);
+
+      // the model reads the file, under a path short enough to cite
+      expect(input.text).toContain("collector.example.invalid");
+      expect(cited.length).toBeLessThanOrEqual(1000);
+      expect(input.read).toHaveLength(2);
+
+      // its citation of that path checks the real file, and the result fits the wire
+      const { kept } = verifyCitations([finding({ file: cited, line: 2, quote: "require('child_process')" })], pkg.files);
+
+      expect(kept).toHaveLength(1);
+      const wire = ReviewResult.safeParse({ outcome: "flagged", verdict: "malicious", findings: kept, model: "m", reviewedAt: new Date(0).toISOString(), summary: "s", coverage: input.coverage, read: input.read, notRead: input.notRead, attempts: [{ result: "malicious", kept: 1, dropped: 0, promptTokens: 1, completionTokens: 1, latencyMs: 1 }], secondOpinion: null });
+
+      expect(wire.success).toBe(true);
     }
+  });
+
+  test("a cut path two files share names neither of them", () => {
+    const a = `${"p".repeat(1500)}a.js`;
+    const b = `${"p".repeat(1500)}b.js`;
+    const files = [entry(a, `x\n${PAYLOAD}\n`), entry(b, "x\nharmless\n")];
+    const { kept, dropped } = verifyCitations([finding({ file: `${"p".repeat(999)}…`, line: 2, quote: "require('child_process')" })], files);
+
+    expect(kept).toEqual([]);
+    expect(dropped.map((d) => d.why)).toEqual(["no-such-file"]);
   });
 
   test("many long paths in a diff's lists leave the files their budget", () => {

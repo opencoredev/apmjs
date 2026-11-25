@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { citable, cutAt, kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
+import { cutAt, kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -166,7 +166,8 @@ function finish(input: { name: string; version: string; previous: string | null;
   const { b } = input;
   const extra = b.omitted.length > 0 ? [...input.extra, `Not shown (budget): ${b.omitted.length} files`] : input.extra;
   const text = `${header({ name: input.name, version: input.version, previous: input.previous, pkg: input.pkg, extra })}\n\n${b.parts.join("\n")}`;
-  const read = b.read.filter((p, i) => b.read.indexOf(p) === i);
+  // recorded as the wire holds them; a path past its limit is cut there, as the prompt showed it
+  const read = b.read.filter((p, i) => b.read.indexOf(p) === i).map(recordedPath);
 
   return {
     name: input.name,
@@ -201,12 +202,12 @@ export function buildFilesInput(input: { name: string; version: string; pkg: Pac
   const shown = ordered(pkg.manifest, pkg.files, pkg.files);
 
   for (const f of shown) {
-    if (f.data.length > MAX_DECODED_BYTES || !citable(f.path)) tooLarge.push(f.path);
+    if (f.data.length > MAX_DECODED_BYTES) tooLarge.push(f.path);
     else if (b.left < MIN_BLOCK_CHARS) b.skip(f.path);
     else {
       const l = linesOf(textOf(f));
 
-      b.add({ path: f.path, header: `=== FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
+      b.add({ path: f.path, header: `=== FILE ${shownPath(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
     }
   }
 
@@ -294,7 +295,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   for (const f of shown) {
     const old = before.get(f.path);
 
-    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES) || !citable(f.path)) {
+    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES)) {
       tooLarge.push(f.path);
       continue;
     }
@@ -307,7 +308,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
     const l = linesOf(textOf(f));
 
     if (!old) {
-      b.add({ path: f.path, header: `=== NEW FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
+      b.add({ path: f.path, header: `=== NEW FILE ${shownPath(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
       continue;
     }
 
@@ -315,7 +316,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
 
     // only line endings or trailing bytes changed: nothing to show, nothing hidden
     if (h.length === 0) b.read.push(f.path);
-    else b.add({ path: f.path, header: `=== DIFF ${singleLine(f.path)} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE, cut: h.some((x) => clipsAny(x.lines.map((d) => d.text))) });
+    else b.add({ path: f.path, header: `=== DIFF ${shownPath(f.path)} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE, cut: h.some((x) => clipsAny(x.lines.map((d) => d.text))) });
   }
 
   const touched = [...added, ...changed];
