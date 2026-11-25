@@ -3,7 +3,7 @@
 // RATE_LIMIT_RETRY.tries times within one RATE_LIMIT_RETRY.maxMs deadline from the first ask, say so, and end with a
 // message that says what to do. The registry is a local stub whose answers each test sets.
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Api, RATE_LIMIT_RETRY, retryAfterMs } from "../src/api.ts";
@@ -60,16 +60,21 @@ async function apm(args: string[], extraEnv: Readonly<Record<string, string>> = 
   writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "app", version: "1.0.0" }));
   const t0 = performance.now();
 
-  const p = Bun.spawn(["bun", CLI, ...args], {
-    cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: home, NO_COLOR: "1", APM_REGISTRY: server?.url.href ?? "", ...extraEnv },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  try {
+    const p = Bun.spawn(["bun", CLI, ...args], {
+      cwd,
+      env: { PATH: process.env.PATH ?? "", HOME: home, NO_COLOR: "1", APM_REGISTRY: server?.url.href ?? "", ...extraEnv },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
-  const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
 
-  return { code, out: out + err, ms: performance.now() - t0 };
+    return { code, out: out + err, ms: performance.now() - t0 };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 describe("a rate-limited resolve", () => {
