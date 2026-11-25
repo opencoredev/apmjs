@@ -1864,7 +1864,14 @@ function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "add
  * read that config (which files count depends on the package manager, its version and the workspace), so it names only
  * the default and how to point it at apm.
  */
-function plainInstallNote(input: { pm: Pm; command: string }): void {
+function plainInstallNote(input: { cwd: string; pm: Pm; command: string }): void {
+  // with no package.json here, the package managers look upward for one, so the project that changes may be another
+  let above = existsSync(join(input.cwd, "package.json")) ? null : dirname(input.cwd);
+
+  while (above !== null && !existsSync(join(above, "package.json"))) above = dirname(above) === above ? null : dirname(above);
+
+  if (above !== null) warn(yellow(`apm: no package.json in ${input.cwd}; ${input.pm} may install the project at ${above}${samePath(above, homedir()) ? ", your home folder," : ""} instead`));
+
   // the copyable setting only for apm's own registry: any other URL could carry a credential
   const shown = sameRegistry(process.env.APM_REGISTRY ?? DEFAULT_REGISTRY, DEFAULT_REGISTRY) ? DEFAULT_REGISTRY : null;
   const hint = shown === null ? `point ${input.pm}'s registry setting at it` : input.pm === "bun" ? `set [install] registry = "${shown}" in bunfig.toml` : input.pm === "yarn" ? `set registry=${shown} in .npmrc (yarn 1) or npmRegistryServer: "${shown}" in .yarnrc.yml (yarn 2 and later)` : `set registry=${shown} in .npmrc`;
@@ -2887,7 +2894,7 @@ async function bareInstall(a: Args): Promise<number> {
   }
 
   if ("args" in passed) {
-    plainInstallNote({ pm: det.pm, command: "install" });
+    plainInstallNote({ cwd, pm: det.pm, command: "install" });
 
     return (await runCmd([det.pm, "install", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   }
@@ -2923,7 +2930,7 @@ async function cleanInstall(a: Args): Promise<number> {
   const passed = det.pm === "npm" ? bareInstallArgs(a, det.pm) : { error: `${det.pm} has no ci apm can pass on; for a frozen install run apm install --frozen-lockfile` };
 
   if ("args" in passed) {
-    plainInstallNote({ pm: det.pm, command: "ci" });
+    plainInstallNote({ cwd, pm: det.pm, command: "ci" });
 
     return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   }

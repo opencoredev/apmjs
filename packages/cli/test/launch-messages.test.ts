@@ -176,6 +176,14 @@ describe("apm's messages for first-time users", () => {
     const bun = await apm(["install", "--pm", "bun"], { cwd: folder("b4-bun", { "package.json": manifest }), registry: "https://registry.apmjs.dev/" });
 
     expect(bun.text).toContain('To install through apm\'s registry, set [install] registry = "https://registry.apmjs.dev/" in bunfig.toml');
+
+    // with no package.json in the folder, the package manager may install the one above: the note names it, the install still runs
+    const home = folder("b4-home", { "package.json": manifest });
+    const stray = await apm(["install", "--pm", "npm"], { cwd: folder("b4-home/new"), home });
+
+    expect(stray.code).toBe(7);
+    expect(stray.text).toContain(`apm: no package.json in ${join(home, "new")}; npm may install the project at ${home}, your home folder, instead`);
+    expect(r.text).not.toContain("may install the project at");
   });
 
   test("D15: with no version tagged latest, apm add, apm explain and apm score name the tag to ask for", async () => {
