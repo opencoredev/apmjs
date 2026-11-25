@@ -22,7 +22,7 @@ import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
-import { argsError, commandOf, helpTopic } from "./commands.ts";
+import { argsError, bareInstallError, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2295,15 +2295,26 @@ const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebu
 // Commands that print one JSON document with --json (everything else is the package manager's).
 const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain", "search", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
 
-async function passthrough(a: Args): Promise<number> {
+async function passthrough(a: Args, det: Detection = pmFor(a, process.cwd())): Promise<number> {
   const cwd = process.cwd();
-  const det = pmFor(a, cwd);
   // apm's --pm is taken out only before --; after it, every argument is the package manager's
   const end = a.raw.indexOf("--");
   const own = end === -1 ? a.raw : a.raw.slice(0, end);
   const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
 
   return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
+}
+
+/** `apm install` with no packages: the package manager's own install, once its arguments cannot name a package. */
+async function bareInstall(a: Args): Promise<number> {
+  const det = pmFor(a, process.cwd());
+  const error = bareInstallError(a, det.pm);
+
+  if (error === null) return passthrough(a, det);
+  fail(`apm: ${error}. Nothing was run.`);
+  say("To check and add a package, name it: apm add <package>.");
+
+  return 2;
 }
 
 /** The help these arguments ask for, or null when they ask for none. */
@@ -2335,18 +2346,7 @@ function refuseArgs(a: Args): boolean {
 
   const command = commandOf(a.cmd);
 
-  if ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0) {
-    // only npm's install reads --tag; bun takes the word after it for a package and installs it with no check of apm's
-    const pm = a.flags.has("tag") ? pmFor(a, process.cwd()).pm : "npm";
-
-    if (pm === "npm") return false;
-    fail(`apm: --tag is read only by npm's own install, not ${pm}'s. Nothing was run.`);
-    say("To check and add a package, name it: apm add <package>.");
-
-    return true;
-  }
-
-  if (command === undefined) return false;
+  if (command === undefined || ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0)) return false;
   const error = argsError(a, command);
 
   if (error === null) return false;
@@ -2368,7 +2368,7 @@ async function main(a: Args): Promise<number> {
       return cmdAdd(a);
     case "install":
     case "i":
-      return a.positional.length > 0 ? cmdAdd(a) : passthrough(a);
+      return a.positional.length > 0 ? cmdAdd(a) : bareInstall(a);
     case "x": // also `apm exec` and `apm dlx` (args.ts)
       return cmdX(a);
     case "score":

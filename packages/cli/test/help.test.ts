@@ -273,19 +273,39 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["npm install --tag next"]);
   });
 
+  // a bare install's arguments must not name a package: bun 1.1 to 1.3 skip an option they do not know and install the
+  // word after it, with none of apm's checks
   test.each([
-    [["install", "--tag", "left-pad"], "bun"],
-    [["i", "--tag", "left-pad"], "bun"],
-    [["install", "--pm", "bun", "--tag", "left-pad"], "bun"],
-    [["install", "--pm", "pnpm", "--tag", "left-pad"], "pnpm"],
-    [["install", "--pm=yarn", "--tag", "left-pad"], "yarn"],
-    [["install", "--tag=next"], "bun"],
-  ])("apm %p is refused: only npm's install reads --tag, and bun would install the word after it unchecked", async (argv, pm) => {
+    [["install", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
+    [["i", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
+    [["install", "--pm", "bun", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not bun's"],
+    [["install", "--pm", "pnpm", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not pnpm's"],
+    [["install", "--pm=yarn", "--tag", "left-pad"], "--tag with a separate value is read only by npm's own install, not yarn's"],
+    [["install", "--omit", "dev"], "--omit with a separate value is read only by npm's own install, not bun's"],
+    [["install", "--cooldown", "left-pad"], "--cooldown is apm's own check flag, and apm install with no packages checks nothing"],
+    [["install", "--pm", "npm", "--floor", "left-pad"], "--floor is apm's own check flag, and apm install with no packages checks nothing"],
+    [["install", "--", "left-pad"], "unknown flag -- for apm install"],
+    [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
+    [["install", "--", "--cooldown", "left-pad"], "apm install with no packages passes nothing after --"],
+    [["i", "--frozen-lockfile", "--", "--cooldown", "left-pad"], "apm i with no packages passes nothing after --"],
+  ])("apm %p is refused: %s", async (argv, message) => {
     const r = await apm(argv);
 
     expect(r.code, r.out + r.err).toBe(2);
-    expect(r.err).toContain(`--tag is read only by npm's own install, not ${pm}'s`);
+    expect(r.err).toContain(message);
     expectNothingRan(r);
+  });
+
+  test.each([
+    [["install", "--pm", "npm", "--omit", "dev"], "npm install --omit dev"],
+    [["install", "--tag=next"], "bun install --tag=next"],
+    [["install", "--omit=dev"], "bun install --omit=dev"],
+    [["install", "--"], "bun install --"],
+  ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual([call]);
   });
 
   test("apm run dev --help is the package manager's", async () => {

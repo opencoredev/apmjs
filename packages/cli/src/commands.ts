@@ -3,6 +3,7 @@
 // not read, before it reads the network, packs, publishes or writes anything (on 0.1.3, `apm publish --help`
 // packed, scored and ran `bun publish`).
 import type { Args } from "./args.ts";
+import { takesValue } from "./xargs.ts";
 
 type FlagKind = "switch" | "value";
 
@@ -14,7 +15,7 @@ type Command = {
   /**
    * Value flags only the package manager's own command reads (`apm install --tag next` with no packages is npm's
    * install): parsed with their value so it is not taken for a package, and refused when apm runs the command itself.
-   * A bare install passes --tag on only to npm (main.ts refuseArgs): bun reads the word after it as a package.
+   * A bare install passes them on with a separate value only to npm (bareInstallError).
    */
   native?: readonly string[];
 };
@@ -162,6 +163,37 @@ export function valueFlagsOf(name: string): ReadonlySet<string> {
 /** The help `apm help <topic>` prints: exec and dlx are x. */
 export function helpTopic(topic: string): Command | undefined {
   return commandOf(topic === "exec" || topic === "dlx" ? "x" : topic);
+}
+
+/** The value flags npm's own install reads with a separate value: `npm install --tag next`, `--omit dev`. */
+const NPM_INSTALL_VALUES: ReadonlySet<string> = new Set(["tag", "omit"]);
+
+/**
+ * Why apm refuses a bare install (`apm install` with no packages, the package manager's own install) with these
+ * arguments, or null when the package manager may run them. apm read the word after each of its value flags as that
+ * flag's value, but a package manager that does not know the flag may read it as a package to add (bun 1.1 to 1.3 skip
+ * an unknown option and install the next word, with none of apm's checks). So only npm gets --tag or --omit with a
+ * separate value, apm's own check flags never get one, and no word may follow --, where every package manager reads
+ * packages. --pm and its value never reach the package manager.
+ */
+export function bareInstallError(a: Args, pm: string): string | null {
+  const end = a.raw.indexOf("--");
+
+  if (end !== -1 && end < a.raw.length - 1) return `apm ${a.cmd} with no packages passes nothing after --`;
+  const own = end === -1 ? a.raw : a.raw.slice(0, end);
+  const valueFlags = valueFlagsOf(a.cmd);
+
+  for (const [i, word] of own.entries()) {
+    const key = word.slice(2);
+
+    if (!word.startsWith("--") || word.includes("=") || key === "pm" || !valueFlags.has(key) || !takesValue(own[i + 1])) continue;
+
+    if (!NPM_INSTALL_VALUES.has(key)) return `${word} is apm's own check flag, and apm ${a.cmd} with no packages checks nothing`;
+
+    if (pm !== "npm") return `${word} with a separate value is read only by npm's own install, not ${pm}'s; write ${word}=<value>`;
+  }
+
+  return null;
 }
 
 /** Why apm refuses these arguments before running anything, or null when it runs them. */
