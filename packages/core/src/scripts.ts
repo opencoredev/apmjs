@@ -24,10 +24,10 @@ export const LIFECYCLE = {
 } as const satisfies Record<string, HookKind>;
 
 /**
- * One command a hook runs, after following script references. `from` says how it was reached. `second`: only the
- * flag-aware reading reaches it (expandHooks' second pass), so a reading budget takes it after every command main reads.
+ * One command a hook runs, after following script references. `from` says how it was reached. `added`: only the shell
+ * reading reaches it (expandHooks' third pass), so a reading budget takes it after every command the first two read.
  */
-export type HookCommand = { from: string; text: string; viaEval: boolean; second: boolean };
+export type HookCommand = { from: string; text: string; viaEval: boolean; added: boolean };
 
 /**
  * A lifecycle hook, the commands it reaches and the names of the scripts it runs (itself included). `cut` says why the
@@ -71,8 +71,19 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
-// node's options that take the next word as their value (`--conditions dev`, `-r ./x`); any other flag takes none
-const VALUE_FLAG = /^(?:-[rC]|--(?:conditions|require|import|(?:experimental-)?loader|input-type|redirect-warnings|title|env-file|disable-warning|watch-path|test-reporter(?:-destination)?|report-dir|report-filename|diagnostic-dir|cpu-prof-dir|heap-prof-dir|inspect-port|debug-port|stack-trace-limit))$/;
+// node's options that take the next word as their value (`--conditions dev`, `-r ./x`), from `node --help` (Node 18 to
+// 24); any other flag takes none, so the first other word is the program node runs and what follows is its own
+const VALUE_FLAG = new RegExp(
+  String.raw`^(?:-[rC]|--(?:${[
+    "conditions", "require", "import", "loader", "experimental-loader", "experimental-default-type", "input-type", "redirect-warnings", "title",
+    "env-file", "env-file-if-exists", "disable-warning", "watch-path", "watch-kill-signal", "unhandled-rejections", "dns-result-order",
+    "icu-data-dir", "openssl-config", "tls-cipher-list", "tls-keylog", "secure-heap", "secure-heap-min", "max-http-header-size",
+    "heapsnapshot-signal", "heapsnapshot-near-heap-limit", "trace-event-categories", "trace-event-file-pattern", "use-largepages",
+    "localstorage-file", "experimental-config-file", "report-dir", "report-directory", "report-filename", "report-signal", "diagnostic-dir",
+    "cpu-prof-dir", "cpu-prof-name", "cpu-prof-interval", "heap-prof-dir", "heap-prof-name", "heap-prof-interval", "inspect-port", "debug-port",
+    "test-reporter", "test-reporter-destination", "test-name-pattern", "test-skip-pattern", "test-concurrency", "test-shard", "test-timeout",
+  ].join("|")}))$`,
+);
 
 /**
  * Whether a command runs inline code: `node -e`, `node --no-warnings -pe`, `$(nodejs -e …)`, `deno eval`. An interpreter
@@ -86,8 +97,7 @@ function inlineEval(cmd: string): boolean {
 
   for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
     word.lastIndex = m.index + m[0].length;
-    // the word after a flag: a value node's option table says it takes, or one a long flag may take unless it names a file
-    let value: "known" | "maybe" | null = null;
+    let value = false;
 
     for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
       // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
@@ -97,8 +107,8 @@ function inlineEval(cmd: string): boolean {
 
       if (EVAL_FLAG.test(flag)) return true;
 
-      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag) ? "known" : /^--\w[\w-]*$/.test(flag) ? "maybe" : null;
-      else if (value === "known" || (value === "maybe" && !/[./\\]/.test(flag))) value = null;
+      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
+      else if (value) value = false;
       else break;
       interpreter.lastIndex = word.lastIndex;
     }
@@ -129,6 +139,9 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
  * "but they will not run any pre- or post-scripts").
  */
 type ScriptRef = { name: string; alone: boolean };
+
+/** expandHooks' passes: main's reading, the flag-aware regex's additions, the shell reading's additions. */
+type Pass = 1 | 2 | 3;
 
 /**
  * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set: -1 when none does, and
@@ -204,15 +217,21 @@ function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
     out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
   }
 
-  // the regex's reading of an invocation stands for it; any other invocation the shell reading finds runs its script with
-  // the pre and post scripts, whether or not the same name was run alone elsewhere
-  const read = new Set<string>();
-
-  for (const m of cmd.matchAll(RUN_REF)) read.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
-
-  for (const r of shellRunReferences(cmd, scripts)) if (!read.has(`${r.end}\0${r.name}`)) out.push({ name: r.name, alone: false });
-
   return out;
+}
+
+/**
+ * Scripts the shell reading finds a command run that neither main's reading nor the flag-aware regex read in that
+ * invocation, each run with its pre and post scripts: the regex's reading of an invocation stands for it, and any other
+ * invocation runs them whether or not the same name was run alone elsewhere.
+ */
+function shellReferences(cmd: string, scripts: Scripts): ScriptRef[] {
+  const read = new Set<string>(mainReferences(cmd, scripts));
+  const regex = new Set<string>();
+
+  for (const m of cmd.matchAll(RUN_REF)) regex.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
+
+  return shellRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || regex.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: false }]));
 }
 
 const PACKAGE_MANAGERS = new Set(["npm", "yarn", "pnpm", "bun"]);
@@ -229,6 +248,8 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
   let word: string | null = null;
   let glob = false;
   let i = 0;
+  // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution
+  const open: string[] = [];
 
   const flush = function* (): Generator<{ word: string; end: number; glob: boolean }> {
     if (word !== null) yield { word, end: i, glob };
@@ -238,26 +259,42 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
 
   for (; i < cmd.length; i++) {
     const c = cmd[i] ?? "";
+    const next = cmd[i + 1] ?? "";
 
-    if (c === "'" || c === '"') {
-      let j = i + 1;
-      let body = "";
+    if (open.at(-1) === '"') {
+      // inside double quotes: a backslash escapes only $, `, ", \ and a newline (which it removes), as the shell reads it,
+      // and a command substitution is a command of its own
+      if (c === '"') open.pop();
+      else if (c === "\\" && next === "\n") i++;
+      else if (c === "\\" && /[$`"\\]/.test(next)) word = (word ?? "") + (cmd[++i] ?? "");
+      else if ((c === "$" && next === "(") || c === "`") {
+        yield* flush();
+        yield null;
+        open.push(c === "`" ? "`" : ")");
+        if (c === "$") i++;
+      } else word = (word ?? "") + c;
+    } else if (c === "'") {
+      const j = cmd.indexOf("'", i + 1);
+      const close = j < 0 ? cmd.length : j;
 
-      for (; j < cmd.length && cmd[j] !== c; j++) {
-        // inside double quotes a backslash escapes only $, `, ", \ and a newline, as the shell reads it
-        if (c === '"' && cmd[j] === "\\" && cmd[j + 1] === "\n") j++;
-        else {
-          if (c === '"' && cmd[j] === "\\" && /[$`"\\]/.test(cmd[j + 1] ?? "")) j++;
-          body += cmd[j];
-        }
-      }
-
-      word = (word ?? "") + body;
-      i = j;
+      word = (word ?? "") + cmd.slice(i + 1, close);
+      i = close;
+    } else if (c === '"') {
+      open.push('"');
+      word ??= "";
     } else if (c === "\\") {
-      if (cmd[i + 1] === "\n") i++;
+      if (next === "\n") i++;
       else word = (word ?? "") + (cmd[++i] ?? "");
-    } else if (COMMAND_END.has(c) || (c === "$" && cmd[i + 1] === "(")) {
+    } else if ((c === ")" || c === "`") && open.at(-1) === c) {
+      yield* flush();
+      yield null;
+      open.pop();
+    } else if ((c === "$" && next === "(") || c === "`") {
+      yield* flush();
+      yield null;
+      open.push(c === "`" ? "`" : ")");
+      if (c === "$") i++;
+    } else if (COMMAND_END.has(c)) {
       yield* flush();
       yield null;
     } else if (/\s|[<>]/.test(c)) yield* flush();
@@ -361,7 +398,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     if (own === undefined) continue;
     const commands: HookCommand[] = [];
     const followed = new Set<string>([hook]);
-    // what the first pass read, for the second to read the flag-aware references in
+    // what the first two passes read, for the next to read its references in
     const read: { text: string; depth: number }[] = [];
     let cut: string | null = null;
 
@@ -382,44 +419,49 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
       return true;
     };
 
-    // the first pass marks a script followed before its body is admitted, as main does; the second only once it is, so a
-    // script it reached but could not read stays one no hook reaches and keeps its standalone reading (otherScripts)
-    const follow = (refs: readonly ScriptRef[], depth: number, first: boolean): void => {
+    // the first pass marks a script followed before its body is admitted, as main does; the later ones only once it is, so
+    // a script they reached but could not read stays one no hook reaches and keeps its standalone reading (otherScripts)
+    const follow = (refs: readonly ScriptRef[], depth: number, pass: Pass): void => {
       for (const { name, alone } of refs) {
         for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
           const body = scripts[n];
           const from = `scripts.${n} (run by scripts.${hook})`;
 
-          if (body === undefined || followed.has(n) || (!first && !admits(from, depth + 1))) continue;
+          if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, depth + 1))) continue;
           followed.add(n);
-          visit(body, from, depth + 1, false, first);
+          visit(body, from, depth + 1, false, pass);
         }
       }
     };
 
-    const visit = (text: string, from: string, depth: number, viaEval: boolean, first: boolean): void => {
+    const visit = (text: string, from: string, depth: number, viaEval: boolean, pass: Pass): void => {
       if (!admits(from, depth)) return;
 
       const evals = viaEval || inlineEval(text);
-      commands.push({ from, text, viaEval: evals, second: !first });
+      commands.push({ from, text, viaEval: evals, added: pass === 3 });
 
-      if (first) read.push({ text, depth });
+      if (pass !== 3) read.push({ text, depth });
 
-      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, first);
+      for (const m of text.matchAll(SH_C)) visit((m[1] ?? m[2] ?? "").replace(/\\(.)/g, "$1"), `${from} (sh -c)`, depth + 1, evals, pass);
 
-      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals, first);
+      for (const d of decodedStrings(text)) visit(d.value, `${from} (decoded ${d.how})`, depth + 1, evals, pass);
 
       const main = mainReferences(text, scripts).map((name) => ({ name, alone: false }));
 
-      follow(first ? main : [...main, ...flagReferences(text, scripts)], depth, first);
+      follow(pass === 1 ? main : [...main, ...flagReferences(text, scripts), ...(pass === 3 ? shellReferences(text, scripts) : [])], depth, pass);
     };
 
-    visit(own, `scripts.${hook}`, 0, false, true);
+    visit(own, `scripts.${hook}`, 0, false, 1);
 
-    for (const { text, depth } of read) {
-      const main = new Set(mainReferences(text, scripts));
+    // the second pass over what the first read, then the third over what either read
+    for (const [pass, n] of [[2, read.length], [3, Number.POSITIVE_INFINITY]] as const) {
+      for (let i = 0; i < Math.min(n, read.length); i++) {
+        const { text, depth } = read[i] ?? { text: "", depth: 0 };
+        const main = new Set(mainReferences(text, scripts));
+        const refs = pass === 2 ? flagReferences(text, scripts).filter((r) => !main.has(r.name)) : shellReferences(text, scripts);
 
-      follow(flagReferences(text, scripts).filter((r) => !main.has(r.name)), depth, false);
+        follow(refs, depth, pass);
+      }
     }
 
     out.push({ hook, kind, commands, scripts: [...followed], cut });

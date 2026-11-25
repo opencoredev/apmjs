@@ -4,7 +4,7 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, expandHooks, runTargets, shellWords, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
+import { analyze, expandHooks, measureManifest, runTargets, shellWords, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
 // any case, as Windows and macOS file systems resolve `require('./x.JS')`
@@ -20,7 +20,7 @@ const BINARY_EXT = /\.(?:node|exe|dll|so|dylib|wasm|bin|dat|zip|gz|tgz|tar|7z|ja
 const MAX_GLOBS = 8;
 const MAX_GLOB_CHARS = 128;
 
-/** Where the review ranks what install hooks reach only as the shell reads them: after everything main ranks. */
+/** Where the review ranks what it shows that main's rules pass over (ordered): after everything they show. */
 const REACHED_TIER = 7;
 
 /** Files larger than this are not decoded at all; they are listed as not read. */
@@ -186,7 +186,8 @@ export function ruleSignalFiles(manifest: Manifest, files: readonly TarEntry[]):
   return out;
 }
 
-export type Tier = { tier: number; sub: number };
+/** `reached`: an install hook names the file only as the shell reading reads its commands (readingOrder). */
+export type Tier = { tier: number; sub: number; reached: boolean };
 
 /** Ranks files for reading; lower is earlier. */
 export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f: TarEntry) => Tier {
@@ -198,9 +199,11 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   // escapes removed (`node './my setup.txt'`), `$PWD/` read as the package's folder, and an unquoted glob expanded over
   // the tarball's files (`node ./pay*.txt`): ranked after everything above, so it only takes budget main left unused
   const reached = new Set<string>();
-  const globs: { pattern: string; depth: number; prefix: string }[] = [];
+  const globs = new Map<string, { depth: number; prefix: string }>();
+  const scripts = { scripts: Object.fromEntries(manifest.scripts) };
 
-  for (const h of expandHooks({ scripts: Object.fromEntries(manifest.scripts) })) {
+  // a manifest past what apm reads is not expanded, as `analyze` does not expand it
+  for (const h of measureManifest(scripts, { charged: false }).kind === "ok" ? expandHooks(scripts) : []) {
     if (h.kind !== "install") continue;
 
     for (const c of h.commands) {
@@ -212,17 +215,17 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
           const f = resolved(w);
 
           if (f !== undefined) reached.add(f);
-        } else if (globs.length < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
-          globs.push({ pattern: w, depth: w.split("/").length, prefix: w.slice(0, w.indexOf("*")) });
+        } else if (globs.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+          globs.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.indexOf("*")) });
         }
       }
     }
   }
 
-  for (const f of globs.length > 0 ? files : []) {
+  for (const f of globs.size > 0 ? files : []) {
     const depth = f.path.split("/").length;
 
-    for (const g of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && wildcardMatch(f.path, g.pattern)) reached.add(f.path);
+    for (const [pattern, g] of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && wildcardMatch(f.path, pattern)) reached.add(f.path);
   }
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
@@ -232,15 +235,12 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   const signals = ruleSignalFiles(manifest, files);
   const reach = importDistances(files, [...targets, ...nodeEntries].filter((p): p is string => p !== undefined));
 
-  return (f) => {
+  const tierOf = (f: TarEntry): { tier: number; sub: number } => {
     const p = f.path;
 
     if (targets.has(p)) return { tier: 0, sub: 0 };
 
     if (nodeEntries.has(p)) return { tier: 1, sub: 0 };
-
-    // shown only because the shell reading names it: after every file main shows
-    if (reached.has(p) && !isReviewable(f)) return { tier: REACHED_TIER, sub: p.split("/").length };
 
     if (signals.has(p)) return { tier: 2, sub: 0 };
     const d = reach.get(p);
@@ -253,12 +253,16 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
 
     return { tier: 6, sub: p.split("/").length };
   };
+
+  return (f) => ({ ...tierOf(f), reached: reached.has(f.path) });
 }
 
 /**
  * What the model reads, in reading order: code and data, and any install-script target or Node entry point that is not
- * machine code, whatever its name or bytes (`node setup.txt` runs it as JavaScript, `./setup.png` with a shebang runs
- * as a script); never package.json, which is shown on its own. Ties break on `prefer`, then size.
+ * binary, whatever its name (`node setup.txt` runs it as JavaScript); never package.json, which is shown on its own.
+ * Then, after all of those, what they leave of the budget goes to what runs that those rules pass over: a binary-named
+ * target or entry that is not machine code (`./setup.png` with a shebang runs as a script), and any file an install
+ * hook names only as the shell reads it. Ties break on `prefer`, then size.
  */
 export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: readonly TarEntry[], prefer: (f: TarEntry) => boolean = () => false): TarEntry[] {
   const rank = readingOrder(manifest, all);
@@ -266,7 +270,11 @@ export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: read
   const keyed = pick.flatMap((f) => {
     const r = rank(f);
 
-    return f.path !== "package.json" && (isReviewable(f) || ((r.tier <= 1 || r.tier === REACHED_TIER) && (kindOf(f) !== "binary" || !isMachineCode(f.data)))) ? [{ f, r, p: prefer(f) ? 0 : 1 }] : [];
+    if (f.path === "package.json") return [];
+
+    if (isReviewable(f) || (r.tier <= 1 && kindOf(f) !== "binary")) return [{ f, r, p: prefer(f) ? 0 : 1 }];
+
+    return (r.tier <= 1 || r.reached) && !isMachineCode(f.data) ? [{ f, r: { ...r, tier: REACHED_TIER }, p: prefer(f) ? 0 : 1 }] : [];
   });
 
   keyed.sort((a, b) => a.r.tier - b.r.tier || a.r.sub - b.r.sub || a.p - b.p || a.f.size - b.f.size || (a.f.path < b.f.path ? -1 : 1));

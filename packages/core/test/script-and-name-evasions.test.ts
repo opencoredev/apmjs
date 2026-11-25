@@ -481,3 +481,33 @@ describe("the flag-aware reading's additions, round two", () => {
   });
 });
 
+
+describe("the shell reading is a third pass: it spends only what the first two leave", () => {
+  test("runs only the shell reading finds cannot use up the command budget before a run the flag-aware regex follows", () => {
+    const many = Array.from({ length: 220 }, (_, i) => `t${i}`);
+    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run '-s' big && npm run -s x", big: many.map((n) => `npm run ${n}`).join(" && "), x: DROPPER };
+    const [hook] = expandHooks({ scripts });
+
+    expect(hook?.commands.map((c) => c.from)).toContain("scripts.x (run by scripts.postinstall)");
+    expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+  });
+
+  test("a streamed plan still holds a target the flag-aware regex reaches, as before", () => {
+    const enc = new TextEncoder();
+    const body = "module.exports = 1;\n";
+    const file = (path: string): TarEntry => ({ path, size: enc.encode(body).length, mode: 0o644, data: enc.encode(body) });
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { postinstall: "npm run -s setup", setup: "node lib/hidden.js" } };
+
+    expect([...planLayers({ manifest, files: [file("lib/hidden.js"), file("index.js")], imports: new Map(), budget: body.length }).production]).toEqual(["lib/hidden.js"]);
+  });
+
+  test("a run inside a double-quoted command substitution is read", () => {
+    expect(expandHooks({ scripts: { postinstall: 'echo "$(npm run \'-s\' payload)"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+    expect(expandHooks({ scripts: { postinstall: 'echo "`npm run \'-s\' payload`"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+  });
+
+  test("an extensionless program after a boolean node flag is the program, and its arguments are its own", () => {
+    expect(isInlineDownload("node --no-warnings bin/run -e https://example.invalid")).toBe(false);
+  });
+});
+

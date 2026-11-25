@@ -1418,9 +1418,9 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
   const first: string[] = [];
   const hooks = expandHooks(manifest);
 
-  // production's roots are what main's reading reaches; what only the flag-aware reading adds (HookCommand.second) is
-  // the second layer's (invokedFiles), held from what production's plan leaves of the budget
-  for (const c of hooks.flatMap((h) => (h.kind === "publish" ? [] : h.commands.filter((x) => !x.second)))) {
+  // what only the shell reading reaches (HookCommand.added) is not production's: the second layer holds it (invokedFiles)
+  // from what production's plan leaves of the budget
+  for (const c of hooks.flatMap((h) => (h.kind === "publish" ? [] : h.commands.filter((x) => !x.added)))) {
     for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
       const f = resolveIn(byPath, w);
 
@@ -1803,8 +1803,12 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
-  const installCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands);
-  const hookCommands = hooks.filter((h) => h.kind !== "publish").flatMap((h) => h.commands.map((c) => ({ text: c.text, kind: h.kind, second: c.second }))).toSorted((a, b) => Number(a.second) - Number(b.second));
+  // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
+  const hookCommands = hooks
+    .filter((h) => h.kind !== "publish")
+    .flatMap((h) => h.commands.map((c) => ({ ...c, kind: h.kind })))
+    .toSorted((a, b) => Number(a.added) - Number(b.added));
+  const installCommands = hookCommands;
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
   const gyp = byPath.get("binding.gyp");
@@ -1854,8 +1858,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // what install hooks run as the second layer reads them (scriptTargets): production's roots are production's
   const installTargetsX = new Set<string>();
   const first: string[] = [];
-  // what install hooks run that only the flag-aware reading reaches (HookCommand.second): read after the entries
-  const later: string[] = [];
+  // what install hooks run that only the shell reading reaches (HookCommand.added): read after the entries
+  const later = new Set<string>();
 
   for (const c of installCommands) {
     for (const w of [...scriptTargetsBefore(c.text), ...commandWords(c.text)]) {
@@ -1863,7 +1867,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
 
       if (f && f.path !== "package.json") {
         installTargets.add(f.path);
-        (c.second ? later : first).push(f.path);
+        if (c.added) later.add(f.path);
+        else first.push(f.path);
       }
     }
 
@@ -1901,7 +1906,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     runsAsCode.add(p);
   }
 
-  first.push(...later);
+  for (const p of later) first.push(p);
 
   const reachable = new Set<string>(first);
   const queue = [...reachable];
