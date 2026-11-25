@@ -3,7 +3,8 @@
 //
 // A report carries a fixed code ("internal" for an Error, "unknown" for anything else thrown), the route's label from
 // WEB_ROUTES (Next.js names the route's file, such as /package/[...name]/page, never the path a visitor sent; a route
-// missing from the table is "unknown"), the status, the build id and the colo. Never the error's message, name,
+// missing from the table is "unknown"), no status (status=-: the answer's is not known yet, and is 200 when the error
+// was in a streamed part, as a home page score badge's was on 2026-11-25), the build id and the colo. Never the error's message, name,
 // digest or stack: Workers Logs keeps what Next.js logs.
 import { errorReporter, type ErrorCode, type ErrorReporter, type WaitUntil } from "@apm/core/error-report";
 
@@ -126,7 +127,8 @@ export function reportRequestError(input: RequestErrorInput, context: ReportCont
         worker: "web",
         code: webErrorCode(input),
         route: webRouteLabel(input),
-        status: 500,
+        // onRequestError runs before Next.js has picked the status, and an error in a streamed part leaves it 200
+        status: null,
         build: context.build,
         colo: coloOf(input.headers["cf-ray"]),
       }),

@@ -1,5 +1,6 @@
 // In-memory limits for the public search route. One process only: after the Cloudflare port these
 // are replaced by Cloudflare's rate limiting rules and its cache, which hold across instances.
+import { inBackground } from "./edge-cache";
 
 export type Take = { ok: true } | { ok: false; retryAfterSeconds: number };
 
@@ -80,6 +81,9 @@ export function createSharedCache<T>(opts: { ttlMs: number; maxEntries: number; 
       });
 
       loading.set(key, promise);
+      // the load's I/O belongs to the request that started it: the Worker ends that request's work when its answer is
+      // done (a HEAD's comes before its streamed parts), and a later request waiting on the load would wait forever
+      inBackground(promise);
 
       try {
         return await promise;
