@@ -90,7 +90,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
-import { listedMalicious, maliciousText, type ListedMalicious } from "./osv.ts";
+import { KnownMalicious, listedMalicious, maliciousText, type ListedMalicious } from "./osv.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { admitResolve, carriesCredentials, ResolveLimit } from "./resolve-limit.ts";
 import { getRouteOf } from "./routes.ts";
@@ -2937,6 +2937,19 @@ const treeReviews = (tree: Tree) =>
     return out;
   });
 
+/**
+ * The versions among `pkgs` the OSSF malicious-packages feed lists (osv.ts), npm's only: a name published on this
+ * registry is its own package, never npm's under that name, so the feed's advisories do not name it.
+ */
+const listedOnNpm = (pkgs: readonly { name: string; version: string }[]) =>
+  Effect.gen(function* () {
+    // no feed, no database read for it (a walk's statements are counted: tree-walk.test.ts)
+    if (pkgs.length === 0 || Option.isNone(yield* Effect.serviceOption(KnownMalicious))) return [];
+    const local = yield* Effect.flatMap(Store, (store) => store.existingPackages([...new Set(pkgs.map((p) => p.name))]));
+
+    return yield* listedMalicious(pkgs.filter((p) => !local.has(p.name)));
+  });
+
 /** Whether an apm reviewer confirmed this version malicious. False when this registry runs no AI review. */
 const reviewerConfirmed = (v: VersionRecord) =>
   Effect.gen(function* () {
@@ -3240,7 +3253,7 @@ const rootAnswer = (input: {
     }
 
     // a dependency the OSSF malicious-packages feed lists: refused in every mode, as a confirmed one is (osv.ts)
-    const knownMalicious = yield* listedMalicious(walked.packages);
+    const knownMalicious = yield* listedOnNpm(walked.packages);
 
     if (knownMalicious.length > 0) {
       return answered(json({ error: `${name}@${v.version} would install ${knownMalicious.map((m) => `${m.name}@${m.version} (${m.ids.join(", ")})`).join(", ")}, which the OSSF malicious-packages feed lists as malicious.`, name, range, version: null, skipped, newest, tree, knownMalicious }, 422));
@@ -3656,7 +3669,7 @@ export const scanResponse = (req: Request, caller: Caller) =>
     // the packuments of the packages being checked at once share the request's lease, each under a child of it given
     // back when it is done; a package the isolate cache or a shared-cache write still holds stays charged to the pool
     // what the OSSF malicious-packages feed lists among them: one query for the whole scan (osv.ts)
-    const listed = new Map((yield* listedMalicious(checked)).map((m) => [`${m.name}@${m.version}`, m]));
+    const listed = new Map((yield* listedOnNpm(checked)).map((m) => [`${m.name}@${m.version}`, m]));
     const reads = yield* Effect.forEach(checked, (p) => briefly((lease) => scanOne({ p, strict, at, lease, policy, queueBudget, listed: listed.get(`${p.name}@${p.version}`) })), { concurrency: SCAN_CONCURRENCY });
     const results = reads.flat();
 

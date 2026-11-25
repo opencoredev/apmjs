@@ -273,7 +273,7 @@ export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string;
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
@@ -780,6 +780,14 @@ function decide(input: ExplainInput): Decided {
 
       if (resolved.confirmed.length > 0) {
         return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: it would install ${listed(resolved.confirmed)}, which apm reviewers confirmed ${resolved.confirmed.length === 1 ? "is" : "are"} malicious.`, reasons, commands: null, coverage: NOT_READ };
+      }
+
+      const bad = resolved.knownMalicious ?? [];
+
+      if (bad.length > 0) {
+        const cited = bad.map((m) => `${m.name}@${m.version} (${m.ids.join(", ")})`).join(", ");
+
+        return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: the OSSF malicious-packages feed lists ${quoted(cited)} as malicious.`, reasons: [...reasons, ...bad.flatMap((m) => m.ids.map((id) => `Advisory: https://osv.dev/vulnerability/${id}`))], commands: null, coverage: NOT_READ };
       }
 
       if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };

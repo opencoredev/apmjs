@@ -14,7 +14,8 @@ import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
 import type { Caller } from "../src/server.ts";
 import { Store } from "../src/db.ts";
-import { KnownMalicious, osvFeed, type PackageVersion } from "../src/osv.ts";
+import { KnownMalicious, OSV_BATCH, osvFeed, REQUEST_BUDGET_MS, type PackageVersion } from "../src/osv.ts";
+import { Client } from "pg";
 import { Upstream } from "../src/upstream.ts";
 import { MemoryPool, RequestMemory } from "../src/memory.ts";
 
@@ -41,7 +42,12 @@ const LISTED = new Map(Object.entries({
   // listed, and no longer on npm (as getsolara@1.0.1 is not): a lockfile may still pin it
   "evil-dep@0.9.0": ["MAL-2026-0004"],
   "plain-pkg@1.0.0": ["GHSA-xxxx-yyyy-zzzz"],
+  // a name published on this registry: npm's advisory is not about it
+  "@local/evil@1.0.0": ["MAL-2026-0005"],
 }));
+
+/** Versions whose first batch answer has no MAL- id but a next page that has one. */
+const PAGED = new Map([["paged-pkg@1.0.0", "MAL-2026-0006"]]);
 
 const npm = Bun.serve({
   port: 0,
@@ -66,19 +72,41 @@ const npm = Bun.serve({
 
 const OsvQuery = z.object({ queries: z.array(z.object({ package: z.object({ name: z.string(), ecosystem: z.string() }), version: z.string() })) });
 
-/** OSV's batch query, standing in: counts the packages it was asked about, and fails while `down`. */
-const osv = { asked: 0, down: false };
+/** OSV, standing in: counts the packages and batches asked about, fails while `down`, answers late while `stallMs`. */
+const osv = { asked: 0, batches: 0, down: false, stallMs: 0, pagesDown: false };
+
+const PageQuery = z.object({ package: z.object({ name: z.string() }), version: z.string(), page_token: z.string() });
 
 const osvServer = Bun.serve({
   port: 0,
   hostname: "127.0.0.1",
   async fetch(req): Promise<Response> {
+    if (osv.stallMs > 0) await Bun.sleep(osv.stallMs);
+
     if (osv.down) return new Response("unavailable", { status: 503 });
+
+    if (new URL(req.url).pathname.endsWith("/v1/query")) {
+      if (osv.pagesDown) return new Response("unavailable", { status: 503 });
+      const q = PageQuery.parse(await req.json());
+      const id = PAGED.get(`${q.package.name}@${q.version}`);
+
+      return Response.json({ vulns: id ? [{ id, modified: "2026-11-24T00:00:00Z" }] : [] });
+    }
+
     const body = OsvQuery.parse(await req.json());
 
     osv.asked += body.queries.length;
+    osv.batches++;
 
-    return Response.json({ results: body.queries.map((q) => ({ vulns: (q.package.ecosystem === "npm" ? (LISTED.get(`${q.package.name}@${q.version}`) ?? []) : []).map((id) => ({ id, modified: "2026-11-24T00:00:00Z" })) })) });
+    const answer = (q: z.infer<typeof OsvQuery>["queries"][number]) => {
+      const key = `${q.package.name}@${q.version}`;
+
+      if (PAGED.has(key)) return { vulns: [{ id: "GHSA-aaaa-bbbb-cccc", modified: "2026-11-24T00:00:00Z" }], next_page_token: "p2" };
+
+      return { vulns: (q.package.ecosystem === "npm" ? (LISTED.get(key) ?? []) : []).map((id) => ({ id, modified: "2026-11-24T00:00:00Z" })) };
+    };
+
+    return Response.json({ results: body.queries.map(answer) });
   },
 });
 
@@ -189,6 +217,39 @@ describe("the OSSF malicious-packages feed", () => {
     expect(fatal?.url).toBe("https://osv.dev/vulnerability/MAL-2026-0003");
     expect(out.blocked.some((b) => b.package === "half-evil" && b.version === "1.0.0")).toBe(false);
   });
+
+  // review of bb6c5ae, finding 1: npm's advisory for a name was applied to the package of that name published here
+  test("a package published on this registry is not matched against npm's advisories", async () => {
+    database ??= freshDatabase();
+    const c = new Client({ connectionString: (await database).url });
+
+    await c.connect();
+
+    try {
+      await c.query(`INSERT INTO packages (name, created_at, modified_at, dist_tags) VALUES ('@local/evil', 0, 0, '{"latest":"1.0.0"}'::jsonb)`);
+    } finally {
+      await c.end();
+    }
+
+    const out = await scan([{ name: "@local/evil", version: "1.0.0" }]);
+
+    expect(out.blocked.some((b) => b.kind === "malicious")).toBe(false);
+  });
+
+  // review of bb6c5ae, finding 2: each page and each pass of a resolve waited on OSV's timeout again
+  test("a stalled feed costs a resolve one budget at most, and it still answers", async () => {
+    osv.stallMs = REQUEST_BUDGET_MS + 2_000;
+
+    try {
+      const t0 = performance.now();
+      const r = await resolve("half-evil");
+
+      expect(r.status).toBe(200);
+      expect(performance.now() - t0).toBeLessThan(REQUEST_BUDGET_MS + 1_500);
+    } finally {
+      osv.stallMs = 0;
+    }
+  });
 });
 
 describe("osvFeed", () => {
@@ -217,5 +278,60 @@ describe("osvFeed", () => {
     }
 
     expect(await lookup(root, pkgs)).toEqual([{ name: "evil-root", version: "1.0.0", ids: ["MAL-2026-0001"] }]);
+  });
+
+  test("one feed's lookups share one budget: after a stall, the next lookup does not wait again", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+
+    const twice = Effect.gen(function* () {
+      const k = yield* KnownMalicious;
+
+      return [yield* k.lookup([{ name: "evil-root", version: "1.0.0" }]), yield* k.lookup([{ name: "evil-dep", version: "1.0.0" }])];
+    });
+
+    osv.stallMs = REQUEST_BUDGET_MS + 2_000;
+
+    try {
+      const t0 = performance.now();
+
+      expect(await Effect.runPromise(twice.pipe(Effect.provide(osvFeed(root))))).toEqual([[], []]);
+      expect(performance.now() - t0).toBeLessThan(REQUEST_BUDGET_MS + 1_000);
+    } finally {
+      osv.stallMs = 0;
+    }
+  });
+
+  // review of bb6c5ae, finding 3: a result with more pages was read as its first page alone, and kept as clean
+  test("a version's next pages are read, and an answer missing a page is not kept", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+    const pkgs = [{ name: "paged-pkg", version: "1.0.0" }];
+
+    osv.pagesDown = true;
+
+    try {
+      expect(await lookup(root, pkgs)).toEqual([]);
+    } finally {
+      osv.pagesDown = false;
+    }
+
+    expect(await lookup(root, pkgs)).toEqual([{ name: "paged-pkg", version: "1.0.0", ids: ["MAL-2026-0006"] }]);
+  });
+
+  test("more versions than one batch holds are asked in batches, the last one's included", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+    const pkgs = [...Array.from({ length: OSV_BATCH }, (_, i) => ({ name: `filler-${i}`, version: "1.0.0" })), { name: "evil-root", version: "1.0.0" }];
+    const before = osv.batches;
+
+    expect(await lookup(root, pkgs)).toEqual([{ name: "evil-root", version: "1.0.0", ids: ["MAL-2026-0001"] }]);
+    expect(osv.batches - before).toBe(2);
+  });
+
+  // review of bb6c5ae, finding 4: anything a scan sent was forwarded and kept
+  test("a name or version that is not an npm coordinate is not asked about", async () => {
+    const root = `${osvServer.url.href}${crypto.randomUUID()}/`;
+    const before = osv.asked;
+
+    expect(await lookup(root, [{ name: "../etc", version: "1.0.0" }, { name: "ok-name", version: "1.0.0 || x" }, { name: "ok-name", version: "x".repeat(300) }])).toEqual([]);
+    expect(osv.asked).toBe(before);
   });
 });

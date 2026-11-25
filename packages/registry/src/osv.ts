@@ -1,11 +1,16 @@
 // Versions the OSSF malicious-packages feed (github.com/ossf/malicious-packages) lists, read through OSV's batch query
 // (api.osv.dev). The feed's advisories carry MAL- ids and report malicious code in exactly the versions they name, so a
-// listed name@version is refused in every mode, like one an apm reviewer confirmed, and the answer cites the ids. Only
-// the exact version counts: getsolara@1.0.1 is listed, the security-holding getsolara@1.0.0 npm serves today is not.
-// A lookup OSV does not answer is logged and reads as nothing listed (an outage of the feed must not stop installs),
-// and is not kept; an answer is kept per isolate for CACHE_MS, so a hot package costs one query per isolate.
+// listed name@version from npm is refused in every mode, like one an apm reviewer confirmed, and the answer cites the
+// ids. Only the exact version counts: getsolara@1.0.1 is listed, the security-holding getsolara@1.0.0 npm serves today
+// is not. A package published on this registry is not npm's, so callers ask only about npm's (listedOnNpm in apm.ts).
+//
+// One request spends at most REQUEST_BUDGET_MS waiting on OSV, across every lookup it makes (a resolve's root pages,
+// its walk and the walk again after a wait): the feed is built per request, and once the budget is spent, or OSV failed
+// once, the request reads only what is cached. A lookup OSV does not answer in full is logged, reads as nothing listed
+// (an outage of the feed must not stop installs) and is not kept; a full answer is kept per isolate for CACHE_MS.
 import { Context, Effect, Layer, Option, Result } from "effect";
 import { z } from "zod";
+import { isValidPackageName } from "@apm/core";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
 
@@ -19,75 +24,134 @@ const CACHE_MS = 10 * 60_000;
 const MAX_CACHED = 20_000;
 
 /** OSV's limit on one batch query. */
-const BATCH = 1000;
-const TIMEOUT_MS = 3_000;
+export const OSV_BATCH = 1000;
 
-const BatchAnswer = z.object({ results: z.array(z.object({ vulns: z.array(z.object({ id: z.string() })).optional() })) });
+/** What one request may spend waiting on OSV, all its lookups together. */
+export const REQUEST_BUDGET_MS = 3_000;
+
+/** Pages of one version's advisories followed past the batch answer's first. */
+const MAX_PAGES = 3;
+const MAX_VERSION_LENGTH = 256;
+
+const Vulns = z.array(z.object({ id: z.string() })).optional();
+const BatchAnswer = z.object({ results: z.array(z.object({ vulns: Vulns, next_page_token: z.string().optional() })) });
+const QueryAnswer = z.object({ vulns: Vulns, next_page_token: z.string().optional() });
+
+/** One version asked about, and the two request shapes OSV takes. */
+type OsvQuery = { package: { name: string; ecosystem: "npm" }; version: string };
+
+type OsvBatchQuery = { queries: OsvQuery[] };
+
+type OsvPageQuery = OsvQuery & { page_token: string };
 
 const keyOf = (p: PackageVersion): string => `${p.name}@${p.version}`;
 
-/** The isolate's answers, by OSV root and name@version: a request's layer is built per request, this outlives it. */
+/** An npm coordinate worth asking about: a valid name and a version of a plain shape. */
+const askable = (p: PackageVersion): boolean => isValidPackageName(p.name) && p.version.length > 0 && p.version.length <= MAX_VERSION_LENGTH && /^[\w.+-]+$/.test(p.version);
+
+/** The isolate's answers, by OSV root and name@version, oldest first: a request's layer is built per request, this outlives it. */
 const CACHE = new Map<string, { ids: string[]; until: number }>();
 
-/** The live feed at `baseUrl` (OSV's API root, ending in a slash). */
+function remember(key: string, ids: string[], until: number): void {
+  CACHE.delete(key);
+  CACHE.set(key, { ids, until });
+
+  for (const oldest of CACHE.keys()) {
+    if (CACHE.size <= MAX_CACHED) break;
+    CACHE.delete(oldest);
+  }
+}
+
+const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-"));
+
+/** The live feed at `baseUrl` (OSV's API root, ending in a slash), with one request's budget. */
 export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.Layer<KnownMalicious> {
-  const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
+  return Layer.sync(KnownMalicious, () => {
+    let deadline: number | null = null;
+    const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
-  const query = (pkgs: readonly PackageVersion[]) =>
-    Effect.tryPromise({
-      try: async (): Promise<string[][]> => {
-        const res = await fetcher(`${baseUrl}v1/querybatch`, {
-          method: "POST",
-          headers: { "content-type": "application/json", accept: "application/json" },
-          body: JSON.stringify({ queries: pkgs.map((p) => ({ package: { name: p.name, ecosystem: "npm" }, version: p.version })) }),
-          signal: AbortSignal.timeout(TIMEOUT_MS),
-        });
+    /** POSTs `body` to OSV within the request's budget and parses the answer with `schema`. */
+    const post = <S extends z.ZodType>(path: "v1/querybatch" | "v1/query", body: OsvBatchQuery | OsvPageQuery, schema: S) =>
+      Effect.tryPromise({
+        try: async (): Promise<z.output<S>> => {
+          deadline ??= Date.now() + REQUEST_BUDGET_MS;
+          const left = deadline - Date.now();
 
-        if (res.status !== 200) {
-          await res.body?.cancel();
-          throw new Error(`OSV answered ${res.status}`);
-        }
+          if (left <= 0) throw new Error("the request's OSV budget is spent");
+          const res = await fetcher(`${baseUrl}${path}`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) });
 
-        const parsed = BatchAnswer.safeParse(await res.json());
+          if (res.status !== 200) {
+            await res.body?.cancel();
+            throw new Error(`OSV answered ${res.status}`);
+          }
 
-        if (!parsed.success || parsed.data.results.length !== pkgs.length) throw new Error("OSV answered in an unexpected shape");
+          const parsed = schema.safeParse(await res.json());
 
-        return parsed.data.results.map((r) => (r.vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-")));
-      },
-      catch: (cause) => cause,
-    });
+          if (!parsed.success) throw new Error("OSV answered in an unexpected shape");
 
-  return Layer.succeed(
-    KnownMalicious,
-    KnownMalicious.of({
+          return parsed.data;
+        },
+        catch: (cause) => cause,
+      });
+
+    const queryOf = (p: PackageVersion): OsvQuery => ({ package: { name: p.name, ecosystem: "npm" }, version: p.version });
+
+    /** The MAL- ids for each of `chunk`, in order, every page read; fails when any part was not read. */
+    const ask = (chunk: readonly PackageVersion[]) =>
+      Effect.gen(function* () {
+        const batch = yield* post("v1/querybatch", { queries: chunk.map(queryOf) }, BatchAnswer);
+
+        if (batch.results.length !== chunk.length) return yield* Effect.fail(new Error("OSV answered in an unexpected shape"));
+
+        return yield* Effect.forEach(chunk, (p, j) =>
+          Effect.gen(function* () {
+            const first = batch.results[j];
+            const ids = malOnly(first?.vulns);
+            let token = first?.next_page_token;
+
+            for (let page = 0; token !== undefined && ids.length === 0; page++) {
+              if (page >= MAX_PAGES) return yield* Effect.fail(new Error("OSV has more pages than apm reads"));
+              const next = yield* post("v1/query", { ...queryOf(p), page_token: token }, QueryAnswer);
+
+              ids.push(...malOnly(next.vulns));
+              token = next.next_page_token;
+            }
+
+            return ids;
+          }),
+        );
+      });
+
+    return KnownMalicious.of({
       lookup: (pkgs) =>
         Effect.gen(function* () {
           const now = Date.now();
-          const wanted = new Map(pkgs.map((p) => [keyOf(p), p]));
+          const wanted = new Map(pkgs.filter(askable).map((p) => [keyOf(p), p]));
           const known = new Map<string, string[]>();
-          const ask: PackageVersion[] = [];
+          const missing: PackageVersion[] = [];
 
           for (const [key, p] of wanted) {
             const hit = CACHE.get(cacheKey(p));
 
             if (hit && hit.until > now) known.set(key, hit.ids);
-            else ask.push(p);
+            else missing.push(p);
           }
 
-          for (let i = 0; i < ask.length; i += BATCH) {
-            const chunk = ask.slice(i, i + BATCH);
-            const got = yield* Effect.result(query(chunk));
+          for (let i = 0; i < missing.length && (deadline === null || deadline > Date.now()); i += OSV_BATCH) {
+            const chunk = missing.slice(i, i + OSV_BATCH);
+            const got = yield* Effect.result(ask(chunk));
 
             if (Result.isFailure(got)) {
               console.error(JSON.stringify({ event: "osv-lookup", packages: chunk.length, error: String(got.failure) }));
-              continue;
+              // no more waiting on OSV in this request: what is cached still counts
+              deadline = 0;
+              break;
             }
-
-            if (CACHE.size + chunk.length > MAX_CACHED) CACHE.clear();
 
             chunk.forEach((p, j) => {
               const ids = got.success[j] ?? [];
-              CACHE.set(cacheKey(p), { ids, until: now + CACHE_MS });
+
+              remember(cacheKey(p), ids, now + CACHE_MS);
               known.set(keyOf(p), ids);
             });
           }
@@ -98,8 +162,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
             return ids.length > 0 ? [{ name: p.name, version: p.version, ids }] : [];
           });
         }),
-    }),
-  );
+    });
+  });
 }
 
 /** The versions among `pkgs` the feed lists; none when this registry runs without the feed. */
