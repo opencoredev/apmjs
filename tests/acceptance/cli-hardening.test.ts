@@ -370,6 +370,38 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     expect(spy.seen, r.out).toEqual([]);
     expect(r.out).toContain("APM_REGISTRY");
   });
+
+  test("revoke, restore, yank and incident send no authenticator code or password to a registry a repo's .npmrc chose", async () => {
+    const spy = standIn();
+    const sb = makeSandbox(reg);
+    const app = writeConsumer(work, reg);
+
+    writeFileSync(join(app, ".npmrc"), `registry=${spy.url}\n`);
+    const opts = { cwd: app, env: laptopEnv(sb.env) };
+
+    const runs = [
+      await apm(["revoke", "mypkg@1.0.0", "--reason", "bad", "--otp", "123456"], opts),
+      await apm(["restore", "mypkg@1.0.0", "--password-stdin"], { ...opts, stdin: "a-long-enough-password\n" }),
+      await apm(["yank", "mypkg@1.0.0", "--otp", "123456"], opts),
+      await apm(["incident", "--since", "2026-11-01T00:00:00Z", "--password-stdin"], { ...opts, stdin: "a-long-enough-password\n" }),
+    ];
+
+    await spy.stop();
+    expect(spy.seen, runs.map((r) => r.out).join("\n")).toEqual([]);
+
+    for (const r of runs) expect(r.code, r.out).toBe(1);
+  });
+
+  test("apm login does not save the token into the project, where npx or npm run's npm_config_userconfig can point it", async () => {
+    const sb = makeSandbox(reg);
+    const app = writeConsumer(work, reg);
+    const steered = join(app, "pwn-npmrc");
+    const r = await apm(["login", "--username", "mallory2", "--password-stdin"], { cwd: app, env: { ...laptopEnv(sb.env), APM_REGISTRY: reg.url, npm_config_userconfig: steered }, stdin: "a-long-enough-password\n" });
+
+    expect(r.code, r.out).toBe(1);
+    expect(existsSync(steered), r.out).toBe(false);
+    expect(r.out).toContain("npm_config_userconfig");
+  });
 });
 
 describe("finding 10: --force advice is accurate and never skips the dependency check", () => {

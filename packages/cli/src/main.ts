@@ -2,8 +2,8 @@
 // apm: a thin layer over bun, npm, pnpm or yarn. It checks before it installs, runs or publishes,
 // then hands the real work to the package manager the project already uses.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { delimiter, dirname, join, relative } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
@@ -1925,7 +1925,10 @@ async function cmdState(a: Args, action: "yank" | "unyank" | "revoke" | "restore
     return 2;
   }
 
-  const api = new Api(config(process.cwd()));
+  const stateCfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(stateCfg, `${action} a version on`)) return 1;
+  const api = new Api(stateCfg);
   const reason = flag(a, "reason");
   if (action === "revoke" && !reason) {
     warn("apm revoke needs --reason; everyone with this version installed will see it.");
@@ -1954,7 +1957,10 @@ async function cmdIncident(a: Args): Promise<number> {
     return 2;
   }
 
-  const api = new Api(config(process.cwd()));
+  const incidentCfg = config(process.cwd());
+
+  if (refuseRepoChosenRegistry(incidentCfg, "run an incident response on")) return 1;
+  const api = new Api(incidentCfg);
   const proof = await readProof(a);
   const body = { since, reason: flag(a, "reason") ?? "account compromised", ...proof, dryRun: has(a, "dry-run") };
   const r = await api.raw("-/apm/v1/incident", { method: "POST", body });
@@ -1997,11 +2003,12 @@ function openBrowser(url: string): void {
 }
 
 /**
- * apm login and apm publish hand credentials only to a registry the user chose (APM_REGISTRY, ~/.npmrc or the default):
- * one a project .npmrc or npm_config_registry picked would get the device code, the password or, through the package
- * manager's own `${VAR}` lines, the publish credentials. True when it refused.
+ * apm login, apm publish and the account commands hand credentials only to a registry the user chose (APM_REGISTRY,
+ * ~/.npmrc or the default): one a project .npmrc or npm_config_registry picked would get the device code, the password,
+ * an authenticator code or, through the package manager's own `${VAR}` lines, the publish credentials. True when it
+ * refused.
  */
-function refuseRepoChosenRegistry(cfg: Config, action: "sign in to" | "publish to"): boolean {
+function refuseRepoChosenRegistry(cfg: Config, action: string): boolean {
   const trusted = tokenRegistry(env());
 
   if (sameRegistry(cfg.registry, trusted)) return false;
@@ -2011,12 +2018,30 @@ function refuseRepoChosenRegistry(cfg: Config, action: "sign in to" | "publish t
   return true;
 }
 
+/**
+ * apm login saves the token to the user config, which npm_config_userconfig names, and `npm run` and `npx` set that
+ * variable from a project .npmrc's `userconfig=`. A token saved inside the current directory could be committed with the
+ * project, so that is refused; ~/.npmrc itself always counts as the user's. True when it refused.
+ */
+function refuseUserconfigInProject(cfg: Config): boolean {
+  const file = resolve(cfg.userconfig);
+
+  if (file === resolve(join(env().HOME ?? homedir(), ".npmrc"))) return false;
+  const rel = relative(process.cwd(), file);
+
+  if (rel.startsWith("..") || isAbsolute(rel)) return false;
+  fail(`refused: apm login would save the token to ${file}, inside this directory (npm_config_userconfig, which a project .npmrc can set through npm run or npx).`);
+  say("Nothing was sent. Run apm login outside this project, or without npm_config_userconfig set.");
+
+  return true;
+}
+
 /** Device login: the browser signs in (GitHub or Vercel) and approves the code; the CLI gets a token that stages publishes. */
 async function cmdLogin(a: Args): Promise<number> {
   if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
   const cfg = config(process.cwd());
 
-  if (refuseRepoChosenRegistry(cfg, "sign in to")) return 1;
+  if (refuseRepoChosenRegistry(cfg, "sign in to") || refuseUserconfigInProject(cfg)) return 1;
   const api = new Api({ ...cfg, token: null });
   const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
   const d = DeviceStart.safeParse(start.body);
@@ -2063,7 +2088,7 @@ async function cmdLogin(a: Args): Promise<number> {
 async function cmdPasswordLogin(a: Args): Promise<number> {
   const cfg = config(process.cwd());
 
-  if (refuseRepoChosenRegistry(cfg, "sign in to")) return 1;
+  if (refuseRepoChosenRegistry(cfg, "sign in to") || refuseUserconfigInProject(cfg)) return 1;
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
     warn("usage: apm login --username <name> --password-stdin");
