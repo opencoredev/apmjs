@@ -91,7 +91,9 @@ describe("account events", () => {
 
     for (const word of ["private-pat", "users.example.test", "@", "email", "avatar"]) expect(text, word).not.toContain(word);
     // each account has its own id
-    expect(new Set(sent.filter((s) => dig(s.body, "name") === "account_created").map((s) => dig(s.body, "profileId"))).size).toBe(sent.filter((s) => dig(s.body, "name") === "account_created").length);
+    const ids = sent.flatMap((s) => (dig(s.body, "name") === "account_created" ? [dig(s.body, "profileId")] : []));
+
+    expect(new Set(ids).size).toBe(ids.length);
   });
 
   test("apm login (the device flow) sends nothing", async () => {
