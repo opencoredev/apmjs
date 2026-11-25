@@ -325,6 +325,19 @@ export type AnalysisStart = ({ kind: "started" } & RunHistory) | { kind: "runnin
 /** A package's stored scores (keyed `${version} ${digest}`) and the versions decided unscorable (keyed by version). */
 export type UpstreamAnalyses = { scores: Map<string, unknown>; unscorable: Map<string, RecordedUnscorable> };
 
+/**
+ * The most JSON, in bytes, of stored analyses upstreamAnalysesOf reads in one round trip, unless one analysis alone is
+ * more. next's 61 together, tens of MB as one value, were more than the production connection carried.
+ */
+export const ANALYSES_BUDGET = 4 * 1024 * 1024;
+
+/** An upstream_analysis row's primary key. */
+const AnalysisKey = z.object({ package: z.string(), version: z.string(), digest: z.string(), scorer: z.string() });
+
+const AnalysisRow = AnalysisKey.extend({ analysis: z.unknown() });
+
+const keyOf = (k: z.output<typeof AnalysisKey>): string => JSON.stringify([k.package, k.version, k.digest, k.scorer]);
+
 /** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
 const AnalysesColumns = {
   analyses: z.array(z.object({ version: z.string(), digest: z.string(), analysis: z.unknown() })),
@@ -1609,27 +1622,69 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
           return got;
         };
 
-        // the analyses, the decided outcomes and the live dismissals in one round trip, as upstreamAnalyses reads them
-        // for one package: the walk reads them once a level
+        // the decided outcomes, the live dismissals, the key and JSON size of every analysis, and the analyses that fit in
+        // ANALYSES_BUDGET, in one round trip, as upstreamAnalyses reads them for one package: the walk reads them once a
+        // level. The rest follow a budget at a time: every stored analysis of next as one value was tens of MB, which the
+        // connection dropped (production, 2026-11-25)
         const row = yield* run(
           "upstreamAnalysesOf",
-          sql`SELECT
-                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'analysis', u.analysis) ORDER BY u.scorer), '[]'::jsonb)
-                   FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS analyses,
+          sql`WITH s AS (
+                SELECT u.package, u.version, u.digest, u.scorer, octet_length(u.analysis::text) AS bytes
+                  FROM upstream_analysis u WHERE u.package = ANY(${wanted}) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+              ), k AS (
+                SELECT s.*, sum(s.bytes) OVER (ORDER BY s.scorer, s.package, s.version, s.digest) <= ${ANALYSES_BUDGET} AS inline FROM s
+              )
+              SELECT
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', k.package, 'version', k.version, 'digest', k.digest, 'scorer', k.scorer, 'bytes', k.bytes, 'inline', k.inline) ORDER BY k.scorer, k.package, k.version, k.digest), '[]'::jsonb)
+                   FROM k) AS keys,
+                (SELECT coalesce(jsonb_agg(jsonb_build_object('package', u.package, 'version', u.version, 'digest', u.digest, 'scorer', u.scorer, 'analysis', u.analysis) ORDER BY k.scorer, k.package, k.version, k.digest), '[]'::jsonb)
+                   FROM k JOIN upstream_analysis u USING (package, version, digest, scorer) WHERE k.inline) AS analyses,
                 (SELECT coalesce(jsonb_agg(jsonb_build_object('package', o.package, 'version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
                    FROM analysis_outcomes o WHERE o.package = ANY(${wanted}) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL) AS decided,
                 (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.dismissed_at, e.id), '[]'::jsonb)
                    FROM evidence_dismissals e WHERE e.package = ANY(${wanted}) AND e.restored_at IS NULL) AS dismissals`,
           one(
             z.object({
-              analyses: z.array(z.object({ package: z.string(), version: z.string(), digest: z.string(), analysis: z.unknown() })),
+              keys: z.array(AnalysisKey.extend({ bytes: z.number(), inline: z.boolean() })),
+              analyses: z.array(AnalysisRow),
               decided: z.array(z.object({ package: z.string(), version: z.string(), outcome: UnscorableReason, detail: z.string().nullable(), digest: z.string().nullable() })),
               dismissals: z.array(DismissalRow),
             }),
           ),
         );
 
-        const rows = row?.analyses ?? [];
+        const rows = [...(row?.analyses ?? [])];
+        const rest = (row?.keys ?? []).filter((k) => !k.inline);
+
+        // the rest a page at a time by primary key, each page within ANALYSES_BUDGET (or one analysis over it), kept in
+        // the order the keys came in (oldest scorer first, the inline ones a prefix of them)
+        for (let at = 0; at < rest.length; ) {
+          let bytes = 0;
+          let to = at;
+
+          while (to < rest.length && (to === at || bytes + (rest[to]?.bytes ?? 0) <= ANALYSES_BUDGET)) bytes += rest[to++]?.bytes ?? 0;
+          const page = rest.slice(at, to);
+          at = to;
+
+          const got = yield* run(
+            "upstreamAnalysesOf: analyses",
+            sql`SELECT u.package, u.version, u.digest, u.scorer, u.analysis
+                FROM upstream_analysis u
+                JOIN unnest(${page.map((k) => k.package)}::text[], ${page.map((k) => k.version)}::text[], ${page.map((k) => k.digest)}::text[], ${page.map((k) => k.scorer)}::text[])
+                  AS k(package, version, digest, scorer)
+                  ON u.package = k.package AND u.version = k.version AND u.digest = k.digest AND u.scorer = k.scorer`,
+            all(AnalysisRow),
+          );
+
+          const byKey = new Map(got.map((g) => [keyOf(g), g] as const));
+
+          for (const k of page) {
+            const g = byKey.get(keyOf(k));
+
+            if (g !== undefined) rows.push(g);
+          }
+        }
+
         const decided = row?.decided ?? [];
         const dismissals = row?.dismissals ?? [];
 
