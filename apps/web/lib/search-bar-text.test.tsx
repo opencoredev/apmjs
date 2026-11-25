@@ -1,8 +1,10 @@
 // Review of cd74781, findings 3 and 4: an npm outage is not "no packages match", and screen readers hear loading,
 // failures and partial answers, not only counts.
 import { describe, expect, mock, test } from "bun:test";
+import * as navigation from "next/navigation";
 
 void mock.module("next/navigation", () => ({
+  ...navigation,
   usePathname: () => "/package/next",
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
 }));
