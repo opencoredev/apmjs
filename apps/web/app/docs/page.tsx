@@ -146,7 +146,7 @@ export default function Docs() {
           </h2>
           <p className="text-[17px] leading-7 text-pretty text-muted-foreground">{s.body}</p>
           {"code" in s && <Code label="Install the apm CLI">{s.code}</Code>}
-          {"brew" in s && <Code label="Or with Homebrew (coming with launch)">{s.brew}</Code>}
+          {"brew" in s && <Code label="Or with Homebrew">{s.brew}</Code>}
           <a href={s.href} className="self-start font-medium text-foreground underline underline-offset-4">
             {s.link}
           </a>
