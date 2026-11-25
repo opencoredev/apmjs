@@ -65,66 +65,61 @@ export function oneSentence(text: string): string {
   return s.length > 300 ? `${s.slice(0, 297)}…` : s;
 }
 
-function normalizePath(raw: string, paths: ReadonlySet<string>, shown: ReadonlyMap<string, string>): string {
-  // the path exactly as named, or as the prompt showed it (escaped onto one line), before any loosening: `package/x.js`
-  // and `x.js` can both be in a tarball, and a citation of one must not land on the other
-  for (const p of [raw, raw.trim()]) {
-    if (paths.has(p)) return p;
-    const real = shown.get(p);
+/** The files a cited path can name, and the path to report when it names none. */
+type Candidates = { files: readonly string[]; file: string };
 
-    if (real !== undefined) return real;
+function candidatesOf(raw: string, named: ReadonlyMap<string, readonly string[]>): Candidates {
+  // the path exactly as named or as the prompt showed it, before any loosening: `package/x.js` and `x.js` can both be in
+  // a tarball, and a citation of one must not land on the other
+  for (const p of [raw, raw.trim()]) {
+    const files = named.get(p);
+
+    if (files) return { files, file: p };
   }
 
   const p = raw.trim().replace(/^\.\//, "").replace(/^package\//, "");
-
-  if (paths.has(p)) return p;
   // models sometimes write "path:line" into the file field
   const m = /^(.*):(\d+)$/.exec(p);
 
-  return m?.[1] && paths.has(m[1]) ? m[1] : (shown.get(p) ?? p);
+  for (const q of m?.[1] ? [p, m[1]] : [p]) {
+    const files = named.get(q);
+
+    if (files) return { files, file: q };
+  }
+
+  return { files: [], file: p };
 }
 
 export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
 
 /**
- * Each path the prompt showed other than as it is (escaped onto one line, or cut to a citation's length), and the file
- * it names. A shown form two files share names neither: a citation of it is dropped rather than given to one of them.
+ * Every name the prompt showed a file under (its path, escaped onto one line, or cut to a citation's length) and the
+ * files shown under it. A publisher can make two files share a shown name (`a\nb.js` and a file literally named
+ * `a\\nb.js`, or two paths cut to the same length), so a citation of a shared name is checked against each of them.
  */
-function shownPaths(files: readonly TarEntry[]): Map<string, string> {
-  const out = new Map<string, string>();
-  const shared = new Set<string>();
+function shownNames(files: readonly TarEntry[]): Map<string, string[]> {
+  const out = new Map<string, string[]>();
 
   for (const f of files) {
-    for (const s of new Set([singleLine(f.path), shownPath(f.path)])) {
-      if (s === f.path) continue;
+    for (const s of new Set([f.path, singleLine(f.path), shownPath(f.path)])) {
+      const named = out.get(s);
 
-      if (out.has(s) && out.get(s) !== f.path) shared.add(s);
-      else out.set(s, f.path);
+      if (!named) out.set(s, [f.path]);
+      else if (!named.includes(f.path)) named.push(f.path);
     }
   }
-
-  for (const s of shared) out.delete(s);
 
   return out;
 }
 
 export function verifyCitations(findings: readonly RawFinding[], files: readonly TarEntry[]): Verified {
   const byPath = new Map(files.map((f) => [f.path, f]));
-  const paths = new Set(byPath.keys());
-  const shown = shownPaths(files);
+  const named = shownNames(files);
   const lineCache = new Map<string, string[]>();
   const kept: Finding[] = [];
   const dropped: DroppedFinding[] = [];
 
-  for (const raw of findings) {
-    const file = normalizePath(raw.file, paths, shown);
-    const entry = byPath.get(file);
-
-    if (!entry) {
-      dropped.push({ file, line: raw.line, why: "no-such-file" });
-      continue;
-    }
-
+  const linesAt = (file: string, entry: TarEntry): string[] => {
     let lines = lineCache.get(file);
 
     if (!lines) {
@@ -132,18 +127,40 @@ export function verifyCitations(findings: readonly RawFinding[], files: readonly
       lineCache.set(file, lines);
     }
 
-    const line = raw.line >= 1 ? lines[raw.line - 1] : undefined;
+    return lines;
+  };
 
-    if (line === undefined) {
-      dropped.push({ file, line: raw.line, why: "no-such-line" });
+  for (const raw of findings) {
+    const candidates = candidatesOf(raw.file, named);
+
+    if (candidates.files.length === 0) {
+      dropped.push({ file: candidates.file, line: raw.line, why: "no-such-file" });
       continue;
     }
 
-    if (!quoteMatches(line, raw.quote)) {
-      dropped.push({ file, line: raw.line, why: "quote-not-on-line" });
+    let found: { file: string; line: string } | null = null;
+    let why: DropReason = "no-such-line";
+
+    for (const file of candidates.files) {
+      const entry = byPath.get(file);
+      const line = entry && raw.line >= 1 ? linesAt(file, entry)[raw.line - 1] : undefined;
+
+      if (line === undefined) continue;
+
+      if (quoteMatches(line, raw.quote)) {
+        found = { file, line };
+        break;
+      }
+
+      why = "quote-not-on-line";
+    }
+
+    if (found === null) {
+      dropped.push({ file: candidates.files[0] ?? candidates.file, line: raw.line, why });
       continue;
     }
 
+    const { file, line } = found;
     // recorded as the wire holds it (wire.ts WireFinding): a path past its limit is cut there, as the prompt showed it
     const recorded = cutAt(file, MAX_PATH_CHARS);
 

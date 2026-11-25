@@ -516,14 +516,33 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     }
   });
 
-  test("a cut path two files share names neither of them", () => {
+  test("a cut path two files share checks each of them: the citation lands on the file its quote is on", () => {
     const a = `${"p".repeat(1500)}a.js`;
     const b = `${"p".repeat(1500)}b.js`;
-    const files = [entry(a, `x\n${PAYLOAD}\n`), entry(b, "x\nharmless\n")];
+    const files = [entry(b, "x\nharmless\n"), entry(a, `x\n${PAYLOAD}\n`)];
     const { kept, dropped } = verifyCitations([finding({ file: `${"p".repeat(999)}…`, line: 2, quote: "require('child_process')" })], files);
 
-    expect(kept).toEqual([]);
-    expect(dropped.map((d) => d.why)).toEqual(["no-such-file"]);
+    expect(dropped).toEqual([]);
+    expect(kept.map((k) => k.excerpt)).toEqual([expect.stringContaining("require('child_process')")]);
+    // a quote on neither is still dropped
+    expect(verifyCitations([finding({ file: `${"p".repeat(999)}…`, line: 2, quote: "not in the package" })], files).dropped.map((d) => d.why)).toEqual(["quote-not-on-line"]);
+  });
+
+  test("a decoy whose real path is another file's shown path does not swallow the citation", () => {
+    // the payload's path has a real newline; the decoy is literally named `a\nb.js` (backslash, n): the prompt shows both as `a\nb.js`
+    const newline = [entry("a\\nb.js", "x\n// decoy\n"), entry("a\nb.js", `x\n${PAYLOAD}\n`)];
+    const one = verifyCitations([finding({ file: "a\\nb.js", line: 2, quote: "require('child_process')" })], newline);
+
+    expect(one.dropped).toEqual([]);
+    expect(one.kept.map((k) => k.file)).toEqual(["a\nb.js"]);
+
+    // a decoy named exactly as a long payload path is shown once cut
+    const prefix = `${"a/".repeat(499)}b`;
+    const cut = [entry(`${prefix}…`, "x\n// decoy\n"), entry(`${prefix}payload.js`, `x\n${PAYLOAD}\n`)];
+    const two = verifyCitations([finding({ file: `${prefix}…`, line: 2, quote: "require('child_process')" })], cut);
+
+    expect(two.dropped).toEqual([]);
+    expect(two.kept).toHaveLength(1);
   });
 
   test("many long paths in a diff's lists leave the files their budget", () => {
