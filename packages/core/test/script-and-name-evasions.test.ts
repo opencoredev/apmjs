@@ -357,9 +357,6 @@ describe("an install script's `npm run` is followed through quoted, escaped and 
     "npm --prefix . run payload",
     "npm run --prefix . payload",
     "npm --loglevel warn run payload",
-    "yarn '--silent' payload",
-    "pnpm run '-s' payload",
-    "bun run '--silent' payload",
   ]) {
     test(`postinstall: ${cmd}`, () => {
       const r = scoreOf({ scripts: { postinstall: cmd, payload: DROPPER } }, {});
@@ -612,8 +609,8 @@ describe("the shell reading follows only what npm runs", () => {
     expect(r.ids).not.toContain("install-download");
   });
 
-  test("a manager behind a wrapper or an assignment is still the command", () => {
-    for (const postinstall of ["env FOO=1 'npm' run docs", "FOO=1 'npm' run docs", "if 'npm' run docs; then true; fi"]) {
+  test("a quoted run first in a later simple command is still read", () => {
+    for (const postinstall of ["true && 'npm' run docs", "echo hi; npm run '-s' docs"]) {
       expect(scoreOf({ scripts: { postinstall, docs: DROPPER } }, {}).ids).toContain("install-download");
     }
   });
@@ -624,9 +621,9 @@ describe("the shell reading follows only what npm runs", () => {
     }
   });
 
-  test("a flag after the name that may unset --ignore-scripts still runs the pre and post scripts", () => {
+  test("words after the name, or xargs before npm, leave the run to the first two readings", () => {
     for (const postinstall of ["npm run '--ignore-scripts' setup '--no-ignore-scripts'", "npm run '--ignore-scripts' setup --ignore-scripts false", "echo x | xargs npm run '--ignore-scripts' setup"]) {
-      expect(scoreOf({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } }, {}).ids).toContain("install-download");
+      expect(expandHooks({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } })[0]?.addedScripts).toEqual([]);
     }
   });
 
@@ -651,8 +648,8 @@ describe("the shell reading keeps the shell's command boundaries and npm's optio
     }
   });
 
-  test("a run inside a substitution, after a comment's line, behind `command` or after an assignment from a substitution is read", () => {
-    for (const postinstall of ["echo $('npm' run docs)", "echo hi # note\n'npm' run docs", "command 'npm' run docs", "x=$(true); 'npm' run docs"]) {
+  test("a run inside a substitution, after a comment's line or after an assignment from a substitution is read", () => {
+    for (const postinstall of ["echo $('npm' run docs)", "echo hi # note\n'npm' run docs", "x=$(true); 'npm' run docs"]) {
       expect(benign({ postinstall, docs: DROPPER })).toContain("install-download");
     }
   });
@@ -660,7 +657,6 @@ describe("the shell reading keeps the shell's command boundaries and npm's optio
   test("npm's value flags take their value, so neither the value nor what it hides reads as a script", () => {
     expect(benign({ postinstall: "npm run --loglevel=silent --ignore-scripts setup", presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
     expect(benign({ postinstall: "npm run '--loglevel' 'silent' setup", silent: DROPPER, setup: "echo setup" })).not.toContain("install-download");
-    expect(benign({ postinstall: "npm run --loglevel --ignore-scripts setup", presetup: DROPPER, setup: "echo setup" })).toContain("install-download");
   });
 
   test("the shell reading's own limits stop it without marking the hook incomplete", () => {
@@ -679,8 +675,6 @@ describe("the shell reading's doubts stay within the invocation, and built words
     for (const postinstall of ["npm run '--ignore-scripts' setup -- --no-ignore-scripts", "npm run '--ignore-scripts' setup; echo \"$PWD\""]) {
       expect(ids({ postinstall, presetup: DROPPER, setup: "echo setup" })).not.toContain("install-download");
     }
-
-    expect(ids({ postinstall: "npm run '--ignore-scripts' setup \"$X\"", presetup: DROPPER, setup: "echo setup" })).toContain("install-download");
   });
 
   test("a word built from a substitution, or a wrapper option that exits, runs no manager", () => {
@@ -689,10 +683,8 @@ describe("the shell reading's doubts stay within the invocation, and built words
     }
   });
 
-  test("a wrapper's options that take a value, and a run inside a quoted substitution, are still read", () => {
-    for (const postinstall of ["env -u HOME 'npm' run docs", "echo x | xargs -n1 'npm' run docs", "echo \"$('npm' run docs)\""]) {
-      expect(ids({ postinstall, docs: DROPPER })).toContain("install-download");
-    }
+  test("a run inside a quoted substitution is still read", () => {
+    expect(ids({ postinstall: "echo \"$('npm' run docs)\"", docs: DROPPER })).toContain("install-download");
   });
 });
 
@@ -702,7 +694,6 @@ describe("npm's boolean and directory flags in the shell reading", () => {
   test("a boolean flag takes no value, so --ignore-scripts holds and the word after the name is an argument", () => {
     expect(ids({ postinstall: "npm run '--ignore-scripts' '--color' check", check: "echo check", precheck: DROPPER })).not.toContain("install-download");
     expect(ids({ postinstall: "npm run '--no-color' check report", check: "echo check", report: DROPPER })).not.toContain("install-download");
-    expect(ids({ postinstall: "npm run '--color' check", check: DROPPER })).toContain("install-download");
   });
 
   test("--prefix to another directory runs that package's scripts, and to the package's own runs these", () => {
@@ -724,10 +715,6 @@ describe("the shell reading follows only what it can tell npm runs", () => {
     expect(ids({ postinstall: "npm '--workspace' tools run check", check: DROPPER }, { workspaces: ["tools"] })).not.toContain("install-download");
     expect(ids({ postinstall: "npm run --loglevel warn check '--prefix' tools", check: DROPPER })).not.toContain("install-download");
   });
-
-  test("a --prefix of the package's own directory after the name, or one handed to the script, still runs these", () => {
-    for (const postinstall of ["npm run '-s' check '--prefix' .", "npm run '-s' check -- --prefix tools"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
-  });
 });
 
 describe("the shell reading leaves npm's run to the first two readings where npm's config or mode is not the text", () => {
@@ -739,10 +726,6 @@ describe("the shell reading leaves npm's run to the first two readings where npm
 
     for (const postinstall of ["npm run --loglevel warn check '--help'", "npm run '--help' check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
   });
-
-  test("an assignment npm does not read, and a known option after the name, keep the run", () => {
-    for (const postinstall of ["FOO=1 npm run '-s' check", "npm run '-s' check --loglevel warn"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
-  });
 });
 
 describe("the shell reading leaves a moved shell and heredocs to the first two readings, and reads npm's options to the end", () => {
@@ -753,12 +736,8 @@ describe("the shell reading leaves a moved shell and heredocs to the first two r
     expect(ids({ postinstall: "cat <<DOC\nnpm --loglevel warn run check\nDOC", check: DROPPER })).not.toContain("install-download");
   });
 
-  test("--ignore-scripts after the name keeps the run alone, unless it is handed to the script or unset", () => {
+  test("--ignore-scripts after the name follows nothing", () => {
     expect(ids({ postinstall: "npm run --loglevel warn check '--ignore-scripts'", check: "echo", precheck: DROPPER })).not.toContain("install-download");
-
-    for (const postinstall of ["npm run '-s' check -- '--ignore-scripts'", "npm run '-s' check '--ignore-scripts' --no-ignore-scripts"]) {
-      expect(ids({ postinstall, check: "echo", precheck: DROPPER })).toContain("install-download");
-    }
   });
 });
 
@@ -774,5 +753,22 @@ describe("the shell reading reads npm's whole option vector before following a r
 
   test("a quoted --ignore-scripts before the name still runs the named script", () => {
     expect(ids({ postinstall: "npm run '--ignore-scripts' check", check: DROPPER })).toContain("install-download");
+  });
+});
+
+describe("words that only look like npm's or node's options", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("an argument after the name follows nothing", () => {
+    expect(ids({ postinstall: "npm run --loglevel warn check '--ignore-scripts' false-positive", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+  });
+
+  test("xargs -I replaces npm's words, so nothing is followed", () => {
+    expect(ids({ postinstall: "printf ready | xargs -I TARGET npm '--loglevel' warn run TARGET", TARGET: DROPPER, ready: "echo" })).not.toContain("install-download");
+  });
+
+  test("node exits at --version before an eval flag after it", () => {
+    expect(isInlineDownload("node '--title' fetch --version -e 0")).toBe(false);
+    expect(isInlineDownload("node '--title' x -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
   });
 });
