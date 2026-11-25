@@ -283,7 +283,7 @@ function runServices(env: WorkerEnv, settings: RegistrySettings, clock: Layer.La
   const base = review === null ? core : Layer.provideMerge(Layer.provideMerge(reviewHooks(env, review, clock, background), Layer.succeed(ReviewConfig, review)), core);
   const analysisQueue = env.ANALYSIS_QUEUE ?? null;
 
-  const withFeed = env.APM_OSV_URL === undefined ? base : Layer.provideMerge(osvFeed(withSlash(env.APM_OSV_URL)), base);
+  const withFeed = env.APM_OSV_URL === undefined ? base : Layer.provideMerge(osvFeed(withSlash(env.APM_OSV_URL), fetch, background), base);
 
   const withScoring =
     settings.upstreamUrl === null
