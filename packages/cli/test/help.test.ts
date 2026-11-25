@@ -297,6 +297,10 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm", "npm", "--omit", "left-pad"], refusedBare("--omit", "npm")],
     [["install", "--pm", "pnpm", "--force=off"], refusedBare("--force=off", "pnpm")],
     [["install", "--pm", "--pm", "npm", "--tag", "left-pad"], "--pm needs a value"],
+    [["install", "--pm=", "--pm", "npm"], "--pm needs a value"],
+    // yarn 1 ignores --immutable and would rewrite the lockfile; yarn 2 and later read --frozen-lockfile as --immutable
+    [["install", "--pm", "yarn", "--immutable"], refusedBare("--immutable", "yarn")],
+    [["install", "--json"], refusedBare("--json", "bun")],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
@@ -314,7 +318,7 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm", "npm", "--omit=peer", "--tag=beta", "--no-audit"], "npm install --omit=peer --tag=beta --no-audit"],
     [["i", "--frozen-lockfile", "--production"], "bun install --frozen-lockfile --production"],
     [["install", "--pm=pnpm", "--frozen-lockfile", "--prod"], "pnpm install --frozen-lockfile --prod"],
-    [["install", "--pm", "yarn", "--immutable"], "yarn install --immutable"],
+    [["install", "--pm", "yarn", "--frozen-lockfile"], "yarn install --frozen-lockfile"],
   ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
     const r = await apm(argv);
 

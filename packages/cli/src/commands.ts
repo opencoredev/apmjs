@@ -175,7 +175,7 @@ const BARE_SWITCHES = new Map<Pm, ReadonlySet<string>>([
   ["bun", new Set(["frozen-lockfile", "production", "ignore-scripts", "dry-run", "no-save", "silent", "verbose", "force", "no-cache"])],
   ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts"])],
   ["pnpm", new Set(["frozen-lockfile", "prod", "ignore-scripts", "prefer-offline", "offline", "silent"])],
-  ["yarn", new Set(["frozen-lockfile", "immutable", "production", "ignore-scripts", "prefer-offline", "offline", "silent"])],
+  ["yarn", new Set(["frozen-lockfile", "production", "ignore-scripts", "prefer-offline", "offline", "silent"])],
 ]);
 
 /** npm's install options that take a value, with the values passed on: a dist-tag, and what to omit. */
@@ -201,7 +201,7 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
     const key = word.startsWith("--") ? word.slice(2, eq === -1 ? undefined : eq) : null;
 
     if (key === "pm") {
-      if (eq === -1 && !takesValue(a.raw[i + 1])) return { error: "--pm needs a value" };
+      if (eq === -1 ? !takesValue(a.raw[i + 1]) : eq === word.length - 1) return { error: "--pm needs a value" };
 
       if (eq === -1) i++;
       continue;
