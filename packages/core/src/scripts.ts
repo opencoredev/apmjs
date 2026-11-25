@@ -60,6 +60,7 @@ const SHELL_WORD = /\S+/g;
 
 // quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
 const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
+
 // xargs appends words from its input to npm's, so they are not the words written either
 const ARGS_FROM_INPUT = /(?<![\w.-])xargs(?![\w.-])/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
@@ -71,6 +72,7 @@ const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
 const EVAL_FLAG = /^(?:-[a-z]*[ep]|--eval|--print|eval)\b/;
 const OTHER_FLAG = /^-{1,2}\w[\w-]*(?:=\S+)?$/;
+
 // node's options that take the next word as their value (`--conditions dev`, `-r ./x`), from `node --help` (Node 18 to
 // 24); any other flag takes none, so the first other word is the program node runs and what follows is its own
 const VALUE_FLAG = new RegExp(
@@ -152,8 +154,8 @@ type Pass = 1 | 2 | 3;
  * `false` after a bare `--ignore-scripts`, is a doubt, read to the end of the command: past the invocation it can only
  * make apm follow more.
  */
-function ignoreScriptsDoubt(cmd: string): number {
-  if (SHELL_SYNTAX.test(cmd) || ARGS_FROM_INPUT.test(cmd)) return Number.POSITIVE_INFINITY;
+function ignoreScriptsDoubt(cmd: string, xargs: boolean): number {
+  if (SHELL_SYNTAX.test(cmd) || (xargs && ARGS_FROM_INPUT.test(cmd))) return Number.POSITIVE_INFINITY;
   let last = -1;
   let bare = false;
 
@@ -199,9 +201,10 @@ function setsIgnoreScripts(words: string): boolean {
 }
 
 /** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
-function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
-  const out: ScriptRef[] = [];
+function flagReferences(cmd: string, scripts: Scripts): (ScriptRef & { aloneStrictly: boolean })[] {
+  const out: (ScriptRef & { aloneStrictly: boolean })[] = [];
   let doubt: number | null = null;
+  let strictDoubt: number | null = null;
 
   for (const m of cmd.matchAll(RUN_REF)) {
     const npm = m[1] ?? m[2];
@@ -210,11 +213,14 @@ function flagReferences(cmd: string, scripts: Scripts): ScriptRef[] {
     if (!name || !Object.hasOwn(scripts, name)) continue;
 
     // npm's flags before the name set ignore-scripts, and nothing from there on may unset it; the doubt is found once per
-    // command, so a script of many such runs is still read in one pass
+    // command, so a script of many such runs is still read in one pass. `alone` is fe2e641's reading, which the second
+    // pass keeps; `aloneStrictly` also doubts a flag that may take the next word as its value and words xargs adds, and
+    // the third pass reads the pre and post scripts where only the first says alone
     const [nameAt] = m.indices?.[m[1] === undefined ? 2 : 1] ?? [m.index];
-    const sets = npm !== undefined && setsIgnoreScripts(cmd.slice(m.index + m[0].length, nameAt));
+    const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
+    const alone = sets && (doubt ??= ignoreScriptsDoubt(cmd, false)) < m.index;
 
-    out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
+    out.push({ name, alone, aloneStrictly: alone && setsIgnoreScripts(cmd.slice(m.index + m[0].length, nameAt)) && (strictDoubt ??= ignoreScriptsDoubt(cmd, true)) < m.index });
   }
 
   return out;
@@ -231,7 +237,10 @@ function shellReferences(cmd: string, scripts: Scripts): ScriptRef[] {
 
   for (const m of cmd.matchAll(RUN_REF)) regex.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
 
-  return shellRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || regex.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: false }]));
+  const doubted = flagReferences(cmd, scripts).flatMap((r) => (r.alone && !r.aloneStrictly ? [{ name: r.name, alone: false }] : []));
+  const shell = shellRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || regex.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: false }]));
+
+  return [...doubted, ...shell];
 }
 
 const PACKAGE_MANAGERS = new Set(["npm", "yarn", "pnpm", "bun"]);
@@ -271,6 +280,7 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
         yield* flush();
         yield null;
         open.push(c === "`" ? "`" : ")");
+
         if (c === "$") i++;
       } else word = (word ?? "") + c;
     } else if (c === "'") {
@@ -293,10 +303,14 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
       yield* flush();
       yield null;
       open.push(c === "`" ? "`" : ")");
+
       if (c === "$") i++;
     } else if (COMMAND_END.has(c)) {
       yield* flush();
       yield null;
+
+      // a group's `)` closes it, not the substitution around it
+      if (c === "(") open.push(")");
     } else if (/\s|[<>]/.test(c)) yield* flush();
     else {
       glob ||= c === "*";
@@ -348,6 +362,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
         afterFlag = false;
         continue;
       }
+
       pm = w;
       pmEnd = t.end;
       phase = "manager";
@@ -362,6 +377,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       pm = null;
     } else if (w === "--") {
       afterFlag = false;
+
       if (phase === "run" || pm === "yarn" || pm === "pnpm") phase = "named";
     } else if (w.length > 1 && w.startsWith("-")) {
       afterFlag = !w.includes("=");

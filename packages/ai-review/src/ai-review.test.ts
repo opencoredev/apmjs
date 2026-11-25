@@ -259,6 +259,7 @@ describe("review input", () => {
       "see.txt": "x".repeat(6000),
       "here.txt": "y".repeat(6000),
     });
+
     const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
 
     expect(input.read).toContain("helper.js");
@@ -281,6 +282,7 @@ describe("review input", () => {
 
   test("a binary-named script main never showed is read only after everything main shows", () => {
     const script = "#!/bin/sh\necho setting up\n".repeat(300);
+
     const pkg = pkgOf({
       "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js", scripts: { preinstall: "./a.png", postinstall: "./b.png" } }),
       "index.js": "require('./helper.js');\n",
@@ -288,10 +290,19 @@ describe("review input", () => {
       "a.png": script,
       "b.png": script,
     });
+
     const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
 
     expect(input.read).toContain("index.js");
     expect(input.read).toContain("helper.js");
+  });
+
+  test("code with an uppercase extension is read only after what main shows", () => {
+    const big = "module.exports = 1;\n".repeat(200);
+    const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js" }), "index.js": "module.exports = 1;\n", "settings.json": '{ "a": 1 }\n'.repeat(40), "A.JS": big, "B.JS": big });
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
+
+    expect(input.read).toContain("settings.json");
   });
 
   test("code with an uppercase extension is code", () => {

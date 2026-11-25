@@ -1802,12 +1802,14 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // a hook whose commands apm stopped expanding runs commands apm did not read
   for (const h of hooks) if (h.cut !== null && h.kind !== "publish") add("incomplete", `scripts.${h.hook}: apm stopped reading the commands it runs at ${h.cut}`);
   const hookEvidence = analyzeHooks(found, manifest, hooks);
+
   // what runs on the installing machine: install hooks, and the git hooks npm runs when it installs from git
   // every hook's commands before what only the shell reading adds to any of them (HookCommand.added)
   const hookCommands = hooks
     .filter((h) => h.kind !== "publish")
     .flatMap((h) => h.commands.map((c) => ({ ...c, kind: h.kind })))
     .toSorted((a, b) => Number(a.added) - Number(b.added));
+
   const installCommands = hookCommands;
 
   // binding.gyp runs at install; its actions and <!(...) expansions are commands like any install script
@@ -1858,7 +1860,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   // what install hooks run as the second layer reads them (scriptTargets): production's roots are production's
   const installTargetsX = new Set<string>();
   const first: string[] = [];
-  // what install hooks run that only the shell reading reaches (HookCommand.added): read after the entries
+  // what install hooks run that only the shell reading reaches (HookCommand.added): the extra layer's, after production's
+  // whole walk
   const later = new Set<string>();
 
   for (const c of installCommands) {
@@ -1866,9 +1869,13 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
       const f = resolveIn(byPath, w);
 
       if (f && f.path !== "package.json") {
-        installTargets.add(f.path);
-        if (c.added) later.add(f.path);
-        else first.push(f.path);
+        if (c.added) {
+          later.add(f.path);
+          installTargetsX.add(f.path);
+        } else {
+          installTargets.add(f.path);
+          first.push(f.path);
+        }
       }
     }
 
@@ -1905,8 +1912,6 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     if (!runsAsCode.has(p)) exposedOnly.add(p);
     runsAsCode.add(p);
   }
-
-  for (const p of later) first.push(p);
 
   const reachable = new Set<string>(first);
   const queue = [...reachable];
@@ -2503,6 +2508,8 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
   const productionStopped = resourceStopped;
 
   layer = "extra";
+
+  for (const p of later) if (!seen.has(p)) reach(p);
 
   for (const c of laterCommands) followCommand(c.f, c.line, c.value, c.reached);
 

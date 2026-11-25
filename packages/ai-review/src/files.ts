@@ -4,11 +4,13 @@
 // not seeing a file it worried about, so the order puts what runs first: install-script targets, then
 // Node entry points, then files where apm's rule-based signals fired, then whatever those entries reach
 // through relative imports, then browser entries, then the rest of the code by depth and size.
-import { analyze, expandHooks, measureManifest, runTargets, shellWords, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
+import { analyze, expandHooks, MAX_ANALYSIS_WORK, measureManifest, Meter, MeterExhausted, metered, runTargets, shellWords, type TarEntry, findingsOf, wildcardMatch } from "@apm/core";
 import { installScripts, type Manifest } from "./manifest.ts";
 
-// any case, as Windows and macOS file systems resolve `require('./x.JS')`
-const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/i;
+const CODE = /\.(?:[cm]?jsx?|[cm]?tsx?|sh|bash|zsh|ps1|psm1|bat|cmd|py|vbs|php|rb|pl|vue|svelte|coffee)$/;
+
+// the same in any case, as Windows and macOS file systems resolve `require('./x.JS')`: shown after what CODE shows (ordered)
+const CODE_ANY_CASE = new RegExp(CODE.source, "i");
 
 /** Declarations and source maps, which end in a code extension (`.d.ts`) or sit beside code, are docs before code. */
 const NOT_CODE = /\.(?:d\.[cm]?ts|map)$/i;
@@ -19,6 +21,9 @@ const BINARY_EXT = /\.(?:node|exe|dll|so|dylib|wasm|bin|dat|zip|gz|tgz|tar|7z|ja
 /** Globs in install commands matched against the tarball's files, and their length; past these the rest are not expanded. */
 const MAX_GLOBS = 8;
 const MAX_GLOB_CHARS = 128;
+
+/** Work units the shell reading of install commands may spend (meter.ts). */
+const MAX_REACH_WORK = MAX_ANALYSIS_WORK / 8;
 
 /** Where the review ranks what it shows that main's rules pass over (ordered): after everything they show. */
 const REACHED_TIER = 7;
@@ -202,31 +207,40 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   const globs = new Map<string, { depth: number; prefix: string }>();
   const scripts = { scripts: Object.fromEntries(manifest.scripts) };
 
-  // a manifest past what apm reads is not expanded, as `analyze` does not expand it
-  for (const h of measureManifest(scripts, { charged: false }).kind === "ok" ? expandHooks(scripts) : []) {
-    if (h.kind !== "install") continue;
+  // a manifest past what apm reads is not expanded, as `analyze` does not expand it, and the expansion and glob matching
+  // run under their own work meter: past it, nothing is added and the review shows what main's rules show
+  try {
+    metered(new Meter(MAX_REACH_WORK), () => {
+      for (const h of measureManifest(scripts, { charged: false }).kind === "ok" ? expandHooks(scripts) : []) {
+        if (h.kind !== "install") continue;
 
-    for (const c of h.commands) {
-      for (const t of shellWords(c.text)) {
-        if (t === null) continue;
-        const w = stripDot(t.word.replace(/^\$\{?PWD\}?\//, "./"));
+        for (const c of h.commands) {
+          for (const t of shellWords(c.text)) {
+            if (t === null) continue;
+            const w = stripDot(t.word.replace(/^\$\{?PWD\}?\//, "./"));
 
-        if (!t.glob) {
-          const f = resolved(w);
+            if (!t.glob) {
+              const f = resolved(w);
 
-          if (f !== undefined) reached.add(f);
-        } else if (globs.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
-          globs.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.indexOf("*")) });
+              if (f !== undefined) reached.add(f);
+            } else if (globs.size < MAX_GLOBS && w.length <= MAX_GLOB_CHARS) {
+              globs.set(w, { depth: w.split("/").length, prefix: w.slice(0, w.indexOf("*")) });
+            }
+          }
         }
       }
-    }
+
+      for (const f of globs.size > 0 ? files : []) {
+        const depth = f.path.split("/").length;
+
+        for (const [pattern, g] of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && wildcardMatch(f.path, pattern)) reached.add(f.path);
+      }
+    });
+  } catch (e) {
+    if (!(e instanceof MeterExhausted)) throw e;
+    reached.clear();
   }
 
-  for (const f of globs.size > 0 ? files : []) {
-    const depth = f.path.split("/").length;
-
-    for (const [pattern, g] of globs) if (depth === g.depth && f.path.startsWith(g.prefix) && wildcardMatch(f.path, pattern)) reached.add(f.path);
-  }
   const nodeEntries = new Set([...manifest.main, ...manifest.bin, ...manifest.module, ...manifest.exports].map(resolved));
 
   // npm's default entry when `main` is absent
@@ -235,7 +249,7 @@ export function readingOrder(manifest: Manifest, files: readonly TarEntry[]): (f
   const signals = ruleSignalFiles(manifest, files);
   const reach = importDistances(files, [...targets, ...nodeEntries].filter((p): p is string => p !== undefined));
 
-  const tierOf = (f: TarEntry): { tier: number; sub: number } => {
+  const tierOf = (f: TarEntry) => {
     const p = f.path;
 
     if (targets.has(p)) return { tier: 0, sub: 0 };
@@ -274,7 +288,7 @@ export function ordered(manifest: Manifest, all: readonly TarEntry[], pick: read
 
     if (isReviewable(f) || (r.tier <= 1 && kindOf(f) !== "binary")) return [{ f, r, p: prefer(f) ? 0 : 1 }];
 
-    return (r.tier <= 1 || r.reached) && !isMachineCode(f.data) ? [{ f, r: { ...r, tier: REACHED_TIER }, p: prefer(f) ? 0 : 1 }] : [];
+    return (r.tier <= 1 || r.reached || (CODE_ANY_CASE.test(f.path) && !NOT_CODE.test(f.path))) && !isMachineCode(f.data) ? [{ f, r: { ...r, tier: REACHED_TIER }, p: prefer(f) ? 0 : 1 }] : [];
   });
 
   keyed.sort((a, b) => a.r.tier - b.r.tier || a.r.sub - b.r.sub || a.p - b.p || a.f.size - b.f.size || (a.f.path < b.f.path ? -1 : 1));
