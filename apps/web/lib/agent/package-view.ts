@@ -51,9 +51,11 @@ export async function loadPackageView(input: { name: string; version: string | n
   const { version, install } = selected;
   const isLatest = version === pkg.latest;
   const status = selected.read?.status ?? pkg.versions.find((r) => r.version === version)?.status ?? "active";
-  const policy = readPolicy({ name, version, status, resolve: source.resolve });
   // the page's score for a version other than latest comes from the score route, with its capabilities: so does this one
   const routeScore = isLatest ? null : source.score({ name, version });
+  // as on the page: resolve is asked only when the version's score marks it risky (lib/refusal.ts looksRisky)
+  const risk = routeScore === null ? Promise.resolve({ score: pkg.score, installScripts: pkg.facts?.installScripts ?? null }) : routeScore.then((s) => ({ score: s.kind === "ok" ? s.value : null, installScripts: null }));
+  const policy = readPolicy({ name, version, status, risk, resolve: source.resolve });
   const read = () => Promise.all([source.version({ name, version }), source.review({ name, version })]);
   // a version the package answer does not list was just read to find it: only its review is new
   const first: Awaited<ReturnType<typeof read>> = selected.read ? [{ kind: "ok", value: selected.read }, await source.review({ name, version })] : await read();

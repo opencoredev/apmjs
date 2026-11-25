@@ -163,6 +163,7 @@ function statusLine(status: NonNullable<PackageView["status"]>, policy: PolicyRe
 
   switch (policy.kind) {
     case "installs":
+    case "not-asked":
       return "- Status: active";
     case "unknown":
       return "- Status: active. The registry's install policy did not answer, so apm may not serve this version.";

@@ -229,7 +229,8 @@ describe("structured answers agree with the text", () => {
     const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, resolve: () => resolvedTo("1.3.0") });
 
     expect(r.structured.refusal).toBeNull();
-    expect(r.structured.installPolicy).toBe("installs");
+    // a clean, scored version: resolve is not asked (lib/refusal.ts looksRisky), and the commands are today's
+    expect(r.structured.installPolicy).toBe("not-asked");
     expect(r.structured.install).toEqual({ kind: "commands", via: "default", commands: { apm: "apm add left-pad", bun: "bun add left-pad@1.3.0", npm: "npm install left-pad@1.3.0", pnpm: "pnpm add left-pad@1.3.0" } });
     expect(r.text).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
   });

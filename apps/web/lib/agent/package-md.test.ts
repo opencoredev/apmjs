@@ -147,8 +147,28 @@ describe("loadPackageView", () => {
     const v = await loadPackageView({ name: "left-pad", version: null, registry: REGISTRY, source });
 
     expect(v.kind).toBe("ok");
-    // resolve for exactly the version shown starts alongside its version and review reads
-    expect(source.calls).toEqual(["package left-pad", "resolve left-pad@1.3.0", "version left-pad@1.3.0", "review left-pad@1.3.0"]);
+    // a scored version with no risk signal is not asked about: no resolve (lib/refusal.ts looksRisky)
+    expect(source.calls).toEqual(["package left-pad", "version left-pad@1.3.0", "review left-pad@1.3.0"]);
+  });
+
+  test("a clean, high-scoring version (react-shaped) makes no resolve call; an F or an install-script signal makes one", async () => {
+    const clean = pkg();
+
+    if (!clean.score) throw new Error("pkg() has a score");
+    const react = pkg({ score: { ...clean.score, score: 96, grade: "A", signals: [] } });
+    const risky = [pkg({ score: { ...clean.score, score: 10, grade: "F" } }), pkg({ score: { ...clean.score, score: 85, grade: "B", signals: [{ id: "install-script", label: "Runs a script at install time", points: -10, evidence: [], confidence: "confirmed" }] } }), pkg({ score: null })];
+
+    const calls = async (p: PackageInfo) => {
+      const source = fakeSource({ packages: { "left-pad": p }, resolve: () => resolvedTo("1.3.0") });
+
+      await loadPackageView({ name: "left-pad", version: null, registry: REGISTRY, source });
+
+      return source.calls.filter((c) => c.startsWith("resolve"));
+    };
+
+    expect(await calls(react)).toEqual([]);
+
+    for (const p of risky) expect(await calls(p)).toEqual(["resolve left-pad@1.3.0"]);
   });
 
   test("an older version reads that version's score", async () => {
@@ -291,7 +311,11 @@ describe("what the Markdown view says apm will not install, and how", () => {
   const ACTIVE = { status: "active", statusReason: null, deprecated: null };
   const score = (over: Partial<Score>): Score => ({ score: 75, grade: "B", signals: [], scorer: "apm-score-v11", digest: null, dismissed: [], redacted: false, capabilities: [], ...over });
   const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-05-09T06:58:15.253Z", publishedBy: "x", status: "active", statusReason: null, deprecated: null, score: 10, grade: "F", ...over });
-  const ugent = (latest: string) => pkg({ name: "ugent_uws", latest, distTags: { latest }, versions: [row("10.9.11"), row("9.0.0", { score: 100, grade: "A" })] });
+  // the package answer's score is latest's: 10.9.11 scores F 10 in production, 9.0.0 A 100
+  const latestScore = (latest: string) => score(latest === "10.9.11" ? { score: 10, grade: "F" } : { score: 100, grade: "A" });
+  const ugent = (latest: string) => pkg({ name: "ugent_uws", latest, distTags: { latest }, score: latestScore(latest), versions: [row("10.9.11"), row("9.0.0", { score: 100, grade: "A" })] });
+  // a version whose F score has resolve asked about it (lib/refusal.ts looksRisky)
+  const leftPadF = () => pkg({ score: score({ score: 10, grade: "F" }), versions: [row("1.3.0")] });
   const refusedFor = (version: string, over: { reason?: string; confirmed?: { name: string; version: string }[] }): ResolveOutcome => ({ kind: "refused", reason: "none passes", newest: version, skipped: [{ version, reason: over.reason ?? "held back" }], confirmed: over.confirmed ?? [] });
 
   const load = async (p: PackageInfo, version: string | null, resolve: (name: string, range: string) => ResolveOutcome, fake: Parameters<typeof fakeSource>[0] = {}) => {
@@ -330,7 +354,7 @@ describe("what the Markdown view says apm will not install, and how", () => {
   const NO_MATCH = parseResolve(422, { error: "No version of left-pad matching 1.3.0 passes the policy.", name: "left-pad", range: "1.3.0", version: null, skipped: [{ version: "1.2.0", reason: "yanked", revokeReason: null }], newest: null, knownMalicious: [] });
 
   test("a picked version whose tree resolve refused: do not install, naming the dependency and its advisory", async () => {
-    const p = pkg({ versions: [row("1.3.0")] });
+    const p = leftPadF();
     const listed = await load(p, null, () => BAD_TREE_LISTED);
     const confirmed = await load(p, null, () => BAD_TREE_CONFIRMED);
 
@@ -344,13 +368,13 @@ describe("what the Markdown view says apm will not install, and how", () => {
   });
 
   test("a root an apm reviewer confirmed is recognised from the skipped reason alone", async () => {
-    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => ROOT_CONFIRMED);
+    const { md } = await load(leftPadF(), null, () => ROOT_CONFIRMED);
 
     expect(md).toContain("- Status: do not install. apm reviewers confirmed it is malicious, so apm add refuses it.");
   });
 
   test("a version apm reviewers confirmed, and one skipped for another reason, in the registry's words", async () => {
-    const p = pkg({ versions: [row("1.3.0")] });
+    const p = leftPadF();
     const confirmed = await load(p, null, () => refusedFor("1.3.0", { confirmed: [{ name: "left-pad", version: "1.3.0" }] }));
     const held = await load(p, null, () => refusedFor("1.3.0", { reason: "held back by the registry" }));
 
@@ -360,7 +384,7 @@ describe("what the Markdown view says apm will not install, and how", () => {
   });
 
   test("a 422 that neither skips nor picks this version is unknown, not installs", async () => {
-    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => NO_MATCH);
+    const { md } = await load(leftPadF(), null, () => NO_MATCH);
 
     expect(md).toContain("- Status: active. The registry's install policy did not answer, so apm may not serve this version.");
     expect(md).not.toContain("- Status: active\n");
@@ -375,7 +399,7 @@ describe("what the Markdown view says apm will not install, and how", () => {
   });
 
   test("resolve not answering keeps the install commands, and says apm may not serve the version", async () => {
-    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => ({ kind: "unavailable" }));
+    const { md } = await load(leftPadF(), null, () => ({ kind: "unavailable" }));
 
     expect(md).toContain("- Status: active. The registry's install policy did not answer, so apm may not serve this version.");
     expect(md).toContain("apm add left-pad\nbun add left-pad@1.3.0");

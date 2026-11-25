@@ -726,7 +726,7 @@ async function InstallSlot(props: { name: string; version: string; install: Inst
   const { name, version, statusReason } = props;
   const p = await props.policy;
 
-  if (p.kind === "installs") return <InstallTabs name={name} version={version} install={props.install} inCooldown={props.inCooldown} registry={REGISTRY} />;
+  if (p.kind === "installs" || p.kind === "not-asked") return <InstallTabs name={name} version={version} install={props.install} inCooldown={props.inCooldown} registry={REGISTRY} />;
 
   if (p.kind === "unknown") {
     return (
@@ -930,8 +930,6 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const shownRow = pkg.versions.find((v) => v.version === version);
   // a version the package answer does not list carries its state in its own answer
   const status = shownRow?.status ?? details?.status ?? "active";
-  // apm's install policy for exactly this version, the read /api/explain makes; only the install box waits for it
-  const policy = readPolicy({ name: pkg.name, version, status, resolve: registrySource.resolve });
 
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball, unless that
   // tarball is too large for the registry to open (next's), which it could only refuse
@@ -941,8 +939,13 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // an older version's own facts, from the per-version answer (already read when the package answer doesn't list it,
   // and started with the package answer when ?v= is a version number: lib/package-reads.ts)
   const versionDetails: Promise<Fetched<VersionDetails>> = isLatest || shown === null ? Promise.resolve(none) : details ? Promise.resolve({ kind: "ok", value: details }) : reads.details(shown);
+  const versionScoreRead = shown && !isLatest ? reads.score(shown) : Promise.resolve(none);
+  // apm's install policy for exactly this version (the read /api/explain makes), asked only when its score marks it risky
+  // (lib/refusal.ts looksRisky); only the install box waits for it
+  const risk = isLatest ? Promise.resolve({ score: pkg.score, installScripts: pkg.facts?.installScripts ?? null }) : versionScoreRead.then((s) => ({ score: s.kind === "ok" ? s.value : null, installScripts: null }));
+  const policy = readPolicy({ name: pkg.name, version, status, risk, resolve: registrySource.resolve });
   // an older version's own score: the header badge and the score panel show it, so it is awaited here
-  const [versionScore, detailsRead] = await Promise.all([shown && !isLatest ? reads.score(shown) : Promise.resolve(none), versionDetails]);
+  const [versionScore, detailsRead] = await Promise.all([versionScoreRead, versionDetails]);
 
   // the facts panel shows the shown version's facts; latest's, labelled as such, only if that version's could not be read
   const glance: { facts: Facts | null; of: "shown" | "latest" } =
