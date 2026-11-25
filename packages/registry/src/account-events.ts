@@ -1,12 +1,13 @@
 // Sign-ups and sign-ins, counted in Databuddy (https://www.databuddy.cc/docs/api/events) as two server-side custom
-// events: account_created when a sign-in makes a new account, sign_in when an existing account signs in again. Each
+// events: account_created when a sign-in makes a new account, sign_in when an existing account signs in again on the
+// website. `apm login`'s device flow is not counted: its token request carries none of the browser's privacy signals. Each
 // carries one property, how the person signed in (a fixed value), and the account's analytics id: a SHA-256 of the
 // account's random internal id, never its email, name or GitHub login. The website gives the same id to Databuddy's
 // identify() on public pages (apps/web/lib/databuddy-client.ts), so Databuddy can tie a visitor's earlier page views to
 // the account they made. A request that carries Global Privacy Control or Do Not Track is still counted, without the id.
 //
-// Sending never touches the sign-in: send() only hands a task to the request's waitUntil, and the task posts after the
-// answer, gives up after SEND_TIMEOUT_MS and swallows every failure. On only when the Worker has APM_DATABUDDY_CLIENT_ID
+// Sending never touches the sign-in: send() only hands a task to the request's waitUntil, which the response never
+// waits on; the task posts only once waitUntil has taken it, gives up after SEND_TIMEOUT_MS and swallows every failure. On only when the Worker has APM_DATABUDDY_CLIENT_ID
 // (production alone, packages/infra/analytics.ts).
 import { createHash } from "node:crypto";
 import { REPORT_ORIGINS, REPORT_USER_AGENT } from "@apm/core/error-report";
@@ -19,7 +20,7 @@ export const ACCOUNT_EVENT_NAMES = ["account_created", "sign_in"] as const;
 export type AccountEventName = (typeof ACCOUNT_EVENT_NAMES)[number];
 
 /** How someone signed in, from the Better Auth route that made the session or the account. */
-export const SIGN_IN_METHODS = ["github", "vercel", "passkey", "cli"] as const;
+export const SIGN_IN_METHODS = ["github", "vercel", "passkey"] as const;
 
 export type SignInMethod = (typeof SIGN_IN_METHODS)[number];
 
@@ -27,10 +28,7 @@ export type SignInMethod = (typeof SIGN_IN_METHODS)[number];
 export type EventMethod = SignInMethod | "other";
 
 /** The Better Auth routes (as ctx.path names them) that sign someone in without a provider. */
-const METHOD_BY_PATH: ReadonlyMap<string, SignInMethod> = new Map([
-  ["/passkey/verify-authentication", "passkey"],
-  ["/device/token", "cli"],
-]);
+const METHOD_BY_PATH: ReadonlyMap<string, SignInMethod> = new Map([["/passkey/verify-authentication", "passkey"]]);
 
 /** The OAuth callback routes, whose provider is the route's parameter. */
 const CALLBACK_PATHS: ReadonlySet<string> = new Set(["/callback/:id", "/oauth2/callback/:providerId"]);
@@ -132,7 +130,11 @@ export function accountEvents(input: {
   return {
     send: (event) => {
       try {
-        input.background(Promise.resolve().then(() => deliver(event)));
+        // the post starts on a later microtask, and only if waitUntil took the task without throwing
+        let held = false;
+
+        input.background(Promise.resolve().then(() => (held ? deliver(event) : undefined)));
+        held = true;
       } catch {
         // waitUntil refused the task: nothing is sent
       }

@@ -1,6 +1,6 @@
 // Spec: sign-ups and sign-ins counted in Databuddy (packages/registry/src/account-events.ts).
 // - A GitHub sign-in that makes a new account sends account_created; a later sign-in to it sends sign_in; `apm login`
-//   sends sign_in with method cli. Each carries the account's opaque analytics id, the same one /-/apm/v1/account
+//   is not counted (its token request carries no browser privacy signals). Each carries the account's opaque analytics id, the same one /-/apm/v1/account
 //   gives the website for identify(), and nothing else about the person.
 // - Global Privacy Control or Do Not Track on the sign-in keeps the id out; the event is still counted.
 // - Databuddy failing or hanging never fails or slows a sign-in: the send runs after the answer.
@@ -94,14 +94,15 @@ describe("account events", () => {
     for (const word of ["private-pat", "users.example.test", "@", "email", "avatar"]) expect(text, word).not.toContain(word);
   });
 
-  test("apm login (the device flow) counts as a sign-in with method cli", async () => {
+  test("apm login (the device flow) sends nothing", async () => {
     const b = await signInWithGitHub(reg, gh, "Cli-Casey");
-    const id = dig((await b.json("-/apm/v1/account")).body, "analyticsId");
+
+    await Bun.sleep(500);
     const before = sent.length;
     await deviceLogin(b);
-    const events = await eventsFrom(before, 1);
+    await Bun.sleep(1_000);
 
-    expect(events.map((e) => e.body)).toContainEqual({ name: "sign_in", properties: { method: "cli" }, source: "registry", profileId: id });
+    expect(sent.slice(before)).toEqual([]);
   });
 
   test("Global Privacy Control or Do Not Track on the sign-in keeps the id out, and the sign-up is still counted", async () => {

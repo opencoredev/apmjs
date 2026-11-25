@@ -2,7 +2,7 @@
 // attributes server components declare, and that nothing is sent or asked without the tracker on the page. The
 // tracker and Databuddy's flag endpoint are stand-ins here; scripts/analytics-browser.ts runs the real databuddy.js.
 import { afterEach, describe, expect, test } from "bun:test";
-import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, linkAccount, track, trackInstallDefaultShown } from "./databuddy-client";
+import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, LINKED_KEY, linkAccount, track, trackInstallDefaultShown } from "./databuddy-client";
 
 type Sent = { name: string; props: Readonly<Record<string, string | number>> };
 
@@ -175,66 +175,82 @@ describe("the install-default-client flag", () => {
 
 describe("linking a signed-in visitor to their account", () => {
   const ID = "0123456789abcdef0123456789abcdef";
+  const OTHER = "fedcba9876543210fedcba9876543210";
 
-  /** A stand-in for databuddy.js's identity calls, starting with `profileId` identified. */
-  function fakeIdentity(profileId: string | null) {
+  /** A stand-in for databuddy.js's identity calls and the page's local storage, with `stored` already in it. */
+  function fakeIdentity(stored: Record<string, string> = {}, throws = false) {
     const calls: string[] = [];
-    let current = profileId;
+    const storage = new Map(Object.entries(stored));
 
     Reflect.set(globalThis, "window", {
       databuddy: {
         identify: (id: string) => {
+          if (throws) throw new Error("tracker bug");
           calls.push(`identify ${id}`);
-          current = id;
+          storage.set("did_profile", id);
         },
-        clearProfile: () => {
-          calls.push("clearProfile");
-          current = null;
+        clear: () => {
+          calls.push("clear");
+          storage.delete("did_profile");
         },
-        getProfileId: () => current,
+      },
+      localStorage: {
+        getItem: (k: string) => storage.get(k) ?? null,
+        setItem: (k: string, v: string) => storage.set(k, v),
+        removeItem: (k: string) => storage.delete(k),
       },
     });
 
-    return calls;
+    return { calls, storage };
   }
 
-  test("a signed-in visitor is identified by the account's analytics id, once", async () => {
-    const calls = fakeIdentity(null);
+  test("a signed-in visitor is identified by the account's analytics id, and databuddy.js keeps no copy for the next page load", async () => {
+    const { calls, storage } = fakeIdentity();
 
     await linkAccount(ID);
+    expect(calls).toEqual([`identify ${ID}`]);
+    expect(storage.get("did_profile")).toBeUndefined();
+    expect(storage.get(LINKED_KEY)).toBe(ID);
+  });
+
+  test("each page load identifies again (databuddy.js sends one request per session)", async () => {
+    const { calls } = fakeIdentity({ [LINKED_KEY]: ID });
+
     await linkAccount(ID);
     expect(calls).toEqual([`identify ${ID}`]);
   });
 
   test("anything but an analytics id (an email, a login, free text) is never sent", async () => {
-    const calls = fakeIdentity(null);
+    const { calls } = fakeIdentity();
 
     for (const bad of ["someone@example.com", "octocat", "0123456789ABCDEF0123456789ABCDEF", `${ID}0`, ""]) await linkAccount(bad);
     expect(calls).toEqual([]);
   });
 
-  test("a signed-out visitor is untied from the account the browser was linked to, and an anonymous one is left alone", async () => {
-    const linked = fakeIdentity(ID);
+  test("signing out starts new visitor ids once; an anonymous visitor is left alone", async () => {
+    const linked = fakeIdentity({ [LINKED_KEY]: ID });
 
     await linkAccount(null);
-    expect(linked).toEqual(["clearProfile"]);
+    await linkAccount(null);
+    expect(linked.calls).toEqual(["clear"]);
+    expect(linked.storage.get(LINKED_KEY)).toBeUndefined();
 
-    const anonymous = fakeIdentity(null);
+    const anonymous = fakeIdentity();
 
     await linkAccount(null);
-    expect(anonymous).toEqual([]);
+    expect(anonymous.calls).toEqual([]);
+  });
+
+  test("a different account signing in starts new visitor ids before it is identified", async () => {
+    const { calls, storage } = fakeIdentity({ [LINKED_KEY]: ID });
+
+    await linkAccount(OTHER);
+    expect(calls).toEqual(["clear", `identify ${OTHER}`]);
+    expect(storage.get(LINKED_KEY)).toBe(OTHER);
   });
 
   test("a tracker that throws never reaches the page", async () => {
-    Reflect.set(globalThis, "window", {
-      databuddy: {
-        identify: () => {
-          throw new Error("tracker bug");
-        },
-        clearProfile: () => {},
-        getProfileId: () => null,
-      },
-    });
+    fakeIdentity({}, true);
 
     await expect(linkAccount(ID)).resolves.toBeUndefined();
   });

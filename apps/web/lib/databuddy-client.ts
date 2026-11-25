@@ -179,11 +179,10 @@ export async function installDefaultClient({ clientId }: { clientId: string }): 
 
 // ---------- linking a signed-in visitor to their account ----------
 
-/** The part of window.databuddy that ties this browser to an account. */
+/** The part of window.databuddy that ties this browser to an account, and `clear`, which starts new visitor ids. */
 const IdentityTracker = z.object({
   identify: z.custom<(profileId: string) => void>((v) => v instanceof Function),
-  clearProfile: z.custom<() => void>((v) => v instanceof Function),
-  getProfileId: z.custom<() => string | null>((v) => v instanceof Function),
+  clear: z.custom<() => void>((v) => v instanceof Function),
 });
 
 type IdentityTracker = z.infer<typeof IdentityTracker>;
@@ -197,29 +196,47 @@ function identityTracker(): IdentityTracker | null {
 /** An account's analytics id as the registry makes it (packages/registry/src/account-events.ts): 32 hex characters. */
 const AnalyticsId = z.string().regex(/^[0-9a-f]{32}$/);
 
+/** Where databuddy.js keeps the identified profile between page loads. */
+const SDK_PROFILE_KEY = "did_profile";
+
+/** This site's own note of which account this browser was last linked to, so a sign-out or switch can untie it. */
+export const LINKED_KEY = "apm_databuddy_linked";
+
 /**
  * Ties this browser's visits to the signed-in account, or unties them once the visitor is signed out. `analyticsId`
  * is the account's opaque id from the registry (a hash of its internal id: never an email, name or login), or null
  * when the visitor is signed out. Only where the tracker loaded, so a visitor who opted out, or a private page, sends
- * nothing; anonymous visitors are never identified. Databuddy then counts the account's sign-up with the page views
- * that led to it. Never throws.
+ * nothing; anonymous visitors are never identified. Never throws.
+ *
+ * databuddy.js would keep the profile in local storage and put it on the next page load's events before this page
+ * knows who is signed in, so its copy is removed right after identify(): every page load starts anonymous, and its
+ * events are tied to the account through the session once identify() runs again. Signing out, or a different account
+ * signing in, calls clear(), which starts new visitor and session ids, so later visits are not credited to the
+ * account through the old visitor id.
  */
 export async function linkAccount(analyticsId: string | null): Promise<void> {
   try {
     const t = await loaded(identityTracker);
 
     if (!t) return;
-    const current = t.getProfileId();
+    const linked = window.localStorage.getItem(LINKED_KEY);
 
     if (analyticsId === null) {
-      if (current !== null) t.clearProfile();
+      if (linked === null) return;
+      t.clear();
+      window.localStorage.removeItem(LINKED_KEY);
 
       return;
     }
 
     const id = AnalyticsId.safeParse(analyticsId);
 
-    if (id.success && current !== id.data) t.identify(id.data);
+    if (!id.success) return;
+
+    if (linked !== null && linked !== id.data) t.clear();
+    t.identify(id.data);
+    window.localStorage.removeItem(SDK_PROFILE_KEY);
+    window.localStorage.setItem(LINKED_KEY, id.data);
   } catch {
     // analytics never breaks the page
   }

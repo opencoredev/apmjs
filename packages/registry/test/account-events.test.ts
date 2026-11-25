@@ -17,15 +17,15 @@ describe("analyticsId", () => {
 });
 
 describe("signInMethod", () => {
-  test("names the provider of an OAuth callback, a passkey sign-in and the CLI's device flow", () => {
+  test("names the provider of an OAuth callback and a passkey sign-in", () => {
     expect(signInMethod({ path: "/callback/:id", params: { id: "github" } })).toBe("github");
     expect(signInMethod({ path: "/callback/:id", params: { id: "vercel" } })).toBe("vercel");
     expect(signInMethod({ path: "/oauth2/callback/:providerId", params: { providerId: "github" } })).toBe("github");
     expect(signInMethod({ path: "/passkey/verify-authentication" })).toBe("passkey");
-    expect(signInMethod({ path: "/device/token" })).toBe("cli");
   });
 
-  test("anything else is not a sign-in: another route, an unknown provider, no route at all", () => {
+  test("anything else is not a sign-in: the CLI's device flow, another route, an unknown provider, no route at all", () => {
+    expect(signInMethod({ path: "/device/token" })).toBeNull();
     expect(signInMethod({ path: "/two-factor/enable" })).toBeNull();
     expect(signInMethod({ path: "/callback/:id", params: { id: "evil<script>" } })).toBeNull();
     expect(signInMethod({ path: "/callback/:id" })).toBeNull();
@@ -85,20 +85,31 @@ describe("accountEvents", () => {
     expect(JSON.parse(String(calls[0]?.init.body))).toEqual(trackPayload(event));
   });
 
-  test("a collector that throws, or a waitUntil that throws, never reaches the caller", async () => {
+  test("a collector that throws, or a waitUntil that throws, never reaches the caller, and a refused task posts nothing", async () => {
     const held: Promise<void>[] = [];
     const failing = accountEvents({ clientId: CLIENT_ID, background: (work) => held.push(work), fetch: () => Promise.reject(new Error("network down")) });
 
     expect(() => failing?.send(event)).not.toThrow();
     await expect(Promise.all(held)).resolves.toBeDefined();
 
+    let posts = 0;
+    let dropped: Promise<void> | null = null;
+
     const refused = accountEvents({
       clientId: CLIENT_ID,
-      background: () => {
+      background: (work) => {
+        dropped = work;
         throw new Error("waitUntil refused");
+      },
+      fetch: async () => {
+        posts += 1;
+
+        return new Response("ok");
       },
     });
 
     expect(() => refused?.send(event)).not.toThrow();
+    await dropped;
+    expect(posts).toBe(0);
   });
 });
