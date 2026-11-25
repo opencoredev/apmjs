@@ -2,10 +2,10 @@
 // read the way it reads them. The table in fixtures/omission-cases.ts is what real npm 9 and pnpm 10 do with each
 // setting (real-layouts.test.ts installs every case with them); here apm's reading is held to it.
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_REGISTRY, loadConfig } from "../src/config.ts";
+import { DEFAULT_REGISTRY, loadConfig, saveToken } from "../src/config.ts";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
 import { decodeIni, type IniValue, text } from "../src/ini.ts";
 import { npmAnswer, OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
@@ -182,6 +182,36 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
     expect(config(NPM11)).toMatchObject({ registry: DEFAULT_REGISTRY, token: null });
     // no npm to ask: the settings are kept
     expect(config(undefined)).toMatchObject({ registry: "https://r.example/", token: "apm_tokentokentokentoken" });
+  });
+
+  test("a rotated token is the only one either grammar reads, whatever way the old one was written (review of e5d8c47)", () => {
+    const key = "//registry.apmjs.dev/:_authToken";
+    const OLD = "apm_oldoldoldoldoldold01";
+    const NEW = "apm_newnewnewnewnewnew01";
+
+    const cases = [
+      `${key} = ${OLD}\n`,
+      `  "${key}" =${OLD}\n`,
+      `${key}[]=${OLD}\n`,
+      // Debian's npm 9.2 reads `[custom] ` as a key, so a token after it is top-level there and, being later, wins
+      `[custom] \n${key} = ${OLD}\n`,
+      `[custom] \n${key}=${OLD}\n`,
+      `${key}=${OLD}\n[custom] \n${key} =${OLD}\nregistry=https://registry.apmjs.dev/\n`,
+      `a=1\r${key}=${OLD}\r[real]\n${key}=${OLD}\n`,
+    ];
+
+    for (const user of cases) {
+      const p = project({ user });
+      const rc = join(p.env.HOME, ".npmrc");
+
+      saveToken(rc, "https://registry.apmjs.dev/", NEW);
+      const after = readFileSync(rc, "utf8");
+
+      for (const sections of ["exact", "spaced"] as const) expect(decodeIni(after, sections).get(key)).toEqual({ kind: "one", item: text(NEW) });
+      expect(after).not.toContain(OLD);
+
+      for (const path of [NPM92_DEBIAN, NPM11]) expect(loadConfig(p.root, { HOME: p.env.HOME, PATH: path }).token).toBe(NEW);
+    }
   });
 });
 

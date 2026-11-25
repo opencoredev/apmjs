@@ -4,7 +4,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { npmIniSections } from "./groups.ts";
-import { decodeIni, type SectionSyntax } from "./ini.ts";
+import { decodeIni, iniLines, readIniLine, type SectionSyntax } from "./ini.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -143,12 +143,21 @@ export function saveToken(userconfig: string, registry: string, token: string): 
   const key = `${authKey(registry)}:_authToken`;
   // a symlinked .npmrc (dotfiles repos) keeps its link: write next to the real file
   const target = existsSync(userconfig) ? realpathSync(userconfig) : userconfig;
-  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/) : [];
-  const kept = lines.filter((l) => !l.trim().startsWith(`${key}=`) && l.trim() !== "");
-  // npm reads no key under a [section] as a top-level setting, so the token goes above the first section header
-  const section = kept.findIndex((l) => /^\[[^\]]*\]\s*$/.test(l));
+  const lines = existsSync(target) ? iniLines(readFileSync(target, "utf8")) : [];
+  // Every line that sets this key goes, read the way ini reads it (`key = x`, `"key"=x`, `key[]=x`), under a header
+  // or not: which npm reads the file later is not known here, and under Debian's npm 9.2 (ini 3) a `[section] ` line is
+  // a key, so an old token after it stays top-level, wins over the new one, or turns it into a list (review of e5d8c47).
+  const kept = lines.filter((l) => {
+    const line = readIniLine(l, "exact");
+
+    return l.trim() !== "" && !(line.kind === "setting" && line.key === key);
+  });
+  // the token goes above the first line either grammar reads as a header, where both read it as top-level
+  const section = kept.findIndex((l) => readIniLine(l, "spaced").kind === "section");
+
   kept.splice(section < 0 ? kept.length : section, 0, `${key}=${token}`);
   const tmp = join(dirname(target), `.npmrc.${randomBytes(6).toString("hex")}.tmp`);
+
   try {
     writeFileSync(tmp, "", { mode: 0o600, flag: "wx" });
     chmodSync(tmp, 0o600);
@@ -158,5 +167,6 @@ export function saveToken(userconfig: string, registry: string, token: string): 
     rmSync(tmp, { force: true });
     throw e;
   }
+
   chmodSync(target, 0o600);
 }
