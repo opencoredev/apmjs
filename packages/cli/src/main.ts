@@ -1648,7 +1648,7 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
   const fetched = specs.find((d) => fetchedSpec(d.spec));
   const root = readManifest(join(layout.root, "package.json"));
   const pnpmSettings = JsonObject.safeParse(root?.pnpm);
-  const redirect = REDIRECTS.find((key) => (key.startsWith("pnpm.") ? pnpmSettings.success && pnpmSettings.data[key.slice(5)] !== undefined : root?.[key] !== undefined)) ?? workspaceRedirect(layout.root) ?? bunfigWithoutLock(layout.root);
+  const redirect = REDIRECTS.find((key) => (key.startsWith("pnpm.") ? pnpmSettings.success && pnpmSettings.data[key.slice(5)] !== undefined : root?.[key] !== undefined)) ?? workspaceRedirect(layout.root) ?? (pm === "bun" ? bunfigWithoutLock(layout.root) : undefined);
 
   if (redirect !== undefined) return refuse(`the project sets ${redirect}, which can make ${pm} resolve packages apm remove does not check; run ${pm} remove yourself`);
 
@@ -1669,7 +1669,8 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
     const cmd = [...installLockOnlyArgs(pm), ...(pm === "npm" ? ["--package-lock=true"] : pm === "pnpm" ? ["--no-frozen-lockfile", "--config.lockfile=true"] : [])];
 
     say(dim(`apm: removing ${names.join(", ")}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
-    const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: environment, stdoutToStderr: true });
+    // bun 1.2 unpacks packages into its cache while it computes a lockfile, so the copy gets a cache of its own, deleted with it
+    const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: pm === "bun" ? { ...environment, BUN_INSTALL_CACHE_DIR: join(copy.dir, ".apm-bun-cache") } : environment, stdoutToStderr: true });
 
     if (run.code !== 0) {
       fail(`apm remove: ${pm} could not compute the lockfile (exit ${run.code}). Your project is unchanged.`);
@@ -1690,9 +1691,12 @@ async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockP
     const computed = existsSync(computedPath) ? readLock({ pm, path: computedPath, cwd: join(copy.dir, layout.member) }) : null;
 
     if (computed !== null && computed.kind !== "read") return refuse(`apm could not read the ${t.lockfile} ${pm} computed`);
-    const notRegistry = (computed?.nodes ?? []).find((n) => (n.origin.kind !== "registry" && n.origin.kind !== "workspace") || (n.origin.kind === "registry" && !n.bundled && n.integrity === null));
+    const notRegistry = (computed?.nodes ?? []).find((n) => n.origin.kind !== "registry" && n.origin.kind !== "workspace");
 
     if (notRegistry !== undefined) return refuse(`the ${t.lockfile} ${pm} computed has ${idOf(notRegistry)} from ${notRegistry.resolved ?? notRegistry.origin.kind}, not a registry; apm remove handles registry versions only`);
+    const unpinned = (computed?.nodes ?? []).find((n) => n.origin.kind === "registry" && !n.bundled && n.integrity === null);
+
+    if (unpinned !== undefined) return refuse(`the ${t.lockfile} ${pm} computed has no integrity for ${idOf(unpinned)}, so apm cannot tell it is the package the lockfile has now`);
     const added = [...new Set((computed?.nodes ?? []).filter((n) => !had.has(artifactOf(n))).map((n) => idOf(n)))];
 
     planned = new Set((computed?.nodes ?? []).map(artifactOf));
@@ -2719,7 +2723,7 @@ async function cleanInstall(a: Args): Promise<number> {
 
 const CI_HELP = "usage: apm ci [switches]\n\nWith npm, npm ci with the switches apm install takes with no packages. With bun, pnpm and yarn, apm passes no ci\non: run apm install --frozen-lockfile.";
 
-const REMOVE_HELP = "usage: apm remove <package>... (also rm, uninstall)\n\nWith bun 1.2 and later, npm and pnpm, apm computes the removal in a copy of your project first and refuses it when\nthe package manager would install anything the lockfile does not have (a package.json entry the lockfile lacks,\nsay). Then it runs the package manager's own removal with the lockfile on. It needs a lockfile apm can read,\nregistry versions only in package.json (no URL, git or path specs) and no overrides, resolutions, catalogs or patched\ndependencies, and\ntakes package names only. With yarn, run yarn remove yourself.";
+const REMOVE_HELP = "usage: apm remove <package>... (also rm, uninstall)\n\nWith bun 1.2 and later, npm and pnpm, apm computes the removal in a copy of your project first and refuses it when\nthe package manager would install anything the lockfile does not have (a package.json entry the lockfile lacks,\nsay). Then it runs the package manager's own removal with the lockfile on. It needs a lockfile apm can read,\nregistry versions only in package.json (no URL, git or path specs) and no overrides, resolutions, catalogs or patched\ndependencies (with bun, a bunfig.toml that turns off install.lockfile.save too), and\ntakes package names only. With yarn, run yarn remove yourself.";
 
 /** The help these arguments ask for, or null when they ask for none. */
 function helpFor(a: Args): string | null {
