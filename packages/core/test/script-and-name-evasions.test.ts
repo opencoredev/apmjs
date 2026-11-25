@@ -515,7 +515,7 @@ describe("the shell reading is a third pass: it spends only what the first two l
 describe("the third pass never costs what fe2e641 read", () => {
   test("pass 2 keeps fe2e641's ignore-scripts reading: a stricter doubt follows pre and post scripts only in pass 3", () => {
     const many = Array.from({ length: 220 }, (_, i) => `t${i}`);
-    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run --silent --ignore-scripts a && npm run -s b", a: "true", prea: many.map((n) => `npm run ${n}`).join(" && "), b: DROPPER };
+    const scripts = { ...Object.fromEntries(many.map((n) => [n, "true"])), postinstall: "npm run --unknown-arity --ignore-scripts a && npm run -s b", a: "true", prea: many.map((n) => `npm run ${n}`).join(" && "), b: DROPPER };
     const [hook] = expandHooks({ scripts });
 
     expect(hook?.commands.map((c) => c.from)).toContain("scripts.b (run by scripts.postinstall)");
@@ -606,3 +606,39 @@ describe("what the third pass reaches is read on a meter of its own", () => {
   });
 });
 
+describe("the shell reading follows only what npm runs", () => {
+  test("a manager's name in another command's arguments is an argument", () => {
+    const r = scoreOf({ scripts: { postinstall: "echo 'npm' run docs", docs: DROPPER } }, {});
+
+    expect(r.ids).not.toContain("install-download");
+  });
+
+  test("a manager behind a wrapper or an assignment is still the command", () => {
+    for (const postinstall of ["env FOO=1 'npm' run docs", "FOO=1 'npm' run docs", "if 'npm' run docs; then true; fi"]) {
+      expect(scoreOf({ scripts: { postinstall, docs: DROPPER } }, {}).ids).toContain("install-download");
+    }
+  });
+
+  test("npm's boolean flags and a quoted --ignore-scripts keep the run alone", () => {
+    for (const postinstall of ["npm run --silent --ignore-scripts setup", "npm run '--ignore-scripts' setup", "npm run -s '--ignore-scripts' setup"]) {
+      expect(scoreOf({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } }, {}).ids).not.toContain("install-download");
+    }
+  });
+
+  test("a flag after the name that may unset --ignore-scripts still runs the pre and post scripts", () => {
+    for (const postinstall of ["npm run '--ignore-scripts' setup '--no-ignore-scripts'", "npm run '--ignore-scripts' setup --ignore-scripts false", "echo x | xargs npm run '--ignore-scripts' setup"]) {
+      expect(scoreOf({ scripts: { postinstall, presetup: DROPPER, setup: "echo setup" } }, {}).ids).toContain("install-download");
+    }
+  });
+
+  test("a long chain only the shell reading finds is not cut by the nesting limit", () => {
+    const steps = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`step${i}`, `npm run '-s' step${i + 1}`]));
+    const scripts = { ...steps, postinstall: "npm run '-s' step0", step9: "echo setup" };
+    const benign = scoreOf({ scripts }, {});
+    const dropper = scoreOf({ scripts: { ...scripts, step9: DROPPER } }, {});
+
+    expect(benign.ids).not.toContain("incomplete");
+    expect(benign.score).toBeGreaterThanOrEqual(SCORE_FLOOR);
+    expect(dropper.ids).toContain("install-download");
+  });
+});

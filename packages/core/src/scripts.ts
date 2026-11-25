@@ -60,6 +60,13 @@ const BARE_RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]
 // the only spellings read as setting npm's ignore-scripts; anything else that might touch it is a doubt (ignoreScriptsDoubt)
 const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
 const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
+
+// npm's flags that take no value, so the word after one is never read as its value
+const NPM_BOOLEAN_FLAGS = new Set(["--silent", "-s", "--quiet", "-q", "--verbose", "-d", "-dd", "-ddd", "--if-present", "--foreground-scripts", "--workspaces", "-ws", "--include-workspace-root"]);
+
+// words that run the rest of the simple command as a command of its own, and the shell's words a command may follow
+const WRAPPERS = new Set(["env", "xargs", "exec", "command", "nohup", "time", "nice", "cross-env", "npx"]);
+const KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{"]);
 const SHELL_WORD = /\S+/g;
 
 // quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
@@ -195,13 +202,13 @@ function mainReferences(cmd: string, scripts: Scripts): string[] {
 
 /**
  * Whether the words between npm and the script name set ignore-scripts and do nothing else: `run` or `run-script`, the
- * two spellings that set it, and `--`. Any other word may be a flag that takes the next word as its value
+ * two spellings that set it, npm's flags that take no value, and `--`. Any other word may be a flag that takes the next word as its value
  * (`--registry --ignore-scripts` sets the registry), so npm may not have read the flag at all.
  */
 function setsIgnoreScripts(words: string): boolean {
   const ws = words.trim().split(/\s+/);
 
-  return IGNORE_SCRIPTS.test(words) && ws.every((w) => ENABLES.has(w) || w === "run" || w === "run-script" || w === "--");
+  return IGNORE_SCRIPTS.test(words) && ws.every((w) => ENABLES.has(w) || NPM_BOOLEAN_FLAGS.has(w) || w === "run" || w === "run-script" || w === "--");
 }
 
 /** Scripts the flag-aware reading finds a command run, in order, each with whether npm runs it alone. */
@@ -242,7 +249,7 @@ function shellReferences(cmd: string, scripts: Scripts): ScriptRef[] {
   for (const m of cmd.matchAll(RUN_REF)) regex.add(`${m.index + m[0].length}\0${m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5]}`);
 
   const doubted = flagReferences(cmd, scripts).flatMap((r) => (r.alone && !r.aloneStrictly ? [{ name: r.name, alone: false }] : []));
-  const shell = shellRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || regex.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: false }]));
+  const shell = shellRunReferences(cmd, scripts).flatMap((r) => (read.has(r.name) || regex.has(`${r.end}\0${r.name}`) ? [] : [{ name: r.name, alone: r.alone }]));
 
   return [...doubted, ...shell];
 }
@@ -348,74 +355,102 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
 /**
  * Scripts a command runs through a package manager, read from the words the shell hands it, so quoted and escaped flags
  * and names and flags that take the next word as their value (`npm --prefix . run x`, `npm run -w pkg x`) do not hide
- * the run. Where a word after a flag may be its value or the name, both readings are followed: following a script npm
- * does not run can only make the reading stricter. Each word is read once. `end` is where the manager's word ends.
+ * the run. A manager is read only where the shell runs a command: first in a simple command, after variable assignments
+ * and wrappers that run the rest (`env`, `xargs`); a manager's name anywhere else is an argument. Where a word after a
+ * flag may be its value or the name, both readings are followed: following a script npm does not run can only make the
+ * reading stricter. `alone`: npm runs it without its pre and post scripts (setsIgnoreScripts), with nothing after the
+ * name that may unset the flag, no xargs before it and no expansion in the command. `end` is where the manager's word ends.
  */
-function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end: number }[] {
+function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end: number; alone: boolean }[] {
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
-  const out: { name: string; end: number }[] = [];
+  const out: { name: string; end: number; alone: boolean }[] = [];
+  // the references of the simple command being read, settled where it ends (a doubt after the name unsets `alone`)
+  let open: { name: string; end: number; alone: boolean }[] = [];
+  const expands = /[$`]/.test(cmd);
   let pm: string | null = null;
   let pmEnd = 0;
   let phase: "manager" | "run" | "named" = "manager";
   let afterFlag = false;
+  let before: string[] = [];
+  let atStart = true;
+  let wrapped = false;
+  let fromInput = false;
+  let bare = false;
 
   const takesName = (): boolean => pm !== null && (phase !== "manager" || pm === "yarn" || pm === "pnpm");
 
   const name = (w: string): void => {
-    if (Object.hasOwn(scripts, w)) out.push({ name: w, end: pmEnd });
+    if (Object.hasOwn(scripts, w)) open.push({ name: w, end: pmEnd, alone: pm === "npm" && !expands && !fromInput && setsIgnoreScripts(before.join(" ")) });
 
     if (afterFlag) afterFlag = false;
     else pm = null;
   };
 
+  const settle = (): void => {
+    out.push(...open);
+    open = [];
+    pm = null;
+    atStart = true;
+    wrapped = false;
+    fromInput = false;
+    bare = false;
+  };
+
   for (const t of shellWords(cmd)) {
     if (t === null) {
-      pm = null;
+      settle();
       continue;
     }
 
     const w = t.word;
 
-    if (PACKAGE_MANAGERS.has(w)) {
-      // a manager's name may also be the script's (`npm run --silent npm`) or a flag's value (`npm --prefix npm run x`),
-      // and the regex's reading still takes it as a manager (flagReferences)
-      if (takesName() && Object.hasOwn(scripts, w)) out.push({ name: w, end: pmEnd });
+    // npm reads its flags anywhere in the invocation, the last one winning, and takes abbreviations and a separate `false`
+    if ((bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) for (const r of open) r.alone = false;
+    bare = w === "--ignore-scripts";
 
-      if (pm !== null && afterFlag) {
+    if (pm === null) {
+      if (atStart && PACKAGE_MANAGERS.has(w)) {
+        pm = w;
+        pmEnd = t.end;
+        phase = "manager";
         afterFlag = false;
-        continue;
-      }
+        before = [];
+      } else if (atStart && (/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || WRAPPERS.has(w.slice(w.lastIndexOf("/") + 1)) || (wrapped && w.startsWith("-")))) {
+        wrapped ||= WRAPPERS.has(w.slice(w.lastIndexOf("/") + 1));
+        fromInput ||= w.endsWith("xargs");
+      } else atStart = false;
 
-      pm = w;
-      pmEnd = t.end;
-      phase = "manager";
-      afterFlag = false;
       continue;
     }
-
-    if (pm === null) continue;
 
     if (phase === "named") {
       name(w);
       pm = null;
     } else if (w === "--") {
       afterFlag = false;
+      before.push(w);
 
       if (phase === "run" || pm === "yarn" || pm === "pnpm") phase = "named";
     } else if (w.length > 1 && w.startsWith("-")) {
-      afterFlag = !w.includes("=");
+      afterFlag = !w.includes("=") && !NPM_BOOLEAN_FLAGS.has(w) && !ENABLES.has(w);
+      before.push(w);
     } else if (phase === "manager" && (w === "run" || (pm === "npm" && w === "run-script"))) {
       phase = "run";
       afterFlag = false;
+      before.push(w);
     } else if (takesName() || (pm === "npm" && NPM_LIFECYCLE_COMMANDS.has(w))) {
       name(w);
+      before.push(w);
     } else if (afterFlag) {
       afterFlag = false;
+      before.push(w);
     } else {
       pm = null;
     }
   }
+
+  settle();
 
   return out;
 }
@@ -468,11 +503,15 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
           const body = scripts[n];
           const from = `scripts.${n} (run by scripts.${hook})`;
 
-          if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, depth + 1))) continue;
+          // the third pass follows scripts at the depth that runs them: `followed` ends a cycle and MAX_COMMANDS the walk, so
+          // the depth cap is left to nested shells and decoded text, and a chain main's reading never reached is not cut short
+          const next = pass === 3 ? depth : depth + 1;
+
+          if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, next))) continue;
           followed.add(n);
 
           if (pass === 3) addedScripts.push(n);
-          visit(body, from, depth + 1, false, pass);
+          visit(body, from, next, false, pass);
         }
       }
     };
