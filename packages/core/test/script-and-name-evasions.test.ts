@@ -729,3 +729,18 @@ describe("the shell reading follows only what it can tell npm runs", () => {
     for (const postinstall of ["npm run '-s' check '--prefix' .", "npm run '-s' check -- --prefix tools"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
   });
 });
+
+describe("the shell reading leaves npm's run to the first two readings where npm's config or mode is not the text", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("env -C, npm's config in the environment and --help before or after the name follow nothing", () => {
+    expect(ids({ postinstall: "env -C tools npm '--loglevel' warn run check", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm_config_ignore_scripts=true npm run '--loglevel' warn check", check: "echo", precheck: DROPPER })).not.toContain("install-download");
+
+    for (const postinstall of ["npm run --loglevel warn check '--help'", "npm run '--help' check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
+  });
+
+  test("an assignment npm does not read, and a known option after the name, keep the run", () => {
+    for (const postinstall of ["FOO=1 npm run '-s' check", "npm run '-s' check --loglevel warn"]) expect(ids({ postinstall, check: DROPPER })).toContain("install-download");
+  });
+});

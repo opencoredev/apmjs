@@ -67,7 +67,7 @@ const NPM_BOOLEAN_FLAGS = new Set([
   "--silent", "-s", "--quiet", "-q", "--verbose", "-d", "-dd", "-ddd", "--if-present", "--foreground-scripts", "--workspaces", "-ws",
   "--include-workspace-root", "--color", "--progress", "--unicode", "--timing", "--json", "--parseable", "-p", "--long", "-l",
   "--offline", "--prefer-offline", "--prefer-online", "--dry-run", "--force", "-f", "--global", "-g", "--yes", "-y", "--audit",
-  "--fund", "--update-notifier", "--strict-ssl", "--legacy-peer-deps", "--usage", "-h",
+  "--fund", "--update-notifier", "--strict-ssl", "--legacy-peer-deps",
 ]);
 
 /** Whether npm reads `w` as a boolean flag; `--no-x` sets x to false (ignore-scripts' own are doubts, not flags). */
@@ -94,7 +94,7 @@ const WRAPPERS = new Set(["env", "xargs", "exec", "command", "nohup", "time", "n
 // each wrapper's options that still run the command after them, and those that take the next word as their value; any
 // other option may print help, look the command up (`command -v`) or run something else, so the words after it are not read
 const WRAPPER_OPTIONS = new Map<string, { flags: ReadonlySet<string>; values: ReadonlySet<string> }>([
-  ["env", { flags: new Set(["-i", "--ignore-environment", "-0", "--null", "-"]), values: new Set(["-u", "--unset", "-C", "--chdir"]) }],
+  ["env", { flags: new Set(["-i", "--ignore-environment", "-0", "--null", "-"]), values: new Set(["-u", "--unset"]) }],
   ["xargs", { flags: new Set(["-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-x", "--exit", "-o", "--open-tty"]), values: new Set(["-n", "--max-args", "-P", "--max-procs", "-L", "--max-lines", "-I", "-d", "--delimiter", "-E", "-s", "--max-chars", "-a", "--arg-file"]) }],
   ["exec", { flags: new Set(["-c", "-l"]), values: new Set(["-a"]) }],
   ["command", { flags: new Set(["-p"]), values: new Set() }],
@@ -474,6 +474,13 @@ interface RunState {
   wrapValue: boolean;
 }
 
+/** Whether npm reads an option written with `=` as one it knows that changes neither the package nor how it runs. */
+function npmKnownAssignment(w: string): boolean {
+  const key = w.split("=")[0] ?? w;
+
+  return w.includes("=") && (NPM_VALUE_FLAGS.has(key) || (npmBoolean(key) && /=(?:true|false)$/.test(w)));
+}
+
 /** Whether an npm option runs another package's scripts: `now`, or `next` when its value is the next word. */
 function npmRedirect(w: string): "now" | "next" | null {
   const key = w.split("=")[0] ?? w;
@@ -516,6 +523,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
     s.named ||= Object.hasOwn(scripts, w);
     s.pm = null;
+    s.after = "no";
   };
 
   const drop = (): void => {
@@ -563,17 +571,19 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       const base = w.slice(w.lastIndexOf("/") + 1);
       const options = s.wrapper === null ? undefined : WRAPPER_OPTIONS.get(s.wrapper);
 
-      // npm's options after the name are still its own, and one may run another package's scripts
-      if (s.mgr === "npm" && s.named && !s.passed) {
-        if (s.pendingPrefix) {
+      // npm's options after the name are still its own: one it does not know may print help instead (`--help`) or run
+      // another package's scripts, so only the options of the tables keep the run
+      if (s.mgr === "npm" && s.named && !s.passed && !s.dropped) {
+        if (s.after === "value") {
+          if (w.startsWith("-") || (s.pendingPrefix && !OWN_DIRECTORY.test(w))) drop();
+          s.after = "no";
           s.pendingPrefix = false;
-
-          if (!OWN_DIRECTORY.test(w)) drop();
-        } else {
+        } else if (w.length > 1 && w.startsWith("-") && w !== "--") {
           const r = npmRedirect(w);
 
-          if (r === "now") drop();
-          else s.pendingPrefix = r === "next";
+          if (r === "next") Object.assign(s, { after: "value", pendingPrefix: true });
+          else if (NPM_VALUE_FLAGS.has(w)) s.after = "value";
+          else if (r === "now" || !(ENABLES.has(w) || npmBoolean(w) || npmKnownAssignment(w) || /ig/i.test(w))) drop();
         }
       }
 
@@ -591,7 +601,10 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       } else if (WRAPPERS.has(base)) {
         s.wrapper = base;
         s.fromInput ||= base === "xargs";
-      } else if (!(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w === "--"))) s.atStart = false;
+      } else if (/^npm_config_/i.test(w) || !(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w === "--"))) {
+        // npm reads its config from the environment too (`npm_config_ignore_scripts=true`), which the reading does not
+        s.atStart = false;
+      }
 
       continue;
     }
@@ -620,7 +633,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
       if (r === "now") drop();
       else if (r === "next") Object.assign(s, { after: "value", pendingPrefix: true });
-      else if (w.includes("=") || ENABLES.has(w)) s.after = "no";
+      else if (ENABLES.has(w) || (s.pm === "npm" ? npmKnownAssignment(w) : w.includes("="))) s.after = "no";
       else if (npmBoolean(w)) s.after = s.pm === "npm" ? "bool" : "no";
       else if (s.pm === "npm" && NPM_VALUE_FLAGS.has(w)) s.after = "value";
       // an option the tables do not list may take the next word as its value
