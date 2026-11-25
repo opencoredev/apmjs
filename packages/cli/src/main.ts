@@ -88,10 +88,11 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
   if (bad.length === 0 && opts.refusal === undefined) say(`  ${green("✓")} no risk signals found`);
   for (const s of bad) {
     const pts = String(s.points).padStart(4);
-    say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${s.id}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(s.label)}`);
-    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(e)}`);
+    // a signal's id, label and evidence are registry text: one line each, no terminal controls
+    say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${oneLine(s.id)}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(oneLine(s.label))}`);
+    for (const e of s.evidence.slice(0, opts.maxEvidence ?? 2)) say(`        ${dim(oneLine(e))}`);
   }
-  for (const s of info) say(`  ${dim(`   · ${s.id}  ${s.label}${s.evidence[0] ? ` (${s.evidence[0]})` : ""}`)}`);
+  for (const s of info) say(`  ${dim(`   · ${oneLine(s.id)}  ${oneLine(s.label)}${s.evidence[0] ? ` (${oneLine(s.evidence[0])})` : ""}`)}`);
   printCapabilities(report.capabilities);
 }
 
