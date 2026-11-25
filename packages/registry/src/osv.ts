@@ -28,7 +28,8 @@ import { WEIGHTS } from "./packument-read.ts";
 export type PackageVersion = { readonly name: string; readonly version: string };
 
 /** A version the feed lists, with its MAL- advisory ids. */
-export type ListedMalicious = { name: string; version: string; ids: string[] };
+/** `unchecked`: those of `ids` that name it only as a hold (every version: not read, or not held), never as OSV wrote. */
+export type ListedMalicious = { name: string; version: string; ids: string[]; unchecked?: string[] };
 
 /** One range of an advisory's affected versions, as OSV writes its events (SEMVER and ECOSYSTEM ranges). */
 const RangeEvents = z.array(z.object({ introduced: z.string().optional(), fixed: z.string().optional(), last_affected: z.string().optional(), limit: z.string().optional() }));
@@ -204,6 +205,19 @@ export const isHold = (id: string): boolean => id === HELD || id === UNREAD_COPY
 /** The block of each kept name's observations under names(); a request that answers from it holds it too (answerOf). */
 const BLOCKS = new Map<string, Block>();
 
+/** What BLOCKS weigh together: what shedding every name could give names() back. */
+let blocksWeight = 0;
+
+/** Lets go of the block of the name under `key`, if it has one. */
+function dropBlock(key: string): void {
+  const block = BLOCKS.get(key);
+
+  if (block === undefined) return;
+  names().drop(block);
+  blocksWeight -= block.weight;
+  BLOCKS.delete(key);
+}
+
 /** The names a request is asking OSV about now, and how many: none of them is forgotten for MAX_NAMES (keep). */
 const ASKING = new Map<string, number>();
 
@@ -238,11 +252,9 @@ function shed(key: string): number {
   const block = BLOCKS.get(key);
 
   if (block === undefined) return 0;
-  const lease = names();
-  const freed = lease.soleHolder(block) ? block.weight : 0;
+  const freed = names().soleHolder(block) ? block.weight : 0;
 
-  lease.drop(block);
-  BLOCKS.delete(key);
+  dropBlock(key);
   const state = NAMES.get(key);
 
   if (state !== undefined) holdWhole(state);
@@ -252,10 +264,7 @@ function shed(key: string): number {
 
 /** Lets go of the name under `key` and what it holds. */
 function forget(key: string): void {
-  const block = BLOCKS.get(key);
-
-  if (block !== undefined) names().drop(block);
-  BLOCKS.delete(key);
+  dropBlock(key);
   NAMES.delete(key);
 }
 
@@ -266,10 +275,8 @@ function forget(key: string): void {
  */
 function keep(key: string, state: NameState): void {
   const lease = names();
-  const old = BLOCKS.get(key);
 
-  if (old !== undefined) lease.drop(old);
-  BLOCKS.delete(key);
+  dropBlock(key);
   NAMES.delete(key);
   NAMES.set(key, state);
 
@@ -282,6 +289,14 @@ function keep(key: string, state: NameState): void {
   const weight = [...state.ids].reduce((n, [id, o]) => n + OBSERVATION_WEIGHT + (id.length + (o.advisory === null ? 0 : JSON.stringify(o.advisory).length)) * PARSE_WEIGHT, 0);
 
   if (weight === 0) return;
+
+  // more than shedding every other name could make room for: only this one is held (Sol on 18281c9)
+  if (weight > lease.limit - (lease.taken - blocksWeight)) {
+    holdWhole(state);
+
+    return;
+  }
+
   let taken = lease.take(weight);
 
   for (const oldest of BLOCKS.keys()) {
@@ -290,8 +305,14 @@ function keep(key: string, state: NameState): void {
     taken = lease.take(weight);
   }
 
-  if (taken) BLOCKS.set(key, lease.seal(weight));
-  else holdWhole(state);
+  if (!taken) {
+    holdWhole(state);
+
+    return;
+  }
+
+  BLOCKS.set(key, lease.seal(weight));
+  blocksWeight += weight;
 }
 
 /** The order of this isolate's asks of OSV about names; a copy from the data center's cache is 0. */
@@ -521,8 +542,11 @@ const parsedWith =
  */
 const advisoryRead =
   (name: string, lease: Lease | null) =>
-  async (res: Response): Promise<Advisory[]> => {
-    const bytes = await readCapped(res, MAX_ADVISORY_BYTES);
+  async (res: Response, signal: AbortSignal): Promise<Advisory[]> => {
+    const bytes = await readCapped(res, MAX_ADVISORY_BYTES, signal);
+
+    // stopped (the request's OSV budget, or the lookup interrupted): a failed read, not one over the cap
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("the advisory read was stopped");
 
     if (bytes === null) throw new OverCap(`OSV answered more than ${MAX_ADVISORY_BYTES} bytes`);
     const parsing = bytes.length * PARSE_WEIGHT;
@@ -594,9 +618,11 @@ export function listedAmong(name: string, advisories: readonly Advisory[], versi
   if (advisories.length === 0) return out;
 
   for (const version of versions) {
-    const ids = advisories.flatMap((a) => (affects(a, version) ? [a.id] : []));
+    const naming = advisories.filter((a) => affects(a, version));
+    const ids = naming.map((a) => a.id);
+    const unchecked = naming.flatMap((a) => (a.every === true || isHold(a.id) ? [a.id] : []));
 
-    if (ids.length > 0) out.set(version, { name, version, ids });
+    if (ids.length > 0) out.set(version, unchecked.length > 0 ? { name, version, ids, unchecked } : { name, version, ids });
   }
 
   return out;
@@ -618,31 +644,39 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
      * Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget, its answer read by
      * `take` (parsedWith, advisoryRead).
      */
-    const post = <T>(path: string, body: OsvBatchQuery | OsvPageQuery | null, take: (res: Response) => Promise<T>) =>
+    const post = <T>(path: string, body: OsvBatchQuery | OsvPageQuery | null, take: (res: Response, signal: AbortSignal) => Promise<T>, settled: () => void = () => undefined) =>
       Effect.tryPromise({
-        try: async (): Promise<T> => {
-          const left = REQUEST_BUDGET_MS - spent();
-
-          if (left <= 0) throw new Error("the request's OSV budget is spent");
-
-          if (inFlight++ === 0) busySince = Date.now();
-
+        // `interrupted` aborts when the effect is interrupted: the fetch and its read stop then, and `settled` runs only
+        // once they have (Sol on 18281c9: the read's room was given back while its stream was still open)
+        try: async (interrupted): Promise<T> => {
           try {
-            const init: RequestInit =
-              body === null
-                ? { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(left) }
-                : { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) };
+            const left = REQUEST_BUDGET_MS - spent();
 
-            const res = await fetcher(`${baseUrl}${path}`, init);
+            if (left <= 0) throw new Error("the request's OSV budget is spent");
 
-            if (res.status !== 200) {
-              await res.body?.cancel();
-              throw new Error(`OSV answered ${res.status}`);
+            if (inFlight++ === 0) busySince = Date.now();
+
+            try {
+              const signal = AbortSignal.any([interrupted, AbortSignal.timeout(left)]);
+
+              const init: RequestInit =
+                body === null
+                  ? { method: "GET", headers: { accept: "application/json" }, signal }
+                  : { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal };
+
+              const res = await fetcher(`${baseUrl}${path}`, init);
+
+              if (res.status !== 200) {
+                await res.body?.cancel();
+                throw new Error(`OSV answered ${res.status}`);
+              }
+
+              return await take(res, signal);
+            } finally {
+              if (--inFlight === 0) spentMs += Date.now() - busySince;
             }
-
-            return await take(res);
           } finally {
-            if (--inFlight === 0) spentMs += Date.now() - busySince;
+            settled();
           }
         },
         catch: (cause) => cause,
@@ -706,13 +740,21 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         let token: string | undefined;
         let complete = true;
 
-        /** One advisory's read: room for its bytes is taken from `lease` before it starts, and given back once it is read. */
+        /** One advisory's read: room for its bytes is taken from `lease` before it starts, and given back once its read has ended. */
         const readOne = (id: string) =>
           Effect.gen(function* () {
             const room = MAX_ADVISORY_BYTES * READ_WEIGHT;
 
             if (lease !== null && !lease.take(room)) return { kind: "withheld" } as const;
-            const got = yield* Effect.result(post(`v1/vulns/${encodeURIComponent(id)}`, null, advisoryRead(name, lease))).pipe(Effect.ensuring(Effect.sync(() => lease?.give(room))));
+            // the room, and the request's lease, are held until the read itself has ended, interrupted or not
+            const letGo = lease?.retain() ?? (() => undefined);
+
+            const got = yield* Effect.result(
+              post(`v1/vulns/${encodeURIComponent(id)}`, null, advisoryRead(name, lease), () => {
+                lease?.give(room);
+                letGo();
+              }),
+            );
 
             if (Result.isSuccess(got)) return { kind: "read", advisories: got.success } as const;
 
@@ -954,7 +996,7 @@ export const listedVersionsOf = (name: string, versions: readonly string[]) =>
  * be checked against the feed, never that the feed lists it (Sol on dd47451).
  */
 export function maliciousText(m: ListedMalicious): string {
-  const listed = m.ids.filter((id) => !isHold(id));
+  const listed = m.ids.filter((id) => !isHold(id) && m.unchecked?.includes(id) !== true);
 
   return listed.length > 0
     ? `known malicious: the OSSF malicious-packages feed lists ${m.name}@${m.version} (${listed.join(", ")})`
@@ -963,7 +1005,7 @@ export function maliciousText(m: ListedMalicious): string {
 
 /** What the tarball routes answer for a listed version: 403, citing its advisories, and the first one's page at OSV. */
 export function listedTarballText(m: ListedMalicious): string {
-  const first = m.ids.find((id) => !isHold(id));
+  const first = m.ids.find((id) => !isHold(id) && m.unchecked?.includes(id) !== true);
 
   return first === undefined ? `${maliciousText(m)}, so apm does not serve it. Try again shortly.` : `${maliciousText(m)}, so apm does not serve it. See https://osv.dev/vulnerability/${first}`;
 }
@@ -980,7 +1022,7 @@ const NOTICE_MAX = 400;
 export function listedNotice(name: string, advisories: readonly Advisory[]): string | null {
   if (advisories.length === 0) return null;
   const range = (events: Advisory["ranges"][number]) => events.map((e) => (e.introduced !== undefined ? `>=${e.introduced}` : e.fixed !== undefined ? `<${e.fixed}` : `<=${e.last_affected ?? ""}`)).join(" ");
-  const listed = advisories.filter((a) => !isHold(a.id));
+  const listed = advisories.filter((a) => !isHold(a.id) && a.every !== true);
   const each = listed.map((a) => `${a.id}: ${[...a.versions, ...a.ranges.map(range)].join(", ")}`).join("; ");
   const parts = [...(listed.length > 0 ? [`versions the OSSF malicious-packages feed lists as malicious (${each})`] : []), ...(listed.length < advisories.length ? ["every version for now, as it could not check them against the OSSF malicious-packages feed"] : [])];
   const text = `apm withholds ${name} ${parts.join(", and ")}`.replace(/[^\x20-\x7e]/g, "?");

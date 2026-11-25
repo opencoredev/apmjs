@@ -6,7 +6,7 @@
 // charge for them; copies waiting to be written queued without bound. OSV is a stand-in fetcher, the data center's cache
 // a stand-in on globalThis.caches; no network and no database.
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { Effect, Layer } from "effect";
+import { Effect, Fiber, Layer } from "effect";
 import { z } from "zod";
 import { ISOLATE_POOL, type Lease, RequestMemory } from "../src/memory.ts";
 import { KnownMalicious, listedAmong, listedNotice, listedTarballText, maliciousText, NAME_FRESH_MS, osvFeed, type Advisory } from "../src/osv.ts";
@@ -16,12 +16,12 @@ const VERSIONS = ["1.0.0", "2.0.0"];
 
 /**
  * OSV for one name: each query answers the ids its `answers` entry gives (shifted, the last kept), each advisory naming
- * 1.0.0; with `down`, every call is a 503.
+ * `versions` (1.0.0); with `down`, every call is a 503; with `stalled`, an advisory's body never ends.
  */
 function osv(name: string) {
   const answers: (() => Promise<string[]>)[] = [];
   const ids: string[] = [];
-  const stand = { down: false, answers, ids, queries: 0 };
+  const stand = { down: false, answers, ids, queries: 0, versions: ["1.0.0"], stalled: false, cancels: 0 };
 
   // SAFETY: osvFeed calls its fetcher only with a URL string and RequestInit, the call shape this stand-in reads
   const fetcher = (async (input: string | URL): Promise<Response> => {
@@ -31,7 +31,17 @@ function osv(name: string) {
     if (read?.[1] !== undefined) {
       const id = decodeURIComponent(read[1]);
 
-      return Response.json({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: ["1.0.0"] }] });
+      if (!stand.stalled) return Response.json({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: stand.versions }] });
+
+      // a detail whose body starts and never ends
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start: (c) => c.enqueue(new TextEncoder().encode('{"id":')),
+          cancel: () => {
+            stand.cancels++;
+          },
+        }),
+      );
     }
 
     stand.queries++;
@@ -43,10 +53,10 @@ function osv(name: string) {
 
   const root = `https://osv.test/${crypto.randomUUID()}/`;
 
-  const ask = (lease?: Lease): Promise<readonly Advisory[]> =>
-    Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor(name)).pipe(Effect.provide(Layer.merge(osvFeed(root, fetcher), lease === undefined ? Layer.empty : Layer.succeed(RequestMemory, lease)))));
+  const lookup = (lease?: Lease) => Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor(name)).pipe(Effect.provide(Layer.merge(osvFeed(root, fetcher), lease === undefined ? Layer.empty : Layer.succeed(RequestMemory, lease))));
+  const ask = (lease?: Lease): Promise<readonly Advisory[]> => Effect.runPromise(lookup(lease));
 
-  return { stand, ask, copyUrl: `https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} ${name}`)}` };
+  return { stand, ask, lookup, copyUrl: `https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} ${name}`)}` };
 }
 
 /** The data center's cache, standing in: `copy` answers a read of a URL, after `matchMs`; `put` takes a write. */
@@ -277,5 +287,63 @@ describe("OSV advisories under memory budgets", () => {
     expect(listedNotice("held-pkg", [{ id: "APM-OSV-COPY-UNREAD", versions: [], ranges: [[{ introduced: "0" }]], every: true }])).toContain("could not check");
     // a real advisory beside it is still cited
     expect(maliciousText({ ...held, ids: [X, "APM-OSV-HELD"] })).toBe(`known malicious: the OSSF malicious-packages feed lists held-pkg@1.0.0 (${X})`);
+  });
+
+  // Sol on 18281c9: interrupting the lookup gave an advisory read's room back while its stream stayed open
+  test("an advisory read stopped by its lookup's interruption is cancelled, and keeps its room until it has ended", async () => {
+    const o = osv("interrupted-read");
+
+    o.stand.ids = [X];
+    o.stand.stalled = true;
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      const fiber = Effect.runFork(o.lookup(lease));
+
+      await Bun.sleep(50);
+      await Effect.runPromise(Fiber.interrupt(fiber));
+      await Bun.sleep(10);
+      // on 18281c9: 0, the stream left open after the room was given back
+      expect(o.stand.cancels).toBe(1);
+      expect(lease.taken).toBe(0);
+    } finally {
+      lease.release();
+    }
+  });
+
+  // Sol on 18281c9: a name that could never fit shed every other name first
+  test("a name whose observations could never fit is held alone: other names keep what they name", async () => {
+    const kept = osv("kept-small");
+
+    kept.stand.ids = [X];
+    expect(listed("kept-small", await kept.ask())).toEqual(["1.0.0"]);
+    const huge = osv("never-fits");
+
+    huge.stand.ids = [X];
+    // about 150 kB of versions: past the names' 2 MiB once weighed as parsed
+    huge.stand.versions = Array.from({ length: 12_000 }, (_, i) => `1.0.${i}`);
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      expect(listed("never-fits", await huge.ask(lease))).toEqual(VERSIONS);
+    } finally {
+      lease.release();
+    }
+
+    // past NAME_FRESH_MS with OSV down: what was kept of the other name answers
+    setSystemTime(Date.now() + NAME_FRESH_MS + 1_000);
+    kept.stand.down = true;
+    // on 18281c9: both, the other name shed and held whole
+    expect(listed("kept-small", await kept.ask())).toEqual(["1.0.0"]);
+  });
+
+  // Sol on 18281c9: an advisory withheld unread was cited as the feed listing the version
+  test("a version only an advisory withheld unread names is said not to be checked", () => {
+    const m = listedAmong("unread-advisory", [{ id: X, versions: [], ranges: [[{ introduced: "0" }]], every: true }], ["1.0.0"]).get("1.0.0");
+
+    expect(m?.ids).toEqual([X]);
+    // on 18281c9: "known malicious: the OSSF malicious-packages feed lists ..."
+    expect(m === undefined ? "" : maliciousText(m)).toStartWith("not checked:");
+    expect(m === undefined ? "" : listedTarballText(m)).not.toContain("osv.dev");
   });
 });
