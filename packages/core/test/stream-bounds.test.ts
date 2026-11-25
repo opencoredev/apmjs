@@ -67,7 +67,10 @@ describe("TarStream refuses a body cut short whatever the entry's type, as readT
         readTar(bytes);
       });
 
-      expect(whole).toBe('invalid: entry "package/link" runs past the end of the archive');
+      // a directory with a payload is refused for having one before its end is looked for, by both readers alike
+      const refusal = type === "5" ? "a directory with a 10-byte body at byte 0, which npm and Bun read as more entries" : 'entry "package/link" runs past the end of the archive';
+
+      expect(whole).toBe(`invalid: ${refusal}`);
       // on ee221e2 the stream accepted it: "ok", no files
       expect(streamed(bytes)).toBe(whole);
     });

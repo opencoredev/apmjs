@@ -167,6 +167,47 @@ describe("tar headers are read as npm and Bun install them", () => {
     });
   }
 
+  // npm and Bun read a directory as having no body whatever its size field says, so a header in its "body" is the next
+  // entry: each of these installs evil.js with both. A PAX header with records after a NUL installs evil.js with npm,
+  // which reads on past the NUL line, and a.js with Bun
+  const hidden = new Uint8Array(entry("package/evil.js", EVIL).flatMap((part) => [...part]));
+  const afterNul = new Uint8Array([...enc.encode(paxRecord("path=package/readme.md")), 0, 0x0a, ...enc.encode(paxRecord("path=package/evil.js"))]);
+  const a = entry("package/a.js", "ok");
+
+  const hiding: [string, Uint8Array[][]][] = [
+    ["a directory with a body", [PJ, rawEntry("package/lib/", hidden, "5"), a]],
+    ["a directory with a body and no trailing slash", [PJ, rawEntry("package/lib", hidden, "5"), a]],
+    ["a file entry whose name ends in a slash, with a body", [PJ, rawEntry("package/lib/", hidden, "0"), a]],
+    ["an old-style file entry whose name ends in a slash, with a body", [PJ, rawEntry("package/lib/", hidden, "\0"), a]],
+    ["a file entry whose PAX path ends in a slash, with a body", [PJ, entry("PaxHeader/a", paxRecord("path=package/lib/"), { type: "x" }), rawEntry("package/lib", hidden, "0"), a]],
+    ["a file entry whose GNU long name ends in a slash, with a body", [PJ, entry("././@LongLink", "package/lib/\0", { type: "L" }), rawEntry("package/lib", hidden, "0"), a]],
+    ["a PAX header with a record after a NUL", [PJ, rawEntry("PaxHeader/a", afterNul, "x"), entry("package/a.js", EVIL)]],
+    ["a global PAX header with a record after a NUL", [PJ, rawEntry("pax_global_header", afterNul, "g"), entry("package/a.js", EVIL)]],
+  ];
+
+  for (const [name, parts] of hiding) {
+    test(`${name} is refused`, () => {
+      const bytes = tar(parts);
+
+      expect(() => readTar(bytes)).toThrow(ArchiveError);
+      expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
+
+  test("an empty directory, as npm packs one, is read with the files after it", () => {
+    const bytes = tar([PJ, rawEntry("package/lib/", new Uint8Array(0), "5"), entry("package/lib/a.js", "ok")]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "lib/a.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "lib/a.js"]);
+  });
+
+  test("a PAX header padded with NULs after its last record is read", () => {
+    const bytes = tar([PJ, rawEntry("PaxHeader/a", new Uint8Array([...enc.encode(paxRecord("path=package/evil.js")), 0, 0, 0]), "x"), entry("package/a.js", EVIL)]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "evil.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "evil.js"]);
+  });
+
   test("a GNU long name of exactly 1 MiB names the next file, as npm reads it", () => {
     const name = "package/evil.js\0";
     const bytes = tar([PJ, entry("././@LongLink", name + junk(MAX_META_ENTRY_BYTES - name.length), { type: "L" }), entry("package/harmless.txt", EVIL)]);

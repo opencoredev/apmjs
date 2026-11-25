@@ -178,6 +178,16 @@ function refuseUnsharedMeta(type: string, size: number, at: number): void {
   if ((type === "L" || type === "K") && size === 0) throw invalid(`an empty GNU long name at byte ${at}, which npm passes over`);
 }
 
+/**
+ * Refuses a directory with a body. npm and Bun read a directory as having no data whatever its size field says, a type
+ * "0" or "\0" entry whose path (a pending long name or PAX path, or its own) ends in "/" included, and read the blocks
+ * after it as the next headers, so a file put there installs where reading them as the directory's data would never list
+ * it. npm writes every directory with a size of 0. `path` is the path the entry takes, before it is normalized.
+ */
+function refuseDirectoryBody(type: string, size: number, path: string, at: number): void {
+  if (size > 0 && (type === "5" || ((type === "0" || type === "\0") && path.endsWith("/")))) throw invalid(`a directory with a ${size}-byte body at byte ${at}, which npm and Bun read as more entries`);
+}
+
 /** Parses an uncompressed tar. Strips the leading "package/" (or any single top dir) from paths. */
 export function readTar(tar: Uint8Array, meter?: Meter): TarEntry[] {
   return metered(meter, () => readTarMetered(tar));
@@ -221,6 +231,7 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
     refuseUnsharedMeta(type, size, off);
+    refuseDirectoryBody(type, size, nextPath ?? headerPath(header), off);
     const dataStart = off + 512;
 
     if (dataStart + size > tar.length) throw invalid(`entry "${name}" runs past the end of the archive`);
@@ -318,8 +329,13 @@ function paxPathOf(data: Uint8Array, at: number): string | null {
   let pos = 0;
 
   while (pos < data.length) {
-    // a trailing NUL pad after the last record is allowed
-    if (data[pos] === 0) break;
+    // a trailing NUL pad after the last record is allowed, but nothing after it: npm reads on past a NUL line to the records
+    // after it, where Bun installs the file under its own header name, so a record hidden behind one names it for npm alone
+    if (data[pos] === 0) {
+      if (data.subarray(pos).some((b) => b !== 0)) throw invalid(`a pax record after a NUL at byte ${at}`);
+      break;
+    }
+
     let len = 0;
     let digits = 0;
 
@@ -622,6 +638,7 @@ export class TarStream {
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
     refuseUnsharedMeta(type, size, off);
+    refuseDirectoryBody(type, size, this.nextPath ?? headerPath(header), off);
     const blocks = Math.ceil(size / 512) * 512;
     const pad = blocks - size;
     // readTar's offset once it has moved past this entry, which a PAX error names
