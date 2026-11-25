@@ -25,6 +25,7 @@ const bindings = new Map([
   ["APM_REGISTRY_URL", url],
   ["APM_PUBLIC_URL", process.env.APM_PUBLIC_URL ?? url],
   ["APM_UPSTREAM", process.env.APM_UPSTREAM ?? "https://registry.npmjs.org/"],
+  ["APM_OSV_URL", process.env.APM_OSV_URL ?? "https://api.osv.dev/"],
   ["APM_LEGACY_AUTH", process.env.APM_LEGACY_AUTH ?? "0"],
   ["APM_NAME_POLICY", process.env.APM_NAME_POLICY ?? "scoped"],
   ["APM_AUTH_SECRET", process.env.APM_AUTH_SECRET ?? randomBytes(32).toString("base64url")],
