@@ -84,7 +84,7 @@ export function packageMetadata(p: PackageMeta & { v?: string }): Metadata {
   return {
     ...pageMetadata({
       title,
-      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and how to install it.`,
+      description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and whether apm installs it.`,
       path: canonicalPackagePath(p.name),
       image: `/og${canonicalPackagePath(p.name).slice("/package".length)}${query}`,
       imageAlt: `${p.name} on apm: ${scoreText}`,

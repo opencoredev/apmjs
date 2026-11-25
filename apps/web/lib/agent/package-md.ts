@@ -7,7 +7,7 @@ import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
 import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
-import { advisoryUrl, noInstallableReason, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "../refusal";
+import { advisoryUrl, dependencyWhy, noInstallableReason, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "../refusal";
 import { basisNote, capabilityParts, scorerCapabilities, statusMark } from "../capabilities";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
@@ -185,6 +185,12 @@ export function refusalOf(view: Pick<PackageView, "status" | "policy">): Refusal
 function refusalText(r: Refusal): string {
   if (r.kind === "known-malicious") return `The OSSF malicious-packages feed lists it as malicious (${r.ids.map((id) => inlineCode(id)).join(", ")}), so apm add refuses it. Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}`;
 
+  if (r.kind === "dependency") {
+    const links = r.deps.flatMap((d) => d.ids ?? []).map((id) => linkUrl(advisoryUrl(id)));
+
+    return `It depends on ${r.deps.map((d) => `${inlineCode(`${d.name}@${d.version}`)}, which ${dependencyWhy(d)}`).join("; and on ")}, so apm add refuses it.${links.length > 0 ? ` Advisory: ${links.join(", ")}` : ""}`;
+  }
+
   return r.kind === "policy" ? `apm's install policy refuses it: ${inlineCode(r.reason)}` : refusalReason(r);
 }
 
@@ -202,9 +208,10 @@ function capabilityLines(score: ScoreReport | null): string[] | null {
 
       return listed.capabilities.map((c) => {
         const { name, detail } = capabilityParts(c.label);
-        const notes = [basisNote(c)?.toLowerCase() ?? "seen", statusMark(c)?.text.toLowerCase()].filter(Boolean).join("; ");
+        // "seen" only for code apm read; a declared capability the scorer found no use of (basis none) reads as the page does
+        const notes = [c.basis === "code" ? "seen" : basisNote(c)?.toLowerCase(), statusMark(c)?.text.toLowerCase()].filter(Boolean).join("; ");
 
-        return `- ${oneLine(name)}${detail ? ` (${oneLine(detail)})` : ""}: ${notes}`;
+        return `- ${oneLine(name)}${detail ? ` (${oneLine(detail)})` : ""}: ${notes || "not seen"}`;
       });
     case "unavailable":
       return ["- Capabilities: not available from this registry."];
@@ -356,10 +363,8 @@ export function packageMarkdown(input: PackageView): string {
   out.push("## Install", "");
 
   if (refusal !== null) {
-    const bareGets = view.policy.kind === "refused" ? view.policy.bareGets : null;
-    const instead = bareGets === null ? "" : ` A bare install gets ${versionText(bareGets)} instead.`;
 
-    out.push(`No install command: apm refuses this version.${instead}`, "");
+    out.push("No install command: apm refuses this version.", "");
   } else {
     out.push(codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, install: named })).join("\n"), "sh"), "");
 

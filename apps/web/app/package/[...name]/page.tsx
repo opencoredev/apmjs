@@ -26,7 +26,7 @@ import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { versionCountLabel } from "@/lib/version-count";
-import { chooseVersion, rowsWith, selectVersion, sharedDefault, sharedShown } from "@/lib/shown-version";
+import { chooseVersion, rowsWith, selectVersion, sharedShown } from "@/lib/shown-version";
 import { buttonVariants } from "@/components/ui/button";
 import { REGISTRY } from "@/lib/registry-url";
 import { inCooldown } from "@/lib/install-note";
@@ -719,13 +719,27 @@ function AdvisoryLinks({ ids }: { ids: readonly string[] }) {
 /**
  * The install box, once apm's install policy has answered for the shown version (lib/refusal.ts readPolicy): the
  * commands, or, for a version apm refuses, why, the advisory and no command or agent prompt. A policy that did not
- * answer keeps the commands: resolve being down is no reason to say a version is refused.
+ * answer keeps the commands under a note that they are unchecked: resolve being down is no reason to say a version is
+ * refused, nor to say it installs.
  */
-async function InstallSlot({ name, version, install, inCooldown, policy }: { name: string; version: string; install: InstallSpec; inCooldown: boolean; policy: Promise<PolicyRead> }) {
-  const p = await policy;
+async function InstallSlot(props: { name: string; version: string; install: InstallSpec; inCooldown: boolean; statusReason: string | null; policy: Promise<PolicyRead> }) {
+  const { name, version, statusReason } = props;
+  const p = await props.policy;
 
-  if (p.kind !== "refused") return <InstallTabs name={name} version={version} install={install} inCooldown={inCooldown} registry={REGISTRY} />;
-  const { refusal, bareGets } = p;
+  if (p.kind === "installs") return <InstallTabs name={name} version={version} install={props.install} inCooldown={props.inCooldown} registry={REGISTRY} />;
+
+  if (p.kind === "unknown") {
+    return (
+      <div className="flex flex-col gap-3">
+        <p role="status" className="max-w-2xl rounded-xl bg-warn-soft px-4 py-3 text-[15px] leading-6 text-pretty">
+          <span className="font-medium text-warn">apm may not serve this version.</span> Its install policy did not answer for {version}, so these commands are unchecked. Check {version} before installing it.
+        </p>
+        <InstallTabs name={name} version={version} install={props.install} inCooldown={props.inCooldown} registry={REGISTRY} />
+      </div>
+    );
+  }
+
+  const { refusal } = p;
 
   return (
     <section aria-labelledby="install" className="flex flex-col gap-3">
@@ -739,14 +753,12 @@ async function InstallSlot({ name, version, install, inCooldown, policy }: { nam
         <p>
           <RefusalText refusal={refusal} />
         </p>
-        <p>
-          No install command: apm refuses this version.{" "}
-          {bareGets && (
-            <Link href={`${packagePath(name)}?v=${encodeURIComponent(bareGets)}`} className="font-medium underline underline-offset-4">
-              A bare install gets {bareGets} instead
-            </Link>
-          )}
-        </p>
+        {statusReason && (
+          <p>
+            Reason given: <span className="break-words">{statusReason}</span>
+          </p>
+        )}
+        <p>No install command: apm refuses this version.</p>
       </div>
     </section>
   );
@@ -759,6 +771,28 @@ function RefusalText({ refusal }: { refusal: Refusal }) {
       <>
         The OSSF malicious-packages feed lists it as malicious (<AdvisoryLinks ids={refusal.ids} />
         ), so apm add refuses it.
+      </>
+    );
+  }
+
+  if (refusal.kind === "dependency") {
+    return (
+      <>
+        It depends on{" "}
+        {refusal.deps.map((d, i) => (
+          <span key={`${d.name}@${d.version}`}>
+            {i > 0 && "; and on "}
+            <span className="font-mono text-[14px]">
+              {d.name}@{d.version}
+            </span>
+            , which {d.ids === null ? "apm reviewers confirmed is malicious" : (
+              <>
+                the OSSF malicious-packages feed lists as malicious (<AdvisoryLinks ids={d.ids} />)
+              </>
+            )}
+          </span>
+        ))}
+        , so apm add refuses it.
       </>
     );
   }
@@ -897,7 +931,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // a version the package answer does not list carries its state in its own answer
   const status = shownRow?.status ?? details?.status ?? "active";
   // apm's install policy for exactly this version, the read /api/explain makes; only the install box waits for it
-  const policy = readPolicy({ name: pkg.name, version, status, isDefault: isLatest, resolve: registrySource.resolve });
+  const policy = readPolicy({ name: pkg.name, version, status, resolve: registrySource.resolve });
 
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball, unless that
   // tarball is too large for the registry to open (next's), which it could only refuse
@@ -929,7 +963,8 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const homepage = links.find((l) => l.kind === "homepage")?.href ?? null;
 
   // the canonical page's data: the version installs get by name, with its own score
-  const share = asked === undefined ? sharedShown({ pkg, version, read: details }) : sharedDefault(pkg);
+  // the release this page shows, with its own score: an explicit ?v= page never describes another release
+  const share = sharedShown({ pkg, version, read: details });
   const listed = score ? scorerCapabilities(score) : null;
 
   const structured = packageJsonLd({
@@ -997,7 +1032,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
         <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
           <div className="order-1 lg:order-none">
             <Suspense fallback={<Skeleton className="h-28 w-full rounded-xl" />}>
-              <InstallSlot name={pkg.name} version={version} install={install} inCooldown={fresh} policy={policy} />
+              <InstallSlot name={pkg.name} version={version} install={install} inCooldown={fresh} statusReason={shownRow?.statusReason ?? details?.statusReason ?? null} policy={policy} />
             </Suspense>
           </div>
 

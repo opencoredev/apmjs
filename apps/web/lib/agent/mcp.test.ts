@@ -219,8 +219,7 @@ describe("structured answers agree with the text", () => {
     expect(r.text).toContain("- Status: do not install.");
     expect(r.structured.refusal).toEqual(refused);
     expect(r.structured.installPolicy).toBe("refused");
-    // not the default, so what a bare install gets is not read
-    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused, installsInstead: null });
+    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused });
     expect(r.text).toContain("- Network (makes requests or opens sockets): seen");
     expect(r.structured.scorerCapabilities).toMatchObject({ kind: "listed", capabilities: [{ id: "network", basis: "code" }] });
     expect(r.structured.capabilities).toContainEqual({ id: "network", label: "Network access", state: "seen" });

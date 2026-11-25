@@ -51,7 +51,7 @@ export async function loadPackageView(input: { name: string; version: string | n
   const { version, install } = selected;
   const isLatest = version === pkg.latest;
   const status = selected.read?.status ?? pkg.versions.find((r) => r.version === version)?.status ?? "active";
-  const policy = readPolicy({ name, version, status, isDefault: isLatest, resolve: source.resolve });
+  const policy = readPolicy({ name, version, status, resolve: source.resolve });
   // the page's score for a version other than latest comes from the score route, with its capabilities: so does this one
   const routeScore = isLatest ? null : source.score({ name, version });
   const read = () => Promise.all([source.version({ name, version }), source.review({ name, version })]);

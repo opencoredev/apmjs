@@ -6,7 +6,7 @@ import { loadPackageView } from "./package-view";
 import { fakeSource, INSTALL, INSTALLS, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED } from "./testing";
 import { codeBlock, inlineCode, oneLine } from "./text";
 import type { PackageInfo } from "../registry";
-import type { ResolveOutcome } from "./source";
+import { parseResolve, type ResolveOutcome } from "./source";
 
 type Row = PackageInfo["versions"][number];
 
@@ -314,12 +314,39 @@ describe("what the Markdown view says apm will not install, and how", () => {
     expect(calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
   });
 
-  test("a refused default says what a bare install gets, from one more resolve for latest", async () => {
+  test("a refused default makes the one resolve and nothing more", async () => {
     const { md, calls } = await load(ugent("10.9.11"), null, (_, range) => (range === "10.9.11" ? UGENT_REFUSED : resolvedTo("9.0.0")));
 
     expect(md).toContain("- Status: do not install.");
-    expect(md).toContain("No install command: apm refuses this version. A bare install gets 9.0.0 instead.");
-    expect(calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11", "resolve ugent_uws@latest"]);
+    expect(md).toContain("No install command: apm refuses this version.\n");
+    expect(md).not.toContain("bare install");
+    expect(calls.filter((c) => c.startsWith("resolve"))).toEqual(["resolve ugent_uws@10.9.11"]);
+  });
+
+  // the registry's 422s (packages/registry/src/apm.ts rootAnswer and the no-match answer), read by the real parser
+  const BAD_TREE_LISTED = parseResolve(422, { error: "left-pad@1.3.0 would install evil@2.0.0 (MAL-2026-1), which the OSSF malicious-packages feed lists as malicious.", name: "left-pad", range: "1.3.0", version: null, skipped: [], newest: { version: "1.3.0", report: null }, knownMalicious: [{ name: "evil", version: "2.0.0", ids: ["MAL-2026-1"] }] });
+  const BAD_TREE_CONFIRMED = parseResolve(422, { error: "left-pad@1.3.0 would install bad@0.1.0, which apm reviewers confirmed is malicious.", name: "left-pad", range: "1.3.0", version: null, skipped: [], newest: { version: "1.3.0", report: null }, confirmed: [{ name: "bad", version: "0.1.0" }] });
+  const ROOT_CONFIRMED = parseResolve(422, { error: "No version of left-pad matching 1.3.0 passes the policy.", name: "left-pad", range: "1.3.0", version: null, skipped: [{ version: "1.3.0", reason: "confirmed malicious by an apm reviewer", revokeReason: null }], newest: null, knownMalicious: [] });
+  const NO_MATCH = parseResolve(422, { error: "No version of left-pad matching 1.3.0 passes the policy.", name: "left-pad", range: "1.3.0", version: null, skipped: [{ version: "1.2.0", reason: "yanked", revokeReason: null }], newest: null, knownMalicious: [] });
+
+  test("a picked version whose tree resolve refused: do not install, naming the dependency and its advisory", async () => {
+    const p = pkg({ versions: [row("1.3.0")] });
+    const listed = await load(p, null, () => BAD_TREE_LISTED);
+    const confirmed = await load(p, null, () => BAD_TREE_CONFIRMED);
+
+    expect(listed.md).toContain("- Status: do not install. It depends on §evil@2.0.0§, which the OSSF malicious-packages feed lists as malicious (MAL-2026-1), so apm add refuses it. Advisory: https://osv.dev/vulnerability/MAL-2026-1".replaceAll("§", "`"));
+    expect(confirmed.md).toContain("- Status: do not install. It depends on §bad@0.1.0§, which apm reviewers confirmed is malicious, so apm add refuses it.".replaceAll("§", "`"));
+
+    for (const { md } of [listed, confirmed]) {
+      expect(md).toContain("No install command: apm refuses this version.");
+      expect(md).not.toContain("apm add left-pad");
+    }
+  });
+
+  test("a root an apm reviewer confirmed is recognised from the skipped reason alone", async () => {
+    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => ROOT_CONFIRMED);
+
+    expect(md).toContain("- Status: do not install. apm reviewers confirmed it is malicious, so apm add refuses it.");
   });
 
   test("a version apm reviewers confirmed, and one skipped for another reason, in the registry's words", async () => {
@@ -332,11 +359,19 @@ describe("what the Markdown view says apm will not install, and how", () => {
     expect(held.md).not.toContain("apm add left-pad\n");
   });
 
-  test("a 422 that skips other versions, not this one, installs it", async () => {
-    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => refusedFor("1.2.0", {}));
+  test("a 422 that neither skips nor picks this version is unknown, not installs", async () => {
+    const { md } = await load(pkg({ versions: [row("1.3.0")] }), null, () => NO_MATCH);
 
-    expect(md).toContain("- Status: active\n");
-    expect(md).toContain("apm add left-pad\n");
+    expect(md).toContain("- Status: active. The registry's install policy did not answer, so apm may not serve this version.");
+    expect(md).not.toContain("- Status: active\n");
+  });
+
+  test("a declared capability the scorer did not see used reads as the page says it, never seen", () => {
+    const declared = score({ capabilities: [{ id: "network", label: "Network: makes requests or opens sockets", status: "unused", basis: "none", evidence: [] }] });
+    const md = packageMarkdown({ pkg: pkg(), version: "1.3.0", status: ACTIVE, policy: INSTALLS, facts: null, score: declared, unscorable: null, review: { kind: "missing" }, install: { kind: "default", version: "1.3.0" }, registry: REGISTRY });
+
+    expect(md).toContain("- Network (makes requests or opens sockets): declared, not seen used");
+    expect(md).not.toContain("seen; declared");
   });
 
   test("resolve not answering keeps the install commands, and says apm may not serve the version", async () => {

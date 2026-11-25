@@ -123,7 +123,7 @@ const searchPackages: Tool<typeof SearchInput> = {
  */
 type InstallAnswer =
   | { kind: "commands"; via: "default" | "tag" | "exact"; commands: Record<InstallClient, string> }
-  | { kind: "refused"; refusal: Refusal; installsInstead: string | null }
+  | { kind: "refused"; refusal: Refusal }
   | { kind: "none"; reason: string };
 
 function installAnswer(view: PackageView): InstallAnswer {
@@ -132,7 +132,7 @@ function installAnswer(view: PackageView): InstallAnswer {
   if (install.kind === "none") return { kind: "none", reason: noInstallableReason({ name: pkg.name, why: install.why }) };
   const refusal = refusalOf(view);
 
-  if (refusal !== null) return { kind: "refused", refusal, installsInstead: view.policy.kind === "refused" ? view.policy.bareGets : null };
+  if (refusal !== null) return { kind: "refused", refusal };
 
   const commands = { apm: "", bun: "", npm: "", pnpm: "" } satisfies Record<InstallClient, string>;
 
