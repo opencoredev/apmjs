@@ -42,7 +42,10 @@ const removeWork = (): void => rmSync(work, { recursive: true, force: true });
 
 process.on("exit", removeWork);
 
-for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) process.on(signal, () => process.exit(code));
+// SIGHUP: an operator's SSH session dropping. SIGKILL cannot be caught; nothing here can clean up after it.
+const SIGNAL_EXITS = [["SIGHUP", 129], ["SIGINT", 130], ["SIGQUIT", 131], ["SIGABRT", 134], ["SIGTERM", 143]] as const;
+
+for (const [signal, code] of SIGNAL_EXITS) process.on(signal, () => process.exit(code));
 
 const results: { ok: boolean; name: string; detail: string }[] = [];
 
