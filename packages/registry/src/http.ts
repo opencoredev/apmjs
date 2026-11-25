@@ -420,8 +420,9 @@ export async function readCapped(source: { readonly body: ReadableStream<Uint8Ar
     if (done) break;
     total += value.length;
 
+    // over the limit whatever the cancel does: a failed cancel must not turn the answer into a read error
     if (total > max) {
-      await reader.cancel();
+      await reader.cancel().catch(() => undefined);
 
       return null;
     }

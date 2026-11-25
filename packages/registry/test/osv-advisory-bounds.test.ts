@@ -6,10 +6,11 @@
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { z } from "zod";
+import { readCapped } from "../src/http.ts";
 import { KnownMalicious, listedAmong, MAX_ADVISORIES, MAX_ADVISORY_BYTES, osvFeed, type Advisory } from "../src/osv.ts";
 
 /** `pages`: the MAL- ids of each page of the name's answer, in order, duplicates kept. */
-type Stand = { pages: string[][]; huge?: ReadonlySet<string>; readMs?: number };
+type Stand = { pages: string[][]; huge?: ReadonlySet<string>; readMs?: number; cancelFails?: boolean };
 
 const PageQuery = z.object({ queries: z.array(z.object({ page_token: z.string().optional() })) });
 
@@ -38,7 +39,21 @@ function standIn(name: string, stand: Stand) {
     try {
       await Bun.sleep(stand.readMs ?? 5);
 
-      return Response.json({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: ["1.0.0"] }], details: stand.huge?.has(id) === true ? "x".repeat(MAX_ADVISORY_BYTES) : "" });
+      const body = JSON.stringify({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: ["1.0.0"] }], details: stand.huge?.has(id) === true ? "x".repeat(MAX_ADVISORY_BYTES) : "" });
+
+      if (stand.cancelFails !== true) return new Response(body, { headers: { "content-type": "application/json" } });
+      const bytes = new TextEncoder().encode(body);
+
+      // a body whose cancel rejects, as a broken connection's can
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start: (c) => {
+            for (let at = 0; at < bytes.length; at += 64 * 1024) c.enqueue(bytes.slice(at, at + 64 * 1024));
+            c.close();
+          },
+          cancel: () => Promise.reject(new Error("connection reset")),
+        }),
+      );
     } finally {
       counts.inFlight--;
     }
@@ -99,6 +114,21 @@ describe("one name's advisory reads are bounded", () => {
     expect([...listedAmong("one-huge", got, ["1.0.0", "3.1.4"]).values()].map((m) => m.ids)).toEqual([["MAL-2026-7", "MAL-2026-8"], ["MAL-2026-8"]]);
     await s.ask();
     expect(s.counts.reads.get("MAL-2026-7")).toBe(2);
+  });
+
+  // Sol on e2081f3: a cancel that rejected after the cap made the advisory a transient failure, serving its versions
+  test("an oversized advisory whose body fails to cancel still withholds every version", async () => {
+    const s = standIn("cancel-fails", { pages: [["MAL-2026-9"]], huge: new Set(["MAL-2026-9"]), cancelFails: true });
+
+    expect(listedAmong("cancel-fails", await s.ask(), ["1.0.0", "2.0.0"]).size).toBe(2);
+  });
+
+  test("readCapped answers over the limit even when the cancel after it rejects", async () => {
+    let reads = 0;
+    const reader = { read: async () => (reads++ < 4 ? { done: false, value: new Uint8Array(1024) } : { done: true, value: undefined }), cancel: () => Promise.reject(new Error("connection reset")) };
+    const source = { body: Object.assign(new ReadableStream<Uint8Array>(), { getReader: () => reader }) };
+
+    expect(await readCapped(source, 2048)).toBeNull();
   });
 
   // Sol on c4a535c: reads that overlap were each charged their whole wait, so two rounds of slow reads spent the budget
