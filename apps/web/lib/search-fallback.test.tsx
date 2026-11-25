@@ -6,13 +6,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 let pathname = "/package/next";
 
-// a module mock holds for every later test file in the process, so it carries every hook the app imports: one missing
-// (useParams) failed lib/approval-ui.test.tsx whenever the runner ordered it after this file
+// bun:test module mocks last for the whole run, so keep every real export: a file that runs later (approval-ui
+// renders a view that calls useParams) imports this mock, not next/navigation
+const navigation = await import("next/navigation");
+
 void mock.module("next/navigation", () => ({
+  ...navigation,
   usePathname: () => pathname,
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
-  useParams: () => ({}),
-  useSearchParams: () => new URLSearchParams(),
 }));
 
 const { SearchBar } = await import("@/components/search-bar");

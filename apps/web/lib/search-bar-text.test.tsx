@@ -2,13 +2,14 @@
 // failures and partial answers, not only counts.
 import { describe, expect, mock, test } from "bun:test";
 
-// a module mock holds for every later test file in the process, so it carries every hook the app imports
-// (search-fallback.test.tsx says why)
+// bun:test module mocks last for the whole run, so keep every real export: a file that runs later (approval-ui
+// renders a view that calls useParams) imports this mock, not next/navigation
+const navigation = await import("next/navigation");
+
 void mock.module("next/navigation", () => ({
+  ...navigation,
   usePathname: () => "/package/next",
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
-  useParams: () => ({}),
-  useSearchParams: () => new URLSearchParams(),
 }));
 
 const { announcement, noteText } = await import("@/components/search-bar");
