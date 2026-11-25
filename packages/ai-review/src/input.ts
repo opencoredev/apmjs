@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { kindOf, linesOf, MAX_DECODED_BYTES, ordered, textOf } from "./files.ts";
+import { kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -47,9 +47,16 @@ export type ReviewInput = {
   notRead: NotRead[];
 };
 
+/** The line cut to MAX_LINE_CHARS, never inside a surrogate pair (a lone half is ill-formed text). */
 function clip(line: string): string {
-  return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)} …[line cut, ${line.length - MAX_LINE_CHARS} more chars]` : line;
+  if (line.length <= MAX_LINE_CHARS) return line;
+  const end = /[\uD800-\uDBFF]/.test(line[MAX_LINE_CHARS - 1] ?? "") ? MAX_LINE_CHARS - 1 : MAX_LINE_CHARS;
+
+  return `${line.slice(0, end)} …[line cut, ${line.length - end} more chars]`;
 }
+
+/** Whether a line is shown cut: a file with one is not shown in full. */
+const clipsAny = (lines: readonly string[]): boolean => lines.some((l) => l.length > MAX_LINE_CHARS);
 
 function numbered(lines: readonly string[]): string {
   return lines.map((l, i) => `${String(i + 1).padStart(5)}  ${clip(l)}`).join("\n");
@@ -74,8 +81,8 @@ class Budget {
     return this.maxChars - this.used;
   }
 
-  /** Adds a block; when it does not fit, adds as many whole lines as fit and records the file as partly read. */
-  add(input: { path: string | null; header: string; body: string; share: number }): void {
+  /** Adds a block; when it does not fit, adds as many whole lines as fit and records the file as partly read. `cut`: a line of it was clipped, so it is partly read even when it fits. */
+  add(input: { path: string | null; header: string; body: string; share: number; cut?: boolean }): void {
     const cap = Math.min(this.left, Math.floor(this.maxChars * input.share));
 
     if (cap < MIN_BLOCK_CHARS) {
@@ -108,7 +115,7 @@ class Budget {
 
     if (input.path === null) return;
 
-    if (whole) this.read.push(input.path);
+    if (whole && input.cut !== true) this.read.push(input.path);
     else this.partial.push(input.path);
   }
 
@@ -117,30 +124,33 @@ class Budget {
   }
 }
 
-/** Keeps publisher-controlled metadata (tar paths, script commands) on one line so it cannot forge prompt headers. */
-function singleLine(text: string): string {
-  return text.replace(/[\r\n\u2028\u2029]/g, (ch) => (ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`));
+/** The metadata above the files is outside the budget, so each publisher-controlled piece of it is one line and clipped. */
+function metadata(text: string): string {
+  return clip(singleLine(text));
 }
 
 function header(input: { name: string; version: string; previous: string | null; pkg: PackageFiles; extra: readonly string[] }): string {
   const scripts = installScripts(input.pkg.manifest);
-  const scriptText = scripts.length > 0 ? scripts.map((s) => `${singleLine(s.key)}: ${singleLine(s.command)}`).join(" | ") : "none";
-  const versionText = input.previous === null ? " (no previous version available: full review)" : ` (previous version: ${input.previous})`;
+  const scriptText = scripts.length > 0 ? scripts.map((s) => `${metadata(s.key)}: ${metadata(s.command)}`).join(" | ") : "none";
+  const versionText = input.previous === null ? " (no previous version available: full review)" : ` (previous version: ${metadata(input.previous)})`;
 
   return [
-    `Package: ${singleLine(input.name)}@${singleLine(input.version)}${versionText}`,
+    `Package: ${metadata(input.name)}@${metadata(input.version)}${versionText}`,
     `Files: ${input.pkg.files.length}, unpacked bytes: ${input.pkg.files.reduce((n, f) => n + f.size, 0)}`,
     `Install-time scripts: ${scriptText}`,
     ...input.extra,
   ].join("\n");
 }
 
+/** A not-read path as the result records it: the wire contract (wire.ts WireNotRead) holds paths to MAX_PATH_CHARS. */
+const recordedPath = (path: string): string => (path.length > MAX_PATH_CHARS ? `${path.slice(0, MAX_PATH_CHARS - 1)}…` : path);
+
 function notReadOf(b: Budget, input: { binaries: readonly TarEntry[]; tooLarge: readonly string[]; pkg: PackageFiles }): NotRead[] {
   const files: NotRead[] = [
-    ...b.omitted.map((path): NotRead => ({ kind: "file", path, reason: "budget" })),
-    ...b.partial.map((path): NotRead => ({ kind: "file", path, reason: "partial" })),
-    ...input.tooLarge.map((path): NotRead => ({ kind: "file", path, reason: "too-large" })),
-    ...input.binaries.map((f): NotRead => ({ kind: "file", path: f.path, reason: "binary" })),
+    ...b.omitted.map((path): NotRead => ({ kind: "file", path: recordedPath(path), reason: "budget" })),
+    ...b.partial.map((path): NotRead => ({ kind: "file", path: recordedPath(path), reason: "partial" })),
+    ...input.tooLarge.map((path): NotRead => ({ kind: "file", path: recordedPath(path), reason: "too-large" })),
+    ...input.binaries.map((f): NotRead => ({ kind: "file", path: recordedPath(f.path), reason: "binary" })),
   ];
 
   const deps = dependencyNamesOf(input.pkg.manifest).map((name): NotRead => ({ kind: "dependency", name }));
@@ -171,20 +181,29 @@ export type BuildOptions = { budgetTokens?: number };
 export function buildFilesInput(input: { name: string; version: string; pkg: PackageFiles } & BuildOptions): ReviewInput {
   const { pkg } = input;
   const b = new Budget(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN));
-  const all = pkg.files.map((f) => `${singleLine(f.path)} (${f.size} bytes)`);
+  const all = pkg.files.map((f) => `${listedPath(f.path)} (${f.size} bytes)`);
   const listing = all.length > 200 ? [...all.slice(0, 200), `…and ${all.length - 200} more files`] : all;
 
   b.add({ path: null, header: "=== FILE LIST ===", body: listing.join("\n"), share: 0.1 });
   const pj = pkg.files.find((f) => f.path === "package.json");
 
-  if (pj) b.add({ path: "package.json", header: "=== FILE package.json ===", body: numbered(linesOf(textOf(pj))), share: 0.25 });
+  if (pj) {
+    const l = linesOf(textOf(pj));
+
+    b.add({ path: "package.json", header: "=== FILE package.json ===", body: numbered(l), share: 0.25, cut: clipsAny(l) });
+  }
+
   const tooLarge: string[] = [];
   const shown = ordered(pkg.manifest, pkg.files, pkg.files);
 
   for (const f of shown) {
-    if (f.data.length > MAX_DECODED_BYTES) tooLarge.push(f.path);
+    if (f.data.length > MAX_DECODED_BYTES || f.path.length > MAX_PATH_CHARS) tooLarge.push(f.path);
     else if (b.left < MIN_BLOCK_CHARS) b.skip(f.path);
-    else b.add({ path: f.path, header: `=== FILE ${singleLine(f.path)} ===`, body: numbered(linesOf(textOf(f))), share: MAX_FILE_SHARE });
+    else {
+      const l = linesOf(textOf(f));
+
+      b.add({ path: f.path, header: `=== FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
+    }
   }
 
   const inScope = shown.length + (pj ? 1 : 0);
@@ -199,6 +218,15 @@ function sameBytes(a: TarEntry, b: TarEntry): boolean {
 
 function listed(label: string, items: readonly string[], max: number): string {
   return `${label} (${items.length}): ${items.slice(0, max).join(", ")}${items.length > max ? " …" : ""}`;
+}
+
+/** A path in a list of paths: short enough that a few hundred of them stay inside the budget's slack. */
+const MAX_LISTED_PATH = 200;
+
+function listedPath(path: string): string {
+  const p = shownPath(path);
+
+  return p.length > MAX_LISTED_PATH ? `${p.slice(0, MAX_LISTED_PATH)}…` : p;
 }
 
 /** An update: package.json in full plus line diffs of added and changed files, numbered as in the new version. */
@@ -217,9 +245,9 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   });
 
   const summary = [
-    listed("Added files", added.map((f) => `${singleLine(f.path)} (${f.size} bytes)`), 60),
-    listed("Removed files", removed.map((f) => singleLine(f.path)), 30),
-    listed("Changed files", changed.map((f) => singleLine(f.path)), 60),
+    listed("Added files", added.map((f) => `${listedPath(f.path)} (${f.size} bytes)`), 60),
+    listed("Removed files", removed.map((f) => listedPath(f.path)), 30),
+    listed("Changed files", changed.map((f) => listedPath(f.path)), 60),
   ];
 
   const pj = pkg.files.find((f) => f.path === "package.json");
@@ -229,7 +257,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   if (pj) {
     const l = linesOf(textOf(pj));
 
-    b.add({ path: "package.json", header: "=== FILE package.json (full, new version) ===", body: numbered(l), share: 0.25 });
+    b.add({ path: "package.json", header: "=== FILE package.json (full, new version) ===", body: numbered(l), share: 0.25, cut: clipsAny(l) });
 
     if (pjOld && pjChanged) {
       const h = diffLines(linesOf(textOf(pjOld)), l);
@@ -245,7 +273,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   for (const f of shown) {
     const old = before.get(f.path);
 
-    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES)) {
+    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES) || f.path.length > MAX_PATH_CHARS) {
       tooLarge.push(f.path);
       continue;
     }
@@ -258,7 +286,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
     const l = linesOf(textOf(f));
 
     if (!old) {
-      b.add({ path: f.path, header: `=== NEW FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE });
+      b.add({ path: f.path, header: `=== NEW FILE ${singleLine(f.path)} ===`, body: numbered(l), share: MAX_FILE_SHARE, cut: clipsAny(l) });
       continue;
     }
 
@@ -266,7 +294,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
 
     // only line endings or trailing bytes changed: nothing to show, nothing hidden
     if (h.length === 0) b.read.push(f.path);
-    else b.add({ path: f.path, header: `=== DIFF ${singleLine(f.path)} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE });
+    else b.add({ path: f.path, header: `=== DIFF ${singleLine(f.path)} ===`, body: renderHunks(h), share: DIFF_FILE_SHARE, cut: h.some((x) => clipsAny(x.lines.map((d) => d.text))) });
   }
 
   const touched = [...added, ...changed];

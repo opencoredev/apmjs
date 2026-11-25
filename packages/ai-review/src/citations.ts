@@ -2,7 +2,7 @@
 // range, and its quote is on that line. The eval kept 270 of 275 findings this way; the ones it drops
 // are the model misremembering, and a flag with no surviving citation is not treated as a flag.
 import type { TarEntry } from "@apm/core";
-import { linesOf, textOf } from "./files.ts";
+import { linesOf, singleLine, textOf } from "./files.ts";
 import type { RawFinding, Severity } from "./reply.ts";
 
 export type Finding = {
@@ -65,14 +65,23 @@ export function oneSentence(text: string): string {
   return s.length > 300 ? `${s.slice(0, 297)}…` : s;
 }
 
-function normalizePath(raw: string, paths: ReadonlySet<string>): string {
+function normalizePath(raw: string, paths: ReadonlySet<string>, shown: ReadonlyMap<string, string>): string {
+  // the path exactly as named, or as the prompt showed it (escaped onto one line), before any loosening: `package/x.js`
+  // and `x.js` can both be in a tarball, and a citation of one must not land on the other
+  for (const p of [raw, raw.trim()]) {
+    if (paths.has(p)) return p;
+    const real = shown.get(p);
+
+    if (real !== undefined) return real;
+  }
+
   const p = raw.trim().replace(/^\.\//, "").replace(/^package\//, "");
 
   if (paths.has(p)) return p;
   // models sometimes write "path:line" into the file field
   const m = /^(.*):(\d+)$/.exec(p);
 
-  return m?.[1] && paths.has(m[1]) ? m[1] : p;
+  return m?.[1] && paths.has(m[1]) ? m[1] : (shown.get(p) ?? p);
 }
 
 export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
@@ -80,12 +89,13 @@ export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
 export function verifyCitations(findings: readonly RawFinding[], files: readonly TarEntry[]): Verified {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const paths = new Set(byPath.keys());
+  const shown = new Map(files.flatMap((f) => (singleLine(f.path) === f.path ? [] : [[singleLine(f.path), f.path] as const])));
   const lineCache = new Map<string, string[]>();
   const kept: Finding[] = [];
   const dropped: DroppedFinding[] = [];
 
   for (const raw of findings) {
-    const file = normalizePath(raw.file, paths);
+    const file = normalizePath(raw.file, paths, shown);
     const entry = byPath.get(file);
 
     if (!entry) {

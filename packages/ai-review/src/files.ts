@@ -58,6 +58,21 @@ export function linesOf(text: string): string[] {
   return text.replace(/\r\n?/g, "\n").split("\n");
 }
 
+/** Keeps publisher-controlled metadata (tar paths, script commands) on one line so it cannot forge prompt headers. */
+export function singleLine(text: string): string {
+  return text.replace(/[\r\n\u2028\u2029]/g, (ch) => (ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`));
+}
+
+/** The longest file path the review shows or cites: a model's citation of a file is at most this long (reply.ts). */
+export const MAX_PATH_CHARS = 1000;
+
+/** A path as the prompt shows it: one line, and cut to MAX_PATH_CHARS (a path that long is never shown as a file). */
+export function shownPath(path: string): string {
+  const p = singleLine(path);
+
+  return p.length > MAX_PATH_CHARS ? `${p.slice(0, MAX_PATH_CHARS - 1)}…` : p;
+}
+
 function stripDot(p: string): string {
   return p.replace(/^\.\//, "").replace(/^\//, "");
 }
