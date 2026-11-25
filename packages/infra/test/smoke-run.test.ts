@@ -156,7 +156,7 @@ describe("smoke.ts against a stage that accepts connections and never answers", 
     expect(code).toBe(1);
     expect(lines).toContain("FAIL: the docs site (no answer within 300 ms)");
     expect(lines).toContain("FAIL: the CLI install script (no answer within 300 ms)");
-    expect(lines).toContain("FAIL: the package check gives a very large package (next) a real verdict, not unknown (next: no answer within 300 ms)");
+    expect(lines.some((l) => l.startsWith("FAIL: explain answers install for a large package (next@"))).toBe(true);
     expect(lines).toContain("FAIL: the package check gives a very large package (firebase) a real verdict, not unknown (firebase: no answer within 300 ms)");
     expect(out).toMatch(/^0\/\d+ passed$/m);
     expect(Date.now() - started).toBeLessThan(60_000);
@@ -197,9 +197,12 @@ describe("smoke.ts against a stage that accepts connections and never answers", 
   }, 30_000);
 });
 
-test("smoke.ts sends every request through its bounded fetch", () => {
-  const source = readFileSync(SMOKE, "utf8");
+test("every request smoke.ts makes carries a timeout", () => {
+  const calls = readFileSync(SMOKE, "utf8")
+    .split("\n")
+    .filter((l) => /\bfetch\(/.test(l));
 
-  expect(source.match(/\bfetch\(/g)?.length).toBe(1);
-  expect(source).toContain("signal: AbortSignal.timeout(TIMEOUTS.httpMs)");
+  expect(calls.length).toBeGreaterThan(0);
+
+  for (const call of calls) expect(call).toContain("AbortSignal.timeout(");
 });

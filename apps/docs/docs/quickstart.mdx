@@ -26,7 +26,7 @@ Pick your package manager. Each setting goes in the project folder, so it applie
     The scanner is not on a registry yet. Until it is, install it from a clone of apm; see [Bun scanner](/guides/bun-scanner#install-it). Without it, the `registry` line alone still works.
   </Tab>
   <Tab title="npm">
-    Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions, and the tarballs of revoked and confirmed-malicious versions answer 410 even to an existing lockfile.
+    Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions and the versions the OSSF malicious-packages feed lists. Even to an existing lockfile, the tarballs of revoked and confirmed-malicious versions answer 410, and the tarballs of other OSSF-listed versions answer 403 with the version's MAL- id.
 
     ```ini title=".npmrc"
     registry=https://registry.apmjs.dev/
@@ -77,14 +77,14 @@ export PATH="$HOME/.apm/bin:$PATH"
 apm --version
 ```
 
-`apm --version` prints `0.1.2`. To update, run the install command again. To uninstall, delete `~/.apm`.
+`apm --version` prints `0.1.5`. To update, run the install command again. To uninstall, delete `~/.apm`.
 
 ### What the install script checks
 
 When a version is released, the SHA-256 of each of its binaries is written into the script. The script downloads the binary for your machine from `https://apmjs.dev/cli/<version>/`, compares its SHA-256 with that list, and installs nothing if they differ. It also runs the binary once and installs it only if it reports that version. It prints the fingerprint it checked:
 
 ```
-apm 0.1.2 (darwin-arm64) installed to /Users/you/.apm/bin/apm
+apm 0.1.5 (darwin-arm64) installed to /Users/you/.apm/bin/apm
 SHA-256 <64-char hex digest>, checked against this script
 ```
 
@@ -116,13 +116,13 @@ The script's last line is the call that runs it, so an empty or cut-off download
 To check a binary by hand, compare its SHA-256 with the line for your platform in the script and in the version's published checksums:
 
 ```bash
-curl -fsSL https://apmjs.dev/cli/0.1.2/SHA256SUMS
+curl -fsSL https://apmjs.dev/cli/0.1.5/SHA256SUMS
 shasum -a 256 ~/.apm/bin/apm     # sha256sum on Linux
 ```
 
 The script, the checksums and the binaries all come from apmjs.dev. The check proves the binary is the one released with the script you read; it does not prove who released it.
 
-`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.2`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
+`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.5`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
 
 apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then falls back to bun when bun is installed and npm when it is not. Pass `--pm npm` to choose.
 

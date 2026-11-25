@@ -139,8 +139,11 @@ export async function spawnBounded(cmd: string[], options: { cwd: string; env: R
   }
 }
 
-/** Packages big enough that their check walks a large tree: issue #1, where they answered "unknown" for over 90 minutes. */
-export const LARGE_PACKAGES = ["next", "firebase"] as const;
+/**
+ * Packages big enough that their check walks a large tree: issue #1, where they answered "unknown" for over 90 minutes.
+ * next is smoke-probes.ts's largeExplain, which must answer install for a pinned version.
+ */
+export const LARGE_PACKAGES = ["firebase"] as const;
 
 const DECIDED = new Set(["install", "review-first", "do-not-install"]);
 

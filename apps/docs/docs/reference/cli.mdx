@@ -5,7 +5,7 @@ sidebar:
   label: CLI
 ---
 
-`apm` 0.1.2 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
+`apm` 0.1.5 checks before you install, run or publish, then hands the work to the package manager your project uses. Any command it does not know goes straight to that package manager: `apm run dev` is `bun run dev` in a bun project.
 
 Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks the binary's SHA-256 before it installs; see [Quick start](/quickstart#2-get-the-apm-cli) for what it checks and how to read it first.
 
@@ -16,15 +16,15 @@ Install it with `curl -fsSL https://apmjs.dev/install | sh`. The script checks t
 | `--pm bun\|npm\|pnpm\|yarn` | The package manager to run. Default: found from the lockfile, then `packageManager` in `package.json`, then bun if it is installed, else npm. |
 | `--json` | Print exactly one JSON document on stdout. Human output goes to stderr. Applies to `add`, `install`, `explain`, `search`, `score`, `name`, `audit`, `yank`, `unyank`, `revoke`, `restore`, `incident`, `publish`, `login` and `whoami`. |
 | `--otp <code>` | A six-digit code from your authenticator app, for commands that need a fresh second factor. |
-| `--help`, `-h` | Print the command list. |
+| `--help`, `-h` | Print the command list. After a command (`apm publish --help`), anywhere in its arguments, print that command's usage and flags and run nothing. |
 | `--version`, `-v` | Print the version. |
 
-Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A passed-through command exits with the package manager's code.
+Exit codes: `0` success, `1` refused or failed, `2` wrong usage. A flag the command does not read is wrong usage: apm refuses it before it runs anything. A flag's value never starts with `-` (`--tag --dry-run` is a `--tag` with no value); write one that does as `--reason=-x`. A passed-through command exits with the package manager's code.
 
 ## apm add
 
 ```bash
-apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D] [--production]
+apm add <package>[@range]... [--strict] [--force] [--no-cooldown] [--cooldown <duration>] [--floor <n>] [-D | --save-dev] [--production]
 ```
 
 Resolves each package to the newest version that is not revoked, yanked or confirmed malicious and checks its whole dependency tree, including every platform's optional binaries (see [Platform](#platform)). Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package of that lockfile (see [Lockfile first](#lockfile-first)). Only a lockfile that passes is written to your project and installed, with install scripts held back until apm confirms the install matches it. `apm install <package>` and `apm i <package>` are the same command. With no packages, it runs your package manager's own install.
@@ -35,7 +35,7 @@ A score informs; it does not block. When the package or a dependency was publish
 WARNING left-pad@1.3.0 scores 30/100 (F), under the floor of 40
   - Sends what it collected: index.js:12: fetch(…) (sends the whole environment in a request)
   - Starts processes at install time: package.json scripts.postinstall: node setup.js
-  https://apmjs.dev/package/left-pad/v/1.3.0
+  https://apmjs.dev/package/left-pad?v=1.3.0
 apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).
 ```
 
@@ -120,7 +120,7 @@ apm x <package>[@version] [args...]
 
 Shows the package's score card, then in a temporary project of its own has your package manager (npm for yarn projects) compute the lockfile, checks every package of it as `apm add` does, and only then installs it with install scripts held back, confirms the install matches it, runs the install scripts and runs the package's binary (the only one, or the one named like the package) in your directory. The binary runs with the temporary project's `node_modules/.bin` first on `PATH`, so a helper binary it calls is one apm checked. The directory is removed afterwards. Aliases: `apm exec`, `apm dlx`. Takes the same `--strict`, `--force`, `--no-cooldown`, `--cooldown`, `--floor` and `--ignore-scripts` flags as `add`, warns the same way, and waits for a version still being analysed the same way. Those flags and `--pm` are apm's wherever they appear before `--`, and never reach the binary; anything else after the package goes to the binary. Everything after `--` goes to the binary unread, so `apm x tool -- --strict` passes `--strict` to `tool`. `apm exec` and `apm dlx` split their arguments exactly the same way.
 
-A binary given only flags gets them: `apm x tool --version` runs `tool --version`. `--json` depends on where it is. Before the package it is apm's: `apm x --json tool` moves apm's own lines (the score card, warnings, progress) to stderr and runs `tool` without `--json`. After the package it is the binary's: `apm x tool --json` passes `--json` to `tool` and also moves apm's lines to stderr, so the binary's output is alone on stdout. `apm x` prints no JSON document of its own either way.
+A binary given only flags gets them: `apm x tool --version` runs `tool --version`. `--help` and `-h` before `--` are apm's: `apm x tool --help` prints the help of `apm x` and runs nothing, and `apm x tool -- --help` prints the binary's. `--json` depends on where it is. Before the package it is apm's: `apm x --json tool` moves apm's own lines (the score card, warnings, progress) to stderr and runs `tool` without `--json`. After the package it is the binary's: `apm x tool --json` passes `--json` to `tool` and also moves apm's lines to stderr, so the binary's output is alone on stdout. `apm x` prints no JSON document of its own either way.
 
 ## apm score
 
