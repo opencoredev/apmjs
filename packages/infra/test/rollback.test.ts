@@ -138,6 +138,11 @@ beforeAll(() => {
         return Response.json({ success: true, result: { id: v[2], number: 1, metadata: {}, resources: { bindings, script: {}, script_runtime: {} } } });
       }
 
+      if (failLists !== null && req.method === "GET" && hangWhere === "body") {
+        // the failure status at once, its body never finished
+        return new Response(new ReadableStream({ start: (c) => c.enqueue(new TextEncoder().encode('{"success":false,')) }), { status: failLists, headers: { "content-type": "application/json" } });
+      }
+
       if (failLists !== null && req.method === "GET") return Response.json({ success: false, errors: [{ code: 10013, message: "service unavailable" }] }, { status: failLists });
       const m = new RegExp(`^/client/v4/accounts/${ACCOUNT}/workers/scripts/([^/]+)/deployments$`).exec(url.pathname);
       const script = decodeURIComponent(m?.[1] ?? "");
@@ -1079,6 +1084,13 @@ describe("Cloudflare's answers", () => {
     const resume = resumeCommand({ action: "to", stage: "production", argv: ["to", "--stage", "production", "--worker", "web", "--version", "it's a b", "--yes"], steps: [], releases: [] });
 
     expect(resume?.command).toBe("bun packages/infra/rollback.ts to --stage production --worker web --version 'it'\\''s a b' --yes");
+  });
+
+  test("a failure status whose body is cut short by the timeout is reported by its status, not as a timeout", async () => {
+    failLists = 503;
+    hangWhere = "body";
+
+    await expect(listDeployments(cf(), "apmjs-web-production", 200)).rejects.toThrow("Cloudflare answered 503 for GET /workers/scripts/apmjs-web-production/deployments");
   });
 
   test("lists and settings with fields missing, null or new still parse; a list missing what rollback relies on does not", async () => {

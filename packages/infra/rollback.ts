@@ -175,8 +175,8 @@ async function request(cf: Cloudflare, path: string, init: { method?: string; bo
     signal: AbortSignal.timeout(Math.max(1, Math.min(REQUEST_TIMEOUT_MS, init.timeoutMs ?? REQUEST_TIMEOUT_MS))),
   });
 
-  // a body that is not JSON is reported by its status
-  const raw: unknown = await res.json().catch(nullUnlessCutShort);
+  // a body that is not JSON is reported by its status, and so is a failure status whose body was cut short
+  const raw: unknown = await res.json().catch(res.ok ? nullUnlessCutShort : () => null);
 
   const success = SuccessField.safeParse(raw);
   const errors = ErrorsField.safeParse(raw);
