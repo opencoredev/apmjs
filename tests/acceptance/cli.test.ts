@@ -237,7 +237,6 @@ describe("apm: publish", () => {
     const d = writePackage(work, { name: "no-login-pkg", version: "1.0.0" }, reg);
     const r = await apm(["publish"], { cwd: d, env: sb.env });
     expect(r.code).not.toBe(0);
-    expect(r.out).toContain(`apm: no apm login token found for ${reg.url}; run apm login first if the upload is refused`);
     expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication, run apm login (an npm login signs in to npm, not apm), then apm publish again`);
   });
 

@@ -36,11 +36,13 @@ describe("apm's messages for first-time users", () => {
       hostname: "127.0.0.1",
       fetch(req) {
         const url = new URL(req.url);
-        const path = decodeURIComponent(url.pathname);
+        // under /no-policy/, a registry that does not say its rules for new names
+        const noPolicy = url.pathname.startsWith("/no-policy/");
+        const path = decodeURIComponent(noPolicy ? url.pathname.slice("/no-policy".length) : url.pathname);
 
         if (path === "/-/whoami") return req.headers.get("authorization") === "Bearer apm_launchmessagestoken" ? Response.json({ username: "Me" }) : Response.json({ error: "Not logged in" }, { status: 401 });
 
-        if (path === "/-/apm/v1/auth/config") return Response.json({ providers: { github: true }, passkeys: false, legacyAuth: false, namePolicy: "scoped" });
+        if (path === "/-/apm/v1/auth/config" && !noPolicy) return Response.json({ providers: { github: true }, passkeys: false, legacyAuth: false, namePolicy: "scoped" });
 
         if (path === "/-/apm/v1/names") {
           const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
@@ -93,9 +95,9 @@ describe("apm's messages for first-time users", () => {
   const manifest = JSON.stringify({ name: "app", version: "1.0.0", private: true });
 
   /** apm with these arguments; `text` is everything a person in a terminal sees. */
-  async function apm(args: string[], opts: { cwd: string; home?: string; token?: boolean }): Promise<{ code: number; out: string; text: string }> {
+  async function apm(args: string[], opts: { cwd: string; home?: string; token?: boolean; registry?: string }): Promise<{ code: number; out: string; text: string }> {
     // an empty APM_TOKEN is no token
-    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: opts.home ?? folder(`home-${crypto.randomUUID()}`), APM_REGISTRY: server.url.toString(), NO_COLOR: "1", APM_TOKEN: opts.token === true ? "apm_launchmessagestoken" : "" };
+    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: opts.home ?? folder(`home-${crypto.randomUUID()}`), APM_REGISTRY: opts.registry ?? server.url.toString(), NO_COLOR: "1", APM_TOKEN: opts.token === true ? "apm_launchmessagestoken" : "" };
 
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), ...args], {
       cwd: opts.cwd,
@@ -155,37 +157,41 @@ describe("apm's messages for first-time users", () => {
     expect(r.text).not.toContain("✓ expresss");
   });
 
-  test("B4: a plain apm install says it checks nothing and which registry the package manager uses", async () => {
+  test("B4: a plain apm install says it checks nothing and where the package manager installs from", async () => {
     const cwd = folder("b4", { "package.json": manifest });
-    const r = await apm(["install", "--pm", "npm"], { cwd });
+    const r = await apm(["install", "--pm", "npm"], { cwd, registry: "https://registry.apmjs.dev/" });
 
     // the package manager's own exit code, as before
     expect(r.code).toBe(7);
-    expect(r.text).toContain(`apm: a plain npm install, which apm checks nothing in; npm's configured registry is https://registry.npmjs.org/, and a lockfile's own URLs still apply (to install through apm's registry, set registry=${server.url.toString()} in .npmrc)`);
+    expect(r.text).toContain("apm: a plain npm install, which apm checks nothing in; npm uses https://registry.npmjs.org/ unless its config names another, and a lockfile's own URLs still apply (to install through apm's registry, set registry=https://registry.apmjs.dev/ in .npmrc)");
+
+    // another apm registry's URL is never printed as a setting to copy: it could carry a credential
+    const other = await apm(["install", "--pm", "npm"], { cwd });
+
+    expect(other.text).toContain("(to install through apm's registry, point npm's registry setting at it)");
 
     const pointed = folder("b4-npmrc", { "package.json": manifest, ".npmrc": `registry=${server.url.toString()}\n` });
     const through = await apm(["install", "--pm", "npm"], { cwd: pointed });
 
-    expect(through.text).toContain(`npm's configured registry is ${server.url.toString()}`);
-    expect(through.text).not.toContain("to install through apm's registry");
+    expect(through.text).toContain("npm's config points it at apm's registry, and a lockfile's own URLs still apply\n");
 
-    const bun = await apm(["install", "--pm", "bun"], { cwd: folder("b4-bun", { "package.json": manifest, "bunfig.toml": '[install]\nregistry = "https://example.test/"\n' }) });
+    const bun = await apm(["install", "--pm", "bun"], { cwd: folder("b4-bun", { "package.json": manifest, "bunfig.toml": '[install]\nregistry = "https://example.test/"\n' }), registry: "https://registry.apmjs.dev/" });
 
-    expect(bun.text).toContain(`bun's configured registry is https://example.test/, and a lockfile's own URLs still apply (to install through apm's registry, set [install] registry = "${server.url.toString()}" in bunfig.toml)`);
+    expect(bun.text).toContain('bun\'s config names https://example.test/, and a lockfile\'s own URLs still apply (to install through apm\'s registry, set [install] registry = "https://registry.apmjs.dev/" in bunfig.toml)');
 
-    // a registry URL with credentials in it is printed as its host and path only
-    const secret = folder("b4-secret", { "package.json": manifest, ".npmrc": "registry=https://user:hunter2@private.example.test/npm/?token=abc\n" });
+    // a registry setting is printed as its origin only: a credential can sit in the user, the path or the query
+    const secret = folder("b4-secret", { "package.json": manifest, ".npmrc": "registry=https://user:hunter2@private.example.test/npm/sekrit-path-token/?token=abc\n" });
     const redacted = await apm(["install", "--pm", "npm"], { cwd: secret });
 
-    expect(redacted.text).toContain("npm's configured registry is https://private.example.test/npm/,");
-    expect(redacted.text).not.toContain("hunter2");
-    expect(redacted.text).not.toContain("token=abc");
+    expect(redacted.text).toContain("npm's config names https://private.example.test/,");
+
+    for (const secretPart of ["hunter2", "sekrit-path-token", "token=abc"]) expect(redacted.text).not.toContain(secretPart);
 
     // npm reads no .npmrc above the project root
     folder("b4-parent", { ".npmrc": "registry=https://parent.example.test/\n" });
     const child = await apm(["install", "--pm", "npm"], { cwd: folder("b4-parent/child", { "package.json": manifest }) });
 
-    expect(child.text).toContain("npm's configured registry is https://registry.npmjs.org/");
+    expect(child.text).toContain("npm uses https://registry.npmjs.org/ unless its config names another");
   });
 
   test("D15: with no version tagged latest, apm add, apm explain and apm score name the tag to ask for", async () => {
@@ -228,6 +234,11 @@ describe("apm's messages for first-time users", () => {
 
     expect(signedIn.text).toContain("Instead, @me/my-lib is free");
 
+    // a registry whose rules for new names apm cannot read: the name is never called available
+    const unknown = await apm(["name", "no-policy-lib"], { cwd, registry: `${server.url.toString()}no-policy/` });
+
+    expect(unknown.text).toContain("is free, but apm could not read this registry's rules for new names");
+
     const signedOut = await apm(["name", "@other/my-lib"], { cwd });
 
     expect(signedOut.text).toContain("! @other/my-lib is free, but only the owner of @other can publish there. Run apm login, then ask again to see whether that is you");
@@ -263,11 +274,15 @@ describe("apm's messages for first-time users", () => {
     expect(yanked.text.split("\n")[0]).toBe("✗ yanked-pkg@0.0.1-security  score 80/100 (B)");
   });
 
-  test("D2: apm publish without a login says to run apm login before it packs", async () => {
+  test("D2: apm publish --dry-run without a login says the real publish needs apm login", async () => {
     const cwd = folder("d2", { "package.json": JSON.stringify({ name: "@me/pkg", version: "1.0.0", files: ["index.js"] }), "index.js": "module.exports = 1;\n" });
-    const r = await apm(["publish", "--pm", "npm"], { cwd });
+    const r = await apm(["publish", "--dry-run", "--pm", "npm"], { cwd });
 
-    expect(r.code).toBe(1);
-    expect(r.text).toContain(`apm: no apm login token found for ${server.url.toString()}; run apm login first if the upload is refused`);
+    expect(r.text).toContain(`apm: apm found no login token for ${server.url.toString()}; a real publish needs a login (apm login)`);
+
+    // a real publish is not told it lacks a login before anything has failed: the package manager may have its own
+    const real = await apm(["publish", "--pm", "npm"], { cwd });
+
+    expect(real.text).not.toContain("found no login token");
   });
 });
