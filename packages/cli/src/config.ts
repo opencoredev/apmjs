@@ -68,12 +68,12 @@ export function sameRegistry(a: string, b: string): boolean {
 }
 
 /**
- * The registry APM_TOKEN is issued for: APM_REGISTRY, else `registry=` in the user .npmrc, else the default.
- * A project .npmrc and npm_config_registry never count: both can come from a cloned repo
- * (`npm run` exports project config as npm_config_* variables).
+ * The registry APM_TOKEN is issued for: APM_REGISTRY, else `registry=` in ~/.npmrc, else the default.
+ * A project .npmrc, npm_config_registry and npm_config_userconfig never count: all three can come from a cloned repo
+ * (`npm run` exports project config, `userconfig=` included, as npm_config_* variables).
  */
 export function tokenRegistry(env: Record<string, string | undefined>): string {
-  return withSlash(env.APM_REGISTRY ?? readNpmrc(userconfigPath(env)).get("registry") ?? DEFAULT_REGISTRY);
+  return withSlash(env.APM_REGISTRY ?? readNpmrc(join(env.HOME ?? homedir(), ".npmrc")).get("registry") ?? DEFAULT_REGISTRY);
 }
 
 export function loadConfig(cwd: string, env: Record<string, string | undefined>): Config {

@@ -202,6 +202,24 @@ describe("finding 2: APM_TOKEN only goes to the registry it was issued for", () 
     expect(score.out).toContain("APM_TOKEN");
   });
 
+  test("npm run's npm_config_userconfig, which a project .npmrc sets, does not decide where APM_TOKEN goes", async () => {
+    // a project .npmrc with registry= and userconfig= reaches every npm run script as npm_config_registry and
+    // npm_config_userconfig (checked with npm 10.9.9 and 11.21.1): both name the attacker's host
+    const spy = standIn();
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg);
+    const steered = join(app, "evil-userconfig");
+
+    writeFileSync(steered, `registry=${spy.url}\n`);
+    const env = { ...laptopEnv(sb.env), APM_TOKEN: "apm_SECRET_CANARY_TOKEN_1234567890", npm_config_registry: spy.url, npm_config_userconfig: steered };
+    const score = await apm(["score", "leakpkg"], { cwd: app, env });
+
+    await spy.stop();
+    expect(spy.seen.length, score.out).toBeGreaterThan(0);
+    expect(spy.seen.filter((s) => (s.auth ?? "").includes("CANARY")), score.out).toEqual([]);
+    expect(score.out).toContain("APM_TOKEN");
+  });
+
   test("APM_TOKEN still goes to the registry in the user config", async () => {
     const sb = makeSandbox(reg, alice);
     const r = await apm(["whoami"], { cwd: sb.home, env: { ...laptopEnv(sb.env), APM_TOKEN: alice } });
