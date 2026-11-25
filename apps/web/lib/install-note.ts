@@ -27,12 +27,63 @@ function base(registry: string): string {
   return registry.replace(/\/?$/, "/");
 }
 
-export function installCommand({ client, name, version }: { client: InstallClient; name: string; version: string | null }): string {
-  const spec = version ? `${name}@${version}` : name;
+/**
+ * How the install commands name the version a page shows, the same on the page and in its Markdown view:
+ * - default: the version installs get by name (latest). apm add resolves its own (it may pick an older one past the
+ *   cooldown); stock clients pin `version`, or take the bare name when it is unknown.
+ * - tag: a dist-tag, asked for with ?v=<tag> or the default when no installable version is tagged latest.
+ * - exact: a version asked for by number; every command pins it.
+ */
+export type InstallSpec =
+  | { readonly kind: "default"; readonly version: string | null }
+  | { readonly kind: "tag"; readonly tag: string }
+  | { readonly kind: "exact"; readonly version: string };
+
+/** The version or tag an agent's verdict request names after `name@`, or null for the bare name. */
+export function specSuffix(install: InstallSpec): string | null {
+  switch (install.kind) {
+    case "default":
+      return null;
+    case "tag":
+      return install.tag;
+    case "exact":
+      return install.version;
+    default: {
+      const _exhaustive: never = install;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * Whether a dist-tag name may go into a shell command or the agent prompt as it is. npm's tags reach the web unchecked
+ * (apm checks only its own packages' tags), so any other tag is not offered: the command pins the version instead.
+ */
+export const isSafeTag = (tag: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(tag);
+
+/** How long apm's cooldown holds a new version back (packages/core DEFAULT_POLICY.cooldownMs). */
+export const COOLDOWN_MS = 24 * 60 * 60_000;
+
+/** Whether a version published at `publishedAt` is inside apm's cooldown at `now`; false when the time is unknown. */
+export function inCooldown(input: { publishedAt: string | null | undefined; now: number }): boolean {
+  const at = Date.parse(input.publishedAt ?? "");
+
+  return Number.isFinite(at) && input.now - at < COOLDOWN_MS;
+}
+
+/** What the install box says about a version inside the cooldown, in the words the page uses. */
+export const cooldownText = (version: string): string =>
+  `${version} was published under 24 hours ago, inside apm's cooldown. apm add warns about it and --strict refuses it; plain bun, npm and pnpm install it without that check.`;
+
+export function installCommand({ client, name, install }: { client: InstallClient; name: string; install: InstallSpec }): string {
+  const suffix = specSuffix(install);
+  const pinned = install.kind === "default" && install.version !== null ? `${name}@${install.version}` : null;
+  const spec = suffix === null ? (pinned ?? name) : `${name}@${suffix}`;
 
   switch (client) {
     case "apm":
-      return `apm add ${name}`;
+      return `apm add ${suffix === null ? name : spec}`;
     case "bun":
       return `bun add ${spec}`;
     case "npm":

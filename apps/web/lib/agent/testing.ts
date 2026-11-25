@@ -3,7 +3,25 @@ import type { ExcerptAnswer } from "../file-excerpt";
 import type { Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { SearchAnswer } from "../search-schema";
-import type { AgentSource, NameReport, ResolveOutcome, VersionInfo } from "./source";
+import type { PolicyRead } from "../refusal";
+import { parseResolve, type AgentSource, type NameReport, type ResolveOutcome, type ScoreReport, type VersionInfo } from "./source";
+
+/** A view whose shown version apm installs, for tests about something else. */
+export const INSTALLS: PolicyRead = { kind: "installs" };
+
+/** Production's resolve answer for ugent_uws@10.9.11 (2026-11-25, `newest.report` left out): a 422 with no `confirmed`. */
+export const UGENT_REFUSED = parseResolve(422, {
+  error: "No version of ugent_uws matching 10.9.11 passes the policy.",
+  name: "ugent_uws",
+  range: "10.9.11",
+  version: null,
+  skipped: [{ version: "10.9.11", reason: "known malicious: the OSSF malicious-packages feed lists ugent_uws@10.9.11 (MAL-2026-20430)", revokeReason: null }],
+  newest: { version: "10.9.11" },
+  knownMalicious: [{ name: "ugent_uws", version: "10.9.11", ids: ["MAL-2026-20430"] }],
+});
+
+/** resolve's 200 for `version`, with nothing in its tree. */
+export const resolvedTo = (version: string): ResolveOutcome => ({ kind: "ok", version, source: "upstream", report: null, skipped: [], deps: { unchecked: 0, uncheckedDeps: [], reviews: { kind: "unknown" }, warnings: [], risks: [] } });
 
 export const signal = (s: Partial<Signal> & Pick<Signal, "id" | "label" | "points">): Signal => ({ evidence: [], confidence: "confirmed", ...s });
 
@@ -51,6 +69,8 @@ export type Fake = Partial<{
   /** A version's own answer; one given without `unscorable` has none (null), as most versions do. */
   versions: Record<string, Omit<VersionInfo, "unscorable"> & Partial<Pick<VersionInfo, "unscorable">>>;
   reviews: Record<string, ReviewAnswer>;
+  /** Answers of the score route, by name@version; a version not here has latest's score for latest and none otherwise. */
+  scores: Record<string, ScoreReport>;
   resolve: (name: string, range: string) => ResolveOutcome;
   search: SearchAnswer | null;
   names: NameReport | null;
@@ -62,6 +82,12 @@ export type Fake = Partial<{
 export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
   const calls: string[] = [];
   const down = { kind: "unavailable", reason: { kind: "timeout" } } as const;
+
+  const resolve: AgentSource["resolve"] = async ({ name, range }) => {
+    calls.push(`resolve ${name}@${range}`);
+
+    return f.resolve ? f.resolve(name, range) : { kind: "missing", reason: `No package named ${name}.` };
+  };
 
   return {
     calls,
@@ -95,11 +121,15 @@ export function fakeSource(f: Fake = {}): AgentSource & { calls: string[] } {
 
       return r ? { kind: "ok", value: r } : { kind: "missing" };
     },
-    async resolve({ name, range }) {
-      calls.push(`resolve ${name}@${range}`);
+    async score({ name, version }) {
+      calls.push(`score ${name}@${version}`);
 
-      return f.resolve ? f.resolve(name, range) : { kind: "missing", reason: `No package named ${name}.` };
+      if (f.down) return down;
+      const s = f.scores?.[`${name}@${version}`] ?? (f.packages?.[name]?.latest === version ? f.packages[name].score : null);
+
+      return s ? { kind: "ok", value: s } : { kind: "missing" };
     },
+    resolve,
     async search({ query }) {
       calls.push(`search ${query}`);
 

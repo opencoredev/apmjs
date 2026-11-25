@@ -6,7 +6,7 @@ import { ArrowRightIcon, BotIcon, ChevronRightIcon } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { CopyBlock, CopyGlyph, CopyStatus, useCopy } from "@/components/copy-button";
-import { INSTALL_CLIENTS, InstallClient, installCommand, installNote, type InstallNote } from "@/lib/install-note";
+import { INSTALL_CLIENTS, InstallClient, installCommand, installNote, specSuffix, type InstallNote, type InstallSpec } from "@/lib/install-note";
 import { packagePrompt } from "@/lib/agent-prompt";
 import { clickEvent, copyEvent, installDefaultClient, track, trackInstallDefaultShown, type TrackedEvent } from "@/lib/databuddy-client";
 
@@ -101,9 +101,9 @@ function PromptView({ prompt }: { prompt: string }) {
   );
 }
 
-/** One click copies a prompt that has a coding agent add the package only after apm's verdict. */
-function AgentPrompt({ name }: { name: string }) {
-  const prompt = packagePrompt({ name });
+/** One click copies a prompt that has a coding agent add the package (at `version`, a tag or a number) only after apm's verdict. */
+function AgentPrompt({ name, version }: { name: string; version: string | null }) {
+  const prompt = packagePrompt({ name, version });
   const { state, copy } = useCopy();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const preRef = useRef<HTMLDivElement>(null);
@@ -163,7 +163,11 @@ function AgentPrompt({ name }: { name: string }) {
   );
 }
 
-export function InstallTabs({ name, version, registry }: { name: string; version: string | null; registry: string }) {
+/**
+ * `install`: how the commands name the shown version (by name, by its tag, or pinned), the same as the Markdown view.
+ * `inCooldown`: the shown version was published in the last 24 hours, so the box says what apm does with it.
+ */
+export function InstallTabs({ name, version, install, inCooldown, registry }: { name: string; version: string; install: InstallSpec; inCooldown: boolean; registry: string }) {
   const [client, setClient] = useState<InstallClient>("apm");
   const chosen = useRef(false);
   const { state, copy } = useCopy();
@@ -184,7 +188,7 @@ export function InstallTabs({ name, version, registry }: { name: string; version
     };
   }, []);
   const codeRef = useRef<HTMLElement>(null);
-  const command = installCommand({ client, name, version });
+  const command = installCommand({ client, name, install });
   const copied = { name: "install_command_copied", props: { client, package: name } } as const satisfies TrackedEvent;
 
   return (
@@ -240,8 +244,13 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         </button>
       </div>
       <CopyStatus state={state} manual="Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." />
+      {inCooldown && (
+        <p className="rounded-xl bg-warn-soft px-4 py-3 text-sm leading-6 text-pretty">
+          <span className="font-medium text-warn">{version} was published under 24 hours ago, inside apm&apos;s cooldown.</span> apm add warns about it and <code className="font-mono text-[13px] whitespace-nowrap">--strict</code> refuses it; plain bun, npm and pnpm install it without that check.
+        </p>
+      )}
       <Note note={installNote({ client, registry })} client={client} />
-      <AgentPrompt name={name} />
+      <AgentPrompt name={name} version={specSuffix(install)} />
     </section>
   );
 }

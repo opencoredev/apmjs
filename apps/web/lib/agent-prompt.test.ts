@@ -92,3 +92,12 @@ describe("setupPrompt", () => {
     expect(JSON.parse(mcpSetups("https://apmjs.dev/mcp").cursor.text)).toEqual({ mcpServers: { apm: { url: "https://apmjs.dev/mcp" } } });
   });
 });
+
+// HOME-502 Sol review finding 5: the tagged prompt put name@tag in explain_install's package-only name
+test("a prompt for a tag gives the HTTP request name@tag and the MCP tool name and version apart", () => {
+  const p = packagePrompt({ name: "@s/p", version: "next" });
+
+  expect(p).toContain("/api/explain?package=%40s%2Fp%40next");
+  expect(p).toContain('explain_install with name "@s/p" and version "next"');
+  expect(p).not.toContain('name "@s/p@next"');
+});

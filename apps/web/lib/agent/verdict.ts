@@ -267,7 +267,7 @@ function commandsFor(name: string, version: string): Record<InstallClient, strin
   const out: Partial<Record<InstallClient, string>> = {};
 
   // apm add takes the exact version the policy picked, like the package manager it hands off to
-  for (const client of INSTALL_CLIENTS) out[client] = client === "apm" ? `apm add ${name}@${version}` : installCommand({ client, name, version });
+  for (const client of INSTALL_CLIENTS) out[client] = installCommand({ client, name, install: { kind: "exact", version } });
 
   return { apm: out.apm ?? "", bun: out.bun ?? "", npm: out.npm ?? "", pnpm: out.pnpm ?? "" };
 }

@@ -171,3 +171,13 @@ describe("SEO helpers", () => {
     expect(jsonLdText(ld)).not.toContain("</script>");
   });
 });
+
+// HOME-502 Sol review of b1a3a1c, finding 5: a pinned page advertised the unpinned Markdown view
+test("a ?v= share keeps it in the card and the Markdown alternate; the canonical URL stays the package's", () => {
+  const m = packageMetadata({ name: "ugent_uws", description: "", latest: "10.9.11", score: { score: 10, grade: "F" }, v: "10.9.11" });
+
+  expect(m.alternates?.canonical).toBe("/package/ugent_uws");
+  expect(m.alternates?.types).toEqual({ "text/markdown": "/package/ugent_uws.md?v=10.9.11" });
+  expect(JSON.stringify(m.openGraph)).toContain("/og/ugent_uws?v=10.9.11");
+  expect(packageMetadata({ name: "ugent_uws", description: "", latest: "9.0.0", score: null }).alternates?.types).toEqual({ "text/markdown": "/package/ugent_uws.md" });
+});
