@@ -80,6 +80,8 @@ describe("the agent views read version state and the AI review without a cache",
   });
 
   test("a registry that fails mid-way is unreadable, not an empty answer", async () => {
+    // set here too: with only the review failing, the resolve must succeed, whichever test ran before this one
+    answers.set("-/apm/v1/resolve", resolveOk);
     answers.set("-/apm/v1/review/fresh-pkg/1.0.0", { status: 502, body: { error: "upstream" } });
     expect((await registrySource.review({ name: "fresh-pkg", version: "1.0.0" })).kind).toBe("unavailable");
     expect((await explainFor({ name: "fresh-pkg", range: null, source: registrySource })).verdict).toBe("unknown");
