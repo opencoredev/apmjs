@@ -3,7 +3,7 @@
 // Usage: bun tools/ai-review/report.ts [--run main] [--traffic traffic] [--volume live.json,day.json]
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { CACHE_DIR } from "./util.ts";
+import { CACHE_DIR, rng } from "./util.ts";
 import type { CaseResult } from "./run-eval.ts";
 
 const QUOTA = { inputPerMin: 701_079, outputPerMin: 76_559 };
@@ -94,6 +94,13 @@ function throughput(avgIn: number, avgOut: number, avgLatencyMs: number) {
 
 const run = arg("--run", "main");
 const rows = load(run);
+
+// no cached run: a report of nothing would overwrite the committed results/summary.json, which the tests replay
+if (rows.length === 0) {
+  process.stderr.write(`no cached results for run "${run}" under ${CACHE_DIR}: run run-eval.ts first\n`);
+  process.exit(1);
+}
+
 const traffic = load(arg("--traffic", "traffic"));
 const lines: string[] = [];
 const say = (s = ""): void => {
@@ -235,11 +242,8 @@ if (repeat.length) {
 for (const f of volFiles.filter((x) => x.startsWith("day-"))) {
   const d: { distinctPackagesChanged: number; packages: { versionsInWindow: number }[] } = JSON.parse(readFileSync(join(volDir, f), "utf8"));
   const xs = d.packages.map((p) => p.versionsInWindow);
-  let seed = 7;
-  const rand = (): number => {
-    seed = (seed * 1103515245 + 12345) % 2147483648;
-    return seed / 2147483648;
-  };
+  // an LCG in doubles loses its low bits (the product passes 2^53) and cycles early, which narrowed the interval
+  const rand = rng(7);
   const means: number[] = [];
   for (let i = 0; i < 2000; i++) {
     let sum = 0;
