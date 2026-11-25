@@ -46,7 +46,9 @@ export function parseArgs(argv: readonly string[]): Args {
 
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
-      const key = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      const typedKey = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      // npm's spelling of --dev
+      const key = typedKey === "save-dev" ? "dev" : typedKey;
       const next = rest[i + 1];
 
       if (eq > 0) flags.set(key, a.slice(eq + 1));
