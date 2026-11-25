@@ -30,7 +30,8 @@ export type ServerError = {
   readonly code: ErrorCode;
   /** A static label from the worker's route table, such as "GET packument" or "GET render package"; never a path. */
   readonly route: string;
-  readonly status: number;
+  /** The status the worker answered with, or null when it reports before knowing it (the website's onRequestError). */
+  readonly status: number | null;
   /** This version's build id (APM_BUILD), or "" when it has none. */
   readonly build: string;
   /** The Cloudflare location that answered (request.cf.colo, or the cf-ray suffix), or "" when unknown. */
@@ -80,7 +81,7 @@ const CODES: ReadonlySet<string> = new Set(ERROR_CODES);
 export function errorPayload(e: ServerError, now: number): ErrorPayload {
   const code = CODES.has(e.code) ? e.code : "unknown";
   const route = ROUTE_LABEL.test(e.route) ? e.route.replaceAll(" ", "_") : UNKNOWN_ROUTE;
-  const status = Number.isInteger(e.status) && e.status >= 500 && e.status <= 599 ? e.status : 500;
+  const status = e.status === null ? "-" : Number.isInteger(e.status) && e.status >= 500 && e.status <= 599 ? e.status : 500;
   const build = BUILD_ID.test(e.build) ? e.build : "-";
   const colo = COLO.test(e.colo) ? e.colo : "-";
 
