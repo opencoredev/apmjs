@@ -13,7 +13,7 @@ import { z } from "zod";
 import { analyze, PREVIOUS_SCORER, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { apmRoute, OVER_BUDGET_TEXT, resolveResponse, ResolveWait, upstreamRoute } from "../src/apm.ts";
+import { apmRoute, OVER_BUDGET_TEXT, resolveResponse, ResolveWait, scanResponse, upstreamRoute } from "../src/apm.ts";
 import { Auth } from "../src/auth.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
@@ -24,6 +24,7 @@ import { StoreError } from "../src/errors.ts";
 import { ChoicesWriter, driverWriteBytes, keepPlans, KEPT_CHOICES_MAX_AGE_MS, KEPT_CHOICES_MAX_CHOICES, KEPT_CHOICES_MAX_TEXT, keptPlan, KeptSide, KEPT_TEXT_WEIGHTS, utf8Bytes } from "../src/kept-choices.ts";
 import { KEPT_VERSIONS, pageExists, summarize } from "../src/kept-package.ts";
 import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
+import { KnownMalicious } from "../src/osv.ts";
 import { NPM_FAILURE_MS, Upstream } from "../src/upstream.ts";
 import { keptSummary } from "../src/walk-catalog.ts";
 import { measured } from "./pg-proxy.ts";
@@ -109,18 +110,23 @@ const Body = z
 
 const settings = (npm: string) => ({ baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm, legacyAuth: false, namePolicy: "open", admins: [] }) as const;
 
-/**
- * A resolve of `name` (`range`, latest by default) at `at` (NOW by default) in a memory pool of its own, as a new
- * isolate's, or under `lease`; with `store`, the store wrapped by it.
- */
-async function resolve(input: { url: string; npm: string; name: string; strict?: boolean; at?: number; range?: string; store?: (s: StoreApi) => StoreApi; lease?: Lease }) {
-  const params = new URLSearchParams({ name: input.name, range: input.range ?? "latest" });
+/** The OSSF feed, standing in: it lists each `name@version` of `listed` under MAL-TEST, and no advisory of a name. */
+const feedListing = (listed: readonly string[]) =>
+  Layer.succeed(
+    KnownMalicious,
+    KnownMalicious.of({
+      lookup: (pkgs) => Effect.succeed(pkgs.filter((p) => listed.includes(`${p.name}@${p.version}`)).map((p) => ({ name: p.name, version: p.version, ids: ["MAL-TEST"] }))),
+      advisoriesFor: () => Effect.succeed([]),
+    }),
+  );
 
-  if (input.strict) params.set("strict", "1");
+/** Every service a request uses here: a memory pool of its own, as a new isolate's, or `lease`; the store wrapped by `store`. */
+function rigLayers(input: { url: string; npm: string; at?: number; store?: (s: StoreApi) => StoreApi; lease?: Lease; listed?: readonly string[] }) {
   const at = input.at ?? NOW;
   const wrap = input.store ?? ((s: StoreApi) => s);
   const memory = input.lease === undefined ? RequestMemory.layer(new MemoryPool()) : Layer.succeed(RequestMemory, input.lease);
-  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: at, wallNow: at }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(input.npm)), memory);
+  const feed = input.listed === undefined ? Layer.empty : feedListing(input.listed);
+  const base = Layer.mergeAll(Store.postgres(input.url), Clock.fixed({ now: at, wallNow: at }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(input.npm)), memory, feed);
 
   // the wrapped store is the one every service is built with, the upstream reader included
   const wrapped = Layer.provideMerge(
@@ -133,9 +139,19 @@ async function resolve(input: { url: string; npm: string; name: string; strict?:
     base,
   );
 
-  const layers = Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), wrapped);
+  return Layer.provideMerge(Upstream.layer(input.npm, 60_000, null), wrapped);
+}
+
+/**
+ * A resolve of `name` (`range`, latest by default) at `at` (NOW by default), with rigLayers; with `listed`, the OSSF
+ * feed listing those.
+ */
+async function resolve(input: { url: string; npm: string; name: string; strict?: boolean; at?: number; range?: string; store?: (s: StoreApi) => StoreApi; lease?: Lease; listed?: readonly string[] }) {
+  const params = new URLSearchParams({ name: input.name, range: input.range ?? "latest" });
+
+  if (input.strict) params.set("strict", "1");
   const program = Effect.flatMap(resolveResponse(new URL(`http://registry.test/-/apm/v1/resolve?${params}`)), (res) => Effect.promise(async () => ({ status: res.status, text: await res.text() })));
-  const out = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+  const out = await Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
 
   return { status: out.status, text: out.text, body: Body.parse(JSON.parse(out.text)) };
 }
@@ -1328,7 +1344,8 @@ describe("what a resolve reads of the analyses is charged to it, and what does n
 
       expect(full.body.tree?.packages.map((p) => p.name)).toEqual(["dep", "risky"]);
       expect(r.status).toBe(200);
-      expect(r.body.tree?.packages).toEqual([]);
+      // still listed: what needs no score of them is checked (review of 6f206c5, finding 1)
+      expect(r.body.tree?.packages).toEqual(full.body.tree?.packages);
       expect(r.body.warnings?.filter((w) => w.kind === "unchecked").map((w) => w.name)).toEqual(["dep", "risky"]);
       expect(r.text).toContain(OVER_BUDGET_TEXT);
       // on 216a4c7 a version whose analysis was not read had score null: queued for analysis, "not scored yet"
@@ -1417,5 +1434,120 @@ describe("what a resolve reads of the analyses is charged to it, and what does n
         lease.release();
         proxy.close();
       }
+    }));
+});
+
+// Review of 6f206c5. Finding 1: an analysis that did not fit took with it what needs no score: the walk let go of the
+// version it picked, so the OSSF feed never saw it, and the scanner returned before comparing the lockfile's integrity.
+// Finding 6: a version's document and the credentialed abbreviated packument read every version's analysis, so an
+// unrelated one that did not fit made them a 503. Finding 7: a root analysis that landed during the resolve and did not
+// fit its reread answered 404, "No package named".
+describe("what needs no score is checked of a version whose analysis does not fit, and only what is shown is read", () => {
+  const noDigest = (): never => {
+    throw new Error("no digest");
+  };
+
+  const label = (name: string, version: string): string => digestLabel(digestOf({ integrity: integrityOf(`${name}@${version}`), shasum: "1".repeat(40) }) ?? noDigest());
+
+  /** The store with every read of analyses under `allowance` at most, or only those naming a package but `root`. */
+  const capped = (allowance: number, root?: string) => (s: StoreApi): StoreApi => ({
+    ...s,
+    upstreamAnalysesWithin: (input) => (root === undefined || input.keys.some((k) => k.package !== root) ? s.upstreamAnalysesWithin({ ...input, allowance: Math.min(allowance, input.allowance) }) : s.upstreamAnalysesWithin(input)),
+  });
+
+  const ScanBody = z
+    .object({
+      advisories: z.array(z.object({ package: z.string(), level: z.string() })),
+      blocked: z.array(z.object({ package: z.string(), kind: z.string() })),
+      unchecked: z.array(z.object({ package: z.string(), reason: z.string() })),
+      pending: z.array(z.object({ package: z.string() })),
+    })
+    .loose();
+
+  async function scan(input: { url: string; npm: string; packages: { name: string; version: string; integrity?: string }[]; store?: (s: StoreApi) => StoreApi }) {
+    const req = new Request("http://registry.test/-/apm/v1/scan", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packages: input.packages }) });
+    const program = Effect.flatMap(scanResponse(req, { kind: "user", user: "someone", tokenHash: "0".repeat(64), scope: "publish" }), (res) => Effect.promise(async () => ScanBody.parse(await res.json())));
+
+    return Effect.runPromise(program.pipe(Effect.provide(rigLayers(input)), Effect.scoped));
+  }
+
+  test("a dependency the OSSF feed lists is refused in every mode, whether its analysis fit or not", () =>
+    withRig(async ({ url, npm, sql }) => {
+      for (const [n, v] of [["app", "1.0.0"], ["dep", "1.0.0"], ["risky", "1.0.0"]] as const) await scored(sql, n, v);
+
+      for (const store of [undefined, capped(0, "app")]) {
+        for (const strict of [false, true]) {
+          const r = await resolve({ url, npm: npm.url, name: "app", strict, store, listed: ["risky@1.0.0"] });
+
+          // on 6f206c5 an analysis that did not fit let risky@1.0.0 install, with a warning that it was not checked
+          expect(r.status).toBe(422);
+          expect(r.text).toContain("MAL-TEST");
+        }
+      }
+    }));
+
+  test("a scanned version whose analysis does not fit still has its integrity compared, and is unchecked, never clean", () =>
+    withRig(async ({ url, npm, sql }) => {
+      await scored(sql, "dep", "1.0.0");
+      const other = await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("other bytes") }], store: capped(0) });
+
+      // on 6f206c5: unchecked, with no fatal advisory, so a lockfile naming other bytes installed in the default mode
+      expect(other.blocked).toEqual([{ package: "dep", kind: "integrity" }]);
+      expect(other.advisories.map((a) => a.level)).toEqual(["fatal"]);
+      const same = await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("dep@1.0.0") }], store: capped(0) });
+
+      expect(same.blocked).toEqual([]);
+      expect(same.pending).toEqual([]);
+      expect(same.unchecked).toEqual([{ package: "dep", reason: OVER_BUDGET_TEXT }]);
+      // and with room for it, scored: nothing unchecked
+      expect((await scan({ url, npm: npm.url, packages: [{ name: "dep", version: "1.0.0", integrity: integrityOf("dep@1.0.0") }] })).unchecked).toEqual([]);
+    }));
+
+  test("a version's document and the credentialed install packument read no analysis of another version", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("twoscores", [doc("twoscores", "1.0.0"), doc("twoscores", "1.0.1")]);
+      await scored(sql, "twoscores", "1.0.1");
+      // 1.0.0's analysis is far past what the requests below may hold, 1.0.1's well inside it
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) SELECT 'twoscores', '1.0.0', $1, scorer, analysis || jsonb_build_object('padding', repeat('x', 300000)), 0 FROM upstream_analysis WHERE package = 'twoscores'", [label("twoscores", "1.0.0")]);
+
+      const served = async (path: string, viaSafe: boolean, headers?: Record<string, string>) => {
+        const req = new Request(`http://registry.test${path}`, { headers });
+        const program = Effect.flatMap(upstreamRoute(req, new URL(req.url), viaSafe), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+        return Effect.runPromise(program.pipe(Effect.provide(rigLayers({ url, npm: npm.url, store: capped(100_000) })), Effect.scoped));
+      };
+
+      for (const viaSafe of [false, true]) {
+        const r = await served("/twoscores/1.0.1", viaSafe);
+
+        // on 6f206c5: 503, both versions' analyses read
+        expect(r.status).toBe(200);
+        expect(r.text).toContain('"_apmScore"');
+      }
+
+      expect((await served("/twoscores", false, { authorization: "Bearer x", accept: "application/vnd.npm.install-v1+json" })).status).toBe(200);
+      // the full packument embeds every version's score: one that does not fit is a 503, never left out
+      expect((await served("/twoscores", false)).status).toBe(503);
+    }));
+
+  test("a root analysis that lands during the resolve and does not fit its reread is a 503 naming the budget, not a 404", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("late", [doc("late", "1.0.0")]);
+      let reads = 0;
+
+      // the first read finds no analysis of late@1.0.0, so the resolve waits for it; by the reread it has landed, too large
+      const landing = (s: StoreApi): StoreApi => ({
+        ...s,
+        upstreamAnalysesWithin: (input) =>
+          ++reads === 1 ? s.upstreamAnalysesWithin(input) : Effect.flatMap(Effect.promise(() => (reads === 2 ? scored(sql, "late", "1.0.0") : Promise.resolve())), () => s.upstreamAnalysesWithin({ ...input, allowance: 0 })),
+      });
+
+      const r = await resolve({ url, npm: npm.url, name: "late", store: landing });
+
+      expect(reads).toBeGreaterThanOrEqual(2);
+      // on 6f206c5: 404, "No package named late"
+      expect(r.status).toBe(503);
+      expect(r.text).toContain(OVER_BUDGET_TEXT);
+      expect(r.text).not.toContain("No package named");
     }));
 });

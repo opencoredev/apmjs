@@ -577,9 +577,13 @@ export function manifestMismatch(body: Record<string, unknown>, tar: Record<stri
  * `unavailable`: the upstream could not be asked, so whether the dependency exists, and what it is, is not known.
  * `over-budget`: the request held as much package metadata as it may (REQUEST_METADATA_WEIGHT), so it was not read.
  * `out-of-time`: the walk's time ran out (WALK_BUDGET_MS) before it was read.
+ * `unread`: the version picked, read without its analysis, which did not fit the request: what needs no score (its
+ * state, the OSSF feed, apm's reviewers, its integrity) is still checked of it, and it is never taken for one with no
+ * score, so it is unchecked for `reason`.
  */
 type Picked =
   | { kind: "found"; src: Catalog; v: VersionRecord }
+  | { kind: "unread"; src: Catalog; v: VersionRecord; reason: string }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string }
   | { kind: "over-budget"; reason: string }
@@ -593,6 +597,9 @@ const found = (src: Catalog, v: VersionRecord): Picked => ({ kind: "found", src,
  * request had no room left to hold it (REQUEST_METADATA_WEIGHT).
  */
 type Lookup = Catalog | null | "unknown" | "over-budget";
+
+/** A catalog read as a lookup is, or one kept without its analyses, which did not fit the request (Upstream.chosen). */
+type CatalogRead = Lookup | { kind: "unread"; src: Catalog };
 
 /** What the walk's `keep` reads of a version to decide whether it may install: its package, number and state. */
 type Keepable = Pick<VersionRecord, "package" | "version" | "status">;
@@ -653,7 +660,7 @@ function pickFrom(src: Lookup, dep: RegistryDependency, keep: (v: Keepable) => b
  * batch given a deadline answers "out-of-time", and the readers that come here (a resolve's root) give none: it would
  * mean the package was not read, so it counts as not asked.
  */
-function lookupOf(p: ChosenAnswer<Catalog> | undefined): Lookup {
+function lookupOf(p: ChosenAnswer<Catalog> | undefined): CatalogRead {
   if (p === undefined) return "unknown";
 
   switch (p.kind) {
@@ -666,6 +673,8 @@ function lookupOf(p: ChosenAnswer<Catalog> | undefined): Lookup {
       return "unknown";
     case "over-budget":
       return "over-budget";
+    case "unread":
+      return { kind: "unread", src: p.summary };
     default: {
       const _exhaustive: never = p;
 
@@ -815,6 +824,12 @@ function pickMemo(lease: Lease, keep: (v: Keepable) => boolean, deadline: { at: 
           // a package npm had: its picks; one not read in time: unchecked, for that reason; otherwise every range of it
           // is picked from what the lookup came to
           if (answer?.kind === "found") known.set(pickKey(d), answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT });
+          // its analyses did not fit: the version it picks is kept, so what needs no score is still checked of it
+          else if (answer?.kind === "unread") {
+            const p = answer.summary.get(pickKey(d)) ?? { kind: "unavailable", reason: UNAVAILABLE_TEXT };
+
+            known.set(pickKey(d), p.kind === "found" ? { kind: "unread", src: p.src, v: p.v, reason: OVER_BUDGET_TEXT } : p);
+          }
           else if (answer?.kind === "out-of-time") known.set(pickKey(d), { kind: "out-of-time", reason: outOfTimeText(deadline.ms) });
           else known.set(pickKey(d), pickFrom(answer === undefined ? "unknown" : answer.kind === "absent" ? null : answer.kind, d, keep));
         }
@@ -2812,7 +2827,7 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
         continue;
       }
 
-      if (picked.kind !== "found") {
+      if (picked.kind !== "found" && picked.kind !== "unread") {
         miss(dep, item.edge === "peer" ? `peer dependency: ${picked.reason}` : picked.reason, item.via);
         continue;
       }
@@ -2852,6 +2867,17 @@ const walkTree = (input: { root: VersionRecord; policy: Policy; target: InstallT
       packages.push(platform === null ? { name: dep.name, version: picked.v.version } : { name: dep.name, version: picked.v.version, platform });
       const digest = digestOf(picked.v);
       digests.push(digest ? digestLabel(digest) : null);
+      if (picked.kind === "unread") {
+        // its score did not fit the request: unchecked, never pending or clean. It stays listed, so the OSSF feed and
+        // apm's reviewers still decide on it, and what it installs is walked
+        miss(dep, picked.reason, item.via);
+        limited = true;
+        children.set(key, installedChildren(picked.v.manifest));
+
+        for (const e of installEdges(picked.v.manifest)) queue.push({ dep: e.spec, edge: e.edge, via: [...item.via, key], installedAs: [...item.installedAs, dep.key], level: item.level + 1 });
+        continue;
+      }
+
       let v = picked.v;
 
       // a capped resolve (anonymous) queues only what its allowance admits, nearest first; the rest answer as queued ones
@@ -3031,6 +3057,22 @@ const NOT_SCORED_YET = "not scored yet";
 const CONFIRMED_SKIP = "confirmed malicious by an apm reviewer";
 
 const answered = (response: Response): ResolvePass => ({ kind: "answer", response });
+
+/** A resolve's root as read: one kept without its analyses is over budget, since the answer embeds its report whole. */
+const rootRead = (got: CatalogRead): Lookup => (got !== null && typeof got === "object" && got.kind === "unread" ? "over-budget" : got);
+
+/**
+ * A resolve whose root could not be looked up, or did not fit the request: nothing to install and not a pass, so a 503 a
+ * retry may get past, naming which (an absent root is a 404).
+ */
+const rootUnread = (name: string, range: string, why: "unknown" | "over-budget") =>
+  json(
+    why === "unknown"
+      ? { error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }
+      : { error: `${name}: ${OVER_BUDGET_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, retryAfter: PENDING_RETRY_AFTER_S },
+    503,
+    { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) },
+  );
 
 const waitingOn = (p: Omit<Extract<ResolvePass, { kind: "pending" }>, "kind">): ResolvePass => ({ kind: "pending", ...p });
 
@@ -3217,11 +3259,15 @@ const resolveWalk = (input: PassInput) =>
       pageLease?.release();
       pageLease = nextLease;
 
-      if (got === null || got === "unknown" || got === "over-budget") {
-        return answered(json({ error: `${name} ${UNAVAILABLE_TEXT}: apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
+      const read = rootRead(got);
+
+      if (read === null || read === "unknown" || read === "over-budget") {
+        const why = read === "over-budget" ? `: ${OVER_BUDGET_TEXT}, so` : ` ${UNAVAILABLE_TEXT}:`;
+
+        return answered(json({ error: `${name}${why} apm could not read past the ${offset} newest versions in range. Nothing was installed; try again in a minute.`, name, range, version: null, skipped, retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) }));
       }
 
-      page = got;
+      page = read;
     }
 
     const newestReport = newest ? reportFor(newest, at) : null;
@@ -3396,8 +3442,7 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
     const candidates: KeyedSelect = { key: rootKey(range, 0), select: (full) => rootPage(full, range, 0) };
     // a later page of the root's candidates, when the first is all skipped (review of 2fbf383, finding 4)
     const page: PageRead = (offset, under) => catalogWithin(name, under, { key: rootKey(range, offset), select: (full) => rootPage(full, range, offset) });
-    const first = yield* catalogWithin(name, rootLease, candidates);
-    let src: Catalog | null | "unknown" = first === "over-budget" ? "unknown" : first;
+    let src = rootRead(yield* catalogWithin(name, rootLease, candidates));
 
     /** The root read afresh: the catalog it replaces is given back. */
     const reload = Effect.gen(function* () {
@@ -3406,13 +3451,8 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
       rootLease.release();
       rootLease = next;
 
-      return got === "unknown" || got === "over-budget" ? null : got;
+      return rootRead(got);
     });
-
-    // the package itself could not be looked up: there is no version to install, and a retry may find one
-    if (src === "unknown") {
-      return json({ error: `${name} ${UNAVAILABLE_TEXT}. Nothing was installed; try again in a minute.`, name, range, version: null, unavailable: [{ dependency: name, via: [] }], retryAfter: PENDING_RETRY_AFTER_S }, 503, { "cache-control": "no-store", "retry-after": String(PENDING_RETRY_AFTER_S) });
-    }
 
     const configured = Option.getOrElse(yield* Effect.serviceOption(ResolveWait), () => RESOLVE_WAIT);
     const wait = { maxMs: Math.min(configured.maxMs, asked.maxMs), pollMs: configured.pollMs };
@@ -3420,7 +3460,9 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
     let waited = 0;
 
     for (;;) {
-      if (!src) return fail(404, `No package named ${name}.`);
+      if (src === null) return fail(404, `No package named ${name}.`);
+
+      if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
       const pass = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: false }, lease, allowance });
 
       if (pass.kind === "answer") return pass.response;
@@ -3438,7 +3480,9 @@ export const resolveResponse = (url: URL, queueing: ResolveQueueing = QUEUE_ALL)
         // the wait is over: what landed is read afresh, and what is still pending is a warning
         src = yield* reload;
 
-        if (!src) return fail(404, `No package named ${name}.`);
+        if (src === null) return fail(404, `No package named ${name}.`);
+
+        if (src === "unknown" || src === "over-budget") return rootUnread(name, range, src);
         const last = yield* resolvePass({ name, range, policy, treePolicy, target, project, src, page, mode: { strict, final: true }, lease, allowance });
 
         if (last.kind === "answer") return last.response;
@@ -3567,18 +3611,21 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     });
 
     // only the version asked about is kept of its package
-    const src = yield* catalogWithin(p.name, lease, { key: `version ${p.version}`, select: (full) => full.versions.filter((v) => v.version === p.version) });
+    const read = yield* catalogWithin(p.name, lease, { key: `version ${p.version}`, select: (full) => full.versions.filter((v) => v.version === p.version) });
 
-    if (src === "over-budget") return unchecked(OVER_BUDGET_TEXT);
+    if (read === "over-budget") return unchecked(OVER_BUDGET_TEXT);
 
     // the registry or npm could not be asked: not clean, and kept apart from a version nobody has
-    if (src === "unknown") return [flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")] satisfies ScanOne[];
+    if (read === "unknown") return [flagged(stateWarning({ kind: "unavailable", name: p.name, version: p.version, text: UNAVAILABLE_TEXT, url, via: [] }), "unavailable")] satisfies ScanOne[];
 
     // a bundled version ships inside its parent's tarball, which the parent's score covers: only its version state is
     // asked about here, and a version no registry knows is the parent's to vouch for (review of 2a098b1, finding 2)
     const parentVouches: ScanOne[] = [{ kind: "clean" }];
 
-    if (src === null) return p.bundled === true ? parentVouches : unchecked("not on this registry or upstream");
+    if (read === null) return p.bundled === true ? parentVouches : unchecked("not on this registry or upstream");
+    // a version whose analysis did not fit is still checked for all that needs no score (its state, integrity and
+    // reviewers), then unchecked, never pending or clean
+    const src = read.kind === "unread" ? read.src : read;
     const v0 = src.versions.find((x) => x.version === p.version);
 
     if (!v0) return p.bundled === true ? parentVouches : unchecked("no such version");
@@ -3619,6 +3666,8 @@ const scanOne = (input: { p: { name: string; version: string; integrity?: string
     // inside the cooldown: a warning (strict: refused), and the version is still checked
     const fresh = cooldownWarning({ name: p.name, version: p.version, ageMs: at - v0.published_at, cooldownMs: policy.cooldownMs, url, via: [] });
     const findings: ScanOne[] = [...yanked, ...unverified, ...(fresh ? [flagged(fresh, "cooldown")] : [])];
+
+    if (read.kind === "unread") return [...findings, ...unchecked(OVER_BUDGET_TEXT)] satisfies ScanOne[];
     // a stored analysis of these exact bytes is reused; a version never analyzed is queued (capped for anonymous callers)
     const needsQueue = !parseAnalysis(v0.score) && !v0.unscorable;
 
@@ -4144,15 +4193,28 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
   });
 
 /**
- * The analyses upstreamRoute reads of a package: a tarball's version's, else every version's (the packument and a
- * version's document embed each one's _apmScore, and ~safe's view picks versions by them), all trimmed: only a score,
- * a grade, signals and coverage are read of them (compact, policyBlock).
+ * The analyses upstreamRoute reads of a package, all trimmed: only a score, a grade, signals and coverage are read of
+ * them (compact, policyBlock). A tarball's version's, and an exact version's document's: the one score it embeds and
+ * ~safe keeps it by. None for the abbreviated packument outside ~safe, which embeds no score and keeps every version.
+ * Otherwise every version's: the full packument embeds each one's _apmScore, and a tag's document is of the version
+ * the tag names among those kept (the view's, the feeds'), latest falling back to the highest of them.
  */
-const routeWanted = (name: string, rest: readonly string[]): Wanted => {
-  const file = rest[0] === "-" ? rest[1] : undefined;
-  const version = file ? tarballVersion(name, file) : null;
+const routeWanted = (input: { name: string; rest: readonly string[]; viaSafe: boolean; abbreviated: boolean }): Wanted => {
+  const [spec, file] = input.rest;
 
-  return (pkg) => new Map((file ? (version ? [version] : []) : pkg.versions.map((v) => v.version)).map((v) => [v, "trimmed"] as const));
+  if (spec === "-" && file) {
+    const version = tarballVersion(input.name, file);
+
+    return () => new Map(version ? [[version, "trimmed"] as const] : []);
+  }
+
+  if (input.rest.length === 0 && input.abbreviated && !input.viaSafe) return () => new Map();
+
+  return (pkg) => {
+    const exact = input.rest.length === 1 && spec !== undefined && tagTarget(pkg.distTags, spec) === undefined;
+
+    return new Map((exact ? [spec] : pkg.versions.map((v) => v.version)).map((v) => [v, "trimmed"] as const));
+  };
 };
 
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
@@ -4201,7 +4263,8 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // the packument and the devDependencies the full one adds back are held together under the request's lease until
     // the answer is sent
     const lease = yield* RequestMemory;
-    const src = yield* lookupWithin(sp.name, lease, routeWanted(sp.name, sp.rest));
+    const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
+    const src = yield* lookupWithin(sp.name, lease, routeWanted({ name: sp.name, rest: sp.rest, viaSafe, abbreviated }));
 
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
     // client retries, never "Not found", which npm reports as a package that does not exist
@@ -4306,7 +4369,6 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     }
 
     if (sp.rest.length > 0) return null;
-    const abbreviated = (req.headers.get("accept") ?? "").includes("application/vnd.npm.install-v1+json");
 
     const [confirmed, advisories] = yield* Effect.all([confirmedVersions(src.name, src.versions), advisoriesOf(src.name)], { concurrency: "unbounded" });
     const listed = listedAmong(src.name, advisories, versionsAndTags(src));

@@ -82,8 +82,12 @@ export type BudgetedProbe = Probe | { kind: "over-budget" };
 /** A summaries answer for one name: BudgetedProbe, with what the caller kept in place of the package. */
 export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" };
 
-/** What Upstream.chosen answers for a package: a summary's answer, or "out-of-time" when its deadline came first. */
-export type ChosenAnswer<S> = Summarized<S> | { kind: "out-of-time" };
+/**
+ * What Upstream.chosen answers for a package: a summary's answer, "out-of-time" when its deadline came first, or
+ * "unread": kept, but with none of its analyses, which did not fit the request (every version reads unscored, and a
+ * reader must take each as not checked, never as one with no score).
+ */
+export type ChosenAnswer<S> = Summarized<S> | { kind: "out-of-time" } | { kind: "unread"; summary: S };
 
 /**
  * What Upstream.chosen holds of a package between reading it and keeping it: the versions each choice took, cut down
@@ -823,7 +827,7 @@ export type UpstreamApi = {
    * down (summaryVersion), their dist-tags charged with them; once every package is read, the analyses of only the
    * versions they took are read, whole or trimmed as `analyses` says, in one statement bounded by the lease's headroom
    * (Store.upstreamAnalysesWithin), and each package is kept with its analyses charged to `lease`. A package one of
-   * whose analyses did not fit is "over-budget", never a package with no score.
+   * whose analyses did not fit is kept without them and answered "unread", never as a package with no score.
    */
   readonly chosen: <S>(input: { names: readonly string[]; lease: Lease; choices: (name: string) => readonly Choice[]; keep: (c: Chosen, reserve: Reserve) => Summary<S> | null; analyses: "whole" | "trimmed"; deadline?: number }) => Effect.Effect<Map<string, ChosenAnswer<S>>, StoreError>;
   /**
@@ -1845,18 +1849,21 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const got = yield* store.upstreamAnalysesWithin({ keys, allowance: lease.headroom, weights: KEPT_TEXT_WEIGHTS }).pipe(Effect.onError(() => Effect.sync(() => lease.give(picked.reduce((n, p) => n + p.weight, 0)))));
               /** What each package's analyses hold once read, taken from `lease` while its answer holds them. */
               const held = new Map<string, number>();
-              /** Packages whose analyses were not all read, or did not fit once read: "over-budget", never unscored. */
+              /**
+               * Packages whose analyses were not all read, or did not fit once read: kept without any of them, and
+               * answered "unread", so a reader still knows which versions it picked (and checks what needs no score)
+               * but never takes one for a version with no score.
+               */
               const unread = new Set(got.omitted);
 
               for (const [name, sizes] of got.sizes) {
                 const weight = sizes.reduce((n, s) => n + parsedWeight(s), 0);
 
                 if (!unread.has(name) && lease.take(weight)) held.set(name, weight);
-                else {
-                  unread.add(name);
-                  got.analyses.delete(name);
-                }
+                else unread.add(name);
               }
+
+              for (const name of unread) got.analyses.delete(name);
 
               const plans: PlanHandle[] = [];
 
@@ -1895,17 +1902,26 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
                * kept, handed `p`'s picks: their charge is given back as keep starts, since keep reserves all it keeps of
                * them itself, as it did of a whole package, and taken again when it did not fit, for one more try alone.
                */
-              const settled = (p: Picked, last: boolean): Summarized<S> => {
+              const settled = (p: Picked, last: boolean): ChosenAnswer<S> => {
                 lease.give(p.weight);
-
-                if (unread.has(p.name)) return { kind: "over-budget" };
                 const answer = kept(p);
 
-                if (answer.kind === "over-budget" && !last && lease.take(p.weight)) again.push(p);
-                // a package not kept lets go of its analyses with its answer
-                else if (answer.kind !== "found") lease.give(held.get(p.name) ?? 0);
+                if (answer.kind === "over-budget" && !last && lease.take(p.weight)) {
+                  again.push(p);
 
-                return answer;
+                  return answer;
+                }
+
+                // a package not kept lets go of its analyses with its answer: nothing refers to them past here
+                if (answer.kind !== "found") {
+                  got.analyses.delete(p.name);
+                  lease.give(held.get(p.name) ?? 0);
+                  held.delete(p.name);
+
+                  return answer;
+                }
+
+                return unread.has(p.name) ? { kind: "unread", summary: answer.summary } : answer;
               };
 
               const out = new Map<string, ChosenAnswer<S>>([...picks].map(([name, p]) => [name, p.kind === "picked" ? settled(p.picked, false) : p] as const));
