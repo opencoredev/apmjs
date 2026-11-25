@@ -210,6 +210,7 @@ describe("review input", () => {
     expect(system).toContain("whose contents you were not shown is never a finding by itself either");
     expect(system).toContain("an install script that downloads and runs code from a host other than the package's own release host");
     expect(system).toContain("a reachable call into an unrelated third-party dependency made only for its side effects");
+    expect(system).toContain("an unused require of the package's own files does not");
   });
 });
 
