@@ -1409,8 +1409,8 @@ type Written = { lockfile: Uint8Array; backup: Backup };
  * otherwise writes that lockfile (and package.json, as computed) to the project and installs exactly it, frozen. The
  * package manager reads the project's own configuration and registry, as `npm install` would.
  */
-async function installWithoutScripts(input: { cwd: string; det: Detection & { pm: LockPm }; remove?: readonly string[] }): Promise<number> {
-  const { det, remove } = input;
+async function installWithoutScripts(input: { cwd: string; det: Detection & { pm: LockPm } }): Promise<number> {
+  const { det } = input;
   const pm = det.pm;
   const environment = withoutSecrets(process.env);
 
@@ -1430,34 +1430,13 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
 
   const layout = found.layout;
   const t = targets(layout);
-  // a removal may only take packages out: every package of the lockfile it computes must be in the one there now
-  const lockPath = join(layout.root, t.lockfile);
-  const before = remove === undefined ? null : existsSync(lockPath) ? readLock({ pm, path: lockPath, cwd: join(layout.root, layout.member) }) : { kind: "missing" as const };
-
-  if (before !== null && before.kind !== "read") {
-    fail(`refused: apm remove needs a lockfile it can read (${before.kind === "unreadable" ? before.reason : `there is no ${t.lockfile}`}), so ${pm} installs nothing apm has not checked. Nothing was run.`);
-
-    return done(1);
-  }
-
   const copy = copyProject(layout);
   let checked: Written;
 
   try {
-    if (remove !== undefined) {
-      const missing = withoutDependencies(join(copy.dir, t.manifest), remove);
+    const cmd = installLockOnlyArgs(pm);
 
-      if (missing.length > 0) {
-        fail(`apm remove: ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${t.manifest}. Nothing was run.`);
-
-        return done(1);
-      }
-    }
-
-    // pnpm keeps the lockfile frozen in CI, and a removal must change it (in the copy, which installs nothing)
-    const cmd = [...installLockOnlyArgs(pm), ...(remove !== undefined && pm === "pnpm" ? ["--no-frozen-lockfile"] : [])];
-
-    say(dim(`apm: ${remove === undefined ? "no packages given" : `removing ${remove.join(", ")}`}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
+    say(dim(`apm: no packages given; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
     const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: environment, stdoutToStderr: true });
 
     if (run.code !== 0) {
@@ -1485,35 +1464,6 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
     const graph = lockGraph(withMemberNames(read.nodes, layout.members), { integrityKnown: true, members: layout.members });
 
     if (refuseNotRegistry({ graph, pm, lockfile: t.lockfile, nothing: "Nothing was installed or run, and your project is unchanged." })) return done(1);
-
-    if (before !== null && before.kind === "read") {
-      const had = new Set(before.nodes.map((n) => idOf(n)));
-      const added = [...new Set(read.nodes.map((n) => idOf(n)).filter((id) => !had.has(id)))];
-
-      if (added.length > 0) {
-        fail(`refused: removing ${remove?.join(", ")} would make ${pm} install ${added.slice(0, 5).join(", ")}${added.length > 5 ? ` and ${added.length - 5} more` : ""}, which ${t.lockfile} does not have, unchecked. Nothing was installed, and your project is unchanged.`);
-        say("Run apm add for what package.json lists that the lockfile lacks, then apm remove again.");
-
-        return done(1);
-      }
-
-      // the removal takes packages out only, so the package manager's own removal (which also prunes) runs in the project
-      const native = [pm, "remove", ...(remove ?? [])];
-
-      say(dim(`→ ${native.join(" ")}  (it takes out only packages ${t.lockfile} has)`));
-      const code = (await runCmd(native, { cwd: join(layout.root, layout.member), env: environment, stdoutToStderr: jsonMode })).code;
-      const after = readLock({ pm, path: join(layout.root, t.lockfile), cwd: join(layout.root, layout.member) });
-      const extra = after.kind === "read" ? [...new Set(after.nodes.map((n) => idOf(n)).filter((id) => !had.has(id)))] : null;
-
-      if (code === 0 && (extra === null || extra.length > 0)) {
-        fail(`apm remove: ${pm} wrote a ${t.lockfile} with packages it did not have before (${extra === null ? "apm could not read it" : extra.slice(0, 5).join(", ")}); check it before you install again.`);
-
-        return done(1);
-      }
-
-      return done(code);
-    }
-
     const applied = applyChecked({ layout, copy, computed });
 
     switch (applied.kind) {
@@ -1568,6 +1518,150 @@ async function installWithoutScripts(input: { cwd: string; det: Detection & { pm
   say(dim(`apm: installed the ${t.lockfile} ${pm} computed; no install script ran (--ignore-scripts)`));
 
   return done(0);
+}
+
+/** A dependency spec apm cannot check before the package manager fetches what it names: a URL, git, a path, a tarball. */
+function fetchedSpec(spec: string): boolean {
+  const tag = /^[a-z][\w.-]*$/i;
+
+  if (spec === "" || isValidRange(spec) || tag.test(spec) || spec.startsWith("workspace:") || spec.startsWith("catalog:")) return false;
+  const alias = /^npm:(?:@[^/@]+\/)?[^/@]+(?:@(.*))?$/.exec(spec);
+
+  return alias === null || (alias[1] !== undefined && !isValidRange(alias[1]) && !tag.test(alias[1]));
+}
+
+/** Every dependency entry of the package.json files at `root` and its members, or null when one cannot be read. */
+function declaredSpecs(root: string, members: readonly { dir: string }[]): { file: string; name: string; spec: string }[] | null {
+  const out: { file: string; name: string; spec: string }[] = [];
+
+  for (const dir of new Set(["", ...members.map((m) => m.dir)])) {
+    const file = join(root, dir, "package.json");
+    const manifest = readManifest(file);
+
+    if (manifest === null) return null;
+
+    for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+      const deps = z.record(z.string(), z.string()).safeParse(manifest[field] ?? {});
+
+      if (!deps.success) return null;
+      out.push(...Object.entries(deps.data).map(([name, spec]) => ({ file, name, spec })));
+    }
+  }
+
+  return out;
+}
+
+/** The JSON object at `path`, or null. */
+function readManifest(path: string): z.infer<typeof JsonObject> | null {
+  try {
+    const parsed = JsonObject.safeParse(JSON.parse(readFileSync(path, "utf8")));
+
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `apm remove <names>` (bun 1.2 and later, npm, pnpm). A removal brings the project in line with package.json, so the
+ * package manager would install anything package.json lists that the lockfile lacks, unchecked. apm first takes the
+ * names out in a copy of the project and has the package manager compute the lockfile there, installing nothing, and
+ * refuses when that lockfile has any package the current one lacks. Only then does the package manager's own removal
+ * run, made to use the lockfile, and apm confirms the lockfile gained nothing.
+ */
+async function checkedRemoval(input: { cwd: string; det: Detection & { pm: LockPm }; names: readonly string[] }): Promise<number> {
+  const { det, names } = input;
+  const pm = det.pm;
+  const environment = withoutSecrets(process.env);
+
+  // the lockfile settings are apm's for a removal: it is computed, checked and installed from the lockfile
+  for (const key of Object.keys(environment)) if (/^(npm|pnpm)_config_(package[-_]lock|package[-_]lock[-_]only|lockfile|frozen[-_]lockfile|prefer[-_]frozen[-_]lockfile|shrinkwrap)$/i.test(key)) delete environment[key];
+
+  const refuse = (reason: string): number => {
+    fail(`refused: ${reason}. Nothing was run.`);
+
+    return 1;
+  };
+
+  const found = projectLayout({ cwd: input.cwd, pm });
+
+  if (found.kind === "refused") return refuse(found.reason);
+  const layout = found.layout;
+  const t = targets(layout);
+
+  if (pm === "bun") {
+    const version = (await runCmd(["bun", "--version"], { cwd: input.cwd, env: environment, quiet: true })).out.trim();
+
+    if (!Bun.semver.satisfies(version, ">=1.2.0")) return refuse(`bun ${version || "of unknown version"} does not read bun.lock, so apm cannot check what its removal installs; use bun 1.2 or later`);
+  }
+
+  const specs = declaredSpecs(layout.root, layout.members);
+
+  if (specs === null) return refuse("apm could not read every package.json of the project");
+  const fetched = specs.find((d) => fetchedSpec(d.spec));
+
+  if (fetched !== undefined) return refuse(`${fetched.file} lists ${fetched.name} as ${fetched.spec}, which ${pm} would fetch before apm could check it; apm remove handles registry versions only`);
+  const lockPath = join(layout.root, t.lockfile);
+  const before = existsSync(lockPath) ? readLock({ pm, path: lockPath, cwd: join(layout.root, layout.member) }) : null;
+
+  if (before === null || before.kind !== "read") return refuse(`apm remove needs a lockfile it can read (${before === null ? `there is no ${t.lockfile}` : before.kind === "unreadable" ? before.reason : t.lockfile}), so ${pm} installs nothing apm has not checked`);
+  const had = new Set(before.nodes.map((n) => idOf(n)));
+  const copy = copyProject(layout);
+  let empty: boolean;
+
+  try {
+    const missing = withoutDependencies(join(copy.dir, t.manifest), names);
+
+    if (missing.length > 0) return refuse(`${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${t.manifest}`);
+    const cmd = [...installLockOnlyArgs(pm), ...(pm === "npm" ? ["--package-lock=true"] : pm === "pnpm" ? ["--no-frozen-lockfile", "--config.lockfile=true"] : [])];
+
+    say(dim(`apm: removing ${names.join(", ")}; → ${cmd.join(" ")}  (${pm}: ${det.why}; in a copy of your project, which installs nothing)`));
+    const run = await runCmd(cmd, { cwd: join(copy.dir, layout.member), env: environment, stdoutToStderr: true });
+
+    if (run.code !== 0) {
+      fail(`apm remove: ${pm} could not compute the lockfile (exit ${run.code}). Your project is unchanged.`);
+
+      return run.code;
+    }
+
+    const computedPath = join(copy.dir, t.lockfile);
+    const copySpecs = declaredSpecs(copy.dir, layout.members);
+
+    // a package manager deletes the lockfile of a project left with no dependencies
+    empty = copySpecs !== null && copySpecs.length === 0;
+
+    if (!existsSync(computedPath) && !empty) return refuse(`${pm} computed no ${t.lockfile}, so apm cannot check what the removal installs`);
+    const computed = existsSync(computedPath) ? readLock({ pm, path: computedPath, cwd: join(copy.dir, layout.member) }) : null;
+
+    if (computed !== null && computed.kind !== "read") return refuse(`apm could not read the ${t.lockfile} ${pm} computed`);
+    const added = [...new Set((computed?.nodes ?? []).map((n) => idOf(n)).filter((id) => !had.has(id)))];
+
+    if (added.length > 0) {
+      fail(`refused: removing ${names.join(", ")} would make ${pm} install ${added.slice(0, 5).join(", ")}${added.length > 5 ? ` and ${added.length - 5} more` : ""}, which ${t.lockfile} does not have, unchecked. Nothing was installed, and your project is unchanged.`);
+      say("Run apm add for what package.json lists that the lockfile lacks, then apm remove again.");
+
+      return 1;
+    }
+  } finally {
+    removeTemp(copy.dir);
+  }
+
+  const native = pm === "npm" ? ["npm", "uninstall", "--package-lock=true", ...names] : pm === "pnpm" ? ["pnpm", "remove", "--config.lockfile=true", ...names] : ["bun", "remove", ...names];
+
+  say(dim(`→ ${native.join(" ")}  (it takes out only packages ${t.lockfile} has)`));
+  const code = (await runCmd(native, { cwd: join(layout.root, layout.member), env: environment, stdoutToStderr: jsonMode })).code;
+
+  if (code !== 0) return code;
+  const after = existsSync(lockPath) ? readLock({ pm, path: lockPath, cwd: join(layout.root, layout.member) }) : null;
+  const extra = after === null ? (empty ? [] : null) : after.kind === "read" ? [...new Set(after.nodes.map((n) => idOf(n)).filter((id) => !had.has(id)))] : null;
+
+  if (extra === null || extra.length > 0) {
+    fail(`apm remove: ${pm} left a ${t.lockfile} apm cannot confirm (${extra === null ? "apm could not read it" : `it now has ${extra.slice(0, 5).join(", ")}`}); check it before you install again.`);
+
+    return 1;
+  }
+
+  return 0;
 }
 
 async function cmdAdd(a: Args): Promise<number> {
@@ -2348,11 +2442,12 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm run <script|file>      your package manager's run (bun: with --no-install)
   apm <script>               a package.json script (apm dev = bun run dev)
   apm remove <pkg>...        your package manager's removal, by name, once apm checked it installs nothing new
+                             (bun 1.2 and later, npm, pnpm; not yarn)
   apm test                   your package manager's test; npm and pnpm also start, why, ls and outdated, yarn start and why
   apm ci                     npm only: npm ci, with the switches apm install takes with no packages
   apm <anything else>        refused: it could install packages apm cannot check
-  apm <command> --help       an apm command's flags (also -h, or apm help <command>); runs nothing. After a command
-                             apm passes on, --help goes to the package manager or the script
+  apm <command> --help       an apm command's flags (also -h, or apm help <command>; also ci and remove); runs nothing.
+                             After another command apm passes on, --help goes to the package manager or the script
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
   --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
@@ -2472,7 +2567,7 @@ async function passthrough(a: Args): Promise<number> {
 
   if (!native && !script) {
     fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
-    say(REMOVALS.has(a.cmd) ? "To remove a package, run apm remove <package>." : `To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+    say(REMOVALS.has(a.cmd) ? (det.pm === "yarn" ? "apm cannot check a removal with yarn; run yarn remove <package> yourself." : "To remove a package, run apm remove <package>.") : `To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
 
     return 2;
   }
@@ -2487,8 +2582,7 @@ async function passthrough(a: Args): Promise<number> {
     return 2;
   }
 
-  // a removal is computed in a copy, checked to take packages out only, and installed from that lockfile (installWithoutScripts)
-  if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return installWithoutScripts({ cwd, det: { pm: det.pm, why: det.why }, remove: args.filter((x) => x !== "--") });
+  if (REMOVALS.has(a.cmd) && isLockPm(det.pm)) return checkedRemoval({ cwd, det: { pm: det.pm, why: det.why }, names: args.filter((x) => x !== "--") });
 
   const command = script ? ["run", a.cmd] : [a.cmd];
 

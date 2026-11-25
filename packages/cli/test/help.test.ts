@@ -45,7 +45,7 @@ async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_
   for (const [name, text] of Object.entries(files)) writeFileSync(join(cwd, name), text);
 
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
-    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : "";
+    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : pm === "bun" ? `[ "$1" = --version ] && echo 1.4.4 && exit 0\n` : "";
 
     writeFileSync(join(bin, pm), `#!/bin/sh\n${version}echo "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
     chmodSync(join(bin, pm), 0o755);
@@ -542,7 +542,7 @@ describe("what still goes to the package manager", () => {
     const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { [file]: lock });
 
     expect(r.code, r.out + r.err).toBe(0);
-    expect(r.pmCalls.at(-1)).toBe(`${pm} remove zod`);
+    expect(r.pmCalls.at(-1)).toBe({ bun: "bun remove zod", npm: "npm uninstall --package-lock=true zod", pnpm: "pnpm remove --config.lockfile=true zod" }[pm]);
     expect(r.pmCalls).toHaveLength(2);
   });
 
@@ -550,7 +550,7 @@ describe("what still goes to the package manager", () => {
     [["remove", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no bun.lock)"],
     [["remove", "--pm", "npm", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no package-lock.json)"],
     [["remove", "--pm", "yarn", "zod"], withDeps({ zod: "^4.0.0" }), { "yarn.lock": ZOD_LOCKS[3]?.[2] ?? "" }, "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new"],
-    [["remove", "left-pad"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "apm remove: left-pad is not in package.json"],
+    [["remove", "left-pad"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "refused: left-pad is not in package.json. Nothing was run."],
     [["remove"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "apm remove needs the names of the packages to remove"],
   ] as const)("apm %p is refused", async (argv, packageJson, files, message) => {
     const r = await apm([...argv], "1.22.22", packageJson, files);
@@ -560,11 +560,11 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual([]);
   });
 
-  test("apm uninstall with yarn points to apm remove, not yarn's own uninstall", async () => {
+  test("apm uninstall with yarn points to yarn remove, not yarn's own uninstall", async () => {
     const r = await apm(["uninstall", "--pm", "yarn", "zod"]);
 
     expect(r.code, r.out + r.err).toBe(2);
-    expect(r.out + r.err).toContain("To remove a package, run apm remove <package>.");
+    expect(r.out + r.err).toContain("apm cannot check a removal with yarn; run yarn remove <package> yourself.");
     expect(r.out + r.err).not.toContain("yarn uninstall");
     expect(r.pmCalls).toEqual([]);
   });
