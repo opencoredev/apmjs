@@ -80,7 +80,7 @@ Open the link. The approval page shows the files and the score evidence first, t
 
 Everything waiting for you is listed at [apmjs.dev/publish](https://apmjs.dev/publish), and every package you publish, with its latest version, score and anything waiting, at [apmjs.dev/account/packages](https://apmjs.dev/account/packages). An upload nobody approves expires after 24 hours; publish again to get a new link.
 
-A prerelease-only package published with the default tag has only a `next` tag and no `latest`, so a plain `apm add @you/my-lib` or `npm install @you/my-lib` finds no version. Install it by the tag it was published with, normally `apm add @you/my-lib@next`, until you publish a plain version such as `1.0.0`.
+On the plain registry, a prerelease-only package published with the default tag has a `next` tag and no `latest`, so a plain `apm add @you/my-lib` or `npm install @you/my-lib` finds no version. Install it by the tag it was published with, normally `apm add @you/my-lib@next`, until you publish a plain version such as `1.0.0`.
 
 ## Publishing from an agent
 

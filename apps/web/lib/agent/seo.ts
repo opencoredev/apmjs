@@ -9,7 +9,7 @@ export const SITE_NAME = "apm";
 export const SITE_TITLE = "apm: check npm packages before you install them";
 
 export const SITE_DESCRIPTION =
-  "A package registry in front of npm. Every version gets a security score with the cited line behind every lost point, versions under 24 hours old get a warning (strict mode hides them), and bad ones can be yanked or revoked. Works with bun, npm and pnpm.";
+  "A package registry in front of npm. Every version gets a security score with the cited line behind every lost point, and bad ones can be yanked or revoked. Works with bun, npm and pnpm.";
 
 /** Search engines show about this many characters of a description. */
 const DESCRIPTION_CHARS = 158;
