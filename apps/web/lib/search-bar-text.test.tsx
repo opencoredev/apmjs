@@ -1,7 +1,6 @@
 // Review of cd74781, findings 3 and 4: an npm outage is not "no packages match", and screen readers hear loading,
 // failures and partial answers, not only counts.
 import { describe, expect, mock, test } from "bun:test";
-import * as navigation from "next/navigation";
 
 // bun:test module mocks last for the whole run, so keep every real export: a file that runs later (approval-ui
 // renders a view that calls useParams) imports this mock, not next/navigation

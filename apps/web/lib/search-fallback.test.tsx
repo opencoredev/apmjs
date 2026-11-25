@@ -2,7 +2,6 @@
 // in a form with no action reloads the current page with ?q= appended (the "it sends me back to next" report). The
 // server-rendered HTML alone has to send the query to /?q=<query>. Rendered with react-dom/server, no browser.
 import { describe, expect, mock, test } from "bun:test";
-import * as navigation from "next/navigation";
 import { renderToStaticMarkup } from "react-dom/server";
 
 let pathname = "/package/next";
