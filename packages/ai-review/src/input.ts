@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
+import { citable, cutAt, kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -143,7 +143,10 @@ function header(input: { name: string; version: string; previous: string | null;
 }
 
 /** A not-read path as the result records it: the wire contract (wire.ts WireNotRead) holds paths to MAX_PATH_CHARS. */
-const recordedPath = (path: string): string => (path.length > MAX_PATH_CHARS ? `${path.slice(0, MAX_PATH_CHARS - 1)}…` : path);
+const recordedPath = (path: string): string => cutAt(path, MAX_PATH_CHARS);
+
+/** npm's longest package name. */
+const MAX_DEPENDENCY_NAME = 214;
 
 function notReadOf(b: Budget, input: { binaries: readonly TarEntry[]; tooLarge: readonly string[]; pkg: PackageFiles }): NotRead[] {
   const files: NotRead[] = [
@@ -153,7 +156,8 @@ function notReadOf(b: Budget, input: { binaries: readonly TarEntry[]; tooLarge: 
     ...input.binaries.map((f): NotRead => ({ kind: "file", path: recordedPath(f.path), reason: "binary" })),
   ];
 
-  const deps = dependencyNamesOf(input.pkg.manifest).map((name): NotRead => ({ kind: "dependency", name }));
+  // a name is a publisher's package.json key; the wire holds it to npm's longest (wire.ts WireNotRead)
+  const deps = dependencyNamesOf(input.pkg.manifest).map((name): NotRead => ({ kind: "dependency", name: cutAt(name, MAX_DEPENDENCY_NAME) }));
 
   return [...files, ...deps];
 }
@@ -180,7 +184,7 @@ export type BuildOptions = { budgetTokens?: number };
 /** A first publish, or a version whose previous one is not available: the files themselves. */
 export function buildFilesInput(input: { name: string; version: string; pkg: PackageFiles } & BuildOptions): ReviewInput {
   const { pkg } = input;
-  const b = new Budget(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN));
+  const b = budgetAfter(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN), header({ name: input.name, version: input.version, previous: null, pkg, extra: [] }));
   const all = pkg.files.map((f) => `${listedPath(f.path)} (${f.size} bytes)`);
   const listing = all.length > 200 ? [...all.slice(0, 200), `…and ${all.length - 200} more files`] : all;
 
@@ -197,7 +201,7 @@ export function buildFilesInput(input: { name: string; version: string; pkg: Pac
   const shown = ordered(pkg.manifest, pkg.files, pkg.files);
 
   for (const f of shown) {
-    if (f.data.length > MAX_DECODED_BYTES || f.path.length > MAX_PATH_CHARS) tooLarge.push(f.path);
+    if (f.data.length > MAX_DECODED_BYTES || !citable(f.path)) tooLarge.push(f.path);
     else if (b.left < MIN_BLOCK_CHARS) b.skip(f.path);
     else {
       const l = linesOf(textOf(f));
@@ -216,23 +220,38 @@ function sameBytes(a: TarEntry, b: TarEntry): boolean {
   return a.size === b.size && Buffer.compare(Buffer.from(a.data), Buffer.from(b.data)) === 0;
 }
 
+/** Characters one list of paths above the files may take, so many long paths cannot crowd out the files themselves. */
+const MAX_LIST_CHARS = 1_500;
+
+/** The first `max` items, and no more than MAX_LIST_CHARS of them. */
 function listed(label: string, items: readonly string[], max: number): string {
-  return `${label} (${items.length}): ${items.slice(0, max).join(", ")}${items.length > max ? " …" : ""}`;
+  const shown: string[] = [];
+  let chars = 0;
+
+  for (const item of items.slice(0, max)) {
+    if (chars + item.length > MAX_LIST_CHARS) break;
+    shown.push(item);
+    chars += item.length + 2;
+  }
+
+  return `${label} (${items.length}): ${shown.join(", ")}${items.length > shown.length ? " …" : ""}`;
 }
 
-/** A path in a list of paths: short enough that a few hundred of them stay inside the budget's slack. */
+/** A path in a list of paths. */
 const MAX_LISTED_PATH = 200;
 
 function listedPath(path: string): string {
-  const p = shownPath(path);
+  return cutAt(shownPath(path), MAX_LISTED_PATH);
+}
 
-  return p.length > MAX_LISTED_PATH ? `${p.slice(0, MAX_LISTED_PATH)}…` : p;
+/** The budget left for files once the header above them is counted: it is outside the blocks, but the model reads it. */
+function budgetAfter(chars: number, headerText: string): Budget {
+  return new Budget(Math.max(0, chars - headerText.length));
 }
 
 /** An update: package.json in full plus line diffs of added and changed files, numbered as in the new version. */
 export function buildDiffInput(input: { name: string; version: string; previousVersion: string; pkg: PackageFiles; prev: PackageFiles } & BuildOptions): ReviewInput {
   const { pkg, prev } = input;
-  const b = new Budget(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN));
   const before = new Map(prev.files.map((f) => [f.path, f]));
   const after = new Set(pkg.files.map((f) => f.path));
   const added = pkg.files.filter((f) => !before.has(f.path));
@@ -249,6 +268,8 @@ export function buildDiffInput(input: { name: string; version: string; previousV
     listed("Removed files", removed.map((f) => listedPath(f.path)), 30),
     listed("Changed files", changed.map((f) => listedPath(f.path)), 60),
   ];
+
+  const b = budgetAfter(Math.floor((input.budgetTokens ?? DEFAULT_BUDGET_TOKENS) * CHARS_PER_TOKEN), header({ name: input.name, version: input.version, previous: input.previousVersion, pkg, extra: summary }));
 
   const pj = pkg.files.find((f) => f.path === "package.json");
   const pjOld = before.get("package.json");
@@ -273,7 +294,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   for (const f of shown) {
     const old = before.get(f.path);
 
-    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES) || f.path.length > MAX_PATH_CHARS) {
+    if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES) || !citable(f.path)) {
       tooLarge.push(f.path);
       continue;
     }

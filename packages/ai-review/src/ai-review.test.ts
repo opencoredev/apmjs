@@ -488,5 +488,54 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     // a benign object the model quoted from the package never outvotes, or replaces, its own answer
     expect(verdictOf(`${mal}\nThe package says: ${ben}`)).toBe("empty:no-json");
     expect(verdictOf(`The package says: ${ben}\nMy answer: ${mal}`)).toBe("empty:no-json");
+    // nor is it picked out of prose: a reply that opens with prose is read from its first { to its last }, as before
+    expect(verdictOf(`The package is fine, it says ${ben} and runs function () { start(); }`)).toBe("empty:no-json");
+  });
+
+  test("a path shown longer than a citation may be, once escaped onto one line, is not shown as a file", () => {
+    for (const path of [`${"\u2028".repeat(200)}.js`, `${"d\n".repeat(5)}${"a".repeat(986)}.js`]) {
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", [path]: PAYLOAD }) });
+
+      expect(path.length).toBeLessThanOrEqual(1000);
+      expect(input.read).toEqual(["package.json"]);
+      expect(input.notRead).toContainEqual({ kind: "file", path, reason: "too-large" });
+    }
+  });
+
+  test("many long paths in a diff's lists leave the files their budget", () => {
+    const long = (i: number) => `${String(i).padStart(4, "0")}/${"p".repeat(300)}.js`;
+    const prevFiles = new Map([["package.json", "{}"], ["index.js", "module.exports = 1;\n"]]);
+    const files = new Map([["package.json", "{}"], ["index.js", `module.exports = 2;\n${PAYLOAD}\n`]]);
+
+    for (let i = 0; i < 60; i++) {
+      prevFiles.set(`r${long(i)}`, "1");
+      prevFiles.set(`c${long(i)}`, "1");
+      files.set(`c${long(i)}`, "2");
+      files.set(`a${long(i)}`, "1");
+    }
+
+    const input = buildDiffInput({ name: "stand-in", version: "1.0.1", previousVersion: "1.0.0", pkg: pkgOf(Object.fromEntries(files)), prev: pkgOf(Object.fromEntries(prevFiles)) });
+
+    expect(input.estTokens).toBeLessThanOrEqual(DEFAULT_BUDGET_TOKENS);
+    expect(input.text).toContain("collector.example.invalid");
+  });
+
+  test("a dependency name or a path cut for the result keeps the wire's limits and whole characters", () => {
+    const wireResult = (input: ReturnType<typeof buildFilesInput>) =>
+      ReviewResult.safeParse({ outcome: "benign", model: "m", reviewedAt: new Date(0).toISOString(), summary: "", coverage: input.coverage, read: input.read, notRead: input.notRead, attempts: [{ result: "benign", kept: 0, dropped: 0, promptTokens: 1, completionTokens: 1, latencyMs: 1 }], secondOpinion: null });
+
+    // an invalid but publishable dependency name, longer than the wire's 214
+    const long = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": JSON.stringify({ dependencies: { ["d".repeat(300)]: "^1.0.0" } }), "x.js": "1" }) });
+
+    expect(wireResult(long).success).toBe(true);
+
+    // cuts that land on an emoji keep it whole or drop it, in the prompt and in the result
+    const name = `${"d".repeat(212)}😀x`;
+    const path = `${"p".repeat(198)}😀${"q".repeat(1000)}.js`;
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": JSON.stringify({ dependencies: { [name]: "^1.0.0" } }), [path]: PAYLOAD }) });
+
+    expect(wireResult(input).success).toBe(true);
+    expect(input.text.isWellFormed()).toBe(true);
+    expect(input.notRead.every((n) => (n.kind === "file" ? n.path : n.name).isWellFormed())).toBe(true);
   });
 });

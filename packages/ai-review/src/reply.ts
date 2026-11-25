@@ -64,9 +64,10 @@ function topLevelObjects(s: string): string[] {
 const WithVerdict = z.object({ verdict: z.unknown() }).loose();
 
 /**
- * The answer in a reply that may be wrapped in a code fence or prose. The whole reply when it is JSON; else the object
- * with a verdict among those the reply holds, so prose with braces after the answer does not lose it. Two of them that
- * disagree are no answer: one may be text the model quoted from the package.
+ * The answer in a reply that may be wrapped in a code fence or prose. The whole reply when it is JSON. A reply that
+ * starts with a verdict object and goes on in prose (braces and all) keeps that object, unless another verdict in it
+ * disagrees. A reply that starts with prose is taken from its first `{` to its last `}`, as before: a verdict object
+ * after prose may be one the model quoted from the package, so it is never picked out of the prose on its own.
  */
 function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
   const s = content
@@ -77,21 +78,14 @@ function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(s) };
   } catch {
-    const answers: z.infer<typeof WithVerdict>[] = [];
+    const objects = s.startsWith("{") ? topLevelObjects(s) : [];
+    const answers = objects.flatMap((text) => verdictObject(text) ?? []);
+    const first = objects[0];
+    const opening = first === undefined ? null : verdictObject(first);
 
-    for (const text of topLevelObjects(s)) {
-      try {
-        const v = WithVerdict.safeParse(JSON.parse(text));
+    // the reply opens with its answer: keep it, unless a verdict later in the reply disagrees with it
+    if (opening !== null) return answers.every((x) => x.verdict === opening.verdict) ? { ok: true, value: opening } : { ok: false };
 
-        if (v.success && "verdict" in v.data) answers.push(v.data);
-      } catch {
-        // not JSON: prose in braces
-      }
-    }
-
-    const verdicts = new Set(answers.map((a) => a.verdict));
-
-    if (answers.length > 0) return verdicts.size === 1 ? { ok: true, value: answers[0] } : { ok: false };
     const a = s.indexOf("{");
     const b = s.lastIndexOf("}");
 
@@ -102,6 +96,17 @@ function jsonIn(content: string): { ok: true; value: unknown } | { ok: false } {
     } catch {
       return { ok: false };
     }
+  }
+}
+
+/** The object in `text` when it is JSON with a verdict key, else null. */
+function verdictObject(text: string): z.infer<typeof WithVerdict> | null {
+  try {
+    const v = WithVerdict.safeParse(JSON.parse(text));
+
+    return v.success ? v.data : null;
+  } catch {
+    return null;
   }
 }
 
