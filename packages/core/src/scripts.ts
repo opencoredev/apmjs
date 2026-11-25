@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { decodedStrings } from "./source.ts";
 import { wildcardMatch } from "./glob.ts";
-import { chargeText } from "./meter.ts";
+import { chargeText, MAX_ANALYSIS_WORK, Meter, MeterExhausted, withMeter } from "./meter.ts";
 
 /**
  * When npm runs a lifecycle script. "install": every install of the tarball. "git": when the package is
@@ -38,6 +38,8 @@ export type HookCommand = { from: string; text: string; viaEval: boolean; added:
 export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[]; addedScripts: string[]; cut: string | null };
 
 const MAX_DEPTH = 8;
+/** Work units the third pass (the shell reading) may spend per hook, on a meter of its own (expandHooks). */
+const MAX_SHELL_READING_WORK = MAX_ANALYSIS_WORK / 16;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
@@ -257,12 +259,16 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 export function* shellWords(cmd: string): Generator<{ word: string; end: number; glob: boolean } | null> {
   let word: string | null = null;
   let glob = false;
+  // the next word is a redirection's file (`> log`, `2>/dev/null`), which the command is not handed
+  let target = false;
   let i = 0;
   // what closes each context the reading is in: `"` a double-quoted string, `)` or a backtick a command substitution
   const open: string[] = [];
 
   const flush = function* (): Generator<{ word: string; end: number; glob: boolean }> {
-    if (word !== null) yield { word, end: i, glob };
+    if (word !== null && !target) yield { word, end: i, glob };
+
+    if (word !== null) target = false;
     word = null;
     glob = false;
   };
@@ -309,10 +315,18 @@ export function* shellWords(cmd: string): Generator<{ word: string; end: number;
     } else if (COMMAND_END.has(c)) {
       yield* flush();
       yield null;
+      target = false;
 
       // a group's `)` closes it, not the substitution around it
       if (c === "(") open.push(")");
-    } else if (/\s|[<>]/.test(c)) yield* flush();
+    } else if (c === "<" || c === ">") {
+      // a file descriptor before it (`2>`) is part of the redirection, as are `>>`, `>&` and `>|`
+      if (word !== null && !glob && /^\d+$/.test(word)) word = null;
+      else yield* flush();
+
+      while (/[<>&|]/.test(cmd[i + 1] ?? "")) i++;
+      target = true;
+    } else if (/\s/.test(c)) yield* flush();
     else {
       glob ||= c === "*";
       word = (word ?? "") + c;
@@ -473,15 +487,23 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
     visit(own, `scripts.${hook}`, 0, false, 1);
 
-    // the second pass over what the first read, then the third over what either read
-    for (const [pass, n] of [[2, read.length], [3, Number.POSITIVE_INFINITY]] as const) {
-      for (let i = 0; i < Math.min(n, read.length); i++) {
-        const { text, depth } = read[i] ?? { text: "", depth: 0 };
-        const main = new Set(mainReferences(text, scripts));
-        const refs = pass === 2 ? flagReferences(text, scripts).filter((r) => !main.has(r.name)) : shellReferences(text, scripts);
+    // the second pass over what the first read, as fe2e641 reads it
+    for (let i = 0, n = read.length; i < n; i++) {
+      const { text, depth } = read[i] ?? { text: "", depth: 0 };
+      const main = new Set(mainReferences(text, scripts));
 
-        follow(refs, depth, pass);
-      }
+      follow(flagReferences(text, scripts).filter((r) => !main.has(r.name)), depth, 2);
+    }
+
+    // the third over what either read, on a meter of its own: its work never spends what the analysis has, so running
+    // it out cannot cost a result the first two passes reach, and past it the hook is cut as any reading stopped is
+    try {
+      withMeter(new Meter(MAX_SHELL_READING_WORK), () => {
+        for (const { text, depth } of read) follow(shellReferences(text, scripts), depth, 3);
+      });
+    } catch (e) {
+      if (!(e instanceof MeterExhausted)) throw e;
+      cut ??= `scripts.${hook}: the shell reading of its commands stopped at its work limit (${MAX_SHELL_READING_WORK} units)`;
     }
 
     out.push({ hook, kind, commands, scripts: [...followed], addedScripts, cut });

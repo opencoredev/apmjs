@@ -567,3 +567,23 @@ describe("the third pass's targets wait for fe2e641's whole reading plan", () =>
   });
 });
 
+
+describe("redirections and the third pass's own work meter", () => {
+  for (const cmd of ["npm run 2>/dev/null 'payload'", "npm run > log '-s' payload", "npm run -s >>log 2>&1 \"payload\""]) {
+    test(`a redirection before the name: ${cmd}`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, payload: DROPPER, log: "true", "1": "true" } })[0]?.scripts).toContain("payload");
+    });
+  }
+
+  test("the shell reading spends none of the analysis's work: a tight work limit reads as it did", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", scripts: { postinstall: "run-s build:*", "build:a": "true", "build:b": "true" } };
+    const enc = new TextEncoder();
+    const pj = { path: "package.json", size: enc.encode(JSON.stringify(manifest)).length, mode: 0o644, data: enc.encode(JSON.stringify(manifest)) };
+    const state = { publishedAt: 0, now: 1e12, deprecated: null, status: "active" as const, statusReason: null };
+    const ample = finalize(analyze({ name: "probe-pkg", manifest, files: [pj], publisher: "a", previousPublishers: [] }), state);
+    const work = analyze({ name: "probe-pkg", manifest, files: [pj], publisher: "a", previousPublishers: [], maxWork: 270 });
+
+    expect(finalize(work, state).score).toBe(ample.score);
+  });
+});
+
