@@ -2,7 +2,7 @@
 import "server-only";
 import { z } from "zod";
 import { ExcerptAnswer } from "../file-excerpt";
-import { getExcerpt, getPackage, getRecent, getReview, getVersionInfo, search, type Fetched } from "../registry";
+import { getExcerpt, getPackage, getRecent, getReview, getVersionInfo, getVersionScore, search, type Fetched } from "../registry";
 import { fetchJson, logUnavailable, readCappedText, REGISTRY_TIMEOUT_MS, withTimeout } from "../registry-fetch";
 import { registryFetch } from "../registry-transport";
 import { REGISTRY } from "../registry-url";
@@ -54,6 +54,7 @@ export const registrySource: AgentSource = {
   package: getPackage,
   version: ({ name, version }) => getVersionInfo(name, version),
   review: ({ name, version }) => getReview(name, version),
+  score: ({ name, version }) => getVersionScore(name, version),
   resolve,
   // the website's search: an answer with a local package is read from the registry every time (a revoke changes its
   // description); only one made entirely of npm's packages is served from the cache (lib/registry.ts)

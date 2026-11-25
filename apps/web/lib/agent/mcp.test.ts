@@ -4,7 +4,7 @@ import { z } from "zod";
 import { mcpGet, mcpOptions, mcpPost } from "./mcp-http";
 import type { Json } from "./json";
 import { PROTOCOL_VERSIONS, TOOLS } from "./mcp";
-import { fakeSource, NETWORK, pkg, REVIEW_CLEAN, type Fake } from "./testing";
+import { fakeSource, NETWORK, pkg, resolvedTo, REVIEW_CLEAN, UGENT_REFUSED, type Fake } from "./testing";
 
 const allow = () => ({ ok: true }) as const;
 
@@ -214,20 +214,23 @@ describe("structured answers agree with the text", () => {
     if (!base) throw new Error("pkg() has a score");
     const score = { ...base, signals: [], scorer: "apm-score-v11", capabilities: [{ id: "network" as const, label: "Network: makes requests or opens sockets", status: "not-declared" as const, basis: "code" as const, evidence: ["package.json scripts.preinstall: wget"] }] };
     const refused = { kind: "known-malicious" as const, ids: ["MAL-2026-20430"] };
-    const r = await call("check_package", { name: "ugent_uws", version: "10.9.11" }, { packages: { ugent_uws: p }, versions: { "ugent_uws@10.9.11": { version: "10.9.11", status: "active", statusReason: null, deprecated: null, facts: null, score, refused } } });
+    const r = await call("check_package", { name: "ugent_uws", version: "10.9.11" }, { packages: { ugent_uws: p }, versions: { "ugent_uws@10.9.11": { version: "10.9.11", status: "active", statusReason: null, deprecated: null, facts: null, score } }, resolve: () => UGENT_REFUSED });
 
     expect(r.text).toContain("- Status: do not install.");
     expect(r.structured.refusal).toEqual(refused);
-    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused, installsInstead: "9.0.0" });
+    expect(r.structured.installPolicy).toBe("refused");
+    // not the default, so what a bare install gets is not read
+    expect(r.structured.install).toEqual({ kind: "refused", refusal: refused, installsInstead: null });
     expect(r.text).toContain("- Network (makes requests or opens sockets): seen");
     expect(r.structured.scorerCapabilities).toMatchObject({ kind: "listed", capabilities: [{ id: "network", basis: "code" }] });
     expect(r.structured.capabilities).toContainEqual({ id: "network", label: "Network access", state: "seen" });
   });
 
   test("check_package: an installable version's commands are the text's", async () => {
-    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() } });
+    const r = await call("check_package", { name: "left-pad" }, { packages: { "left-pad": pkg() }, resolve: () => resolvedTo("1.3.0") });
 
     expect(r.structured.refusal).toBeNull();
+    expect(r.structured.installPolicy).toBe("installs");
     expect(r.structured.install).toEqual({ kind: "commands", via: "default", commands: { apm: "apm add left-pad", bun: "bun add left-pad@1.3.0", npm: "npm install left-pad@1.3.0", pnpm: "pnpm add left-pad@1.3.0" } });
     expect(r.text).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
   });

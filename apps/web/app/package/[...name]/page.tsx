@@ -45,7 +45,9 @@ import { packageJsonLd, packageMetadata, pageMetadata } from "@/lib/agent/seo";
 import { canonicalPackagePath } from "@/lib/agent/site";
 import { CapabilityList } from "@/components/capability-list";
 import { scorerCapabilities } from "@/lib/capabilities";
-import { advisoryUrl, noInstallableReason, refusalLabel, refusalOf, refusalReason, type NoInstallable, type Refusal } from "@/lib/refusal";
+import { advisoryUrl, noInstallableReason, readPolicy, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "@/lib/refusal";
+import { registrySource } from "@/lib/agent/registry-source";
+import type { InstallSpec } from "@/lib/install-note";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -689,22 +691,6 @@ function NoInstallableVersion({ pkg, why }: { pkg: PackageInfo; why: NoInstallab
       <div role="alert" className="flex max-w-2xl flex-col gap-1.5 rounded-xl bg-bad-soft px-4 py-3 text-[15px] leading-6 text-pretty">
         <p className="font-medium text-bad">No install command for {pkg.name}.</p>
         <p>{noInstallableReason({ name: pkg.name, why })}</p>
-        {why.kind === "none-served" && (
-          <ul className="flex flex-col gap-1">
-            {why.versions.map((v) => (
-              <li key={v.version}>
-                <span className="font-mono text-[14px]">{v.version}</span>:{" "}
-                {v.refusal.kind === "known-malicious" ? (
-                  <>
-                    listed as malicious by the OSSF malicious-packages feed (<AdvisoryLinks ids={v.refusal.ids} />)
-                  </>
-                ) : (
-                  refusalLabel(v.refusal)
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
       </div>
       {pkg.versions.length > 0 && (
         <section aria-labelledby="versions">
@@ -730,51 +716,54 @@ function AdvisoryLinks({ ids }: { ids: readonly string[] }) {
   ));
 }
 
-/** Leads the page when apm will not install the version shown: why, the advisory, and the version installs get instead. */
-function RefusalBanner({ name, version, refusal, served }: { name: string; version: string; refusal: Refusal; served: string | null }) {
-  return (
-    <div role="alert" className="flex max-w-2xl flex-col gap-1.5 rounded-xl bg-bad-soft px-4 py-3 text-[15px] leading-6 text-pretty">
-      <p className="font-medium text-bad">
-        Do not install {name} {version}.
-      </p>
-      <p>
-        {refusal.kind === "known-malicious" ? (
-          <>
-            The OSSF malicious-packages feed lists it as malicious (<AdvisoryLinks ids={refusal.ids} />
-            ), so apm does not serve it.
-          </>
-        ) : (
-          refusalReason(refusal)
-        )}
-      </p>
-      {served && (
-        <p>
-          <Link href={packagePath(name)} className="font-medium underline underline-offset-4">
-            Show {served}, the version apm installs
-          </Link>
-        </p>
-      )}
-    </div>
-  );
-}
+/**
+ * The install box, once apm's install policy has answered for the shown version (lib/refusal.ts readPolicy): the
+ * commands, or, for a version apm refuses, why, the advisory and no command or agent prompt. A policy that did not
+ * answer keeps the commands: resolve being down is no reason to say a version is refused.
+ */
+async function InstallSlot({ name, version, install, inCooldown, policy }: { name: string; version: string; install: InstallSpec; inCooldown: boolean; policy: Promise<PolicyRead> }) {
+  const p = await policy;
 
-/** The install box's place for a version apm will not install: no command and no agent prompt. */
-function NoInstall({ name, version, served }: { name: string; version: string; served: string | null }) {
+  if (p.kind !== "refused") return <InstallTabs name={name} version={version} install={install} inCooldown={inCooldown} registry={REGISTRY} />;
+  const { refusal, bareGets } = p;
+
   return (
     <section aria-labelledby="install" className="flex flex-col gap-3">
       <h2 id="install" className="scroll-mt-24 text-xl font-medium tracking-tight">
         Install
       </h2>
-      <p className="rounded-xl bg-surface px-4 py-3 text-[15px] leading-6 text-pretty text-muted-foreground">
-        No install command for {version}: apm refuses it.{" "}
-        {served && (
-          <Link href={packagePath(name)} className="text-foreground underline underline-offset-4">
-            Install {served} instead
-          </Link>
-        )}
-      </p>
+      <div role="alert" className="flex max-w-2xl flex-col gap-1.5 rounded-xl bg-bad-soft px-4 py-3 text-[15px] leading-6 text-pretty">
+        <p className="font-medium text-bad">
+          Do not install {name} {version}.
+        </p>
+        <p>
+          <RefusalText refusal={refusal} />
+        </p>
+        <p>
+          No install command: apm refuses this version.{" "}
+          {bareGets && (
+            <Link href={`${packagePath(name)}?v=${encodeURIComponent(bareGets)}`} className="font-medium underline underline-offset-4">
+              A bare install gets {bareGets} instead
+            </Link>
+          )}
+        </p>
+      </div>
     </section>
   );
+}
+
+/** Why apm refuses a version, in the page's words: advisory ids linked, a policy reason as the registry gave it. */
+function RefusalText({ refusal }: { refusal: Refusal }) {
+  if (refusal.kind === "known-malicious") {
+    return (
+      <>
+        The OSSF malicious-packages feed lists it as malicious (<AdvisoryLinks ids={refusal.ids} />
+        ), so apm add refuses it.
+      </>
+    );
+  }
+
+  return refusalReason(refusal);
 }
 
 /** The header's note about an open or confirmed AI review flag, once the review answer arrives. */
@@ -904,6 +893,11 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   // answer or a fresh read of that version
   const shown = version ? shownOf(rows, version, isLatest && pkg.score?.redacted === true) : null;
   const review = shown ? reads.review(shown) : Promise.resolve<Fetched<ReviewAnswer>>(none);
+  const shownRow = pkg.versions.find((v) => v.version === version);
+  // a version the package answer does not list carries its state in its own answer
+  const status = shownRow?.status ?? details?.status ?? "active";
+  // apm's install policy for exactly this version, the read /api/explain makes; only the install box waits for it
+  const policy = readPolicy({ name: pkg.name, version, status, isDefault: isLatest, resolve: registrySource.resolve });
 
   // only when npm's packument has no readme (react's has none): the README in the shown version's tarball, unless that
   // tarball is too large for the registry to open (next's), which it could only refuse
@@ -926,14 +920,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const unscorable = unscored?.kind === "unscorable";
   const latest = pkg.versions.find((v) => v.version === pkg.latest);
   const pulled = pkg.versions.filter((v) => v.status !== "active");
-  const withheldRows = pkg.versions.filter((v) => Boolean(v.refused));
-  const withheldIds = [...new Set(withheldRows.flatMap((v) => (v.refused?.kind === "known-malicious" ? v.refused.ids : [])))];
-  const shownRow = version === null ? undefined : pkg.versions.find((v) => v.version === version);
-  // a version the package answer does not list carries its state in its own answer
-  const refusal = shownRow ? refusalOf(shownRow) : details ? refusalOf(details) : null;
-  // what installs get instead: the version installs get by name, unless that is the version refused
-  const served = refusal && byName.kind === "latest" && byName.version !== version ? byName.version : null;
-  const fresh = refusal === null && inCooldown({ publishedAt: shownRow?.publishedAt ?? details?.publishedAt, now: Date.now() });
+  const fresh = statusRefusal(status) === null && inCooldown({ publishedAt: shownRow?.publishedAt ?? details?.publishedAt, now: Date.now() });
   const versionRows = pkg.versions.toSorted((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).map((v) => ({ ...v, when: ago(v.publishedAt) }));
   const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
   const signInHref = `/signin?next=${encodeURIComponent(here)}`;
@@ -968,15 +955,9 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             <AiNotice review={review} />
           </Suspense>
         </div>
-        {refusal && version && <RefusalBanner name={pkg.name} version={version} refusal={refusal} served={served} />}
-        {asked === undefined && version === pkg.latest && install.kind !== "default" && (
+        {tag && asked === undefined && (
           <p className="text-sm text-muted-foreground">
-            This prerelease is tagged latest, and apm add does not install a prerelease by name, so installs {tag ? <>name its other tag, <span className="font-mono text-foreground">{tag}</span></> : "pin the version"}.
-          </p>
-        )}
-        {tag && asked === undefined && version !== pkg.latest && (
-          <p className="text-sm text-muted-foreground">
-            {pkg.latest === null ? "No version is tagged latest yet." : `apm does not install ${pkg.latest}, the version tagged latest.`} This is the newest, tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.
+            No version is tagged latest. This is the newest tagged version, tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.
           </p>
         )}
         {tag && asked !== undefined && (
@@ -989,7 +970,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             )}
           </p>
         )}
-        {!isLatest && pkg.latest && !served && tag === null && (
+        {!isLatest && pkg.latest && tag === null && (
           <p className="text-sm text-muted-foreground">
             {extra ? `An older version, not among the newest ${pkg.versions.length} listed below.` : "An older version."}{" "}
             <Link href={packagePath(pkg.name)} className="text-foreground underline-offset-4 hover:underline">
@@ -1008,21 +989,6 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             {pulled.map((v) => `${v.version} (${v.status.replace("-", " ")})`).join(", ")}. New installs skip them.
           </p>
         )}
-        {withheldRows.length > 0 && refusal === null && (
-          <p className="max-w-2xl rounded-xl bg-bad-soft px-4 py-3 text-[15px] leading-6 text-pretty">
-            <span className="font-medium text-bad">
-              apm does not serve {withheldRows.length === 1 ? "1 version" : `${withheldRows.length} versions`}{" "}
-              {withheldIds.length === 0 ? "apm reviewers confirmed malicious" : withheldRows.every((v) => v.refused?.kind === "known-malicious") ? "the OSSF malicious-packages feed lists as malicious" : "the OSSF feed lists or apm reviewers confirmed as malicious"}:
-            </span>{" "}
-            {withheldRows.map((v) => v.version).join(", ")}
-            {withheldIds.length > 0 && (
-              <>
-                {" "}(<AdvisoryLinks ids={withheldIds} />)
-              </>
-            )}
-            . New installs skip {withheldRows.length === 1 ? "it" : "them"}.
-          </p>
-        )}
       </header>
 
       {/* Phones get one column in reading order: install, score summary, facts, the full report, capabilities, the AI
@@ -1030,7 +996,9 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
       <div className="flex flex-col gap-10 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-14">
         <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
           <div className="order-1 lg:order-none">
-            {refusal && version ? <NoInstall name={pkg.name} version={version} served={served} /> : <InstallTabs name={pkg.name} version={version} install={install} inCooldown={fresh} registry={REGISTRY} />}
+            <Suspense fallback={<Skeleton className="h-28 w-full rounded-xl" />}>
+              <InstallSlot name={pkg.name} version={version} install={install} inCooldown={fresh} policy={policy} />
+            </Suspense>
           </div>
 
           <section aria-labelledby="score" className="order-4 lg:order-none">

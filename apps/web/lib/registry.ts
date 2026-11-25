@@ -70,15 +70,6 @@ export type Facts = z.infer<typeof Facts>;
 /** A version's full score as the package answer (latest) and the versions route (any version) carry it. */
 const PackageScore = z.object({ score: z.number(), grade: z.string(), signals: z.array(Signal), notChecked: z.array(z.string()).optional(), coverage: Coverage.nullish(), omittedFolders: z.array(OmittedFolder).optional(), ...Reviewable, ...CapabilityFields });
 
-/**
- * Why the registry does not serve a version (its packuments leave it out, its tarball is refused): an apm reviewer
- * confirmed it malicious, or the OSSF malicious-packages feed lists it. An older registry sends none (null).
- */
-const Refused = z.discriminatedUnion("kind", [z.object({ kind: z.literal("confirmed-malicious") }), z.object({ kind: z.literal("known-malicious"), ids: z.array(z.string()) })]);
-
-export type Refused = z.infer<typeof Refused>;
-
-
 const PackageInfo = z.object({
   name: z.string(),
   source: z.enum(["local", "upstream"]),
@@ -118,7 +109,6 @@ const PackageInfo = z.object({
       grade: z.string().nullable(),
       // why apm can never score this version, when it decided so
       unscorable: z.string().nullish(),
-      refused: Refused.nullish(),
     }),
   ),
 });
@@ -135,7 +125,6 @@ const WireHit = z.object({
   package: z.object({ name: z.string(), version: z.string(), description: z.string().nullish(), date: z.string().nullish() }),
   apmScore: z.object({ score: z.number(), grade: z.string() }).nullish(),
   downloads: z.object({ weekly: z.number() }).nullish(),
-  knownMalicious: z.array(z.string()).nullish(),
 });
 
 const WireSearch = z.object({ total: z.number(), upstreamFailed: z.boolean().default(false), objects: z.array(z.unknown()) });
@@ -227,7 +216,6 @@ const VersionInfo = z.object({
   facts: Facts.nullable(),
   score: PackageScore.nullable(),
   unscorable: VersionUnscorable.nullable().default(null),
-  refused: Refused.nullish(),
   // when it was published: picks among tag targets the package answer does not list (shown-version.ts), and the cooldown
   publishedAt: z.string().nullish(),
 });
@@ -360,7 +348,6 @@ export async function search(q: string, signal?: AbortSignal): Promise<SearchAns
       source: o.data.source,
       score: o.data.apmScore ?? null,
       weeklyDownloads: o.data.downloads?.weekly ?? null,
-      malicious: o.data.knownMalicious ?? [],
     });
   }
 

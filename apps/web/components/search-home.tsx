@@ -356,11 +356,6 @@ function ResultRow({
           <span className="flex min-w-0 items-center gap-2">
             <Highlight name={hit.name} q={q} className="text-[15px] sm:text-base" />
             <SourceTag source={hit.source} />
-            {hit.malicious && hit.malicious.length > 0 && (
-              <span title={`${hit.version} is listed as malicious (${hit.malicious.join(", ")}); apm does not serve it`} className="inline-flex h-5 shrink-0 items-center rounded-md bg-bad-soft px-1.5 text-[11px] font-medium text-bad">
-                malicious
-              </span>
-            )}
           </span>
           <span className="truncate text-sm text-muted-foreground">{hit.description || "No description"}</span>
           {/* Phones: version, downloads and score on one line under the description, so the name keeps the row's width. */}

@@ -42,11 +42,11 @@ export function VersionList({ rows, packageHref, current }: { rows: VersionRow[]
                   <Link
                     href={`${packageHref}?v=${encodeURIComponent(v.version)}`}
                     aria-current={v.version === current ? "page" : undefined}
-                    className={cn("font-mono text-[15px] underline-offset-4 hover:underline aria-[current=page]:font-semibold", (v.status !== "active" || Boolean(v.refused)) && "text-muted-foreground line-through")}
+                    className={cn("font-mono text-[15px] underline-offset-4 hover:underline aria-[current=page]:font-semibold", v.status !== "active" && "text-muted-foreground line-through")}
                   >
                     {v.version}
                   </Link>
-                  <StatusBadge status={v.refused ? "malicious" : v.status} />
+                  <StatusBadge status={v.status} />
                   {v.deprecated && <span className="text-xs text-muted-foreground">deprecated</span>}
                 </div>
                 {v.statusReason && <div className="mt-1 text-sm text-muted-foreground">{v.statusReason}</div>}

@@ -6,10 +6,9 @@ import { cooldownText, installCommand, installNote, INSTALL_CLIENTS, specSuffix,
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
-import type { Facts, Fetched, PackageInfo, Refused, Signal } from "../registry";
-import { advisoryUrl, noInstallableReason, refusalLabel, refusalOf, refusalReason, type NoInstallable, type Refusal } from "../refusal";
+import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
+import { advisoryUrl, noInstallableReason, refusalReason, statusRefusal, type NoInstallable, type PolicyRead, type Refusal } from "../refusal";
 import { basisNote, capabilityParts, scorerCapabilities, statusMark } from "../capabilities";
-import { chooseVersion } from "../shown-version";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
 import { canonicalPackagePath, siteUrl } from "./site";
@@ -25,8 +24,8 @@ export type PackageView = {
   version: string | null;
   /** That version's own state, from the versions route; null when there is no version. */
   status: { status: string; statusReason: string | null; deprecated: string | null } | null;
-  /** Why the registry does not serve that version (confirmed or known malicious); absent or null when it serves it. */
-  refused?: Refused | null;
+  /** Whether apm installs that version: its status, else resolve for exactly that version (lib/refusal.ts readPolicy). */
+  policy: PolicyRead;
   /** That version's own facts (not latest's); null when it is not scored yet. */
   facts: Facts | null;
   /** That version's score; null when it is not scored yet. */
@@ -157,16 +156,36 @@ function reviewSection(review: Fetched<ReviewAnswer>): string[] {
   return lines;
 }
 
-function statusLine(status: NonNullable<PackageView["status"]>, refusal: Refusal | null): string {
+function statusLine(status: NonNullable<PackageView["status"]>, policy: PolicyRead): string {
   const reason = status.statusReason ? `, reason ${inlineCode(status.statusReason)}` : "";
 
-  if (refusal?.kind === "known-malicious") {
-    return `- Status: do not install. The OSSF malicious-packages feed lists it as malicious (${refusal.ids.map((id) => inlineCode(id)).join(", ")}), so apm does not serve it. Advisory: ${refusal.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}`;
+  if (status.status !== "active") return `- Status: ${wordText(status.status)}${reason}. New installs skip it.`;
+
+  switch (policy.kind) {
+    case "installs":
+      return "- Status: active";
+    case "unknown":
+      return "- Status: active. The registry's install policy did not answer, so apm may not serve this version.";
+    case "refused":
+      return `- Status: do not install. ${refusalText(policy.refusal)}`;
+    default: {
+      const _exhaustive: never = policy;
+
+      return _exhaustive;
+    }
   }
+}
 
-  if (refusal?.kind === "confirmed-malicious") return `- Status: do not install. ${refusalReason(refusal)}`;
+/** Why apm will not install the shown version: its own fresh status first, else what resolve said; null when it installs. */
+export function refusalOf(view: Pick<PackageView, "status" | "policy">): Refusal | null {
+  return (view.status ? statusRefusal(view.status.status) : null) ?? (view.policy.kind === "refused" ? view.policy.refusal : null);
+}
 
-  return status.status === "active" ? "- Status: active" : `- Status: ${wordText(status.status)}${reason}. New installs skip it.`;
+/** A refusal in Markdown: advisory ids and a policy reason quoted, each advisory linked. */
+function refusalText(r: Refusal): string {
+  if (r.kind === "known-malicious") return `The OSSF malicious-packages feed lists it as malicious (${r.ids.map((id) => inlineCode(id)).join(", ")}), so apm add refuses it. Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}`;
+
+  return r.kind === "policy" ? `apm's install policy refuses it: ${inlineCode(r.reason)}` : refusalReason(r);
 }
 
 /**
@@ -236,14 +255,6 @@ function moreLines(spec: string): string[] {
   ];
 }
 
-/** A refused version in a list, its advisory ids quoted and linked. */
-function refusedLine(v: { version: string; refusal: Refusal }): string {
-  const r = v.refusal;
-  const label = r.kind === "known-malicious" ? `listed as malicious by the OSSF malicious-packages feed (${r.ids.map((id) => inlineCode(id)).join(", ")}). Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}` : refusalLabel(r);
-
-  return `  - ${versionText(v.version)}: ${label}`;
-}
-
 /** The Markdown view of a package with no version to install: the reason first, and no install command. */
 function noInstallableMarkdown(input: { pkg: PackageInfo; why: NoInstallable }): string {
   const { pkg, why } = input;
@@ -254,7 +265,6 @@ function noInstallableMarkdown(input: { pkg: PackageInfo; why: NoInstallable }):
     "",
     "- Version shown: none. apm installs no version of this package.",
     `- Status: do not install. ${reason}`,
-    ...(why.kind === "none-served" ? why.versions.map(refusedLine) : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
     `- Page: ${siteUrl(canonicalPackagePath(pkg.name))}`,
@@ -281,15 +291,14 @@ export function packageMarkdown(input: PackageView): string {
   // installed by a dist-tag: the default when apm installs no version tagged latest, or a ?v= that names the tag
   const tag = install.kind === "tag" ? install.tag : null;
   const older = version !== null && version !== pkg.latest && tag === null;
-  const refusal = view.status ? refusalOf({ status: view.status.status, refused: view.refused }) : null;
+  const refusal = refusalOf(view);
   const unscorable = unscorableOf(view);
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
-  const latestByTag = version !== null && version === pkg.latest && install.kind !== "default";
-  const shownNote = latestByTag ? ` (latest, a prerelease; installs ${tag ? `name its tag ${inlineCode(tag)}` : "pin it"})` : tag ? ` (tagged ${inlineCode(tag)}; ${pkg.latest === null ? "no version is tagged latest" : `latest is ${versionText(pkg.latest)}`})` : older ? ` (${pkg.latest ? `latest is ${versionText(pkg.latest)}` : "no version is tagged latest"})` : version ? " (latest)" : "";
+  const shownNote = tag ? ` (tagged ${inlineCode(tag)}; ${pkg.latest === null ? "no version is tagged latest" : `latest is ${versionText(pkg.latest)}`})` : older ? ` (${pkg.latest ? `latest is ${versionText(pkg.latest)}` : "no version is tagged latest"})` : version ? " (latest)" : "";
 
   out.push(
     `- Version shown: ${version ? versionText(version) : "none published"}${shownNote}`,
-    ...(view.status ? [statusLine(view.status, refusal)] : []),
+    ...(view.status ? [statusLine(view.status, view.policy)] : []),
     ...(withheld ? ["- Source: withheld. This version's revoke takes its files out of view: apm shows no line of its code, only what was found and where."] : []),
     ...(view.status?.deprecated ? [`- Deprecated: ${inlineCode(view.status.deprecated)}`] : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
@@ -305,15 +314,6 @@ export function packageMarkdown(input: PackageView): string {
   const pulled = pkg.versions.filter((v) => v.status !== "active");
 
   if (pulled.length > 0) out.push("## Pulled versions", "", ...pulled.map((v) => `- ${versionText(v.version)}: ${wordText(v.status)}${v.statusReason ? `, reason ${inlineCode(v.statusReason)}` : ""}. New installs skip it.`), "");
-  const withheldRows = pkg.versions.flatMap((v) => (v.refused ? [{ version: v.version, refused: v.refused }] : []));
-
-  if (withheldRows.length > 0) {
-    const why = (r: Refused) => (r.kind === "known-malicious" ? `listed as malicious by the OSSF malicious-packages feed (${r.ids.map((id) => inlineCode(id)).join(", ")})` : "confirmed malicious by apm reviewers");
-
-    const advisory = (r: Refused) => (r.kind === "known-malicious" ? ` Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}` : "");
-
-    out.push("## Versions apm does not serve", "", ...withheldRows.map((v) => `- ${versionText(v.version)}: ${why(v.refused)}. Do not install it.${advisory(v.refused)}`), "");
-  }
 
   out.push("## Risk signals", "");
 
@@ -356,8 +356,8 @@ export function packageMarkdown(input: PackageView): string {
   out.push("## Install", "");
 
   if (refusal !== null) {
-    const byName = chooseVersion({ pkg, asked: undefined });
-    const instead = byName.kind === "latest" && byName.version !== version ? ` The version apm installs is ${versionText(byName.version)}: ${url}` : "";
+    const bareGets = view.policy.kind === "refused" ? view.policy.bareGets : null;
+    const instead = bareGets === null ? "" : ` A bare install gets ${versionText(bareGets)} instead.`;
 
     out.push(`No install command: apm refuses this version.${instead}`, "");
   } else {

@@ -3,7 +3,7 @@
 // registry's per-version endpoint, and a version string that can't exist says "no such version" without a read.
 import { describe, expect, test } from "bun:test";
 import { shownOf } from "./early-answer";
-import { chooseVersion, rowsWith, selectVersion, sharedDefault, taggedDefault } from "./shown-version";
+import { chooseVersion, rowsWith, selectVersion, sharedDefault } from "./shown-version";
 import type { Fetched, VersionDetails } from "./registry";
 import { installCommand } from "./install-note";
 import { unscoredNotice } from "./unscored";
@@ -59,12 +59,10 @@ describe("a package with no latest tag", () => {
 
   test("shows the newest version a tag names, with that tag", () => {
     expect(chooseVersion({ pkg: prerelease, asked: undefined })).toEqual({ kind: "latest", version: "0.0.2-test.2", tag: "next" });
-    expect(taggedDefault(prerelease)).toEqual({ tag: "next", version: "0.0.2-test.2" });
   });
 
-  test("a package with latest, or with no tag on a listed version, has none", () => {
-    expect(taggedDefault(pkg())).toBeNull();
-    expect(taggedDefault(pkg({ latest: null, distTags: { next: "9.9.9" } }))).toBeNull();
+  test("a package with latest shows it; one with no tag on any version has no default", () => {
+    expect(chooseVersion({ pkg: pkg(), asked: undefined })).toEqual({ kind: "latest", version: "1.3.0", tag: null });
     expect(chooseVersion({ pkg: pkg({ latest: null, distTags: {} }), asked: undefined })).toEqual({ kind: "none" });
   });
 });
@@ -99,25 +97,15 @@ describe("the selection the page and its Markdown view share", () => {
     expect(selected).toEqual({ kind: "shown", version: "0.0.1", install: { kind: "tag", tag: "next" }, read: details });
   });
 
-  test("latest yanked: the default is the newest installable tagged version, else nothing", async () => {
+  test("latest yanked: the default is still the published latest, which the page then says not to install", async () => {
     const yankedLatest = pkg({ latest: "2.0.0", distTags: { latest: "2.0.0", next: "1.9.0" }, versions: [row("2.0.0", { status: "yanked" }), row("1.9.0", { publishedAt: "2026-11-24T00:00:00.000Z" })] });
 
-    expect(chooseVersion({ pkg: yankedLatest, asked: undefined })).toEqual({ kind: "latest", version: "1.9.0", tag: "next" });
-
-    // a local package whose releases are all yanked or revoked keeps latest pointing at one
-    const allPulled = pkg({ latest: "2.0.0", distTags: { latest: "2.0.0" }, versions: [row("2.0.0", { status: "yanked" }), row("1.0.0", { status: "revoked" })] });
-
-    expect(await selectVersion({ pkg: allPulled, asked: undefined, read: noRead })).toEqual({
-      kind: "none",
-      why: { kind: "none-served", versions: [{ version: "2.0.0", refusal: { kind: "yanked" } }, { version: "1.0.0", refusal: { kind: "revoked", pending: false } }] },
-    });
+    expect(await selectVersion({ pkg: yankedLatest, asked: undefined, read: noRead })).toEqual({ kind: "shown", version: "2.0.0", install: { kind: "default", version: "2.0.0" }, read: null });
   });
 
-  test("every version listed as malicious, no latest and no tags: nothing to install, with the advisories", async () => {
-    const allListed = pkg({ latest: null, score: null, distTags: {}, versions: [row("1.0.0", { refused: { kind: "known-malicious", ids: ["MAL-2026-1"] } })] });
-
-    expect(await selectVersion({ pkg: allListed, asked: undefined, read: noRead })).toEqual({ kind: "none", why: { kind: "none-served", versions: [{ version: "1.0.0", refusal: { kind: "known-malicious", ids: ["MAL-2026-1"] } }] } });
+  test("nothing published, or no tag on an active version: nothing to show by name", async () => {
     expect(await selectVersion({ pkg: pkg({ latest: null, distTags: {}, versions: [] }), asked: undefined, read: noRead })).toEqual({ kind: "none", why: { kind: "unpublished" } });
+    expect(await selectVersion({ pkg: pkg({ latest: null, distTags: {}, versions: [row("1.0.0")] }), asked: undefined, read: noRead })).toEqual({ kind: "none", why: { kind: "untagged" } });
   });
 
   test("a share names the default the page shows, with that version's own score", () => {
@@ -127,9 +115,9 @@ describe("the selection the page and its Markdown view share", () => {
   });
 });
 
-// HOME-502 Sol review of b1a3a1c, findings 1 and 3: a packument that withheld the stable release tags a prerelease
-// latest, which apm's resolver refuses by bare name; and an off-list tag lost to an older listed one without a read
-describe("prerelease latest and tag targets the list does not hold", () => {
+// HOME-502 Sol review of b1a3a1c, finding 3: an off-list tag lost to an older listed one without a read. Tags are the
+// published dist-tags: a command names a tag (bare for latest) only when that tag names the version shown.
+describe("published tags and tag targets the list does not hold", () => {
   type Row = ReturnType<typeof pkg>["versions"][number];
 
   const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-01-01T00:00:00.000Z", publishedBy: "me", status: "active", statusReason: null, deprecated: null, score: 90, grade: "A", ...over });
@@ -139,21 +127,23 @@ describe("prerelease latest and tag targets the list does not hold", () => {
     throw new Error("a listed version needs no read");
   };
 
-  test("stable 1.0.0 refused, 0.9.0-beta.1 tagged latest and next: installs name next, never the bare name", async () => {
-    const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1", next: "0.9.0-beta.1" }, versions: [row("1.0.0", { refused: { kind: "confirmed-malicious" } }), row("0.9.0-beta.1")] });
+  test("react's tags: latest by name, next by its tag, a version number pinned", async () => {
+    const p = pkg({ latest: "19.3.1", distTags: { latest: "19.3.1", next: "19.3.0-canary-d5736f09-20260507", backport: "19.1.10" }, versions: [row("19.3.1"), row("19.3.0-canary-d5736f09-20260507"), row("19.1.10")] });
     const selected = await selectVersion({ pkg: p, asked: undefined, read: noRead });
 
-    expect(selected).toEqual({ kind: "shown", version: "0.9.0-beta.1", install: { kind: "tag", tag: "next" }, read: null });
+    expect(selected).toEqual({ kind: "shown", version: "19.3.1", install: { kind: "default", version: "19.3.1" }, read: null });
 
     if (selected.kind !== "shown") return;
-    expect(installCommand({ client: "apm", name: "pkg", install: selected.install })).toBe("apm add pkg@next");
-    expect(await selectVersion({ pkg: p, asked: "latest", read: noRead })).toMatchObject({ install: { kind: "tag", tag: "next" } });
+    expect(installCommand({ client: "apm", name: "react", install: selected.install })).toBe("apm add react");
+    expect(await selectVersion({ pkg: p, asked: "next", read: noRead })).toMatchObject({ install: { kind: "tag", tag: "next" } });
+    expect(await selectVersion({ pkg: p, asked: "backport", read: noRead })).toMatchObject({ install: { kind: "tag", tag: "backport" } });
+    expect(await selectVersion({ pkg: p, asked: "19.1.10", read: noRead })).toMatchObject({ install: { kind: "exact", version: "19.1.10" } });
   });
 
-  test("a prerelease latest no other tag names is pinned", async () => {
+  test("a prerelease tagged latest installs by name, as the published tag says", async () => {
     const p = pkg({ latest: "0.9.0-beta.1", distTags: { latest: "0.9.0-beta.1" }, versions: [row("0.9.0-beta.1")] });
 
-    expect(await selectVersion({ pkg: p, asked: undefined, read: noRead })).toMatchObject({ install: { kind: "exact", version: "0.9.0-beta.1" } });
+    expect(await selectVersion({ pkg: p, asked: undefined, read: noRead })).toMatchObject({ install: { kind: "default", version: "0.9.0-beta.1" } });
   });
 
   test("with no installable latest, a newer off-list next beats an older listed beta, and the other way round", async () => {

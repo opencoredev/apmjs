@@ -3,7 +3,7 @@
 import { z } from "zod";
 import type { ExcerptAnswer } from "../file-excerpt";
 import type { Json } from "./json";
-import type { Facts, Fetched, PackageInfo, Refused, Signal } from "../registry";
+import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { AlternativesPart, ExactPart, LookalikePart, SearchAnswer } from "../search-schema";
 
@@ -23,8 +23,6 @@ export type VersionInfo = {
   score: ScoreReport | null;
   /** Why apm can never score this version (the registry's reason and sentence); null when it has a score or may get one. */
   unscorable: { reason: string; text: string } | null;
-  /** Why the registry does not serve this version (confirmed or known malicious); absent from an older registry. */
-  refused?: Refused | null;
   /** When it was published; absent from an older registry. */
   publishedAt?: string | null;
 };
@@ -213,6 +211,8 @@ export type AgentSource = {
   /** One version's state, facts and score, whatever its age; "missing" when the package has no such version. */
   version: (input: { name: string; version: string }) => Promise<Fetched<VersionInfo>>;
   review: (input: { name: string; version: string }) => Promise<Fetched<ReviewAnswer>>;
+  /** One version's score from the score route, which the package page reads for a version other than latest: it carries the capabilities the version answer leaves out. */
+  score: (input: { name: string; version: string }) => Promise<Fetched<ScoreReport>>;
   resolve: (input: { name: string; range: string }) => Promise<ResolveOutcome>;
   search: (input: { query: string }) => Promise<SearchAnswer | null>;
   /** The name check; `scope` is the npm scope (without @) the alternatives are checked under. */

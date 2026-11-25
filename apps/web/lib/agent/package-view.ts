@@ -8,7 +8,11 @@
 // A withheld version's AI review is what the registry sends for it (each finding's sentence replaced, each file by
 // reference), never an earlier answer: the version and its review are two reads, and a revoke between them leaves one
 // withheld and the other not. Both are then read again; if they still disagree, the view is not built at all.
+//
+// Whether apm installs the shown version is the same read /api/explain makes: resolve, for exactly that version
+// (lib/refusal.ts readPolicy), started alongside the version and review reads.
 import { inCooldown } from "../install-note";
+import { readPolicy } from "../refusal";
 import type { Fetched } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import { selectVersion } from "../shown-version";
@@ -30,7 +34,7 @@ export async function loadPackageView(input: { name: string; version: string | n
 
   switch (selected.kind) {
     case "none":
-      return { kind: "ok", view: { pkg, version: null, status: null, facts: null, score: null, unscorable: null, review: { kind: "missing" }, install: { kind: "none", why: selected.why }, registry: input.registry } };
+      return { kind: "ok", view: { pkg, version: null, status: null, policy: { kind: "unknown" }, facts: null, score: null, unscorable: null, review: { kind: "missing" }, install: { kind: "none", why: selected.why }, registry: input.registry } };
     case "no-such-version":
       return { kind: "missing", reason: `${name} has no version ${selected.asked}. Latest is ${pkg.latest ?? "unknown"}.` };
     case "unavailable":
@@ -45,6 +49,11 @@ export async function loadPackageView(input: { name: string; version: string | n
   }
 
   const { version, install } = selected;
+  const isLatest = version === pkg.latest;
+  const status = selected.read?.status ?? pkg.versions.find((r) => r.version === version)?.status ?? "active";
+  const policy = readPolicy({ name, version, status, isDefault: isLatest, resolve: source.resolve });
+  // the page's score for a version other than latest comes from the score route, with its capabilities: so does this one
+  const routeScore = isLatest ? null : source.score({ name, version });
   const read = () => Promise.all([source.version({ name, version }), source.review({ name, version })]);
   // a version the package answer does not list was just read to find it: only its review is new
   const first: Awaited<ReturnType<typeof read>> = selected.read ? [{ kind: "ok", value: selected.read }, await source.review({ name, version })] : await read();
@@ -57,6 +66,7 @@ export async function loadPackageView(input: { name: string; version: string | n
   // without the version's own answer the view would show another version's facts or a stale status: say so instead
   if (info.kind === "unavailable") return { kind: "unavailable" };
   const v = info.value;
+  const routed = routeScore === null ? null : await routeScore;
 
   // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
@@ -65,9 +75,9 @@ export async function loadPackageView(input: { name: string; version: string | n
       pkg,
       version: v.version,
       status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated },
-      refused: v.refused ?? null,
+      policy: await policy,
       facts: v.facts,
-      score: latestCapabilities({ score: v.score, pkg, version: v.version }),
+      score: withCapabilities({ score: v.score, from: isLatest ? pkg.score : routed?.kind === "ok" ? routed.value : null }),
       unscorable: v.unscorable,
       review,
       install,
@@ -78,16 +88,16 @@ export async function loadPackageView(input: { name: string; version: string | n
 }
 
 /**
- * The version's score with latest's capabilities from the package answer when the version answer sent none for
- * latest: a registry before the version answer carried them leaves the field out, and the page shows the package
- * answer's. A version answer that sent a list, even an empty one, is that version's own.
+ * The version's score with the capabilities the page shows, when the version answer sent none (the registry leaves
+ * them out of it): latest's from the package answer, any other version's from the score route. A version answer that
+ * sent a list, even an empty one, is that version's own.
  */
-function latestCapabilities(input: { score: VersionInfo["score"]; pkg: { latest: string | null; score: VersionInfo["score"] }; version: string }): VersionInfo["score"] {
-  const { score, pkg } = input;
+function withCapabilities(input: { score: VersionInfo["score"]; from: VersionInfo["score"] }): VersionInfo["score"] {
+  const { score, from } = input;
 
-  if (score === null || pkg.score === null || input.version !== pkg.latest || score.capabilities !== undefined) return score;
+  if (score === null || from === null || score.capabilities !== undefined) return score;
 
-  return { ...score, capabilities: pkg.score.capabilities, declaration: pkg.score.declaration };
+  return { ...score, capabilities: from.capabilities, declaration: from.declaration };
 }
 
 /**

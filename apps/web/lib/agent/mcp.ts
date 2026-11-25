@@ -8,10 +8,9 @@ import { looksLikePackageName } from "../search-schema";
 import { scorerCapabilities, type ScorerCapabilities } from "../capabilities";
 import { installCommand, INSTALL_CLIENTS, type InstallClient } from "../install-note";
 import { publishability, publishabilityText } from "../publish-name";
-import { chooseVersion } from "../shown-version";
-import { noInstallableReason, refusalOf, type Refusal } from "../refusal";
+import { noInstallableReason, type Refusal } from "../refusal";
 import { capabilitiesOf } from "./capabilities";
-import { packageMarkdown, unscorableOf, type PackageView } from "./package-md";
+import { packageMarkdown, refusalOf, unscorableOf, type PackageView } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { REGISTRY } from "../registry-url";
 import { siteUrl } from "./site";
@@ -131,13 +130,9 @@ function installAnswer(view: PackageView): InstallAnswer {
   const { pkg, install } = view;
 
   if (install.kind === "none") return { kind: "none", reason: noInstallableReason({ name: pkg.name, why: install.why }) };
-  const refusal = view.status ? refusalOf({ status: view.status.status, refused: view.refused }) : null;
+  const refusal = refusalOf(view);
 
-  if (refusal !== null) {
-    const byName = chooseVersion({ pkg, asked: undefined });
-
-    return { kind: "refused", refusal, installsInstead: byName.kind === "latest" && byName.version !== view.version ? byName.version : null };
-  }
+  if (refusal !== null) return { kind: "refused", refusal, installsInstead: view.policy.kind === "refused" ? view.policy.bareGets : null };
 
   const commands = { apm: "", bun: "", npm: "", pnpm: "" } satisfies Record<InstallClient, string>;
 
@@ -191,6 +186,8 @@ const checkPackage: Tool<typeof CheckPackageInput> = {
       status,
       // null when apm installs the shown version; why it does not (withheld with advisory ids, revoked, yanked) otherwise
       refusal: install.kind === "refused" ? install.refusal : null,
+      // what resolve said for exactly the shown version, as the text says it: "unknown" when it did not answer, so apm may not serve it
+      installPolicy: install.kind === "refused" ? "refused" : install.kind === "none" ? null : view.policy.kind,
       install,
       score: score ? { score: score.score, grade: score.grade } : null,
       // why apm can never score the shown version ({ reason, text }, the registry's words); null when it has a score or may get one
