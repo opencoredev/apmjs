@@ -4,6 +4,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Menu } from "@base-ui/react/menu";
 import { Account, call } from "@/lib/account";
+import { clickEvent } from "@/lib/databuddy-client";
 
 const MENU = [
   { href: "/account/packages", label: "Your packages" },
@@ -39,6 +40,7 @@ export function AccountButton() {
       // Plain anchor so entering /signin from a tracked public page is a direct user-activated full navigation
       <a
         href={`/signin${next}`}
+        {...clickEvent({ name: "sign_in_clicked", props: { location: "header" } })}
         className="inline-flex h-9 items-center rounded-full bg-primary px-4 text-[15px] font-medium text-primary-foreground transition-colors hover:bg-primary/85"
       >
         Sign in
