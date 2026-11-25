@@ -8,16 +8,41 @@
 // its walk and the walk again after a wait): the feed is built per request, and only time spent waiting on OSV counts,
 // so a slow walk does not use it up. Once it is spent, or OSV failed once, the request reads only what is cached. A lookup OSV does not answer in full is logged, reads as nothing listed
 // (an outage of the feed must not stop installs) and is not kept; a full answer is kept per isolate for CACHE_MS.
+//
+// The npm protocol routes (packuments, version documents, dist-tags and tarballs, plain and ~safe) ask about a whole
+// name instead (advisoriesFor): one batch query for the package with no version returns only the ids of every advisory
+// OSV has for it, a few hundred bytes even for next, and each MAL- id among them is then read for the versions it
+// names. So a packument of thousands of versions costs one small query, and nothing more unless the name is listed. A
+// name's answer is kept for NAME_FRESH_MS in the isolate and in the data center's cache, and while OSV cannot be asked
+// an answer up to NAME_STALE_MS old is used instead of nothing, so an outage fails open only for a name not asked about
+// in that long.
 import { Context, Effect, Layer, Option, Result } from "effect";
+import semver from "semver";
 import { z } from "zod";
 import { isValidPackageName } from "@apm/core";
+import { matchWithin, within } from "./deadline.ts";
 
 export type PackageVersion = { readonly name: string; readonly version: string };
 
 /** A version the feed lists, with its MAL- advisory ids. */
 export type ListedMalicious = { name: string; version: string; ids: string[] };
 
-export class KnownMalicious extends Context.Service<KnownMalicious, { readonly lookup: (pkgs: readonly PackageVersion[]) => Effect.Effect<ListedMalicious[]> }>()("@apm/registry/KnownMalicious") {}
+/** One range of an advisory's affected versions, as OSV writes its events (SEMVER and ECOSYSTEM ranges). */
+const RangeEvents = z.array(z.object({ introduced: z.string().optional(), fixed: z.string().optional(), last_affected: z.string().optional() }));
+
+/** One MAL- advisory's affected versions of one npm name: the exact versions it lists and its ranges. */
+const AdvisorySchema = z.object({ id: z.string(), versions: z.array(z.string()), ranges: z.array(RangeEvents) });
+
+export type Advisory = z.infer<typeof AdvisorySchema>;
+
+export class KnownMalicious extends Context.Service<
+  KnownMalicious,
+  {
+    readonly lookup: (pkgs: readonly PackageVersion[]) => Effect.Effect<ListedMalicious[]>;
+    /** The MAL- advisories OSV has for every version of npm's `name`: none when it has none or could not be asked. */
+    readonly advisoriesFor: (name: string) => Effect.Effect<readonly Advisory[]>;
+  }
+>()("@apm/registry/KnownMalicious") {}
 
 /** How long a lookup's answer is kept. A version newly listed is refused within this long. */
 const CACHE_MS = 10 * 60_000;
@@ -29,6 +54,16 @@ export const OSV_BATCH = 1000;
 /** What one request may spend waiting on OSV, all its lookups together. */
 export const REQUEST_BUDGET_MS = 3_000;
 
+/** How long a name's advisories are kept (advisoriesFor). A version newly listed is withheld within this long. */
+export const NAME_FRESH_MS = 5 * 60_000;
+
+/** How old a name's kept advisories may be and still be used while OSV cannot be asked. */
+export const NAME_STALE_MS = 24 * 60 * 60_000;
+const MAX_NAMES = 20_000;
+
+/** How long a read of, or a write to, the data center's copy of a name's advisories is waited for. */
+const SHARED_MS = 150;
+
 /** Pages of one version's advisories followed past the batch answer's first. */
 const MAX_PAGES = 3;
 const MAX_VERSION_LENGTH = 256;
@@ -37,10 +72,20 @@ const Vulns = z.array(z.object({ id: z.string() })).optional();
 const BatchAnswer = z.object({ results: z.array(z.object({ vulns: Vulns, next_page_token: z.string().optional() })) });
 const QueryAnswer = z.object({ vulns: Vulns, next_page_token: z.string().optional() });
 
-/** One version asked about, and the two request shapes OSV takes. */
+const VulnAnswer = z.object({
+  id: z.string(),
+  withdrawn: z.string().optional(),
+  affected: z
+    .array(z.object({ package: z.object({ name: z.string(), ecosystem: z.string() }).optional(), versions: z.array(z.string()).optional(), ranges: z.array(z.object({ type: z.string(), events: RangeEvents })).optional() }))
+    .optional(),
+});
+
+/** One version asked about, every version of a name (a page of it past the first), and the request shapes OSV takes. */
 type OsvQuery = { package: { name: string; ecosystem: "npm" }; version: string };
 
-type OsvBatchQuery = { queries: OsvQuery[] };
+type OsvNameQuery = { package: { name: string; ecosystem: "npm" }; page_token?: string };
+
+type OsvBatchQuery = { queries: (OsvQuery | OsvNameQuery)[] };
 
 type OsvPageQuery = OsvQuery & { page_token: string };
 
@@ -64,6 +109,105 @@ function remember(key: string, ids: string[], until: number): void {
 
 const malOnly = (vulns: z.infer<typeof Vulns>): string[] => (vulns ?? []).map((v) => v.id).filter((id) => id.startsWith("MAL-"));
 
+/** A name's advisories as kept: when OSV gave them (wall clock), in the isolate and in the data center's cache. */
+const NameEntry = z.object({ fetchedAt: z.number(), advisories: z.array(AdvisorySchema) });
+
+type NameEntry = z.infer<typeof NameEntry>;
+
+/** The isolate's answers per name, by OSV root and name, oldest first. */
+const NAMES = new Map<string, NameEntry>();
+
+function rememberName(key: string, entry: NameEntry): void {
+  NAMES.delete(key);
+  NAMES.set(key, entry);
+
+  for (const oldest of NAMES.keys()) {
+    if (NAMES.size <= MAX_NAMES) break;
+    NAMES.delete(oldest);
+  }
+}
+
+/** The data center's cache key of a name's advisories. This host is never fetched; it only names the entry. */
+const sharedKey = (key: string): Request => new Request(`https://osv-cache.apmjs.internal/v1/${encodeURIComponent(key)}`);
+
+/** The data center's copy of a name's advisories, or null: none outside a Worker, a miss, a late or unreadable one. */
+async function sharedRead(key: string): Promise<NameEntry | null> {
+  if (typeof caches === "undefined") return null;
+  const got = await matchWithin({ cache: caches.default, key: sharedKey(key), ms: SHARED_MS, operation: "osv-copy" });
+
+  if (got.kind !== "hit") return null;
+  const body = await within(got.res.json(), SHARED_MS);
+
+  if (body.kind !== "done") return null;
+  const parsed = NameEntry.safeParse(body.value);
+
+  return parsed.success ? parsed.data : null;
+}
+
+/** Gives the data center a copy of a name's advisories, waiting for it SHARED_MS at most. Never rejects. */
+async function sharedWrite(key: string, entry: NameEntry): Promise<void> {
+  if (typeof caches === "undefined") return;
+  const res = new Response(JSON.stringify(entry), { headers: { "content-type": "application/json", "cache-control": `max-age=${NAME_STALE_MS / 1000}` } });
+
+  await within(caches.default.put(sharedKey(key), res), SHARED_MS);
+}
+
+/** What one advisory OSV sent says about npm's `name`: nothing when it is withdrawn or names no version of it. */
+function advisoryOf(name: string, vuln: z.infer<typeof VulnAnswer>): Advisory[] {
+  if (vuln.withdrawn !== undefined) return [];
+  const mine = (vuln.affected ?? []).filter((a) => a.package?.ecosystem === "npm" && a.package.name === name);
+  const versions = mine.flatMap((a) => a.versions ?? []);
+  const ranges = mine.flatMap((a) => (a.ranges ?? []).filter((r) => r.type === "SEMVER" || r.type === "ECOSYSTEM").map((r) => r.events));
+
+  return versions.length === 0 && ranges.length === 0 ? [] : [{ id: vuln.id, versions, ranges }];
+}
+
+/** An event's bound as a version, "0" lowest of all; null when it is not one. */
+const boundOf = (v: string): string | null => (v === "0" ? "0.0.0-0" : semver.valid(v));
+
+/** Whether `version` (valid semver) is in one range, by OSV's rule: the last event at or below it decides. */
+function inRange(events: z.infer<typeof RangeEvents>, version: string): boolean {
+  const points = events.flatMap((e) => {
+    const raw = e.introduced ?? e.fixed ?? e.last_affected;
+    const at = raw === undefined ? null : boundOf(raw);
+
+    return at === null ? [] : [{ at, kind: e.introduced !== undefined ? "introduced" : e.fixed !== undefined ? "fixed" : "last_affected" }];
+  });
+
+  let affected = false;
+
+  for (const p of points.toSorted((a, b) => semver.compare(a.at, b.at))) {
+    if (p.kind === "introduced" && semver.gte(version, p.at)) affected = true;
+    else if (p.kind === "fixed" && semver.gte(version, p.at)) affected = false;
+    else if (p.kind === "last_affected" && semver.gt(version, p.at)) affected = false;
+  }
+
+  return affected;
+}
+
+/** Whether one advisory names `version`: listed exactly, or within one of its ranges. */
+function affects(a: Advisory, version: string): boolean {
+  if (a.versions.includes(version)) return true;
+  const valid = semver.valid(version);
+
+  return valid !== null && a.ranges.some((events) => inRange(events, valid));
+}
+
+/** The versions among `versions` that `advisories` (npm's `name`'s) name, each with the ids that name it. */
+export function listedAmong(name: string, advisories: readonly Advisory[], versions: readonly string[]): Map<string, ListedMalicious> {
+  const out = new Map<string, ListedMalicious>();
+
+  if (advisories.length === 0) return out;
+
+  for (const version of versions) {
+    const ids = advisories.flatMap((a) => (affects(a, version) ? [a.id] : []));
+
+    if (ids.length > 0) out.set(version, { name, version, ids });
+  }
+
+  return out;
+}
+
 /** The live feed at `baseUrl` (OSV's API root, ending in a slash), with one request's budget. */
 export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.Layer<KnownMalicious> {
   return Layer.sync(KnownMalicious, () => {
@@ -72,8 +216,8 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
     let stopped = false;
     const cacheKey = (p: PackageVersion): string => `${baseUrl} ${keyOf(p)}`;
 
-    /** POSTs `body` to OSV within the request's budget and parses the answer with `schema`. */
-    const post = <S extends z.ZodType>(path: "v1/querybatch" | "v1/query", body: OsvBatchQuery | OsvPageQuery, schema: S) =>
+    /** Asks OSV at `path` (a POST of `body`, or a GET when it is null) within the request's budget and parses the answer with `schema`. */
+    const post = <S extends z.ZodType>(path: string, body: OsvBatchQuery | OsvPageQuery | null, schema: S) =>
       Effect.tryPromise({
         try: async (): Promise<z.output<S>> => {
           const left = REQUEST_BUDGET_MS - spentMs;
@@ -82,7 +226,12 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
           const t0 = Date.now();
 
           try {
-            const res = await fetcher(`${baseUrl}${path}`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) });
+            const init: RequestInit =
+              body === null
+                ? { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(left) }
+                : { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(left) };
+
+            const res = await fetcher(`${baseUrl}${path}`, init);
 
             if (res.status !== 200) {
               await res.body?.cancel();
@@ -137,7 +286,74 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch): Layer.L
         );
       });
 
+    /** Every MAL- advisory OSV has for npm's `name`, with the versions each names. Fails when OSV did not answer in full. */
+    const askName = (name: string) =>
+      Effect.gen(function* () {
+        const ids = new Set<string>();
+        let token: string | undefined;
+
+        for (let page = 0; ; page++) {
+          const query: OsvNameQuery = { package: { name, ecosystem: "npm" } };
+
+          if (token !== undefined) query.page_token = token;
+          const batch = yield* post("v1/querybatch", { queries: [query] }, BatchAnswer);
+          const first = batch.results[0];
+
+          if (batch.results.length !== 1 || first === undefined) return yield* Effect.fail(new Error("OSV answered in an unexpected shape"));
+
+          for (const id of malOnly(first.vulns)) ids.add(id);
+          token = first.next_page_token;
+
+          if (token === undefined) break;
+
+          if (page >= MAX_PAGES) return yield* Effect.fail(new Error("more pages than apm reads"));
+        }
+
+        const vulns = yield* Effect.forEach([...ids], (id) => post(`v1/vulns/${encodeURIComponent(id)}`, null, VulnAnswer), { concurrency: "unbounded" });
+
+        return vulns.flatMap((v) => advisoryOf(name, v));
+      });
+
     return KnownMalicious.of({
+      advisoriesFor: (name) =>
+        Effect.gen(function* () {
+          if (!isValidPackageName(name)) return [];
+          const key = `${baseUrl} ${name}`;
+          const now = Date.now();
+          const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
+          const kept = NAMES.get(key) ?? null;
+
+          if (kept !== null && youngerThan(kept, NAME_FRESH_MS)) return kept.advisories;
+          const shared = yield* Effect.promise(() => sharedRead(key).catch(() => null));
+
+          if (shared !== null && youngerThan(shared, NAME_FRESH_MS)) {
+            rememberName(key, shared);
+
+            return shared.advisories;
+          }
+
+          if (!stopped && spentMs < REQUEST_BUDGET_MS) {
+            const got = yield* Effect.result(askName(name));
+
+            if (Result.isSuccess(got)) {
+              const entry = { fetchedAt: now, advisories: got.success };
+
+              rememberName(key, entry);
+              yield* Effect.promise(() => sharedWrite(key, entry).catch(() => undefined));
+
+              return entry.advisories;
+            }
+
+            console.error(JSON.stringify({ event: "osv-name", name, error: String(got.failure) }));
+            // no more waiting on OSV in this request: what is cached still counts
+            stopped = true;
+          }
+
+          // OSV could not be asked: the newest answer kept, if it is young enough, else nothing (fail open)
+          const stale = [kept, shared].flatMap((e) => (e !== null && youngerThan(e, NAME_STALE_MS) ? [e] : [])).toSorted((a, b) => b.fetchedAt - a.fetchedAt)[0];
+
+          return stale?.advisories ?? [];
+        }),
       lookup: (pkgs) =>
         Effect.gen(function* () {
           const now = Date.now();
@@ -190,7 +406,55 @@ export const listedMalicious = (pkgs: readonly PackageVersion[]) =>
     return Option.isNone(feed) || pkgs.length === 0 ? [] : yield* feed.value.lookup(pkgs);
   });
 
+/** The MAL- advisories of npm's `name`; none when this registry runs without the feed. */
+export const advisoriesOf = (name: string) =>
+  Effect.gen(function* () {
+    const feed = yield* Effect.serviceOption(KnownMalicious);
+
+    return Option.isNone(feed) ? [] : yield* feed.value.advisoriesFor(name);
+  });
+
+/** The versions among `versions` of npm's `name` the feed lists, by version; none without the feed. */
+export const listedVersionsOf = (name: string, versions: readonly string[]) =>
+  Effect.map(advisoriesOf(name), (advisories) => listedAmong(name, advisories, versions));
+
 /** Why a listed version is refused, citing its advisories. */
 export function maliciousText(m: ListedMalicious): string {
   return `known malicious: the OSSF malicious-packages feed lists ${m.name}@${m.version} (${m.ids.join(", ")})`;
 }
+
+/** What the tarball routes answer for a listed version: 403, citing its advisories. */
+export function listedTarballText(m: ListedMalicious): string {
+  return `${maliciousText(m)}, so apm does not serve it. See https://osv.dev/vulnerability/${m.ids[0] ?? ""}`;
+}
+
+/** The header npm prints (as "npm notice") from any registry answer: the packument routes name what they withheld. */
+export const NOTICE_HEADER = "npm-notice";
+
+const NOTICE_MAX = 400;
+
+/**
+ * The notice of a packument that withholds versions of `name` the feed lists, or null when it lists none: npm prints
+ * it before it reports that no version matched, so `npm install name@<listed>` says why. ASCII only, as a header must be.
+ */
+export function listedNotice(name: string, advisories: readonly Advisory[]): string | null {
+  if (advisories.length === 0) return null;
+  const range = (events: Advisory["ranges"][number]) => events.map((e) => (e.introduced !== undefined ? `>=${e.introduced}` : e.fixed !== undefined ? `<${e.fixed}` : `<=${e.last_affected ?? ""}`)).join(" ");
+  const each = advisories.map((a) => `${a.id}: ${[...a.versions, ...a.ranges.map(range)].join(", ")}`).join("; ");
+  const text = `apm withholds ${name} versions the OSSF malicious-packages feed lists as malicious (${each})`.replace(/[^\x20-\x7e]/g, "?");
+
+  return text.length <= NOTICE_MAX ? text : `${text.slice(0, NOTICE_MAX - 3)}...`;
+}
+
+/**
+ * The headers a packument adds when it withholds versions of `name` the feed lists: the notice, and no-store, since npm
+ * prints a notice only from an answer it did not keep (one from its cache carries x-local-cache). Nothing otherwise.
+ */
+export function noticeHeaders(name: string, advisories: readonly Advisory[]): Record<string, string> {
+  const notice = listedNotice(name, advisories);
+
+  return notice === null ? {} : { [NOTICE_HEADER]: notice, "cache-control": "no-store" };
+}
+
+/** The lines the install packument's stamp adds for a name's advisories (upstream.ts installStamp), in a stable order. */
+export const advisoryLines = (advisories: readonly Advisory[]): string[] => advisories.map((a) => `osv ${JSON.stringify(a)}`).toSorted();

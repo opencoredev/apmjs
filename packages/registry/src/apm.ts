@@ -91,7 +91,7 @@ import {
   type PublishHook,
 } from "./server.ts";
 import { ReviewConfig, reviewStandings } from "./review.ts";
-import { KnownMalicious, listedMalicious, maliciousText, type ListedMalicious } from "./osv.ts";
+import { advisoriesOf, advisoryLines, KnownMalicious, listedAmong, listedMalicious, listedTarballText, listedVersionsOf, maliciousText, noticeHeaders, type Advisory, type ListedMalicious } from "./osv.ts";
 import { parseWait, RESOLVE_WAIT, WAIT_PARAM, WALK_BUDGET_MS } from "./resolve-wait.ts";
 import { admitResolve, carriesCredentials, ResolveLimit } from "./resolve-limit.ts";
 import { getRouteOf } from "./routes.ts";
@@ -3877,11 +3877,13 @@ export function upstreamPackument(input: {
   view: PackumentView | null;
   at: number;
   confirmed: ReadonlySet<string>;
+  listed: ReadonlyMap<string, ListedMalicious>;
   devDependencies: ReadonlyMap<string, unknown> | null;
 }): Record<string, unknown> {
-  const { base, src, abbreviated, view, at, confirmed, devDependencies } = input;
-  // a version an apm reviewer confirmed malicious is not offered, in any view (confirmed.ts)
-  const offered = src.versions.filter((v) => !confirmed.has(v.version));
+  const { base, src, abbreviated, view, at, confirmed, listed, devDependencies } = input;
+  // a version an apm reviewer confirmed malicious, or one the OSSF malicious-packages feed lists, is not offered, in
+  // any view (confirmed.ts, osv.ts)
+  const offered = src.versions.filter((v) => !confirmed.has(v.version) && !listed.has(v.version));
   const kept = view ? offered.filter(view.keep) : offered;
 
   // a manifest past the limits apm reads is served without the fields past them: serializing it whole recurses deep
@@ -3921,7 +3923,7 @@ export function upstreamPackument(input: {
   const versions = new LazyMembers(versionDocs);
   let distTags = { ...src.distTags };
 
-  if (view || confirmed.size > 0) {
+  if (view || confirmed.size > 0 || listed.size > 0) {
     const keptIds = new Set(kept.map((v) => v.version));
     const tags: Record<string, string> = {};
 
@@ -3989,8 +3991,13 @@ const installPackument = (name: string, upstream: UpstreamApi) =>
 /** What installAnswer gives when the edge view that cleared the name is too old to answer by the time it would. */
 const EXPIRED = "expired";
 
-/** What an install document is decided from: the two facts, the stamp of the confirmed set, and the edge's clearance if it decided. */
-type InstallFacts = { read: { local: boolean; confirmed: { version: string; digest: string }[] }; stamp: string | null; clearance: Clearance | null };
+/**
+ * What an install document is decided from: the two facts, the OSSF feed's advisories for the name (osv.ts), the stamp
+ * of the confirmed set and those advisories, and the edge's clearance if it decided.
+ */
+type InstallFacts = { read: { local: boolean; confirmed: { version: string; digest: string }[] }; advisories: readonly Advisory[]; stamp: string | null; clearance: Clearance | null };
+
+
 
 /** installPackument's answer, deciding from `edge` (APM_INSTALL_CHECKS=edge) when there is one, else from the database. */
 const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi | null) =>
@@ -4000,17 +4007,25 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     // the statement and the copy's lookup (with npm's 304 when it is past the TTL) run at once; the copy answers only
     // for the stamp of the confirmed set this statement read
 
-    const fromDatabase: Effect.Effect<InstallFacts, StoreError> = Effect.flatMap((yield* Store).installRead(name), (read) =>
-      Effect.map(read.local ? Effect.succeed(null) : Effect.promise(() => installStamp(read.confirmed)), (stamp) => ({ read, stamp, clearance: null })),
-    );
+    type Decided = Pick<InstallFacts, "read" | "clearance">;
+
+    const fromDatabase: Effect.Effect<Decided, StoreError> = Effect.map((yield* Store).installRead(name), (read) => ({ read, clearance: null }));
     // with APM_INSTALL_CHECKS=edge, a name this isolate's edge view clears (not published here, no version confirmed
     // malicious) needs no statement: the database would read the same two facts (edge-checks.ts says how fresh)
 
     const timed = timedOf(yield* timingOrNull, "edge");
-    const cleared = (clearance: Clearance): Effect.Effect<InstallFacts> => Effect.map(Effect.promise(() => installStamp([])), (stamp) => ({ read: { local: false, confirmed: [] }, stamp, clearance }));
-    const stamped: Effect.Effect<InstallFacts, StoreError> = edge === null ? fromDatabase : Effect.flatMap(timed(edge.verdict(name)), (verdict) => (verdict.kind === "clear" ? cleared(verdict) : fromDatabase));
+    const cleared = (clearance: Clearance): Decided => ({ read: { local: false, confirmed: [] }, clearance });
+    const decided: Effect.Effect<Decided, StoreError> = edge === null ? fromDatabase : Effect.flatMap(timed(edge.verdict(name)), (verdict) => (verdict.kind === "clear" ? Effect.succeed(cleared(verdict)) : fromDatabase));
+
+    // what the OSSF feed lists of the name is asked beside them (osv.ts), and stamped with the confirmed set, so a copy
+    // answers only while both are what it was made from
+    const stamped: Effect.Effect<InstallFacts, StoreError> = Effect.flatMap(Effect.all([decided, advisoriesOf(name)], { concurrency: "unbounded" }), ([facts, advisories]) =>
+      Effect.map(facts.read.local ? Effect.succeed(null) : Effect.promise(() => installStamp(facts.read.confirmed, advisoryLines(advisories))), (stamp) => ({ ...facts, advisories, stamp })),
+    );
+
     const { read: looked, copy } = yield* upstream.installCopy({ name, served: baseUrl, lease, read: stamped, stampOf: (r) => r.stamp });
-    const { read, stamp, clearance } = looked;
+    const { read, advisories, stamp, clearance } = looked;
+    const headers = { ...INSTALL_HEADERS, ...noticeHeaders(name, advisories) };
 
     if (copy === null || stamp === null) {
       // npm has no such package: an edge view's clearance says so only while it is young, as for any answer
@@ -4048,7 +4063,7 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     if (got.kind === "copy") {
       timing?.expose();
 
-      return new Response(got.body, { headers: INSTALL_HEADERS });
+      return new Response(got.body, { headers });
     }
 
     const listing = got.listing;
@@ -4063,11 +4078,12 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     const src = { kind: "upstream" as const, name: probe.pkg.name, distTags: probe.pkg.distTags, versions: probe.pkg.versions, pkg: probe.pkg };
     const at = yield* now;
     const confirmed = confirmedIn(read.confirmed, src.versions);
+    const listed = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
     // what an answer holds while it is sent, charged before it is made (as upstreamRoute charges it)
     const serving = listing.pkg.serveCost.versionDocs + src.versions.length * SERVED_VERSION_WEIGHT + streamWeight(listing.pkg.serveCost.maxPieceChars + SERVED_EXTRA_CHARS);
 
     if (!lease.take(serving)) return pageRefused(name);
-    const make = () => upstreamPackument({ base: baseUrl, src, abbreviated: true, view: null, at, confirmed, devDependencies: null });
+    const make = () => upstreamPackument({ base: baseUrl, src, abbreviated: true, view: null, at, confirmed, listed, devDependencies: null });
 
     // the data center's copy is a second answer written after the response, charged as this one; skipped if it does not fit
     if (lease.take(serving)) {
@@ -4093,7 +4109,7 @@ const installAnswer = (name: string, upstream: UpstreamApi, edge: EdgeChecksApi 
     timing?.expose();
 
     // the request's lease stays open until the last byte is sent: the stream refers to the package until then
-    return streamedJson(make(), "versions", INSTALL_HEADERS, { onDone: lease.retain() });
+    return streamedJson(make(), "versions", headers, { onDone: lease.retain() });
   });
 
 /** Packuments and tarballs of packages that only exist upstream; null for anything else. */
@@ -4159,6 +4175,11 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
 
       // confirmed malicious by an apm reviewer: gone like a revoked version, before anything is downloaded
       if ((yield* confirmedVersions(src.name, src.versions.filter((x) => x.version === version))).has(version)) return fail(410, confirmedText(src.name, version), { confirmed: true });
+      // listed by the OSSF malicious-packages feed: refused before anything is downloaded, in every view, a version npm
+      // has since removed included (osv.ts)
+      const listedHere = (yield* listedVersionsOf(src.name, [version])).get(version);
+
+      if (listedHere) return fail(403, listedTarballText(listedHere), { knownMalicious: listedHere });
       const v = src.versions.find((x) => x.version === version);
 
       if (viaSafe) {
@@ -4211,18 +4232,23 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // GET /<upstream-pkg>/<version|tag>: npm view and tools that fetch a single version manifest
     if (sp.rest.length === 1) {
       const spec = sp.rest[0] ?? "";
-      const confirmed = yield* confirmedVersions(src.name, src.versions);
-      const offered = src.versions.filter((v) => !confirmed.has(v.version));
+      const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, src.versions.map((x) => x.version))], { concurrency: "unbounded" });
+      const offered = src.versions.filter((v) => !confirmed.has(v.version) && !listed.has(v.version));
       const view = viaSafe ? safeView(at) : null;
       const keptIds = new Set<string>();
 
       for (const v of offered) if (!view || view.keep(v)) keptIds.add(v.version);
 
-      const tags = view || confirmed.size > 0 ? filterDistTags(src.distTags, keptIds) : src.distTags;
+      const tags = view || confirmed.size > 0 || listed.size > 0 ? filterDistTags(src.distTags, keptIds) : src.distTags;
       const resolved = tagTarget(tags, spec) ?? spec;
       const v = offered.find((x) => x.version === resolved);
 
-      if (!v) return fail(404, "Version not found");
+      if (!v) {
+        // the version asked for, or the one its tag named before the feed's were withheld: say why it is not served
+        const asked = listed.get(spec) ?? listed.get(tagTarget(src.distTags, spec) ?? "");
+
+        return asked ? fail(404, `${maliciousText(asked)}, so apm does not serve it.`, { knownMalicious: asked }) : fail(404, "Version not found");
+      }
 
       if (view && !view.keep(v)) return fail(404, `${src.name}@${v.version} is not in this view: ${view.why(v) ?? "blocked by its policy"}.`);
 
@@ -4250,7 +4276,8 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       yield* Effect.forEach(cooled, (v) => ensureAnalyzed(src, v), { concurrency: "unbounded" });
     }
 
-    const headers = { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache" };
+    const [confirmed, advisories] = yield* Effect.all([confirmedVersions(src.name, src.versions), advisoriesOf(src.name)], { concurrency: "unbounded" });
+    const headers = { "content-type": abbreviated ? "application/vnd.npm.install-v1+json; charset=utf-8" : "application/json", "cache-control": "no-cache", ...noticeHeaders(src.name, advisories) };
 
     // a HEAD sends no body, so nothing is read or written for one
     if (req.method === "HEAD") return new Response(null, { status: 200, headers });
@@ -4266,7 +4293,8 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
       return json({ error: `The upstream registry could not be read for ${sp.name}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
     }
 
-    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed: yield* confirmedVersions(src.name, src.versions), devDependencies: dev?.byVersion ?? null });
+    const listed = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
+    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: viaSafe ? safeView(at) : null, at, confirmed, listed, devDependencies: dev?.byVersion ?? null });
 
     // the request's lease stays open until the last byte is sent: the stream refers to the package until then
     return streamedJson(body, "versions", headers, { onDone: lease.retain() });
@@ -4294,12 +4322,12 @@ export const apmRoute = (req: Request, url: URL, caller: Caller) =>
         if (src === "unknown" || src === "over-budget") return fail(503, `The upstream registry could not be read for ${sp.name}. Try again shortly.`);
 
         if (src && src.kind === "upstream") {
-          const confirmed = yield* confirmedVersions(src.name, src.versions);
+          const [confirmed, listed] = yield* Effect.all([confirmedVersions(src.name, src.versions), listedVersionsOf(src.name, src.versions.map((v) => v.version))], { concurrency: "unbounded" });
           const offeredIds = new Set<string>();
 
-          for (const v of src.versions) if (!confirmed.has(v.version)) offeredIds.add(v.version);
+          for (const v of src.versions) if (!confirmed.has(v.version) && !listed.has(v.version)) offeredIds.add(v.version);
 
-          const tags = confirmed.size > 0 ? filterDistTags(src.distTags, offeredIds) : src.distTags;
+          const tags = confirmed.size > 0 || listed.size > 0 ? filterDistTags(src.distTags, offeredIds) : src.distTags;
 
           return req.method === "HEAD" ? new Response(null, { status: 200, headers: { "content-type": "application/json", "cache-control": "no-cache" } }) : json(tags, 200, { "cache-control": "no-cache" });
         }

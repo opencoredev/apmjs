@@ -12,6 +12,7 @@ import { Clock } from "./clock.ts";
 import { RegistryConfig } from "./config.ts";
 import { confirmedAmong, confirmedText } from "./confirmed.ts";
 import { fail, json, routePath, streamedJson, streamWeight } from "./http.ts";
+import { advisoriesOf, listedAmong, listedTarballText, noticeHeaders } from "./osv.ts";
 import { RequestMemory } from "./memory.ts";
 import { getRouteOf } from "./routes.ts";
 import { splitPath, tarballVersion } from "./server.ts";
@@ -97,6 +98,8 @@ export const degradedRoute = (req: Request) =>
     if (probe.kind !== "found") return marked(fail(404, "Not found"));
     const src = upstreamSource(probe.pkg);
     const confirmed = confirmedAmong(verdict.confirmed, src.versions);
+    // the OSSF malicious-packages feed needs no database: its versions are withheld here too (osv.ts)
+    const advisories = yield* advisoriesOf(src.name);
 
     if (sp.rest[0] === "-" && sp.rest[1]) {
       const version = tarballVersion(src.name, sp.rest[1]);
@@ -104,6 +107,9 @@ export const degradedRoute = (req: Request) =>
       if (!version) return marked(fail(404, "Not found"));
 
       if (confirmed.has(version)) return marked(fail(410, confirmedText(src.name, version), { confirmed: true }));
+      const listedHere = listedAmong(src.name, advisories, [version]).get(version);
+
+      if (listedHere) return marked(fail(403, listedTarballText(listedHere), { knownMalicious: listedHere }));
       const got = yield* Effect.result(upstream.serve(src.pkg, version));
 
       if (Result.isFailure(got)) return unavailable("the tarball could not be read from the blob store");
@@ -150,6 +156,7 @@ export const degradedRoute = (req: Request) =>
       "cache-control": "no-cache",
       [DEGRADED_HEADER]: DATABASE_UNAVAILABLE,
       [SCORES_HEADER]: "unknown",
+      ...noticeHeaders(src.name, advisories),
     };
 
     if (req.method === "HEAD") return new Response(null, { status: 200, headers });
@@ -162,7 +169,8 @@ export const degradedRoute = (req: Request) =>
 
     const at = yield* (yield* Clock).now;
     const { baseUrl } = yield* RegistryConfig;
-    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: null, at, confirmed, devDependencies: dev?.byVersion ?? null });
+    const withheld = listedAmong(src.name, advisories, src.versions.map((v) => v.version));
+    const body = upstreamPackument({ base: baseUrl, src, abbreviated, view: null, at, confirmed, listed: withheld, devDependencies: dev?.byVersion ?? null });
 
     // read by apm's CLI and by people: these versions carry no score because none could be read, not because none exists
     body._apmDegraded = { reason: DATABASE_UNAVAILABLE, scores: "unknown", blocklistSyncedAt: new Date(syncedAt).toISOString() };
