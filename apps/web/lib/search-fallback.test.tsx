@@ -6,7 +6,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 let pathname = "/package/next";
 
+// Bun's module mock is process-wide: keep the real exports so later test files that import useParams still load.
+const realNavigation = await import("next/navigation");
+
 void mock.module("next/navigation", () => ({
+  ...realNavigation,
   usePathname: () => pathname,
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
 }));

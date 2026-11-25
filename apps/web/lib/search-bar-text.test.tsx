@@ -2,7 +2,11 @@
 // failures and partial answers, not only counts.
 import { describe, expect, mock, test } from "bun:test";
 
+// Bun's module mock is process-wide: keep the real exports so later test files that import useParams still load.
+const realNavigation = await import("next/navigation");
+
 void mock.module("next/navigation", () => ({
+  ...realNavigation,
   usePathname: () => "/package/next",
   useRouter: () => ({ push: () => undefined, replace: () => undefined, prefetch: () => undefined }),
 }));
