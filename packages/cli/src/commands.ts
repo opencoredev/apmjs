@@ -187,7 +187,8 @@ const SWITCH = /^--[A-Za-z][\w-]*$/;
  * or why apm refuses it. apm checks nothing on a bare install, so none of its arguments may reach the package manager
  * as a package. Every package manager reads a word that is not an option, or the word after an option it does not know
  * or that takes a value, as a package (bun 1.1 to 1.3 install the word after --tag, unchecked), and npm and pnpm read
- * `--audit=off` as a package `off`. So a bare install passes on plain switches (`--frozen-lockfile`, `--force`), and for
+ * `--audit=off` as a package `off`. --global and --location turn it into a global install, where npm installs the
+ * project itself as a package. So a bare install passes on the other plain switches (`--frozen-lockfile`, `--force`), and for
  * npm --tag and --omit with a checked value; written as two words, they may only come first or after a switch npm reads
  * as one (NPM_SWITCHES). apm's --pm and its value are taken out; anything else, -- included, is refused.
  */
@@ -202,11 +203,13 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
     const key = word.startsWith("--") ? word.slice(2, eq === -1 ? undefined : eq) : null;
 
     if (key === "pm") {
-      if (eq === -1 ? !takesValue(a.raw[i + 1]) : eq === word.length - 1) return { error: "--pm needs a value" };
+      if (eq === -1 ? !takesValue(a.raw[i + 1]) || a.raw[i + 1] === "" : eq === word.length - 1) return { error: "--pm needs a value" };
 
       if (eq === -1) i++;
       continue;
     }
+
+    if (key === "global" || key === "location") return { error: `apm ${a.cmd} with no packages installs this project, so it does not pass ${word} on to ${pm}: run ${pm} yourself to install globally` };
 
     const check = pm === "npm" && key !== null ? NPM_VALUES.get(key) : undefined;
 
@@ -220,7 +223,7 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
 
     if (check === undefined || value === undefined || !check(value)) return { error: `apm ${a.cmd} with no packages does not pass ${word} on to ${pm}: it checks nothing, and passes on only plain switches such as --frozen-lockfile` };
 
-    if (eq === -1 && !free) return { error: `apm ${a.cmd} with no packages passes ${word} on to npm only first or after a plain npm switch; write ${word}=${value}` };
+    if (!free) return { error: `apm ${a.cmd} with no packages passes ${word} on to npm only first or after a plain npm switch; put it first` };
     args.push(word);
 
     if (eq === -1) {

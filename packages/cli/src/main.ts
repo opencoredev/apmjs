@@ -2310,7 +2310,14 @@ async function passthrough(a: Args): Promise<number> {
 async function bareInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const passed = bareInstallArgs(a, det.pm);
+  let passed = bareInstallArgs(a, det.pm);
+
+  // yarn 1 ignores --immutable and rewrites a stale yarn.lock; only yarn 2 and later keep it
+  if ("args" in passed && det.pm === "yarn" && passed.args.includes("--immutable")) {
+    const line = await yarnLine({ cwd, env: withoutSecrets(process.env) });
+
+    if (line.kind !== "berry") passed = { error: `yarn ${line.kind === "classic" ? line.version : "(version unknown)"} ignores --immutable and may rewrite yarn.lock; use --frozen-lockfile` };
+  }
 
   if ("args" in passed) return (await runCmd([det.pm, "install", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   fail(`apm: ${passed.error}. Nothing was run.`);

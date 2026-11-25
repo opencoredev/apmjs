@@ -31,7 +31,7 @@ afterAll(() => {
 
 type Run = { code: number; out: string; err: string; pmCalls: string[]; files: string[]; packageJson: string };
 
-async function apm(argv: string[]): Promise<Run> {
+async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), "apm-help-"));
   const cwd = join(root, "pkg");
   const bin = join(root, "bin");
@@ -43,7 +43,9 @@ async function apm(argv: string[]): Promise<Run> {
   writeFileSync(join(cwd, "index.js"), "module.exports = 1;\n");
 
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
-    writeFileSync(join(bin, pm), `#!/bin/sh\necho "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
+    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : "";
+
+    writeFileSync(join(bin, pm), `#!/bin/sh\n${version}echo "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
     chmodSync(join(bin, pm), 0o755);
   }
 
@@ -300,6 +302,13 @@ describe("what still goes to the package manager", () => {
     [["install", "-P"], refusedBare("-P", "bun")],
     [["install", "--pm", "--pm", "npm", "--tag", "left-pad"], "--pm needs a value"],
     [["install", "--pm=", "--pm", "npm"], "--pm needs a value"],
+    [["install", "--pm", "", "--pm", "npm"], "--pm needs a value"],
+    [["install", "--pm", "npm", "--loglevel", "--tag=next"], "passes --tag=next on to npm only first or after a plain npm switch"],
+    [["install", "--pm", "npm", "--global"], "does not pass --global on to npm"],
+    [["install", "--global", "--frozen-lockfile"], "does not pass --global on to bun"],
+    [["install", "--pm", "pnpm", "--global"], "does not pass --global on to pnpm"],
+    [["install", "--pm", "npm", "--location", "--force"], "does not pass --location on to npm"],
+    [["install", "-g"], refusedBare("-g", "bun")],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
@@ -320,7 +329,6 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm", "npm", "--omit", "dev"], "npm install --omit dev"],
     [["install", "--pm", "npm", "--omit=peer", "--tag=beta", "--no-audit"], "npm install --omit=peer --tag=beta --no-audit"],
     [["install", "--pm", "npm", "--legacy-peer-deps", "--tag", "next", "--force"], "npm install --legacy-peer-deps --tag next --force"],
-    [["install", "--pm", "npm", "--loglevel", "--tag=next"], "npm install --loglevel --tag=next"],
     [["install", "--pm", "npm", "--frozen-lockfile"], "npm install --frozen-lockfile"],
     [["i", "--frozen-lockfile", "--production"], "bun install --frozen-lockfile --production"],
     [["install", "--force"], "bun install --force"],
@@ -333,6 +341,14 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
+  });
+
+  test("apm install --immutable is refused on yarn 1, which ignores it and rewrites a stale yarn.lock", async () => {
+    const r = await apm(["install", "--pm", "yarn", "--immutable"], "1.22.22");
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("yarn 1.22.22 ignores --immutable and may rewrite yarn.lock; use --frozen-lockfile");
+    expectNothingRan(r);
   });
 
   test("apm run dev --help is the package manager's", async () => {
