@@ -32,7 +32,7 @@ import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts"
 import { largeExplain, ossfListed } from "./smoke-probes.ts";
 import { installCheck } from "./cli-check.ts";
 import { cliLedgerPath } from "./cli-ledger.ts";
-import { cliRecordOf, installStep, killRunning, LARGE_PACKAGES, largePackageAnswer, resultLine, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
+import { cliRecordOf, installStep, killRunning, LARGE_PACKAGES, largePackageAnswer, resultLine, smokeTimeouts, spawnBounded, transcriptLines, type CheckAnswer } from "./smoke-checks.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
@@ -254,7 +254,7 @@ function matchOf(list: readonly (readonly [string, RegExp])[], out: string): str
 /** A failed check's whole CLI output, indented under its FAIL line, so a failure says what apm printed. */
 function transcript(ok: boolean, out: string): void {
   if (ok) return;
-  process.stdout.write(`${out.trimEnd().split("\n").map((l) => `    | ${l}`).join("\n")}\n`);
+  process.stdout.write(transcriptLines(out));
 }
 
 /**

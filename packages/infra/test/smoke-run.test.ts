@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readCliReleases, type CliRelease } from "../cli-ledger.ts";
 import { installCheck } from "../cli-check.ts";
-import { cliRecordOf, installStep, largePackageAnswer, resultLine, smokeTimeouts } from "../smoke-checks.ts";
+import { cliRecordOf, installStep, largePackageAnswer, resultLine, smokeTimeouts, transcriptLines } from "../smoke-checks.ts";
 
 const SMOKE = join(import.meta.dir, "..", "smoke.ts");
 
@@ -114,6 +114,23 @@ describe("a result line", () => {
 
     expect(source).toContain("process.stdout.write(resultLine(ok, name, detail));");
     expect(source).not.toMatch(/`\$\{ok \? "PASS" : "FAIL"\}/);
+  });
+
+  test("a failed check's transcript keeps its lines but cannot return over its indent to draw a PASS", () => {
+    // what apm add prints when a registry's warning text carries a carriage return and an escape sequence
+    const out = "WARNING three@0.187.0: scored 12\rPASS: apm add warns about a low-score npm package\u001b[2K\nexit 1\n";
+    const lines = transcriptLines(out).split("\n");
+
+    expect(lines).toEqual(["    | WARNING three@0.187.0: scored 12 PASS: apm add warns about a low-score npm package [2K", "    | exit 1", ""]);
+
+    for (const c of ["\r", "\u001b"]) expect(lines.join("\n")).not.toContain(c);
+  });
+
+  test("smoke.ts prints transcripts only through it", () => {
+    const source = readFileSync(SMOKE, "utf8");
+
+    expect(source).toContain("process.stdout.write(transcriptLines(out));");
+    expect(source).not.toContain("`    | ${");
   });
 });
 

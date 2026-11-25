@@ -6,20 +6,36 @@ import { CliRelease, readCliReleases } from "./cli-ledger.ts";
 
 export type SmokeTimeouts = { httpMs: number; commandMs: number };
 
-/**
- * One PASS or FAIL line. A detail carries text the stage under test wrote (a verdict's summary, an error body), so line
- * breaks and other control characters become spaces: the stage cannot print a line of its own, such as a forged PASS.
- */
-export function resultLine(ok: boolean, name: string, detail: string): string {
+/** `s` with line breaks and other control characters (C0, C1, U+2028/2029) as spaces: it prints as one line, as written. */
+function oneLine(s: string): string {
   const printable = (c: string): boolean => {
     const code = c.codePointAt(0) ?? 0;
 
     return code >= 0x20 && !(code >= 0x7f && code <= 0x9f) && code !== 0x2028 && code !== 0x2029;
   };
 
-  const oneLine = (s: string): string => [...s].map((c) => (printable(c) ? c : " ")).join("");
+  return [...s].map((c) => (printable(c) ? c : " ")).join("");
+}
 
+/**
+ * One PASS or FAIL line. A detail carries text the stage under test wrote (a verdict's summary, an error body), so line
+ * breaks and other control characters become spaces: the stage cannot print a line of its own, such as a forged PASS.
+ */
+export function resultLine(ok: boolean, name: string, detail: string): string {
   return `${ok ? "PASS" : "FAIL"}: ${oneLine(name)} (${oneLine(detail)})\n`;
+}
+
+/**
+ * A failed check's whole CLI output, each line indented under its FAIL line. The output quotes the stage (apm add's
+ * warnings, npm's and bun's error bodies), so a carriage return or an escape sequence in it is a space here: it cannot
+ * return to the start of a line and draw a PASS over the indent.
+ */
+export function transcriptLines(out: string): string {
+  return `${out
+    .trimEnd()
+    .split("\n")
+    .map((l) => `    | ${oneLine(l)}`)
+    .join("\n")}\n`;
 }
 
 /**
