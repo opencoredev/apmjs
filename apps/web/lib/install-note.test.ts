@@ -28,7 +28,6 @@ describe("installNote", () => {
     if (note.kind !== "needs-setup") return;
     expect(note.file).toBe("bunfig.toml");
     expect(note.config).toBe(`[install]\nregistry = "${registry}/"`);
-    expect(note.config).not.toContain("[install.security]");
     expect(note.lead).toContain("skips apm’s checks");
     expect(note.checks).toContain("apm add checks the score, cooldown and dependency tree");
     expect(note.checks.startsWith(note.effect)).toBe(true);

@@ -133,7 +133,7 @@ Run it in a folder with a `package.json` (`npm init -y` makes one). Like npm, ap
 apm add zod
 ```
 
-apm asks the registry for the newest version that is not revoked, yanked or confirmed malicious, prints its score card, and checks every package under it. Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package in it at its exact version. Only a lockfile that passes is written to your project and installed, with install scripts held back until apm has confirmed the install matches it. A revoked or yanked version anywhere in that lockfile refuses the add before anything in your project changes.
+apm asks the registry for the newest version that is not revoked, yanked, confirmed malicious or on the OSSF malicious-packages list, prints its score card, and checks every package under it. Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package in it at its exact version. Only a lockfile that passes is written to your project and installed, with install scripts held back until apm has confirmed the install matches it. A revoked or yanked version anywhere in that lockfile refuses the add before anything in your project changes. Two exceptions: npm runs a git dependency's `prepare` script while it computes the lockfile, and yarn 1 installs and runs scripts before apm checks; see [Lockfile first](/reference/cli#lockfile-first).
 
 ```text
 ✓ zod@4.6.7  score 100/100 (A)
@@ -147,7 +147,7 @@ apm asks the registry for the newest version that is not revoked, yanked or conf
 
 A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
 
-If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning. `--strict` refuses it instead (for the package you name, it picks the newest version past the cooldown), and `apm explain` recommends that version. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
+If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning. `--strict` refuses it instead; for the package you name, it skips fresh versions and may pick an older one that passes. `apm explain` looks for an older version in range past the cooldown and says whether to install it. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
 
 `apm install` with no package names runs your package manager's own install and checks nothing. The checks happen in `apm add`, and `apm audit` checks what is already installed.
 

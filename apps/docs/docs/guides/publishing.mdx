@@ -58,7 +58,7 @@ Before anything is uploaded, apm:
 5. refuses if the tarball holds a secret, has duplicate or escaping paths, or if `main`, `types`, `bin`, `module`, `browser` or an `exports` target points at a file that is not in it;
 6. lists the files and their sizes and prints the score the version would get.
 
-A prerelease (`1.2.0-beta.1`) is tagged `next` unless you pass `--tag`. A package whose only versions are prereleases has no `latest` tag, so a plain `apm add @you/my-lib` or `npm install @you/my-lib` finds no version: install it with the tag (`apm add @you/my-lib@next`) until you publish a plain version such as `1.0.0`. Then apm uploads with your package manager's own `publish` command.
+A prerelease (`1.2.0-beta.1`) is tagged `next` unless you pass `--tag`. Then apm uploads with your package manager's own `publish` command.
 
 The registry repeats the secret and entry-point checks, and also refuses:
 
@@ -79,6 +79,8 @@ The upload is staged, not live:
 Open the link. The approval page shows the files and the score evidence first, then the approve and reject controls. Approve with your passkey, or type a code from your authenticator app. The code or passkey check counts for that one upload only.
 
 Everything waiting for you is listed at [apmjs.dev/publish](https://apmjs.dev/publish), and every package you publish, with its latest version, score and anything waiting, at [apmjs.dev/account/packages](https://apmjs.dev/account/packages). An upload nobody approves expires after 24 hours; publish again to get a new link.
+
+A prerelease-only package published with the default tag has only a `next` tag and no `latest`, so a plain `apm add @you/my-lib` or `npm install @you/my-lib` finds no version. Install it by the tag it was published with, normally `apm add @you/my-lib@next`, until you publish a plain version such as `1.0.0`.
 
 ## Publishing from an agent
 
