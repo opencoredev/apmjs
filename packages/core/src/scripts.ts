@@ -41,9 +41,10 @@ const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 
-// npm's own reading of the flag, last one winning: `--ignore-scripts` and `--ignore-scripts=true` set it, `=false` and
-// `--no-ignore-scripts` clear it, and any other value makes npm refuse the command, so it runs nothing at all
-const IGNORE_SCRIPTS = /(?<!\S)--(no-)?ignore-scripts(?:=(\S*))?(?!\S)/g;
+// the only spellings read as setting npm's ignore-scripts; anything else that might touch it is a doubt (ignoreScriptsDoubt)
+const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
+const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
+const SHELL_WORD = /\S+/g;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
 
@@ -101,18 +102,31 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
  */
 type ScriptRef = { name: string; alone: boolean };
 
-/** Whether npm's flags before the script name leave `ignore-scripts` set. */
-function ignoresScripts(flags: string): boolean {
-  let set = false;
+/**
+ * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set, or -1. npm reads its flags
+ * anywhere in the invocation, the last one winning (`npm run --ignore-scripts x --no-ignore-scripts` runs prex), takes
+ * abbreviations (`--no-ig`), a separate `false` after the flag, and words the shell builds (`"--no-ig"`, `$FLAG`). So any
+ * word with "ig" in a flag other than the two spellings that set it, a `false` after a bare `--ignore-scripts`, and any word
+ * the shell expands is a doubt, read to the end of the command: past the invocation it can only make apm follow more.
+ */
+function ignoreScriptsDoubt(cmd: string): number {
+  let last = -1;
+  let bare = false;
 
-  for (const m of flags.matchAll(IGNORE_SCRIPTS)) set = m[1] === undefined && (m[2] === undefined || m[2] === "true");
+  for (const m of cmd.matchAll(SHELL_WORD)) {
+    const w = m[0].replace(/['"\\]/g, "");
 
-  return set;
+    if ((bare && /^false$/i.test(w)) || /[$`{]/.test(w) || (w.startsWith("-") && /ig|[*?[]/i.test(w) && !ENABLES.has(w))) last = m.index;
+    bare = w === "--ignore-scripts";
+  }
+
+  return last;
 }
 
 /** Scripts a command runs through the package manager, in order. */
 function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
   const out: ScriptRef[] = [];
+  let doubt: number | null = null;
 
   for (const m of cmd.matchAll(RUN_REF)) {
     const npm = m[1] ?? m[2];
@@ -121,9 +135,11 @@ function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
     // `yarn add x` or `pnpm install` are package manager commands, not scripts
     if (!name || !Object.hasOwn(scripts, name)) continue;
 
-    // the match ends with the name, so what comes before it is npm's flags (and `run`): only those are read, and a
-    // flag after the name, which npm reads too, leaves the pre and post scripts followed, the stricter reading
-    out.push({ name, alone: npm !== undefined && ignoresScripts(m[0].slice(0, m[0].length - name.length)) });
+    // npm's flags before the name (the match ends with it) set ignore-scripts, and nothing from there on may unset it;
+    // the doubt is found once per command, so a script of many such runs is still read in one pass
+    const sets = npm !== undefined && IGNORE_SCRIPTS.test(m[0].slice(0, m[0].length - name.length));
+
+    out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
   }
 
   for (const m of cmd.matchAll(RUN_ALL)) {

@@ -55,14 +55,38 @@ describe("an install script's `npm run` is followed whatever flags or quotes it 
   }
 });
 
-describe("npm's --ignore-scripts runs the named script, not its pre and post scripts", () => {
-  // checked with npm 11.19.1: `npm run --ignore-scripts payload` prints only payload's output
-  const scriptsOf = (cmd: string) => expandHooks({ scripts: { postinstall: cmd, prepayload: DROPPER, payload: "echo ok", postpayload: DROPPER } })[0]?.scripts;
+describe("npm run --ignore-scripts runs the script but not its pre and post scripts", () => {
+  // npm docs, config `ignore-scripts`: `npm run`, `npm test` and the like still run their script, "but they will not run
+  // any pre- or post-scripts", so a dropper in those never runs (npm 9.2 and 11.19.1 run locally print only the named
+  // script). npm reads its flags anywhere in the invocation, the last one winning, so they are skipped only when nothing
+  // from the npm word on could leave the flag unset
+  const files = { "index.js": "module.exports = 1;\n" };
 
-  for (const cmd of ["npm run --ignore-scripts payload", "npm --ignore-scripts run payload", "npm run --ignore-scripts=true payload"]) {
-    test(`${cmd}: payload only`, () => {
-      expect(scriptsOf(cmd)).toEqual(["postinstall", "payload"]);
-      expect(scoreOf({ scripts: { postinstall: cmd, prepayload: DROPPER, payload: "echo ok", postpayload: DROPPER } }, {}).ids).not.toContain("install-download");
+  const manifestOf = (cmd: string) => {
+    const name = cmd.includes("payload") ? "payload" : "test";
+
+    return { name, scripts: { postinstall: cmd, [name]: "node index.js", [`pre${name}`]: DROPPER, [`post${name}`]: DROPPER } };
+  };
+
+  const clean = scoreOf({ scripts: { postinstall: "npm run payload", payload: "node index.js" } }, files);
+
+  for (const cmd of [
+    "npm run --ignore-scripts payload",
+    "npm --ignore-scripts run payload",
+    "npm run --ignore-scripts=true payload",
+    "npm run-script --ignore-scripts 'payload'",
+    "npm --ignore-scripts test",
+    "npm run --ignore-scripts payload --silent",
+    "npm run --ignore-scripts payload --ignore-scripts=true",
+    "npm run --no-ignore-scripts other; npm run --ignore-scripts payload",
+  ]) {
+    test(`${cmd}: the script alone`, () => {
+      const { name, scripts } = manifestOf(cmd);
+      const r = scoreOf({ scripts }, files);
+
+      expect(expandHooks({ scripts })[0]?.scripts).toEqual(["postinstall", name]);
+      expect(r.ids).not.toContain("install-download");
+      expect(r.score).toBe(clean.score);
     });
   }
 
@@ -70,11 +94,50 @@ describe("npm's --ignore-scripts runs the named script, not its pre and post scr
     expect(scoreOf({ scripts: { postinstall: "npm run --ignore-scripts payload", payload: DROPPER } }, {}).ids).toContain("install-download");
   });
 
-  for (const cmd of ["npm run payload", "npm run --ignore-scripts=false payload", "yarn run --ignore-scripts payload"]) {
-    test(`${cmd}: pre and post scripts still followed`, () => {
-      expect(scriptsOf(cmd)).toEqual(["postinstall", "prepayload", "payload", "postpayload"]);
+  // npm runs them, or may: no flag, a later disable before or after the name (abbreviated, quoted, a separate `false`, or
+  // built by the shell), a value other than `true`, a flag after `--` (the script's, so following them is only stricter),
+  // an abbreviation apm does not read as setting it, or a package manager other than npm
+  for (const cmd of [
+    "npm run payload",
+    "npm run --ignore-scripts=false payload",
+    "npm run --ignore-scripts --no-ignore-scripts payload",
+    "npm --ignore-scripts run --ignore-scripts=false payload",
+    "npm run --ignore-scripts payload --no-ignore-scripts",
+    "npm run --ignore-scripts payload --ignore-scripts=false",
+    "npm run --ignore-scripts payload --no-ig",
+    "npm run --ignore-scripts payload --ignore-scripts false",
+    "npm run --ignore-scripts payload x --no-ignore-scripts",
+    'npm run --ignore-scripts payload "--no-ignore-scripts"',
+    "npm run --ignore-scripts payload --no-\\ignore-scripts",
+    "npm run --ignore-scripts payload $FLAG",
+    "npm run --ignore-scripts payload `printf -- --no-ig`",
+    "npm run --ignore-scripts payload -- --no-ignore-scripts",
+    "npm run --ignore-scripts payload && npm run payload",
+    "npm run --ignore-scripts=1 payload",
+    "npm run --ignore-scripts=yes payload",
+    "npm run --ignore-scripts=TRUE payload",
+    "npm run --ignore-scripts= payload",
+    "npm run --ig payload",
+    "npm --ignore-scripts test --no-ig",
+    "yarn run --ignore-scripts payload",
+  ]) {
+    test(`${cmd}: its pre and post scripts too`, () => {
+      const { name, scripts } = manifestOf(cmd);
+      const r = scoreOf({ scripts }, files);
+
+      expect(expandHooks({ scripts })[0]?.scripts.toSorted()).toEqual(["postinstall", `pre${name}`, name, `post${name}`].toSorted());
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBeLessThan(SCORE_FLOOR);
     });
   }
+
+  test("a long script of such runs is read in linear time", () => {
+    const cmd = "npm run --ignore-scripts payload; ".repeat(20_000);
+    const started = performance.now();
+
+    expect(expandHooks({ scripts: { postinstall: cmd, payload: "true" } })[0]?.scripts).toEqual(["postinstall", "payload"]);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
 });
 
 describe("node's inline-eval flag is recognised after other flags", () => {
@@ -89,39 +152,6 @@ describe("node's inline-eval flag is recognised after other flags", () => {
       expect(r.score).toBe(plain.score);
     });
   }
-});
-
-describe("npm run --ignore-scripts runs the script but not its pre and post scripts", () => {
-  // npm docs, config `ignore-scripts`: `npm run`, `npm test` and the like still run their script, "but they will not run
-  // any pre- or post-scripts", so a dropper in those never runs; npm 9 run locally printed only the named script's output
-  const files = { "index.js": "module.exports = 1;\n" };
-  const withHooks = (postinstall: string, name: string) => ({ scripts: { postinstall, [name]: "node index.js", [`pre${name}`]: DROPPER, [`post${name}`]: DROPPER } });
-  const clean = scoreOf({ scripts: { postinstall: "npm run payload", payload: "node index.js" } }, files);
-
-  for (const cmd of ["npm run --ignore-scripts payload", "npm --ignore-scripts run payload", "npm run --ignore-scripts=true payload", "npm run-script --ignore-scripts 'payload'", "npm --ignore-scripts test"]) {
-    test(`postinstall: ${cmd}`, () => {
-      const r = scoreOf(withHooks(cmd, cmd.endsWith("test") ? "test" : "payload"), files);
-
-      expect(r.ids).not.toContain("install-download");
-      expect(r.score).toBe(clean.score);
-    });
-  }
-
-  // npm runs them here: no flag, the flag cleared by a later one or by `=false`, or a value npm refuses (then nothing runs)
-  for (const cmd of ["npm run payload", "npm run --ignore-scripts=false payload", "npm run --ignore-scripts --no-ignore-scripts payload", "npm --ignore-scripts run --ignore-scripts=false payload", "npm run --ignore-scripts=1 payload", "yarn run --ignore-scripts payload"]) {
-    test(`postinstall: ${cmd} still reads them`, () => {
-      const r = scoreOf(withHooks(cmd, "payload"), files);
-
-      expect(r.ids).toContain("install-download");
-      expect(r.score).toBeLessThan(SCORE_FLOOR);
-    });
-  }
-
-  test("the same script run again without the flag still reads them", () => {
-    const r = scoreOf(withHooks("npm run --ignore-scripts payload && npm run payload", "payload"), files);
-
-    expect(r.ids).toContain("install-download");
-  });
 });
 
 describe("the flags a command may carry are read in linear time", () => {
