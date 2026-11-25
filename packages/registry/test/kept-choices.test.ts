@@ -11,7 +11,8 @@ import { z } from "zod";
 import { analyze, PREVIOUS_SCORER, SCORER, type Analysis as Scored } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Analysis } from "../src/analysis.ts";
-import { resolveResponse, ResolveWait } from "../src/apm.ts";
+import { apmRoute, resolveResponse, ResolveWait } from "../src/apm.ts";
+import { Auth } from "../src/auth.ts";
 import { Blobs } from "../src/blobs.ts";
 import { Clock } from "../src/clock.ts";
 import { RegistryConfig } from "../src/config.ts";
@@ -1076,6 +1077,48 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
           expect(history).toBeGreaterThan(16_000_000);
           expect(bytes).toBeLessThan(270_000 + 64 * 1024);
         }
+      } finally {
+        proxy.close();
+      }
+    }));
+  // Production, 2026-11-25: /package/next read every one of next's stored analyses, whole, on every view (the package
+  // answer, the score answer, a version's answer), and popular-scores read them twice for latest's score
+  test("the package page, the score and version answers and latest's score read only the versions they show", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const history = await seed(npm, sql);
+      const proxy = await measured(url);
+
+      const route = async (path: string) => {
+        // Better Auth is built on first use only, and these routes never sign anyone in
+        const auth = Auth.layer({ databaseUrl: proxy.url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+
+        const layers = Layer.provideMerge(
+          Layer.mergeAll(Upstream.layer(npm.url, 60_000, null), auth),
+          Layer.mergeAll(Store.postgres(proxy.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(npm.url)), RequestMemory.layer(new MemoryPool())),
+        );
+
+        const req = new Request(`http://registry.test${path}`);
+        const before = proxy.total();
+        const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+        const got = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+
+        return { ...got, bytes: proxy.total() - before };
+      };
+
+      try {
+        // the first package answer reads npm's packument, the second the summary the first kept
+        for (const path of ["/-/apm/v1/packages/nextlike", "/-/apm/v1/packages/nextlike", "/-/apm/v1/score/nextlike", "/-/apm/v1/score/nextlike/1.0.1", "/-/apm/v1/packages/nextlike/versions/1.0.0", "/-/apm/v1/packages/nextlike/versions/1.0.2", "/-/apm/v1/popular-scores?names=nextlike", "/-/apm/v1/names?q=nextlike", "/-/package/nextlike/dist-tags", "/-/apm/v1/packages/nextlike/events"]) {
+          const r = await route(path);
+
+          expect(r.status).toBe(200);
+          // 16 MB stored; at most 1.0.0's 270 kB analysis twice (the version answer of 1.0.0: the page read's, and
+          // npm's packument's when the summary cannot answer it) and the rest of the statements' rows
+          expect(history).toBeGreaterThan(16_000_000);
+          expect(r.bytes).toBeLessThan(2 * 270_000 + 64 * 1024);
+        }
+
+        expect((await route("/-/apm/v1/packages/nextlike")).text).toContain('"score":');
+        expect((await route("/-/apm/v1/score/nextlike/1.0.1")).text).toContain('"previous":{"version":"1.0.0"');
       } finally {
         proxy.close();
       }

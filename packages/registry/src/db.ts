@@ -332,8 +332,11 @@ const AnalysisItem = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("dismissal"), payload: DismissalRow }),
 ]);
 
-/** An upstream version's exact bytes, by its tarball digest's label: what upstreamAnalysesFor reads the analyses of. */
-export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string };
+/**
+ * An upstream version's exact bytes, by its tarball digest's label: what upstreamAnalysesFor reads the analyses of.
+ * \`trimmed\`: without PAGE_TRIMMED's members, for a reader that works out only its score and grade (and whether it has one).
+ */
+export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string; readonly trimmed?: boolean };
 
 /** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
 const AnalysesColumns = {
@@ -590,6 +593,11 @@ export type StoreApi = {
    * package's history.
    */
   readonly upstreamAnalysesFor: (keys: readonly AnalysisKey[]) => Effect.Effect<Map<string, UpstreamAnalyses>, StoreError>;
+  /**
+   * Whether upstreamAnalyses would find a score for the package (its scores are not empty), without reading one: an
+   * analysis by the current scorer, or an apm-score-v10 one it reuses. currentScore keeps every row that filter passes.
+   */
+  readonly upstreamScored: (name: string) => Effect.Effect<boolean, StoreError>;
   /**
    * The kept popular-scores answers for these names (migration 0019), never one for a package published on apm. Marks
    * them asked about at `at`, at most once an hour each, so the sweep keeps refreshing them.
@@ -971,6 +979,9 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
             shown AS (
               SELECT v AS version FROM unnest(${versions}::text[]) AS v
               UNION SELECT k.summary -> 'distTags' ->> t FROM kept_packages k, unnest(${tags}::text[]) AS t WHERE k.package = ${name}
+            ),
+            listed AS (
+              SELECT jsonb_array_elements(k.summary -> 'versions') ->> 'version' AS version FROM kept_packages k WHERE k.package = ${name} AND jsonb_typeof(k.summary -> 'versions') = 'array'
             )
             SELECT
               (SELECT to_jsonb(p) FROM p) AS pkg,
@@ -984,9 +995,9 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
                  FROM kept_packages k WHERE k.package = ${name} AND NOT EXISTS (SELECT 1 FROM p)) AS kept,
               (SELECT coalesce(jsonb_agg(jsonb_build_object('version', u.version, 'digest', u.digest,
                         'analysis', CASE WHEN u.version IN (SELECT version FROM shown) THEN u.analysis ELSE u.analysis - ${[...PAGE_TRIMMED]}::text[] END) ORDER BY u.scorer), '[]'::jsonb)
-                 FROM upstream_analysis u WHERE ${read} AND u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
+                 FROM upstream_analysis u WHERE ${read} AND u.package = ${name} AND u.version IN (SELECT version FROM listed) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis))) AND NOT EXISTS (SELECT 1 FROM p)) AS analyses,
               (SELECT coalesce(jsonb_agg(jsonb_build_object('version', o.version, 'outcome', o.outcome, 'detail', o.detail, 'digest', o.digest) ORDER BY o.scorer), '[]'::jsonb)
-                 FROM analysis_outcomes o WHERE ${read} AND o.package = ${name} AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable,
+                 FROM analysis_outcomes o WHERE ${read} AND o.package = ${name} AND o.version IN (SELECT version FROM listed) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL AND NOT EXISTS (SELECT 1 FROM p)) AS unscorable,
               (SELECT coalesce(jsonb_agg(version), '[]'::jsonb) FROM shown WHERE version IS NOT NULL AND ${read}) AS shown`,
         z.tuple([PageReadRow]).transform(([r]) => r),
       );
@@ -1664,14 +1675,25 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
     upstreamAnalysesFor: (keys) =>
       Effect.gen(function* () {
         if (keys.length === 0) return new Map<string, UpstreamAnalyses>();
+        const byKey = new Map<string, AnalysisKey>();
 
-        // upstreamAnalysesOf's statement for only these versions: their analyses and the dismissals for their bytes,
-        // and the outcomes decided for them (scoredPackage reads one only for a version with no score)
+        // each key once, whole when any reader of it asked for it whole
+        for (const k of keys) {
+          const id = JSON.stringify([k.package, k.version, k.digest]);
+
+          byKey.set(id, { ...k, trimmed: (k.trimmed ?? false) && (byKey.get(id)?.trimmed ?? true) });
+        }
+
+        const asked = [...byKey.values()];
+
+        // upstreamAnalysesOf's statement for only these versions: their analyses (whole, or trimmed as pageRead trims
+        // the versions a page does not show) and the dismissals for their bytes, and the outcomes decided for them
+        // (scoredPackage reads one only for a version with no score)
         const items = yield* run(
           "upstreamAnalysesFor",
-          sql`WITH k AS (SELECT * FROM unnest(${keys.map((k) => k.package)}::text[], ${keys.map((k) => k.version)}::text[], ${keys.map((k) => k.digest)}::text[]) AS k(package, version, digest))
-              SELECT 'analysis' AS kind, u.package, u.version, u.digest, row_number() OVER (ORDER BY u.scorer) AS seq, u.analysis AS payload
-                FROM upstream_analysis u WHERE (u.package, u.version, u.digest) IN (SELECT package, version, digest FROM k) AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+          sql`WITH k AS (SELECT * FROM unnest(${asked.map((k) => k.package)}::text[], ${asked.map((k) => k.version)}::text[], ${asked.map((k) => k.digest)}::text[], ${asked.map((k) => k.trimmed ?? false)}::boolean[]) AS k(package, version, digest, trimmed))
+              SELECT 'analysis' AS kind, u.package, u.version, u.digest, row_number() OVER (ORDER BY u.scorer) AS seq, CASE WHEN k.trimmed THEN u.analysis - ${[...PAGE_TRIMMED]}::text[] ELSE u.analysis END AS payload
+                FROM upstream_analysis u JOIN k ON u.package = k.package AND u.version = k.version AND u.digest = k.digest WHERE (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
               UNION ALL
               SELECT 'decided', o.package, o.version, o.digest, row_number() OVER (ORDER BY o.scorer), jsonb_build_object('outcome', o.outcome, 'detail', o.detail)
                 FROM analysis_outcomes o WHERE (o.package, o.version) IN (SELECT package, version FROM k) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL
@@ -1684,6 +1706,12 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
 
         return analysesByPackage(items);
       }),
+    upstreamScored: (name) =>
+      run(
+        "upstreamScored",
+        sql`SELECT EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS scored`,
+        z.tuple([z.object({ scored: z.boolean() })]).transform(([r]) => r.scored),
+      ),
     latestUpstreamAnalyses: (versions) =>
       Effect.gen(function* () {
         if (versions.length === 0) return new Map<string, unknown>();

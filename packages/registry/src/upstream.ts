@@ -7,7 +7,7 @@ import { Blobs } from "./blobs.ts";
 import { CACHE_FIRST_BYTE_MS, CACHE_IDLE_MS, DeadlinePassed, firstChunkWithin, logStall, matchWithin, R2_PUT_MS, within } from "./deadline.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { upstreamPuts, type PendingPuts } from "./pending-puts.ts";
-import { Store, type KeptChoicesRow, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
+import { Store, type KeptChoicesRow, type StoreApi, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
 import type { BlobError, StoreError } from "./errors.ts";
 import { ReleaseHooks } from "./hooks.ts";
 import { readCapped, streamedJson, streamWeight, type StreamOptions } from "./http.ts";
@@ -319,6 +319,24 @@ export function keptPackage(name: string, row: KeptChoicesRow): CachedPackage {
 export function scoredPackage(pkg: CachedPackage, analyses: UpstreamAnalyses): Probe {
   return { kind: "found", pkg: { ...pkg, versions: pkg.versions.map((v) => scoredVersion(v, analyses)) } };
 }
+
+/**
+ * Which versions' analyses a reader of a package reads, by version: whole, or trimmed (without PAGE_TRIMMED's members)
+ * for one that works out only a score and a grade from it. A version it does not name reads as not scored.
+ */
+export type Wanted = (pkg: CachedPackage) => ReadonlyMap<string, "whole" | "trimmed">;
+
+/** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
+export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> => {
+  const keys = versions.flatMap((v) => {
+    const form = want.get(v.version);
+    const d = digestOf(v);
+
+    return form !== undefined && d ? [{ package: name, version: v.version, digest: digestLabel(d), trimmed: form === "trimmed" }] : [];
+  });
+
+  return Effect.map(store.upstreamAnalysesFor(keys), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() });
+};
 
 /** One version of scoredPackage: its stored analysis for its exact bytes, or why it can never be scored. */
 function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
@@ -718,11 +736,17 @@ export type UpstreamApi = {
   readonly scopeExists: (scope: string) => Effect.Effect<"found" | "absent" | "unknown">;
   /**
    * The package with its analyses, read under `lease` (memory.ts): what it holds stays taken from the lease until the
-   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here.
+   * lease closes. Every read of a packument takes a lease; a package that does not fit is "unknown" here. It reads
+   * every stored analysis of the package whole; probeFor reads only those of the versions its `wanted` names
+   * (Store.upstreamAnalysesFor), each whole or trimmed, and every other version reads as not scored.
    */
   readonly probe: (name: string, lease: Lease) => Effect.Effect<Probe, StoreError>;
   /** probe, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
   readonly probeWithin: (name: string, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
+  /** probe reading only the analyses `wanted` names (see probe). */
+  readonly probeFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<Probe, StoreError>;
+  /** probeWithin reading only the analyses `wanted` names (see probe). */
+  readonly probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
   /**
@@ -1476,17 +1500,21 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           // a package that did not fit the lease could not be read: the caller asks again later
           Effect.map(listed(name, lease), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        const probeWithin = (name: string, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
+        const probeWithinFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
           Effect.gen(function* () {
             const l = yield* listed(name, lease);
 
             if (l.kind !== "found") return l;
 
-            return scoredPackage(l.pkg, yield* store.upstreamAnalyses(name));
+            return scoredPackage(l.pkg, wanted === undefined ? yield* store.upstreamAnalyses(name) : yield* wantedAnalyses(store, name, l.pkg.versions, wanted(l.pkg)));
           });
 
-        const probe = (name: string, lease: Lease): Effect.Effect<Probe, StoreError> =>
-          Effect.map(probeWithin(name, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+        const probeFor = (name: string, wanted: Wanted | undefined, lease: Lease): Effect.Effect<Probe, StoreError> =>
+          Effect.map(probeWithinFor(name, wanted, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+
+        const probeWithin = (name: string, lease: Lease) => probeWithinFor(name, undefined, lease);
+
+        const probe = (name: string, lease: Lease) => probeFor(name, undefined, lease);
 
         const probeMany = (names: readonly string[], lease: Lease): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
@@ -2074,6 +2102,8 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
             }),
           probe,
           probeWithin,
+          probeFor: (name: string, wanted: Wanted, lease: Lease) => probeFor(name, wanted, lease),
+          probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => probeWithinFor(name, wanted, lease),
           listing,
           listingIfChanged: listedOrSame,
           installCopy,
