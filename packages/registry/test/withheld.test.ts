@@ -32,6 +32,18 @@ describe("withheldLimitations", () => {
     expect(out).toContain("dependency plain-url: tarball URL: installs code from outside any registry");
     expect(out.join("\n")).not.toContain("Secret");
   });
+
+  test("an unchecked required peer is named, as a dependency is, and its spec stays out", () => {
+    // the publish check lists required peers (installEdges); an optional peer is not installed, so it is not one
+    const manifest = { peerDependencies: { "peer-lib": "github:evil/peer-lib#deadbeef", "opt-peer": "^1.0.0" }, peerDependenciesMeta: { "opt-peer": { optional: true } } };
+    // what checkDependencies stores for it: `${describeDependency(spec)}: ${uncheckableReason(spec)}`, under "dependency "
+    const stored = ["dependency peer-lib (github:evil/peer-lib#deadbeef): git dependency: installs code from a repository, outside any registry"];
+    const out = withheldLimitations(stored, manifest);
+
+    // named on its own line, not counted under "N more: not named while this version is withheld"
+    expect(out.filter((n) => n.startsWith("dependency "))).toEqual(["dependency peer-lib: git dependency: installs code from a repository, outside any registry"]);
+    expect(out.join("\n")).not.toContain("evil");
+  });
 });
 
 describe("withheldDismissals", () => {
