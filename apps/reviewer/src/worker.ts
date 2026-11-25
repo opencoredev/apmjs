@@ -85,15 +85,27 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
   const ids = { job: job.id, name: job.name, version: job.version };
 
   deps.log("info", "job.start", { ...ids, reasons: job.reasons.join(","), previous: job.previous?.version ?? null });
+  // counted per answer, so a review that throws after an attempt still charges the tokens that attempt used; settling
+  // once also releases the reserve the lease held
+  let tokens = 0;
+  let settled = false;
+
+  const ask: typeof deps.model.ask = async (messages) => {
+    const answer = await deps.model.ask(messages);
+
+    tokens += answer.usage.promptTokens + answer.usage.completionTokens;
+
+    return answer;
+  };
 
   try {
     const pkg = packageFilesOf(await deps.registry.tarball(job));
     const previous = await loadPrevious(deps, job);
     const review = buildReviewInput({ name: job.name, version: job.version, pkg, previous, budgetTokens: deps.budgetTokens });
-    const run = await runReview({ review, pkg, ask: deps.model.ask });
-    const tokens = run.attempts.reduce((n, a) => n + a.usage.promptTokens + a.usage.completionTokens, 0);
+    const run = await runReview({ review, pkg, ask });
 
-    deps.budget.spend(tokens);
+    settled = true;
+    deps.budget.settle(tokens);
     let secondOpinion: ReviewResult["secondOpinion"] = null;
 
     if (deps.secondStage && run.decision.outcome !== "benign") {
@@ -120,6 +132,17 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
 
     return "posted";
   } catch (cause) {
+    if (!settled) {
+      settled = true;
+
+      try {
+        deps.budget.settle(tokens);
+      } catch (budgetCause) {
+        // the job is still given back below; a budget that cannot be written must not strand its lease
+        deps.log("error", "budget.write_failed", { ...ids, tokens, why: budgetCause instanceof Error ? budgetCause.message.slice(0, 300) : "unknown" });
+      }
+    }
+
     const retryable = cause instanceof ModelUnavailable || (cause instanceof RegistryError && cause.retryable);
     const why = cause instanceof Error ? cause.message : String(cause);
 
@@ -140,9 +163,12 @@ export async function processJob(deps: WorkerDeps, job: ReviewJob): Promise<JobO
 
 /** Leases as many jobs as there are free slots and reviews them. Returns how many jobs it took. */
 export async function runOnce(deps: WorkerDeps, slots: number): Promise<number> {
-  if (!deps.budget.canStart()) return 0;
-  const jobs = await deps.registry.lease(slots);
+  const fit = Math.min(slots, deps.budget.reviewsThatFit());
 
+  if (fit <= 0) return 0;
+  const jobs = await deps.registry.lease(fit);
+
+  deps.budget.hold(jobs.length);
   await Promise.all(jobs.map((j) => processJob(deps, j)));
 
   return jobs.length;
@@ -176,7 +202,10 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
     });
 
   while (!deps.signal.aborted) {
-    if (!deps.budget.canStart()) {
+    // each leased job holds a reserve until it is charged (DailyBudget.hold and settle)
+    const fit = deps.budget.reviewsThatFit();
+
+    if (fit <= 0 && inflight.size === 0) {
       if (!budgetNoted) deps.log("warn", "budget.exhausted", { usedToday: deps.budget.usedToday(), limit: deps.budget.limit, resumesInMs: deps.budget.msUntilReset() });
       budgetNoted = true;
       await pause(Math.min(deps.budget.msUntilReset() + 1000, 10 * 60_000));
@@ -184,7 +213,7 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
     }
 
     budgetNoted = false;
-    const free = deps.concurrency - inflight.size;
+    const free = Math.min(deps.concurrency - inflight.size, fit);
 
     if (free <= 0) {
       await Promise.race(inflight);
@@ -195,6 +224,7 @@ export async function runDaemon(deps: WorkerDeps & { concurrency: number; pollMs
 
     try {
       jobs = await deps.registry.lease(free);
+      deps.budget.hold(jobs.length);
       backoff = 0;
     } catch (cause) {
       backoff = Math.min(backoff === 0 ? 2000 : backoff * 2, 5 * 60_000);
