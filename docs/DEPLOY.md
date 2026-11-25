@@ -186,6 +186,8 @@ A released version never changes. A run that finds the version's `SHA256SUMS` bu
 
 The website must be deployed with the bucket before the first release on a stage: `deploy.ts` creates the bucket and the binding, and the release fails its checks (and records nothing) until the site serves `/install` and `/cli/*`. The smoke check runs the install on every deploy; until a stage has a CLI release on record it passes as skipped, and after that `/install` must work.
 
+After a production release passes its checks, it runs `gh workflow run update-apm.yml --repo opencoredev/homebrew-tap -f version=<version>` with this machine's `gh` sign-in. That workflow installs the new formula with `brew install opencoredev/tap/apm` and runs `brew test` on macOS arm64 and Intel and on Linux x64 and arm64, then commits `Formula/apm.rb`. If `gh` is missing or the call fails, the release still succeeds and prints that command to run by hand. Users install with `brew install opencoredev/tap/apm`.
+
 The darwin binaries are ad-hoc signed by `bun build --compile` (`codesign -dv` shows `Signature=adhoc`), which is enough for macOS to run a binary that curl downloaded. The musl build needs `libstdc++` and `libgcc`; the script says so when it does not run.
 
 To try a release on this machine: `bun packages/infra/release-cli.ts --stage local --serve` keeps the bucket in `~/.cache/apm-cli-local` and serves it on `http://127.0.0.1:8790` with the website's own handler in workerd. `--host <tailscale address>` serves it to other machines.
