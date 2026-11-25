@@ -3,8 +3,6 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { z } from "zod";
-import type { Pm } from "./pm.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -98,43 +96,6 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
 }
 
-/** bunfig.toml's `[install] registry`, a URL or `{ url, token }`, read as its URL. */
-const BunfigRegistry = z.object({ install: z.object({ registry: z.union([z.string(), z.object({ url: z.string() }).loose().transform((r) => r.url)]) }).loose() }).loose();
-
-/** .yarnrc.yml's `npmRegistryServer` (yarn 2 and later). */
-const YarnrcRegistry = z.object({ npmRegistryServer: z.string() }).loose();
-
-/** The registry a bunfig.toml or .yarnrc.yml at `path` names; null when it names none or cannot be read. */
-function fileRegistry(path: string, kind: "bunfig" | "yarnrc"): string | null {
-  if (!existsSync(path)) return null;
-
-  try {
-    const text = readFileSync(path, "utf8");
-
-    switch (kind) {
-      case "bunfig": {
-        const parsed = BunfigRegistry.safeParse(Bun.TOML.parse(text));
-
-        return parsed.success ? parsed.data.install.registry : null;
-      }
-
-      case "yarnrc": {
-        const parsed = YarnrcRegistry.safeParse(Bun.YAML.parse(text));
-
-        return parsed.success ? parsed.data.npmRegistryServer : null;
-      }
-
-      default: {
-        const _exhaustive: never = kind;
-
-        return _exhaustive;
-      }
-    }
-  } catch {
-    return null;
-  }
-}
-
 /**
  * A registry as apm prints it: the origin of an http or https URL and nothing else, since an .npmrc or a variable can
  * carry a credential in the user, the path, the query or the fragment. Null for anything else, which apm then does not name.
@@ -146,38 +107,6 @@ export function displayRegistry(url: string): string | null {
     return u.protocol === "https:" || u.protocol === "http:" ? `${u.origin}/` : null;
   } catch {
     return null;
-  }
-}
-
-/**
- * The registry setting apm can find for `pm` in the project at `root`, for a plain install it does not check: for bun,
- * its variables, then bunfig.toml (the project's, then the user's); then npm_config_registry, the project root's .npmrc
- * and the user's. For yarn, YARN_NPM_REGISTRY_SERVER or .yarnrc.yml's npmRegistryServer. Null when apm finds none,
- * which does not mean there is none (a global npmrc, a flag): only for a hedged note, never to decide anything.
- */
-export function pmRegistry(input: { pm: Pm; root: string; env: Record<string, string | undefined> }): string | null {
-  const { pm, root, env } = input;
-  const home = env.HOME ?? homedir();
-  const npmrc = [join(root, ".npmrc"), userconfigPath(env)].map(readNpmrc).find((f) => f.has("registry"))?.get("registry") ?? null;
-  const fromEnv = env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? null;
-
-  switch (pm) {
-    case "bun": {
-      const bunfig = [join(root, "bunfig.toml"), join(env.XDG_CONFIG_HOME ?? join(home, ".config"), ".bunfig.toml"), join(home, ".bunfig.toml")].map((p) => fileRegistry(p, "bunfig")).find((r) => r !== null) ?? null;
-
-      return env.BUN_CONFIG_REGISTRY ?? fromEnv ?? bunfig ?? npmrc;
-    }
-
-    case "npm":
-    case "pnpm":
-      return fromEnv ?? npmrc;
-    case "yarn":
-      return env.YARN_NPM_REGISTRY_SERVER ?? fileRegistry(join(root, ".yarnrc.yml"), "yarnrc");
-    default: {
-      const _exhaustive: never = pm;
-
-      return _exhaustive;
-    }
   }
 }
 
