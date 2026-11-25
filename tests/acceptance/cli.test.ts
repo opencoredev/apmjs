@@ -114,9 +114,12 @@ describe("apm: runtime detection and pass-through", () => {
     gone.stop(true);
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);
-    const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: url } });
+    // a registry URL can carry a credential in its path or query: the message names only its origin
+    const withSecret = `${url}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY`;
+    const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: withSecret } });
 
     expect(r.code, r.out).toBe(1);
+    expect(r.out).not.toContain("SECRET_");
     const body: unknown = JSON.parse(r.stdout);
 
     // reference/cli.mdx: { ok, pm, error, packages, installed }, installed null when apm stopped before the check

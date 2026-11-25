@@ -1981,7 +1981,7 @@ async function cmdAdd(a: Args): Promise<number> {
     for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
   } catch (e) {
     // the registry could not be asked (down, refused, a timeout): nothing was installed, and --json keeps its shape
-    const why = e instanceof ApiError ? e.message : `could not reach ${cfg.registry} (${e instanceof Error ? e.message : String(e)})`;
+    const why = e instanceof ApiError ? e.message : `could not reach ${displayRegistry(cfg.registry) ?? "the registry"} (${e instanceof Error ? e.message : String(e)})`;
 
     fail(`apm add: ${why}; nothing was installed`);
     emitJson({ ok: false, det, results: [], error: lastError });
