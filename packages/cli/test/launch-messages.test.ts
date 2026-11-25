@@ -207,7 +207,7 @@ describe("apm's messages for first-time users", () => {
     expect(add.code).toBe(1);
     expect(add.text).toContain("✗ pre-only  no version is tagged latest");
     expect(add.text).toContain("refused: pre-only has no version tagged latest, the one apm installs when no version is named. Its versions are tagged next (0.0.1-test.1)");
-    expect(add.text).toContain("To install the version tagged next, run the same command with pre-only@next in place of pre-only");
+    expect(add.text).toContain("To install from the next tag, run the same command with pre-only@next as the package argument. apm checks whatever that tag resolves to, which can be an older version than the one listed");
     expect(add.text).not.toContain("score unknown");
     expect(add.text).not.toContain("--force does not help");
 
@@ -218,13 +218,13 @@ describe("apm's messages for first-time users", () => {
     expect(verdict.verdict).toBe("not-found");
     expect(verdict.summary).toBe("No version of pre-only is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.");
     expect(verdict.reasons).toContain("Its tags: `next` (`0.0.1-test.1`).");
-    expect(verdict.reasons).toContain("To check the version tagged `next`: apm explain pre-only@next");
+    expect(verdict.reasons).toContain("To check what the tag `next` resolves to: apm explain pre-only@next");
 
     const score = await apm(["score", "pre-only"], { cwd });
 
     expect(score.code).toBe(1);
     expect(score.text).toContain("apm: pre-only has no version tagged latest. Its versions are tagged next (0.0.1-test.1)");
-    expect(score.text).toContain("To score the version tagged next: apm score pre-only@next");
+    expect(score.text).toContain("To score what the tag next resolves to: apm score pre-only@next");
     // a tag with a terminal control in it is publisher text apm does not print
     expect(add.text).not.toContain("bad");
   });

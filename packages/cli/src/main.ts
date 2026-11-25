@@ -685,7 +685,7 @@ function refusalAdvice(blocked: Resolved[], verb: "add" | "x", strict: boolean):
   for (const b of blocked) {
     const [first] = b.tags;
 
-    if (first !== undefined) say(`To ${verb === "add" ? "install" : "run"} the version tagged ${first.tag}, run the same command with ${b.name}@${first.tag} in place of ${b.name}`);
+    if (first !== undefined) say(`To ${verb === "add" ? "install" : "run"} from the ${first.tag} tag, run the same command with ${b.name}@${first.tag} as the package argument. apm checks whatever that tag resolves to, which can be an older version than the one listed`);
   }
 
   if (forceable.length > 0) {
@@ -2202,7 +2202,7 @@ async function cmdScore(a: Args): Promise<number> {
 
     if (first === undefined) throw e;
     fail(`apm: ${name} has no version tagged latest. Its versions are tagged ${[first, ...rest].map((t) => `${t.tag} (${t.version})`).join(", ")}`);
-    say(`To score the version tagged ${first.tag}: apm score ${name}@${first.tag}`);
+    say(`To score what the tag ${first.tag} resolves to: apm score ${name}@${first.tag}`);
 
     return 1;
   }

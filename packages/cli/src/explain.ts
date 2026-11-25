@@ -804,7 +804,7 @@ function decide(input: ExplainInput): Decided {
       if (resolved.skipped.length === 0 && resolved.newest === null && tagged !== undefined) {
         const tags = (resolved.tags ?? []).map((t) => `${quoted(t.tag)} (${quoted(t.version)})`).join(", ");
 
-        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.`, reasons: [...reasons, `Its tags: ${tags}.`, `To check the version tagged ${quoted(tagged.tag)}: apm explain ${name}@${tagged.tag}`], commands: null, coverage: NOT_READ };
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.`, reasons: [...reasons, `Its tags: ${tags}.`, `To check what the tag ${quoted(tagged.tag)} resolves to: apm explain ${name}@${tagged.tag}`], commands: null, coverage: NOT_READ };
       }
 
       if (resolved.skipped.length === 0 && resolved.newest === null) {
