@@ -94,6 +94,16 @@ describe("npm run --ignore-scripts runs the script but not its pre and post scri
     expect(scoreOf({ scripts: { postinstall: "npm run --ignore-scripts payload", payload: DROPPER } }, {}).ids).toContain("install-download");
   });
 
+  // a newline ends a command: a run cut short at the end of a line never takes the next line's `npm` as its script name
+  for (const cmd of ["npm run --silent\nnpm run payload", "npm --silent run\nnpm run payload"]) {
+    test(`${JSON.stringify(cmd)}: the second line's run is read`, () => {
+      const scripts = { build: cmd, payload: DROPPER };
+
+      expect(expandHooks({ scripts: { postinstall: "npm run build", ...scripts } })[0]?.scripts).toContain("payload");
+      expect(scoreOf({ scripts: { postinstall: cmd, payload: DROPPER } }, {}).ids).toContain("install-download");
+    });
+  }
+
   // a flag's value is never read as reaching past a quote, so a run inside a quoted command substitution is still found
   for (const cmd of ['npm --x "$(npm run payload)" run build', 'npm --x="$(npm run payload)" run build']) {
     test(`${cmd}: the run inside the substitution is read`, () => {

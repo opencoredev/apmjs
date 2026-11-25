@@ -37,9 +37,9 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
-const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
-const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
+const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
+const SCRIPT = String.raw`[ \t]+["']?([\w:.@/-]+)`;
+const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}[ \t]+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT}|bun${FLAGS}[ \t]+run${FLAGS}${SCRIPT})`, "g");
 
 // the only spellings read as setting npm's ignore-scripts; anything else that might touch it is a doubt (ignoreScriptsDoubt)
 const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
