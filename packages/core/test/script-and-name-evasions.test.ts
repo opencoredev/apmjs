@@ -761,3 +761,18 @@ describe("the shell reading leaves a moved shell and heredocs to the first two r
     }
   });
 });
+
+describe("the shell reading reads npm's whole option vector before following a run", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a true after --ignore-scripts, a -- before run, an exported npm config or a config file follow nothing", () => {
+    expect(ids({ postinstall: "npm --loglevel warn run '--ignore-scripts' true check", true: DROPPER, check: "echo" })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm -- run '--loglevel' warn check", "--loglevel": "echo", check: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "export npm_config_ignore_scripts=true; npm run '--loglevel' warn check", precheck: DROPPER, check: "echo" })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm '--userconfig' ./check.ini --loglevel warn run check", precheck: DROPPER, check: "echo" })).not.toContain("install-download");
+  });
+
+  test("a quoted --ignore-scripts before the name still runs the named script", () => {
+    expect(ids({ postinstall: "npm run '--ignore-scripts' check", check: DROPPER })).toContain("install-download");
+  });
+});

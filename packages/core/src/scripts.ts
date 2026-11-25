@@ -89,7 +89,8 @@ const CHANGES_DIRECTORY = new Set(["cd", "pushd", "popd"]);
 const OWN_DIRECTORY = /^\.\/?$/;
 
 // npm's flags that take the next word as their value when it is not itself a flag
-const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", "-w", "--registry", "--userconfig", "--globalconfig", "--cache", "--script-shell", "--tag", "--otp", "--scope", "--node-options"]);
+// (a config file, the script shell and node's options may decide what runs, so they are not among them)
+const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", "-w", "--registry", "--cache", "--tag", "--otp", "--scope"]);
 
 // words that run the rest of the simple command as a command of its own, and the shell's words a command may follow
 const WRAPPERS = new Set(["env", "xargs", "exec", "command", "nohup", "time", "nice", "cross-env", "npx"]);
@@ -512,8 +513,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   // a manager's word is in the text as written unless quotes or escapes split it
   if (!/npm|yarn|bun|['"\\]/.test(cmd)) return [];
 
-  // a heredoc's body is text the shell hands a command, not commands, and the reading does not tell them apart
-  if (/<<(?!<)/.test(cmd)) return [];
+  // a heredoc's body is text the shell hands a command, not commands, and the reading does not tell them apart; npm's
+  // config set in the environment (`export npm_config_ignore_scripts=true`) holds across commands, which it does not track
+  if (/<<(?!<)|npm_config_/i.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
   // the simple command being read; `open` holds its references, settled where it ends (a doubt after the name unsets
   // `alone`)
@@ -623,10 +625,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       } else if (WRAPPERS.has(base)) {
         s.wrapper = base;
         s.fromInput ||= base === "xargs";
-      } else if (/^npm_config_/i.test(w) || !(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w === "--"))) {
-        // npm reads its config from the environment too (`npm_config_ignore_scripts=true`), which the reading does not
-        s.atStart = false;
-      }
+      } else if (!(/^[A-Za-z_]\w*=/.test(w) || KEYWORDS.has(w) || (s.wrapper !== null && w === "--"))) s.atStart = false;
 
       continue;
     }
@@ -647,7 +646,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
       s.after = "no";
       s.before.push(w);
 
+      // npm's options end at a `--` before `run` too, and `run` is then a word the reading does not follow
       if (s.phase === "run" || s.pm === "yarn" || s.pm === "pnpm") s.phase = "named";
+      else s.pm = null;
     } else if (w.length > 1 && w.startsWith("-")) {
       const r = s.pm === "npm" ? npmRedirect(w) : null;
 
@@ -655,6 +656,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
       if (r === "now") drop();
       else if (r === "next") Object.assign(s, { after: "value", pendingPrefix: true });
+      else if (w === "--ignore-scripts" && s.pm === "npm") s.after = "bool";
       else if (ENABLES.has(w) || (s.pm === "npm" ? npmKnownAssignment(w) : w.includes("="))) s.after = "no";
       else if (npmBoolean(w)) s.after = s.pm === "npm" ? "bool" : "no";
       else if (s.pm === "npm" && NPM_VALUE_FLAGS.has(w)) s.after = "value";
