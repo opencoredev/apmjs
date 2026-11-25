@@ -162,18 +162,18 @@ async function verify(site: SiteUrl, sums: readonly CliSum[], script: string): P
 // ---------- Homebrew ----------
 const BREW_TAP = "opencoredev/homebrew-tap";
 
-/** Starts the tap's Update apm workflow for this version through gh, which tests the new formula on every platform and commits it. Never fails the release. */
+/** Starts the tap's Update apm workflow for this version through gh, which tests the new formula on every platform and commits it. Never fails the release; gh gets 30 s so a hung call cannot hold the release lock. */
 function startBrewUpdate(released: CliVersion): string {
   const manual = `gh workflow run update-apm.yml --repo ${BREW_TAP} -f version=${released}`;
 
   try {
-    const run = Bun.spawnSync(["gh", "workflow", "run", "update-apm.yml", "--repo", BREW_TAP, "-f", `version=${released}`], { stdout: "pipe", stderr: "pipe" });
+    const run = Bun.spawnSync(["gh", "workflow", "run", "update-apm.yml", "--repo", BREW_TAP, "-f", `version=${released}`], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
 
     if (run.exitCode === 0) return `Homebrew: started the ${BREW_TAP} update for ${released} (https://github.com/${BREW_TAP}/actions)`;
 
     return `Homebrew: could not start the tap update (${run.stderr.toString().trim() || `gh exited ${run.exitCode}`}); run: ${manual}`;
-  } catch {
-    return `Homebrew: gh is not installed, so the tap was not updated; run: ${manual}`;
+  } catch (error) {
+    return `Homebrew: could not run gh (${error instanceof Error ? error.message : String(error)}), so the tap was not updated; run: ${manual}`;
   }
 }
 
