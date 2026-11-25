@@ -256,7 +256,10 @@ export async function linkAccount(analyticsId: string | null): Promise<void> {
 
     if (!id.success) return;
 
-    if (linked !== null && linked !== id.data) t.clear();
+    // another account was linked, in this tab (in memory) or in another one (the marker): start new ids before linking
+    const inMemory = t.getProfileId();
+
+    if ((linked !== null && linked !== id.data) || (inMemory !== null && inMemory !== id.data)) t.clear();
     t.identify(id.data);
     window.localStorage.removeItem(SDK_PROFILE_KEY);
     window.localStorage.setItem(LINKED_KEY, id.data);

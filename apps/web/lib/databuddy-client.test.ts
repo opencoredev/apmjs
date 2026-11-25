@@ -264,6 +264,13 @@ describe("linking a signed-in visitor to their account", () => {
     expect([...session.keys()]).toEqual([]);
   });
 
+  test("a tab still identified as one account that sees another signed in (switched in another tab) starts new ids first", async () => {
+    const { calls } = fakeIdentity({ [LINKED_KEY]: OTHER }, { inMemory: ID });
+
+    await linkAccount(OTHER);
+    expect(calls).toEqual(["clear", `identify ${OTHER}`]);
+  });
+
   test("a different account signing in starts new visitor ids before it is identified", async () => {
     const { calls, storage } = fakeIdentity({ [LINKED_KEY]: ID });
 
