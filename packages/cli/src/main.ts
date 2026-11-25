@@ -515,9 +515,11 @@ function lookalikeOf(report: Report | null): { reason: string; target: string | 
   const signal = report?.signals.find((s) => s.id === "typosquat" && s.points < 0);
 
   if (signal === undefined) return null;
-  const reason = signal.evidence[0] ?? signal.label;
+  // registry text, printed in apm's WARNING: one line, no terminal controls; only a valid package name is offered back
+  const reason = oneLine(signal.evidence[0] ?? signal.label);
+  const target = /"([^"]+)"/.exec(reason)?.[1] ?? null;
 
-  return { reason, target: /"([^"]+)"/.exec(reason)?.[1] ?? null };
+  return { reason, target: target !== null && isValidPackageName(target) ? target : null };
 }
 
 function printResolved(r: Resolved): void {
@@ -2247,7 +2249,9 @@ async function cmdName(a: Args): Promise<number> {
   let user = "";
   if (cfg.token) {
     const me = await api.raw("-/whoami");
-    if (me.status === 200 && typeof me.body === "object" && me.body !== null && "username" in me.body) user = String(me.body.username);
+    // the username becomes a scope apm prints and suggests: only one in a scope's alphabet counts
+    const who = z.object({ username: z.string().regex(/^[a-z0-9][a-z0-9._~-]*$/i) }).safeParse(me.body);
+    if (me.status === 200 && who.success) user = who.data.username;
   }
   const r = await api.get(`-/apm/v1/names?q=${encodeURIComponent(q)}${user ? `&user=${encodeURIComponent(user)}` : ""}`, NameResponse);
 

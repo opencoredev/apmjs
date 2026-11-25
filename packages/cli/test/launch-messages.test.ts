@@ -97,7 +97,7 @@ describe("apm's messages for first-time users", () => {
   /** apm with these arguments; `text` is everything a person in a terminal sees. */
   async function apm(args: string[], opts: { cwd: string; home?: string; token?: boolean; registry?: string }): Promise<{ code: number; out: string; text: string }> {
     // an empty APM_TOKEN is no token
-    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: opts.home ?? folder(`home-${crypto.randomUUID()}`), APM_REGISTRY: opts.registry ?? server.url.toString(), NO_COLOR: "1", APM_TOKEN: opts.token === true ? "apm_launchmessagestoken" : "" };
+    const env = { PATH: `${bin}:/usr/bin:/bin`, TMPDIR: root, HOME: opts.home ?? folder(`home-${crypto.randomUUID()}`), APM_REGISTRY: opts.registry ?? server.url.toString(), NO_COLOR: "1", APM_TOKEN: opts.token === true ? "apm_launchmessagestoken" : "" };
 
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "main.ts"), ...args], {
       cwd: opts.cwd,
@@ -208,6 +208,12 @@ describe("apm's messages for first-time users", () => {
     expect(add.text).toContain("✗ pre-only  no version is tagged latest");
     expect(add.text).toContain("refused: pre-only has no version tagged latest, the one apm installs when no version is named. Its versions are tagged next (0.0.1-test.1)");
     expect(add.text).toContain("To install from the next tag, run the same command with pre-only@next as the package argument. apm checks whatever that tag resolves to, which can be an older version than the one listed");
+
+    // apm x with its own flags and the binary's arguments: the advice keeps the command and changes only the package argument
+    const x = await apm(["x", "--pm", "bun", "--strict", "--ignore-scripts", "pre-only@latest", "--", "--test-arg"], { cwd });
+
+    expect(x.code).toBe(1);
+    expect(x.text).toContain("To run from the next tag, run the same command with pre-only@next as the package argument");
     expect(add.text).not.toContain("score unknown");
     expect(add.text).not.toContain("--force does not help");
 
