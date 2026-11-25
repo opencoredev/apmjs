@@ -289,6 +289,9 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 export type ShellToken = { word: string; end: number; glob: boolean; expanded: boolean } | null | "(" | ")";
 
 
+/** The deepest nesting of quotes, substitutions and groups the shell words are read through. */
+const MAX_SHELL_NESTING = 64;
+
 export function* shellWords(cmd: string): Generator<ShellToken> {
   let word: string | null = null;
   let glob = false;
@@ -335,6 +338,9 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
   };
 
   for (; i < cmd.length; i++) {
+    // past this nesting the words are not read at all: each level holds the word it interrupts, so a run of `$(` would
+    // otherwise grow the stacks with the script
+    if (open.length > MAX_SHELL_NESTING) return;
     const c = cmd[i] ?? "";
     const next = cmd[i + 1] ?? "";
 

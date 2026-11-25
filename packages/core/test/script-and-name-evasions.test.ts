@@ -1,7 +1,7 @@
 // Ways a package with a clearly malicious pattern scored higher than the same pattern written another way: a payload
 // named like a document, an `npm run` with flags or quotes, an inline eval after other flags. Payloads are stand-ins.
 import { describe, expect, test } from "bun:test";
-import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, planLayers, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
+import { analyze, expandHooks, finalize, gypCommands, isInlineDownload, shellWords, planLayers, SCORE_FLOOR, type Analysis, type AnalyzeInput, type TarEntry } from "../src/index.ts";
 
 function entry(path: string, text: string): TarEntry {
   const data = new TextEncoder().encode(text);
@@ -765,5 +765,15 @@ describe("node's exit flags never cost what fe2e641's eval reading finds", () =>
   test("an eval fe2e641 reads stands, and an exit flag inside the eval code is code", () => {
     expect(isInlineDownload("node '-e' 'fetch(\"data:,inline --help marker\").then(r=>r.text())'")).toBe(true);
     expect(isInlineDownload("node --version -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
+  });
+});
+
+describe("the shell words of deeply nested substitutions", () => {
+  test("past the nesting limit nothing more is read, so the stacks stay small", () => {
+    let tokens = 0;
+
+    for (const _ of shellWords("$(".repeat(100_000))) tokens++;
+
+    expect(tokens).toBeLessThan(200);
   });
 });
