@@ -40,7 +40,7 @@ export async function copyText(text: string): Promise<boolean> {
 export type CopyState = "idle" | "copied" | "manual";
 
 /** What useCopy hands back: the last copy's outcome, and the function that copies. */
-export type Copier = { state: CopyState; copy: (text: string, onFail?: () => void) => void };
+export type Copier = { state: CopyState; copy: (text: string, onFail?: () => void, onCopied?: () => void) => void };
 
 /** Copies on demand and holds the outcome long enough to show it: a tick for a copy, a hint when it failed. */
 export function useCopy(): Copier {
@@ -48,11 +48,12 @@ export function useCopy(): Copier {
 
   return {
     state,
-    copy(text, onFail) {
+    copy(text, onFail, onCopied) {
       void copyText(text).then((ok) => {
         setState(ok ? "copied" : "manual");
 
-        if (!ok) onFail?.();
+        if (ok) onCopied?.();
+        else onFail?.();
         setTimeout(() => setState("idle"), ok ? 1500 : 3000);
       });
     },
@@ -94,7 +95,7 @@ function SettingBreaks({ text }: { text: string }) {
  * Text in a filled block with a copy button on its right edge. Lines wrap at spaces and after "=" (the copied text
  * has no breaks added); a longer word scrolls sideways. `wrap` breaks long words anywhere, for prose;
  * `oneLine` keeps a single setting on one line (smaller on phones, scrolling if it still does not fit). `event` is sent
- * to analytics when the copy button is pressed.
+ * to analytics when the copy button's copy succeeds.
  */
 export function CopyBlock({
   text,
@@ -135,12 +136,17 @@ export function CopyBlock({
             "grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-[background-color,color,scale] duration-150 hover:text-foreground active:scale-[0.96]",
             "hover:bg-background",
           )}
-          onClick={() => {
-            if (event) track(event);
-            copy(text, () => {
-              if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-            });
-          }}
+          onClick={() =>
+            copy(
+              text,
+              () => {
+                if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+              },
+              () => {
+                if (event) track(event);
+              },
+            )
+          }
         >
           <CopyGlyph copied={state === "copied"} />
         </button>

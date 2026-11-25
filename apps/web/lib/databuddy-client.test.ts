@@ -2,7 +2,7 @@
 // attributes server components declare, and that nothing is sent or asked without the tracker on the page. The
 // tracker and Databuddy's flag endpoint are stand-ins here; scripts/analytics-browser.ts runs the real databuddy.js.
 import { afterEach, describe, expect, test } from "bun:test";
-import { DATABUDDY_FLAGS_URL, EVENTS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, track } from "./databuddy-client";
+import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, track } from "./databuddy-client";
 
 type Sent = { name: string; props: Readonly<Record<string, string | number>> };
 
@@ -36,13 +36,13 @@ afterEach(() => {
 
 describe("the events", () => {
   test("carry no free text: no search query, URL, path, email or user id", () => {
-    const props = Object.values(EVENTS).flat();
+    const props = [...EVENT_PROPS.values()].flat();
 
     for (const word of ["q", "query", "text", "url", "path", "href", "email", "user", "userId", "referrer"]) expect(props, word).not.toContain(word);
   });
 
   test("a declared click or copy reads back as the same event", () => {
-    const event = { name: "evidence_opened", props: { package: "zod", signal: "network-at-install" } } as const;
+    const event = { name: "evidence_opened", props: { package: "zod", signal: "network" } } as const;
     const click = clickEvent(event);
     const copy = copyEvent(event);
 
@@ -50,7 +50,21 @@ describe("the events", () => {
     expect(eventFromAttributes({ name: copy["data-copy-event"], props: copy["data-event-props"] })).toEqual(event);
   });
 
-  test("anything but one of EVENTS with exactly its properties is dropped", () => {
+  test("a value outside an event's schema is dropped: a URL as a location, free text as a package, a fraction", () => {
+    expect(eventFromAttributes({ name: "docs_cta_clicked", props: '{"location":"https://evil.test/?q=secret"}' })).toBeNull();
+    expect(eventFromAttributes({ name: "evidence_opened", props: '{"package":"my secret query","signal":"network"}' })).toBeNull();
+    expect(eventFromAttributes({ name: "package_searched", props: '{"results":2.5}' })).toBeNull();
+    expect(eventFromAttributes({ name: "search_result_opened", props: '{"package":"@scope/pkg","position":2}' })).toEqual({ name: "search_result_opened", props: { package: "@scope/pkg", position: 2 } });
+  });
+
+  test("track drops an event its schema refuses, even when the tracker is there", () => {
+    const t = fakeTracker();
+
+    track(JSON.parse('{"name":"docs_cta_clicked","props":{"location":"https://evil.test/"}}'));
+    expect(t.sent).toEqual([]);
+  });
+
+  test("anything but a known event with exactly its properties is dropped", () => {
     expect(eventFromAttributes({ name: "page_hijack", props: '{"location":"nav"}' })).toBeNull();
     expect(eventFromAttributes({ name: "docs_cta_clicked", props: '{"location":"nav","q":"secret"}' })).toBeNull();
     expect(eventFromAttributes({ name: "docs_cta_clicked", props: "{}" })).toBeNull();
@@ -136,6 +150,11 @@ describe("the install-default-client flag", () => {
 
     serve({ enabled: true, value: "<script>", variant: "x", reason: "RULE_MATCH", payload: null });
     expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
+
+    const t = fakeTracker();
+    serve({ enabled: true, value: "npm", variant: "https://evil.test/", reason: "RULE_MATCH", payload: null });
+    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("npm");
+    expect(t.sent).toEqual([{ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: "npm", value: "npm" } }]);
 
     serve({ error: "boom" }, 500);
     expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");

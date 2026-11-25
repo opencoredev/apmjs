@@ -3,47 +3,43 @@
 // asks the tracker that is already on the page: where the loader declined (another origin, an opt-out, a private
 // route) there is no window.databuddy, every track() does nothing and every flag read returns its default.
 //
-// Events carry no search text, no URL and nothing about the visitor: only the fixed values listed in EVENTS, and a
-// package name where the event is about one package.
+// Event properties carry no search text, no URL and nothing about the visitor: only the fixed values TrackedEvent
+// lists, counts, and a package name where the event is about one package. databuddy.js adds its usual envelope (the
+// page path without ?q, its random visitor and session ids), the same as a page view.
 import { z } from "zod";
 import "./zod-csp";
 import { DATABUDDY_FLAGS_ORIGIN } from "./databuddy-origin";
 import { InstallClient } from "./install-note";
 
-/** Each custom event and the property names it carries. Goals and funnels in Databuddy match these names. */
-export const EVENTS = {
-  install_command_copied: ["client", "package"],
-  registry_setup_copied: ["client"],
-  cli_install_copied: ["method", "source"],
-  agent_prompt_copied: ["package"],
-  agent_setup_copied: ["kind"],
-  mcp_setup_copied: ["agent", "source"],
-  docs_cta_clicked: ["location"],
-  package_searched: ["results"],
-  search_result_opened: ["package", "position"],
-  evidence_opened: ["package", "signal"],
-  sign_in_clicked: ["location"],
-  $flag_evaluated: ["flag", "variant", "value"],
-} as const satisfies Readonly<Record<string, readonly string[]>>;
+/** An npm package name, scoped or not; nothing longer or looser can ride along as a "package". */
+const PackageName = z.string().regex(/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/).max(214);
 
-export type EventName = keyof typeof EVENTS;
+const Count = z.number().int().nonnegative().max(10_000);
 
-export type EventProps<E extends EventName> = { readonly [K in (typeof EVENTS)[E][number]]: string | number };
+/**
+ * Each custom event and exactly what its properties may hold: fixed values, counts and package names, never free
+ * text. Goals and funnels in Databuddy match these names.
+ */
+const TrackedEvent = z.discriminatedUnion("name", [
+  z.object({ name: z.literal("install_command_copied"), props: z.strictObject({ client: InstallClient, package: PackageName }) }),
+  z.object({ name: z.literal("registry_setup_copied"), props: z.strictObject({ client: InstallClient }) }),
+  z.object({ name: z.literal("cli_install_copied"), props: z.strictObject({ method: z.enum(["curl", "brew"]), source: z.literal("docs") }) }),
+  z.object({ name: z.literal("agent_prompt_copied"), props: z.strictObject({ package: PackageName }) }),
+  z.object({ name: z.literal("agent_setup_copied"), props: z.strictObject({ kind: z.enum(["prompt", "instructions"]) }) }),
+  z.object({ name: z.literal("mcp_setup_copied"), props: z.strictObject({ agent: z.enum(["claude", "codex", "cursor"]), source: z.enum(["home", "docs"]) }) }),
+  z.object({ name: z.literal("docs_cta_clicked"), props: z.strictObject({ location: z.enum(["nav", "docs_overview", "install_note", "agent_setup", "not_found"]) }) }),
+  z.object({ name: z.literal("package_searched"), props: z.strictObject({ results: Count }) }),
+  z.object({ name: z.literal("search_result_opened"), props: z.strictObject({ package: PackageName, position: Count }) }),
+  z.object({ name: z.literal("evidence_opened"), props: z.strictObject({ package: PackageName, signal: z.string().regex(/^[a-z0-9-]{1,64}$/) }) }),
+  z.object({ name: z.literal("sign_in_clicked"), props: z.strictObject({ location: z.literal("header") }) }),
+  z.object({ name: z.literal("$flag_evaluated"), props: z.strictObject({ flag: z.literal("install-default-client"), variant: InstallClient, value: InstallClient }) }),
+]);
 
 /** One event with its properties, as a value a component can hold and pass on. */
-export type TrackedEvent = { [E in EventName]: { readonly name: E; readonly props: EventProps<E> } }[EventName];
+export type TrackedEvent = z.infer<typeof TrackedEvent>;
 
-const EVENT_KEYS: ReadonlyMap<string, readonly string[]> = new Map(Object.entries(EVENTS));
-
-const RawEvent = z.object({ name: z.string(), props: z.record(z.string(), z.union([z.string(), z.number()])) });
-
-/** Whether a parsed event is one of EVENTS with exactly its property names. */
-function hasEventKeys(e: z.infer<typeof RawEvent>): e is TrackedEvent {
-  const keys = EVENT_KEYS.get(e.name);
-  const got = Object.keys(e.props);
-
-  return keys !== undefined && got.length === keys.length && keys.every((k) => got.includes(k));
-}
+/** Every event and the property names it may carry, for the tests and for anyone wiring a goal. */
+export const EVENT_PROPS: ReadonlyMap<TrackedEvent["name"], readonly string[]> = new Map(TrackedEvent.options.map((o) => [o.shape.name.value, Object.keys(o.shape.props.shape)]));
 
 /** The part of databuddy.js's window.databuddy this file uses. */
 const Tracker = z.object({
@@ -74,9 +70,10 @@ function tracker(): Tracker | null {
 export function track(event: TrackedEvent): void {
   try {
     const t = tracker();
+    const parsed = TrackedEvent.safeParse(event);
 
-    if (!t) return;
-    t.track(event.name, event.props);
+    if (!t || !parsed.success) return;
+    t.track(parsed.data.name, parsed.data.props);
     t.flush();
   } catch {
     // analytics never breaks the page
@@ -93,17 +90,14 @@ export function copyEvent(event: TrackedEvent) {
   return { "data-copy-event": event.name, "data-event-props": JSON.stringify(event.props) };
 }
 
-/**
- * Reads back what clickEvent or copyEvent put on an element: the event when its name is one of EVENTS and its
- * properties are exactly that event's, each a string or a number, or null.
- */
+/** Reads back what clickEvent or copyEvent put on an element: the event when its schema accepts it, or null. */
 export function eventFromAttributes({ name, props }: { name: string | undefined; props: string | undefined }): TrackedEvent | null {
   if (props === undefined) return null;
 
   try {
-    const parsed = RawEvent.safeParse({ name, props: JSON.parse(props) });
+    const parsed = TrackedEvent.safeParse({ name, props: JSON.parse(props) });
 
-    return parsed.success && hasEventKeys(parsed.data) ? parsed.data : null;
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
@@ -168,7 +162,9 @@ export async function installDefaultClient({ clientId, fallback }: { clientId: s
     const client = InstallClient.safeParse(result.data.value);
 
     if (!client.success) return fallback;
-    track({ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: result.data.variant ?? client.data, value: client.data } });
+    const variant = InstallClient.safeParse(result.data.variant);
+
+    track({ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: variant.success ? variant.data : client.data, value: client.data } });
 
     return client.data;
   } catch {

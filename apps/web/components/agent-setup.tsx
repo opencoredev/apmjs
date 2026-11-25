@@ -43,10 +43,13 @@ export function AgentSetup() {
             </p>
           </div>
         </div>
-        <Button size="lg" className="w-full sm:w-auto" onClick={() => {
-            track({ name: "agent_setup_copied", props: { kind: "prompt" } });
-            prompt.copy(setupPrompt(), () => setManual(true));
-          }}>
+        <Button size="lg" className="w-full sm:w-auto" onClick={() =>
+            prompt.copy(
+              setupPrompt(),
+              () => setManual(true),
+              () => track({ name: "agent_setup_copied", props: { kind: "prompt" } }),
+            )
+          }>
           <CopyGlyph copied={prompt.state === "copied"} className="[&_svg]:text-current" />
           {prompt.state === "copied" ? "Prompt copied" : "Copy setup prompt"}
         </Button>

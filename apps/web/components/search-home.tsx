@@ -23,7 +23,7 @@ import {
   type SearchHit,
 } from "@/lib/search-schema";
 import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
-import { clickEvent, track } from "@/lib/databuddy-client";
+import { track } from "@/lib/databuddy-client";
 
 const NAME_CHECK_DEBOUNCE_MS = 250;
 
@@ -321,24 +321,24 @@ function ResultRow({
   hit,
   q,
   id,
-  position,
   active,
   reserveScore,
   onHover,
+  onOpen,
 }: {
   hit: SearchHit;
   q: string;
   id: string;
-  position: number;
   active: boolean;
   reserveScore: boolean;
   onHover: () => void;
+  onOpen: () => void;
 }) {
   return (
     <li role="presentation" className="border-b" onMouseMove={onHover}>
       <Link
         id={id}
-        {...clickEvent({ name: "search_result_opened", props: { package: hit.name, position } })}
+        onClick={onOpen}
         role="option"
         aria-selected={active}
         href={packageHref(hit.name)}
@@ -380,6 +380,7 @@ function Results({
   setActive,
   retry,
   updating,
+  onOpen,
 }: {
   done: SearchDone;
   q: string;
@@ -389,6 +390,8 @@ function Results({
   retry: () => void;
   /** The typed query, when the results on screen still belong to the previous one. */
   updating: string | null;
+  /** Called with a result's name and 1-based position when it is clicked. */
+  onOpen: (name: string, position: number) => void;
 }) {
   const again = (
     <button type="button" onClick={retry} className="font-medium text-foreground underline underline-offset-4 hover:no-underline">
@@ -432,7 +435,7 @@ function Results({
       ) : (
         <ul id={listId} role="listbox" aria-label="Packages" className="border-t">
           {hits.map((hit, i) => (
-            <ResultRow key={hit.name} hit={hit} q={q} id={`${listId}-${i}`} position={i + 1} active={i === active} reserveScore={reserveScore} onHover={() => setActive(i)} />
+            <ResultRow key={hit.name} hit={hit} q={q} id={`${listId}-${i}`} active={i === active} reserveScore={reserveScore} onHover={() => setActive(i)} onOpen={() => onOpen(hit.name, i + 1)} />
           ))}
         </ul>
       )}
@@ -506,16 +509,32 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // One package_searched per query whose answer stays on screen: its result count only, never the text typed.
+  // One package_searched per query whose answer stays on screen, or that a result is opened from first: its result
+  // count only, never the text typed.
   const counted = useRef<string | null>(null);
   const shownResults = fresh && q !== "" && current?.kind === "ok" ? current.answer.hits.length : null;
-  useEffect(() => {
+
+  const countSearch = () => {
     if (shownResults === null || counted.current === q) return;
 
-    const timer = setTimeout(() => {
-      counted.current = q;
-      track({ name: "package_searched", props: { results: shownResults } });
-    }, SEARCH_SETTLE_MS);
+    counted.current = q;
+    track({ name: "package_searched", props: { results: shownResults } });
+  };
+
+  const openResult = (name: string, position: number) => {
+    countSearch();
+    track({ name: "search_result_opened", props: { package: name, position } });
+  };
+
+  const countSearchRef = useRef(countSearch);
+
+  useEffect(() => {
+    countSearchRef.current = countSearch;
+  });
+  useEffect(() => {
+    if (shownResults === null) return;
+
+    const timer = setTimeout(() => countSearchRef.current(), SEARCH_SETTLE_MS);
 
     return () => clearTimeout(timer);
   }, [q, shownResults]);
@@ -547,6 +566,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     const exact = current.answer.hits.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
     if (!exact) return;
+    countSearchRef.current();
     track({ name: "search_result_opened", props: { package: exact.name, position: current.answer.hits.indexOf(exact) + 1 } });
     router.push(packageHref(exact.name));
   }, [enterFor, q, fresh, current, router]);
@@ -571,7 +591,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
       const selected = active >= 0 ? actionable[active] : actionable.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
       if (!selected) return;
-      track({ name: "search_result_opened", props: { package: selected.name, position: actionable.indexOf(selected) + 1 } });
+      openResult(selected.name, actionable.indexOf(selected) + 1);
       router.push(packageHref(selected.name));
     } else if (e.key === "Escape") {
       e.preventDefault();
@@ -653,7 +673,7 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
           )}
           <div className={cn("min-w-0 transition-opacity duration-200", pending && current ? "opacity-70" : "")}>
             {current ? (
-              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} retry={retry} updating={fresh ? null : q} />
+              <Results done={current} q={shownQuery} listId={listId} active={active} setActive={setActive} retry={retry} updating={fresh ? null : q} onOpen={openResult} />
             ) : (
               <div aria-hidden className="flex flex-col">
                 <Line className="mb-4 w-24" />

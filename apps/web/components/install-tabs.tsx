@@ -15,6 +15,9 @@ const isClient = (v: unknown): v is InstallClient => InstallClient.safeParse(v).
 /** Databuddy's client id, inlined at build time; "" on every build but production's, which reads no flags. */
 const DATABUDDY_CLIENT_ID = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
 
+/** The flag is asked once per document; every install box after the first reuses the answer. */
+let startingClient: Promise<InstallClient> | null = null;
+
 function DocsLink({ href }: { href: string }) {
   return (
     <Link
@@ -110,14 +113,17 @@ function AgentPrompt({ name }: { name: string }) {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <Button
           variant="secondary"
-          onClick={() => {
-            track({ name: "agent_prompt_copied", props: { package: name } });
-            copy(prompt, () => {
-              if (detailsRef.current) detailsRef.current.open = true;
+          onClick={() =>
+            copy(
+              prompt,
+              () => {
+                if (detailsRef.current) detailsRef.current.open = true;
 
-              if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-            });
-          }}
+                if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+              },
+              () => track({ name: "agent_prompt_copied", props: { package: name } }),
+            )
+          }
         >
           {state === "copied" ? <CopyGlyph copied /> : <BotIcon aria-hidden />}
           {state === "copied" ? "Prompt copied" : "Copy prompt for your agent"}
@@ -139,12 +145,15 @@ function AgentPrompt({ name }: { name: string }) {
             type="button"
             aria-label={state === "copied" ? "Copied" : "Copy the prompt"}
             className="absolute top-1.5 right-1.5 grid size-9 place-items-center rounded-lg bg-background text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-surface hover:text-foreground active:scale-[0.96]"
-            onClick={() => {
-              track({ name: "agent_prompt_copied", props: { package: name } });
-              copy(prompt, () => {
-                if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-              });
-            }}
+            onClick={() =>
+              copy(
+                prompt,
+                () => {
+                  if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
+                },
+                () => track({ name: "agent_prompt_copied", props: { package: name } }),
+              )
+            }
           >
             <CopyGlyph copied={state === "copied"} />
           </button>
@@ -159,11 +168,18 @@ export function InstallTabs({ name, version, registry }: { name: string; version
   const chosen = useRef(false);
   const { state, copy } = useCopy();
 
-  // The install-default-client flag may start the box on another client; a tab the visitor already picked wins.
+  // The install-default-client flag may start the box on another client; a tab the visitor already pressed wins.
   useEffect(() => {
-    void installDefaultClient({ clientId: DATABUDDY_CLIENT_ID, fallback: "apm" }).then((c) => {
-      if (!chosen.current) setClient(c);
+    let live = true;
+
+    startingClient ??= installDefaultClient({ clientId: DATABUDDY_CLIENT_ID, fallback: "apm" });
+    void startingClient.then((c) => {
+      if (live && !chosen.current) setClient(c);
     });
+
+    return () => {
+      live = false;
+    };
   }, []);
   const codeRef = useRef<HTMLElement>(null);
   const command = installCommand({ client, name, version });
@@ -178,12 +194,17 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         <Tabs
           value={client}
           onValueChange={(v) => {
-            if (!isClient(v)) return;
-            chosen.current = true;
-            setClient(v);
+            if (isClient(v)) setClient(v);
           }}
         >
-          <TabsList className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
+          <TabsList
+            onPointerDown={() => {
+              chosen.current = true;
+            }}
+            onKeyDown={() => {
+              chosen.current = true;
+            }}
+            className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
             {INSTALL_CLIENTS.map((c) => (
               <TabsTrigger key={c} value={c} className="h-7 rounded-md px-2.5 font-mono text-xs data-active:bg-background data-active:shadow-xs dark:data-active:bg-input">
                 {c}
@@ -201,12 +222,15 @@ export function InstallTabs({ name, version, registry }: { name: string; version
           type="button"
           aria-label={state === "copied" ? "Copied" : "Copy install command"}
           className="grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-background hover:text-foreground active:scale-[0.96]"
-          onClick={() => {
-            track(copied);
-            copy(command, () => {
-              if (codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
-            });
-          }}
+          onClick={() =>
+            copy(
+              command,
+              () => {
+                if (codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
+              },
+              () => track(copied),
+            )
+          }
         >
           <CopyGlyph copied={state === "copied"} />
         </button>
