@@ -47,7 +47,8 @@ describe("packageMarkdown", () => {
 
   test("has install commands for apm, bun, npm and pnpm, and the config that turns the checks on", () => {
     expect(md).toContain("apm add left-pad\nbun add left-pad@1.3.0\nnpm install left-pad@1.3.0\npnpm add left-pad@1.3.0");
-    expect(md).toContain(`registry=${REGISTRY}~safe/`);
+    expect(md).toContain(`registry=${REGISTRY}\n`);
+    expect(md).toContain(`For strict mode use registry=${REGISTRY}~safe/`);
     expect(md).toContain('scanner = "@apm/bun-scanner"');
   });
 
