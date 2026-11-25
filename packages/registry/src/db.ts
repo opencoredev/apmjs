@@ -334,9 +334,10 @@ const AnalysisItem = z.discriminatedUnion("kind", [
 
 /**
  * An upstream version's exact bytes, by its tarball digest's label: what upstreamAnalysesFor reads the analyses of.
- * \`trimmed\`: without PAGE_TRIMMED's members, for a reader that works out only its score and grade (and whether it has one).
+ * `trimmed`: without PAGE_TRIMMED's members, for a reader that works out only its score and grade (and whether it has one).
+ * A null digest is a version npm lists no checksum for: it has no analysis or dismissal, only an outcome (unavailable).
  */
-export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string; readonly trimmed?: boolean };
+export type AnalysisKey = { readonly package: string; readonly version: string; readonly digest: string | null; readonly trimmed?: boolean };
 
 /** An upstream package's analyses, its live dismissals and what it cannot score, as upstreamAnalyses reads them. */
 const AnalysesColumns = {
@@ -1684,14 +1685,16 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
           byKey.set(id, { ...k, trimmed: (k.trimmed ?? false) && (byKey.get(id)?.trimmed ?? true) });
         }
 
+        // as JSON: a column of digests can be all nulls, which the driver cannot type as text[]
         const asked = [...byKey.values()];
 
         // upstreamAnalysesOf's statement for only these versions: their analyses (whole, or trimmed as pageRead trims
-        // the versions a page does not show) and the dismissals for their bytes, and the outcomes decided for them
-        // (scoredPackage reads one only for a version with no score)
+        // the versions a page does not show) and the dismissals for their bytes, and the outcomes decided for them by
+        // version, whatever their digest, as upstreamAnalysesOf reads them (scoredPackage reads one only for a version
+        // with no score; one with no checksum has only its outcome)
         const items = yield* run(
           "upstreamAnalysesFor",
-          sql`WITH k AS (SELECT * FROM unnest(${asked.map((k) => k.package)}::text[], ${asked.map((k) => k.version)}::text[], ${asked.map((k) => k.digest)}::text[], ${asked.map((k) => k.trimmed ?? false)}::boolean[]) AS k(package, version, digest, trimmed))
+          sql`WITH k AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(asked.map((k) => ({ package: k.package, version: k.version, digest: k.digest, trimmed: k.trimmed ?? false })))}::jsonb) AS k(package text, version text, digest text, trimmed boolean))
               SELECT 'analysis' AS kind, u.package, u.version, u.digest, row_number() OVER (ORDER BY u.scorer) AS seq, CASE WHEN k.trimmed THEN u.analysis - ${[...PAGE_TRIMMED]}::text[] ELSE u.analysis END AS payload
                 FROM upstream_analysis u JOIN k ON u.package = k.package AND u.version = k.version AND u.digest = k.digest WHERE (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
               UNION ALL

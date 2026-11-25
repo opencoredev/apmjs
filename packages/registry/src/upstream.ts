@@ -324,7 +324,7 @@ export function scoredPackage(pkg: CachedPackage, analyses: UpstreamAnalyses): P
  * Which versions' analyses a reader of a package reads, by version: whole, or trimmed (without PAGE_TRIMMED's members)
  * for one that works out only a score and a grade from it. A version it does not name reads as not scored.
  */
-export type Wanted = (pkg: CachedPackage) => ReadonlyMap<string, "whole" | "trimmed">;
+export type Wanted = (pkg: { readonly distTags: Record<string, string>; readonly versions: readonly Omit<VersionRecord, "score">[] }) => ReadonlyMap<string, "whole" | "trimmed">;
 
 /** The analyses of the versions of `name` that `want` names, in one statement (none when it names none). */
 export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly Omit<VersionRecord, "score">[], want: ReadonlyMap<string, "whole" | "trimmed">): Effect.Effect<UpstreamAnalyses, StoreError> => {
@@ -332,14 +332,14 @@ export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly
     const form = want.get(v.version);
     const d = digestOf(v);
 
-    return form !== undefined && d ? [{ package: name, version: v.version, digest: digestLabel(d), trimmed: form === "trimmed" }] : [];
+    return form === undefined ? [] : [{ package: name, version: v.version, digest: d ? digestLabel(d) : null, trimmed: form === "trimmed" }];
   });
 
   return Effect.map(store.upstreamAnalysesFor(keys), (got) => got.get(name) ?? { scores: new Map(), unscorable: new Map() });
 };
 
 /** One version of scoredPackage: its stored analysis for its exact bytes, or why it can never be scored. */
-function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
+export function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
   const d = digestOf(v);
   const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
   const why = score === null ? unscorable.get(v.version) : undefined;
@@ -1802,12 +1802,13 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
               const picked = [...picks.values()].flatMap((p) => (p.kind === "picked" ? [p.picked] : []));
 
               // the analyses of exactly the versions picked, in one statement: what is read grows with the versions the
-              // choices took, never with a package's history (next: 61 analyses, 16 MB, for the one version a range picks)
+              // choices took, never with a package's history (next: 61 analyses, 16 MB, for the one version a range picks).
+              // A version with no checksum is asked for too: its outcome (unavailable) is read by version
               const keys = picked.flatMap((p) =>
-                [...p.versions.values()].flat().flatMap((v) => {
+                [...p.versions.values()].flat().map((v) => {
                   const d = digestOf(v);
 
-                  return d ? [{ package: p.name, version: v.version, digest: digestLabel(d) }] : [];
+                  return { package: p.name, version: v.version, digest: d ? digestLabel(d) : null };
                 }),
               );
 

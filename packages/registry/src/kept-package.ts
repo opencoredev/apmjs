@@ -40,7 +40,7 @@ import { digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
 import { newestFirst } from "./semver.ts";
-import { scoredPackage, Upstream, upstreamBlobKey, wantedAnalyses, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage, type Wanted } from "./upstream.ts";
+import { scoredPackage, scoredVersion, Upstream, upstreamBlobKey, wantedAnalyses, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage, type Wanted } from "./upstream.ts";
 import { RECENT_SEED_MS } from "./analysis.ts";
 
 /** Versions a summary keeps by version number, and again by publish time: the package answer lists the newest 200. */
@@ -626,11 +626,25 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
     const probe: Probe = fetched === null ? yield* upstream.probeFor(name, wanted, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* wantedAnalyses(store, name, fetched.pkg.versions, wanted(fetched.pkg))) : fetched;
 
     // a kept row is replaced with what npm sent (keepAnalyzed replaces as well as adds)
-    if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, admitted(probe.pkg), yield* (yield* Clock).now);
+    if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, yield* admittedAll(probe.pkg, wanted(probe.pkg)), yield* (yield* Clock).now);
 
     if (probe.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
 
     return probe;
+  });
+
+/**
+ * admitted, as every stored analysis of `pkg` decides it: when the versions `read` scored admit nothing, the analyses of
+ * the versions it left out (a package scored only in versions its summary does not keep) are read, trimmed, to decide.
+ */
+const admittedAll = (pkg: UpstreamPackage, read: ReadonlyMap<string, "whole" | "trimmed">) =>
+  Effect.gen(function* () {
+    const rest = pkg.versions.filter((v) => !read.has(v.version));
+
+    if (admitted(pkg) || rest.length === 0) return admitted(pkg);
+    const analyses = yield* wantedAnalyses(yield* Store, pkg.name, rest, new Map(rest.map((v) => [v.version, "trimmed"] as const)));
+
+    return admitted({ ...pkg, versions: rest.map((v) => scoredVersion(v, analyses)) });
   });
 
 /** Like pageProbe, without the scores (the review answer reads none): the kept summary, else Upstream.listing. */

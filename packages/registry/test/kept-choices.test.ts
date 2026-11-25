@@ -19,7 +19,7 @@ import { RegistryConfig } from "../src/config.ts";
 import { KEPT_CHOICES_INSERT_LOCK, Store, type StoreApi, type VersionRecord } from "../src/db.ts";
 import { digestLabel, digestOf } from "../src/digest.ts";
 import { ChoicesWriter, driverWriteBytes, keepPlans, KEPT_CHOICES_MAX_AGE_MS, KEPT_CHOICES_MAX_CHOICES, KEPT_CHOICES_MAX_TEXT, keptPlan, KeptSide, KEPT_TEXT_WEIGHTS, utf8Bytes } from "../src/kept-choices.ts";
-import { pageExists, summarize } from "../src/kept-package.ts";
+import { KEPT_VERSIONS, pageExists, summarize } from "../src/kept-package.ts";
 import { MemoryPool, RequestMemory, type Lease } from "../src/memory.ts";
 import { NPM_FAILURE_MS, Upstream } from "../src/upstream.ts";
 import { keptSummary } from "../src/walk-catalog.ts";
@@ -34,18 +34,31 @@ type Doc = { name: string; version: string; main: string; license: string; depen
 
 const integrityOf = (id: string): string => `sha512-${createHash("sha512").update(id).digest("base64")}`;
 
-/** npm, standing in: packuments with an ETag each, a 304 for a matching If-None-Match, and a switch to fail one. */
+/**
+ * npm, standing in: packuments with an ETag each, a 304 for a matching If-None-Match, and a switch to fail one. A
+ * `name@version` in `bare` lists no checksum; one in `times` was published then (else a day apart, the last 20 days ago).
+ */
 function fakeNpm(initial: Record<string, Doc[]>) {
   const docs = new Map(Object.entries(initial));
   const failing = new Set<string>();
+  const bare = new Set<string>();
+  const times = new Map<string, number>();
   const seen = { bodies: 0, notModified: 0 };
 
   const textOf = (name: string): string | null => {
     const vs = docs.get(name);
 
     if (!vs) return null;
-    const versions = Object.fromEntries(vs.map((d) => [d.version, { ...d, dist: { tarball: `https://npm.invalid/${name}/-/${name}-${d.version}.tgz`, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${d.version}`) } }]));
-    const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(NOW - (20 - i) * DAY).toISOString()]));
+
+    const versions = Object.fromEntries(
+      vs.map((d) => {
+        const tarball = `https://npm.invalid/${name}/-/${name}-${d.version}.tgz`;
+
+        return [d.version, { ...d, dist: bare.has(`${name}@${d.version}`) ? { tarball } : { tarball, shasum: "1".repeat(40), integrity: integrityOf(`${name}@${d.version}`) } }];
+      }),
+    );
+
+    const time = Object.fromEntries(vs.map((d, i) => [d.version, new Date(times.get(`${name}@${d.version}`) ?? NOW - (20 - i) * DAY).toISOString()]));
 
     return JSON.stringify({ name, "dist-tags": { latest: vs.at(-1)?.version ?? "" }, versions, time });
   };
@@ -74,7 +87,7 @@ function fakeNpm(initial: Record<string, Doc[]>) {
     },
   });
 
-  return { url: server.url.href, docs, failing, seen, stop: () => server.stop(true) };
+  return { url: server.url.href, docs, failing, bare, times, seen, stop: () => server.stop(true) };
 }
 
 const noBlobs = Layer.succeed(
@@ -1081,6 +1094,23 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
         proxy.close();
       }
     }));
+
+  /** An apm route's answer for `path` at NOW, read from the database at `url` and npm at `npmUrl`. */
+  async function routed(url: string, npmUrl: string, path: string): Promise<{ status: number; text: string }> {
+    // Better Auth is built on first use only, and these routes never sign anyone in
+    const auth = Auth.layer({ databaseUrl: url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
+
+    const layers = Layer.provideMerge(
+      Layer.mergeAll(Upstream.layer(npmUrl, 60_000, null), auth),
+      Layer.mergeAll(Store.postgres(url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(npmUrl)), RequestMemory.layer(new MemoryPool())),
+    );
+
+    const req = new Request(`http://registry.test${path}`);
+    const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
+
+    return Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+  }
+
   // Production, 2026-11-25: /package/next read every one of next's stored analyses, whole, on every view (the package
   // answer, the score answer, a version's answer), and popular-scores read them twice for latest's score
   test("the package page, the score and version answers and latest's score read only the versions they show", () =>
@@ -1089,18 +1119,8 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
       const proxy = await measured(url);
 
       const route = async (path: string) => {
-        // Better Auth is built on first use only, and these routes never sign anyone in
-        const auth = Auth.layer({ databaseUrl: proxy.url, options: { secret: "test-secret-that-is-long-enough-for-better-auth" }, baseURL: "http://web.test/" });
-
-        const layers = Layer.provideMerge(
-          Layer.mergeAll(Upstream.layer(npm.url, 60_000, null), auth),
-          Layer.mergeAll(Store.postgres(proxy.url), Clock.fixed({ now: NOW, wallNow: NOW }), Analysis.none, noBlobs, Layer.succeed(ResolveWait, { maxMs: 0, pollMs: 1 }), Layer.succeed(RegistryConfig, settings(npm.url)), RequestMemory.layer(new MemoryPool())),
-        );
-
-        const req = new Request(`http://registry.test${path}`);
         const before = proxy.total();
-        const program = Effect.flatMap(apmRoute(req, new URL(req.url), { kind: "anon" }), (res) => Effect.promise(async () => ({ status: res?.status ?? 0, text: (await res?.text()) ?? "" })));
-        const got = await Effect.runPromise(program.pipe(Effect.provide(layers), Effect.scoped));
+        const got = await routed(proxy.url, npm.url, path);
 
         return { ...got, bytes: proxy.total() - before };
       };
@@ -1122,5 +1142,45 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
       } finally {
         proxy.close();
       }
+    }));
+
+  // Review of ef5ace1: a version npm lists no checksum for has no digest, so it was left out of the versions read, and
+  // the outcome the worker stores for it (unavailable, no digest) with it: it showed as queued for analysis
+  test("a picked or shown version npm lists no checksum for keeps its unavailable outcome", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("bare", [doc("bare", "1.0.0"), doc("bare", "1.0.1")]);
+      npm.bare.add("bare@1.0.1");
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('bare', '1.0.0', $1, $2, $3::jsonb, 1)", [digestLabel(digestOf({ integrity: integrityOf("bare@1.0.0"), shasum: "1".repeat(40) }) ?? fail()), SCORER, JSON.stringify(analysis)]);
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ('bare', '1.0.1', $1, 'unavailable', 'the upstream publishes no checksum for this version', NULL, 1)", [SCORER]);
+      const resolved = await resolve({ url, npm: npm.url, name: "bare" });
+
+      expect(resolved.body.version).toBe("1.0.1");
+      expect(resolved.text).toContain('"unscorable":"unavailable"');
+      expect(resolved.text).not.toContain("queued for analysis");
+
+      for (const path of ["/-/apm/v1/packages/bare", "/-/apm/v1/packages/bare", "/-/apm/v1/packages/bare/versions/1.0.1"]) {
+        const r = await routed(url, npm.url, path);
+
+        expect(r.status).toBe(200);
+        expect(r.text).toContain("the upstream publishes no checksum for this version");
+        expect(r.text).not.toContain('"kind":"queued"');
+      }
+    }));
+
+  // Review of ef5ace1: a package page reads the analyses of the versions it shows and keeps, so one scored only in an
+  // older version its summary leaves out was not kept, where a read of its whole history kept it
+  test("a package scored only in a version its summary leaves out is kept", () =>
+    withRig(async ({ url, npm, sql }) => {
+      const versions = Array.from({ length: KEPT_VERSIONS + 30 }, (_, i) => `0.0.${i + 1}`);
+
+      npm.docs.set("oldscored", versions.map((v) => doc("oldscored", v)));
+      versions.forEach((v, i) => npm.times.set(`oldscored@${v}`, NOW - (400 - i) * DAY));
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('oldscored', '0.0.1', $1, $2, $3::jsonb, 1)", [digestLabel(digestOf({ integrity: integrityOf("oldscored@0.0.1"), shasum: "1".repeat(40) }) ?? fail()), SCORER, JSON.stringify(analysis)]);
+      const r = await routed(url, npm.url, "/-/apm/v1/packages/oldscored");
+      const kept = z.array(z.object({ package: z.string(), versions: z.coerce.number() })).parse(await sql("SELECT package, jsonb_array_length(summary -> 'versions') AS versions FROM kept_packages"));
+
+      expect(r.status).toBe(200);
+      // 0.0.1 is not among the versions kept: the newest KEPT_VERSIONS by publish time and by number
+      expect(kept).toEqual([{ package: "oldscored", versions: KEPT_VERSIONS }]);
     }));
 });
