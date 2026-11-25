@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { ScoreBadge } from "@/components/score-badge";
 import { SignInPanel } from "@/components/sign-in-panel";
 import { Account, AuthConfig, call, passkeyConfirmation, StagedDetail, StagedFile, timeLeft, type Signal } from "@/lib/account";
+import { isSafeTag } from "@/lib/install-note";
 import { cn } from "@/lib/utils";
 
 type State =
@@ -16,7 +17,23 @@ type State =
   | { kind: "signed-out" }
   | { kind: "error"; message: string }
   | { kind: "ok"; staged: StagedDetail; account: Account; config: AuthConfig }
-  | { kind: "decided"; status: "approved" | "rejected"; name: string; version: string };
+  | ({ kind: "decided"; name: string; version: string } & Decision);
+
+/**
+ * How an approved version installs now. The registry answers the dist-tag that names it (commitVersion): latest, another
+ * tag (a prerelease asked for as latest goes to next once a stable release exists), or none for a backport, which
+ * leaves latest on the newer release. A registry that does not answer it gets the pinned version.
+ */
+type Live = { kind: "latest" } | { kind: "tagged"; tag: string } | { kind: "pinned" };
+
+type Decision = { status: "rejected" } | { status: "approved"; live: Live };
+
+function liveOf(tag: string | null | undefined): Live {
+  if (tag === "latest") return { kind: "latest" };
+
+  // a tag that is not a plain name never goes into the command shown: the version is pinned instead
+  return tag === null || tag === undefined || !isSafeTag(tag) ? { kind: "pinned" } : { kind: "tagged", tag };
+}
 
 function fmtSize(n: number): string {
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -31,9 +48,9 @@ function Fact({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-const Decided = z.object({ ok: z.boolean(), status: z.enum(["approved", "rejected"]) });
+const Decided = z.object({ ok: z.boolean(), status: z.enum(["approved", "rejected"]), tag: z.string().nullable().optional() });
 
-function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: Account; config: AuthConfig; onDecided: (status: "approved" | "rejected") => void }) {
+function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: Account; config: AuthConfig; onDecided: (d: Decision) => void }) {
   const [code, setCode] = useState("");
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState<"code" | "passkey" | "reject" | null>(null);
@@ -50,7 +67,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     const r = await call(`staged/${s.id}/approve`, Decided, { method: "POST", body: { ...body, confirmName: typed } });
     setBusy(null);
 
-    if (r.kind === "ok") return onDecided(r.value.status);
+    if (r.kind === "ok") return onDecided(r.value.status === "approved" ? { status: "approved", live: liveOf(r.value.tag) } : { status: "rejected" });
     setError(r.kind === "error" ? r.message : "Sign in again.");
   }
 
@@ -75,7 +92,7 @@ function Confirm({ s, account, config, onDecided }: { s: StagedDetail; account: 
     const r = await call(`staged/${s.id}/reject`, Decided, { method: "POST", body: {} });
     setBusy(null);
 
-    if (r.kind === "ok") return onDecided("rejected");
+    if (r.kind === "ok") return onDecided({ status: "rejected" });
     setError(r.kind === "error" ? r.message : "Sign in again.");
   }
 
@@ -286,34 +303,57 @@ export function ApproveView() {
     );
   }
 
-  if (state.kind === "decided") {
-    return (
-      <div className="flex max-w-xl flex-col gap-3">
-        <h1 className="text-[28px] font-medium tracking-tight">
-          {state.status === "approved" ? `${state.name}@${state.version} is live` : `${state.name}@${state.version} was rejected`}
-        </h1>
-        <p className="text-[15px] text-muted-foreground">
-          {state.status === "approved" ? "It installs with bun, npm and pnpm now." : "Nothing was published. The upload is deleted."}
-        </p>
-        {state.status === "approved" && (
-          <Link href={`/package/${state.name}`} className="text-[15px] underline underline-offset-4">
-            Open the package page
-          </Link>
-        )}
-      </div>
-    );
-  }
+  if (state.kind === "decided") return <DecisionScreen {...state} />;
 
   const { staged: s, account, config } = state;
 
-  return <StagedReview s={s} account={account} config={config} onDecided={(status) => setState({ kind: "decided", status, name: s.package, version: s.version })} />;
+  return <StagedReview s={s} account={account} config={config} onDecided={(d) => setState({ kind: "decided", name: s.package, version: s.version, ...d })} />;
+}
+
+function installLine(name: string, version: string, live: Live): React.ReactNode {
+  const command = (spec: string) => <code className="font-mono text-[13px] text-foreground [overflow-wrap:anywhere]">apm add {spec}</code>;
+
+  switch (live.kind) {
+    case "latest":
+      return "It installs with bun, npm and pnpm now.";
+    case "tagged":
+      return (
+        <>
+          It is tagged <span className="font-mono text-foreground">{live.tag}</span>, not latest, so installs name the tag: {command(`${name}@${live.tag}`)}.
+        </>
+      );
+    case "pinned":
+      return <>Latest may name a newer release, so install this one by its version: {command(`${name}@${version}`)}.</>;
+    default: {
+      const _exhaustive: never = live;
+
+      return _exhaustive;
+    }
+  }
+}
+
+/** What the page says once a version is approved or rejected. Exported for the rendering test. */
+export function DecisionScreen(input: { name: string; version: string } & Decision) {
+  const { name, version } = input;
+
+  return (
+    <div className="flex max-w-xl flex-col gap-3">
+      <h1 className="text-[28px] font-medium tracking-tight">{input.status === "approved" ? `${name}@${version} is live` : `${name}@${version} was rejected`}</h1>
+      <p className="text-[15px] text-muted-foreground">{input.status === "rejected" ? "Nothing was published. The upload is deleted." : installLine(name, version, input.live)}</p>
+      {input.status === "approved" && (
+        <Link href={input.live.kind === "latest" ? `/package/${name}` : `/package/${name}?v=${encodeURIComponent(version)}`} className="text-[15px] underline underline-offset-4">
+          Open the package page
+        </Link>
+      )}
+    </div>
+  );
 }
 
 /**
  * What a person reads before approving: the facts, the risk summary with every signal and what was not
  * checked, and the files, all above the approve and reject controls. Exported for the rendering test.
  */
-export function StagedReview({ s, account, config, onDecided }: { s: StagedDetail; account: Account; config: AuthConfig; onDecided: (status: "approved" | "rejected") => void }) {
+export function StagedReview({ s, account, config, onDecided }: { s: StagedDetail; account: Account; config: AuthConfig; onDecided: (d: Decision) => void }) {
   const pending = s.status === "pending" && Date.parse(s.expiresAt) > Date.now();
   const risks = s.score?.signals.filter((x) => x.points < 0) ?? [];
   const notes = s.score?.signals.filter((x) => x.points >= 0) ?? [];

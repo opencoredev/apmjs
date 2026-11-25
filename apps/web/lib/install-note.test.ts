@@ -60,10 +60,25 @@ describe("installNote", () => {
 
 describe("installCommand", () => {
   test("stock clients pin the shown version; apm add resolves its own", () => {
-    expect(INSTALL_CLIENTS.map((client) => installCommand({ client, name: "zod", version: "4.6.7" }))).toEqual(["apm add zod", "bun add zod@4.6.7", "npm install zod@4.6.7", "pnpm add zod@4.6.7"]);
+    expect(INSTALL_CLIENTS.map((client) => installCommand({ client, name: "zod", install: { kind: "default", version: "4.6.7" } }))).toEqual(["apm add zod", "bun add zod@4.6.7", "npm install zod@4.6.7", "pnpm add zod@4.6.7"]);
   });
 
   test("no version installs the bare name", () => {
-    expect(installCommand({ client: "npm", name: "@scope/pkg", version: null })).toBe("npm install @scope/pkg");
+    expect(installCommand({ client: "npm", name: "@scope/pkg", install: { kind: "default", version: null } })).toBe("npm install @scope/pkg");
+  });
+
+  // HOME-502 D15: a package with only a prerelease tagged next has no latest, so every untagged command failed
+  test("a version installed by its tag names the tag in every command, apm add's included", () => {
+    expect(INSTALL_CLIENTS.map((client) => installCommand({ client, name: "@s/p", install: { kind: "tag", tag: "next" } }))).toEqual(["apm add @s/p@next", "bun add @s/p@next", "npm install @s/p@next", "pnpm add @s/p@next"]);
+  });
+
+  // HOME-502 Sol review finding 5: an exact-version link gave a bare apm add, which installs latest or nothing
+  test("an exact version asked for by number is pinned in every command, apm add's included", () => {
+    expect(INSTALL_CLIENTS.map((client) => installCommand({ client, name: "@s/p", install: { kind: "exact", version: "0.0.2-test.2" } }))).toEqual([
+      "apm add @s/p@0.0.2-test.2",
+      "bun add @s/p@0.0.2-test.2",
+      "npm install @s/p@0.0.2-test.2",
+      "pnpm add @s/p@0.0.2-test.2",
+    ]);
   });
 });
