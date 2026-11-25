@@ -6,3 +6,6 @@ export const DATABUDDY_SCRIPT_ORIGIN = "https://cdn.databuddy.cc";
 
 /** Where databuddy.js sends page views, Web Vitals, errors and outgoing links. The CSP allows it in connect-src. */
 export const DATABUDDY_INGEST_ORIGIN = "https://basket.databuddy.cc";
+
+/** Where lib/databuddy-client.ts asks for feature flags. The CSP allows it in connect-src. */
+export const DATABUDDY_FLAGS_ORIGIN = "https://api.databuddy.cc";

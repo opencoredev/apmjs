@@ -1,7 +1,7 @@
 // Review item 9: `deploy.ts plan` changes nothing. It reports a missing database and pending migrations, and
 // a missing auth secret, but creates and applies none of them; `deploy` does.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "pg";
@@ -63,6 +63,21 @@ describe("deploy.ts plan is read-only", () => {
   test("a missing auth secret is reported, not written", () => {
     expect(authSecret({ action: "plan", dir: secrets, stage: "staging" })).toEqual({ kind: "missing" });
     expect(readdirSync(secrets)).toEqual([]);
+  });
+
+  test("an empty or blank auth-secret file is refused, by a plan and a deploy, and left as it is", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apm-empty-secret-"));
+
+    try {
+      for (const text of ["", "  \n"]) {
+        writeFileSync(join(dir, "auth-secret-staging"), text);
+
+        for (const action of ["plan", "deploy"] as const) expect(() => authSecret({ action, dir, stage: "staging" })).toThrow("auth-secret-staging is empty");
+        expect(readFileSync(join(dir, "auth-secret-staging"), "utf8")).toBe(text);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

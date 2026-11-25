@@ -203,6 +203,15 @@ async function workersSubdomain(token: string, accountId: string): Promise<strin
 
 const cloudflare = envFile("cloudflare.env");
 const github = envFile("github-oauth.env");
+
+// every secret the stack needs is read here, before the incident preflight and the database: a missing one found after
+// migrating would leave the database ahead of the Workers
+const githubClientId = required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env");
+const githubClientSecret = required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env");
+
+// refuses an empty auth-secret file now; a deploy makes a missing one only after the preflight (below)
+authSecret({ action: "plan", dir: SECRETS, stage: args.stage });
+
 const token = secretFile("cloudflare-token");
 const accountId = required(cloudflare, "CLOUDFLARE_ACCOUNT_ID", "cloudflare.env");
 const neonUrl = secretFile("neon-url");
@@ -302,8 +311,8 @@ const alchemyOptions = {
       APM_DATABASE: database,
       APM_REGISTRY_BUNDLE: bundle,
       AUTH_SECRET: secret.kind === "missing" ? "plan-only-stand-in-for-the-auth-secret-deploy-creates" : secret.value,
-      GITHUB_CLIENT_ID: required(github, "APM_GITHUB_CLIENT_ID", "github-oauth.env"),
-      GITHUB_CLIENT_SECRET: required(github, "APM_GITHUB_CLIENT_SECRET", "github-oauth.env"),
+      GITHUB_CLIENT_ID: githubClientId,
+      GITHUB_CLIENT_SECRET: githubClientSecret,
       REVIEW_TOKEN_HASH: review.hash,
       APM_ADMINS: review.admins,
       DEBUG_TOKEN_HASH: debugHash,
