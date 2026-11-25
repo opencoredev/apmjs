@@ -219,6 +219,7 @@ export function forgetAccount(): void {
     }
 
     window.localStorage.removeItem(LINKED_KEY);
+    window.sessionStorage.removeItem(LINKED_KEY);
   } catch {
     // storage refused: the next public page's account check clears the ids instead
   }
@@ -241,13 +242,15 @@ export async function linkAccount(analyticsId: string | null): Promise<void> {
     const t = await loaded(identityTracker);
 
     if (!t) return;
-    const linked = window.localStorage.getItem(LINKED_KEY);
+    // Which account each of databuddy.js's ids was last tied to: the visitor id (local storage) by the shared marker,
+    // this tab's session id (session storage, kept across reloads) by the tab's own marker, and the page by memory.
+    const tiedTo = [window.localStorage.getItem(LINKED_KEY), window.sessionStorage.getItem(LINKED_KEY), t.getProfileId()];
 
     if (analyticsId === null) {
-      // another tab may have dropped the marker while this one still holds the profile in memory
-      if (linked === null && t.getProfileId() === null) return;
+      if (tiedTo.every((v) => v === null)) return;
       t.clear();
       window.localStorage.removeItem(LINKED_KEY);
+      window.sessionStorage.removeItem(LINKED_KEY);
 
       return;
     }
@@ -256,13 +259,12 @@ export async function linkAccount(analyticsId: string | null): Promise<void> {
 
     if (!id.success) return;
 
-    // another account was linked, in this tab (in memory) or in another one (the marker): start new ids before linking
-    const inMemory = t.getProfileId();
-
-    if ((linked !== null && linked !== id.data) || (inMemory !== null && inMemory !== id.data)) t.clear();
+    // any id tied to another account is replaced (new visitor and session ids) before this one is linked
+    if (tiedTo.some((v) => v !== null && v !== id.data)) t.clear();
     t.identify(id.data);
     window.localStorage.removeItem(SDK_PROFILE_KEY);
     window.localStorage.setItem(LINKED_KEY, id.data);
+    window.sessionStorage.setItem(LINKED_KEY, id.data);
   } catch {
     // analytics never breaks the page
   }

@@ -178,10 +178,10 @@ describe("linking a signed-in visitor to their account", () => {
   const OTHER = "fedcba9876543210fedcba9876543210";
 
   /** A stand-in for databuddy.js's identity calls and the page's local storage, with `stored` already in it. */
-  function fakeIdentity(stored: Record<string, string> = {}, opts: { throws?: boolean; inMemory?: string } = {}) {
+  function fakeIdentity(stored: Record<string, string> = {}, opts: { throws?: boolean; inMemory?: string; tab?: Record<string, string> } = {}) {
     const calls: string[] = [];
     const storage = new Map(Object.entries(stored));
-    const session = new Map<string, string>([["did_session", "sess_1"]]);
+    const session = new Map<string, string>([["did_session", "sess_1"], ...Object.entries(opts.tab ?? {})]);
     let profile = opts.inMemory ?? null;
 
     const store = (m: Map<string, string>) => ({
@@ -269,6 +269,21 @@ describe("linking a signed-in visitor to their account", () => {
 
     await linkAccount(OTHER);
     expect(calls).toEqual(["clear", `identify ${OTHER}`]);
+  });
+
+  test("a reloaded tab whose session was tied to another account starts new ids, though memory and the shared marker agree", async () => {
+    const { calls, session } = fakeIdentity({ [LINKED_KEY]: OTHER }, { tab: { [LINKED_KEY]: ID } });
+
+    await linkAccount(OTHER);
+    expect(calls).toEqual(["clear", `identify ${OTHER}`]);
+    expect(session.get(LINKED_KEY)).toBe(OTHER);
+  });
+
+  test("a reloaded tab whose session was tied to an account clears it once signed out, though another tab dropped the marker", async () => {
+    const { calls } = fakeIdentity({}, { tab: { [LINKED_KEY]: ID } });
+
+    await linkAccount(null);
+    expect(calls).toEqual(["clear"]);
   });
 
   test("a different account signing in starts new visitor ids before it is identified", async () => {
