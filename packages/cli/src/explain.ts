@@ -14,7 +14,7 @@
 // past it (agent.ts), so only a range with no such version stays review-first for its age. Anything apm could not read
 // is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
 // the version or anything in its tree. Like the rest of apm it never calls a version "safe".
-import type { Report, ReportCoverage } from "./api.ts";
+import type { DistTag, Report, ReportCoverage } from "./api.ts";
 
 /** "2,656 files (74.0 MB)": what a version apm did not read in full left out. */
 function omittedText(c: { omittedFiles: number; omittedBytes: number }): string {
@@ -273,7 +273,7 @@ export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string;
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[]; tags?: DistTag[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 
@@ -369,11 +369,17 @@ const SHOWN = 3;
 
 /** Control characters (a terminal's escapes included), line breaks and bidi overrides: what can fake a line. */
 // oxlint-disable-next-line eslint/no-control-regex -- matching control characters is the point: they are removed
-const LINE_BREAKERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g;
+const BREAKER = "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u061c]";
+const LINE_BREAKERS = new RegExp(`${BREAKER}+`, "g");
 
 /** Registry text (which carries publisher text, such as a yank reason) on one line, so none can pose as apm's. */
 export function oneLine(text: string): string {
   return text.replace(LINE_BREAKERS, " ").replace(/\s+/g, " ").trim();
+}
+
+/** A local path for the terminal: line breaks, controls and bidi overrides shown as escapes, so the path stays readable and none can pose as apm's. */
+export function escapedPath(path: string): string {
+  return path.replace(new RegExp(BREAKER, "g"), (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
 }
 
 /** The longest run of backticks in `text`, in one pass: a spread into Math.max overflows the stack on big input. */
@@ -791,6 +797,15 @@ function decide(input: ExplainInput): Decided {
       }
 
       if (refusedAsPulled(resolved.skipped)) return { ...base, verdict: "do-not-install", version: resolved.newest, score: null, summary: `Do not install ${asked}: apm's install policy refused it. The reasons say why.`, reasons, commands: null, coverage: NOT_READ };
+
+      // no version tagged latest, but others tagged (a package with only a prerelease, tagged next): name them
+      const [tagged] = resolved.tags ?? [];
+
+      if (resolved.skipped.length === 0 && resolved.newest === null && tagged !== undefined) {
+        const tags = (resolved.tags ?? []).map((t) => `${quoted(t.tag)} (${quoted(t.version)})`).join(", ");
+
+        return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} is tagged latest, the tag apm installs when no version is named. Ask about one of its other tags: the reasons list them.`, reasons: [...reasons, `Its tags: ${tags}.`, `To check what the tag ${quoted(tagged.tag)} resolves to: apm explain ${name}@${tagged.tag}`], commands: null, coverage: NOT_READ };
+      }
 
       if (resolved.skipped.length === 0 && resolved.newest === null) {
         return { ...base, verdict: "not-found", version: null, score: null, summary: `No version of ${name} matches ${plain(range)}. Check the version or range.`, reasons, commands: null, coverage: NOT_READ };

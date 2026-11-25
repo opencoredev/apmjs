@@ -13,7 +13,7 @@ This page lists every setting apm reads, grouped by where you set it. The first 
 | `.npmrc` | `registry=https://registry.apmjs.dev/~safe/` | Opt-in strict mode: the [`~safe` view](/guides/safe-view) hides versions under 24 hours old, versions scoring under 40 and versions apm has not fully analysed. |
 | `.npmrc` | `//registry.apmjs.dev/:_authToken=<token>` | The token `apm login` writes to your user `.npmrc`. `${VAR}` reads it from the environment. |
 | `bunfig.toml` | `[install] registry = "https://registry.apmjs.dev/"` | Bun installs through apm. |
-| `bunfig.toml` | `[install.security] scanner = "@apm/bun-scanner"` | Turns on the [Bun scanner](/guides/bun-scanner). |
+| `bunfig.toml` | `[install.security] scanner = "@apm/bun-scanner"` | Turns on the [Bun scanner](/guides/bun-scanner). It is not on a registry yet: install it from a clone of apm first, or every `bun install` fails. |
 
 A scoped registry line, such as `@acme:registry=https://elsewhere/`, sends that scope somewhere apm did not check. `apm add` and `apm publish` refuse to run while one applies to a package they handle.
 

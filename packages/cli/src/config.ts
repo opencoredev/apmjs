@@ -129,6 +129,20 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };
 }
 
+/**
+ * A registry as apm prints it: the origin of an http or https URL and nothing else, since an .npmrc or a variable can
+ * carry a credential in the user, the path, the query or the fragment. Null for anything else, which apm then does not name.
+ */
+export function displayRegistry(url: string): string | null {
+  try {
+    const u = new URL(url);
+
+    return u.protocol === "https:" || u.protocol === "http:" ? `${u.origin}/` : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The token .npmrc files hold for exactly this registry host (never one keyed to another host). */
 function fileToken(files: Map<string, string>[], registry: string, env: Record<string, string | undefined>): string | null {
   const key = `${authKey(registry)}:_authToken`;

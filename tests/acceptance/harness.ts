@@ -629,8 +629,11 @@ export class Browser {
   }
 }
 
-/** Signs in with "GitHub" (the fake) the way the website's button does, and returns the signed-in browser. */
-export async function signInWithGitHub(reg: Registry, gh: FakeGitHub, login: string): Promise<Browser> {
+/**
+ * Signs in with "GitHub" (the fake) the way the website's button does, and returns the signed-in browser.
+ * `callbackHeaders` ride on the browser's return to the registry, such as Sec-GPC.
+ */
+export async function signInWithGitHub(reg: Registry, gh: FakeGitHub, login: string, callbackHeaders: Record<string, string> = {}): Promise<Browser> {
   const b = new Browser(reg);
   const start = await b.json("api/auth/sign-in/social", { method: "POST", body: { provider: "github", callbackURL: "/", disableRedirect: true } });
   const authorizeUrl = dig(start.body, "url");
@@ -644,7 +647,7 @@ export async function signInWithGitHub(reg: Registry, gh: FakeGitHub, login: str
   const callback = atGitHub.headers.get("location");
 
   if (!callback) throw new Error("fake GitHub did not redirect back");
-  const done = await b.fetch(callback);
+  const done = await b.fetch(callback, { headers: callbackHeaders });
 
   if (done.status >= 400) throw new Error(`sign-in callback failed: ${done.status} ${await done.text()}`);
   const session = await b.json("api/auth/get-session");
