@@ -106,7 +106,7 @@ describe("tools", () => {
     const r = await call("check_package", { name: "nope" });
 
     expect(r.isError).toBe(true);
-    expect(r.text).toBe("No package named nope on apm or npm.");
+    expect(r.text).toBe("No package named `nope` on apm or npm.");
   });
 
   test("check_name checks alternatives under the scope given, without its @", async () => {

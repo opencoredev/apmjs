@@ -11,6 +11,7 @@ import type { Fetched } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import { isWithheld, withholdSource, type PackageView } from "./package-md";
 import type { AgentSource, VersionInfo } from "./source";
+import { inlineCode } from "./text";
 
 export type LoadedView = { kind: "ok"; view: PackageView } | { kind: "missing"; reason: string } | { kind: "unavailable" };
 
@@ -18,7 +19,8 @@ export async function loadPackageView(input: { name: string; version: string | n
   const { name, source } = input;
   const found = await source.package(name);
 
-  if (found.kind === "missing") return { kind: "missing", reason: `No package named ${name} on apm or npm.` };
+  // the name and version come from the URL or the tool call, not from apm: quoted as data, like publisher text
+  if (found.kind === "missing") return { kind: "missing", reason: `No package named ${inlineCode(name)} on apm or npm.` };
 
   if (found.kind === "unavailable") return { kind: "unavailable" };
   const pkg = found.value;
@@ -32,7 +34,7 @@ export async function loadPackageView(input: { name: string; version: string | n
 
   if (!agree(info, review)) return { kind: "unavailable" };
 
-  if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
+  if (info.kind === "missing") return { kind: "missing", reason: `${inlineCode(name)} has no version ${inlineCode(version)}. Latest is ${pkg.latest === null ? "unknown" : inlineCode(pkg.latest)}.` };
 
   // without the version's own answer the view would show another version's facts or a stale status: say so instead
   if (info.kind === "unavailable") return { kind: "unavailable" };

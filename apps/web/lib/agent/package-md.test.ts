@@ -196,7 +196,7 @@ describe("loadPackageView", () => {
   test("an unknown version or package is missing, a down registry unavailable", async () => {
     expect(await loadPackageView({ name: "left-pad", version: "9.9.9", registry: REGISTRY, source: fakeSource({ packages: { "left-pad": pkg() } }) })).toEqual({
       kind: "missing",
-      reason: "left-pad has no version 9.9.9. Latest is 1.3.0.",
+      reason: "`left-pad` has no version `9.9.9`. Latest is `1.3.0`.",
     });
     expect((await loadPackageView({ name: "nope", version: null, registry: REGISTRY, source: fakeSource() })).kind).toBe("missing");
     expect((await loadPackageView({ name: "x", version: null, registry: REGISTRY, source: fakeSource({ down: true }) })).kind).toBe("unavailable");
