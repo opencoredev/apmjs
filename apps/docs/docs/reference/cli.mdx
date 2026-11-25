@@ -206,7 +206,7 @@ apm login [--no-browser]
 apm login --username <name> --password-stdin [--email <address>]
 ```
 
-The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`.
+The first form signs you in through the browser with a device code and saves a staging token to your user `.npmrc`. `--no-browser` only prints the link. The second form is npm's password login, for self-hosted registries that run with `APM_LEGACY_AUTH=1`. Both sign in only to a registry you chose: `APM_REGISTRY`, else `registry=` in `~/.npmrc`, else the default. When a project `.npmrc` or `npm_config_registry` names another one, `apm login` refuses before it sends anything.
 
 ## apm explain
 

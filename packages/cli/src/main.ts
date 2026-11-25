@@ -10,7 +10,7 @@ import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFa
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, isApmToken, loadConfig, sameRegistry, saveToken, tokenRegistry, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
@@ -1996,10 +1996,26 @@ function openBrowser(url: string): void {
   }
 }
 
+/**
+ * apm login signs in only to a registry the user chose (APM_REGISTRY, ~/.npmrc or the default): one a project .npmrc or
+ * npm_config_registry picked would be handed the device code or the password, and then the token. True when it refused.
+ */
+function refuseRepoChosenLogin(cfg: Config): boolean {
+  const trusted = tokenRegistry(env());
+
+  if (sameRegistry(cfg.registry, trusted)) return false;
+  fail(`refused: apm login would sign in to ${cfg.registry}, which a project .npmrc or npm_config_registry chose, not you.`);
+  say(`Nothing was sent. To log in there, run APM_REGISTRY=${cfg.registry} apm login, or put registry=${cfg.registry} in ~/.npmrc.`);
+
+  return true;
+}
+
 /** Device login: the browser signs in (GitHub or Vercel) and approves the code; the CLI gets a token that stages publishes. */
 async function cmdLogin(a: Args): Promise<number> {
   if (flag(a, "username") || flag(a, "password") || has(a, "password-stdin")) return cmdPasswordLogin(a);
   const cfg = config(process.cwd());
+
+  if (refuseRepoChosenLogin(cfg)) return 1;
   const api = new Api({ ...cfg, token: null });
   const start = await api.raw("-/apm/v1/login/device", { method: "POST", body: {} });
   const d = DeviceStart.safeParse(start.body);
@@ -2045,6 +2061,8 @@ async function cmdLogin(a: Args): Promise<number> {
 /** npm's password login, for registries that run with legacy auth on. */
 async function cmdPasswordLogin(a: Args): Promise<number> {
   const cfg = config(process.cwd());
+
+  if (refuseRepoChosenLogin(cfg)) return 1;
   const username = flag(a, "username") ?? (process.stdin.isTTY ? prompt("Username:") : null);
   if (!username) {
     warn("usage: apm login --username <name> --password-stdin");

@@ -338,6 +338,24 @@ describe("finding 9: apm login only saves a well-formed token", () => {
     expect(readFileSync(join(sb.home, ".npmrc"), "utf8")).toBe(before);
     expect(r.code, r.out).not.toBe(0);
   });
+
+  test("apm login inside a repo whose .npmrc picks the registry asks that registry nothing: no device code, no password", async () => {
+    const spy = standIn();
+    const sb = makeSandbox(reg);
+    const app = writeConsumer(work, reg);
+    const before = readFileSync(join(sb.home, ".npmrc"), "utf8");
+
+    writeFileSync(join(app, ".npmrc"), `registry=${spy.url}\n`);
+    const device = await apm(["login", "--no-browser"], { cwd: app, env: laptopEnv(sb.env) });
+    const password = await apm(["login", "--username", "dave", "--password-stdin"], { cwd: app, env: laptopEnv(sb.env), stdin: "a-long-enough-password\n" });
+
+    await spy.stop();
+    expect(spy.seen, `${device.out}\n${password.out}`).toEqual([]);
+    expect(device.code, device.out).toBe(1);
+    expect(password.code, password.out).toBe(1);
+    expect(device.out).toContain("APM_REGISTRY");
+    expect(readFileSync(join(sb.home, ".npmrc"), "utf8")).toBe(before);
+  });
 });
 
 describe("finding 10: --force advice is accurate and never skips the dependency check", () => {
