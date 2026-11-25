@@ -120,10 +120,12 @@ const CAPTURE_ENDPOINT =
 
 /**
  * A command that opens a shell to another machine, or downloads a program and runs it: `/dev/tcp/` redirects, `nc -e`,
- * `sh -i`, `curl … | sh`, `curl -o x; chmod +x`, PowerShell's `IEX … DownloadString` and encoded commands, certutil.
+ * `sh -i`, `curl … | sh` (the URL quoted or not, the shell by path, through env or sudo), `sh -c "$(curl …)"` and
+ * `sh <(curl …)`, `curl -o x; chmod +x`, PowerShell's `IEX … DownloadString` and encoded commands, certutil. `||` runs
+ * its right side only when curl fails, so it is not a pipe.
  */
 const REMOTE_SHELL =
-  /\/dev\/tcp\/|\bnc(?:at)?\s+(?:-\w+\s+)*-e\s|\b(?:ba)?sh\s+-i\b|\b(?:curl|wget)\b[^\n'"`]{0,200}\|\s*(?:sudo\s+)?(?:ba|z)?sh\b|\b(?:curl|wget)\b[^\n]{0,200}\s-[oO]\s*\S+[^\n]{0,120}\bchmod\s+\+?[0-7x]+|\bIEX\b[^\n]{0,120}DownloadString|Invoke-Expression[^\n]{0,120}(?:DownloadString|WebClient)|powershell[^\n]{0,60}\s-(?:e|enc|EncodedCommand)\s|\bcertutil\b[^\n]{0,60}-urlcache/gi;
+  /\/dev\/tcp\/|\bnc(?:at)?\s+(?:-\w+\s+)*-e\s|\b(?:ba)?sh\s+-i\b|\b(?:curl|wget)\b[^\n]{0,200}(?<!\|)\|(?!\|)\s*(?:sudo(?:\s+-\w+){0,5}\s+)?(?:(?:\/usr)?(?:\/local)?\/bin\/(?:env\s+)?|env\s+)?(?:ba|z|da|k)?sh\b|\b(?:ba|z|da|k)?sh\s+-c\s+["']?(?:\$\(|`)\s*(?:curl|wget)\b|(?:\b(?:ba|z|da|k)?sh|\bsource|\s\.)\s+<\(\s*(?:curl|wget)\b|\b(?:curl|wget)\b[^\n]{0,200}\s-[oO]\s*\S+[^\n]{0,120}\bchmod\s+\+?[0-7x]+|\bIEX\b[^\n]{0,120}DownloadString|Invoke-Expression[^\n]{0,120}(?:DownloadString|WebClient)|powershell[^\n]{0,60}\s-(?:e|enc|EncodedCommand)\s|\bcertutil\b[^\n]{0,60}-urlcache/gi;
 
 /** An evaluator handed a value, not a literal: `eval(r.data)`, `new Function.constructor("require", s)`, `vm.runInThisContext(code)`. */
 const EVAL_VALUE = /(?<![\w$.])eval\s*\(\s*(?!['"`)])|\bFunction(?:\s*\.\s*constructor)?\s*\(\s*(?:['"`][\w$]*['"`]\s*,\s*)*(?!['"`)])[\w$]|\brunIn(?:This|New)?Context\s*\(\s*(?!['"`)])|\bcompileFunction\s*\(\s*(?!['"`)])/g;
