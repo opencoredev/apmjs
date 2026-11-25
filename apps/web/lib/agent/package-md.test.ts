@@ -416,6 +416,44 @@ describe("what the Markdown view says apm will not install, and how", () => {
     expect(source.calls.filter((c) => c.startsWith("resolve"))).toEqual([]);
   });
 
+  // Sol review of 8500e77: the retry lost the score and review reads (503), which left the stale active version answer
+  // as the only vote. A withdrawal seen once in the request stays seen: only a withheld version answer, or nothing
+  test("a withdrawal seen in the first reads holds though the retry's score and review answer 503", async () => {
+    const stale = ["RETRY-STALE-SECRET", "retry-stale.js", "RETRY-STALE-NOT-CHECKED", "RETRY-STALE-LICENSE"];
+    const p = pkg({ versions: [row("1.3.0"), row("1.2.0")] });
+
+    if (!p.facts) throw new Error("pkg() has facts");
+    const active = score({ notChecked: ["RETRY-STALE-NOT-CHECKED"], signals: [{ ...NETWORK, evidence: ['lib/retry-stale.js:12: fetch("https://x.example/RETRY-STALE-SECRET")'] }] });
+    const down = { kind: "unavailable", reason: { kind: "status", status: 503 } } as const;
+
+    const base = fakeSource({
+      packages: { "left-pad": p },
+      versions: { "left-pad@1.2.0": { version: "1.2.0", status: "active", statusReason: null, deprecated: null, facts: { ...p.facts, license: "RETRY-STALE-LICENSE" }, score: active } },
+      resolve: () => ({ kind: "unavailable" }),
+    });
+
+    // each request reads twice at most: the first batch sees the score route's redaction, the retry gets 503s
+    const fresh = () => {
+      let scores = 0;
+      let reviews = 0;
+
+      return {
+        ...base,
+        score: async () => (scores++ === 0 ? { kind: "ok", value: score({ redacted: true, signals: [{ ...NETWORK, evidence: [] }] }) } : down),
+        review: async () => (reviews++ === 0 ? { kind: "ok", value: REVIEW_CLEAN } : down),
+      } satisfies typeof base;
+    };
+
+    const md = await (await markdownResponse({ name: "left-pad", version: "1.2.0", registry: REGISTRY, source: fresh() })).text();
+    const answer = JSON.stringify(await handleMessage({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "check_package", arguments: { name: "left-pad", version: "1.2.0" } } }, fresh()));
+
+    for (const out of [md, answer]) {
+      for (const s of stale) expect(out).not.toContain(s);
+      expect(out).not.toContain("npm install left-pad");
+      expect(out).not.toContain('"commands"');
+    }
+  });
+
   test("every read says withheld: refused before any resolve, with only the withheld answers' fields", async () => {
     const p = pkg({ versions: [row("1.3.0"), row("1.2.0")] });
     const redacted = score({ redacted: true, signals: [{ ...NETWORK, evidence: ["lib/index.js:12"] }] });

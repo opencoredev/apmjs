@@ -57,18 +57,20 @@ export async function loadPackageView(input: { name: string; version: string | n
   const read = () => Promise.all([source.version({ name, version }), source.review({ name, version }), scoreRead()]);
   // a version the package answer does not list was just read to find it: only its review and score are new
   const first: Awaited<ReturnType<typeof read>> = selected.read ? await Promise.all([{ kind: "ok", value: selected.read } as const, source.review({ name, version }), scoreRead()]) : await read();
-  const [info, review, routed] = agree(...first) ? first : await read();
+  const last = agree(...first) ? first : await read();
+  const [info, review, routed] = last;
+  // a withdrawal any read of this request has seen stays seen: a retry's missing or unavailable answers never undo it
+  const withheld = saysWithheld(first) || saysWithheld(last);
 
-  // the reads still disagree about a revoke: build no view at all, rather than one mixing answers from both sides of it
-  if (!agree(info, review, routed)) return { kind: "unavailable" };
+  // the reads still disagree about a revoke, or one saw it and the version answer does not say it: build no view at
+  // all, rather than one mixing answers from both sides of it
+  if (!agree(info, review, routed) || (withheld && versionSays(info) !== true)) return { kind: "unavailable" };
 
   if (info.kind === "missing") return { kind: "missing", reason: `${name} has no version ${version}. Latest is ${pkg.latest ?? "unknown"}.` };
 
   // without the version's own answer the view would show another version's facts or a stale status: say so instead
   if (info.kind === "unavailable") return { kind: "unavailable" };
   const v = info.value;
-  // the reads agree, so any one saying withheld means all do: the view then has only the withheld answers' fields
-  const withheld = versionSays(info) === true || redactedSays(review) === true || redactedSays(routed) === true;
   const routedScore = routed?.kind === "ok" ? routed.value : null;
 
   // as on the page: a withdrawal or a review apm reviewers confirmed refuses it, and resolve is asked only when the
@@ -119,6 +121,10 @@ const versionSays = (read: Fetched<VersionInfo>): boolean | null => (read.kind =
 
 /** What a review or score-route answer says about a revoke: redacted, not, or nothing when there is no answer. */
 const redactedSays = (read: Fetched<{ redacted: boolean }> | null): boolean | null => (read?.kind === "ok" ? read.value.redacted : null);
+
+/** Whether any read of a batch says withheld. */
+const saysWithheld = ([info, review, routed]: [Fetched<VersionInfo>, Fetched<ReviewAnswer>, Fetched<ScoreReport> | null]): boolean =>
+  versionSays(info) === true || redactedSays(review) === true || redactedSays(routed) === true;
 
 /**
  * Whether the version, review and score-route answers saw the version in the same state: all withheld or none. A read
