@@ -7,7 +7,6 @@ import { z } from "zod";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SignInPanel } from "@/components/sign-in-panel";
-import { forgetAccount } from "@/lib/databuddy-client";
 import {
   Account,
   AuthConfig,
@@ -487,7 +486,6 @@ export function AccountView() {
 
   async function signOut() {
     await authPost("sign-out", {});
-    forgetAccount();
     window.location.assign("/");
   }
 

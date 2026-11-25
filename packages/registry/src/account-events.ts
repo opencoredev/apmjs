@@ -1,14 +1,14 @@
 // Sign-ups and sign-ins, counted in Databuddy (https://www.databuddy.cc/docs/api/events) as two server-side custom
 // events: account_created when a sign-in makes a new account, sign_in when an existing account signs in again on the
-// website. `apm login`'s device flow is not counted: its token request carries none of the browser's privacy signals. Each
-// carries one property, how the person signed in (a fixed value), and the account's analytics id: a SHA-256 of the
-// account's random internal id, never its email, name or GitHub login. The website gives the same id to Databuddy's
-// identify() on public pages (apps/web/lib/databuddy-client.ts), so Databuddy can tie a visitor's earlier page views to
-// the account they made. A request that carries Global Privacy Control or Do Not Track is still counted, without the id.
+// website. `apm login`'s device flow is not counted: its token request carries none of the browser's privacy signals.
+// Each carries one property, how the person signed in (a fixed value), and the account's analytics id as its profile:
+// a SHA-256 of the account's random internal id, never its email, name or GitHub login. Databuddy counts accounts by
+// it; the browser tracker is never given it, so page views stay anonymous. A request that carries Global Privacy
+// Control or Do Not Track is still counted, without the id.
 //
 // Sending never touches the sign-in: send() only hands a task to the request's waitUntil, which the response never
-// waits on; the task posts only once waitUntil has taken it, gives up after SEND_TIMEOUT_MS and swallows every failure. On only when the Worker has APM_DATABUDDY_CLIENT_ID
-// (production alone, packages/infra/analytics.ts).
+// waits on; the task posts only once waitUntil has taken it, gives up after SEND_TIMEOUT_MS and swallows every
+// failure. On only when the Worker has APM_DATABUDDY_CLIENT_ID (production alone, packages/infra/analytics.ts).
 import { createHash } from "node:crypto";
 import { REPORT_ORIGINS, REPORT_USER_AGENT } from "@apm/core/error-report";
 import { z } from "zod";

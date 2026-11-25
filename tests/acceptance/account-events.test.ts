@@ -1,10 +1,11 @@
 // Spec: sign-ups and sign-ins counted in Databuddy (packages/registry/src/account-events.ts).
 // - A GitHub sign-in that makes a new account sends account_created; a later sign-in to it sends sign_in; `apm login`
-//   is not counted (its token request carries no browser privacy signals). Each carries the account's opaque analytics id, the same one /-/apm/v1/account
-//   gives the website for identify(), and nothing else about the person.
+//   is not counted (its token request carries no browser privacy signals). Each carries the account's opaque
+//   analytics id, the same for every event of one account, and nothing else about the person.
 // - Global Privacy Control or Do Not Track on the sign-in keeps the id out; the event is still counted.
-// - Databuddy failing or hanging never fails or slows a sign-in: the send runs after the answer.
+// - Databuddy failing or hanging never fails or slows a sign-in: the response never waits on the send.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { z } from "zod";
 import { deviceLogin, dig, signInWithGitHub, startFakeGitHub, startRegistry, type FakeGitHub, type Registry } from "./harness";
 
 const CLIENT_ID = "00000000-0000-4000-8000-000000000001";
@@ -59,14 +60,11 @@ async function eventsFrom(from: number, count: number): Promise<Sent[]> {
 }
 
 describe("account events", () => {
-  test("a new account sends account_created with its analytics id; signing in again sends sign_in", async () => {
+  test("a new account sends account_created with its analytics id; signing in again sends sign_in with the same id", async () => {
     const before = sent.length;
-    const b = await signInWithGitHub(reg, gh, "Signup-Sam");
-    const me = await b.json("-/apm/v1/account");
-    const id = dig(me.body, "analyticsId");
-
-    expect(id).toMatch(/^[0-9a-f]{32}$/);
+    await signInWithGitHub(reg, gh, "Signup-Sam");
     const [created, ...rest] = await eventsFrom(before, 1);
+    const id = z.object({ profileId: z.string().regex(/^[0-9a-f]{32}$/) }).parse(created?.body).profileId;
 
     expect(created?.websiteId).toBe(CLIENT_ID);
     expect(created?.userAgent).toBe("apmjs/1.0");
@@ -92,6 +90,8 @@ describe("account events", () => {
     expect(e).toBeDefined();
 
     for (const word of ["private-pat", "users.example.test", "@", "email", "avatar"]) expect(text, word).not.toContain(word);
+    // each account has its own id
+    expect(new Set(sent.filter((s) => dig(s.body, "name") === "account_created").map((s) => dig(s.body, "profileId"))).size).toBe(sent.filter((s) => dig(s.body, "name") === "account_created").length);
   });
 
   test("apm login (the device flow) sends nothing", async () => {

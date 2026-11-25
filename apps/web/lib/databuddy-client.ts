@@ -118,22 +118,17 @@ const FlagsResponse = z.object({ flags: z.record(z.string(), z.unknown()) });
 /** How long a flag read waits for databuddy.js, which loads after the page, before it keeps the default. */
 const TRACKER_WAIT_MS = 3000;
 
-/** What `read` finds once databuddy.js has loaded, or null when it has not within TRACKER_WAIT_MS. */
-async function loaded<T>(read: () => T | null): Promise<T | null> {
+async function loadedTracker(): Promise<Tracker | null> {
   const deadline = Date.now() + TRACKER_WAIT_MS;
 
   while (Date.now() < deadline) {
-    const t = read();
+    const t = tracker();
 
     if (t) return t;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   return null;
-}
-
-async function loadedTracker(): Promise<Tracker | null> {
-  return loaded(tracker);
 }
 
 /** Reports that the install box opened on `client` because of the flag, for Databuddy's experiment results. */
@@ -174,98 +169,5 @@ export async function installDefaultClient({ clientId }: { clientId: string }): 
     return client.success ? client.data : null;
   } catch {
     return null;
-  }
-}
-
-// ---------- linking a signed-in visitor to their account ----------
-
-/** The part of window.databuddy that ties this browser to an account, and `clear`, which starts new visitor ids. */
-const IdentityTracker = z.object({
-  identify: z.custom<(profileId: string) => void>((v) => v instanceof Function),
-  clear: z.custom<() => void>((v) => v instanceof Function),
-  getProfileId: z.custom<() => string | null>((v) => v instanceof Function),
-});
-
-type IdentityTracker = z.infer<typeof IdentityTracker>;
-
-function identityTracker(): IdentityTracker | null {
-  const parsed = IdentityTracker.safeParse(globalThis.window?.databuddy);
-
-  return parsed.success ? parsed.data : null;
-}
-
-/** An account's analytics id as the registry makes it (packages/registry/src/account-events.ts): 32 hex characters. */
-const AnalyticsId = z.string().regex(/^[0-9a-f]{32}$/);
-
-/** Where databuddy.js keeps the identified profile between page loads. */
-const SDK_PROFILE_KEY = "did_profile";
-
-/** This site's own note of which account this browser was last linked to, so a sign-out or switch can untie it. */
-export const LINKED_KEY = "apm_databuddy_linked";
-
-/** Every key databuddy.js keeps its visitor, session and profile ids under, in local and session storage. */
-const SDK_ID_KEYS = ["did", "did_profile", "did_session", "did_session_timestamp", "did_session_start", "did_profile_sent"] as const;
-
-/**
- * Called by the sign-out button (a private page, where databuddy.js never runs): drops databuddy.js's stored visitor,
- * session and profile ids and this site's link marker, so the next public page starts as a new anonymous visitor
- * instead of under ids that were tied to the account. Never throws.
- */
-export function forgetAccount(): void {
-  try {
-    for (const key of SDK_ID_KEYS) {
-      window.localStorage.removeItem(key);
-      window.sessionStorage.removeItem(key);
-    }
-
-    window.localStorage.removeItem(LINKED_KEY);
-    window.sessionStorage.removeItem(LINKED_KEY);
-  } catch {
-    // storage refused: the next public page's account check clears the ids instead
-  }
-}
-
-/**
- * Ties this browser's visits to the signed-in account, or unties them once the visitor is signed out. `analyticsId`
- * is the account's opaque id from the registry (a hash of its internal id: never an email, name or login), or null
- * when the visitor is signed out. Only where the tracker loaded, so a visitor who opted out, or a private page, sends
- * nothing; anonymous visitors are never identified. Never throws.
- *
- * databuddy.js would keep the profile in local storage and put it on the next page load's events before this page
- * knows who is signed in, so its copy is removed right after identify(): every page load starts anonymous, and its
- * events are tied to the account through the session once identify() runs again. Signing out, or a different account
- * signing in, calls clear(), which starts new visitor and session ids, so later visits are not credited to the
- * account through the old visitor id.
- */
-export async function linkAccount(analyticsId: string | null): Promise<void> {
-  try {
-    const t = await loaded(identityTracker);
-
-    if (!t) return;
-    // Which account each of databuddy.js's ids was last tied to: the visitor id (local storage) by the shared marker,
-    // this tab's session id (session storage, kept across reloads) by the tab's own marker, and the page by memory.
-    const tiedTo = [window.localStorage.getItem(LINKED_KEY), window.sessionStorage.getItem(LINKED_KEY), t.getProfileId()];
-
-    if (analyticsId === null) {
-      if (tiedTo.every((v) => v === null)) return;
-      t.clear();
-      window.localStorage.removeItem(LINKED_KEY);
-      window.sessionStorage.removeItem(LINKED_KEY);
-
-      return;
-    }
-
-    const id = AnalyticsId.safeParse(analyticsId);
-
-    if (!id.success) return;
-
-    // any id tied to another account is replaced (new visitor and session ids) before this one is linked
-    if (tiedTo.some((v) => v !== null && v !== id.data)) t.clear();
-    t.identify(id.data);
-    window.localStorage.removeItem(SDK_PROFILE_KEY);
-    window.localStorage.setItem(LINKED_KEY, id.data);
-    window.sessionStorage.setItem(LINKED_KEY, id.data);
-  } catch {
-    // analytics never breaks the page
   }
 }

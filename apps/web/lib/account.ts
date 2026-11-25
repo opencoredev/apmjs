@@ -45,8 +45,6 @@ export const Account = z.object({
     z.object({ id: z.string(), label: z.string(), scope: z.string(), createdAt: z.string(), expiresAt: z.string().nullable(), revokedAt: z.string().nullable() }),
   ),
   pending: z.number(),
-  /** The opaque id Databuddy knows this account by (lib/databuddy-client.ts linkAccount); null from an older registry. */
-  analyticsId: z.string().nullable().catch(null),
 });
 
 export type Account = z.infer<typeof Account>;
