@@ -104,6 +104,27 @@ describe("npm run --ignore-scripts runs the script but not its pre and post scri
     });
   }
 
+  // a run inside a flag's value, or one taken for the script name, is still read: the match never consumes past the
+  // package manager's word (fuzzed against main's regex, every name main finds is found)
+  for (const cmd of ["npm --x=` npm run payload` run build", "npm run --x=` npm run payload`", "npm --x=`npm run payload` run build", "npm --x=$(npm run payload) run build", "echo `npm run payload`", "yarn --silent npm run payload", "npm run --silent npm run payload", "pnpm --x yarn payload", "bun run --x bun run payload"]) {
+    test(`${cmd}: the inner run is read`, () => {
+      const scripts = { postinstall: cmd, build: "true", npm: "true", yarn: "true", bun: "true", payload: DROPPER };
+
+      expect(expandHooks({ scripts })[0]?.scripts).toContain("payload");
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
+  // where a quote after `run` makes the flag-aware reading take another name, main's reading (`run` as the name) is kept
+  for (const cmd of ["pnpm run '--x", 'yarn run "other']) {
+    test(`${cmd}: the script main's reading names is read`, () => {
+      const scripts = { postinstall: cmd, run: DROPPER };
+
+      expect(expandHooks({ scripts })[0]?.scripts).toContain("run");
+      expect(scoreOf({ scripts }, {}).ids).toContain("install-download");
+    });
+  }
+
   // a flag's value is never read as reaching past a quote, so a run inside a quoted command substitution is still found
   for (const cmd of ['npm --x "$(npm run payload)" run build', 'npm --x="$(npm run payload)" run build']) {
     test(`${cmd}: the run inside the substitution is read`, () => {
@@ -121,7 +142,7 @@ describe("npm run --ignore-scripts runs the script but not its pre and post scri
   for (const cmd of [
     'npm run --ignore-scripts payload --foo="a --ignore-scripts"',
     "npm run --ignore-scripts payload --foo='a --ignore-scripts'",
-    "npm run --foo=a\\ --ignore-scripts payload",
+    "npm run --ignore-scripts payload --foo=a\\ --ignore-scripts",
     "npm run-script --ignore-scripts 'payload'",
     "npm run --ignore-scripts payload --ignore-scripts false; echo done",
     "(npm run --ignore-scripts payload)",

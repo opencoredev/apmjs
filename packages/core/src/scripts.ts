@@ -37,9 +37,17 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
+const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()'"\\$\`{}<>]*)?)*`;
 const SCRIPT = String.raw`[ \t]+["']?([\w:.@/-]+)`;
-const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}[ \t]+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT}|bun${FLAGS}[ \t]+run${FLAGS}${SCRIPT})`, "g");
+
+// a match takes only the package manager's word: its flags and the script name are read ahead without being consumed, so
+// the scan goes on from the next word, and a run held in a flag value or taken for the name (`npm --x=`npm run payload``,
+// `yarn --silent npm run payload`) is still found, as main's regex, which read no flags, found it. A flag value stops at
+// any separator, quote, escape or expansion, a newline ends the command, and a command may start a backtick substitution
+const RUN_REF = new RegExp(String.raw`(?:^|[;&|(\`]\s*|\s)(?:npm(?=${FLAGS}[ \t]+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b))|yarn(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|pnpm(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|bun(?=${FLAGS}[ \t]+run${FLAGS}${SCRIPT}))`, "dg");
+
+// main's reading, which takes no flags, beside it: every script it finds is still followed, with its pre and post scripts
+const BARE_RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]+)|(start|test|stop|restart)\b)|yarn(?:\s+run)?\s+([\w:.@/-]+)|pnpm(?:\s+run)?\s+([\w:.@/-]+)|bun\s+run\s+([\w:.@/-]+))/g;
 
 // the only spellings read as setting npm's ignore-scripts; anything else that might touch it is a doubt (ignoreScriptsDoubt)
 const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
@@ -141,11 +149,18 @@ function referencedScripts(cmd: string, scripts: Scripts): ScriptRef[] {
     // `yarn add x` or `pnpm install` are package manager commands, not scripts
     if (!name || !Object.hasOwn(scripts, name)) continue;
 
-    // npm's flags before the name (the match ends with it) set ignore-scripts, and nothing from there on may unset it;
-    // the doubt is found once per command, so a script of many such runs is still read in one pass
-    const sets = npm !== undefined && IGNORE_SCRIPTS.test(m[0].slice(0, m[0].length - name.length));
+    // npm's flags before the name set ignore-scripts, and nothing from there on may unset it; the doubt is found once per
+    // command, so a script of many such runs is still read in one pass
+    const [nameAt] = m.indices?.[m[1] === undefined ? 2 : 1] ?? [m.index];
+    const sets = npm !== undefined && IGNORE_SCRIPTS.test(cmd.slice(m.index, nameAt));
 
     out.push({ name, alone: sets && (doubt ??= ignoreScriptsDoubt(cmd)) < m.index });
+  }
+
+  for (const m of cmd.matchAll(BARE_RUN_REF)) {
+    const name = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+
+    if (name && Object.hasOwn(scripts, name)) out.push({ name, alone: false });
   }
 
   for (const m of cmd.matchAll(RUN_ALL)) {
