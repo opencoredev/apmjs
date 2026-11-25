@@ -125,7 +125,7 @@ describe("apm: install gate", () => {
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/WARNING.*evil-dep@1\.0\.0.*scores \d+\/100 \(F\), under the floor of 40/);
     expect(r.out).toMatch(/x\.js:1/);
-    expect(r.out).toContain("/package/evil-dep/v/1.0.0");
+    expect(r.out).toContain("/package/evil-dep?v=1.0.0");
     expect(r.out).toContain("--strict");
     expect(installedVersion(app, "evil-dep")).toBe("1.0.0");
   });

@@ -2,7 +2,7 @@
 // and points only), so the website's and the CLI's install verdict can tell a risk from apm's own gap.
 import { describe, expect, test } from "bun:test";
 import type { ScoreReport, SignalId } from "@apm/core";
-import { cooldownWarning, lostSignals, scoreWarning, stateWarning } from "../src/warnings.ts";
+import { cooldownWarning, lostSignals, scoreWarning, stateWarning, versionUrl } from "../src/warnings.ts";
 
 const report = (score: number, signals: { id: SignalId; points: number }[]): Pick<ScoreReport, "score" | "grade" | "signals" | "scorer"> => ({
   scorer: "apm-score-v10",
@@ -11,7 +11,7 @@ const report = (score: number, signals: { id: SignalId; points: number }[]): Pic
   signals: signals.map((s) => ({ ...s, label: s.id, evidence: [`index.js:1: ${s.id}`], confidence: "confirmed" as const })),
 });
 
-const where = { url: "https://apmjs.dev/package/dep/v/1.0.0", via: ["app@1.0.0"] };
+const where = { url: "https://apmjs.dev/package/dep?v=1.0.0", via: ["app@1.0.0"] };
 
 describe("warnings carry the lost signals of a scored version", () => {
   test("lostSignals: what cost points, heaviest first, with no evidence", () => {
@@ -62,5 +62,16 @@ describe("warnings carry what the verdict needs to fail closed", () => {
   test("an unscorable warning names why, when the registry decided it", () => {
     expect(stateWarning({ kind: "unscorable", name: "dep", version: "1.0.0", text: "apm cannot score this version", unscorable: "analysis-limit", ...where }).unscorable).toBe("analysis-limit");
     expect(stateWarning({ kind: "unscorable", name: "dep", version: "1.0.0", text: "could not be analyzed", ...where })).not.toHaveProperty("unscorable");
+  });
+});
+
+describe("versionUrl", () => {
+  test("the version's page on the website: /package/<name>?v=<version>, the version encoded", () => {
+    expect(versionUrl("https://apmjs.dev/", "express", "5.3.0")).toBe("https://apmjs.dev/package/express?v=5.3.0");
+    expect(versionUrl("https://apmjs.dev/", "@types/node", "1.0.0+build.5")).toBe("https://apmjs.dev/package/@types/node?v=1.0.0%2Bbuild.5");
+  });
+
+  test("a name ending in .md keeps its page, not the Markdown view of another name", () => {
+    expect(versionUrl("https://apmjs.dev/", "@acme/readme.md", "1.0.0")).toBe("https://apmjs.dev/package/@acme/readme%2Emd?v=1.0.0");
   });
 });
