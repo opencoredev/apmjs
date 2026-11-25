@@ -34,19 +34,29 @@ describe("a 404 from /install", () => {
   });
 
   test("fails without a record, instead of passing as a stage with no CLI release", () => {
-    const step = installStep({ status: 404, stage: "production", record: { kind: "absent", path: "/home/ci/.config/apmjs/cli-releases.jsonl" } });
+    const step = installStep({ status: 404, stage: "production", readRecord: () => ({ kind: "absent", path: "/home/ci/.config/apmjs/cli-releases.jsonl" }) });
 
     expect(step.kind).toBe("fail");
     expect(step.kind === "fail" && step.detail).toContain("no CLI release record (/home/ci/.config/apmjs/cli-releases.jsonl)");
   });
 
   test("is skipped only when the record exists and names no release for the stage", () => {
-    expect(installStep({ status: 404, stage: "staging", record: { kind: "read", releases: [] } })).toEqual({ kind: "skip", detail: "skipped: no CLI release on staging yet (bun packages/infra/release-cli.ts --stage staging)" });
-    expect(installStep({ status: 404, stage: "staging", record: { kind: "read", releases: [release] } })).toEqual({ kind: "install" });
+    expect(installStep({ status: 404, stage: "staging", readRecord: () => ({ kind: "read", releases: [] }) })).toEqual({ kind: "skip", detail: "skipped: no CLI release on staging yet (bun packages/infra/release-cli.ts --stage staging)" });
+    expect(installStep({ status: 404, stage: "staging", readRecord: () => ({ kind: "read", releases: [release] }) })).toEqual({ kind: "install" });
   });
 
-  test("any other answer runs the install, record or not", () => {
-    for (const record of [{ kind: "absent", path: "x" } as const, { kind: "read", releases: [] } as const]) expect(installStep({ status: 200, stage: "production", record })).toEqual({ kind: "install" });
+  test("any other answer runs the install without reading the record, so an unreadable one cannot fail a working installer", () => {
+    for (const status of [200, 500]) {
+      const step = installStep({
+        status,
+        stage: "production",
+        readRecord: () => {
+          throw new Error("EACCES: permission denied, open 'cli-releases.jsonl'");
+        },
+      });
+
+      expect(step).toEqual({ kind: "install" });
+    }
   });
 
   test("a record with a line that does not parse (a write torn by a crash) cannot vouch for no release, so a 404 fails", () => {
@@ -60,7 +70,7 @@ describe("a 404 from /install", () => {
       const record = cliRecordOf("production", path);
 
       expect(record).toEqual({ kind: "unreadable", path, broken: 1 });
-      expect(installStep({ status: 404, stage: "production", record }).kind).toBe("fail");
+      expect(installStep({ status: 404, stage: "production", readRecord: () => record }).kind).toBe("fail");
       writeFileSync(path, `${JSON.stringify(release)}\n`);
       expect(cliRecordOf("staging", path)).toEqual({ kind: "read", releases: [release] });
     } finally {
@@ -162,7 +172,8 @@ describe("smoke.ts against a stage that accepts connections and never answers", 
     expect(Date.now() - started).toBeLessThan(60_000);
   }, 90_000);
 
-  test("stopping the run kills the command it was waiting on, not only itself", async () => {
+  // processes are found by their working directory under /proc, which only Linux has (CI runs on Linux)
+  test.skipIf(process.platform !== "linux")("stopping the run kills the command it was waiting on, not only itself", async () => {
     // the commands smoke runs work in its workspace, under TMPDIR: any process whose cwd is there is one of them
     const commands = (): number[] =>
       readdirSync("/proc")
@@ -192,6 +203,8 @@ describe("smoke.ts against a stage that accepts connections and never answers", 
       for (let i = 0; i < 40 && commands().length > 0; i++) await Bun.sleep(25);
       expect(commands()).toEqual([]);
     } finally {
+      proc.kill("SIGKILL");
+
       for (const pid of commands()) process.kill(pid, "SIGKILL");
     }
   }, 30_000);

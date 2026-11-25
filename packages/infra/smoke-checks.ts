@@ -73,20 +73,22 @@ export type InstallStep = { kind: "install" } | { kind: "skip"; detail: string }
 
 /**
  * A stage with no CLI release yet answers /install with 404, which passes only while a readable record says so. Without
- * one a 404 proves nothing: a stage that never had a CLI release cannot be told from one whose install broke.
+ * one a 404 proves nothing: a stage that never had a CLI release cannot be told from one whose install broke. The record
+ * is read only for a 404: a stage that serves its installer is checked by installing, whatever this machine's record says.
  */
-export function installStep(input: { status: number; stage: string; record: CliRecord }): InstallStep {
+export function installStep(input: { status: number; stage: string; readRecord: () => CliRecord }): InstallStep {
   if (input.status !== 404) return { kind: "install" };
+  const record = input.readRecord();
 
-  if (input.record.kind === "absent") {
-    return { kind: "fail", detail: `/install answers 404 and this machine has no CLI release record (${input.record.path}), so a stage that never had a CLI release cannot be told from a broken install. Run the smoke check where release-cli.ts runs, or set APM_CLI_RELEASES_LEDGER to that record` };
+  if (record.kind === "absent") {
+    return { kind: "fail", detail: `/install answers 404 and this machine has no CLI release record (${record.path}), so a stage that never had a CLI release cannot be told from a broken install. Run the smoke check where release-cli.ts runs, or set APM_CLI_RELEASES_LEDGER to that record` };
   }
 
-  if (input.record.kind === "unreadable") {
-    return { kind: "fail", detail: `/install answers 404 and the CLI release record (${input.record.path}) has ${input.record.broken} line(s) that do not parse, so it cannot show that ${input.stage} never had a CLI release` };
+  if (record.kind === "unreadable") {
+    return { kind: "fail", detail: `/install answers 404 and the CLI release record (${record.path}) has ${record.broken} line(s) that do not parse, so it cannot show that ${input.stage} never had a CLI release` };
   }
 
-  if (input.record.releases.length === 0) return { kind: "skip", detail: `skipped: no CLI release on ${input.stage} yet (bun packages/infra/release-cli.ts --stage ${input.stage})` };
+  if (record.releases.length === 0) return { kind: "skip", detail: `skipped: no CLI release on ${input.stage} yet (bun packages/infra/release-cli.ts --stage ${input.stage})` };
 
   return { kind: "install" };
 }

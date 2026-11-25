@@ -139,7 +139,7 @@ async function identity(when: "before" | "after"): Promise<void> {
 async function cliInstall(): Promise<void> {
   const site = web.replace(/\/$/, "");
   const res = await bounded(`${site}/install`, { method: "HEAD" });
-  const step = installStep({ status: res.status, stage, record: cliRecordOf(stage, cliLedgerPath()) });
+  const step = installStep({ status: res.status, stage, readRecord: () => cliRecordOf(stage, cliLedgerPath()) });
 
   if (step.kind !== "install") {
     record(step.kind === "skip", "the CLI install script", step.detail);
