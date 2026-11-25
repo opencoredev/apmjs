@@ -486,7 +486,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
 
     return { name, version: null, report: null, skipped: [], blocked: `${name}: ${msg}`, forceable: false, source: "none", unchecked: [], tree: [], warnings: [], projectPeers: [], tags: [] };
   }
-  if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${api.cfg.registry} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
+  if (r.status === 414) throw new ApiError(r.status, `resolve failed for ${name}: the request was too long for ${displayRegistry(api.cfg.registry) ?? "the registry"} (HTTP 414). apm sends the project's direct dependencies with it; nothing was installed`, r.body);
 
   if (r.status === 400) throw new ApiError(r.status, `resolve failed for ${name}: ${errorOf(r.body, r.status)}`, r.body);
 
@@ -1983,7 +1983,7 @@ async function cmdAdd(a: Args): Promise<number> {
     // the registry could not be asked (down, refused, a timeout): nothing was installed, and --json keeps its shape
     const why = e instanceof ApiError ? e.message : `could not reach ${displayRegistry(cfg.registry) ?? "the registry"} (${e instanceof Error ? e.message : String(e)})`;
 
-    fail(`apm add: ${why}; nothing was installed`);
+    fail(`apm add: ${why.endsWith("nothing was installed") ? why : `${why}; nothing was installed`}`);
     emitJson({ ok: false, det, results: [], error: lastError });
 
     return 1;

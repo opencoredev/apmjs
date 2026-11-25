@@ -107,6 +107,23 @@ describe("apm: runtime detection and pass-through", () => {
     expect(dig(doc, "packages", 0, "warnings", 0, "kind")).toBe("low-score");
   });
 
+  test("apm add --json when the registry answers 414: the error names only the registry's origin", async () => {
+    const tooLong = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("", { status: 414 }) });
+
+    try {
+      const sb = makeSandbox(reg, alice);
+      const app = bunProject({}, alice);
+      const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: `${tooLong.url.href}SECRET_PATH_TOKEN/?key=SECRET_QUERY_KEY` } });
+
+      expect(r.code, r.out).toBe(1);
+      expect(r.out).toContain("HTTP 414");
+      expect(r.out).not.toContain("SECRET_");
+      expect(r.out).not.toContain("nothing was installed; nothing was installed");
+    } finally {
+      tooLong.stop(true);
+    }
+  });
+
   test("apm add --json when the registry cannot be reached: exit 1 and the documented shape, nothing installed", async () => {
     const gone = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
     const url = gone.url.href;
