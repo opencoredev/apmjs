@@ -777,3 +777,11 @@ describe("the shell words of deeply nested substitutions", () => {
     expect(tokens).toBeLessThan(200);
   });
 });
+
+describe("a command cut by the nesting limit", () => {
+  test("is unfinished, so no run is read from it", () => {
+    const postinstall = "( ".repeat(64) + 'npm --loglevel warn run check "--help"' + " )".repeat(64);
+
+    expect(expandHooks({ scripts: { postinstall, check: DROPPER } })[0]?.addedScripts).toEqual([]);
+  });
+});

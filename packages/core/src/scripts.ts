@@ -283,10 +283,11 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
  * `-s`, `'a b'` is one word), each with where it ends in `cmd` and whether an unquoted `*` makes it a glob, and `null`
  * where a command ends: `;`, `&`, `|`, a newline or a group's parenthesis. A command substitution (`$(` or a backtick)
  * is `"("`, its own commands, then `")"`, and the word around it goes on after it; `expanded` marks a word whose text
- * the shell builds from a substitution or a variable, which is not the word as written. A comment is skipped. One pass; a quote
- * left open runs to the end of `cmd`.
+ * the shell builds from a substitution or a variable, which is not the word as written. A comment is skipped. Nesting past
+ * MAX_SHELL_NESTING ends the reading with `"cut"`, the command it is in unfinished. One pass; a quote left open runs to
+ * the end of `cmd`.
  */
-export type ShellToken = { word: string; end: number; glob: boolean; expanded: boolean } | null | "(" | ")";
+export type ShellToken = { word: string; end: number; glob: boolean; expanded: boolean } | null | "(" | ")" | "cut";
 
 
 /** The deepest nesting of quotes, substitutions and groups the shell words are read through. */
@@ -340,7 +341,12 @@ export function* shellWords(cmd: string): Generator<ShellToken> {
   for (; i < cmd.length; i++) {
     // past this nesting the words are not read at all: each level holds the word it interrupts, so a run of `$(` would
     // otherwise grow the stacks with the script
-    if (open.length > MAX_SHELL_NESTING) return;
+    if (open.length > MAX_SHELL_NESTING) {
+      yield "cut";
+
+      return;
+    }
+
     const c = cmd[i] ?? "";
     const next = cmd[i + 1] ?? "";
 
@@ -441,6 +447,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   };
 
   for (const t of shellWords(cmd)) {
+    // past the nesting limit the command being read is unfinished, so only the commands before it count
+    if (t === "cut") return out;
+
     if (t === "(") {
       outer.push(words);
       words = [];
@@ -456,7 +465,7 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   return out;
 }
 
-type ShellWord = Exclude<ShellToken, null | "(" | ")">;
+type ShellWord = Exclude<ShellToken, null | "(" | ")" | "cut">;
 
 // the options of the shapes the shell reading reads, each alone or with its value as the next word
 const RUN_OPTIONS = new Set(["-s", "--silent", "--ignore-scripts", "--prefix=.", "--prefix=./"]);
