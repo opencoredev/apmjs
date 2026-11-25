@@ -10,7 +10,7 @@ import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFa
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
 import { childEnv, registryArgs, scopeOverrides, scopesOf, withoutSecrets, type Override } from "./child.ts";
-import { DEFAULT_REGISTRY, isApmToken, loadConfig, pmRegistry, sameRegistry, saveToken, type Config } from "./config.ts";
+import { DEFAULT_REGISTRY, displayRegistry, isApmToken, loadConfig, pmRegistry, sameRegistry, saveToken, type Config } from "./config.ts";
 import { capabilityLines } from "./capabilities.ts";
 import { isLockPm, isRegistryVersion, LOCKFILES, projectPins, readLock, yarnBerryNodes, type LockImporter, type LockNode, type LockPm } from "./lockfile.ts";
 import { parseArgs, type Args } from "./args.ts";
@@ -84,7 +84,7 @@ function printCard(title: string, report: Report | null, opts: { maxEvidence?: n
   else say(`  ${dim(`its score, ${report.score}/100 (${report.grade}), does not count: apm refuses it whatever it scores`)}`);
   const bad = report.signals.filter((s) => s.points < 0);
   const info = report.signals.filter((s) => s.points >= 0);
-  if (bad.length === 0) say(`  ${green("✓")} no risk signals found`);
+  if (bad.length === 0 && opts.refusal === undefined) say(`  ${green("✓")} no risk signals found`);
   for (const s of bad) {
     const pts = String(s.points).padStart(4);
     say(`  ${s.confidence === "possible" ? dim(pts) : red(pts)} ${s.id}${s.confidence === "possible" ? " (possible)" : ""}  ${dim(s.label)}`);
@@ -444,7 +444,7 @@ async function resolveSpec(api: Api, spec: string, a: Args, ctx: ResolveContext)
     const treeBlocked = (f.tree?.blocks.length ?? 0) > 0;
     const forceable = !force && !treeBlocked && f.skipped.some((s) => FORCEABLE.test(s.reason));
     // nothing in range at all, asked for no range: a package whose versions are all under other tags (a prerelease tagged next)
-    const tags = range === null && f.skipped.length === 0 && !f.newest ? await tagsWithoutLatest(api, name) : [];
+    const tags = (range === null || range === "latest") && f.skipped.length === 0 && !f.newest ? await tagsWithoutLatest(api, name) : [];
     const blocked = tags.length > 0 ? `${name} has no version tagged latest, the one apm installs when no version is named. Its versions are tagged ${tags.map((t) => `${t.tag} (${t.version})`).join(", ")}` : f.error;
 
     return { name, version: f.newest?.version ?? null, report: newestReport, skipped: f.skipped, blocked, forceable, source: "apm", unchecked: [], tree: [], warnings: [], projectPeers: [], tags };
@@ -503,6 +503,9 @@ async function scoreOf(api: Api, name: string, version: string): Promise<Report 
   }
 }
 
+/** How the registry words a skip for a version known malicious (osv.ts maliciousText, apm.ts CONFIRMED_SKIP). */
+const MALICIOUS_SKIPS = ["known malicious: the OSSF malicious-packages feed lists ", "confirmed malicious by an apm reviewer"];
+
 /**
  * The popular package a version's name is one or two edits from, when its `typosquat` signal costs points (a name npm
  * has listed for years keeps the signal at no points). `reason` is the signal's evidence, as "one edit away from "express"".
@@ -524,8 +527,9 @@ function printResolved(r: Resolved): void {
   }
 
   const lookalike = r.blocked === null ? lookalikeOf(r.report) : null;
-  // a version the OSSF feed lists or an apm reviewer confirmed malicious: the refusal leads, not its score
-  const malicious = r.blocked === null ? undefined : r.skipped.find((s) => s.version === r.version && /\bmalicious\b/.test(s.reason));
+  // a version the OSSF feed lists or an apm reviewer confirmed malicious, in the registry's own words (never an owner's
+  // yank reason): the refusal leads, not its score
+  const malicious = r.blocked === null ? undefined : r.skipped.find((s) => s.version === r.version && MALICIOUS_SKIPS.some((m) => s.reason.startsWith(m)));
   const mark = r.blocked ? red("✗") : r.warnings.length > 0 || lookalike !== null ? yellow("!") : green("✓");
 
   printCard(`${mark} ${r.name}@${r.version ?? "?"}`, r.report, malicious === undefined ? {} : { refusal: `refused: ${malicious.reason}` });
@@ -552,7 +556,7 @@ function printResolved(r: Resolved): void {
   say(`${yellow(bold("WARNING"))} ${bold(`${r.name}@${r.version ?? "?"}`)} has a name like a popular package's: ${lookalike.reason}`);
 
   if (lookalike.target !== null) say(`  did you mean ${lookalike.target}?`);
-  say(yellow(`apm goes ahead anyway: a score informs, it does not block. If you meant ${lookalike.target ?? "another package"}, stop here and use that name.`));
+  say(yellow(`A look-alike name does not stop apm on its own: a score informs, it does not block. If you meant ${lookalike.target ?? "another package"}, stop here and use that name.`));
 }
 
 /**
@@ -1832,7 +1836,12 @@ function samePath(a: string, b: string): boolean {
 function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "adding to" | "removing from" }): boolean {
   const project = join(input.layout.root, input.layout.member);
 
-  if (samePath(project, input.cwd)) return false;
+  if (samePath(project, input.cwd)) {
+    // a workspace member: the lockfile the add or removal changes is the workspace's
+    if (input.layout.member !== "") say(dim(`apm: ${input.cwd} is a member of the workspace at ${input.layout.root}, whose lockfile this changes`));
+
+    return false;
+  }
 
   if (samePath(project, homedir())) {
     fail(`refused: there is no package.json in ${input.cwd}; the nearest one is ${join(project, "package.json")}, in your home folder, and apm does not change that project from another folder. Nothing was changed.`);
@@ -1851,9 +1860,12 @@ function refuseProjectElsewhere(input: { cwd: string; layout: Layout; verb: "add
  * checks nothing there, and the package manager installs from the registry its own config names, so say which.
  */
 function plainInstallNote(input: { pm: Pm; cwd: string; command: string }): void {
-  const apmRegistry = process.env.APM_REGISTRY ?? DEFAULT_REGISTRY;
-  const registry = pmRegistry({ pm: input.pm, cwd: input.cwd, env: process.env });
-  const via = registry === null ? `${input.pm} installs from the registry its config names` : `${input.pm} installs from ${registry}`;
+  const apmRegistry = displayRegistry(process.env.APM_REGISTRY ?? DEFAULT_REGISTRY) ?? DEFAULT_REGISTRY;
+  const layout = projectLayout({ cwd: input.cwd, pm: input.pm });
+  const configured = pmRegistry({ pm: input.pm, root: layout.kind === "ok" ? layout.layout.root : input.cwd, env: process.env });
+  // printed only as its host and path, so a credential in the URL never reaches a log
+  const registry = configured === null ? null : displayRegistry(configured);
+  const via = registry === null ? `${input.pm} uses the registry its own config names` : `${input.pm}'s configured registry is ${registry}, and a lockfile's own URLs still apply`;
   const through = registry !== null && sameRegistry(registry, apmRegistry);
   const hint = input.pm === "bun" ? `[install] registry = "${apmRegistry}" in bunfig.toml` : input.pm === "yarn" ? `registry=${apmRegistry} in .npmrc (yarn 1) or npmRegistryServer: "${apmRegistry}" in .yarnrc.yml (yarn 2 and later)` : `registry=${apmRegistry} in .npmrc`;
 
@@ -2158,7 +2170,7 @@ async function cmdScore(a: Args): Promise<number> {
     s = await api.get(`-/apm/v1/score/${encodeName(name)}${range ? `/${encodeURIComponent(range)}` : ""}`, ScoreResponse);
   } catch (e) {
     // no version named, and none tagged latest (a package with only a prerelease, tagged next): say which tags it has
-    const [first, ...rest] = e instanceof ApiError && e.status === 404 && range === null ? await tagsWithoutLatest(api, name) : [];
+    const [first, ...rest] = e instanceof ApiError && e.status === 404 && (range === null || range === "latest") ? await tagsWithoutLatest(api, name) : [];
 
     if (first === undefined) throw e;
     fail(`apm: ${name} has no version tagged latest. Its versions are tagged ${[first, ...rest].map((t) => `${t.tag} (${t.version})`).join(", ")}`);
@@ -2176,6 +2188,19 @@ async function cmdScore(a: Args): Promise<number> {
   if (s.previous) say(dim(`  previous ${s.previous.version}: ${s.previous.score}/100${s.changes.length ? `; changed: ${s.changes.join("; ")}` : ""}`));
   for (const n of s.notChecked ?? []) say(dim(`  not checked: ${n}`));
   return 0;
+}
+
+const AuthConfig = z.object({ namePolicy: z.enum(["scoped", "open"]) }).loose();
+
+/** The registry's policy for new names: "scoped" (production: only under your GitHub login), "open", or null when unknown. */
+async function namePolicy(api: Api): Promise<"scoped" | "open" | null> {
+  try {
+    const config = AuthConfig.safeParse((await api.raw("-/apm/v1/auth/config")).body);
+
+    return config.success ? config.data.namePolicy : null;
+  } catch {
+    return null;
+  }
 }
 
 async function cmdName(a: Args): Promise<number> {
@@ -2211,13 +2236,16 @@ async function cmdName(a: Args): Promise<number> {
 
   if (!r.valid) say(red(`✗ ${r.query} is not a valid package name: a name is lowercase letters, digits and - . _ (and ~ in a scope), starts with a letter or digit, is at most 214 characters, and has at most one scope, as @scope/name`));
   else if (r.taken) say(`${red("✗")} ${bold(r.query)} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}`);
-  else if (r.available) {
-    // the registry takes a new package only under its publisher's own GitHub login
-    if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Publish it as ${yours}/${base}`);
+  else if (r.available && (await namePolicy(api)) === "scoped") {
+    // this registry takes a new package only under its publisher's own GitHub login (access.ts newNameRefusal)
+    const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
+    const instead = user === "" ? `use ${yours}/${base} (run apm login, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
+
+    if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Instead, ${instead}`);
     else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Run apm login, then ask again to see whether that is you`);
-    else if (scope !== user.toLowerCase()) say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}: ${yours}/${base}`);
+    else if (scope !== user.toLowerCase()) say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}`);
     else say(`${green("✓")} ${bold(r.query)} is available`);
-  }
+  } else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);
   else say(`${yellow("!")} ${bold(r.query)} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}`);
   for (const s of r.similar ?? []) say(dim(`  similar: ${s.reason}`));
   const alts = r.suggestions.filter((s) => s.available).slice(0, 4);
@@ -2563,7 +2591,7 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   // a publish needs an apm login; the package manager's own hint on failing (bunx npm login) signs in to npmjs.org
-  if (cfg.token === null) say(yellow(`apm: no login token for ${cfg.registry} found; a publish needs one: run apm login`));
+  if (cfg.token === null) say(yellow(`apm: no apm login token found for ${displayRegistry(cfg.registry) ?? "this registry"}; ${dry ? "a real publish needs one: run apm login before it" : "run apm login first if the upload is refused"}`));
 
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
@@ -2626,7 +2654,7 @@ async function cmdPublish(a: Args): Promise<number> {
   const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
-    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. You are not logged in to ${cfg.registry}: run apm login, then apm publish again (${det.pm}'s login hint above signs in to npm, not apm)` : ""}`);
+    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication, run apm login (an npm login signs in to npm, not apm), then apm publish again` : ""}`);
     return pub.code;
   }
   // A login token stages the version: the registry answers with an approval link in its notice.

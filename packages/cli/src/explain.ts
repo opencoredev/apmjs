@@ -14,7 +14,7 @@
 // past it (agent.ts), so only a range with no such version stays review-first for its age. Anything apm could not read
 // is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
 // the version or anything in its tree. Like the rest of apm it never calls a version "safe".
-import type { Report, ReportCoverage } from "./api.ts";
+import type { DistTag, Report, ReportCoverage } from "./api.ts";
 
 /** "2,656 files (74.0 MB)": what a version apm did not read in full left out. */
 function omittedText(c: { omittedFiles: number; omittedBytes: number }): string {
@@ -273,7 +273,7 @@ export type DepCheck = { unchecked: number; uncheckedDeps: { dependency: string;
 /** `confirmed`: what an apm reviewer confirmed malicious, when that is why the registry refused (older registries send none). */
 export type ResolvedInput =
   | { kind: "ok"; version: string; report: Report | null; skipped: { version: string; reason: string }[]; deps: DepCheck }
-  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[]; tags?: { tag: string; version: string }[] }
+  | { kind: "refused"; reason: string; newest: string | null; skipped: { version: string; reason: string }[]; confirmed: DepRef[]; knownMalicious?: { name: string; version: string; ids: string[] }[]; tags?: DistTag[] }
   | { kind: "missing"; reason: string }
   | { kind: "unavailable"; reason: string };
 

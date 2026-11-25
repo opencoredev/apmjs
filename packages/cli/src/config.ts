@@ -139,34 +139,47 @@ function fileRegistry(path: string, kind: "bunfig" | "yarnrc"): string | null {
 }
 
 /**
- * The registry `pm` installs from at `cwd` when apm passes nothing (a plain install), read from the files and variables
- * it reads: for bun, its variables, then bunfig.toml (the project's, then the user's); then npm_config_registry and the
- * .npmrc files, nearest first; else npm's registry. Yarn's own defaults differ by version, so for yarn it is the
- * .yarnrc.yml or .npmrc line, or null when neither names one. Only for saying where a plain install goes.
+ * A registry URL as apm prints it: http or https, its host and path only, no user, password, query or fragment (an
+ * .npmrc or a variable can carry credentials in any of them). Null for anything else, which apm then does not name.
  */
-export function pmRegistry(input: { pm: Pm; cwd: string; env: Record<string, string | undefined> }): string | null {
-  const { pm, cwd, env } = input;
+export function displayRegistry(url: string): string | null {
+  try {
+    const u = new URL(url);
+
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    const shown = `${u.origin}${u.pathname}`;
+
+    return /^[\w\-.:/~%]{1,200}$/.test(shown) ? withSlash(shown) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The default registry `pm` is configured with for the project at `root` when apm passes nothing (a plain install), from
+ * the variables and files it reads: for bun, its variables, then bunfig.toml (the project's, then the user's); then
+ * npm_config_registry, the project root's .npmrc and the user's (npm reads no .npmrc above the project root); else npm's
+ * registry. For yarn, YARN_NPM_REGISTRY_SERVER or .yarnrc.yml's npmRegistryServer, or null: its defaults differ by
+ * version. Only for saying where a plain install goes; a scope's own registry and a lockfile's URLs still apply.
+ */
+export function pmRegistry(input: { pm: Pm; root: string; env: Record<string, string | undefined> }): string | null {
+  const { pm, root, env } = input;
   const home = env.HOME ?? homedir();
-  const userconfig = userconfigPath(env);
-  const npmrc = [...projectNpmrcs(cwd, new Set([homedir(), home, dirname(userconfig)])), userconfig].map(readNpmrc).find((f) => f.has("registry"))?.get("registry") ?? null;
+  const npmrc = [join(root, ".npmrc"), userconfigPath(env)].map(readNpmrc).find((f) => f.has("registry"))?.get("registry") ?? null;
   const fromEnv = env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? null;
 
   switch (pm) {
     case "bun": {
-      const bunfig = [join(cwd, "bunfig.toml"), join(env.XDG_CONFIG_HOME ?? join(home, ".config"), ".bunfig.toml"), join(home, ".bunfig.toml")].map((p) => fileRegistry(p, "bunfig")).find((r) => r !== null) ?? null;
+      const bunfig = [join(root, "bunfig.toml"), join(env.XDG_CONFIG_HOME ?? join(home, ".config"), ".bunfig.toml"), join(home, ".bunfig.toml")].map((p) => fileRegistry(p, "bunfig")).find((r) => r !== null) ?? null;
 
-      return withSlash(env.BUN_CONFIG_REGISTRY ?? fromEnv ?? bunfig ?? npmrc ?? NPM_REGISTRY);
+      return env.BUN_CONFIG_REGISTRY ?? fromEnv ?? bunfig ?? npmrc ?? NPM_REGISTRY;
     }
 
     case "npm":
     case "pnpm":
-      return withSlash(fromEnv ?? npmrc ?? NPM_REGISTRY);
-    case "yarn": {
-      const found = fileRegistry(join(cwd, ".yarnrc.yml"), "yarnrc") ?? npmrc;
-
-      return found === null ? null : withSlash(found);
-    }
-
+      return fromEnv ?? npmrc ?? NPM_REGISTRY;
+    case "yarn":
+      return env.YARN_NPM_REGISTRY_SERVER ?? fileRegistry(join(root, ".yarnrc.yml"), "yarnrc");
     default: {
       const _exhaustive: never = pm;
 

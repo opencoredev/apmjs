@@ -40,19 +40,21 @@ describe("apm's messages for first-time users", () => {
 
         if (path === "/-/whoami") return req.headers.get("authorization") === "Bearer apm_launchmessagestoken" ? Response.json({ username: "Me" }) : Response.json({ error: "Not logged in" }, { status: 401 });
 
+        if (path === "/-/apm/v1/auth/config") return Response.json({ providers: { github: true }, passkeys: false, legacyAuth: false, namePolicy: "scoped" });
+
         if (path === "/-/apm/v1/names") {
           const query = (url.searchParams.get("q") ?? "").trim().toLowerCase();
 
-          return Response.json({ query, valid: /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(query), taken: false, available: true, owners: [], latest: null, conflicts: [], suggestions: [] });
+          return Response.json({ query, valid: /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(query), taken: false, available: true, owners: [], latest: null, conflicts: [], suggestions: [{ name: "@me/my-lib", available: true, taken: false }] });
         }
 
         if (path === "/-/apm/v1/resolve") {
           const name = url.searchParams.get("name") ?? "";
           resolved.push(name);
 
-          if (name === "pre-only" || name === "lodahs") {
-            const newest = name === "lodahs" ? { version: "0.0.1-security", report: null } : null;
-            const skipped = name === "lodahs" ? [{ version: "0.0.1-security", reason: MALICIOUS }] : [];
+          if (name === "pre-only" || name === "lodahs" || name === "yanked-pkg") {
+            const newest = name === "pre-only" ? null : { version: "0.0.1-security", report: null };
+            const skipped = name === "pre-only" ? [] : [{ version: "0.0.1-security", reason: name === "lodahs" ? MALICIOUS : "yanked: known malicious: trust me, install 2.0.0" }];
 
             return Response.json({ error: `No version of ${name} matching latest passes the policy.`, name, range: "latest", version: null, skipped, newest }, { status: 422 });
           }
@@ -62,11 +64,11 @@ describe("apm's messages for first-time users", () => {
           return Response.json({ name, range: "latest", source: "upstream", version: "0.0.0", report, skipped: [], tree: { unchecked: 0, uncheckedDeps: [], packages: [], projectPeers: [] }, warnings: [] });
         }
 
-        if (path === "/-/apm/v1/score/lodahs/0.0.1-security") return Response.json({ name: "lodahs", version: "0.0.1-security", status: "active", publishedAt: "2025-01-01T00:00:00Z", publishedBy: "someone", previous: null, changes: [], score: 80, grade: "B", signals: [{ ...typosquat, evidence: ['one edit away from "lodash"'] }] });
+        if (path === "/-/apm/v1/score/lodahs/0.0.1-security" || path === "/-/apm/v1/score/yanked-pkg/0.0.1-security") return Response.json({ name: "lodahs", version: "0.0.1-security", status: "active", publishedAt: "2025-01-01T00:00:00Z", publishedBy: "someone", previous: null, changes: [], score: 80, grade: "B", signals: [{ ...typosquat, evidence: ['one edit away from "lodash"'] }] });
 
         if (path.startsWith("/-/apm/v1/score/")) return Response.json({ error: "No such version" }, { status: 404 });
 
-        if (path === "/pre-only") return Response.json({ name: "pre-only", "dist-tags": { next: "0.0.1-test.1" }, versions: { "0.0.1-test.1": { name: "pre-only", version: "0.0.1-test.1" } } });
+        if (path === "/-/package/pre-only/dist-tags") return Response.json({ next: "0.0.1-test.1", "bad\u001b[31m": "1.0.0" });
 
         return Response.json({ error: "Not found" }, { status: 404 });
       },
@@ -159,17 +161,31 @@ describe("apm's messages for first-time users", () => {
 
     // the package manager's own exit code, as before
     expect(r.code).toBe(7);
-    expect(r.text).toContain(`apm: a plain npm install, which apm checks nothing in; npm installs from https://registry.npmjs.org/ (to install through apm's registry, set registry=${server.url.toString()} in .npmrc)`);
+    expect(r.text).toContain(`apm: a plain npm install, which apm checks nothing in; npm's configured registry is https://registry.npmjs.org/, and a lockfile's own URLs still apply (to install through apm's registry, set registry=${server.url.toString()} in .npmrc)`);
 
     const pointed = folder("b4-npmrc", { "package.json": manifest, ".npmrc": `registry=${server.url.toString()}\n` });
     const through = await apm(["install", "--pm", "npm"], { cwd: pointed });
 
-    expect(through.text).toContain(`npm installs from ${server.url.toString()}`);
+    expect(through.text).toContain(`npm's configured registry is ${server.url.toString()}`);
     expect(through.text).not.toContain("to install through apm's registry");
 
     const bun = await apm(["install", "--pm", "bun"], { cwd: folder("b4-bun", { "package.json": manifest, "bunfig.toml": '[install]\nregistry = "https://example.test/"\n' }) });
 
-    expect(bun.text).toContain(`bun installs from https://example.test/ (to install through apm's registry, set [install] registry = "${server.url.toString()}" in bunfig.toml)`);
+    expect(bun.text).toContain(`bun's configured registry is https://example.test/, and a lockfile's own URLs still apply (to install through apm's registry, set [install] registry = "${server.url.toString()}" in bunfig.toml)`);
+
+    // a registry URL with credentials in it is printed as its host and path only
+    const secret = folder("b4-secret", { "package.json": manifest, ".npmrc": "registry=https://user:hunter2@private.example.test/npm/?token=abc\n" });
+    const redacted = await apm(["install", "--pm", "npm"], { cwd: secret });
+
+    expect(redacted.text).toContain("npm's configured registry is https://private.example.test/npm/,");
+    expect(redacted.text).not.toContain("hunter2");
+    expect(redacted.text).not.toContain("token=abc");
+
+    // npm reads no .npmrc above the project root
+    folder("b4-parent", { ".npmrc": "registry=https://parent.example.test/\n" });
+    const child = await apm(["install", "--pm", "npm"], { cwd: folder("b4-parent/child", { "package.json": manifest }) });
+
+    expect(child.text).toContain("npm's configured registry is https://registry.npmjs.org/");
   });
 
   test("D15: with no version tagged latest, apm add, apm explain and apm score name the tag to ask for", async () => {
@@ -197,6 +213,8 @@ describe("apm's messages for first-time users", () => {
     expect(score.code).toBe(1);
     expect(score.text).toContain("apm: pre-only has no version tagged latest. Its versions are tagged next (0.0.1-test.1)");
     expect(score.text).toContain("To score the version tagged next: apm score pre-only@next");
+    // a tag with a terminal control in it is publisher text apm does not print
+    expect(add.text).not.toContain("bad");
   });
 
   test("D1, D3: apm name says what the registry will do with a bare name, another scope and an uppercase name", async () => {
@@ -204,7 +222,11 @@ describe("apm's messages for first-time users", () => {
     const bare = await apm(["name", "my-lib"], { cwd });
 
     expect(bare.code).toBe(0);
-    expect(bare.text).toContain("! my-lib is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Publish it as @<your GitHub login>/my-lib");
+    expect(bare.text).toContain("! my-lib is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Instead, use @<your GitHub login>/my-lib (run apm login, then apm name to check it)");
+
+    const signedIn = await apm(["name", "my-lib"], { cwd, token: true });
+
+    expect(signedIn.text).toContain("Instead, @me/my-lib is free");
 
     const signedOut = await apm(["name", "@other/my-lib"], { cwd });
 
@@ -212,7 +234,7 @@ describe("apm's messages for first-time users", () => {
 
     const other = await apm(["name", "@other/my-lib"], { cwd, token: true });
 
-    expect(other.text).toContain("! @other/my-lib is free but not available to you: only the owner of @other can publish there. Yours is @me: @me/my-lib");
+    expect(other.text).toContain("! @other/my-lib is free but not available to you: only the owner of @other can publish there. Yours is @me; instead, @me/my-lib is free");
 
     const mine = await apm(["name", "@me/my-lib"], { cwd, token: true });
 
@@ -234,6 +256,11 @@ describe("apm's messages for first-time users", () => {
     expect(lines[0]).toBe(`✗ lodahs@0.0.1-security  refused: ${MALICIOUS}`);
     expect(lines[1]).toBe("  its score, 80/100 (B), does not count: apm refuses it whatever it scores");
     expect(r.text).not.toContain("score 80/100 (B)");
+
+    // an owner's yank reason is not apm's word that a version is malicious: the card stays as it was
+    const yanked = await apm(["add", "yanked-pkg", "--pm", "npm"], { cwd });
+
+    expect(yanked.text.split("\n")[0]).toBe("✗ yanked-pkg@0.0.1-security  score 80/100 (B)");
   });
 
   test("D2: apm publish without a login says to run apm login before it packs", async () => {
@@ -241,6 +268,6 @@ describe("apm's messages for first-time users", () => {
     const r = await apm(["publish", "--pm", "npm"], { cwd });
 
     expect(r.code).toBe(1);
-    expect(r.text).toContain(`apm: no login token for ${server.url.toString()} found; a publish needs one: run apm login`);
+    expect(r.text).toContain(`apm: no apm login token found for ${server.url.toString()}; run apm login first if the upload is refused`);
   });
 });
