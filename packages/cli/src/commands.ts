@@ -11,6 +11,11 @@ type Command = {
   flags: Readonly<Record<string, FlagKind>>;
   /** How many positional arguments it takes at most; null for any number. */
   maxPositional: number | null;
+  /**
+   * Value flags only the package manager's own command reads (`apm install --tag next` with no packages is npm's
+   * install): parsed with their value so it is not taken for a package, and refused when apm runs the command itself.
+   */
+  native?: readonly string[];
 };
 
 /** Read by every command apm runs itself. */
@@ -26,7 +31,7 @@ const ADD: Command = {
 Resolves each package, checks its whole dependency tree and the lockfile your package manager computes, then installs
 the exact versions. With no packages, apm install runs your package manager's own install.
 
-  -D, --dev                add to devDependencies
+  -D, --dev, --save-dev    add to devDependencies
   --production, --prod, --omit dev   leave devDependencies out of the install
   --strict                 refuse what is otherwise only a warning (also APM_STRICT=1)
   --force                  install past the score floor and the cooldown
@@ -38,6 +43,7 @@ the exact versions. With no packages, apm install runs your package manager's ow
   --json                   print one JSON document on stdout`,
   flags: { ...COMMON, ...CHECKS, dev: "switch", production: "switch", prod: "switch", omit: "value" },
   maxPositional: null,
+  native: ["tag"],
 };
 
 export const COMMANDS = {
@@ -146,9 +152,10 @@ export function commandOf(name: string): Command | undefined {
 
 /** The flags that take the next argument as their value: the command's own, or only --pm for a package manager's command. */
 export function valueFlagsOf(name: string): ReadonlySet<string> {
-  const flags = commandOf(name)?.flags ?? COMMON;
+  const command = commandOf(name);
+  const flags = command?.flags ?? COMMON;
 
-  return new Set(Object.entries(flags).flatMap(([key, kind]) => (kind === "value" ? [key] : [])));
+  return new Set([...Object.entries(flags).flatMap(([key, kind]) => (kind === "value" ? [key] : [])), ...(command?.native ?? [])]);
 }
 
 /** The help `apm help <topic>` prints: exec and dlx are x. */
@@ -161,6 +168,8 @@ export function argsError(a: Args, command: Command): string | null {
   for (const [key, value] of a.flags) {
     const shown = key.startsWith("-") ? key : `--${key}`;
     const kind = Object.hasOwn(command.flags, key) ? command.flags[key] : undefined;
+
+    if (kind === undefined && command.native?.includes(key) === true) return `${shown} is read only by your package manager's own install (apm ${a.cmd} with no packages)`;
 
     if (kind === undefined) return `unknown flag ${shown} for apm ${a.cmd}`;
 
