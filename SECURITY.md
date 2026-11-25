@@ -8,7 +8,7 @@ Open a [package report](../../issues/new?template=report-package.yml). Reports a
 
 Include the package, the exact version, and what you saw (a file and line, a network call, an install script). When we confirm it:
 
-- the version is revoked, so its tarball answers 410 and `apm`, the `~safe/` registry view and the Bun scanner refuse it, existing lockfiles included; or it is yanked, so new installs skip it while a lockfile that already pins it still installs it;
+- the version is revoked, so its tarball answers 410 and `apm`, the `~safe/` registry view and the Bun scanner refuse it, existing lockfiles included; or it is yanked, so new installs skip it while a lockfile that already pins it from the plain registry still installs it (through `~safe` it answers 404);
 - the package's public log records who reported it and what changed;
 - packages that come from npm are also reported to the npm security team and to the OSV database, because apm cannot remove them at the source.
 
