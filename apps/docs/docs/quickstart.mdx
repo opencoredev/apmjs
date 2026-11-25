@@ -127,7 +127,7 @@ apm uses the package manager your project already uses: it reads the lockfile, t
 
 ## 3. Add a package
 
-Run it in a folder with a `package.json` (`npm init -y` makes one). Like npm, apm uses the nearest `package.json`, so in a folder without one it changes the nearest parent project.
+Run it in a folder with a `package.json` (`npm init -y` makes one). Like npm, apm uses the nearest `package.json`, so in a folder without one it changes the nearest parent project and says which. The one exception is a `package.json` in your home folder: from a folder below it, `apm add` and `apm remove` refuse and change nothing.
 
 ```bash
 apm add zod
