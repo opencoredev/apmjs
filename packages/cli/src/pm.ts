@@ -83,7 +83,7 @@ export function addArgs(pm: Pm, specs: string[], opts: { dev: boolean; ignoreScr
   }
 }
 
-export function packArgs(pm: Pm, dest: string): string[] {
+export function packArgs(pm: Pm, dest: string, yarn: YarnLine["kind"] = "berry"): string[] {
   switch (pm) {
     case "bun":
       return ["bun", "pm", "pack", "--destination", dest];
@@ -92,7 +92,8 @@ export function packArgs(pm: Pm, dest: string): string[] {
     case "pnpm":
       return ["pnpm", "pack", "--pack-destination", dest];
     case "yarn":
-      return ["yarn", "pack", "--out", join(dest, "%s-%v.tgz")];
+      // yarn 1 has no --out: it ignores it and writes the tarball into the project
+      return yarn === "classic" ? ["yarn", "pack", "--filename", join(dest, "package.tgz")] : ["yarn", "pack", "--out", join(dest, "%s-%v.tgz")];
     default: {
       const _exhaustive: never = pm;
       return _exhaustive;

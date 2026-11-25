@@ -28,6 +28,7 @@
     "pnpm": "10.18.3",
     "rolldown": "1.2.13",
     "typescript": "^5.9.3",
+    "yarn": "1.22.22",
     "zod": "4.6.7"
   },
   "license": "MIT",
