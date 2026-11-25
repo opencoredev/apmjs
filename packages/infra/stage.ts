@@ -55,7 +55,15 @@ export type AuthSecret = { kind: "existing"; value: string } | { kind: "created"
 export function authSecret(input: { action: DeployAction; dir: string; stage: string }): AuthSecret {
   const path = join(input.dir, `auth-secret-${input.stage}`);
 
-  if (existsSync(path)) return { kind: "existing", value: readFileSync(path, "utf8").trim() };
+  if (existsSync(path)) {
+    const value = readFileSync(path, "utf8").trim();
+
+    // an empty key would sign sessions and encrypt TOTP secrets with nothing; making a new one would orphan what the
+    // old one encrypted, so a person decides
+    if (value === "") throw new Error(`${path} is empty. Restore the stage's auth secret into it; deploy.ts makes one only when the file does not exist.`);
+
+    return { kind: "existing", value };
+  }
 
   if (input.action === "plan") return { kind: "missing" };
   mkdirSync(input.dir, { recursive: true, mode: 0o700 });
