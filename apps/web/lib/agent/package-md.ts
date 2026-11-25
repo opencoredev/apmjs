@@ -2,23 +2,26 @@
 // tool. The same facts as the HTML page, in the order an agent deciding on an install needs them. Pure.
 import { isNotAllRead, NOT_ALL_READ_INSTALLS, scoreOnWhatWasRead, skippedSentence } from "../coverage";
 import { citeEvidence, namesFile } from "../evidence";
-import { installCommand, installNote, INSTALL_CLIENTS } from "../install-note";
+import { installCommand, installNote, INSTALL_CLIENTS, specSuffix, type InstallSpec } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
 import type { Facts, Fetched, PackageInfo, Refused, Signal } from "../registry";
-import { advisoryUrl, refusalOf, refusalReason, type Refusal } from "../refusal";
-import { taggedDefault } from "../shown-version";
-import { basisNote, capabilityParts, listsCapabilities, statusMark } from "../capabilities";
+import { advisoryUrl, noInstallableReason, refusalLabel, refusalOf, refusalReason, type NoInstallable, type Refusal } from "../refusal";
+import { basisNote, capabilityParts, scorerCapabilities, statusMark } from "../capabilities";
+import { chooseVersion } from "../shown-version";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
 import { canonicalPackagePath, siteUrl } from "./site";
 import type { ScoreReport, VersionInfo } from "./source";
 import { codeBlock, inlineCode, linkUrl, oneLine, points, UNTRUSTED_NOTE } from "./text";
 
+/** How the install commands name the shown version (shown-version.ts selectVersion), or why there is none to install. */
+export type InstallTarget = InstallSpec | { readonly kind: "none"; readonly why: NoInstallable };
+
 export type PackageView = {
   pkg: PackageInfo;
-  /** The version shown: the one asked for with ?v=, else latest. Null when the package has no versions. */
+  /** The version shown: the one asked for with ?v=, else the one installs get by name. Null when none installs. */
   version: string | null;
   /** That version's own state, from the versions route; null when there is no version. */
   status: { status: string; statusReason: string | null; deprecated: string | null } | null;
@@ -31,6 +34,8 @@ export type PackageView = {
   /** Why apm can never score that version, from its own version answer (not the package answer's newest 200). */
   unscorable: VersionInfo["unscorable"];
   review: Fetched<ReviewAnswer>;
+  /** The same selection the HTML page makes for the same URL, so both name the same release the same way. */
+  install: InstallTarget;
   /** The registry URL install config points at, ending in "/". */
   registry: string;
 };
@@ -168,19 +173,28 @@ function statusLine(status: NonNullable<PackageView["status"]>, refusal: Refusal
  */
 function capabilityLines(score: ScoreReport | null): string[] | null {
   if (score === null) return null;
+  const listed = scorerCapabilities(score);
 
-  if (score.capabilities.length > 0 || listsCapabilities(score.scorer)) {
-    if (score.capabilities.length === 0) return ["- None found in the code apm read."];
+  switch (listed.kind) {
+    case "listed":
+      if (listed.capabilities.length === 0) return ["- None found in the code apm read."];
 
-    return score.capabilities.map((c) => {
-      const { name, detail } = capabilityParts(c.label);
-      const notes = [basisNote(c)?.toLowerCase() ?? "seen", statusMark(c)?.text.toLowerCase()].filter(Boolean).join("; ");
+      return listed.capabilities.map((c) => {
+        const { name, detail } = capabilityParts(c.label);
+        const notes = [basisNote(c)?.toLowerCase() ?? "seen", statusMark(c)?.text.toLowerCase()].filter(Boolean).join("; ");
 
-      return `- ${oneLine(name)}${detail ? ` (${oneLine(detail)})` : ""}: ${notes}`;
-    });
+        return `- ${oneLine(name)}${detail ? ` (${oneLine(detail)})` : ""}: ${notes}`;
+      });
+    case "unavailable":
+      return ["- Capabilities: not available from this registry."];
+    case "not-listed":
+      return capabilitiesOf(score.signals)?.map((c) => `- ${c.label}: ${c.state}`) ?? null;
+    default: {
+      const _exhaustive: never = listed;
+
+      return _exhaustive;
+    }
   }
-
-  return capabilitiesOf(score.signals)?.map((c) => `- ${c.label}: ${c.state}`) ?? null;
 }
 
 /** Why apm can never score the shown version: null when it has a score or may still get one. */
@@ -209,20 +223,66 @@ export function scoreLine(input: { name: string; score: ScoreReport; unpackedSiz
   return `${scoreOnWhatWasRead(score.score)}. Not fully checked:${skipped || " apm did not read every file."} ${NOT_ALL_READ_INSTALLS}`;
 }
 
+/** The links every Markdown view ends with; `spec` is the name, with @tag or @version when the view installs by one. */
+function moreLines(spec: string): string[] {
+  return [
+    "## More",
+    "",
+    `- Should an agent install it? GET ${siteUrl(`/api/explain?package=${encodeURIComponent(spec)}`)}`,
+    `- API: ${siteUrl("/openapi.json")}`,
+    `- MCP server (optional, the same answers as tools): ${siteUrl("/mcp")}`,
+  ];
+}
+
+/** A refused version in a list, its advisory ids quoted and linked. */
+function refusedLine(v: { version: string; refusal: Refusal }): string {
+  const r = v.refusal;
+  const label = r.kind === "known-malicious" ? `listed as malicious by the OSSF malicious-packages feed (${r.ids.map((id) => inlineCode(id)).join(", ")}). Advisory: ${r.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}` : refusalLabel(r);
+
+  return `  - ${versionText(v.version)}: ${label}`;
+}
+
+/** The Markdown view of a package with no version to install: the reason first, and no install command. */
+function noInstallableMarkdown(input: { pkg: PackageInfo; why: NoInstallable }): string {
+  const { pkg, why } = input;
+  const reason = noInstallableReason({ name: oneLine(pkg.name), why });
+
+  return `${[
+    `# ${oneLine(pkg.name)}`,
+    "",
+    "- Version shown: none. apm installs no version of this package.",
+    `- Status: do not install. ${reason}`,
+    ...(why.kind === "none-served" ? why.versions.map(refusedLine) : []),
+    ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
+    `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
+    `- Page: ${siteUrl(canonicalPackagePath(pkg.name))}`,
+    `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
+    "",
+    UNTRUSTED_NOTE,
+    "",
+    "## Install",
+    "",
+    "No install command: apm installs no version of this package.",
+    "",
+    ...moreLines(pkg.name),
+  ].join("\n")}\n`;
+}
+
 /** The whole Markdown document for one package version. */
 export function packageMarkdown(input: PackageView): string {
   const view = withholdSource(input);
-  const { pkg, version, score } = view;
+  const { pkg, version, score, install } = view;
+
+  if (install.kind === "none") return noInstallableMarkdown({ pkg, why: install.why });
   const withheld = sourceWithheld(view);
   const url = siteUrl(canonicalPackagePath(pkg.name));
-  // a package with no latest tag: the newest version another tag names, installed by that tag
-  const tagged = taggedDefault(pkg);
-  const tag = tagged !== null && tagged.version === version ? tagged.tag : null;
+  // installed by a dist-tag: the default when apm installs no version tagged latest, or a ?v= that names the tag
+  const tag = install.kind === "tag" ? install.tag : null;
   const older = version !== null && version !== pkg.latest && tag === null;
   const refusal = view.status ? refusalOf({ status: view.status.status, refused: view.refused }) : null;
   const unscorable = unscorableOf(view);
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
-  const shownNote = tag ? ` (tagged ${inlineCode(tag)}; no version is tagged latest)` : older ? ` (latest is ${pkg.latest ? versionText(pkg.latest) : "unknown"})` : version ? " (latest)" : "";
+  const shownNote = tag ? ` (tagged ${inlineCode(tag)}; ${pkg.latest === null ? "no version is tagged latest" : `latest is ${versionText(pkg.latest)}`})` : older ? ` (${pkg.latest ? `latest is ${versionText(pkg.latest)}` : "no version is tagged latest"})` : version ? " (latest)" : "";
 
   out.push(
     `- Version shown: ${version ? versionText(version) : "none published"}${shownNote}`,
@@ -232,7 +292,7 @@ export function packageMarkdown(input: PackageView): string {
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
     `- Source: ${pkg.source === "upstream" ? "the public npm registry, proxied and scored by apm" : "published to apm"}`,
     `- Score: ${score ? scoreLine({ name: pkg.name, score, unpackedSize: view.facts?.unpackedSize ?? null }) : unscorable !== null ? "none: apm cannot score this version" : "not scored yet"}`,
-    `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : ""}`,
+    `- Page: ${url}${older ? `?v=${encodeURIComponent(version)}` : tag !== null && pkg.latest !== null ? `?v=${encodeURIComponent(tag)}` : ""}`,
     `- Maintainers: ${pkg.maintainers.length ? pkg.maintainers.map((m) => inlineCode(m)).join(", ") : "unknown"}`,
     "",
     UNTRUSTED_NOTE,
@@ -285,16 +345,18 @@ export function packageMarkdown(input: PackageView): string {
   else out.push(`- Install scripts, license and size: ${unknownUntil}`);
   out.push("", "## AI review", "", ...reviewSection(view.review), "");
 
-  const shown = version === null ? null : oneLine(version);
+  // the registry's version and tag strings, kept to one line inside the command block
+  const named: InstallSpec = install.kind === "tag" ? { kind: "tag", tag: oneLine(install.tag) } : install.kind === "exact" ? { kind: "exact", version: oneLine(install.version) } : { kind: "default", version: version === null ? null : oneLine(version) };
 
   out.push("## Install", "");
 
   if (refusal !== null) {
-    const instead = pkg.latest !== null && pkg.latest !== version ? ` The version apm installs is ${versionText(pkg.latest)}: ${url}` : "";
+    const byName = chooseVersion({ pkg, asked: undefined });
+    const instead = byName.kind === "latest" && byName.version !== version ? ` The version apm installs is ${versionText(byName.version)}: ${url}` : "";
 
     out.push(`No install command: apm refuses this version.${instead}`, "");
   } else {
-    out.push(codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, version: shown, tag: tag === null ? null : oneLine(tag) })).join("\n"), "sh"), "");
+    out.push(codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, install: named })).join("\n"), "sh"), "");
     out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm get only some of them, and only once pointed at apm:", "");
 
     for (const client of ["bun", "npm"] as const) {
@@ -310,14 +372,9 @@ export function packageMarkdown(input: PackageView): string {
   if (notChecked.length === 0) out.push("- What the code does at runtime, the code of its dependencies, or a compromised publisher.");
   else out.push(...notChecked.map((n) => `- ${inlineCode(n)}`));
 
-  out.push(
-    "",
-    "## More",
-    "",
-    `- Should an agent install it? GET ${siteUrl(`/api/explain?package=${encodeURIComponent(pkg.name)}`)}`,
-    `- API: ${siteUrl("/openapi.json")}`,
-    `- MCP server (optional, the same answers as tools): ${siteUrl("/mcp")}`,
-  );
+  const suffix = specSuffix(named);
+
+  out.push("", ...moreLines(suffix === null ? pkg.name : `${pkg.name}@${suffix}`));
 
   return `${out.join("\n")}\n`;
 }

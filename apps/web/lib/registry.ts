@@ -44,8 +44,9 @@ const Declaration = z.object({ kind: z.enum(["none", "declared"]), notes: z.arra
 
 export type Declaration = z.infer<typeof Declaration>;
 
-// added with apm-score-v10; an older registry or scorer sends neither
-const CapabilityFields = { capabilities: z.array(Capability).default([]), declaration: Declaration.nullish() };
+// added with apm-score-v10; an older registry or scorer sends neither. Absent is not an empty list: an empty list
+// says the scorer found none, absent says this answer does not carry them (lib/capabilities.ts scorerCapabilities)
+const CapabilityFields = { capabilities: z.array(Capability).optional(), declaration: Declaration.nullish() };
 
 // what names an evidence item for a reviewer's dismissal; added with dismissals, an older registry leaves them out.
 // `redacted`: the version is revoked and its signals carry no evidence lines. Required: a registry too old to send it

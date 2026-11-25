@@ -28,15 +28,42 @@ function base(registry: string): string {
 }
 
 /**
- * The command for `client`. `tag` is the dist-tag the shown version is installed by when the package has no latest
- * (a prerelease tagged next): a bare name would ask for latest and find nothing.
+ * How the install commands name the version a page shows, the same on the page and in its Markdown view:
+ * - default: the version installs get by name (latest). apm add resolves its own (it may pick an older one past the
+ *   cooldown); stock clients pin `version`, or take the bare name when it is unknown.
+ * - tag: a dist-tag, asked for with ?v=<tag> or the default when no installable version is tagged latest.
+ * - exact: a version asked for by number; every command pins it.
  */
-export function installCommand({ client, name, version, tag = null }: { client: InstallClient; name: string; version: string | null; tag?: string | null }): string {
-  const spec = tag ? `${name}@${tag}` : version ? `${name}@${version}` : name;
+export type InstallSpec =
+  | { readonly kind: "default"; readonly version: string | null }
+  | { readonly kind: "tag"; readonly tag: string }
+  | { readonly kind: "exact"; readonly version: string };
+
+/** The version or tag an agent's verdict request names after `name@`, or null for the bare name. */
+export function specSuffix(install: InstallSpec): string | null {
+  switch (install.kind) {
+    case "default":
+      return null;
+    case "tag":
+      return install.tag;
+    case "exact":
+      return install.version;
+    default: {
+      const _exhaustive: never = install;
+
+      return _exhaustive;
+    }
+  }
+}
+
+export function installCommand({ client, name, install }: { client: InstallClient; name: string; install: InstallSpec }): string {
+  const suffix = specSuffix(install);
+  const pinned = install.kind === "default" && install.version !== null ? `${name}@${install.version}` : null;
+  const spec = suffix === null ? (pinned ?? name) : `${name}@${suffix}`;
 
   switch (client) {
     case "apm":
-      return `apm add ${tag ? spec : name}`;
+      return `apm add ${suffix === null ? name : spec}`;
     case "bun":
       return `bun add ${spec}`;
     case "npm":

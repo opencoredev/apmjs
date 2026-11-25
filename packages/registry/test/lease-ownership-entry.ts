@@ -25,7 +25,7 @@ const MiB = 1024 * 1024;
 const encoder = new TextEncoder();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const empty = () => ({ scores: new Map(), unscorable: new Map() });
-const store = { confirmedReviews: () => Effect.succeed([]), getPackage: () => Effect.succeed(null), upstreamAnalyses: () => Effect.succeed(empty()), upstreamAnalysesOf: () => Effect.succeed(new Map()), upstreamAnalysesFor: () => Effect.succeed(new Map()), upstreamScored: () => Effect.succeed(false), upstreamAdmitted: () => Effect.succeed(false), keptPackage: () => Effect.succeed(null), pageRead: () => Effect.succeed({ kind: "upstream", kept: null, analyses: empty() }), keepPackage: () => Effect.void, dropKeptPackages: () => Effect.void };
+const store = { confirmedReviews: () => Effect.succeed([]), getPackage: () => Effect.succeed(null), upstreamAnalyses: () => Effect.succeed(empty()), upstreamAnalysesOf: () => Effect.succeed(new Map()), upstreamAnalysesFor: () => Effect.succeed(new Map()), upstreamScored: () => Effect.succeed(false), upstreamAdmitted: () => Effect.succeed(false), keptPackage: () => Effect.succeed(null), pageRead: () => Effect.succeed({ kind: "upstream", kept: null, analyses: empty(), confirmed: [] }), keepPackage: () => Effect.void, dropKeptPackages: () => Effect.void };
 const deps = Layer.mergeAll(Layer.succeed(Store, store), Layer.succeed(Blobs, {}));
 const HEAD = '{"name":"p","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"p","version":"1.0.0","dist":{"tarball":"https://npm.invalid/t"}}},"time":{"1.0.0":"2020-01-01T00:00:00.000Z"},"readme":"';
 

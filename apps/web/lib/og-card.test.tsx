@@ -29,3 +29,10 @@ describe("the package OG card", () => {
     expect(markup).toContain("not scored");
   });
 });
+
+// HOME-502 Sol review finding 8: a package with only a prerelease tagged next drew a versionless card
+test("a package with no latest: the card names the tagged default and its own score", () => {
+  const prerelease = pkg({ name: "pre", latest: null, score: null, distTags: { next: "0.0.2-test.2" }, versions: [{ version: "0.0.2-test.2", publishedAt: "2026-11-25T19:00:00.000Z", publishedBy: "me", status: "active", statusReason: null, deprecated: null, score: 64, grade: "C" }] });
+
+  expect(packageCardInput({ name: "pre", pkg: prerelease })).toEqual({ name: "pre", version: "0.0.2-test.2", score: 64, grade: "C" });
+});

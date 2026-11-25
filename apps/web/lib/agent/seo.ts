@@ -67,7 +67,8 @@ function scoreWords(score: { score: number; grade: string }): ScoreWords {
   };
 }
 
-export function packageMetadata(p: PackageMeta): Metadata {
+/** `image`: the card's site path, when a share names another version than the default (/og/<name>?v=<version>). */
+export function packageMetadata(p: PackageMeta & { image?: string }): Metadata {
   const words = p.score ? scoreWords(p.score) : null;
   const scoreText = words ? words.alt : "not scored by apm yet";
   const verdict = words ? words.verdict : `is ${scoreText}`;
@@ -80,7 +81,7 @@ export function packageMetadata(p: PackageMeta): Metadata {
       title,
       description: `${lead}${p.name}${p.latest ? ` ${p.latest}` : ""} ${verdict}. See every risk signal with its cited line, the AI review and how to install it.`,
       path: canonicalPackagePath(p.name),
-      image: `/og${canonicalPackagePath(p.name).slice("/package".length)}`,
+      image: p.image ?? `/og${canonicalPackagePath(p.name).slice("/package".length)}`,
       imageAlt: `${p.name} on apm: ${scoreText}`,
     }),
     // the Markdown view of the same page, for agents

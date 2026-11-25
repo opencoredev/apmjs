@@ -24,6 +24,7 @@ import {
 } from "@/lib/search-schema";
 import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
 import { track } from "@/lib/databuddy-client";
+import { NEEDS_SCOPE_STATUS, needsScopeSentence, publishability } from "@/lib/publish-name";
 
 const NAME_CHECK_DEBOUNCE_MS = 250;
 
@@ -129,9 +130,6 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
   );
 }
 
-/** apm publishes new packages under the publisher's GitHub login only: a free bare name is free on npm, not here. */
-const isBare = (q: string): boolean => !q.startsWith("@");
-
 function ExactStatus({ q, state }: { q: string; state: PartState<"exact"> }) {
   if (state.kind === "loading") return <Status kind="wait">checking</Status>;
 
@@ -149,13 +147,14 @@ function ExactStatus({ q, state }: { q: string; state: PartState<"exact"> }) {
 
   if (data.unknown) return <Status kind="warn">couldn&apos;t check npm</Status>;
 
-  if (data.available) return isBare(q) ? <Status kind="warn">not taken, needs a scope</Status> : <Status kind="free">available</Status>;
+  if (data.available) return publishability({ name: q, available: true }).kind === "needs-scope" ? <Status kind="warn">{NEEDS_SCOPE_STATUS}</Status> : <Status kind="free">available</Status>;
 
   return <Status kind="warn">{data.valid ? "blocked: too close to a popular name" : "invalid"}</Status>;
 }
 
 function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
   const data = state.kind === "ok" ? state.data : null;
+  const publishable = publishability({ name: q, available: data?.available === true });
 
   return (
     <Slot label="Exact name" href={data?.taken ? packageHref(q) : undefined}>
@@ -164,7 +163,7 @@ function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
         <ExactStatus q={q} state={state} />
       </span>
       {data && !data.taken && data.conflicts[0] && <span className="text-sm text-pretty text-muted-foreground">{data.conflicts[0].reason}</span>}
-      {data?.available && isBare(q) && <span className="text-sm text-pretty text-muted-foreground">New packages on apm go under your GitHub login, like @you/{q}.</span>}
+      {publishable.kind === "needs-scope" && <span className="text-sm text-pretty text-muted-foreground">{needsScopeSentence(publishable.suggestion)}</span>}
     </Slot>
   );
 }

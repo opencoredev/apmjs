@@ -129,7 +129,7 @@ describe("the package Markdown keeps publisher and AI text inert", () => {
   for (const payload of PAYLOADS) {
     test(`payload ${JSON.stringify(payload)}`, () => {
       const { pkg: p, review } = hostileView(payload);
-      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: p.facts, score: p.score, unscorable: null, review: { kind: "ok", value: review }, registry: REGISTRY });
+      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: p.facts, score: p.score, unscorable: null, review: { kind: "ok", value: review }, install: { kind: "default", version: "1.3.0" }, registry: REGISTRY });
 
       expect(breakouts(parse(md))).toEqual([]);
       expect(spoofedLines(md)).toEqual([]);
@@ -149,7 +149,7 @@ describe("the reason a version cannot be scored stays inert", () => {
     test(`file name ${JSON.stringify(payload)}`, () => {
       const p = pkg({ score: null, facts: null });
       const text = `apm cannot score this version: its tarball is not a package apm can read (entry "package/${payload}" runs past the end of the archive)`;
-      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: null, score: null, unscorable: { reason: "unreadable", text }, review: { kind: "missing" }, registry: REGISTRY });
+      const md = packageMarkdown({ pkg: p, version: "1.3.0", status: { status: "active", statusReason: null, deprecated: null }, facts: null, score: null, unscorable: { reason: "unreadable", text }, review: { kind: "missing" }, install: { kind: "default", version: "1.3.0" }, registry: REGISTRY });
 
       expect(breakouts(parse(md))).toEqual([]);
       expect(spoofedLines(md)).toEqual([]);

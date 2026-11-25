@@ -3,7 +3,8 @@
 // registry's per-version endpoint, and a version string that can't exist says "no such version" without a read.
 import { describe, expect, test } from "bun:test";
 import { shownOf } from "./early-answer";
-import { chooseVersion, rowsWith, taggedDefault } from "./shown-version";
+import { chooseVersion, rowsWith, selectVersion, sharedDefault, taggedDefault } from "./shown-version";
+import type { Fetched, VersionDetails } from "./registry";
 import { unscoredNotice } from "./unscored";
 import { pkg } from "./agent/testing";
 
@@ -63,7 +64,64 @@ describe("a package with no latest tag", () => {
   test("a package with latest, or with no tag on a listed version, has none", () => {
     expect(taggedDefault(pkg())).toBeNull();
     expect(taggedDefault(pkg({ latest: null, distTags: { next: "9.9.9" } }))).toBeNull();
-    expect(chooseVersion({ pkg: pkg({ latest: null, distTags: {} }), asked: undefined })).toEqual({ kind: "latest", version: null, tag: null });
+    expect(chooseVersion({ pkg: pkg({ latest: null, distTags: {} }), asked: undefined })).toEqual({ kind: "none" });
   });
 });
 
+
+// HOME-502 Sol review findings 1, 5 and 8: the default page offered an install with nothing to install, ?v=next and an
+// exact version installed differently from the default, and a share named another release's grade
+describe("the selection the page and its Markdown view share", () => {
+  type Row = ReturnType<typeof pkg>["versions"][number];
+
+  const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-11-25T19:00:00.000Z", publishedBy: "me", status: "active", statusReason: null, deprecated: null, score: 100, grade: "A", ...over });
+  const prerelease = pkg({ latest: null, score: null, distTags: { next: "0.0.2-test.2" }, versions: [row("0.0.2-test.2", { score: 92, grade: "A" })] });
+
+  const noRead = async (): Promise<Fetched<VersionDetails>> => {
+    throw new Error("a listed version needs no read");
+  };
+
+  test("the default, ?v=<tag> and an exact version: by the tag, by the tag, pinned", async () => {
+    expect(await selectVersion({ pkg: prerelease, asked: undefined, read: noRead })).toEqual({ kind: "shown", version: "0.0.2-test.2", install: { kind: "tag", tag: "next" }, read: null });
+    expect(await selectVersion({ pkg: prerelease, asked: "next", read: noRead })).toEqual({ kind: "shown", version: "0.0.2-test.2", install: { kind: "tag", tag: "next" }, read: null });
+    expect(await selectVersion({ pkg: prerelease, asked: "0.0.2-test.2", read: noRead })).toEqual({ kind: "shown", version: "0.0.2-test.2", install: { kind: "exact", version: "0.0.2-test.2" }, read: null });
+    expect(await selectVersion({ pkg: pkg(), asked: "latest", read: noRead })).toEqual({ kind: "shown", version: "1.3.0", install: { kind: "default", version: "1.3.0" }, read: null });
+  });
+
+  test("a tagged default outside the listed rows is read from the per-version endpoint, not dropped", async () => {
+    const old = pkg({ latest: null, score: null, distTags: { next: "0.0.1" }, versions: [row("0.0.2", { status: "yanked" })] });
+    const details: VersionDetails = { version: "0.0.1", status: "active", statusReason: null, deprecated: null, facts: null, score: null, unscorable: null };
+    const asked: string[] = [];
+    const selected = await selectVersion({ pkg: old, asked: undefined, read: async (version) => (asked.push(version), { kind: "ok", value: details }) });
+
+    expect(asked).toEqual(["0.0.1"]);
+    expect(selected).toEqual({ kind: "shown", version: "0.0.1", install: { kind: "tag", tag: "next" }, read: details });
+  });
+
+  test("latest yanked: the default is the newest installable tagged version, else nothing", async () => {
+    const yankedLatest = pkg({ latest: "2.0.0", distTags: { latest: "2.0.0", next: "1.9.0" }, versions: [row("2.0.0", { status: "yanked" }), row("1.9.0", { publishedAt: "2026-11-24T00:00:00.000Z" })] });
+
+    expect(chooseVersion({ pkg: yankedLatest, asked: undefined })).toEqual({ kind: "latest", version: "1.9.0", tag: "next" });
+
+    // a local package whose releases are all yanked or revoked keeps latest pointing at one
+    const allPulled = pkg({ latest: "2.0.0", distTags: { latest: "2.0.0" }, versions: [row("2.0.0", { status: "yanked" }), row("1.0.0", { status: "revoked" })] });
+
+    expect(await selectVersion({ pkg: allPulled, asked: undefined, read: noRead })).toEqual({
+      kind: "none",
+      why: { kind: "none-served", versions: [{ version: "2.0.0", refusal: { kind: "yanked" } }, { version: "1.0.0", refusal: { kind: "revoked", pending: false } }] },
+    });
+  });
+
+  test("every version listed as malicious, no latest and no tags: nothing to install, with the advisories", async () => {
+    const allListed = pkg({ latest: null, score: null, distTags: {}, versions: [row("1.0.0", { refused: { kind: "known-malicious", ids: ["MAL-2026-1"] } })] });
+
+    expect(await selectVersion({ pkg: allListed, asked: undefined, read: noRead })).toEqual({ kind: "none", why: { kind: "none-served", versions: [{ version: "1.0.0", refusal: { kind: "known-malicious", ids: ["MAL-2026-1"] } }] } });
+    expect(await selectVersion({ pkg: pkg({ latest: null, distTags: {}, versions: [] }), asked: undefined, read: noRead })).toEqual({ kind: "none", why: { kind: "unpublished" } });
+  });
+
+  test("a share names the default the page shows, with that version's own score", () => {
+    expect(sharedDefault(prerelease)).toEqual({ version: "0.0.2-test.2", score: { score: 92, grade: "A" } });
+    expect(sharedDefault(pkg())).toEqual({ version: "1.3.0", score: { score: 75, grade: "B" } });
+    expect(sharedDefault(pkg({ latest: null, distTags: {}, versions: [] }))).toEqual({ version: null, score: null });
+  });
+});

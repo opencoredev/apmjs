@@ -26,7 +26,7 @@ import { InstallTabs } from "@/components/install-tabs";
 import { ago, formatSize } from "@/lib/format";
 import { VersionList } from "@/components/version-list";
 import { versionCountLabel } from "@/lib/version-count";
-import { chooseVersion, rowsWith, type VersionState } from "@/lib/shown-version";
+import { chooseVersion, rowsWith, selectVersion, sharedDefault, sharedShown } from "@/lib/shown-version";
 import { buttonVariants } from "@/components/ui/button";
 import { REGISTRY } from "@/lib/registry-url";
 import { askedVersion, shownOf } from "@/lib/early-answer";
@@ -43,8 +43,8 @@ import { JsonLd } from "@/components/json-ld";
 import { packageJsonLd, packageMetadata, pageMetadata } from "@/lib/agent/seo";
 import { canonicalPackagePath } from "@/lib/agent/site";
 import { CapabilityList } from "@/components/capability-list";
-import { listsCapabilities } from "@/lib/capabilities";
-import { advisoryUrl, refusalOf, refusalReason, type Refusal } from "@/lib/refusal";
+import { scorerCapabilities } from "@/lib/capabilities";
+import { advisoryUrl, noInstallableReason, refusalLabel, refusalOf, refusalReason, type NoInstallable, type Refusal } from "@/lib/refusal";
 
 // The page shows this much of a readme; the rest is one click away at /api/readme.
 const README_PREVIEW_CHARS = 20_000;
@@ -507,29 +507,43 @@ export async function generateMetadata({ params, searchParams }: PageProps): Pro
 
   if (found.kind !== "ok") return pageMetadata({ title: `${route.name} · apm`, description: `The apm security score and install policy for ${route.name}.`, path: canonicalPackagePath(route.name) });
   const pkg = found.value;
-  const meta = packageMetadata({ name: pkg.name, description: pkg.description, latest: pkg.latest, score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null });
-  // a ?v= that names no version shows "No such version": keep it out of search indexes and do not claim latest's score/version
-  const resolved = await resolveVersion({ pkg, asked: askedVersion((await searchParams).v) });
-  const shownVersion = resolved.kind === "shown" ? resolved.version : null;
+  const asked = askedVersion((await searchParams).v);
+  // the page's own selection, so the title, description, card and JSON-LD name the release the page shows, with its score
+  const selected = await selectShown({ pkg, asked });
 
-  if (resolved.kind === "no-such-version") {
-    return {
-      ...pageMetadata({
-        title: `${pkg.name} ${resolved.asked}: no such version · apm`,
-        description: `${pkg.name} has no version ${resolved.asked} on apm or npm.`,
-        path: canonicalPackagePath(pkg.name),
-      }),
-      robots: { index: false, follow: true },
-    };
+  switch (selected.kind) {
+    case "no-such-version":
+      // the page shows "No such version": keep it out of search indexes and do not claim another version's score
+      return {
+        ...pageMetadata({
+          title: `${pkg.name} ${selected.asked}: no such version · apm`,
+          description: `${pkg.name} has no version ${selected.asked} on apm or npm.`,
+          path: canonicalPackagePath(pkg.name),
+        }),
+        robots: { index: false, follow: true },
+      };
+    case "none":
+      return pageMetadata({ title: `${pkg.name}: no version to install · apm`, description: noInstallableReason({ name: pkg.name, why: selected.why }), path: canonicalPackagePath(pkg.name), image: ogPath(pkg.name), imageAlt: `${pkg.name} on apm` });
+    case "unavailable":
+      return pageMetadata({ title: `${pkg.name} · apm`, description: `The apm security score and install policy for ${pkg.name}.`, path: canonicalPackagePath(pkg.name), image: ogPath(pkg.name), imageAlt: `${pkg.name} on apm` });
+    case "shown": {
+      const share = sharedShown({ pkg, version: selected.version, read: selected.read });
+      // a shared ?v= link gets that version's card; the canonical URL stays the package's
+      const image = asked === undefined ? ogPath(pkg.name) : `${ogPath(pkg.name)}?v=${encodeURIComponent(selected.version)}`;
+
+      return packageMetadata({ name: pkg.name, description: pkg.description, latest: share.version, score: share.score, image });
+    }
+
+    default: {
+      const _exhaustive: never = selected;
+
+      return _exhaustive;
+    }
   }
-
-  if (shownVersion === null || shownVersion === pkg.latest) return meta;
-  // another version than latest: the title names it, with the score its row carries
-  const row = pkg.versions.find((v) => v.version === shownVersion);
-  const rowScore = row?.score !== null && row?.score !== undefined && row.grade !== null ? { score: row.score, grade: row.grade } : null;
-
-  return { ...meta, title: packageMetadata({ name: pkg.name, description: pkg.description, latest: shownVersion, score: rowScore }).title };
 }
+
+/** The package's social card (app/og), which draws the version a `?v=` names the way the page selects it. */
+const ogPath = (name: string): string => `/og${canonicalPackagePath(name).slice("/package".length)}`;
 
 /** The page's columns while the package answer is read: the install box, the score and the facts. */
 function BodySkeleton() {
@@ -615,56 +629,20 @@ function SectionTitle({ id, children, aside }: { id: string; children: React.Rea
 }
 
 /**
- * The version `?v=` names: latest without one, a listed version or dist-tag at once, and any other version number
- * from the registry's per-version answer, which also says whether it exists. `extra` is that answer's row, for a
- * version the package answer does not list.
+ * The version `?v=` names and how installs name it, by the selection the Markdown view makes too (shown-version.ts):
+ * the package answer decides when it can, and the registry's per-version answer for a version it does not list, which
+ * also says whether that version exists. That answer comes back as `read`.
  */
-type Resolved =
-  | { kind: "shown"; version: string | null; tag: string | null; extra: VersionState | null; details: VersionDetails | null }
-  | { kind: "no-such-version"; asked: string }
-  | { kind: "unavailable"; version: string };
+const selectShown = (input: { pkg: PackageInfo; asked: string | undefined }) =>
+  selectVersion<VersionDetails>({
+    ...input,
+    // the per-version answer is never cached (its status changes at any time), so metadata that needs it renders per request
+    read: async (version) => {
+      await connection();
 
-async function resolveVersion(input: { pkg: PackageInfo; asked: string | undefined }): Promise<Resolved> {
-  const choice = chooseVersion(input);
-
-  switch (choice.kind) {
-    case "latest":
-      return { kind: "shown", version: choice.version, tag: choice.tag, extra: null, details: null };
-    case "listed":
-      return { kind: "shown", version: choice.version, tag: null, extra: null, details: null };
-    case "invalid":
-      return { kind: "no-such-version", asked: choice.asked };
-    case "unlisted": {
-      const info = await getVersionInfo(input.pkg.name, choice.version);
-
-      switch (info.kind) {
-        case "ok":
-          return {
-            kind: "shown",
-            version: info.value.version,
-            tag: null,
-            extra: { version: info.value.version, status: info.value.status, unscorable: info.value.unscorable?.text ?? null },
-            details: info.value,
-          };
-        case "missing":
-          return { kind: "no-such-version", asked: choice.version };
-        case "unavailable":
-          return { kind: "unavailable", version: choice.version };
-        default: {
-          const _exhaustive: never = info;
-
-          return _exhaustive;
-        }
-      }
-    }
-
-    default: {
-      const _exhaustive: never = choice;
-
-      return _exhaustive;
-    }
-  }
-}
+      return getVersionInfo(input.pkg.name, version);
+    },
+  });
 
 /** `?v=` names no version of this package: say so, and offer latest and the listed versions, instead of showing latest. */
 function NoSuchVersion({ pkg, asked }: { pkg: PackageInfo; asked: string }) {
@@ -685,6 +663,46 @@ function NoSuchVersion({ pkg, asked }: { pkg: PackageInfo; asked: string }) {
           <Link href={packagePath(pkg.name)} className={buttonVariants({ size: "lg" })}>
             Show the latest, {pkg.latest}
           </Link>
+        )}
+      </div>
+      {pkg.versions.length > 0 && (
+        <section aria-labelledby="versions">
+          <SectionTitle id="versions" aside={<span className="text-sm text-muted-foreground tabular-nums">{versionCountLabel(pkg.versions.length)}</span>}>
+            Versions
+          </SectionTitle>
+          <VersionList rows={pkg.versions.toSorted((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).map((v) => ({ ...v, when: ago(v.publishedAt) }))} packageHref={packagePath(pkg.name)} current={null} />
+        </section>
+      )}
+    </div>
+  );
+}
+
+/** The default page when apm installs no version of the package: the reason first, and no install command or agent prompt. */
+function NoInstallableVersion({ pkg, why }: { pkg: PackageInfo; why: NoInstallable }) {
+  return (
+    <div className="flex flex-col gap-10 sm:gap-12">
+      <header className="flex flex-col gap-4">
+        <PackageName name={pkg.name} />
+        {pkg.description && <p className="max-w-2xl text-lg leading-8 text-pretty text-muted-foreground">{pkg.description}</p>}
+      </header>
+      <div role="alert" className="flex max-w-2xl flex-col gap-1.5 rounded-xl bg-bad-soft px-4 py-3 text-[15px] leading-6 text-pretty">
+        <p className="font-medium text-bad">No install command for {pkg.name}.</p>
+        <p>{noInstallableReason({ name: pkg.name, why })}</p>
+        {why.kind === "none-served" && (
+          <ul className="flex flex-col gap-1">
+            {why.versions.map((v) => (
+              <li key={v.version}>
+                <span className="font-mono text-[14px]">{v.version}</span>:{" "}
+                {v.refusal.kind === "known-malicious" ? (
+                  <>
+                    listed as malicious by the OSSF malicious-packages feed (<AdvisoryLinks ids={v.refusal.ids} />)
+                  </>
+                ) : (
+                  refusalLabel(v.refusal)
+                )}
+              </li>
+            ))}
+          </ul>
         )}
       </div>
       {pkg.versions.length > 0 && (
@@ -866,12 +884,18 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   if (found.kind === "unavailable") return <RegistryUnavailable what={`the package ${name}`} retryHref={packagePath(name)} />;
   const pkg = found.value;
   // a version outside the newest 200 the package answer lists is read from the per-version endpoint (shown-version.ts)
-  const resolved = await resolveVersion({ pkg, asked });
+  const selected = await selectShown({ pkg, asked });
 
-  if (resolved.kind === "no-such-version") return <NoSuchVersion pkg={pkg} asked={resolved.asked} />;
+  if (selected.kind === "no-such-version") return <NoSuchVersion pkg={pkg} asked={selected.asked} />;
 
-  if (resolved.kind === "unavailable") return <RegistryUnavailable what={`${name} ${resolved.version}`} retryHref={`${packagePath(name)}?v=${encodeURIComponent(resolved.version)}`} />;
-  const { version, tag, extra, details } = resolved;
+  if (selected.kind === "unavailable") return <RegistryUnavailable what={`${name} ${selected.version}`} retryHref={`${packagePath(name)}?v=${encodeURIComponent(selected.version)}`} />;
+
+  if (selected.kind === "none") return <NoInstallableVersion pkg={pkg} why={selected.why} />;
+  const { version, install, read: details } = selected;
+  const extra = details ? { version: details.version, status: details.status, unscorable: details.unscorable?.text ?? null } : null;
+  const tag = install.kind === "tag" ? install.tag : null;
+  // what the page without ?v= shows: the version installs get by name
+  const byName = chooseVersion({ pkg, asked: undefined });
   const rows = rowsWith(pkg.versions, extra);
   const isLatest = version === pkg.latest;
   const none: Fetched<never> = { kind: "missing" };
@@ -909,8 +933,8 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const shownRow = version === null ? undefined : pkg.versions.find((v) => v.version === version);
   // a version the package answer does not list carries its state in its own answer
   const refusal = shownRow ? refusalOf(shownRow) : details ? refusalOf(details) : null;
-  // what installs get instead: latest, unless that is the version refused
-  const served = refusal && pkg.latest !== version ? pkg.latest : null;
+  // what installs get instead: the version installs get by name, unless that is the version refused
+  const served = refusal && byName.kind === "latest" && byName.version !== version ? byName.version : null;
   const inCooldown = shownRow !== undefined && refusal === null && Date.now() - Date.parse(shownRow.publishedAt) < COOLDOWN_MS;
   const versionRows = pkg.versions.toSorted((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)).map((v) => ({ ...v, when: ago(v.publishedAt) }));
   const here = version && !isLatest ? `${packagePath(pkg.name)}?v=${encodeURIComponent(version)}` : packagePath(pkg.name);
@@ -919,11 +943,15 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
   const repository = links.find((l) => l.kind === "repository")?.href ?? null;
   const homepage = links.find((l) => l.kind === "homepage")?.href ?? null;
 
+  // the canonical page's data: the version installs get by name, with its own score
+  const share = asked === undefined ? sharedShown({ pkg, version, read: details }) : sharedDefault(pkg);
+  const listed = score ? scorerCapabilities(score) : null;
+
   const structured = packageJsonLd({
     name: pkg.name,
     description: pkg.description,
-    latest: pkg.latest,
-    score: pkg.score ? { score: pkg.score.score, grade: pkg.score.grade } : null,
+    latest: share.version,
+    score: share.score,
     license: pkg.facts?.license ?? null,
     repository,
     homepage,
@@ -943,12 +971,22 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
           </Suspense>
         </div>
         {refusal && version && <RefusalBanner name={pkg.name} version={version} refusal={refusal} served={served} />}
-        {tag && (
+        {tag && asked === undefined && (
           <p className="text-sm text-muted-foreground">
-            No version is tagged latest yet. This is the newest, tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.
+            {pkg.latest === null ? "No version is tagged latest yet." : `apm does not install ${pkg.latest}, the version tagged latest.`} This is the newest, tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.
           </p>
         )}
-        {!isLatest && pkg.latest && !served && (
+        {tag && asked !== undefined && (
+          <p className="text-sm text-muted-foreground">
+            Tagged <span className="font-mono text-foreground">{tag}</span>, so installs name the tag.{" "}
+            {byName.kind === "latest" && byName.version !== version && (
+              <Link href={packagePath(pkg.name)} className="text-foreground underline-offset-4 hover:underline">
+                Show {byName.version}, the version installs get by name
+              </Link>
+            )}
+          </p>
+        )}
+        {!isLatest && pkg.latest && !served && tag === null && (
           <p className="text-sm text-muted-foreground">
             {extra ? `An older version, not among the newest ${pkg.versions.length} listed below.` : "An older version."}{" "}
             <Link href={packagePath(pkg.name)} className="text-foreground underline-offset-4 hover:underline">
@@ -989,7 +1027,7 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
       <div className="flex flex-col gap-10 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:items-start lg:gap-14">
         <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-12">
           <div className="order-1 lg:order-none">
-            {refusal && version ? <NoInstall name={pkg.name} version={version} served={served} /> : <InstallTabs name={pkg.name} version={version} tag={tag} inCooldown={inCooldown} registry={REGISTRY} />}
+            {refusal && version ? <NoInstall name={pkg.name} version={version} served={served} /> : <InstallTabs name={pkg.name} version={version} install={install} inCooldown={inCooldown} registry={REGISTRY} />}
           </div>
 
           <section aria-labelledby="score" className="order-4 lg:order-none">
@@ -1004,12 +1042,16 @@ async function PackageContent({ name, searchParams }: { name: string; searchPara
             )}
           </section>
 
-          {score && (score.capabilities.length > 0 || listsCapabilities(score.scorer)) && (
+          {score && listed && listed.kind !== "not-listed" && (
             <section aria-labelledby="capabilities" className="order-5 lg:order-none">
               <SectionTitle id="capabilities" aside={<span className="text-sm text-muted-foreground">not scored</span>}>
                 Capabilities
               </SectionTitle>
-              <CapabilityList capabilities={score.capabilities} declaration={score.declaration} name={pkg.name} version={version} />
+              {listed.kind === "listed" ? (
+                <CapabilityList capabilities={listed.capabilities} declaration={score.declaration} name={pkg.name} version={version} />
+              ) : (
+                <p className="rounded-xl bg-surface px-5 py-4 text-pretty text-muted-foreground">This registry does not send this version&apos;s capabilities.</p>
+              )}
             </section>
           )}
 

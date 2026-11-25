@@ -24,6 +24,9 @@ import { EdgeChecks } from "../src/edge-checks.ts";
 import { MemoryPool, RequestMemory } from "../src/memory.ts";
 import { KnownMalicious, listedAmong, listedNotice, NAME_FRESH_MS, NAME_STALE_MS, osvFeed, REQUEST_BUDGET_MS, type Advisory } from "../src/osv.ts";
 import { installStamp, Upstream } from "../src/upstream.ts";
+import { digestLabel, digestOf } from "../src/digest.ts";
+import { packument as localPackument } from "../src/server.ts";
+import { Client } from "pg";
 
 const POOL = new MemoryPool();
 const NOW = Date.parse("2026-11-25T00:00:00Z");
@@ -49,6 +52,8 @@ const NPM = new Map(Object.entries<NpmPackage>({
   "half-read": { versions: ["1.0.0", "1.1.0", "1.2.0"] },
   // listed while a slower request about it is still out
   flip: { versions: ["1.0.0", "1.1.0"] },
+  // its latest an apm reviewer confirmed malicious (the package page's answer test)
+  "confirmed-latest": { versions: ["1.0.0", "2.0.0"] },
 } satisfies Record<string, NpmPackage>));
 
 /** OSV's advisories per name: ids only in the batch answer, then each one read whole. */
@@ -544,6 +549,68 @@ describe("the package page's answers", () => {
       ["10.9.9", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
       ["9.0.0", null],
     ]);
+  });
+
+  test("latest and the dist-tags match the packument's, a tag on a listed version outside the list and a confirmed latest included", async () => {
+    const digest = digestOf({ integrity: integrity("confirmed-latest", "2.0.0"), shasum: shasum("confirmed-latest", "2.0.0") });
+    const client = new Client({ connectionString: db.url });
+
+    await client.connect();
+    await client.query("INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state) VALUES ($1, $2, $3, 'flagged', '{}', 0, 'confirmed')", ["confirmed-latest", "2.0.0", digest ? digestLabel(digest) : ""]);
+    await client.end();
+    const root = freshRoot();
+
+    for (const name of ["evil-tagged", "ranged", "all-listed", "clean", "orphan-tag", "confirmed-latest"]) {
+      const answer = PackageAnswer.parse(JSON.parse((await get(`/-/apm/v1/packages/${name}`, { route: "apm", root }))?.text ?? ""));
+      const { body } = await packument(name, { root });
+
+      expect([name, answer.distTags]).toEqual([name, body["dist-tags"]]);
+      expect([name, answer.latest]).toEqual([name, body["dist-tags"].latest ?? null]);
+    }
+
+    const confirmed = PackageAnswer.parse(JSON.parse((await get("/-/apm/v1/packages/confirmed-latest", { route: "apm", root }))?.text ?? ""));
+
+    expect(confirmed.versions.find((v) => v.version === "2.0.0")?.refused).toEqual({ kind: "confirmed-malicious" });
+  });
+
+  test("a package published here: latest and the dist-tags are its packument's when its latest is confirmed malicious and the one before is yanked", async () => {
+    const name = "here-confirmed-latest";
+    const client = new Client({ connectionString: db.url });
+    const sum = (v: string) => createHash("sha1").update(`${name}@${v}`).digest("hex");
+    const sri = (v: string) => `sha512-${createHash("sha512").update(`${name}@${v}`).digest("base64")}`;
+
+    await client.connect();
+    await client.query("INSERT INTO packages (name, created_at, modified_at, dist_tags, description, keywords, readme, readme_version) VALUES ($1, 1, 2, $2, '', '[]', '', NULL)", [name, JSON.stringify({ latest: "3.0.0", beta: "2.0.0" })]);
+
+    for (const [i, [version, status]] of ([["1.0.0", "active"], ["2.0.0", "yanked"], ["3.0.0", "active"]] as const).entries()) {
+      await client.query(
+        `INSERT INTO versions (package, version, manifest, shasum, integrity, size, tarball_key, published_at, published_by, status, status_reason, status_at)
+         VALUES ($1, $2, $3, $4, $5, 10, 'sha512/x', $6, 'alice', $7, NULL, NULL)`,
+        [name, version, JSON.stringify({ name, version }), sum(version), sri(version), 1_000 + i, status],
+      );
+    }
+
+    const digest = digestOf({ integrity: sri("3.0.0"), shasum: sum("3.0.0") });
+
+    await client.query("INSERT INTO reviews (package, version, digest, outcome, result, reviewed_at, human_state) VALUES ($1, '3.0.0', $2, 'flagged', '{}', 0, 'confirmed')", [name, digest ? digestLabel(digest) : ""]);
+    await client.end();
+
+    const settings = { baseUrl: "http://registry.test/", webUrl: "http://web.test/", upstreamUrl: npm.url.href, legacyAuth: false, namePolicy: "open", admins: [], tarballRedirects: "upstream" } as const;
+
+    const served = await Effect.runPromise(
+      Effect.flatMap(Store, (s) => s.getPackage(name)).pipe(
+        Effect.flatMap((pkg) => (pkg ? localPackument(pkg, true) : Effect.die("no package row"))),
+        Effect.provide(Layer.mergeAll(Store.postgres(db.url), Clock.fixed({ now: NOW, wallNow: NOW }), Layer.succeed(RegistryConfig, settings))),
+        Effect.scoped,
+      ),
+    );
+
+    const answer = PackageAnswer.parse(JSON.parse((await get(`/-/apm/v1/packages/${name}`, { route: "apm", root: freshRoot() }))?.text ?? ""));
+
+    expect(served["dist-tags"]).toEqual({ latest: "1.0.0" });
+    expect(answer.distTags).toEqual(served["dist-tags"]);
+    expect(answer.latest).toBe("1.0.0");
+    expect(answer.versions.find((v) => v.version === "3.0.0")?.refused).toEqual({ kind: "confirmed-malicious" });
   });
 
   test("the per-version answer says the same, and a clean package's answer is unchanged", async () => {

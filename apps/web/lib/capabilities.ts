@@ -9,6 +9,21 @@ export function listsCapabilities(scorer: string | null | undefined): boolean {
   return n !== undefined && Number(n) >= 10;
 }
 
+/**
+ * What a score says about the version's capabilities: the scorer's own list (empty when it found none), none in this
+ * answer although the scorer lists them (a registry that does not send them), or an older scorer that lists none, whose
+ * signals are all there is. Shared by the page, the Markdown view and the MCP tool, so none of them reads absent as none.
+ */
+export type ScorerCapabilities = { readonly kind: "listed"; readonly capabilities: readonly Capability[] } | { readonly kind: "unavailable" } | { readonly kind: "not-listed" };
+
+export function scorerCapabilities(score: { scorer?: string | undefined; capabilities?: readonly Capability[] | undefined }): ScorerCapabilities {
+  const lists = listsCapabilities(score.scorer);
+
+  if (score.capabilities === undefined) return lists ? { kind: "unavailable" } : { kind: "not-listed" };
+
+  return score.capabilities.length > 0 || lists ? { kind: "listed", capabilities: score.capabilities } : { kind: "not-listed" };
+}
+
 /** "Network: makes requests or opens sockets" as its name and what it covers. */
 export function capabilityParts(label: string): { name: string; detail: string } {
   const at = label.indexOf(": ");

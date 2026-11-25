@@ -65,13 +65,14 @@ import { RegistryConfig } from "./config.ts";
 import { Guard } from "./db-health.ts";
 import { digestLabel, digestOf } from "./digest.ts";
 import { confirmedAmong as confirmedIn, confirmedText, confirmedVersions } from "./confirmed.ts";
-import { Store, type LatestScore, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
+import { Store, type ConfirmedReview, type LatestScore, type PackageRecord, type PackageTags, type Unscorable, type VersionHead, type VersionRecord, type VersionSize } from "./db.ts";
 import { refuse, type HttpFailure, type StoreError } from "./errors.ts";
 import { fail, json, LazyMembers, longestPiece, parseBody, streamedJson, streamWeight } from "./http.ts";
 import { atTime, DAY, FRESH_MS, PENDING_MS, transition } from "./lifecycle.ts";
 import { newestFirst, order, satisfies } from "./semver.ts";
 import {
   highest,
+  retag,
   localSearchObjects,
   lockOwned,
   MAX_MANIFEST_BYTES,
@@ -99,7 +100,7 @@ import { cooldownWarning, incompleteText, lostSignals, scoreWarning, stateWarnin
 import { EdgeChecks, type Clearance, type EdgeChecksApi } from "./edge-checks.ts";
 import { fastTarball } from "./fast-tarball.ts";
 import { timed as timedOf, timingOrNull } from "./timing.ts";
-import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KeptPackage, pageExists, pageProbe, pageScores, previousVersion, type PageNeed } from "./kept-package.ts";
+import { expand, KEPT_PACKAGE_ASKED_WINDOW_MS, KEPT_VERSIONS, KeptPackage, pageExists, pageProbe, pageScores, previousVersion, type PageNeed } from "./kept-package.ts";
 import { newestPublishersFirst } from "./publishers.ts";
 import { REQUEST_WEIGHT, RequestMemory, type Lease } from "./memory.ts";
 import type { Choice, Chosen } from "./kept-choices.ts";
@@ -267,20 +268,27 @@ const briefly = <A, E, R>(use: (lease: Lease) => Effect.Effect<A, E, R>) =>
  * round trip (Store.pageRead) instead of four in a row, and each version's state is the one at the registry's time now.
  * Only the shown version's analysis comes whole (pageScores); the others carry what their score and grade are read
  * from, so next's page no longer reads 2,656 unread files' names for each of its scored versions.
+ *
+ * `confirmed` is the tarballs an apm reviewer confirmed malicious, read in the same round trip. With `feed`, an upstream
+ * package's advisories from the OSSF feed (osv.ts) are asked while npm is: a package published here never waits on OSV.
  */
-const pageLookup = (name: string, lease: Lease, need: PageNeed) =>
+const pageLookup = (name: string, lease: Lease, need: PageNeed, feed: "advisories" | "none" = "none") =>
   Effect.gen(function* () {
     const at = yield* now;
     const row = yield* (yield* Store).pageRead({ name, at, scores: pageScores(need) });
 
-    if (row.kind === "local") return { src: localSource(row.pkg, row.versions.map((v) => atTime(v, at))), maintainers: row.owners };
+    if (row.kind === "local") return { src: localSource(row.pkg, row.versions.map((v) => atTime(v, at))), maintainers: row.owners, confirmed: row.confirmed, advisories: [] };
 
     const upstream = yield* upstreamOrNull;
 
     if (!upstream) return null;
-    const probe = yield* pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } });
 
-    return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers } : null;
+    const [probe, advisories] = yield* Effect.all(
+      [pageProbe({ upstream, name, need, lease, first: { kind: "read", kept: row.kept, analyses: row.analyses, whole: row.whole } }), feed === "advisories" ? advisoriesOf(name) : Effect.succeed([])],
+      { concurrency: "unbounded" },
+    );
+
+    return probe.kind === "found" ? { src: upstreamSource(probe.pkg), maintainers: probe.pkg.maintainers, confirmed: row.confirmed, advisories } : null;
   });
 
 /** Upstream.probe's wanted for a reader of no score: whether npm has the package, and its versions. */
@@ -1419,26 +1427,55 @@ const PAGE_VERSIONS = 200;
 /** Why the packuments leave a version out (upstreamPackument): an apm reviewer confirmed it malicious, or the OSSF feed lists it. */
 type Refusal = { kind: "confirmed-malicious" } | { kind: "known-malicious"; ids: string[] };
 
-/** The versions among `versions` the packuments withhold, by version. The feed counts for npm's packages only. */
-const refusalsOf = (input: { src: Source; versions: readonly VersionRecord[]; advisories: readonly Advisory[] }) =>
-  Effect.map(confirmedVersions(input.src.name, input.versions), (confirmed) => {
-    const listed = input.src.kind === "upstream" ? listedAmong(input.src.name, input.advisories, input.versions.map((v) => v.version)) : new Map<string, ListedMalicious>();
-    const out = new Map<string, Refusal>();
+/**
+ * What the packuments withhold of `src`, worked out as they work it out: `refusals` by version (and by tag target, for
+ * a tag naming a version the list does not hold), and the dist-tags they serve. A local package serves its active
+ * versions an apm reviewer did not confirm malicious, retagged only when one was (server.ts packument); an upstream one
+ * serves every version neither confirmed nor listed by the OSSF feed, its tags filtered when either withholds one
+ * (upstreamPackument). `confirmedRows` is Store.confirmedReviews for the name; `advisories` the feed's, npm's names only.
+ */
+function withheldOf(input: { src: Source; confirmedRows: readonly ConfirmedReview[]; advisories: readonly Advisory[] }) {
+  const { src } = input;
+  const confirmed = confirmedIn(input.confirmedRows, src.versions);
+  const listed = src.kind === "upstream" ? listedAmong(src.name, input.advisories, versionsAndTags(src)) : new Map<string, ListedMalicious>();
+  const refusals = new Map<string, Refusal>();
 
-    for (const v of input.versions) {
-      const m = listed.get(v.version);
+  for (const version of new Set([...confirmed, ...listed.keys()])) {
+    const m = listed.get(version);
 
-      if (confirmed.has(v.version)) out.set(v.version, { kind: "confirmed-malicious" });
-      else if (m) out.set(v.version, { kind: "known-malicious", ids: m.ids });
-    }
+    refusals.set(version, confirmed.has(version) || !m ? { kind: "confirmed-malicious" } : { kind: "known-malicious", ids: m.ids });
+  }
 
-    return out;
-  });
+  if (src.kind === "local") {
+    const distTags = confirmed.size > 0 ? retag(src.distTags, servedVersions(src.versions).flatMap((v) => (confirmed.has(v.version) ? [] : [v.version]))) : src.distTags;
 
-/** The dist-tags the packuments serve once `refusals` are left out: a tag on a withheld version is dropped, latest moved. */
-function servedDistTags(src: Source, refusals: ReadonlyMap<string, Refusal>): Record<string, string> {
-  return refusals.size === 0 ? src.distTags : filterDistTags(src.distTags, new Set(src.versions.flatMap((v) => (refusals.has(v.version) ? [] : [v.version]))));
+    return { refusals, distTags };
+  }
+
+  const kept = new Set(src.versions.flatMap((v) => (refusals.has(v.version) ? [] : [v.version])));
+
+  return { refusals, distTags: refusals.size > 0 ? filterDistTags(src.distTags, kept) : src.distTags };
 }
+
+/**
+ * withheldOf for a page's lookup. A kept summary of a package with more than KEPT_VERSIONS versions holds only the newest
+ * (kept-package.ts), so when its latest is withheld and no stable version it holds is served, the packument's latest may
+ * be an older stable one it left out: only then is npm's whole listing read (lookupWithin), and its dist-tags used.
+ */
+const withheldFor = (found: { src: Source; confirmed: readonly ConfirmedReview[]; advisories: readonly Advisory[] }, lease: Lease) =>
+  Effect.gen(function* () {
+    const { src } = found;
+    const withheld = withheldOf({ src, confirmedRows: found.confirmed, advisories: found.advisories });
+    const latest = src.distTags.latest;
+    const short = src.kind === "upstream" && src.versions.length >= KEPT_VERSIONS && latest !== undefined && withheld.refusals.has(latest) && !src.versions.some((v) => !v.version.includes("-") && !withheld.refusals.has(v.version));
+
+    if (!short) return withheld;
+    const whole = yield* lookupWithin(src.name, lease);
+
+    if (whole === null || whole === "unknown" || whole === "over-budget") return withheld;
+
+    return { refusals: withheld.refusals, distTags: withheldOf({ src: whole, confirmedRows: found.confirmed, advisories: found.advisories }).distTags };
+  });
 
 /** The package answer did not fit the request's lease: the same 503 as a packument that did not (upstreamRoute). */
 const pageRefused = (name: string): Response =>
@@ -1454,8 +1491,7 @@ const packageResponse = (name: string) =>
   Effect.gen(function* () {
     const at = yield* now;
     const lease = yield* RequestMemory;
-    // the feed's advisories for the name are asked while the package is looked up: one small cached query (osv.ts)
-    const [found, advisories] = yield* Effect.all([pageLookup(name, lease, { kind: "page" }), advisoriesOf(name)], { concurrency: "unbounded" });
+    const found = yield* pageLookup(name, lease, { kind: "page" }, "advisories");
 
     if (!found) return fail(404, "Not found");
     const { src, maintainers } = found;
@@ -1464,11 +1500,13 @@ const packageResponse = (name: string) =>
     if (!lease.take(src.versions.length * PAGE_LISTED_WEIGHT + Math.min(PAGE_VERSIONS, src.versions.length) * PAGE_SHOWN_WEIGHT)) return pageRefused(name);
     // the row lookup read, so the answer and the versions come from one read of it
     const local = src.kind === "local" ? src.pkg : null;
-    // what the packuments withhold, so latest and the dist-tags here are the ones installs get (upstreamPackument)
-    const refusals = yield* refusalsOf({ src, versions: src.versions, advisories });
-    const distTags = servedDistTags(src, refusals);
+    // what the packuments withhold, so latest and the dist-tags here are the ones installs get
+    const { refusals, distTags } = yield* withheldFor(found, lease);
     const latest0 = src.versions.find((v) => v.version === distTags.latest) ?? null;
-    const latest = latest0 ? yield* ensureAnalyzed(src, latest0) : null;
+    // a latest moved off a withheld version came without PAGE_TRIMMED's members (pageScores reads npm's latest whole):
+    // its record is read again, whole, so its capabilities and unread files are not lost
+    const moved = latest0 !== null && latest0.version !== src.distTags.latest ? ((yield* pageLookup(name, lease, { kind: "version", version: latest0.version }))?.src.versions.find((v) => v.version === latest0.version) ?? latest0) : latest0;
+    const latest = moved ? yield* ensureAnalyzed(src, moved) : null;
 
     // a prerelease line (typescript@next, next@canary) is never latest: its versions are queued with it
     if (src.kind === "upstream") yield* seedVersions(src, at);
@@ -1560,14 +1598,15 @@ const packageExists = (path: string) =>
 const versionResponse = (name: string, version: string) =>
   Effect.gen(function* () {
     const at = yield* now;
-    const src = (yield* pageLookup(name, yield* RequestMemory, { kind: "version", version }))?.src;
+    const found = yield* pageLookup(name, yield* RequestMemory, { kind: "version", version }, "advisories");
+    const src = found?.src;
 
     if (!src) return fail(404, "Not found");
     const v0 = src.versions.find((x) => x.version === version);
 
     if (!v0) return fail(404, `${name} has no version ${version}.`);
     const v = yield* ensureAnalyzed(src, v0);
-    const refusals = yield* refusalsOf({ src, versions: [v0], advisories: src.kind === "upstream" ? yield* advisoriesOf(name) : [] });
+    const { refusals } = withheldOf({ src, confirmedRows: found.confirmed, advisories: found.advisories });
     const report = reportFor(v, at);
     // as on the score route: a withheld version's license and not-checked list are rebuilt without its manifest text
     const free = report ? sourceFreeReport(v, report) : null;
