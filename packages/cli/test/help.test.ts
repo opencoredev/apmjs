@@ -538,12 +538,12 @@ describe("what still goes to the package manager", () => {
 
   const withDeps = (dependencies: Record<string, string>): string => `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies })}\n`;
 
-  test.each(ZOD_LOCKS.filter(([pm]) => pm !== "yarn"))("apm remove with %s computes the removal in a copy first, then runs the package manager's removal", async (pm, file, lock) => {
+  test.each(ZOD_LOCKS.filter(([pm]) => pm !== "yarn"))("apm remove with %s refuses when the package manager did not compute a new lockfile in the copy", async (pm, file, lock) => {
     const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { [file]: lock });
 
-    expect(r.code, r.out + r.err).toBe(0);
-    expect(r.pmCalls.at(-1)).toBe({ bun: "bun remove zod", npm: "npm uninstall --package-lock=true zod", pnpm: "pnpm remove --config.lockfile=true zod" }[pm]);
-    expect(r.pmCalls).toHaveLength(2);
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.err).toContain(`${pm} did not rewrite ${file} for the removal`);
+    expect(r.pmCalls.some((call) => call.includes(" remove ") || call.includes(" uninstall "))).toBe(false);
   });
 
   test.each([
