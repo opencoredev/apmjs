@@ -37,7 +37,10 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=[^\s;&|()]*)?)*`;
+
+// a flag's value may be quoted or hold escapes (`--foo="a b"`, `--foo=a\ b`): each part starts with its own character, so
+// a value has one reading and a run of flags that does not match fails in linear time
+const FLAGS = String.raw`(?:\s+--?\w[\w-]*(?:=(?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s;&|()"'\\])*)?)*`;
 const SCRIPT = String.raw`\s+["']?([\w:.@/-]+)`;
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b)|yarn${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|pnpm${FLAGS}(?:\s+run${FLAGS})?${SCRIPT}|bun${FLAGS}\s+run${FLAGS}${SCRIPT})`, "g");
 
@@ -45,6 +48,9 @@ const RUN_REF = new RegExp(String.raw`(?:^|[;&|(]\s*|\s)(?:npm${FLAGS}\s+(?:run(
 const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
 const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
 const SHELL_WORD = /\S+/g;
+
+// quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
+const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
 const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
 
@@ -103,20 +109,23 @@ function scriptsOf(manifest: ScriptsManifest): Scripts {
 type ScriptRef = { name: string; alone: boolean };
 
 /**
- * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set, or -1. npm reads its flags
- * anywhere in the invocation, the last one winning (`npm run --ignore-scripts x --no-ignore-scripts` runs prex), takes
- * abbreviations (`--no-ig`), a separate `false` after the flag, and words the shell builds (`"--no-ig"`, `$FLAG`). So any
- * word with "ig" in a flag other than the two spellings that set it, a `false` after a bare `--ignore-scripts`, and any word
- * the shell expands is a doubt, read to the end of the command: past the invocation it can only make apm follow more.
+ * Where the last word of `cmd` starts that could leave npm's ignore-scripts other than set: -1 when none does, and
+ * Infinity when the command has any quote, escape, expansion, grouping or redirection, since then the words npm gets are
+ * not the words written (`--foo="a --ignore-scripts"` is one argument). npm reads its flags anywhere in the invocation,
+ * the last one winning (`npm run --ignore-scripts x --no-ignore-scripts` runs prex), and takes abbreviations (`--no-ig`)
+ * and a separate `false` after the flag. So any word with "ig" in a flag other than the two spellings that set it, and a
+ * `false` after a bare `--ignore-scripts`, is a doubt, read to the end of the command: past the invocation it can only
+ * make apm follow more.
  */
 function ignoreScriptsDoubt(cmd: string): number {
+  if (SHELL_SYNTAX.test(cmd)) return Number.POSITIVE_INFINITY;
   let last = -1;
   let bare = false;
 
   for (const m of cmd.matchAll(SHELL_WORD)) {
-    const w = m[0].replace(/['"\\]/g, "");
+    const w = m[0];
 
-    if ((bare && /^false$/i.test(w)) || /[$`{]/.test(w) || (w.startsWith("-") && /ig|[*?[]/i.test(w) && !ENABLES.has(w))) last = m.index;
+    if ((bare && /^false\b/i.test(w)) || (w.startsWith("-") && /ig/i.test(w) && !ENABLES.has(w))) last = m.index;
     bare = w === "--ignore-scripts";
   }
 
