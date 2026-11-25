@@ -3,7 +3,8 @@
 import { describe, expect, test } from "bun:test";
 import { NextRequest } from "next/server";
 import { proxy } from "../proxy";
-import { parseVersionRoute } from "./package-route";
+import { markdownRoute } from "./agent/md-route";
+import { parsePackageRoute, parseVersionRoute } from "./package-route";
 
 async function redirectOf(path: string): Promise<{ status: number; location: string | null }> {
   const res = await proxy(new NextRequest(`https://apmjs.dev${path}`));
@@ -36,6 +37,13 @@ describe("/package/<name>/v/<version>", () => {
     expect((await redirectOf("/package/zod/v/4.1.0?v=3.0.0")).location).toBe("https://apmjs.dev/package/zod?v=4.1.0");
   });
 
+  test("a name ending in .md stays the package page, not the Markdown view of another name", async () => {
+    const { location } = await redirectOf("/package/@acme/readme.md/v/1.0.0");
+    expect(location).toBe("https://apmjs.dev/package/@acme/readme%2Emd?v=1.0.0");
+    expect(markdownRoute(new URL(location ?? ""))).toBeNull();
+    expect(parsePackageRoute(new URL(location ?? "").pathname.slice("/package/".length).split("/"))).toEqual({ kind: "package", name: "@acme/readme.md" });
+  });
+
   test("a package named v", async () => {
     expect((await redirectOf("/package/v/v/1.0.0")).location).toBe("https://apmjs.dev/package/v?v=1.0.0");
   });
@@ -57,5 +65,7 @@ describe("parseVersionRoute", () => {
     expect(parseVersionRoute(["zod", "v", "%E0%A4%A"])).toBeNull();
     // the scoped package @acme/v at a path with no version, not "@acme" at 1.0.0
     expect(parseVersionRoute(["@acme", "v", "1.0.0"])).toBeNull();
+    expect(parseVersionRoute(["x%2Fy", "v", "1.0.0"])).toBeNull();
+    expect(parseVersionRoute(["%40acme", "a%2Fb", "v", "1.0.0"])).toBeNull();
   });
 });

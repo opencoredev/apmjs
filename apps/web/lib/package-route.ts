@@ -33,7 +33,7 @@ export function parsePackageRoute(encoded: readonly string[]): PackageRoute | nu
 /**
  * The version a /package/<name>/v/<version> path names (still percent-encoded segments, as in parsePackageRoute). The
  * page for a version is /package/<name>?v=<version>; the CLI and the registry printed the /v/ form, so proxy.ts
- * redirects it there. Null for anything else, and for "@scope" alone, which is not a package name.
+ * redirects it there. Null for anything else, and for a name that is not one ("@scope" alone, or an encoded "/").
  */
 export function parseVersionRoute(encoded: readonly string[]): { name: string; version: string } | null {
   const [v, version] = encoded.slice(-2);
@@ -41,7 +41,7 @@ export function parseVersionRoute(encoded: readonly string[]): { name: string; v
 
   if (route?.kind !== "package" || v !== "v" || version === undefined) return null;
 
-  if (route.name.startsWith("@") && !route.name.includes("/")) return null;
+  if (route.name.split("/").length !== (route.name.startsWith("@") ? 2 : 1)) return null;
 
   try {
     const decoded = decodeURIComponent(version);
