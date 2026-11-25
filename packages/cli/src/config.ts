@@ -89,8 +89,10 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
     const bound = tokenRegistry(env);
 
     if (sameRegistry(bound, registry)) return { registry, token: envToken, userconfig, withheld: null };
+    // a repo's .npmrc can ask for `${APM_TOKEN}` as its own host's token: a withheld token stays withheld
+    const fallback = fileToken(files, registry, env);
 
-    return { registry, token: fileToken(files, registry, env), userconfig, withheld: bound };
+    return { registry, token: fallback === envToken ? null : fallback, userconfig, withheld: bound };
   }
 
   return { registry, token: fileToken(files, registry, env), userconfig, withheld: null };

