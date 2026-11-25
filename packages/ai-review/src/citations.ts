@@ -2,7 +2,7 @@
 // range, and its quote is on that line. The eval kept 270 of 275 findings this way; the ones it drops
 // are the model misremembering, and a flag with no surviving citation is not treated as a flag.
 import type { TarEntry } from "@apm/core";
-import { cutAt, linesOf, MAX_PATH_CHARS, shownPath, singleLine, textOf } from "./files.ts";
+import { cutPath, linesOf, shownPath, singleLine, textOf } from "./files.ts";
 import type { RawFinding, Severity } from "./reply.ts";
 
 export type Finding = {
@@ -163,7 +163,7 @@ export function verifyCitations(findings: readonly RawFinding[], files: readonly
     const { file, line } = found;
     // recorded as the wire holds it (wire.ts WireFinding): a path past its limit is cut there, as the prompt showed it,
     // and an empty one (a `package/` entry) is named so the wire, which refuses empty strings, keeps the result
-    const recorded = file === "" ? '""' : cutAt(file, MAX_PATH_CHARS);
+    const recorded = file === "" ? '""' : cutPath(file, file);
 
     if (kept.some((k) => k.file === recorded && k.line === raw.line)) continue;
     kept.push({ file: recorded, line: raw.line, quote: quoteCore(raw.quote), excerpt: excerptOf(line, raw.quote), issue: oneSentence(raw.issue), severity: raw.severity });

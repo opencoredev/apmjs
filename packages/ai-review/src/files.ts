@@ -74,10 +74,26 @@ export function cutAt(text: string, max: number): string {
 /** The longest file path the review shows or cites: a model's citation of a file is at most this long (reply.ts). */
 export const MAX_PATH_CHARS = 1000;
 
+/** FNV-1a over UTF-16 units, as 8 hex digits: tells apart paths that share their cut form. */
+function pathId(path: string): string {
+  let h = 0x811c9dc5;
+
+  for (let i = 0; i < path.length; i++) h = Math.imul(h ^ path.charCodeAt(i), 0x01000193);
+
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * `text` (a form of `path`) as the review names it: whole when it fits MAX_PATH_CHARS, else cut with the id of the
+ * whole path after, so two files that share their first thousand characters keep two names.
+ */
+export function cutPath(text: string, path: string): string {
+  return text.length <= MAX_PATH_CHARS ? text : `${cutAt(text, MAX_PATH_CHARS - 9)}#${pathId(path)}`;
+}
 
 /** A path as the prompt shows it: one line, and cut to MAX_PATH_CHARS so a citation of it fits (citations.ts maps it back). */
 export function shownPath(path: string): string {
-  return cutAt(singleLine(path), MAX_PATH_CHARS);
+  return cutPath(singleLine(path), path);
 }
 
 function stripDot(p: string): string {

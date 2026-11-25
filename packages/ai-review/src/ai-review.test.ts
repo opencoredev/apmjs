@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { TarEntry } from "@apm/core";
+import { shownPath } from "./files.ts";
 import {
   buildDiffInput,
   DEFAULT_BUDGET_TOKENS,
@@ -450,7 +451,7 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     for (const input of [script, diff, path]) expect(input.estTokens).toBeLessThan(DEFAULT_BUDGET_TOKENS + 2_000);
     // a path longer than a citation may be is shown under its cut path, and recorded within the wire's limits
     expect(path.text).toContain("collector.example.invalid");
-    expect(path.read).toEqual(["package.json", expect.stringMatching(/^d\/a+…$/)]);
+    expect(path.read).toEqual(["package.json", expect.stringMatching(/^d\/a+…#[0-9a-f]{8}$/)]);
     expect(path.read.every((p) => p.length <= 1000)).toBe(true);
   });
 
@@ -516,16 +517,29 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     }
   });
 
-  test("a cut path two files share checks each of them: the citation lands on the file its quote is on", () => {
+  test("two files that share their first thousand characters keep two names: a finding in each survives, here and in the merge", () => {
     const a = `${"p".repeat(1500)}a.js`;
     const b = `${"p".repeat(1500)}b.js`;
-    const files = [entry(b, "x\nharmless\n"), entry(a, `x\n${PAYLOAD}\n`)];
-    const { kept, dropped } = verifyCitations([finding({ file: `${"p".repeat(999)}…`, line: 2, quote: "require('child_process')" })], files);
+    const files = [entry(b, `x\nfs.readFileSync('/etc/passwd');\n`), entry(a, `x\n${PAYLOAD}\n`)];
+
+    expect(shownPath(a)).not.toBe(shownPath(b));
+    expect(shownPath(a).length).toBeLessThanOrEqual(1000);
+
+    const { kept, dropped } = verifyCitations(
+      [finding({ file: shownPath(a), line: 2, quote: "require('child_process')" }), finding({ file: shownPath(b), line: 2, quote: "readFileSync('/etc/passwd')" })],
+      files,
+    );
 
     expect(dropped).toEqual([]);
-    expect(kept.map((k) => k.excerpt)).toEqual([expect.stringContaining("require('child_process')")]);
-    // a quote on neither is still dropped
-    expect(verifyCitations([finding({ file: `${"p".repeat(999)}…`, line: 2, quote: "not in the package" })], files).dropped.map((d) => d.why)).toEqual(["quote-not-on-line"]);
+    expect(kept.map((k) => k.file)).toEqual([shownPath(a), shownPath(b)]);
+
+    // decide merges findings by file and line: both stay
+    const step = decide([
+      { kind: "answer", verdict: "malicious", summary: "s", findings: kept, dropped: [] },
+      { kind: "answer", verdict: "malicious", summary: "s", findings: kept, dropped: [] },
+    ]);
+
+    expect(step.kind === "done" && step.decision.outcome === "flagged" ? step.decision.findings.length : 0).toBe(2);
   });
 
   test("a decoy whose real path is another file's shown path does not swallow the citation", () => {
@@ -536,10 +550,10 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     expect(one.dropped).toEqual([]);
     expect(one.kept.map((k) => k.file)).toEqual(["a\nb.js"]);
 
-    // a decoy named exactly as a long payload path is shown once cut
-    const prefix = `${"a/".repeat(499)}b`;
-    const cut = [entry(`${prefix}…`, "x\n// decoy\n"), entry(`${prefix}payload.js`, `x\n${PAYLOAD}\n`)];
-    const two = verifyCitations([finding({ file: `${prefix}…`, line: 2, quote: "require('child_process')" })], cut);
+    // a decoy named exactly as a long payload path is shown once cut (its id can be computed by the publisher)
+    const payload = `${"a/".repeat(499)}bpayload.js`;
+    const cut = [entry(shownPath(payload), "x\n// decoy\n"), entry(payload, `x\n${PAYLOAD}\n`)];
+    const two = verifyCitations([finding({ file: shownPath(payload), line: 2, quote: "require('child_process')" })], cut);
 
     expect(two.dropped).toEqual([]);
     expect(two.kept).toHaveLength(1);

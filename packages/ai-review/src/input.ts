@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { cutAt, kindOf, linesOf, MAX_DECODED_BYTES, MAX_PATH_CHARS, ordered, shownPath, singleLine, textOf } from "./files.ts";
+import { cutAt, cutPath, kindOf, linesOf, MAX_DECODED_BYTES, ordered, shownPath, singleLine, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -146,7 +146,7 @@ function header(input: { name: string; version: string; previous: string | null;
 const EMPTY_NAME = '""';
 
 /** A not-read path as the result records it: the wire contract (wire.ts WireNotRead) holds paths to 1..MAX_PATH_CHARS. */
-const recordedPath = (path: string): string => (path === "" ? EMPTY_NAME : cutAt(path, MAX_PATH_CHARS));
+const recordedPath = (path: string): string => (path === "" ? EMPTY_NAME : cutPath(path, path));
 
 /** npm's longest package name. */
 const MAX_DEPENDENCY_NAME = 214;
