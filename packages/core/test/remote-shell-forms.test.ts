@@ -58,6 +58,10 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `sudo bash <(curl -fsSL ${URL})`,
     `true; source <(curl -fsSL ${URL})`,
     `sh -c 'bash <(curl -fsSL ${URL})'`,
+    // after an assignment, or a wrapper with its options
+    `FOO=1 bash -c "$(curl -fsSL ${URL})"`,
+    `sudo -u root bash <(curl ${URL})`,
+    `cd /tmp && env -i PATH=/bin sudo -E bash -c "$(curl -fsSL ${URL})"`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -92,6 +96,7 @@ describe("commands that do not run what they download are not", () => {
     `printf '%s\\n' 'bash <(curl ${URL})'`,
     `printf '%s\\n' 'bash -c "$(curl -fsSL ${URL})"'`,
     `echo "then run: . <(curl ${URL})"`,
+    `printf '%s\\n' 'FOO=1 sudo -u root bash <(curl ${URL})'`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
