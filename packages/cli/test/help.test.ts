@@ -560,6 +560,28 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual([]);
   });
 
+  test("apm dev runs under a bunfig.toml whose run table leaves bun unset", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nsilent = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.pmCalls).toEqual(["bun run --no-install dev"]);
+  });
+
+  test("apm remove with bun gets past a bunfig.toml whose lockfile table leaves save unset", async () => {
+    const r = await apm(["remove", "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "", "bunfig.toml": "[install.lockfile]\nprint = \"yarn\"\n" });
+
+    expect(r.err).not.toContain("install.lockfile.save");
+    expect(r.err).toContain("bun did not rewrite bun.lock for the removal");
+  });
+
+  test("apm remove with pnpm is refused when the project has a .pnpmfile.cjs", async () => {
+    const r = await apm(["remove", "--pm", "pnpm", "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { "pnpm-lock.yaml": ZOD_LOCKS[2]?.[2] ?? "", ".pnpmfile.cjs": "module.exports = {};\n" });
+
+    expect(r.code, r.out + r.err).toBe(1);
+    expect(r.err).toContain("the project has a .pnpmfile.cjs");
+    expect(r.pmCalls).toEqual([]);
+  });
+
   test("apm uninstall with yarn points to yarn remove, not yarn's own uninstall", async () => {
     const r = await apm(["uninstall", "--pm", "yarn", "zod"]);
 
