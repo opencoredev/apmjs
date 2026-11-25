@@ -28,11 +28,13 @@ import { z } from "zod";
 import { apmAdd, bunInstallLocked, metadataProblem, NO_SCRIPTS_ENV, npmCi, PROBE_NAMES, probeFixture, singleLockfile, tarballPath, type Locked, type Probe } from "./smoke-commands.ts";
 import { confirmBuild, parseSmokeArgs, smokeTargets } from "./smoke-identity.ts";
 import { installCheck } from "./cli-check.ts";
-import { readCliReleases } from "./cli-ledger.ts";
+import { cliLedgerPath, readCliReleases } from "./cli-ledger.ts";
+import { installStep, LARGE_PACKAGES, largePackageAnswer, smokeTimeouts, spawnBounded, type CheckAnswer } from "./smoke-checks.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const CLI_MAIN = join(ROOT, "packages", "cli", "src", "main.ts");
 const SECRETS = process.env.APM_SECRETS_DIR ?? join(homedir(), ".config", "apmjs");
+const TIMEOUTS = smokeTimeouts(process.env);
 const { stage, build, subdomain } = parseSmokeArgs(process.argv.slice(2));
 const { registry, web, docs } = smokeTargets(stage, subdomain);
 const work = mkdtempSync(join(tmpdir(), "apm-smoke-"));
@@ -54,17 +56,27 @@ function record(ok: boolean, name: string, detail: string): void {
   process.stdout.write(`${ok ? "PASS" : "FAIL"}: ${name} (${detail})\n`);
 }
 
+/** fetch, cut short after TIMEOUTS.httpMs: a hung endpoint fails its check instead of holding the run. */
+function bounded(url: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(TIMEOUTS.httpMs) });
+}
+
+/** Runs one check; one that throws (a request cut short, an unreadable answer) fails as itself and the rest still run. */
+async function check(name: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (e) {
+    const timedOut = e instanceof Error && e.name === "TimeoutError";
+
+    record(false, name, timedOut ? `no answer within ${TIMEOUTS.httpMs} ms` : `stopped: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function run(cmd: string[], cwd: string, env: Record<string, string> = {}): Promise<{ code: number; out: string; stdout: string }> {
-  const proc = Bun.spawn(cmd, {
-    cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), TMPDIR: tmpdir(), ...env, ...NO_SCRIPTS_ENV },
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const r = await spawnBounded(cmd, { cwd, env: { PATH: process.env.PATH ?? "", HOME: work, NO_COLOR: "1", npm_config_cache: join(work, ".npm"), BUN_INSTALL_CACHE_DIR: join(work, ".bun"), TMPDIR: tmpdir(), ...env, ...NO_SCRIPTS_ENV } }, TIMEOUTS.commandMs);
+  const stopped = r.stopped ? `\n(stopped: ${cmd.slice(0, 3).join(" ")} gave no result within ${TIMEOUTS.commandMs} ms)` : "";
 
-  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-
-  return { code, out: stdout + stderr, stdout };
+  return { code: r.code, out: r.stdout + r.stderr + stopped, stdout: r.stdout };
 }
 
 function project(name: string, files: Record<string, string> = {}): string {
@@ -114,30 +126,33 @@ async function identity(when: "before" | "after"): Promise<void> {
  * The documented install, `curl -fsSL <site>/install | sh`, into a fresh HOME (cli-check.ts): it must install, the
  * installed apm must print the version, and the fingerprint the script printed must be the installed file's SHA-256 and
  * the one the version's SHA256SUMS lists. A stage with no CLI release yet answers /install with 404 and a sentence
- * saying so; that passes only while the CLI release record (cli-ledger.ts) has no release for the stage.
+ * saying so; that passes only while this machine's CLI release record (cli-ledger.ts) exists and has no release for the
+ * stage (smoke-checks.ts, installStep).
  */
 async function cliInstall(): Promise<void> {
   const site = web.replace(/\/$/, "");
-  const res = await fetch(`${site}/install`, { method: "HEAD" });
+  const res = await bounded(`${site}/install`, { method: "HEAD" });
+  const ledger = cliLedgerPath();
+  const step = installStep({ status: res.status, stage, record: existsSync(ledger) ? { kind: "read", releases: readCliReleases(stage, ledger) } : { kind: "absent", path: ledger } });
 
-  if (res.status === 404 && readCliReleases(stage).length === 0) {
-    record(true, "the CLI install script", `skipped: no CLI release on ${stage} yet (bun packages/infra/release-cli.ts --stage ${stage})`);
+  if (step.kind !== "install") {
+    record(step.kind === "skip", "the CLI install script", step.detail);
 
     return;
   }
 
-  const r = await installCheck(site);
+  const r = await installCheck(site, TIMEOUTS);
 
   record(r.ok, `curl -fsSL ${site}/install | sh installs apm and checks its SHA-256`, r.detail);
 }
 
 // ---------- docs ----------
 async function docsSite(): Promise<void> {
-  const home = await fetch(docs, { redirect: "manual" });
+  const home = await bounded(docs, { redirect: "manual" });
   const text = await home.text();
   record(home.status === 200 && text.includes("apm documentation"), "the docs site serves its home page", `HTTP ${home.status}`);
   // assets-only Worker with drop-trailing-slash: a page answers at its own path, without a redirect
-  const page = await fetch(`${docs}quickstart`, { redirect: "manual" });
+  const page = await bounded(`${docs}quickstart`, { redirect: "manual" });
   record(page.status === 200, "a docs page answers without a redirect", `/quickstart HTTP ${page.status}`);
 }
 
@@ -153,7 +168,7 @@ async function stockClients(): Promise<void> {
 
 /** The registry's install metadata for a package (what npm and bun resolve from): its status and parsed JSON body. */
 async function installMetadata(name: string): Promise<{ status: number; body: unknown }> {
-  const res = await fetch(`${registry}${name.replace("/", "%2F")}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
+  const res = await bounded(`${registry}${name.replace("/", "%2F")}`, { headers: { accept: "application/vnd.npm.install-v1+json" } });
 
   return { status: res.status, body: res.status === 200 ? await res.json().catch(() => null) : null };
 }
@@ -177,6 +192,27 @@ async function resolution(): Promise<void> {
   }
 
   record(wrong.length === 0, "the registry resolves every locked version to the lockfile's integrity, tarball URL and dependencies, and latest is a listed version (metadata only, nothing installed)", wrong.length === 0 ? `${all.size} versions` : wrong.join("; "));
+}
+
+/**
+ * The package check agents read (GET /api/explain) for packages whose check walks a very large tree. Issue #1: next
+ * and firebase answered "unknown" for over 90 minutes while small packages, the only ones the monitors asked about,
+ * answered. Each must be a real verdict with a version.
+ */
+async function largePackages(): Promise<void> {
+  for (const name of LARGE_PACKAGES) {
+    let answer: CheckAnswer;
+
+    try {
+      const res = await bounded(`${web}api/explain?package=${encodeURIComponent(name)}`, { headers: { accept: "application/json", "cache-control": "no-cache" } });
+
+      answer = largePackageAnswer({ name, status: res.status, body: await res.json().catch(() => null) });
+    } catch (e) {
+      answer = { ok: false, detail: `${name}: ${e instanceof Error && e.name === "TimeoutError" ? `no answer within ${TIMEOUTS.httpMs} ms` : e instanceof Error ? e.message : String(e)}` };
+    }
+
+    record(answer.ok, `the package check gives a very large package (${name}) a real verdict, not unknown`, answer.detail);
+  }
 }
 
 /**
@@ -295,7 +331,7 @@ async function checkSession(): Promise<{ cookie: string; done: () => Promise<voi
   neon.pathname = "/apmjs_staging";
   neon.searchParams.set("sslmode", "verify-full");
   const secret = readFileSync(join(SECRETS, `auth-secret-${stage}`), "utf8").trim();
-  const db = new Client({ connectionString: neon.toString() });
+  const db = new Client({ connectionString: neon.toString(), connectionTimeoutMillis: TIMEOUTS.httpMs, query_timeout: TIMEOUTS.httpMs });
   await db.connect();
   const now = new Date();
   await db.query(
@@ -359,7 +395,7 @@ async function call(path: string, init: { method?: string; jar?: Jar; body?: unk
   if (init.jar) headers.set("cookie", init.jar.header());
 
   if (init.body !== undefined) headers.set("content-type", "application/json");
-  const res = await fetch(`${init.via === "registry" ? registry : web}${path}`, { method: init.method ?? "GET", headers, body: init.body === undefined ? undefined : JSON.stringify(init.body) });
+  const res = await bounded(`${init.via === "registry" ? registry : web}${path}`, { method: init.method ?? "GET", headers, body: init.body === undefined ? undefined : JSON.stringify(init.body) });
   init.jar?.take(res);
   const text = await res.text();
   let body: unknown = text;
@@ -384,7 +420,7 @@ const AccountView = z.object({ security: z.object({ totp: z.boolean() }) });
  * a deploy missing it still answers installs, so a signed-out session read, which loads it, is checked on every stage.
  */
 async function signInLoads(): Promise<void> {
-  const res = await fetch(`${web}api/auth/get-session`, { headers: { accept: "application/json", "cache-control": "no-cache" } });
+  const res = await bounded(`${web}api/auth/get-session`, { headers: { accept: "application/json", "cache-control": "no-cache" } });
   const text = await res.text();
 
   record(res.status === 200 && text.trim() === "null", "the sign-in code loads: a signed-out session read answers null", `HTTP ${res.status}, ${text.trim().slice(0, 40)}`);
@@ -461,7 +497,7 @@ async function concurrentPages(): Promise<void> {
   for (const [label, base] of [["the home page", web], ["a package page (react)", `${web}package/react`]] as const) {
     const results = await Promise.all(
       Array.from({ length: 16 }, async (_, i) => {
-        const res = await fetch(`${base}?smoke=${i}`, { headers: { "accept-encoding": "identity" } });
+        const res = await bounded(`${base}?smoke=${i}`, { headers: { "accept-encoding": "identity" } });
         const html = await res.text();
 
         return { ok: res.status === 200 && html.trimEnd().endsWith("</html>") && /<title>[^<]+<\/title>/.test(html), status: res.status, bytes: html.length };
@@ -478,23 +514,25 @@ process.stdout.write(`smoke: ${stage} registry ${registry}\n`);
 
 await identity("before");
 
-await docsSite();
+await check("the docs site", docsSite);
 
-await cliInstall();
+await check("the CLI install script", cliInstall);
 
-await stockClients();
+await check("stock clients install through the registry", stockClients);
 
-await resolution();
+await check("the registry resolves locked versions", resolution);
 
-await apmWarning();
+await check("the package check for very large packages", largePackages);
 
-await signInLoads();
+await check("apm add warns and --strict refuses", apmWarning);
 
-await stagedPublish();
+await check("the sign-in code loads", signInLoads);
 
-await bunAudit();
+await check("staged publish and approval", stagedPublish);
 
-await concurrentPages();
+await check("bun audit reads advisories", bunAudit);
+
+await check("pages finish under concurrent requests", concurrentPages);
 
 await identity("after");
 
