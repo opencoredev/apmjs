@@ -309,6 +309,11 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm", "pnpm", "--global"], "does not pass --global on to pnpm"],
     [["install", "--pm", "npm", "--location", "--force"], "does not pass --location on to npm"],
     [["install", "-g"], refusedBare("-g", "bun")],
+    [["install", "--pm", "npm", "--g"], "does not pass --g on to npm"],
+    [["install", "--pm", "npm", "--no-no-global"], "does not pass --no-no-global on to npm"],
+    [["install", "--pm", "npm", "--loca", "--force"], "does not pass --loca on to npm"],
+    [["install", "--pm", "npm", "--global=true"], "does not pass --global=true on to npm"],
+    [["install", "--pm", "pnpm", "--frozen-lockfile=off"], refusedBare("--frozen-lockfile=off", "pnpm")],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
@@ -336,6 +341,10 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm=pnpm", "--frozen-lockfile", "--prod"], "pnpm install --frozen-lockfile --prod"],
     [["install", "--pm", "yarn", "--frozen-lockfile", "--ignore-engines"], "yarn install --frozen-lockfile --ignore-engines"],
     [["install", "--pm", "yarn", "--immutable"], "yarn install --immutable"],
+    [["install", "--pm", "pnpm", "--frozen-lockfile=true"], "pnpm install --frozen-lockfile=true"],
+    [["install", "--pm", "npm", "--package-lock-only", "--omit", "dev"], "npm install --package-lock-only --omit dev"],
+    [["install", "--pm", "npm", "--json", "--omit", "dev"], "npm install --json --omit dev"],
+    [["install", "--pm", "npm", "--global-style"], "npm install --global-style"],
   ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
     const r = await apm(argv);
 

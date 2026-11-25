@@ -171,7 +171,7 @@ export function helpTopic(topic: string): Command | undefined {
  * npm's install options that read no value, so the word after one of them is read as what it is: npm's --tag and --omit
  * may follow only these (or come first), never an option that could take --tag itself as its value.
  */
-const NPM_SWITCHES: ReadonlySet<string> = new Set(["production", "ignore-scripts", "prefer-offline", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts", "force"]);
+const NPM_SWITCHES: ReadonlySet<string> = new Set(["production", "ignore-scripts", "prefer-offline", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts", "force", "json", "package-lock-only", "no-package-lock", "prefer-online", "workspaces", "include-workspace-root"]);
 
 /** npm's install options that take a value, with the values passed on: a dist-tag, and what to omit. */
 const NPM_VALUES = new Map<string, (value: string) => boolean>([
@@ -188,7 +188,8 @@ const SWITCH = /^--[A-Za-z][\w-]*$/;
  * as a package. Every package manager reads a word that is not an option, or the word after an option it does not know
  * or that takes a value, as a package (bun 1.1 to 1.3 install the word after --tag, unchecked), and npm and pnpm read
  * `--audit=off` as a package `off`. --global and --location turn it into a global install, where npm installs the
- * project itself as a package. So a bare install passes on the other plain switches (`--frozen-lockfile`, `--force`), and for
+ * project itself as a package, and npm and pnpm also read them abbreviated (`--g`, `--loca`) or negated twice
+ * (`--no-no-global`). So a bare install passes on the other plain switches, alone or with `=true` or `=false` (`--frozen-lockfile`, `--force`), and for
  * npm --tag and --omit with a checked value; written as two words, they may only come first or after a switch npm reads
  * as one (NPM_SWITCHES). apm's --pm and its value are taken out; anything else, -- included, is refused.
  */
@@ -209,13 +210,15 @@ export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: 
       continue;
     }
 
-    if (key === "global" || key === "location") return { error: `apm ${a.cmd} with no packages installs this project, so it does not pass ${word} on to ${pm}: run ${pm} yourself to install globally` };
+    const name = key?.replace(/^(no-)+/, "") ?? "";
+
+    if (name !== "" && ("global".startsWith(name) || "location".startsWith(name))) return { error: `apm ${a.cmd} with no packages installs this project, so it does not pass ${word} on to ${pm}: run ${pm} yourself to install globally` };
 
     const check = pm === "npm" && key !== null ? NPM_VALUES.get(key) : undefined;
 
-    if (check === undefined && SWITCH.test(word)) {
+    if (check === undefined && (SWITCH.test(word) || (eq !== -1 && SWITCH.test(word.slice(0, eq)) && /^(true|false)$/.test(word.slice(eq + 1))))) {
       args.push(word);
-      free = pm !== "npm" || NPM_SWITCHES.has(key ?? "");
+      free = pm !== "npm" || eq !== -1 || NPM_SWITCHES.has(key ?? "");
       continue;
     }
 
