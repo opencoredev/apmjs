@@ -571,5 +571,5 @@ test("the rendered verdict lists the evidence, quoted, and the version's page", 
   const text = verdictText(explainInstall({ name: "x", range: null, resolve: resolveOf(c.resolve), review: reviewOf(c.review) }));
 
   expect(text).toContain("Evidence:\n- `Runs code built at runtime: index.js:7: eval(body)`");
-  expect(text).toContain("Details: https://apmjs.dev/package/x/v/1.0.0");
+  expect(text).toContain("Details: https://apmjs.dev/package/x?v=1.0.0");
 });

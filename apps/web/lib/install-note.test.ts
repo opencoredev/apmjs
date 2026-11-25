@@ -38,18 +38,19 @@ describe("installNote", () => {
     expect(note.docs).toBe("/docs#bun");
   });
 
-  test.each(["npm", "pnpm"] as const)("%s gets the ~safe registry line in .npmrc", (client) => {
+  test.each(["npm", "pnpm"] as const)("%s gets the plain registry line in .npmrc, with ~safe as strict mode", (client) => {
     const note = installNote({ client, registry: `${registry}/` });
 
     expect(note.kind).toBe("needs-setup");
 
     if (note.kind !== "needs-setup") return;
     expect(note.file).toBe(".npmrc");
-    expect(note.config).toBe(`registry=${registry}/~safe/`);
-    expect(note.lead).toBe(`Plain ${client} skips apm’s checks. Set its registry to apm’s ~safe view in .npmrc:`);
+    expect(note.config).toBe(`registry=${registry}/`);
+    expect(note.lead).toBe(`Plain ${client} skips apm’s checks. Point its registry at apm in .npmrc:`);
     expect(note.checks).toContain("apm add checks the score, cooldown and dependency tree");
     expect(note.checks.startsWith(note.effect)).toBe(true);
-    expect(note.effect).toBe("~safe hides versions under 24 hours old and versions scoring under 40.");
+    expect(note.effect).toContain(`registry=${registry}/~safe/`);
+    expect(note.effect).toContain("not fully analysed");
     expect(note.docs).toBe("/docs#npm");
   });
 
