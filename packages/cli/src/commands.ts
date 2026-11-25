@@ -3,6 +3,8 @@
 // not read, before it reads the network, packs, publishes or writes anything (on 0.1.3, `apm publish --help`
 // packed, scored and ran `bun publish`).
 import type { Args } from "./args.ts";
+import type { Pm } from "./pm.ts";
+import { takesValue } from "./xargs.ts";
 
 type FlagKind = "switch" | "value";
 
@@ -14,6 +16,7 @@ type Command = {
   /**
    * Value flags only the package manager's own command reads (`apm install --tag next` with no packages is npm's
    * install): parsed with their value so it is not taken for a package, and refused when apm runs the command itself.
+   * A bare install passes them on only to npm, with a checked value (bareInstallArgs).
    */
   native?: readonly string[];
 };
@@ -29,7 +32,8 @@ const ADD: Command = {
   help: `usage: apm add <package>[@range]... [flags]   (also apm install, apm i)
 
 Resolves each package, checks its whole dependency tree and the lockfile your package manager computes, then installs
-the exact versions. With no packages, apm install runs your package manager's own install.
+the exact versions. With no packages, apm install runs your package manager's own install, checking nothing; it passes on
+only plain switches such as --frozen-lockfile, and npm's --tag and --omit.
 
   -D, --dev, --save-dev    add to devDependencies
   --production, --prod, --omit dev   leave devDependencies out of the install
@@ -161,6 +165,66 @@ export function valueFlagsOf(name: string): ReadonlySet<string> {
 /** The help `apm help <topic>` prints: exec and dlx are x. */
 export function helpTopic(topic: string): Command | undefined {
   return commandOf(topic === "exec" || topic === "dlx" ? "x" : topic);
+}
+
+/**
+ * The switches a bare install passes on to each package manager: ones its install reads as switches, so none takes the
+ * next word as its value or as a package.
+ */
+const BARE_SWITCHES = new Map<Pm, ReadonlySet<string>>([
+  ["bun", new Set(["frozen-lockfile", "production", "ignore-scripts", "dry-run", "no-save", "silent", "verbose", "force", "no-cache"])],
+  ["npm", new Set(["production", "ignore-scripts", "prefer-offline", "offline", "no-audit", "no-fund", "legacy-peer-deps", "strict-peer-deps", "dry-run", "no-save", "silent", "foreground-scripts"])],
+  ["pnpm", new Set(["frozen-lockfile", "prod", "ignore-scripts", "prefer-offline", "offline", "silent"])],
+  ["yarn", new Set(["frozen-lockfile", "production", "ignore-scripts", "prefer-offline", "offline", "silent"])],
+]);
+
+/** npm's install options that take a value, with the values passed on: a dist-tag, and what to omit. */
+const NPM_VALUES = new Map<string, (value: string) => boolean>([
+  ["tag", (value) => /^[A-Za-z][\w.-]*$/.test(value)],
+  ["omit", (value) => value === "dev" || value === "optional" || value === "peer"],
+]);
+
+/**
+ * What a bare install (`apm install` with no packages, the package manager's own install) passes on to `pm`'s install,
+ * or why apm refuses it. apm checks nothing on a bare install, so none of its arguments may reach the package manager
+ * as a package: package managers read the word after an option they do not know, or after a value-taking option apm
+ * does not know about, as a package (bun 1.1 to 1.3 install the word after --tag, unchecked). So a bare install passes
+ * on only the switches BARE_SWITCHES lists for `pm`, and npm's --tag and --omit with a checked value. apm's --pm and
+ * its value are taken out; anything else, -- included, is refused.
+ */
+export function bareInstallArgs(a: Args, pm: Pm): { args: string[] } | { error: string } {
+  const args: string[] = [];
+
+  for (let i = 0; i < a.raw.length; i++) {
+    const word = a.raw[i] ?? "";
+    const eq = word.indexOf("=");
+    const key = word.startsWith("--") ? word.slice(2, eq === -1 ? undefined : eq) : null;
+
+    if (key === "pm") {
+      if (eq === -1 ? !takesValue(a.raw[i + 1]) : eq === word.length - 1) return { error: "--pm needs a value" };
+
+      if (eq === -1) i++;
+      continue;
+    }
+
+    if (key !== null && eq === -1 && BARE_SWITCHES.get(pm)?.has(key) === true) {
+      args.push(word);
+      continue;
+    }
+
+    const value = eq === -1 ? a.raw[i + 1] : word.slice(eq + 1);
+    const check = pm === "npm" && key !== null ? NPM_VALUES.get(key) : undefined;
+
+    if (check === undefined || value === undefined || !check(value)) return { error: `apm ${a.cmd} with no packages does not pass ${word} on to ${pm}: it checks nothing, and passes on only plain switches such as --frozen-lockfile` };
+    args.push(word);
+
+    if (eq === -1) {
+      args.push(value);
+      i++;
+    }
+  }
+
+  return { args };
 }
 
 /** Why apm refuses these arguments before running anything, or null when it runs them. */
