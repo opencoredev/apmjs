@@ -36,11 +36,12 @@ import semver from "semver";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type KeptPackageRow, type PageScores, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
-import { digestOf } from "./digest.ts";
+import { digestLabel, digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
 import { newestFirst } from "./semver.ts";
-import { scoredPackage, Upstream, upstreamBlobKey, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage } from "./upstream.ts";
+import { scoredPackage, Upstream, upstreamBlobKey, wantedAnalyses, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage, type Wanted } from "./upstream.ts";
+import { RECENT_SEED_MS } from "./analysis.ts";
 
 /** Versions a summary keeps by version number, and again by publish time: the package answer lists the newest 200. */
 export const KEPT_VERSIONS = 200;
@@ -116,13 +117,23 @@ export type KeptPackage = z.infer<typeof KeptPackage>;
 type SummarySource = Omit<CachedPackage, "fetchedAt" | "readAt">;
 
 /** The summary of a package as npm lists it now; null when its JSON is more than KEPT_PACKAGE_MAX_BYTES as UTF-8. */
-export function summarize(pkg: SummarySource): KeptPackage | null {
-  // pkg.versions is in publish order
+/**
+ * The versions a summary of `pkg` keeps, in publish order (pkg.versions is): the last KEPT_VERSIONS published, the newest
+ * KEPT_VERSIONS by number and every one a dist-tag names; and the publish time from which it keeps every one (null when
+ * it keeps them all).
+ */
+function keptVersionsOf<V extends Pick<VersionRecord, "version" | "published_at">>(pkg: { readonly distTags: Record<string, string>; readonly versions: readonly V[] }) {
   const all = pkg.versions;
   const cut = all.length > KEPT_VERSIONS ? (all[all.length - KEPT_VERSIONS]?.published_at ?? null) : null;
   const byNumber = new Set(all.map((v) => v.version).toSorted(newestFirst).slice(0, KEPT_VERSIONS));
   const tagged = new Set(Object.values(pkg.distTags));
-  const kept = all.filter((v) => cut === null || v.published_at >= cut || byNumber.has(v.version) || tagged.has(v.version));
+
+  return { kept: all.filter((v) => cut === null || v.published_at >= cut || byNumber.has(v.version) || tagged.has(v.version)), cut };
+}
+
+export function summarize(pkg: SummarySource): KeptPackage | null {
+  const all = pkg.versions;
+  const { kept, cut } = keptVersionsOf(pkg);
   const latest = all.find((v) => v.version === pkg.distTags.latest);
   // every version carries the same record of the name, made from all of them, kept or not
   const history = all[0]?.history;
@@ -216,13 +227,13 @@ export type PageNeed = { kind: "page" } | { kind: "version"; version: string } |
 type KeptVersion = z.infer<typeof KeptVersion>;
 
 /** The dist-tag's target, own keys only. */
-const tagOf = (kept: KeptPackage, tag: string): string | undefined => (Object.hasOwn(kept.distTags, tag) ? kept.distTags[tag] : undefined);
+const tagOf = (kept: { readonly distTags: Record<string, string> }, tag: string): string | undefined => (Object.hasOwn(kept.distTags, tag) ? kept.distTags[tag] : undefined);
 
 /**
  * The version `need` names in `kept`, resolved as its route resolves it: latest for the package answer, an exact version
  * first for the review answer, a dist-tag first for the score answer. Undefined when the summary does not hold it.
  */
-function versionAsked(kept: KeptPackage, need: PageNeed): KeptVersion | undefined {
+function versionAsked<V extends { readonly version: string }>(kept: { readonly distTags: Record<string, string>; readonly versions: readonly V[] }, need: PageNeed): V | undefined {
   const has = (version: string | undefined) => (version === undefined ? undefined : kept.versions.find((v) => v.version === version));
 
   switch (need.kind) {
@@ -242,6 +253,36 @@ function versionAsked(kept: KeptPackage, need: PageNeed): KeptVersion | undefine
     }
   }
 }
+
+/** The version published before `v` among `versions` (publish order), revoked ones left out: the score answer's previous version. */
+export function previousVersion<V extends Pick<VersionRecord, "version" | "published_at" | "status">>(versions: readonly V[], v: V): V | null {
+  const all = versions.filter((x) => x.version !== v.version && x.published_at <= v.published_at && x.status !== "revoked");
+
+  return all[all.length - 1] ?? null;
+}
+
+/**
+ * The analyses a page's read of `need` at `at` reads of an upstream package (Upstream.probe's wanted). Whole: the version it
+ * shows (versionAsked), latest, and for the score answer the one before it (previousVersion). Trimmed, for their score
+ * and grade and whether they have one: the versions a summary of it keeps (summarize; the package answer lists the
+ * newest KEPT_VERSIONS, and keepAnalyzed admits a summary by them), and the ones published in the last RECENT_SEED_MS
+ * (versionsToSeed). None of the rest of its history.
+ */
+export const pageWanted =
+  (need: PageNeed, at: number): Wanted =>
+  (pkg) => {
+    const want = new Map<string, "whole" | "trimmed">();
+
+    for (const v of keptVersionsOf(pkg).kept) want.set(v.version, "trimmed");
+
+    for (const v of pkg.versions) if (v.published_at >= at - RECENT_SEED_MS) want.set(v.version, "trimmed");
+    const shown = versionAsked(pkg, need);
+    const previous = shown !== undefined && need.kind === "history" ? previousVersion(pkg.versions, shown) : null;
+
+    for (const v of [shown?.version, tagOf(pkg, "latest"), previous?.version]) if (v !== undefined) want.set(v, "whole");
+
+    return want;
+  };
 
 /** Whether `kept` answers `need` exactly as the whole packument would. */
 export function covers(kept: KeptPackage, need: PageNeed): boolean {
@@ -310,11 +351,11 @@ export function pageScores(need: PageNeed): PageScores {
 const firstRow = (name: string, at: number, first: PageFirst) => (first.kind === "read" ? Effect.succeed(parseKept(name, first.kept)) : keptRow(name, at));
 
 /**
- * The scores `first` brought when they hold the analysis of `shown` whole (pageScores), else upstreamAnalyses': a read
- * whose shown version came without PAGE_TRIMMED's members reads every analysis again, whole, rather than show it so.
+ * The scores `first` brought when they hold the analysis of `shown` whole (pageScores), else the ones `wanted` names of
+ * `pkg`: a read whose shown version came without PAGE_TRIMMED's members reads it again, whole, rather than show it so.
  */
-const firstAnalyses = (name: string, first: PageFirst, shown: string) =>
-  first.kind === "read" && first.whole.has(shown) ? Effect.succeed(first.analyses) : Effect.flatMap(Store, (s) => s.upstreamAnalyses(name));
+const firstAnalyses = (input: { name: string; first: PageFirst; shown: string; pkg: CachedPackage; wanted: Wanted }) =>
+  input.first.kind === "read" && input.first.whole.has(input.shown) ? Effect.succeed(input.first.analyses) : Effect.flatMap(Store, (s) => wantedAnalyses(s, input.name, input.pkg.versions, input.wanted(input.pkg)));
 
 /** What a request holds of an expanded summary: each version's record and its scored copy. */
 const expandWeight = (kept: KeptPackage): number => kept.versions.length * (RECORD_WEIGHT + SCORED_WEIGHT);
@@ -565,6 +606,7 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
   Effect.gen(function* () {
     const { upstream, name, lease, first } = input;
     const store = yield* Store;
+    const wanted = pageWanted(input.need, yield* (yield* Clock).now);
     const { kept, fetched } = yield* keptFor(input);
 
     // the scores read with the row (pageRead) or now: either way after the request began, so a score or a dismissal
@@ -574,19 +616,41 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
     if (kept !== null && shown !== undefined) {
       if (!lease.take(expandWeight(kept))) return { kind: "unknown" } satisfies Probe;
 
-      return scoredPackage(expand(kept), yield* firstAnalyses(name, first, shown.version));
+      const pkg = expand(kept);
+
+      return scoredPackage(pkg, yield* firstAnalyses({ name, first, shown: shown.version, pkg, wanted }));
     }
 
     // npm's packument was read instead, which can take seconds: the scores are read again after it, as before
     // summaries were kept. What the row's check already read from npm is the answer: npm is not asked again
-    const probe: Probe = fetched === null ? yield* upstream.probe(name, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* store.upstreamAnalyses(name)) : fetched;
+    const probe: Probe = fetched === null ? yield* upstream.probeFor(name, wanted, lease) : fetched.kind === "found" ? scoredPackage(fetched.pkg, yield* wantedAnalyses(store, name, fetched.pkg.versions, wanted(fetched.pkg))) : fetched;
 
     // a kept row is replaced with what npm sent (keepAnalyzed replaces as well as adds)
-    if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, admitted(probe.pkg), yield* (yield* Clock).now);
+    if (probe.kind === "found") yield* keepAnalyzed(probe.pkg, yield* admittedAll(probe.pkg, wanted(probe.pkg)), yield* (yield* Clock).now);
 
     if (probe.kind === "absent") yield* store.dropKeptPackages({ kind: "name", name });
 
     return probe;
+  });
+
+/**
+ * admitted, as every stored analysis of `pkg` decides it: when the versions `read` scored admit nothing, whether the
+ * versions it left out (a package scored only in versions its summary does not keep) admit it is asked of the database,
+ * which reads none of their analyses (Store.upstreamAdmitted).
+ */
+const admittedAll = (pkg: UpstreamPackage, read: ReadonlyMap<string, "whole" | "trimmed">) =>
+  Effect.gen(function* () {
+    const rest = pkg.versions.filter((v) => !read.has(v.version));
+
+    if (admitted(pkg) || rest.length === 0) return admitted(pkg);
+
+    const keys = rest.map((v) => {
+      const d = digestOf(v);
+
+      return { package: pkg.name, version: v.version, digest: d ? digestLabel(d) : null };
+    });
+
+    return yield* (yield* Store).upstreamAdmitted({ keys, outcomes: keptWithoutScore(pkg.name) });
   });
 
 /** Like pageProbe, without the scores (the review answer reads none): the kept summary, else Upstream.listing. */

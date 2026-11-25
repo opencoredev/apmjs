@@ -3,13 +3,13 @@
 // the real Postgres store: what it returns is what upstreamAnalyses (one package, one statement) returns, and no row the
 // server sends holds more than one analysis.
 import { describe, expect, test } from "bun:test";
-import { createServer, connect } from "node:net";
 import { Effect } from "effect";
 import { Client } from "pg";
 import { z } from "zod";
 import { analyze, parseAnalysis, PREVIOUS_SCORER, SCORER, type Analysis } from "@apm/core";
 import { freshDatabase } from "../../../tests/acceptance/postgres.ts";
 import { Store } from "../src/db.ts";
+import { measured } from "./pg-proxy.ts";
 
 const enc = new TextEncoder();
 const manifest = { name: "pkg", version: "1.0.0", license: "MIT", main: "index.js" };
@@ -41,57 +41,6 @@ const run = <A>(url: string, effect: Effect.Effect<A, unknown, Store>) => Effect
 
 const insert = (sql: (text: string, params?: unknown[]) => Promise<unknown[]>, row: { name: string; version: string; digest: string; scorer: string; analysis: unknown }) =>
   sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, $2, $3, $4, $5::jsonb, 1)", [row.name, row.version, row.digest, row.scorer, JSON.stringify(row.analysis)]);
-
-/**
- * A proxy in front of Postgres that records the largest DataRow message the server sends: each is one row of a result,
- * so the largest is the most one value of the reply held.
- */
-async function measured(url: string): Promise<{ url: string; largest: () => number; close: () => void }> {
-  const target = new URL(url);
-  let largest = 0;
-
-  const server = createServer((client) => {
-    const upstream = connect(Number(target.port), target.hostname);
-    // the server's messages are a type byte and a length that counts itself: skip each one's body as it passes
-    let header = new Uint8Array(0);
-    let skip = 0;
-
-    upstream.on("data", (chunk: Uint8Array) => {
-      let at = 0;
-
-      while (at < chunk.length) {
-        if (skip > 0) {
-          const n = Math.min(skip, chunk.length - at);
-          skip -= n;
-          at += n;
-          continue;
-        }
-
-        const need = 5 - header.length;
-        header = new Uint8Array([...header, ...chunk.subarray(at, at + need)]);
-        at += Math.min(need, chunk.length - at);
-
-        if (header.length < 5) break;
-        const length = new DataView(header.buffer).getUint32(1);
-
-        if (header[0] === 0x44) largest = Math.max(largest, length);
-        skip = length - 4;
-        header = new Uint8Array(0);
-      }
-    });
-    client.pipe(upstream);
-    upstream.pipe(client);
-    client.on("error", () => upstream.destroy());
-    upstream.on("error", () => client.destroy());
-  });
-
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const proxied = new URL(url);
-  proxied.hostname = "127.0.0.1";
-  proxied.port = String(z.object({ port: z.number() }).parse(server.address()).port);
-
-  return { url: proxied.toString(), largest: () => largest, close: () => server.close() };
-}
 
 describe("upstreamAnalysesOf reads one analysis a row", () => {
   test("it returns what upstreamAnalyses returns, across packages, scorers, dismissals and outcomes", async () => {
