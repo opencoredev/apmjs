@@ -226,6 +226,20 @@ describe("publish approval", () => {
     expect(dig((await packumentStatus("@octo-cat/needs-2fa")).body, "versions", "1.0.0", "version")).toBe("1.0.0");
   });
 
+  test("an approval answers the dist-tag that names the version now: latest, or none for a backport", async () => {
+    const approved = async (version: string) => {
+      const ok = await approve(octo, await stage("@octo-cat/tagged-lib", version), totp(octoSecret));
+
+      expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+
+      return dig(ok.body, "tag");
+    };
+
+    expect(await approved("1.0.0")).toBe("latest");
+    expect(await approved("0.9.0")).toBeNull();
+    expect(dig((await packumentStatus("@octo-cat/tagged-lib")).body, "dist-tags")).toEqual({ latest: "1.0.0" });
+  });
+
   test("a staged version expires after 24h and can no longer be approved", async () => {
     const id = await stage("@octo-cat/too-late", "1.0.0");
     clock += 24 * HOUR + MINUTE;
