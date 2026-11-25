@@ -1,0 +1,237 @@
+// What the isolate keeps of names' OSV advisories, and the data center's copies of them, under memory budgets (osv.ts:
+// keep, answerOf, sharedRead, sharedWrite). From Sol's review of c752a16: a copy the request had no room to read was taken
+// for none, so a name OSV could not be asked about was served as unlisted; a name whose advisories did not fit lost its
+// newest stamp, so an older answer landing after it undid it; the kept advisories shared npm's cache lease and limit; a
+// read past its deadline gave its room back while it still read, and a request answered from kept advisories held no
+// charge for them; copies waiting to be written queued without bound. OSV is a stand-in fetcher, the data center's cache
+// a stand-in on globalThis.caches; no network and no database.
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { Effect, Layer } from "effect";
+import { z } from "zod";
+import { ISOLATE_POOL, type Lease, RequestMemory } from "../src/memory.ts";
+import { KnownMalicious, listedAmong, NAME_FRESH_MS, osvFeed, type Advisory } from "../src/osv.ts";
+
+const X = "MAL-2026-90001";
+const VERSIONS = ["1.0.0", "2.0.0"];
+
+/**
+ * OSV for one name: each query answers the ids its `answers` entry gives (shifted, the last kept), each advisory naming
+ * 1.0.0; with `down`, every call is a 503.
+ */
+function osv(name: string) {
+  const answers: (() => Promise<string[]>)[] = [];
+  const ids: string[] = [];
+  const stand = { down: false, answers, ids, queries: 0 };
+
+  // SAFETY: osvFeed calls its fetcher only with a URL string and RequestInit, the call shape this stand-in reads
+  const fetcher = (async (input: string | URL): Promise<Response> => {
+    if (stand.down) return new Response("unavailable", { status: 503 });
+    const read = /\/v1\/vulns\/(.+)$/.exec(new URL(String(input)).pathname);
+
+    if (read?.[1] !== undefined) {
+      const id = decodeURIComponent(read[1]);
+
+      return Response.json({ id, affected: [{ package: { name, ecosystem: "npm" }, versions: ["1.0.0"] }] });
+    }
+
+    stand.queries++;
+    const next = stand.answers.shift();
+    const ids = next === undefined ? stand.ids : await next();
+
+    return Response.json({ results: [{ vulns: ids.map((id) => ({ id, modified: "2026-11-24T00:00:00Z" })) }] });
+  }) as typeof fetch;
+
+  const root = `https://osv.test/${crypto.randomUUID()}/`;
+
+  const ask = (lease?: Lease): Promise<readonly Advisory[]> =>
+    Effect.runPromise(Effect.flatMap(KnownMalicious, (k) => k.advisoriesFor(name)).pipe(Effect.provide(Layer.merge(osvFeed(root, fetcher), lease === undefined ? Layer.empty : Layer.succeed(RequestMemory, lease)))));
+
+  return { stand, ask, copyUrl: `https://osv-cache.apmjs.internal/v2/${encodeURIComponent(`${root} ${name}`)}` };
+}
+
+/** The data center's cache, standing in: `copy` answers a read of a URL, `put` takes a write. */
+function sharedCache(input: { copy: (url: string) => Response | undefined; put?: (url: string, res: Response) => Promise<void> }) {
+  const cache = { match: async (key: Request) => input.copy(key.url), put: async (key: Request, res: Response) => input.put?.(key.url, res) };
+
+  Object.defineProperty(globalThis, "caches", { value: { default: cache }, configurable: true });
+}
+
+afterEach(() => {
+  Reflect.deleteProperty(globalThis, "caches");
+  setSystemTime();
+});
+
+const listed = (name: string, advisories: readonly Advisory[]): string[] => [...listedAmong(name, advisories, VERSIONS).keys()].toSorted();
+
+describe("OSV advisories under memory budgets", () => {
+  test("a copy the request has no room to read, or past the read's cap, withholds every version while OSV is down", async () => {
+    for (const kind of ["no room", "too large"] as const) {
+      const name = kind === "no room" ? "copy-no-room" : "copy-too-large";
+      const o = osv(name);
+      // older than NAME_FRESH_MS, so OSV is asked after it
+      const fetchedAt = Date.now() - NAME_FRESH_MS - 60_000;
+      const versions = kind === "too large" ? Array.from({ length: 120_000 }, (_, i) => `1.0.${i}`) : ["1.0.0"];
+
+      sharedCache({ copy: (url) => (url === o.copyUrl ? Response.json({ fetchedAt, advisories: [{ id: X, versions, ranges: [] }] }) : undefined) });
+      o.stand.down = true;
+      const lease = ISOLATE_POOL.request();
+
+      try {
+        if (kind === "no room") expect(lease.take(lease.headroom - 64 * 1024)).toBe(true);
+        // on c752a16: [], read as no copy, so served as unlisted
+        expect(listed(name, await o.ask(lease))).toEqual(VERSIONS);
+      } finally {
+        lease.release();
+      }
+    }
+
+    // a copy read whole is used as ever: only what it names
+    const o = osv("copy-read");
+
+    sharedCache({ copy: (url) => (url === o.copyUrl ? Response.json({ fetchedAt: Date.now() - NAME_FRESH_MS - 60_000, advisories: [{ id: X, versions: ["1.0.0"], ranges: [] }] }) : undefined) });
+    o.stand.down = true;
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      expect(listed("copy-read", await o.ask(lease))).toEqual(["1.0.0"]);
+    } finally {
+      lease.release();
+    }
+  });
+
+  test("a name whose advisories do not fit keeps its newest answer's order: an older answer landing after it does not undo it", async () => {
+    const o = osv("no-fit");
+    const gate = Promise.withResolvers<void>();
+    const queried = Promise.withResolvers<void>();
+
+    o.stand.answers.push(async () => {
+      queried.resolve();
+      await gate.promise;
+
+      return [];
+    });
+    o.stand.ids = [X];
+    // the pool has no room left, so nothing the isolate keeps of the name fits
+    const hog = ISOLATE_POOL.request(Number.POSITIVE_INFINITY);
+
+    try {
+      expect(hog.take(ISOLATE_POOL.unused)).toBe(true);
+      const older = o.ask();
+
+      await queried.promise;
+      expect(listed("no-fit", await o.ask())).toContain("1.0.0");
+      gate.resolve();
+      // on c752a16: [], the older empty answer's, as the newer one was not kept
+      expect(listed("no-fit", await older)).toContain("1.0.0");
+    } finally {
+      gate.resolve();
+      hog.release();
+    }
+  });
+
+  test("the advisories the isolate keeps are charged to a lease of their own, never npm's cache", async () => {
+    const o = osv("own-lease");
+
+    o.stand.ids = [X];
+    const cache = ISOLATE_POOL.cache();
+    const before = { cache: cache.taken, pool: ISOLATE_POOL.charged };
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      expect(listed("own-lease", await o.ask(lease))).toEqual(["1.0.0"]);
+    } finally {
+      lease.release();
+    }
+
+    // on c752a16: charged to the npm cache's lease, whose limit the first to open it set
+    expect(cache.taken).toBe(before.cache);
+    expect(ISOLATE_POOL.charged).toBeGreaterThan(before.pool);
+  });
+
+  test("a request answered from what the isolate keeps holds its charge while it refers to it", async () => {
+    const o = osv("held-answer");
+
+    o.stand.ids = [X];
+    const first = ISOLATE_POOL.request();
+
+    try {
+      await o.ask(first);
+    } finally {
+      first.release();
+    }
+
+    const second = ISOLATE_POOL.request();
+
+    try {
+      expect(listed("held-answer", await o.ask(second))).toEqual(["1.0.0"]);
+      // fresh: OSV was asked once; on c752a16 the second request held nothing of what it answered with
+      expect(o.stand.queries).toBe(1);
+      expect(second.taken).toBeGreaterThan(0);
+    } finally {
+      second.release();
+    }
+  });
+
+  test("a copy whose read passes its deadline is cancelled, and its room held until the read has ended", async () => {
+    const o = osv("stalled-copy");
+    let cancels = 0;
+
+    sharedCache({
+      copy: (url) =>
+        url === o.copyUrl
+          ? new Response(
+              new ReadableStream<Uint8Array>({
+                start: (c) => c.enqueue(new TextEncoder().encode('{"fetchedAt":')),
+                cancel: () => {
+                  cancels++;
+                },
+              }),
+            )
+          : undefined,
+    });
+    const lease = ISOLATE_POOL.request();
+
+    try {
+      // OSV answers: the copy that could not be read stands for nothing then
+      expect(await o.ask(lease)).toEqual([]);
+      await Bun.sleep(10);
+      // on c752a16: 0, the stream left open after its room was given back
+      expect(cancels).toBe(1);
+      expect(lease.taken).toBe(0);
+    } finally {
+      lease.release();
+    }
+  });
+
+  test("copies waiting on a put that has not ended are charged and coalesced: only the newest is written after it", async () => {
+    const o = osv("slow-put");
+
+    o.stand.ids = [X];
+    const gate = Promise.withResolvers<void>();
+    const puts: number[] = [];
+
+    sharedCache({
+      copy: () => undefined,
+      put: async (_url, res) => {
+        puts.push(z.object({ fetchedAt: z.number() }).parse(await res.json()).fetchedAt);
+
+        if (puts.length === 1) await gate.promise;
+      },
+    });
+    const t = Date.now();
+
+    for (const at of [t, t + NAME_FRESH_MS + 1_000, t + 2 * (NAME_FRESH_MS + 1_000)]) {
+      setSystemTime(at);
+      await o.ask();
+    }
+
+    expect(o.stand.queries).toBe(3);
+    const waiting = ISOLATE_POOL.charged;
+
+    gate.resolve();
+    await Bun.sleep(20);
+    expect(puts).toEqual([t, t + 2 * (NAME_FRESH_MS + 1_000)]);
+    // the copy being written and the one waiting were charged until written; on c752a16 neither was
+    expect(ISOLATE_POOL.charged).toBeLessThan(waiting);
+  });
+});

@@ -314,6 +314,8 @@ const lookupWithin = (name: string, lease: Lease, wanted: Wanted) =>
       case "unknown":
       case "over-budget":
         return p.kind;
+      case "unread":
+        return { kind: "unread" as const, src: upstreamSource(p.pkg) };
       default: {
         const _exhaustive: never = p;
 
@@ -1669,7 +1671,8 @@ const workOutLatestScore = (name: string, known: boolean) =>
       if (!local && !known && !(yield* store.upstreamScored(name))) return { kind: "unanalysed", score: none } satisfies WorkedOut;
       const src = yield* lookupWithin(name, lease, latestWanted(at));
 
-      if (src === "unknown" || src === "over-budget") return { kind: "unavailable" } satisfies WorkedOut;
+      // its scores did not fit: not one with no score
+      if (src === "unknown" || src === "over-budget" || src?.kind === "unread") return { kind: "unavailable" } satisfies WorkedOut;
       const latest = src ? src.versions.find((v) => v.version === src.distTags.latest) : undefined;
       // an upstream version carries its stored analysis already (upstream.get reads them); none means not scored yet
       const r = latest ? reportFor(latest, at) : null;
@@ -4284,6 +4287,25 @@ export const upstreamRoute = (req: Request, url: URL, viaSafe: boolean) =>
     // npm could not be asked, or answered with a packument apm refused to read or could not hold: a registry error the
     // client retries, never "Not found", which npm reports as a package that does not exist. A version the request names
     // that the OSSF feed lists is refused first, as it would be with the package read: that needs neither (Sol on fb84083)
+    // npm's listing read, its analyses not, as they did not fit: what needs no score of the version asked for is checked
+    // as it would be with them (apm's reviewers, the OSSF feed), and the rest is the budget's 503 (Sol on c752a16)
+    if (src !== null && src !== "unknown" && src !== "over-budget" && src.kind === "unread") {
+      const { name, versions, distTags } = src.src;
+      const spec = sp.rest[0] ?? "";
+      const tarball = spec === "-" && sp.rest[1] !== undefined;
+      const named = tarball ? tarballVersion(name, sp.rest[1] ?? "") : sp.rest.length === 1 ? (tagTarget(distTags, spec) ?? spec) : null;
+      const v = versions.find((x) => x.version === named);
+
+      if (named !== null && v !== undefined && (yield* confirmedVersions(name, [v])).has(named)) return tarball ? fail(410, confirmedText(name, named), { confirmed: true }) : fail(404, "Version not found");
+      const listedHere = named === null ? undefined : (yield* listedVersionsOf(name, [named])).get(named);
+
+      if (listedHere && tarball) return fail(403, listedTarballText(listedHere), { knownMalicious: listedHere });
+
+      if (listedHere) return fail(404, `${maliciousText(listedHere)}, so apm does not serve it.`, { knownMalicious: listedHere });
+
+      return json({ error: `${name}: ${OVER_BUDGET_TEXT}. Try again shortly.` }, 503, { "retry-after": String(UPSTREAM_RETRY_AFTER_S) });
+    }
+
     if (src === "unknown" || src === "over-budget") {
       const tarball = sp.rest[0] === "-" && sp.rest[1] !== undefined;
       const named = tarball ? tarballVersion(sp.name, sp.rest[1] ?? "") : sp.rest.length === 1 ? (sp.rest[0] ?? null) : null;

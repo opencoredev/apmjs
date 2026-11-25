@@ -1619,6 +1619,38 @@ describe("what needs no score is checked of a version whose analysis does not fi
       expect(r.status).toBe(403);
     }));
 
+  // Review of c752a16: with only its analyses refused, the listing npm sent was dropped, so the digest-specific reviewer
+  // check, which needs no score, did not run
+  test("a ~safe tarball an apm reviewer confirmed malicious is refused when only its package's analyses do not fit", () =>
+    withRig(async ({ url, npm, sql }) => {
+      npm.docs.set("tarrev", [doc("tarrev", "1.0.0"), doc("tarrev", "1.1.0")]);
+      await scored(sql, "tarrev", "1.0.0");
+      await scored(sql, "tarrev", "1.1.0");
+      let asked = 0;
+
+      const reviewed = (s: StoreApi): StoreApi => ({
+        ...capped(0)(s),
+        confirmedReviews: (name) => {
+          if (name !== "tarrev") return s.confirmedReviews(name);
+          asked++;
+
+          return Effect.succeed([{ version: "1.0.0", digest: label("tarrev", "1.0.0") }]);
+        },
+      });
+
+      const tarball = await route({ url, npm: npm.url, path: "/tarrev/-/tarrev-1.0.0.tgz", viaSafe: true, store: reviewed });
+
+      // on c752a16: 503, and the reviewers were not asked
+      expect(tarball.status).toBe(410);
+      expect(asked).toBeGreaterThan(0);
+      expect((await route({ url, npm: npm.url, path: "/tarrev/1.0.0", viaSafe: true, store: reviewed })).status).toBe(404);
+      // a version they did not confirm is the budget's 503: it needs a score
+      const other = await route({ url, npm: npm.url, path: "/tarrev/-/tarrev-1.1.0.tgz", viaSafe: true, store: reviewed });
+
+      expect(other.status).toBe(503);
+      expect(other.text).toContain(OVER_BUDGET_TEXT);
+    }));
+
   // Review of fb84083: with no latest tag from npm, latest was read as an exact version, so ~safe's fallback had no scores
   test("~safe/latest of a package npm names no latest of answers the highest version the view keeps", () =>
     withRig(async ({ url, npm, sql }) => {

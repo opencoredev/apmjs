@@ -79,6 +79,12 @@ export type Probe = { kind: "found"; pkg: UpstreamPackage } | { kind: "absent" }
  */
 export type BudgetedProbe = Probe | { kind: "over-budget" };
 
+/**
+ * probeWithinFor's answer: a BudgetedProbe, or "unread": npm's listing read and kept, its analyses not, as they did not
+ * fit (every version reads unscored, and a reader takes each as not checked, never as one with no score).
+ */
+export type ListedProbe = BudgetedProbe | { kind: "unread"; pkg: UpstreamPackage };
+
 /** A summaries answer for one name: BudgetedProbe, with what the caller kept in place of the package. */
 export type Summarized<S> = { kind: "found"; summary: S } | { kind: "absent" } | { kind: "unknown" } | { kind: "over-budget" };
 
@@ -782,7 +788,7 @@ export type UpstreamApi = {
    */
   readonly probeFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<Probe, StoreError>;
   /** probeFor, with "over-budget" kept apart from "unknown" (a walk, a scan: one child lease per package). */
-  readonly probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<BudgetedProbe, StoreError>;
+  readonly probeWithinFor: (name: string, wanted: Wanted, lease: Lease) => Effect.Effect<ListedProbe, StoreError>;
   /** Like probe, with no scores, so it reads nothing from the database: the existence check and the review's version lookup. */
   readonly listing: (name: string, lease: Lease) => Effect.Effect<UpstreamListing>;
   /**
@@ -1541,18 +1547,19 @@ export class Upstream extends Context.Service<Upstream, UpstreamApi>()("@apm/reg
           // a package that did not fit the lease could not be read: the caller asks again later
           Effect.map(listed(name, lease), (l) => (l.kind === "over-budget" ? { kind: "unknown" as const } : l));
 
-        const probeWithinFor = (name: string, wanted: Wanted, lease: Lease): Effect.Effect<BudgetedProbe, StoreError> =>
+        const probeWithinFor = (name: string, wanted: Wanted, lease: Lease): Effect.Effect<ListedProbe, StoreError> =>
           Effect.gen(function* () {
             const l = yield* listed(name, lease);
 
             if (l.kind !== "found") return l;
             const analyses = yield* wantedWithin(store, name, l.pkg.versions, wanted(l.pkg), lease);
 
-            return analyses === null ? { kind: "over-budget" as const } : scoredPackage(l.pkg, analyses);
+            // the listing is kept when only its analyses did not fit, so what needs no score is still checked of it
+            return analyses === null ? { kind: "unread" as const, pkg: { ...l.pkg, versions: l.pkg.versions.map((v) => scoredVersion(v, NO_ANALYSES)) } } : scoredPackage(l.pkg, analyses);
           });
 
         const probeFor = (name: string, wanted: Wanted, lease: Lease): Effect.Effect<Probe, StoreError> =>
-          Effect.map(probeWithinFor(name, wanted, lease), (p) => (p.kind === "over-budget" ? { kind: "unknown" as const } : p));
+          Effect.map(probeWithinFor(name, wanted, lease), (p) => (p.kind === "over-budget" || p.kind === "unread" ? { kind: "unknown" as const } : p));
 
         const probeMany = (names: readonly string[], lease: Lease): Effect.Effect<Map<string, BudgetedProbe>, StoreError> =>
           Effect.gen(function* () {
