@@ -163,7 +163,11 @@ function AgentPrompt({ name }: { name: string }) {
   );
 }
 
-export function InstallTabs({ name, version, registry }: { name: string; version: string | null; registry: string }) {
+/**
+ * `tag`: the dist-tag the shown version installs by when the package has no latest. `inCooldown`: the shown version was
+ * published in the last 24 hours, so the box says what apm does with it.
+ */
+export function InstallTabs({ name, version, tag, inCooldown, registry }: { name: string; version: string | null; tag: string | null; inCooldown: boolean; registry: string }) {
   const [client, setClient] = useState<InstallClient>("apm");
   const chosen = useRef(false);
   const { state, copy } = useCopy();
@@ -184,7 +188,7 @@ export function InstallTabs({ name, version, registry }: { name: string; version
     };
   }, []);
   const codeRef = useRef<HTMLElement>(null);
-  const command = installCommand({ client, name, version });
+  const command = installCommand({ client, name, version, tag });
   const copied = { name: "install_command_copied", props: { client, package: name } } as const satisfies TrackedEvent;
 
   return (
@@ -240,8 +244,13 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         </button>
       </div>
       <CopyStatus state={state} manual="Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." />
+      {inCooldown && version && (
+        <p className="rounded-xl bg-warn-soft px-4 py-3 text-sm leading-6 text-pretty">
+          <span className="font-medium text-warn">{version} was published under 24 hours ago, inside apm&apos;s cooldown.</span> apm add warns before it installs it and <code className="font-mono text-[13px] whitespace-nowrap">--strict</code> refuses it; plain bun, npm and pnpm install it without that check.
+        </p>
+      )}
       <Note note={installNote({ client, registry })} client={client} />
-      <AgentPrompt name={name} />
+      <AgentPrompt name={tag ? `${name}@${tag}` : name} />
     </section>
   );
 }

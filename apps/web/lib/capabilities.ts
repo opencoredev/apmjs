@@ -2,6 +2,13 @@
 // and what its evidence rests on. Pure, so it is tested without rendering.
 import type { Capability, Declaration } from "./registry";
 
+/** Whether a scorer lists capabilities (apm-score-v10 and later), so an empty list means it found none. */
+export function listsCapabilities(scorer: string | null | undefined): boolean {
+  const n = /^apm-score-v(\d+)$/.exec(scorer ?? "")?.[1];
+
+  return n !== undefined && Number(n) >= 10;
+}
+
 /** "Network: makes requests or opens sockets" as its name and what it covers. */
 export function capabilityParts(label: string): { name: string; detail: string } {
   const at = label.indexOf(": ");

@@ -5,6 +5,11 @@ import { packageMarkdown } from "./package-md";
 import { loadPackageView } from "./package-view";
 import { fakeSource, INSTALL, pkg, REVIEW_CLEAN } from "./testing";
 import { codeBlock, inlineCode, oneLine } from "./text";
+import type { PackageInfo, Refused } from "../registry";
+
+type Row = PackageInfo["versions"][number];
+
+type Score = NonNullable<PackageInfo["score"]>;
 
 const REGISTRY = "https://registry.apmjs.dev/";
 
@@ -275,3 +280,49 @@ test("an answer the registry marked redacted withholds the source even when the 
   expect(md).not.toContain("REDACTED-FLAG-SOURCE");
   expect(md).not.toContain("/file/lib/index.js");
 });
+
+// HOME-502 A10/A11/D15: the Markdown view said "Status: active" and "Network access: not seen" for ugent_uws 10.9.11,
+// a version the OSSF feed lists whose preinstall runs wget, and gave untagged commands for a prerelease-only package
+describe("what the Markdown view says apm will not install, and how", () => {
+  const ACTIVE = { status: "active", statusReason: null, deprecated: null };
+  const score = (over: Partial<Score>): Score => ({ score: 75, grade: "B", signals: [], scorer: "apm-score-v11", digest: null, dismissed: [], redacted: false, capabilities: [], ...over });
+  const row = (version: string, over: Partial<Row> = {}): Row => ({ version, publishedAt: "2026-05-09T06:58:15.253Z", publishedBy: "x", status: "active", statusReason: null, deprecated: null, score: 10, grade: "F", ...over });
+
+  test("a version the feed lists says do not install, links its advisory, and offers no install command", () => {
+    const refused: Refused = { kind: "known-malicious", ids: ["MAL-2026-20430"] };
+    const p = pkg({ name: "ugent_uws", latest: "9.0.0", distTags: { latest: "9.0.0" }, versions: [row("10.9.11", { refused }), row("9.0.0", { score: 100, grade: "A" })] });
+    const md = packageMarkdown({ pkg: p, version: "10.9.11", status: ACTIVE, refused, facts: null, score: null, unscorable: null, review: { kind: "missing" }, registry: REGISTRY });
+
+    expect(md).toContain("- Status: do not install. The OSSF malicious-packages feed lists it as malicious (`MAL-2026-20430`), so apm does not serve it. Advisory: https://osv.dev/vulnerability/MAL-2026-20430");
+    expect(md).not.toContain("- Status: active");
+    expect(md).toContain("No install command: apm refuses this version. The version apm installs is 9.0.0");
+    expect(md).not.toContain("npm install ugent_uws");
+    expect(md).toContain("## Versions apm does not serve");
+  });
+
+  test("a scorer that lists capabilities is read from that list, as the page shows it", () => {
+    const caps = score({
+      capabilities: [
+        { id: "network", label: "Network: makes requests or opens sockets", status: "not-declared", basis: "code", evidence: ["package.json scripts.preinstall: wget"] },
+        { id: "shell", label: "Processes and shell: starts commands", status: "not-declared", basis: "possible", evidence: [] },
+      ],
+    });
+
+    const md = packageMarkdown({ pkg: pkg(), version: "1.3.0", status: ACTIVE, facts: null, score: caps, unscorable: null, review: { kind: "missing" }, registry: REGISTRY });
+    const none = packageMarkdown({ pkg: pkg(), version: "1.3.0", status: ACTIVE, facts: null, score: score({ capabilities: [] }), unscorable: null, review: { kind: "missing" }, registry: REGISTRY });
+
+    expect(md).toContain("- Network (makes requests or opens sockets): seen");
+    expect(md).toContain("- Processes and shell (starts commands): possible");
+    expect(md).not.toContain("Network access: not seen");
+    expect(none).toContain("- None found in the code apm read.");
+  });
+
+  test("a package with no latest shows its tagged version and installs it by the tag", () => {
+    const p = pkg({ latest: null, score: null, distTags: { next: "0.0.1-test.1" }, versions: [row("0.0.1-test.1", { score: 100, grade: "A" })] });
+    const md = packageMarkdown({ pkg: p, version: "0.0.1-test.1", status: ACTIVE, facts: null, score: null, unscorable: null, review: { kind: "missing" }, registry: REGISTRY });
+
+    expect(md).toContain("- Version shown: 0.0.1-test.1 (tagged `next`; no version is tagged latest)");
+    expect(md).toContain("apm add left-pad@next\nbun add left-pad@next\nnpm install left-pad@next\npnpm add left-pad@next");
+  });
+});
+

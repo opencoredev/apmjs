@@ -27,12 +27,16 @@ function base(registry: string): string {
   return registry.replace(/\/?$/, "/");
 }
 
-export function installCommand({ client, name, version }: { client: InstallClient; name: string; version: string | null }): string {
-  const spec = version ? `${name}@${version}` : name;
+/**
+ * The command for `client`. `tag` is the dist-tag the shown version is installed by when the package has no latest
+ * (a prerelease tagged next): a bare name would ask for latest and find nothing.
+ */
+export function installCommand({ client, name, version, tag = null }: { client: InstallClient; name: string; version: string | null; tag?: string | null }): string {
+  const spec = tag ? `${name}@${tag}` : version ? `${name}@${version}` : name;
 
   switch (client) {
     case "apm":
-      return `apm add ${name}`;
+      return `apm add ${tag ? spec : name}`;
     case "bun":
       return `bun add ${spec}`;
     case "npm":

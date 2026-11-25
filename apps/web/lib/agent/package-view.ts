@@ -9,6 +9,7 @@
 // withheld and the other not. Both are then read again; if they still disagree, the view is not built at all.
 import type { Fetched } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
+import { taggedDefault } from "../shown-version";
 import { isWithheld, withholdSource, type PackageView } from "./package-md";
 import type { AgentSource, VersionInfo } from "./source";
 
@@ -22,7 +23,7 @@ export async function loadPackageView(input: { name: string; version: string | n
 
   if (found.kind === "unavailable") return { kind: "unavailable" };
   const pkg = found.value;
-  const version = input.version ?? pkg.latest;
+  const version = input.version ?? pkg.latest ?? taggedDefault(pkg)?.version ?? null;
 
   if (version === null) return { kind: "ok", view: { pkg, version: null, status: null, facts: null, score: null, unscorable: null, review: { kind: "missing" }, registry: input.registry } };
 
@@ -41,8 +42,30 @@ export async function loadPackageView(input: { name: string; version: string | n
   // a revoked version's source stays out of every answer built from this view, the MCP tool's structured one included
   return {
     kind: "ok",
-    view: withholdSource({ pkg, version: v.version, status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated }, facts: v.facts, score: v.score, unscorable: v.unscorable, review, registry: input.registry }),
+    view: withholdSource({
+      pkg,
+      version: v.version,
+      status: { status: v.status, statusReason: v.statusReason, deprecated: v.deprecated },
+      refused: v.refused ?? null,
+      facts: v.facts,
+      score: latestCapabilities({ score: v.score, pkg, version: v.version }),
+      unscorable: v.unscorable,
+      review,
+      registry: input.registry,
+    }),
   };
+}
+
+/**
+ * The version's score with latest's capabilities from the package answer when the version answer has none for latest:
+ * a registry before the version answer carried them sends none, and the page shows the package answer's.
+ */
+function latestCapabilities(input: { score: VersionInfo["score"]; pkg: { latest: string | null; score: VersionInfo["score"] }; version: string }): VersionInfo["score"] {
+  const { score, pkg } = input;
+
+  if (score === null || pkg.score === null || input.version !== pkg.latest || score.capabilities.length > 0) return score;
+
+  return { ...score, capabilities: pkg.score.capabilities, declaration: pkg.score.declaration };
 }
 
 /**

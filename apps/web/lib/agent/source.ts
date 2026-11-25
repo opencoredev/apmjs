@@ -3,7 +3,7 @@
 import { z } from "zod";
 import type { ExcerptAnswer } from "../file-excerpt";
 import type { Json } from "./json";
-import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
+import type { Facts, Fetched, PackageInfo, Refused, Signal } from "../registry";
 import type { ReviewAnswer } from "../review-schema";
 import type { AlternativesPart, ExactPart, LookalikePart, SearchAnswer } from "../search-schema";
 
@@ -23,6 +23,8 @@ export type VersionInfo = {
   score: ScoreReport | null;
   /** Why apm can never score this version (the registry's reason and sentence); null when it has a score or may get one. */
   unscorable: { reason: string; text: string } | null;
+  /** Why the registry does not serve this version (confirmed or known malicious); absent from an older registry. */
+  refused?: Refused | null;
 };
 
 /** The whole name check (GET /-/apm/v1/names without `part`): the three parts in one answer. */

@@ -16,7 +16,7 @@ type State =
   | { kind: "signed-out" }
   | { kind: "error"; message: string }
   | { kind: "ok"; staged: StagedDetail; account: Account; config: AuthConfig }
-  | { kind: "decided"; status: "approved" | "rejected"; name: string; version: string };
+  | { kind: "decided"; status: "approved" | "rejected"; name: string; version: string; tag: string };
 
 function fmtSize(n: number): string {
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} kB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -293,7 +293,19 @@ export function ApproveView() {
           {state.status === "approved" ? `${state.name}@${state.version} is live` : `${state.name}@${state.version} was rejected`}
         </h1>
         <p className="text-[15px] text-muted-foreground">
-          {state.status === "approved" ? "It installs with bun, npm and pnpm now." : "Nothing was published. The upload is deleted."}
+          {state.status === "rejected" ? (
+            "Nothing was published. The upload is deleted."
+          ) : state.tag === "latest" ? (
+            "It installs with bun, npm and pnpm now."
+          ) : (
+            <>
+              It is tagged <span className="font-mono text-foreground">{state.tag}</span>, not latest, so installs name the tag:{" "}
+              <code className="font-mono text-[13px] text-foreground [overflow-wrap:anywhere]">
+                apm add {state.name}@{state.tag}
+              </code>
+              .
+            </>
+          )}
         </p>
         {state.status === "approved" && (
           <Link href={`/package/${state.name}`} className="text-[15px] underline underline-offset-4">
@@ -306,7 +318,7 @@ export function ApproveView() {
 
   const { staged: s, account, config } = state;
 
-  return <StagedReview s={s} account={account} config={config} onDecided={(status) => setState({ kind: "decided", status, name: s.package, version: s.version })} />;
+  return <StagedReview s={s} account={account} config={config} onDecided={(status) => setState({ kind: "decided", status, name: s.package, version: s.version, tag: s.tag })} />;
 }
 
 /**

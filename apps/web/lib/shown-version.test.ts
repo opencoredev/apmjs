@@ -3,7 +3,7 @@
 // registry's per-version endpoint, and a version string that can't exist says "no such version" without a read.
 import { describe, expect, test } from "bun:test";
 import { shownOf } from "./early-answer";
-import { chooseVersion, rowsWith } from "./shown-version";
+import { chooseVersion, rowsWith, taggedDefault } from "./shown-version";
 import { unscoredNotice } from "./unscored";
 import { pkg } from "./agent/testing";
 
@@ -11,7 +11,7 @@ describe("which version ?v= shows", () => {
   const answer = pkg({ distTags: { latest: "1.3.0", legacy: "1.2.0", old: "0.9.0" } });
 
   test("no ?v= is latest", () => {
-    expect(chooseVersion({ pkg: answer, asked: undefined })).toEqual({ kind: "latest", version: "1.3.0" });
+    expect(chooseVersion({ pkg: answer, asked: undefined })).toEqual({ kind: "latest", version: "1.3.0", tag: null });
   });
 
   test("a listed version is shown without another read", () => {
@@ -49,3 +49,21 @@ describe("which version ?v= shows", () => {
     expect(notice.text).toStartWith("apm cannot open this tarball. ");
   });
 });
+
+// HOME-502 D15/D16: a package with only a prerelease tagged next showed "n/a" and untagged install commands
+describe("a package with no latest tag", () => {
+  const row = (version: string, publishedAt: string) => ({ version, publishedAt, publishedBy: "me", status: "active", statusReason: null, deprecated: null, score: 100, grade: "A" });
+  const prerelease = pkg({ latest: null, score: null, distTags: { next: "0.0.2-test.2", beta: "0.0.1-test.1" }, versions: [row("0.0.2-test.2", "2026-11-25T19:00:00.000Z"), row("0.0.1-test.1", "2026-11-24T19:00:00.000Z")] });
+
+  test("shows the newest version a tag names, with that tag", () => {
+    expect(chooseVersion({ pkg: prerelease, asked: undefined })).toEqual({ kind: "latest", version: "0.0.2-test.2", tag: "next" });
+    expect(taggedDefault(prerelease)).toEqual({ tag: "next", version: "0.0.2-test.2" });
+  });
+
+  test("a package with latest, or with no tag on a listed version, has none", () => {
+    expect(taggedDefault(pkg())).toBeNull();
+    expect(taggedDefault(pkg({ latest: null, distTags: { next: "9.9.9" } }))).toBeNull();
+    expect(chooseVersion({ pkg: pkg({ latest: null, distTags: {} }), asked: undefined })).toEqual({ kind: "latest", version: null, tag: null });
+  });
+});
+

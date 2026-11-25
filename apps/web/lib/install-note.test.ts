@@ -67,4 +67,9 @@ describe("installCommand", () => {
   test("no version installs the bare name", () => {
     expect(installCommand({ client: "npm", name: "@scope/pkg", version: null })).toBe("npm install @scope/pkg");
   });
+
+  // HOME-502 D15: a package with only a prerelease tagged next has no latest, so every untagged command failed
+  test("a version installed by its tag names the tag in every command, apm add's included", () => {
+    expect(INSTALL_CLIENTS.map((client) => installCommand({ client, name: "@s/p", version: "0.0.1-test.1", tag: "next" }))).toEqual(["apm add @s/p@next", "bun add @s/p@next", "npm install @s/p@next", "pnpm add @s/p@next"]);
+  });
 });

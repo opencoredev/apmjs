@@ -6,7 +6,10 @@ import { installCommand, installNote, INSTALL_CLIENTS } from "../install-note";
 import { splitPossible, splitTestFile } from "../limitations";
 import { fileHref } from "../package-route";
 import { UNSCORABLE_INSTALLS } from "../unscored";
-import type { Facts, Fetched, PackageInfo, Signal } from "../registry";
+import type { Facts, Fetched, PackageInfo, Refused, Signal } from "../registry";
+import { advisoryUrl, refusalOf, refusalReason, type Refusal } from "../refusal";
+import { taggedDefault } from "../shown-version";
+import { basisNote, capabilityParts, listsCapabilities, statusMark } from "../capabilities";
 import { coverageText, explanation, headline, type ReviewAnswer } from "../review-schema";
 import { capabilitiesOf, factLines } from "./capabilities";
 import { canonicalPackagePath, siteUrl } from "./site";
@@ -19,6 +22,8 @@ export type PackageView = {
   version: string | null;
   /** That version's own state, from the versions route; null when there is no version. */
   status: { status: string; statusReason: string | null; deprecated: string | null } | null;
+  /** Why the registry does not serve that version (confirmed or known malicious); absent or null when it serves it. */
+  refused?: Refused | null;
   /** That version's own facts (not latest's); null when it is not scored yet. */
   facts: Facts | null;
   /** That version's score; null when it is not scored yet. */
@@ -145,10 +150,37 @@ function reviewSection(review: Fetched<ReviewAnswer>): string[] {
   return lines;
 }
 
-function statusLine(status: NonNullable<PackageView["status"]>): string {
+function statusLine(status: NonNullable<PackageView["status"]>, refusal: Refusal | null): string {
   const reason = status.statusReason ? `, reason ${inlineCode(status.statusReason)}` : "";
 
+  if (refusal?.kind === "known-malicious") {
+    return `- Status: do not install. The OSSF malicious-packages feed lists it as malicious (${refusal.ids.map((id) => inlineCode(id)).join(", ")}), so apm does not serve it. Advisory: ${refusal.ids.map((id) => linkUrl(advisoryUrl(id))).join(", ")}`;
+  }
+
+  if (refusal?.kind === "confirmed-malicious") return `- Status: do not install. ${refusalReason(refusal)}`;
+
   return status.status === "active" ? "- Status: active" : `- Status: ${wordText(status.status)}${reason}. New installs skip it.`;
+}
+
+/**
+ * The capability lines: from the scorer's own list (apm-score-v10 and later), as the page shows them, else from the
+ * signals of an older scorer. Null when the version is not scored.
+ */
+function capabilityLines(score: ScoreReport | null): string[] | null {
+  if (score === null) return null;
+
+  if (score.capabilities.length > 0 || listsCapabilities(score.scorer)) {
+    if (score.capabilities.length === 0) return ["- None found in the code apm read."];
+
+    return score.capabilities.map((c) => {
+      const { name, detail } = capabilityParts(c.label);
+      const notes = [basisNote(c)?.toLowerCase() ?? "seen", statusMark(c)?.text.toLowerCase()].filter(Boolean).join("; ");
+
+      return `- ${oneLine(name)}${detail ? ` (${oneLine(detail)})` : ""}: ${notes}`;
+    });
+  }
+
+  return capabilitiesOf(score.signals)?.map((c) => `- ${c.label}: ${c.state}`) ?? null;
 }
 
 /** Why apm can never score the shown version: null when it has a score or may still get one. */
@@ -183,13 +215,18 @@ export function packageMarkdown(input: PackageView): string {
   const { pkg, version, score } = view;
   const withheld = sourceWithheld(view);
   const url = siteUrl(canonicalPackagePath(pkg.name));
-  const older = version !== null && version !== pkg.latest;
+  // a package with no latest tag: the newest version another tag names, installed by that tag
+  const tagged = taggedDefault(pkg);
+  const tag = tagged !== null && tagged.version === version ? tagged.tag : null;
+  const older = version !== null && version !== pkg.latest && tag === null;
+  const refusal = view.status ? refusalOf({ status: view.status.status, refused: view.refused }) : null;
   const unscorable = unscorableOf(view);
   const out: string[] = [`# ${oneLine(pkg.name)}`, ""];
+  const shownNote = tag ? ` (tagged ${inlineCode(tag)}; no version is tagged latest)` : older ? ` (latest is ${pkg.latest ? versionText(pkg.latest) : "unknown"})` : version ? " (latest)" : "";
 
   out.push(
-    `- Version shown: ${version ? versionText(version) : "none published"}${older ? ` (latest is ${pkg.latest ? versionText(pkg.latest) : "unknown"})` : version ? " (latest)" : ""}`,
-    ...(view.status ? [statusLine(view.status)] : []),
+    `- Version shown: ${version ? versionText(version) : "none published"}${shownNote}`,
+    ...(view.status ? [statusLine(view.status, refusal)] : []),
     ...(withheld ? ["- Source: withheld. This version's revoke takes its files out of view: apm shows no line of its code, only what was found and where."] : []),
     ...(view.status?.deprecated ? [`- Deprecated: ${inlineCode(view.status.deprecated)}`] : []),
     ...(pkg.description ? [`- Description: ${inlineCode(pkg.description)}`] : []),
@@ -205,6 +242,13 @@ export function packageMarkdown(input: PackageView): string {
   const pulled = pkg.versions.filter((v) => v.status !== "active");
 
   if (pulled.length > 0) out.push("## Pulled versions", "", ...pulled.map((v) => `- ${versionText(v.version)}: ${wordText(v.status)}${v.statusReason ? `, reason ${inlineCode(v.statusReason)}` : ""}. New installs skip it.`), "");
+  const withheldRows = pkg.versions.flatMap((v) => (v.refused ? [{ version: v.version, refused: v.refused }] : []));
+
+  if (withheldRows.length > 0) {
+    const why = (r: Refused) => (r.kind === "known-malicious" ? `listed as malicious by the OSSF malicious-packages feed (${r.ids.map((id) => inlineCode(id)).join(", ")})` : "confirmed malicious by apm reviewers");
+
+    out.push("## Versions apm does not serve", "", ...withheldRows.map((v) => `- ${versionText(v.version)}: ${why(v.refused)}. Do not install it.`), "");
+  }
 
   out.push("## Risk signals", "");
 
@@ -229,11 +273,11 @@ export function packageMarkdown(input: PackageView): string {
   }
 
   out.push("## Capabilities", "");
-  const caps = capabilitiesOf(score?.signals ?? null);
+  const caps = capabilityLines(score);
 
   const unknownUntil = unscorable !== null ? "unknown: apm cannot score this version" : "unknown until the version is scored";
 
-  if (caps) out.push(...caps.map((c) => `- ${c.label}: ${c.state}`));
+  if (caps) out.push(...caps);
   else out.push(`- Code capabilities: ${unknownUntil}`);
 
   // the shown version's own facts; the license is the publisher's text
@@ -243,13 +287,21 @@ export function packageMarkdown(input: PackageView): string {
 
   const shown = version === null ? null : oneLine(version);
 
-  out.push("## Install", "", codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, version: shown })).join("\n"), "sh"), "");
-  out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm get only some of them, and only once pointed at apm:", "");
+  out.push("## Install", "");
 
-  for (const client of ["bun", "npm"] as const) {
-    const note = installNote({ client, registry: view.registry });
+  if (refusal !== null) {
+    const instead = pkg.latest !== null && pkg.latest !== version ? ` The version apm installs is ${versionText(pkg.latest)}: ${url}` : "";
 
-    if (note.kind === "needs-setup") out.push(`${client === "npm" ? "npm and pnpm" : client} (${note.file}):`, "", codeBlock(note.config, client === "bun" ? "toml" : "ini"), "", note.effect, "");
+    out.push(`No install command: apm refuses this version.${instead}`, "");
+  } else {
+    out.push(codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, version: shown, tag: tag === null ? null : oneLine(tag) })).join("\n"), "sh"), "");
+    out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm get only some of them, and only once pointed at apm:", "");
+
+    for (const client of ["bun", "npm"] as const) {
+      const note = installNote({ client, registry: view.registry });
+
+      if (note.kind === "needs-setup") out.push(`${client === "npm" ? "npm and pnpm" : client} (${note.file}):`, "", codeBlock(note.config, client === "bun" ? "toml" : "ini"), "", note.effect, "");
+    }
   }
 
   out.push("## Not checked", "");

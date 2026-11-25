@@ -525,3 +525,38 @@ describe("advisories", () => {
     expect(await installStamp(rows, ["osv x"])).not.toBe(await installStamp(rows));
   });
 });
+
+describe("the package page's answers", () => {
+  const Row = z.object({ version: z.string(), refused: z.object({ kind: z.string(), ids: z.array(z.string()).optional() }).nullable() });
+  const PackageAnswer = z.object({ latest: z.string().nullable(), distTags: z.record(z.string(), z.string()), versions: z.array(Row) });
+
+  test("latest and the dist-tags are what the packuments serve, and each listed version names its advisory", async () => {
+    const got = await get("/-/apm/v1/packages/evil-tagged", { route: "apm", root: freshRoot() });
+
+    expect(got?.status).toBe(200);
+    const body = PackageAnswer.parse(JSON.parse(got?.text ?? ""));
+
+    expect(body.latest).toBe("9.0.0");
+    expect(body.distTags).toEqual({ latest: "9.0.0", old: "9.0.0" });
+    expect(body.versions.map((v) => [v.version, v.refused])).toEqual([
+      ["10.9.11", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
+      ["10.9.10", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
+      ["10.9.9", { kind: "known-malicious", ids: ["MAL-2026-1000"] }],
+      ["9.0.0", null],
+    ]);
+  });
+
+  test("the per-version answer says the same, and a clean package's answer is unchanged", async () => {
+    const root = freshRoot();
+    const listed = await get("/-/apm/v1/packages/evil-tagged/versions/10.9.11", { route: "apm", root });
+
+    expect(listed?.status).toBe(200);
+    expect(Row.parse(JSON.parse(listed?.text ?? "")).refused).toEqual({ kind: "known-malicious", ids: ["MAL-2026-1000"] });
+    const clean = PackageAnswer.parse(JSON.parse((await get("/-/apm/v1/packages/clean", { route: "apm", root }))?.text ?? ""));
+
+    expect(clean.latest).toBe("1.1.0");
+    expect(clean.distTags).toEqual({ latest: "1.1.0" });
+    expect(clean.versions.every((v) => v.refused === null)).toBe(true);
+  });
+});
+

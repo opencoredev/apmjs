@@ -14,6 +14,8 @@ export const SearchHit = z.object({
   /** Only present when the registry already stored an analysis for this version. */
   score: Score.nullable(),
   weeklyDownloads: z.number().nullable(),
+  /** The OSSF advisories that list this version as malicious, so apm does not serve it; an older registry sends none. */
+  malicious: z.array(z.string()).optional(),
 });
 
 export type SearchHit = z.infer<typeof SearchHit>;

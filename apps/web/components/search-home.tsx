@@ -129,7 +129,10 @@ function Slot({ label, href, children }: { label: string; href?: string; childre
   );
 }
 
-function ExactStatus({ state }: { state: PartState<"exact"> }) {
+/** apm publishes new packages under the publisher's GitHub login only: a free bare name is free on npm, not here. */
+const isBare = (q: string): boolean => !q.startsWith("@");
+
+function ExactStatus({ q, state }: { q: string; state: PartState<"exact"> }) {
   if (state.kind === "loading") return <Status kind="wait">checking</Status>;
 
   if (state.kind === "error") return <Status kind="warn">couldn&apos;t check</Status>;
@@ -146,7 +149,7 @@ function ExactStatus({ state }: { state: PartState<"exact"> }) {
 
   if (data.unknown) return <Status kind="warn">couldn&apos;t check npm</Status>;
 
-  if (data.available) return <Status kind="free">available</Status>;
+  if (data.available) return isBare(q) ? <Status kind="warn">not taken, needs a scope</Status> : <Status kind="free">available</Status>;
 
   return <Status kind="warn">{data.valid ? "blocked: too close to a popular name" : "invalid"}</Status>;
 }
@@ -158,9 +161,10 @@ function ExactSlot({ q, state }: { q: string; state: PartState<"exact"> }) {
     <Slot label="Exact name" href={data?.taken ? packageHref(q) : undefined}>
       <Highlight name={q} q="" className="text-lg font-medium" />
       <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <ExactStatus state={state} />
+        <ExactStatus q={q} state={state} />
       </span>
       {data && !data.taken && data.conflicts[0] && <span className="text-sm text-pretty text-muted-foreground">{data.conflicts[0].reason}</span>}
+      {data?.available && isBare(q) && <span className="text-sm text-pretty text-muted-foreground">New packages on apm go under your GitHub login, like @you/{q}.</span>}
     </Slot>
   );
 }
@@ -293,7 +297,7 @@ function NameDisclosure({ q, states }: { q: string; states: NameStates }) {
       >
         <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-sm text-muted-foreground">Name check</span>
-          <ExactStatus state={states.exact} />
+          <ExactStatus q={q} state={states.exact} />
         </span>
         <ChevronDownIcon className={cn("size-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-180")} aria-hidden />
       </button>
@@ -353,6 +357,11 @@ function ResultRow({
           <span className="flex min-w-0 items-center gap-2">
             <Highlight name={hit.name} q={q} className="text-[15px] sm:text-base" />
             <SourceTag source={hit.source} />
+            {hit.malicious && hit.malicious.length > 0 && (
+              <span title={`${hit.version} is listed as malicious (${hit.malicious.join(", ")}); apm does not serve it`} className="inline-flex h-5 shrink-0 items-center rounded-md bg-bad-soft px-1.5 text-[11px] font-medium text-bad">
+                malicious
+              </span>
+            )}
           </span>
           <span className="truncate text-sm text-muted-foreground">{hit.description || "No description"}</span>
           {/* Phones: version, downloads and score on one line under the description, so the name keeps the row's width. */}
