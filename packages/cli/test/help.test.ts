@@ -274,33 +274,32 @@ describe("what still goes to the package manager", () => {
   });
 
   // a bare install checks nothing, so no word of it may reach the package manager as a package: bun 1.1 to 1.3 install
-  // the word after an option they do not know, npm reads --audit=off as a package off, and a value-taking option apm does
-  // not know takes the next option as its value. Only plain switches, and npm's --tag and --omit with a checked value, pass.
+  // the word after an option they do not know, npm reads --audit=off as a package off, and an option that takes a value
+  // takes the next one as its value. Plain switches pass, and npm's --tag and --omit with a checked value.
   const refusedBare = (word: string, pm: string) => `apm install with no packages does not pass ${word} on to ${pm}`;
 
   test.each([
-    [["install", "--tag", "left-pad"], refusedBare("--tag", "bun")],
-    [["i", "--tag", "left-pad"], "apm i with no packages does not pass --tag on to bun"],
-    [["install", "--pm", "bun", "--tag", "left-pad"], refusedBare("--tag", "bun")],
-    [["install", "--pm", "pnpm", "--tag", "left-pad"], refusedBare("--tag", "pnpm")],
-    [["install", "--pm=yarn", "--tag", "left-pad"], refusedBare("--tag", "yarn")],
+    [["install", "--tag", "left-pad"], refusedBare("left-pad", "bun")],
+    [["i", "--tag", "left-pad"], "apm i with no packages does not pass left-pad on to bun"],
+    [["install", "--pm", "bun", "--tag", "left-pad"], refusedBare("left-pad", "bun")],
+    [["install", "--pm", "pnpm", "--tag", "left-pad"], refusedBare("left-pad", "pnpm")],
+    [["install", "--pm=yarn", "--tag", "left-pad"], refusedBare("left-pad", "yarn")],
     [["install", "--tag=next"], refusedBare("--tag=next", "bun")],
-    [["install", "--omit", "dev"], refusedBare("--omit", "bun")],
+    [["install", "--omit", "dev"], refusedBare("dev", "bun")],
     [["install", "--omit=dev"], refusedBare("--omit=dev", "bun")],
-    [["install", "--cooldown", "left-pad"], refusedBare("--cooldown", "bun")],
-    [["install", "--pm", "npm", "--floor", "left-pad"], refusedBare("--floor", "npm")],
+    [["install", "--cooldown", "left-pad"], refusedBare("left-pad", "bun")],
+    [["install", "--pm", "npm", "--floor", "left-pad"], refusedBare("left-pad", "npm")],
     [["install", "--pm", "npm", "--audit=off"], refusedBare("--audit=off", "npm")],
-    [["install", "--pm", "npm", "--prefix", "--tag", "left-pad"], refusedBare("--prefix", "npm")],
+    [["install", "--pm", "npm", "--prefix", "--tag", "left-pad"], "apm install with no packages passes --tag on to npm only first or after a plain npm switch"],
+    [["install", "--pm", "npm", "--registry", "--pm", "npm", "--omit", "dev"], "apm install with no packages passes --omit on to npm only first or after a plain npm switch"],
     [["install", "--pm", "npm", "---", "left-pad"], "unknown flag - for apm install"],
     [["install", "--pm", "npm", "---"], refusedBare("---", "npm")],
     [["install", "--pm", "npm", "--tag", "1.x"], refusedBare("--tag", "npm")],
     [["install", "--pm", "npm", "--omit", "left-pad"], refusedBare("--omit", "npm")],
     [["install", "--pm", "pnpm", "--force=off"], refusedBare("--force=off", "pnpm")],
+    [["install", "-P"], refusedBare("-P", "bun")],
     [["install", "--pm", "--pm", "npm", "--tag", "left-pad"], "--pm needs a value"],
     [["install", "--pm=", "--pm", "npm"], "--pm needs a value"],
-    // yarn 1 ignores --immutable and would rewrite the lockfile; yarn 2 and later read --frozen-lockfile as --immutable
-    [["install", "--pm", "yarn", "--immutable"], refusedBare("--immutable", "yarn")],
-    [["install", "--json"], refusedBare("--json", "bun")],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
@@ -313,12 +312,22 @@ describe("what still goes to the package manager", () => {
     expectNothingRan(r);
   });
 
+  // everyday forms 0.1.5 passed on still run (HOME-355's matrix and common CI flags)
   test.each([
+    [["install"], "bun install"],
+    [["install", "--pm", "npm"], "npm install"],
+    [["install", "--pm", "npm", "--tag", "next"], "npm install --tag next"],
     [["install", "--pm", "npm", "--omit", "dev"], "npm install --omit dev"],
     [["install", "--pm", "npm", "--omit=peer", "--tag=beta", "--no-audit"], "npm install --omit=peer --tag=beta --no-audit"],
+    [["install", "--pm", "npm", "--legacy-peer-deps", "--tag", "next", "--force"], "npm install --legacy-peer-deps --tag next --force"],
+    [["install", "--pm", "npm", "--loglevel", "--tag=next"], "npm install --loglevel --tag=next"],
+    [["install", "--pm", "npm", "--frozen-lockfile"], "npm install --frozen-lockfile"],
     [["i", "--frozen-lockfile", "--production"], "bun install --frozen-lockfile --production"],
+    [["install", "--force"], "bun install --force"],
+    [["install", "--json"], "bun install --json"],
     [["install", "--pm=pnpm", "--frozen-lockfile", "--prod"], "pnpm install --frozen-lockfile --prod"],
-    [["install", "--pm", "yarn", "--frozen-lockfile"], "yarn install --frozen-lockfile"],
+    [["install", "--pm", "yarn", "--frozen-lockfile", "--ignore-engines"], "yarn install --frozen-lockfile --ignore-engines"],
+    [["install", "--pm", "yarn", "--immutable"], "yarn install --immutable"],
   ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
     const r = await apm(argv);
 
