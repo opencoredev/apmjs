@@ -107,6 +107,27 @@ describe("apm: runtime detection and pass-through", () => {
     expect(dig(doc, "packages", 0, "warnings", 0, "kind")).toBe("low-score");
   });
 
+  test("apm add --json when the registry cannot be reached: exit 1 and the documented shape, nothing installed", async () => {
+    const gone = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const url = gone.url.href;
+
+    gone.stop(true);
+    const sb = makeSandbox(reg, alice);
+    const app = bunProject({}, alice);
+    const r = await apm(["add", "nice-dep", "--json"], { cwd: app, env: { ...sb.env, APM_REGISTRY: url } });
+
+    expect(r.code, r.out).toBe(1);
+    const body: unknown = JSON.parse(r.stdout);
+
+    // reference/cli.mdx: { ok, pm, error, packages, installed }, installed null when apm stopped before the check
+    expect(dig(body, "ok")).toBe(false);
+    expect(dig(body, "pm")).toBe("bun");
+    expect(String(dig(body, "error"))).toContain(url);
+    expect(dig(body, "packages")).toEqual([]);
+    expect(dig(body, "installed")).toBeNull();
+    expect(existsSync(join(app, "node_modules", "nice-dep"))).toBe(false);
+  });
+
   test("--pm overrides detection", async () => {
     const sb = makeSandbox(reg, alice);
     const app = bunProject({}, alice);

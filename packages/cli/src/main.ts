@@ -1559,7 +1559,17 @@ async function cmdAdd(a: Args): Promise<number> {
   const ctx = resolveContext({ pm: det.pm, cwd, project: true });
 
   if (ctx.leftOut !== null) say(dim(`apm: ${ctx.leftOut}, so it goes without them; the check of the computed lockfile reads every package`));
-  for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
+  try {
+    for (const spec of specs) results.push(await resolveSpec(api, spec, a, ctx));
+  } catch (e) {
+    // the registry could not be asked (down, refused, a timeout): nothing was installed, and --json keeps its shape
+    const why = e instanceof ApiError ? e.message : `could not reach ${cfg.registry} (${e instanceof Error ? e.message : String(e)})`;
+
+    fail(`apm add: ${why}; nothing was installed`);
+    emitJson({ ok: false, det, results: [], error: lastError });
+
+    return 1;
+  }
   for (const r of results) printResolved(r);
   const blocked = results.filter((r) => r.blocked !== null || r.version === null);
 
@@ -1866,14 +1876,26 @@ async function cmdAudit(): Promise<number> {
   }
   const query: Record<string, string[]> = {};
   for (const [n, vs] of installed) query[n] = [...vs];
-  const audit = installed.size > 0 ? await api.post("-/apm/v1/audit", query, AuditResponse) : { advisories: {}, unavailable: [] };
+  // a registry that cannot answer leaves every advisory unknown: each version is unchecked, and the report still prints
+  let advisoriesFailed: string | null = null;
+  let audit: z.infer<typeof AuditResponse> = { advisories: {}, unavailable: [] };
+
+  if (installed.size > 0) {
+    try {
+      audit = await api.post("-/apm/v1/audit", query, AuditResponse);
+    } catch (e) {
+      advisoriesFailed = e instanceof Error ? e.message : String(e);
+      audit = { advisories: {}, unavailable: [...installed.keys()] };
+    }
+  }
+
   const { graph } = nodeModulesGraph(disk);
   const verdict = await checkGraph({ api, packages: graph.packages, local: graph.local, noIntegrity: [], waitMs: pendingWaitMs(), progress: (line) => say(dim(line)), policy: DEFAULT_CHECK });
   const findings: { id: string; severity: string; text: string }[] = verdict.blocked.map((b) => ({ id: idOf(b), severity: "critical", text: b.reason }));
   // checks that could not run: an audit with any of these is not a pass
   const unchecked: { id: string; reason: string }[] = [
     ...unreadable,
-    ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: "advisories could not be fetched from the upstream registry" }))),
+    ...audit.unavailable.flatMap((name) => [...(installed.get(name) ?? [])].map((v) => ({ id: `${name}@${v}`, reason: advisoriesFailed === null ? "advisories could not be fetched from the upstream registry" : `the registry did not answer the advisory check (${advisoriesFailed})` }))),
   ];
 
   for (const w of verdict.warnings) {

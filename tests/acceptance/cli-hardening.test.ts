@@ -421,4 +421,34 @@ describe("finding 12: apm audit does not match on malformed advisory ranges", ()
     expect(findings).toContain("hard-store@1.0.0");
     expect(JSON.stringify(dig(body, "unchecked"))).toContain("garbage range");
   });
+
+  test("a registry that cannot answer: apm audit still prints its report, with every installed version unchecked", async () => {
+    const down = standIn(() => Response.json({ error: "upstream unavailable" }, { status: 503 }));
+    const sb = makeSandbox(reg, alice);
+    const app = writeConsumer(work, reg, alice);
+
+    for (const name of ["hard-nice", "hard-store"]) {
+      mkdirSync(join(app, "node_modules", name), { recursive: true });
+      writeFileSync(join(app, "node_modules", name, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
+    }
+
+    const env = { ...sb.env, APM_REGISTRY: down.url };
+    const r = await apm(["audit", "--json"], { cwd: app, env });
+    const human = await apm(["audit"], { cwd: app, env });
+
+    await down.stop();
+    expect(r.code, r.out).toBe(1);
+    const body = oneJson(r.stdout);
+
+    // the shape reference/cli.mdx documents: { ok, checked, findings, unchecked }
+    expect(dig(body, "ok")).toBe(false);
+    expect(dig(body, "checked")).toBe(2);
+    expect(dig(body, "findings")).toEqual([]);
+    const unchecked = JSON.stringify(dig(body, "unchecked"));
+
+    expect(unchecked).toContain("hard-nice@1.0.0");
+    expect(unchecked).toContain("hard-store@1.0.0");
+    expect(human.code, human.out).toBe(1);
+    expect(human.out).toContain("could not be checked, so this audit is not a pass");
+  });
 });
