@@ -140,14 +140,29 @@ function project(deps: Record<string, string> = {}) {
   return { root, env: { ...sb.env, npm_config_store_dir: join(sb.home, ".pnpm-store"), TMPDIR: tmpdir() } };
 }
 
-test("the reproducer: npm install --ignore-scripts of the registry package runs the git dependency's prepare", async () => {
+/**
+ * Whether this npm runs a git dependency's prepare with --ignore-scripts. npm 11.0.0 made --ignore-scripts cover
+ * prepare ("applies to all lifecycle scripts, include prepare", its breaking changes); 10.9.9 still runs it. apm
+ * refuses npm with scripts ignored in either case, since npm 10 is still in use and npm still clones the repository.
+ */
+async function npmRunsGitPrepare(env: Record<string, string>): Promise<boolean> {
+  const v = await run(["npm", "--version"], { cwd: tmpdir(), env });
+  const major = Number(/^(\d+)\./.exec(v.stdout.trim())?.[1]);
+
+  expect(Number.isFinite(major), v.out).toBe(true);
+
+  return major < 11;
+}
+
+test("the reproducer: npm install --ignore-scripts of the registry package runs the git dependency's prepare (npm 10 and older)", async () => {
   clearMarks();
   const p = project();
+  const prepares = await npmRunsGitPrepare(p.env);
   const r = await run(["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "gitparent@1.0.0"], { cwd: p.root, env: p.env, timeoutMs: 120_000 });
 
   expect(r.code, r.out).toBe(0);
   expect(existsSync(join(p.root, "node_modules", "gitdep", "package.json")), r.out).toBe(true);
-  expect(ran().length, "npm ran gitdep's prepare despite --ignore-scripts").toBeGreaterThan(0);
+  expect(ran().length > 0, prepares ? "npm 10 ran gitdep's prepare despite --ignore-scripts" : "npm 11 holds back gitdep's prepare with --ignore-scripts").toBe(prepares);
 });
 
 test("the reproducer, lockfile only: npm install --package-lock-only --ignore-scripts clones the git dependency, and runs the prepare of one that bundles", async () => {
@@ -163,12 +178,13 @@ test("the reproducer, lockfile only: npm install --package-lock-only --ignore-sc
     clearMarks();
     rmSync(gitLog, { force: true });
     const p = project();
+    const npmPrepares = await npmRunsGitPrepare(p.env);
     const r = await run(["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", `${name}@1.0.0`], { cwd: p.root, env: onPath(gitSpy, p.env), timeoutMs: 120_000 });
 
     expect(r.code, r.out).toBe(0);
     expect(existsSync(join(p.root, "node_modules")), r.out).toBe(false);
     expect(readFileSync(gitLog, "utf8"), "npm cloned the git dependency while computing the lockfile").toContain(`clone file://${join(work, repo)}`);
-    expect(ran().length > 0, `npm ran ${repo}'s prepare while computing the lockfile`).toBe(prepares);
+    expect(ran().length > 0, `npm ran ${repo}'s prepare while computing the lockfile (npm 10 and older, a dependency that bundles)`).toBe(prepares && npmPrepares);
   }
 });
 

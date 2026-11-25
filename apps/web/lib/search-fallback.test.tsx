@@ -7,6 +7,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 let pathname = "/package/next";
 
+// bun:test module mocks last for the whole run, so keep every real export: a file that runs later (approval-ui
+// renders a view that calls useParams) imports this mock, not next/navigation
+const navigation = await import("next/navigation");
+
 void mock.module("next/navigation", () => ({
   ...navigation,
   usePathname: () => pathname,

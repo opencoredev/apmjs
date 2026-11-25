@@ -43,6 +43,9 @@ jobs:
           for f in tools/oxlint/anti-slop/rules/*.test.ts tools/oxlint/anti-slop/effect/rules/*.test.ts; do node "$f"; done
       - name: Unit tests
         run: bun test packages/cli/test packages/core/test packages/registry/test packages/infra/test
+      - name: Unit tests (bun-scanner, ai-review and its eval harness, launch audit)
+        # packages/infra/test/ci-coverage.test.ts fails when a tracked test file runs in no CI step
+        run: bun test --timeout 90000 packages/bun-scanner/test packages/ai-review/src tools/ai-review tests/launch-audit
       - name: Web unit tests
         run: bun test lib
         working-directory: apps/web
@@ -54,6 +57,11 @@ jobs:
       - name: Docs site (Blume build, then a strict link check that fails on any navigation warning)
         run: bun run build && bun run validate
         working-directory: apps/docs
+      - name: Tarballs the streamed-analysis acceptance tests read (they skip without them, and the score counts a skip)
+        # npm pack checks each tarball against the registry's integrity before writing it
+        run: |
+          mkdir -p ~/.cache/apm-corpus/tgz
+          cd ~/.cache/apm-corpus/tgz && npm pack next@16.4.6 prettier@3.10.1 --silent
       - name: Acceptance suite (real bun, npm and pnpm against the registry Worker build in Miniflare and Postgres 18)
         run: |
           bun scripts/score.ts | tee score.txt
