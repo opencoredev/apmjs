@@ -36,11 +36,11 @@ import semver from "semver";
 import { z } from "zod";
 import { Clock } from "./clock.ts";
 import { Store, type KeptPackageRow, type PageScores, type UpstreamAnalyses, type VersionRecord } from "./db.ts";
-import { digestOf } from "./digest.ts";
+import { digestLabel, digestOf } from "./digest.ts";
 import type { StoreError } from "./errors.ts";
 import { RequestMemory, type Lease } from "./memory.ts";
 import { newestFirst } from "./semver.ts";
-import { scoredPackage, scoredVersion, Upstream, upstreamBlobKey, wantedAnalyses, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage, type Wanted } from "./upstream.ts";
+import { scoredPackage, Upstream, upstreamBlobKey, wantedAnalyses, RECORD_WEIGHT, SCORED_WEIGHT, type CachedPackage, type Probe, type UpstreamApi, type UpstreamListing, type UpstreamPackage, type Wanted } from "./upstream.ts";
 import { RECENT_SEED_MS } from "./analysis.ts";
 
 /** Versions a summary keeps by version number, and again by publish time: the package answer lists the newest 200. */
@@ -634,17 +634,23 @@ export const pageProbe = (input: { upstream: UpstreamApi; name: string; need: Pa
   });
 
 /**
- * admitted, as every stored analysis of `pkg` decides it: when the versions `read` scored admit nothing, the analyses of
- * the versions it left out (a package scored only in versions its summary does not keep) are read, trimmed, to decide.
+ * admitted, as every stored analysis of `pkg` decides it: when the versions `read` scored admit nothing, whether the
+ * versions it left out (a package scored only in versions its summary does not keep) admit it is asked of the database,
+ * which reads none of their analyses (Store.upstreamAdmitted).
  */
 const admittedAll = (pkg: UpstreamPackage, read: ReadonlyMap<string, "whole" | "trimmed">) =>
   Effect.gen(function* () {
     const rest = pkg.versions.filter((v) => !read.has(v.version));
 
     if (admitted(pkg) || rest.length === 0) return admitted(pkg);
-    const analyses = yield* wantedAnalyses(yield* Store, pkg.name, rest, new Map(rest.map((v) => [v.version, "trimmed"] as const)));
 
-    return admitted({ ...pkg, versions: rest.map((v) => scoredVersion(v, analyses)) });
+    const keys = rest.map((v) => {
+      const d = digestOf(v);
+
+      return { package: pkg.name, version: v.version, digest: d ? digestLabel(d) : null };
+    });
+
+    return yield* (yield* Store).upstreamAdmitted({ keys, outcomes: keptWithoutScore(pkg.name) });
   });
 
 /** Like pageProbe, without the scores (the review answer reads none): the kept summary, else Upstream.listing. */

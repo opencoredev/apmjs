@@ -600,6 +600,12 @@ export type StoreApi = {
    */
   readonly upstreamScored: (name: string) => Effect.Effect<boolean, StoreError>;
   /**
+   * Whether upstreamAnalysesFor(keys) would find a score for one of them, or with `outcomes` an outcome decided for one
+   * (by version, whatever its digest), without reading either: kept-package admission (admitted) of versions a read
+   * left out. currentScore keeps every row the scorer filter passes, so a row is a score.
+   */
+  readonly upstreamAdmitted: (input: { keys: readonly AnalysisKey[]; outcomes: boolean }) => Effect.Effect<boolean, StoreError>;
+  /**
    * The kept popular-scores answers for these names (migration 0019), never one for a package published on apm. Marks
    * them asked about at `at`, at most once an hour each, so the sweep keeps refreshing them.
    */
@@ -1715,6 +1721,16 @@ const make = (faults: ReadonlySet<StoreFault>, guard: DatabaseGuard) => Effect.g
         sql`SELECT EXISTS (SELECT 1 FROM upstream_analysis u WHERE u.package = ${name} AND (u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))) AS scored`,
         z.tuple([z.object({ scored: z.boolean() })]).transform(([r]) => r.scored),
       ),
+    upstreamAdmitted: ({ keys, outcomes }) =>
+      keys.length === 0
+        ? Effect.succeed(false)
+        : run(
+            "upstreamAdmitted",
+            sql`WITH k AS (SELECT * FROM jsonb_to_recordset(${JSON.stringify(keys.map((k) => ({ package: k.package, version: k.version, digest: k.digest })))}::jsonb) AS k(package text, version text, digest text))
+                SELECT EXISTS (SELECT 1 FROM upstream_analysis u JOIN k ON u.package = k.package AND u.version = k.version AND u.digest = k.digest WHERE u.scorer = ${SCORER} OR (u.scorer = ${PREVIOUS_SCORER} AND apm_v10_reusable(u.analysis)))
+                  OR (${outcomes} AND EXISTS (SELECT 1 FROM analysis_outcomes o WHERE (o.package, o.version) IN (SELECT package, version FROM k) AND (o.scorer = ${SCORER} OR (o.scorer = ${PREVIOUS_SCORER} AND apm_v10_outcome_reusable(o.outcome))) AND o.outcome IS NOT NULL)) AS admitted`,
+            z.tuple([z.object({ admitted: z.boolean() })]).transform(([r]) => r.admitted),
+          ),
     latestUpstreamAnalyses: (versions) =>
       Effect.gen(function* () {
         if (versions.length === 0) return new Map<string, unknown>();

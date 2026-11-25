@@ -339,7 +339,7 @@ export const wantedAnalyses = (store: StoreApi, name: string, versions: readonly
 };
 
 /** One version of scoredPackage: its stored analysis for its exact bytes, or why it can never be scored. */
-export function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
+function scoredVersion(v: Omit<VersionRecord, "score">, { scores, unscorable }: UpstreamAnalyses): VersionRecord {
   const d = digestOf(v);
   const score = d ? (scores.get(`${v.version} ${digestLabel(d)}`) ?? null) : null;
   const why = score === null ? unscorable.get(v.version) : undefined;

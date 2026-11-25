@@ -1168,19 +1168,50 @@ describe("a resolve reads the analyses of the versions it picks, not every one s
     }));
 
   // Review of ef5ace1: a package page reads the analyses of the versions it shows and keeps, so one scored only in an
-  // older version its summary leaves out was not kept, where a read of its whole history kept it
-  test("a package scored only in a version its summary leaves out is kept", () =>
+  // older version its summary leaves out was not kept, where a read of its whole history kept it. Review of e68dcd8:
+  // deciding that by reading those older analyses read all 16 MB of next's history again, whatever the trim left
+  test("a package scored only in versions its summary leaves out is kept, and deciding so reads none of their analyses", () =>
     withRig(async ({ url, npm, sql }) => {
-      const versions = Array.from({ length: KEPT_VERSIONS + 30 }, (_, i) => `0.0.${i + 1}`);
+      // next's shape: 60 analyses of about 270 kB, of none of the newest KEPT_VERSIONS versions, in a member no trim drops
+      const versions = Array.from({ length: KEPT_VERSIONS + 60 }, (_, i) => `0.0.${i + 1}`);
+      const label = (name: string, v: string) => digestLabel(digestOf({ integrity: integrityOf(`${name}@${v}`), shasum: "1".repeat(40) }) ?? fail());
+      const big = { ...analysis, padding: "x".repeat(270_000) };
 
-      npm.docs.set("oldscored", versions.map((v) => doc("oldscored", v)));
-      versions.forEach((v, i) => npm.times.set(`oldscored@${v}`, NOW - (400 - i) * DAY));
-      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('oldscored', '0.0.1', $1, $2, $3::jsonb, 1)", [digestLabel(digestOf({ integrity: integrityOf("oldscored@0.0.1"), shasum: "1".repeat(40) }) ?? fail()), SCORER, JSON.stringify(analysis)]);
-      const r = await routed(url, npm.url, "/-/apm/v1/packages/oldscored");
-      const kept = z.array(z.object({ package: z.string(), versions: z.coerce.number() })).parse(await sql("SELECT package, jsonb_array_length(summary -> 'versions') AS versions FROM kept_packages"));
+      // and a package kept without a score (KEPT_WITHOUT_SCORE) that apm could only decide it cannot score, long ago
+      for (const name of ["oldscored", "@next/swc-oldonly"]) {
+        npm.docs.set(name, versions.map((v) => doc(name, v)));
 
-      expect(r.status).toBe(200);
-      // 0.0.1 is not among the versions kept: the newest KEPT_VERSIONS by publish time and by number
-      expect(kept).toEqual([{ package: "oldscored", versions: KEPT_VERSIONS }]);
+        for (const [i, v] of versions.entries()) npm.times.set(`${name}@${v}`, NOW - (400 - i) * DAY);
+      }
+
+      for (const v of versions.slice(0, 60)) {
+        await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ('oldscored', $1, $2, $3, $4::jsonb, 1)", [v, label("oldscored", v), SCORER, JSON.stringify(big)]);
+      }
+
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail, digest, decided_at) VALUES ('@next/swc-oldonly', '0.0.1', $1, 'too-large', 'over the cap', $2, 1)", [SCORER, label("@next/swc-oldonly", "0.0.1")]);
+      const [stored] = await sql("SELECT sum(octet_length(analysis::text))::bigint AS bytes FROM upstream_analysis WHERE package = 'oldscored'");
+      const proxy = await measured(url);
+
+      try {
+        for (const name of ["oldscored", "@next/swc-oldonly"]) {
+          const before = proxy.total();
+          const r = await routed(proxy.url, npm.url, `/-/apm/v1/packages/${encodeURIComponent(name)}`);
+
+          expect(r.status).toBe(200);
+          // no row yet: the page reads npm's packument, and admission asks only whether the older versions have one
+          expect(proxy.total() - before).toBeLessThan(50_000);
+        }
+      } finally {
+        proxy.close();
+      }
+
+      const kept = z.array(z.object({ package: z.string(), versions: z.coerce.number() })).parse(await sql("SELECT package, jsonb_array_length(summary -> 'versions') AS versions FROM kept_packages ORDER BY package"));
+
+      expect(z.object({ bytes: z.coerce.number() }).parse(stored).bytes).toBeGreaterThan(16_000_000);
+      // 0.0.1 to 0.0.60 are not among the versions kept: the newest KEPT_VERSIONS by publish time and by number
+      expect(kept).toEqual([
+        { package: "@next/swc-oldonly", versions: KEPT_VERSIONS },
+        { package: "oldscored", versions: KEPT_VERSIONS },
+      ]);
     }));
 });
