@@ -8,7 +8,7 @@ export function agentCard() {
   return {
     name: "apm",
     description:
-      "A package registry in front of npm. Scores every version out of 100 with file:line evidence, holds new versions for 24 hours, and lets maintainers yank or revoke a bad version. Ask it before installing a package.",
+      "A package registry in front of npm. Scores every version out of 100 with file:line evidence, recommends versions past a 24-hour cooldown, and lets maintainers yank or revoke a bad version. Ask it before installing a package.",
     url: siteUrl("/"),
     version: "1.0.0",
     provider: { organization: "apm", url: siteUrl("/") },
