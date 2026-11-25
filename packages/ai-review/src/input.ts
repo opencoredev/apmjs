@@ -188,7 +188,8 @@ export function buildFilesInput(input: { name: string; version: string; pkg: Pac
   }
 
   const inScope = shown.length + (pj ? 1 : 0);
-  const binaries = pkg.files.filter((f) => kindOf(f) === "binary");
+  const shownSet = new Set(shown);
+  const binaries = pkg.files.filter((f) => kindOf(f) === "binary" && !shownSet.has(f));
 
   return finish({ name: input.name, version: input.version, previous: null, pkg, b, extra: [], inScope, binaries, tooLarge });
 }
@@ -271,7 +272,8 @@ export function buildDiffInput(input: { name: string; version: string; previousV
 
   const touched = [...added, ...changed];
   const inScope = shown.length + (touched.some((f) => f.path === "package.json") ? 1 : 0);
-  const binaries = touched.filter((f) => kindOf(f) === "binary");
+  const shownSet = new Set(shown);
+  const binaries = touched.filter((f) => kindOf(f) === "binary" && !shownSet.has(f));
   const read = pjChanged ? b.read : b.read.filter((p) => p !== "package.json");
   const partial = pjChanged ? b.partial : b.partial.filter((p) => p !== "package.json");
 
