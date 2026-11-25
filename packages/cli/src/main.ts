@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSyn
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
-import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
+import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, isValidVersion, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
 import { Api, ApiError, AuditResponse, NameResponse, RATE_LIMIT_RETRY, ResolveFail, ResolveOk, ResolvePending, ScoreResponse, Tree, encodeName, parseSpec, type Capability, type InstallWarning, type Report } from "./api.ts";
 import { installedPackages, isValidRange, type Found, type Installed } from "./audit.ts";
 import { explainCommand, searchCommand, type AgentIo } from "./agent.ts";
@@ -2105,8 +2105,6 @@ async function cmdWhoami(): Promise<number> {
 }
 
 // ---------- publish ----------
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-
 /**
  * The version `npm version <kind>` gives (semver's inc): a prerelease is bumped to its own release when that release is
  * of the kind asked for (1.2.0-beta.1 minor -> 1.2.0, 2.0.0-beta.1 major -> 2.0.0), else past it. An exact version must
@@ -2120,7 +2118,7 @@ function bump(version: string, kind: string): string | null {
   if (kind === "major") return pre && min === 0 && pat === 0 ? `${maj}.0.0` : `${maj + 1}.0.0`;
   if (kind === "minor") return pre && pat === 0 ? `${maj}.${min}.0` : `${maj}.${min + 1}.0`;
   if (kind === "patch") return pre ? `${maj}.${min}.${pat}` : `${maj}.${min}.${pat + 1}`;
-  return SEMVER.test(kind) ? kind : null;
+  return isValidVersion(kind) ? kind : null;
 }
 
 function walkFiles(root: string, limit = 5000): FileLike[] {

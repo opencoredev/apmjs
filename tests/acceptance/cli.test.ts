@@ -318,10 +318,15 @@ describe("apm: publish", () => {
     const sb = makeSandbox(reg, alice);
     const d = writePackage(work, { name: "bad-bump", version: "1.0.0" }, reg, alice);
     const before = readFileSync(join(d, "package.json"), "utf8");
-    const r = await apm(["publish", "--bump", "1.2.3garbage"], { cwd: d, env: sb.env });
 
-    expect(r.code, r.out).toBe(2);
-    expect(readFileSync(join(d, "package.json"), "utf8")).toBe(before);
+    // a prefix that looks like a version, and a numeric prerelease part with a leading zero (not semver 2.0)
+    for (const bad of ["1.2.3garbage", "1.2.3-01"]) {
+      const r = await apm(["publish", "--bump", bad], { cwd: d, env: sb.env });
+
+      expect(r.code, r.out).toBe(2);
+      expect(readFileSync(join(d, "package.json"), "utf8")).toBe(before);
+    }
+
     const { status } = await getJson(`${reg.url}bad-bump`);
     expect(status).toBe(404);
   });
