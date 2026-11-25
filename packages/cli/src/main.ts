@@ -22,6 +22,7 @@ import { projectLayout, withMemberNames, type Layout } from "./project.ts";
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
+import { argsError, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
   const v = a.flags.get(k);
@@ -2276,6 +2277,7 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm incident --since <time> [--dry-run]   account compromised: revoke tokens and recent versions
   apm login | whoami        sign in through the browser; publishes then wait for your approval
   apm <anything else>        passed to your package manager (apm run dev = bun run dev)
+  apm <command> --help       that command's flags (also -h, or apm help <command>); runs nothing
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
   --strict (or APM_STRICT=1): refuse a version inside the 24-hour cooldown (the newest older one is used), a score
@@ -2296,19 +2298,57 @@ const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain"
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  // apm's --pm, as `--pm x` or `--pm=x`, is not the package manager's
-  const args = a.raw.filter((x, i, arr) => x !== "--pm" && !x.startsWith("--pm=") && arr[i - 1] !== "--pm");
+  // apm's --pm is taken out only before --; after it, every argument is the package manager's
+  const end = a.raw.indexOf("--");
+  const own = end === -1 ? a.raw : a.raw.slice(0, end);
+  const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
 
   return (await runCmd([det.pm, a.cmd, ...args], { cwd, env: INSTALLS.has(a.cmd) ? withoutSecrets(process.env) : env() })).code;
 }
 
+/** The help these arguments ask for, or null when they ask for none. */
+function helpFor(a: Args): string | null {
+  if (a.cmd === "help") return helpTopic(a.positional[0] ?? "")?.help ?? HELP;
+  if (a.cmd === "--help" || a.cmd === "-h") return HELP;
+
+  return has(a, "help") ? (commandOf(a.cmd)?.help ?? null) : null;
+}
+
+/**
+ * Refuses, before anything runs, a flag in place of the command (`apm --pm npm add x` would reach the package manager
+ * unchecked) and arguments a command of apm's does not read. `apm install` with no packages is the package manager's.
+ */
+function refuseArgs(a: Args): boolean {
+  if (a.cmd.startsWith("-") && a.cmd !== "--version" && a.cmd !== "-v") {
+    fail(`apm: ${a.cmd} is not a command; put flags after it (apm <command> [flags]). apm --help lists the commands.`);
+
+    return true;
+  }
+
+  const pm = a.flags.get("pm");
+
+  if (pm === true || pm === "") {
+    fail("apm: --pm needs a value (bun, npm, pnpm or yarn). Nothing was run.");
+
+    return true;
+  }
+
+  const command = commandOf(a.cmd);
+
+  if (command === undefined || ((a.cmd === "install" || a.cmd === "i") && a.positional.length === 0)) return false;
+  const error = argsError(a, command);
+
+  if (error === null) return false;
+  fail(`apm: ${error}. Nothing was run.`);
+  say(`Run apm ${a.cmd} --help for its flags.`);
+
+  return true;
+}
+
 async function main(a: Args): Promise<number> {
+  if (refuseArgs(a)) return 2;
+
   switch (a.cmd) {
-    case "help":
-    case "--help":
-    case "-h":
-      say(HELP);
-      return 0;
     case "--version":
     case "-v":
       say(CLI_VERSION);
@@ -2349,18 +2389,25 @@ async function main(a: Args): Promise<number> {
 }
 
 const args = parseArgs(process.argv.slice(2));
+const help = helpFor(args);
 
 // `apm install` with no packages is the package manager's own install, and so is its --json
 const ownsJson = JSON_COMMANDS.has(args.cmd) && !((args.cmd === "install" || args.cmd === "i") && args.positional.length === 0);
 
 jsonMode = has(args, "json");
-try {
-  process.exitCode = await main(args);
 
-  if (ownsJson) emit({ ok: process.exitCode === 0, error: lastError ?? (process.exitCode !== 0 ? lastWarn : null) });
-} catch (e) {
-  fail(`apm: ${e instanceof Error ? e.message : String(e)}`);
+if (help !== null) {
+  // help goes to stdout with or without --json, and nothing else runs
+  process.stdout.write(`${help}\n`);
+} else {
+  try {
+    process.exitCode = await main(args);
 
-  if (ownsJson) emit({ ok: false, error: lastError });
-  process.exitCode = 1;
+    if (ownsJson) emit({ ok: process.exitCode === 0, error: lastError ?? (process.exitCode !== 0 ? lastWarn : null) });
+  } catch (e) {
+    fail(`apm: ${e instanceof Error ? e.message : String(e)}`);
+
+    if (ownsJson) emit({ ok: false, error: lastError });
+    process.exitCode = 1;
+  }
 }
