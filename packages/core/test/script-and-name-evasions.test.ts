@@ -696,3 +696,19 @@ describe("the shell reading's doubts stay within the invocation, and built words
     }
   });
 });
+
+describe("npm's boolean and directory flags in the shell reading", () => {
+  const ids = (scripts: Record<string, string>) => scoreOf({ scripts }, {}).ids;
+
+  test("a boolean flag takes no value, so --ignore-scripts holds and the word after the name is an argument", () => {
+    expect(ids({ postinstall: "npm run '--ignore-scripts' '--color' check", check: "echo check", precheck: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm run '--no-color' check report", check: "echo check", report: DROPPER })).not.toContain("install-download");
+    expect(ids({ postinstall: "npm run '--color' true check", check: DROPPER })).toContain("install-download");
+  });
+
+  test("--prefix to another directory runs that package's scripts, and to the package's own runs these", () => {
+    for (const postinstall of ["npm '--prefix' tools run check", "npm '--prefix=tools' run check"]) expect(ids({ postinstall, check: DROPPER })).not.toContain("install-download");
+
+    expect(ids({ postinstall: "npm '--prefix' . run check", check: DROPPER })).toContain("install-download");
+  });
+});

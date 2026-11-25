@@ -61,8 +61,23 @@ const BARE_RUN_REF = /(?:^|[;&|(]\s*|\s)(?:npm\s+(?:run(?:-script)?\s+([\w:.@/-]
 const IGNORE_SCRIPTS = /(?<!\S)--ignore-scripts(?:=true)?(?!\S)/;
 const ENABLES = new Set(["--ignore-scripts", "--ignore-scripts=true"]);
 
-// npm's flags that take no value, so the word after one is never read as its value
-const NPM_BOOLEAN_FLAGS = new Set(["--silent", "-s", "--quiet", "-q", "--verbose", "-d", "-dd", "-ddd", "--if-present", "--foreground-scripts", "--workspaces", "-ws", "--include-workspace-root"]);
+// npm's boolean flags: the word after one is its value only when it is `true` or `false` (nopt), and a `--no-` flag
+// never takes one (npmBoolean)
+const NPM_BOOLEAN_FLAGS = new Set([
+  "--silent", "-s", "--quiet", "-q", "--verbose", "-d", "-dd", "-ddd", "--if-present", "--foreground-scripts", "--workspaces", "-ws",
+  "--include-workspace-root", "--color", "--progress", "--unicode", "--timing", "--json", "--parseable", "-p", "--long", "-l",
+  "--offline", "--prefer-offline", "--prefer-online", "--dry-run", "--force", "-f", "--global", "-g", "--yes", "-y", "--audit",
+  "--fund", "--update-notifier", "--strict-ssl", "--legacy-peer-deps", "--usage", "-h",
+]);
+
+/** Whether npm reads `w` as a boolean flag; `--no-x` sets x to false (ignore-scripts' own are doubts, not flags). */
+function npmBoolean(w: string): boolean {
+  return NPM_BOOLEAN_FLAGS.has(w) || (/^--no-[\w-]+$/.test(w) && !/ig/i.test(w));
+}
+
+// npm's flags that set the directory it runs in: with any other value than the package's own, npm runs the scripts of
+// the package.json there, not these
+const NPM_PREFIX_FLAGS = new Set(["--prefix", "-C"]);
 
 // npm's flags that take the next word as their value when it is not itself a flag
 const NPM_VALUE_FLAGS = new Set(["--loglevel", "--prefix", "-C", "--workspace", "-w", "--registry", "--userconfig", "--globalconfig", "--cache", "--script-shell", "--tag", "--otp", "--scope", "--node-options"]);
@@ -228,7 +243,10 @@ function setsIgnoreScripts(ws: readonly string[]): boolean {
   for (let i = 0; i < ws.length; i++) {
     const w = ws[i] ?? "";
 
-    if (ENABLES.has(w) || NPM_BOOLEAN_FLAGS.has(w) || w === "run" || w === "run-script" || w === "--") continue;
+    if (ENABLES.has(w) || npmBoolean(w) || w === "run" || w === "run-script" || w === "--") {
+      if (npmBoolean(w) && /^(?:true|false)$/.test(ws[i + 1] ?? "")) i++;
+      continue;
+    }
 
     if (/^--?[\w-]+=/.test(w) && !/ig/i.test(w)) continue;
 
@@ -427,7 +445,7 @@ interface RunState {
   pm: string | null;
   pmEnd: number;
   phase: "manager" | "run" | "named";
-  after: "no" | "maybe" | "value";
+  after: "no" | "maybe" | "value" | "bool";
   before: string[];
   atStart: boolean;
   wrapper: string | null;
@@ -541,9 +559,13 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 
       if (s.phase === "run" || s.pm === "yarn" || s.pm === "pnpm") s.phase = "named";
     } else if (w.length > 1 && w.startsWith("-")) {
-      s.after = w.includes("=") || NPM_BOOLEAN_FLAGS.has(w) || ENABLES.has(w) ? "no" : s.pm === "npm" && NPM_VALUE_FLAGS.has(w) ? "value" : "maybe";
+      s.after = w.includes("=") || ENABLES.has(w) ? "no" : npmBoolean(w) ? (s.pm === "npm" ? "bool" : "no") : s.pm === "npm" && NPM_VALUE_FLAGS.has(w) ? "value" : "maybe";
       s.before.push(w);
-    } else if (s.after === "value") {
+
+      if (s.pm === "npm" && NPM_PREFIX_FLAGS.has(w.split("=")[0] ?? w) && w.includes("=") && !/^-[\w-]+=\.\/?$/.test(w)) s.pm = null;
+    } else if (s.after === "value" || (s.after === "bool" && /^(?:true|false)$/.test(w))) {
+      // another directory's package runs its own scripts
+      if (s.after === "value" && NPM_PREFIX_FLAGS.has(s.before.at(-1) ?? "") && !/^\.\/?$/.test(w)) s.pm = null;
       s.after = "no";
       s.before.push(w);
     } else if (s.phase === "manager" && (w === "run" || (s.pm === "npm" && w === "run-script"))) {
