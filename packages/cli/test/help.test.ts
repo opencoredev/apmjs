@@ -31,7 +31,7 @@ afterAll(() => {
 
 type Run = { code: number; out: string; err: string; pmCalls: string[]; files: string[]; packageJson: string };
 
-async function apm(argv: string[]): Promise<Run> {
+async function apm(argv: string[], yarnVersion = "4.5.0"): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), "apm-help-"));
   const cwd = join(root, "pkg");
   const bin = join(root, "bin");
@@ -43,7 +43,9 @@ async function apm(argv: string[]): Promise<Run> {
   writeFileSync(join(cwd, "index.js"), "module.exports = 1;\n");
 
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
-    writeFileSync(join(bin, pm), `#!/bin/sh\necho "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
+    const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : "";
+
+    writeFileSync(join(bin, pm), `#!/bin/sh\n${version}echo "${pm} $*" >> ${JSON.stringify(log)}\nexit 0\n`);
     chmodSync(join(bin, pm), 0o755);
   }
 
@@ -274,8 +276,8 @@ describe("what still goes to the package manager", () => {
   });
 
   // a bare install checks nothing, so no word of it may reach the package manager as a package: bun 1.1 to 1.3 install
-  // the word after an option they do not know, npm reads --audit=off as a package off, and a value-taking option apm does
-  // not know takes the next option as its value. Only plain switches, and npm's --tag and --omit with a checked value, pass.
+  // the word after an option they do not know, npm reads --audit=off as a package off, and an option that takes a value
+  // takes the next one as its value. Plain switches pass, and npm's --tag and --omit with a checked value.
   const refusedBare = (word: string, pm: string) => `apm install with no packages does not pass ${word} on to ${pm}`;
 
   test.each([
@@ -291,16 +293,47 @@ describe("what still goes to the package manager", () => {
     [["install", "--pm", "npm", "--floor", "left-pad"], refusedBare("--floor", "npm")],
     [["install", "--pm", "npm", "--audit=off"], refusedBare("--audit=off", "npm")],
     [["install", "--pm", "npm", "--prefix", "--tag", "left-pad"], refusedBare("--prefix", "npm")],
+    [["install", "--pm", "npm", "--registry", "--pm", "npm", "--omit", "dev"], refusedBare("--registry", "npm")],
     [["install", "--pm", "npm", "---", "left-pad"], "unknown flag - for apm install"],
     [["install", "--pm", "npm", "---"], refusedBare("---", "npm")],
     [["install", "--pm", "npm", "--tag", "1.x"], refusedBare("--tag", "npm")],
     [["install", "--pm", "npm", "--omit", "left-pad"], refusedBare("--omit", "npm")],
     [["install", "--pm", "pnpm", "--force=off"], refusedBare("--force=off", "pnpm")],
+    [["install", "-P"], refusedBare("-P", "bun")],
     [["install", "--pm", "--pm", "npm", "--tag", "left-pad"], "--pm needs a value"],
     [["install", "--pm=", "--pm", "npm"], "--pm needs a value"],
-    // yarn 1 ignores --immutable and would rewrite the lockfile; yarn 2 and later read --frozen-lockfile as --immutable
-    [["install", "--pm", "yarn", "--immutable"], refusedBare("--immutable", "yarn")],
-    [["install", "--json"], refusedBare("--json", "bun")],
+    [["install", "--pm", "", "--pm", "npm"], "--pm needs a value"],
+    [["install", "--pm", "npm", "--loglevel", "--tag=next"], refusedBare("--loglevel", "npm")],
+    [["install", "--pm", "npm", "--global"], "does not pass --global on to npm"],
+    [["install", "--global", "--frozen-lockfile"], "does not pass --global on to bun"],
+    [["install", "--pm", "pnpm", "--global"], "does not pass --global on to pnpm"],
+    [["install", "--pm", "npm", "--location", "--force"], "does not pass --location on to npm"],
+    [["install", "-g"], refusedBare("-g", "bun")],
+    [["install", "--pm", "npm", "--g"], "does not pass --g on to npm"],
+    [["install", "--pm", "npm", "--no-no-global"], "does not pass --no-no-global on to npm"],
+    [["install", "--pm", "npm", "--loca", "--force"], "does not pass --loca on to npm"],
+    [["install", "--pm", "npm", "--global=true"], "does not pass --global=true on to npm"],
+    [["install", "--pm", "pnpm", "--frozen-lockfile=off"], refusedBare("--frozen-lockfile=off", "pnpm")],
+    [["install", "--pm", "pnpm", "--frozen-lockfile=true"], refusedBare("--frozen-lockfile=true", "pnpm")],
+    [["install", "--pm", "npm", "--gf"], refusedBare("--gf", "npm")],
+    [["install", "--pm", "pnpm", "--local=false"], refusedBare("--local=false", "pnpm")],
+    [["install", "--pm", "npm", "--quiet=false"], refusedBare("--quiet=false", "npm")],
+    [["install", "--pm", "npm", "--prefix=true"], refusedBare("--prefix=true", "npm")],
+    [["install", "--cwd=true"], refusedBare("--cwd=true", "bun")],
+    [["install", "--pm", "yarn", "--immutable=true"], refusedBare("--immutable=true", "yarn")],
+    [["install", "--pm", "npm", "--global-style"], refusedBare("--global-style", "npm")],
+    [["install", "--pm", "npm", "--frozen-lockfile"], "npm ignores --frozen-lockfile and may rewrite package-lock.json"],
+    [["install", "--pm", "pnpm", "--frozen-lockfile", "--fix-lockfile"], refusedBare("--fix-lockfile", "pnpm")],
+    [["install", "--pm", "yarn", "--frozen-lockfile", "--force"], refusedBare("--force", "yarn")],
+    [["install", "--pm", "pnpm", "--no-frozen-lockfile"], refusedBare("--no-frozen-lockfile", "pnpm")],
+    [["install", "--pm", "pnpm", "--lockfile-only"], refusedBare("--lockfile-only", "pnpm")],
+    [["install", "--pm", "npm", "--no-package-lock"], refusedBare("--no-package-lock", "npm")],
+    [["install", "--pm", "npm", "--workspaces"], refusedBare("--workspaces", "npm")],
+    [["install", "--pm", "yarn", "--pure-lockfile"], refusedBare("--pure-lockfile", "yarn")],
+    [["install", "--no-save"], refusedBare("--no-save", "bun")],
+    [["install", "--pm", "pnpm", "--ignore-pnpmfile"], refusedBare("--ignore-pnpmfile", "pnpm")],
+    [["install", "--pm", "pnpm", "--legacy-peer-deps"], refusedBare("--legacy-peer-deps", "pnpm")],
+    [["install", "--pm", "yarn", "--check-cache"], "passes on only switches of yarn's own install such as --frozen-lockfile"],
     [["install", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--pm", "npm", "--", "left-pad"], "unknown flag -- for apm install"],
     [["install", "--", "--cooldown", "left-pad"], refusedBare("--", "bun")],
@@ -313,17 +346,39 @@ describe("what still goes to the package manager", () => {
     expectNothingRan(r);
   });
 
+  // everyday forms 0.1.5 passed on still run (HOME-355's matrix and common CI flags)
   test.each([
+    [["install"], "bun install"],
+    [["install", "--pm", "npm"], "npm install"],
+    [["install", "--pm", "npm", "--tag", "next"], "npm install --tag next"],
     [["install", "--pm", "npm", "--omit", "dev"], "npm install --omit dev"],
     [["install", "--pm", "npm", "--omit=peer", "--tag=beta", "--no-audit"], "npm install --omit=peer --tag=beta --no-audit"],
+    [["install", "--pm", "npm", "--legacy-peer-deps", "--tag", "next", "--force"], "npm install --legacy-peer-deps --tag next --force"],
+    [["install", "--pm", "npm", "--silent", "--tag", "next", "--no-audit", "--omit", "dev"], "npm install --silent --tag next --no-audit --omit dev"],
     [["i", "--frozen-lockfile", "--production"], "bun install --frozen-lockfile --production"],
+    [["install", "--force"], "bun install --force"],
+    [["install", "--json"], "bun install --json"],
     [["install", "--pm=pnpm", "--frozen-lockfile", "--prod"], "pnpm install --frozen-lockfile --prod"],
-    [["install", "--pm", "yarn", "--frozen-lockfile"], "yarn install --frozen-lockfile"],
+    [["install", "--pm", "yarn", "--frozen-lockfile", "--ignore-engines"], "yarn install --frozen-lockfile --ignore-engines"],
+    [["install", "--pm", "yarn", "--immutable"], "yarn install --immutable"],
+    [["install", "--pm", "pnpm", "--force", "--ignore-scripts"], "pnpm install --force --ignore-scripts"],
+    [["install", "--pm", "yarn", "--frozen-lockfile", "--json", "--production"], "yarn install --frozen-lockfile --json --production"],
+    [["install", "--pm", "npm", "--tag", "next", "--force"], "npm install --tag next --force"],
+    [["install", "--pm", "npm", "--package-lock-only", "--omit", "dev"], "npm install --package-lock-only --omit dev"],
+    [["install", "--pm", "npm", "--json", "--omit", "dev"], "npm install --json --omit dev"],
   ])("apm %p is the package manager's install: no word of it can be a package", async (argv, call) => {
     const r = await apm(argv);
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
+  });
+
+  test("apm install --immutable is refused on yarn 1, which ignores it and rewrites a stale yarn.lock", async () => {
+    const r = await apm(["install", "--pm", "yarn", "--immutable"], "1.22.22");
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("yarn 1.22.22 ignores --immutable and may rewrite yarn.lock; use --frozen-lockfile");
+    expectNothingRan(r);
   });
 
   test("apm run dev --help is the package manager's", async () => {
