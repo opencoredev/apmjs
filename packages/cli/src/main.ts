@@ -2233,7 +2233,7 @@ const NAME_POLICY_TIMEOUT_MS = 5_000;
 
 const AuthConfig = z.object({ namePolicy: z.enum(["scoped", "open"]) }).loose();
 
-/** The registry's policy for new names: "scoped" (production: only under your GitHub login), "open", or null when unknown. */
+/** The registry's policy for new names: "scoped" (only under your account name; on production, your GitHub login), "open", or null when unknown. */
 async function namePolicy(api: Api): Promise<"scoped" | "open" | null> {
   try {
     const answer = await api.raw("-/apm/v1/auth/config", {}, NAME_POLICY_TIMEOUT_MS);
@@ -2269,7 +2269,7 @@ async function cmdName(a: Args): Promise<number> {
   }
   const scope = /^@([^/]+)\//.exec(r.query)?.[1] ?? null;
   const base = r.query.slice(scope === null ? 0 : scope.length + 2);
-  const yours = user === "" ? "@<your GitHub login>" : `@${user.toLowerCase()}`;
+  const yours = user === "" ? "@<your account name>" : `@${user.toLowerCase()}`;
 
   // the registry reads the name lowercased; a new package's name must be lowercase as typed
   if (r.valid && q.trim() !== r.query) {
@@ -2282,7 +2282,7 @@ async function cmdName(a: Args): Promise<number> {
   else if (r.taken) say(`${red("✗")} ${bold(r.query)} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}`);
   else if (r.available && (scope === null || scope !== user.toLowerCase())) {
     // a scope is its owner's under every policy (access.ts newNameRefusal); a bare name depends on the registry's rules
-    // for new names: "scoped" (production) takes one only under its publisher's GitHub login, and rules apm could not
+    // for new names: "scoped" (production) takes one only under its publisher's account name, and rules apm could not
     // read are said so, never called available
     const policy = scope === null ? await namePolicy(api) : null;
     const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
@@ -2290,7 +2290,7 @@ async function cmdName(a: Args): Promise<number> {
 
     if (scope === null && policy === "open") say(`${green("✓")} ${bold(r.query)} is available`);
     else if (scope === null && policy === null) say(`${yellow("!")} ${bold(r.query)} is free, but apm could not read this registry's rules for new names, so it cannot say whether you may publish it (apm's own registry takes a new package only under your GitHub login)`);
-    else if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Instead, ${instead}`);
+    else if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, ${instead}`);
     else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Run apm login, then ask again to see whether that is you`);
     else say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}`);
   } else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);

@@ -240,7 +240,7 @@ describe("apm's messages for first-time users", () => {
     const bare = await apm(["name", "my-lib"], { cwd });
 
     expect(bare.code).toBe(0);
-    expect(bare.text).toContain("! my-lib is free but not available: apm does not hand out bare names, so a new package goes under your GitHub login. Instead, use @<your GitHub login>/my-lib (run apm login, then apm name to check it)");
+    expect(bare.text).toContain("! my-lib is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, use @<your account name>/my-lib (run apm login, then apm name to check it)");
 
     const signedIn = await apm(["name", "my-lib"], { cwd, token: true });
 

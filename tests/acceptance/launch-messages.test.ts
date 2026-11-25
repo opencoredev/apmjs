@@ -53,7 +53,7 @@ describe("apm add, as first-time users met it", () => {
   test("a look-alike name installs with a WARNING that names the popular package, and never with \"no warnings\"", async () => {
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice);
-    const r = await apm(["add", "expresss"], { cwd: app, env: sb.env, timeoutMs: 120_000 });
+    const r = await apm(["add", "expresss"], { cwd: app, env: { ...sb.env, TMPDIR: work }, timeoutMs: 120_000 });
 
     expect(r.code, r.out).toBe(0);
     expect(r.out).toContain("! expresss@1.0.0");
@@ -70,7 +70,7 @@ describe("apm add, as first-time users met it", () => {
     expect([200, 201]).toContain(published.status);
     const sb = makeSandbox(reg, alice);
     const app = writeConsumer(work, reg, alice);
-    const r = await apm(["add", "pre-only-pkg"], { cwd: app, env: sb.env, timeoutMs: 120_000 });
+    const r = await apm(["add", "pre-only-pkg"], { cwd: app, env: { ...sb.env, TMPDIR: work }, timeoutMs: 120_000 });
 
     expect(r.code).toBe(1);
     expect(r.out).toContain("pre-only-pkg has no version tagged latest");
@@ -79,7 +79,7 @@ describe("apm add, as first-time users met it", () => {
     expect(r.out).not.toContain("--force does not help");
     expect(r.out).not.toContain("score unknown");
 
-    const tagged = await apm(["add", "pre-only-pkg@next"], { cwd: app, env: sb.env, timeoutMs: 120_000 });
+    const tagged = await apm(["add", "pre-only-pkg@next"], { cwd: app, env: { ...sb.env, TMPDIR: work }, timeoutMs: 120_000 });
 
     expect(tagged.code, tagged.out).toBe(0);
     expect(installedVersion(app, "pre-only-pkg")).toBe("0.0.1-test.1");
