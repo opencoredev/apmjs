@@ -433,17 +433,27 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
   // npm's word is in the text as written unless quotes or escapes split it
   if (!/npm|['"\\]/.test(cmd) || /<<(?!<)|npm_config_/i.test(cmd)) return [];
   const out: { name: string; end: number; alone: boolean }[] = [];
-  const outer: ShellWord[][] = [];
+  // the command being read: its words while it may still be one of the shapes, else only its first (`skip`)
+  const outer: { words: ShellWord[]; skip: boolean }[] = [];
   let words: ShellWord[] = [];
+  let skip = false;
   // a `cd` moves the shell to another directory, whose package.json then holds the scripts npm runs
   let moved = false;
 
   const settle = (): void => {
-    const ref = moved ? null : npmRun(words, scripts);
+    const ref = moved || skip ? null : npmRun(words, scripts);
 
     if (ref !== null) out.push(ref);
     moved ||= CHANGES_DIRECTORY.has(words[0]?.word ?? "");
     words = [];
+    skip = false;
+  };
+
+  const add = (t: ShellWord): void => {
+    if (skip) return;
+
+    if (words.length === 0 || (words[0]?.word === "npm" && words.length < MAX_RUN_WORDS)) words.push(t);
+    else skip = true;
   };
 
   for (const t of shellWords(cmd)) {
@@ -451,13 +461,14 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
     if (t === "cut") return out;
 
     if (t === "(") {
-      outer.push(words);
+      outer.push({ words, skip });
       words = [];
+      skip = false;
     } else if (t === ")") {
       settle();
-      words = outer.pop() ?? [];
+      ({ words, skip } = outer.pop() ?? { words: [], skip: false });
     } else if (t === null) settle();
-    else words.push(t);
+    else add(t);
   }
 
   settle();
@@ -466,6 +477,9 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
 }
 
 type ShellWord = Exclude<ShellToken, null | "(" | ")" | "cut">;
+
+// the most words one of those shapes has: npm, its options and their values, run, `--` and the name
+const MAX_RUN_WORDS = 16;
 
 // the options of the shapes the shell reading reads, each alone or with its value as the next word
 const RUN_OPTIONS = new Set(["-s", "--silent", "--ignore-scripts", "--prefix=.", "--prefix=./"]);
@@ -485,6 +499,9 @@ function npmRun(words: readonly ShellWord[], scripts: Scripts): { name: string; 
     if (/[*?[]/.test(w)) {
       // the shell may expand it to other words, and npm runs what it expands to
       return null;
+    } else if (run && before.at(-1) === "--" && i === rest.length - 1) {
+      // after `--` the last word is the name, whatever it looks like
+      return Object.hasOwn(scripts, w) ? { name: w, end: npm.end, alone: setsIgnoreScripts(before) } : null;
     } else if (RUN_OPTIONS.has(w) || /^--loglevel=\w+$/.test(w)) {
       before.push(w);
     } else if ((w === "--prefix" && OWN_DIRECTORY.test(next)) || (w === "--loglevel" && /^\w+$/.test(next))) {

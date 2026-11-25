@@ -785,3 +785,9 @@ describe("a command cut by the nesting limit", () => {
     expect(expandHooks({ scripts: { postinstall, check: DROPPER } })[0]?.addedScripts).toEqual([]);
   });
 });
+
+describe("after -- the last word is the script's name", () => {
+  test("a script named like an option is followed", () => {
+    expect(scoreOf({ scripts: { postinstall: "npm run '-s' -- '--silent'", "--silent": DROPPER } }, {}).ids).toContain("install-download");
+  });
+});
