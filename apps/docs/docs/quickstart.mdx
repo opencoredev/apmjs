@@ -13,17 +13,14 @@ Pick your package manager. Each setting goes in the project folder, so it applie
 
 <Tabs>
   <Tab title="Bun">
-    Add this to `bunfig.toml`. The scanner makes plain `bun install` refuse revoked and confirmed-malicious versions, and warn about versions scoring under 40 (`APM_SCANNER_STRICT=1` refuses those too).
+    Add this to `bunfig.toml`. Bun then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions and the versions the OSSF malicious-packages feed lists.
 
     ```toml title="bunfig.toml"
     [install]
     registry = "https://registry.apmjs.dev/"
-
-    [install.security]
-    scanner = "@apm/bun-scanner"
     ```
 
-    The scanner is not on a registry yet. Until it is, install it from a clone of apm; see [Bun scanner](/guides/bun-scanner#install-it). Without it, the `registry` line alone still works.
+    Optional: the [Bun scanner](/guides/bun-scanner) also makes `bun install` warn about versions scoring under 40. It is not on a registry yet, so you install it from a clone of apm first, as its guide shows. Add its `[install.security]` lines only after that: with the scanner named in `bunfig.toml` but not installed, every `bun install` fails.
   </Tab>
   <Tab title="npm">
     Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions and the versions the OSSF malicious-packages feed lists. Even to an existing lockfile, the tarballs of revoked and confirmed-malicious versions answer 410, and the tarballs of other OSSF-listed versions answer 403 with the version's MAL- id.
@@ -65,6 +62,8 @@ Install it with one command. The install script downloads one prebuilt binary fo
     ```bash
     brew install opencoredev/tap/apm
     ```
+
+    Keep the full tap path: plain `brew install apm` installs a different tool, Microsoft's apm from homebrew/core. Update with `brew upgrade opencoredev/tap/apm` and uninstall with `brew uninstall opencoredev/tap/apm`. Don't also run the install script: it puts a second apm in `~/.apm/bin`, which can shadow the Homebrew one on your PATH.
   </Tab>
 </Tabs>
 
@@ -77,14 +76,14 @@ export PATH="$HOME/.apm/bin:$PATH"
 apm --version
 ```
 
-`apm --version` prints `0.1.6`. To update, run the install command again. To uninstall, delete `~/.apm`.
+`apm --version` prints `0.1.7`. To update, run the install command again. To uninstall, delete `~/.apm`.
 
 ### What the install script checks
 
 When a version is released, the SHA-256 of each of its binaries is written into the script. The script downloads the binary for your machine from `https://apmjs.dev/cli/<version>/`, compares its SHA-256 with that list, and installs nothing if they differ. It also runs the binary once and installs it only if it reports that version. It prints the fingerprint it checked:
 
 ```
-apm 0.1.6 (darwin-arm64) installed to /Users/you/.apm/bin/apm
+apm 0.1.7 (darwin-arm64) installed to /Users/you/.apm/bin/apm
 SHA-256 <64-char hex digest>, checked against this script
 ```
 
@@ -116,33 +115,41 @@ The script's last line is the call that runs it, so an empty or cut-off download
 To check a binary by hand, compare its SHA-256 with the line for your platform in the script and in the version's published checksums:
 
 ```bash
-curl -fsSL https://apmjs.dev/cli/0.1.6/SHA256SUMS
+curl -fsSL https://apmjs.dev/cli/0.1.7/SHA256SUMS
 shasum -a 256 ~/.apm/bin/apm     # sha256sum on Linux
 ```
 
 The script, the checksums and the binaries all come from apmjs.dev. The check proves the binary is the one released with the script you read; it does not prove who released it.
 
-`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.6`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
+`--version X` or `APM_VERSION=X` installs another released version: `curl -fsSL https://apmjs.dev/install | sh -s -- --version 0.1.7`. `APM_INSTALL=<dir>` installs to `<dir>/bin/apm`. Windows is not supported yet. On Alpine, apm needs `libstdc++` and `libgcc` (`apk add libstdc++ libgcc`).
 
 apm uses the package manager your project already uses: it reads the lockfile, then the `packageManager` field in `package.json`, then falls back to bun when bun is installed and npm when it is not. Pass `--pm npm` to choose.
 
 ## 3. Add a package
 
+Run it in a folder with a `package.json` (`npm init -y` makes one). Like npm, apm uses the nearest `package.json`, so in a folder without one it changes the nearest parent project and says which. The one exception is a `package.json` in your home folder: from a folder below it, `apm add` and `apm remove` refuse and change nothing.
+
 ```bash
 apm add zod
 ```
 
-apm asks the registry for the newest version that is at least 24 hours old and not revoked, yanked or confirmed malicious, prints its score card, and checks every package under it. Then your package manager computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package in it at its exact version. Only a lockfile that passes is written to your project and installed, with install scripts held back until apm has confirmed the install matches it. A revoked or yanked version anywhere in that lockfile refuses the add before anything in your project changes.
+apm asks the registry for the newest version in the range or tag you ask for (`latest` for a bare name) that is not revoked, yanked, confirmed malicious or on the OSSF malicious-packages list, prints its score card, and checks every package under it. With bun, npm and pnpm, your package manager then computes the add's lockfile in a copy of your project, installing nothing, and apm checks every package in it at its exact version. Only a lockfile that passes is written to your project and installed, with install scripts held back until apm has confirmed the install matches it, so a revoked or yanked version anywhere in that lockfile refuses the add before anything in your project changes. One exception: npm can run a git dependency's `prepare` script while it computes the lockfile. Yarn runs install scripts while it installs. Yarn 2 and later compute the lockfile first, and apm checks it before the install and refuses one that fails. Yarn 1, or yarn 2 and later when yarn cannot produce that lockfile or apm cannot read it, installs first, and apm checks what installed afterwards. See [Lockfile first](/reference/cli#lockfile-first).
 
 ```text
-✓ zod@4.6.7  score 90/100 (A)
-   -10 eval  Evaluates code built at runtime (eval, Function, vm)
+✓ zod@4.6.7  score 100/100 (A)
+  ✓ no risk signals found
+  capabilities (what it can do; not scored)
+    filesystem  loads fs to read or write files
+        src/v4/core/tests/locales/parity.test.ts:1: import { readFileSync } from "node:fs"; (in a test file)
+    eval        eval, Function, vm or a Worker from a string
         v4/core/compile.js:184: const factory = new F(...constantNames, factoryCode);
 ```
 
 A score informs; it does not block. If the package or one it brings in scores under 40, was not fully analysed, has no score, or could not be looked up, apm prints a warning with the score, the top reasons (file and line) and a link, then installs. Run `apm add --strict` (or set `APM_STRICT=1`) to refuse those instead.
 
-If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning; `--strict` refuses it. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
+If a package is refused, apm says why and whether `--force` would help. A package or dependency published in the last 24 hours installs with a warning. `--strict` refuses it instead; for the package you name, it skips fresh versions and may pick an older one that passes. `apm explain` looks for an older version in range past the cooldown and says whether to install it. `--force` lifts the cooldown for the named package only, and in strict mode its score floor. Revoked and yanked versions, and versions apm reviewers confirmed malicious, stay blocked.
+
+`apm install` with no package names runs your package manager's own install and checks nothing. The checks happen in `apm add`, and `apm audit` checks what is already installed.
 
 ## Next steps
 
