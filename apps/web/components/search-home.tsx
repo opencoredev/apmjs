@@ -23,8 +23,12 @@ import {
   type SearchHit,
 } from "@/lib/search-schema";
 import { normalizeQuery as normalize, packageHref, searchHref as urlFor } from "@/lib/typeahead";
+import { clickEvent, track } from "@/lib/databuddy-client";
 
 const NAME_CHECK_DEBOUNCE_MS = 250;
+
+/** How long a query's results must stay on screen before they count as one search (package_searched). */
+const SEARCH_SETTLE_MS = 1500;
 
 type PartState<P extends NamePart> = { kind: "loading" } | { kind: "ok"; data: NamePartAnswer[P] } | { kind: "error" };
 
@@ -313,11 +317,28 @@ function NameDisclosure({ q, states }: { q: string; states: NameStates }) {
 
 // ---------- results ----------
 
-function ResultRow({ hit, q, id, active, reserveScore, onHover }: { hit: SearchHit; q: string; id: string; active: boolean; reserveScore: boolean; onHover: () => void }) {
+function ResultRow({
+  hit,
+  q,
+  id,
+  position,
+  active,
+  reserveScore,
+  onHover,
+}: {
+  hit: SearchHit;
+  q: string;
+  id: string;
+  position: number;
+  active: boolean;
+  reserveScore: boolean;
+  onHover: () => void;
+}) {
   return (
     <li role="presentation" className="border-b" onMouseMove={onHover}>
       <Link
         id={id}
+        {...clickEvent({ name: "search_result_opened", props: { package: hit.name, position } })}
         role="option"
         aria-selected={active}
         href={packageHref(hit.name)}
@@ -411,7 +432,7 @@ function Results({
       ) : (
         <ul id={listId} role="listbox" aria-label="Packages" className="border-t">
           {hits.map((hit, i) => (
-            <ResultRow key={hit.name} hit={hit} q={q} id={`${listId}-${i}`} active={i === active} reserveScore={reserveScore} onHover={() => setActive(i)} />
+            <ResultRow key={hit.name} hit={hit} q={q} id={`${listId}-${i}`} position={i + 1} active={i === active} reserveScore={reserveScore} onHover={() => setActive(i)} />
           ))}
         </ul>
       )}
@@ -485,6 +506,20 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // One package_searched per query whose answer stays on screen: its result count only, never the text typed.
+  const counted = useRef<string | null>(null);
+  const shownResults = fresh && q !== "" && current?.kind === "ok" ? current.answer.hits.length : null;
+  useEffect(() => {
+    if (shownResults === null || counted.current === q) return;
+
+    const timer = setTimeout(() => {
+      counted.current = q;
+      track({ name: "package_searched", props: { results: shownResults } });
+    }, SEARCH_SETTLE_MS);
+
+    return () => clearTimeout(timer);
+  }, [q, shownResults]);
+
   useEffect(() => {
     if (active < 0) return;
     document.getElementById(`${listId}-${active}`)?.scrollIntoView({ block: "nearest" });
@@ -511,7 +546,9 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
     setEnterFor(null);
     const exact = current.answer.hits.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
-    if (exact) router.push(packageHref(exact.name));
+    if (!exact) return;
+    track({ name: "search_result_opened", props: { package: exact.name, position: current.answer.hits.indexOf(exact) + 1 } });
+    router.push(packageHref(exact.name));
   }, [enterFor, q, fresh, current, router]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -533,7 +570,9 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
       const selected = active >= 0 ? actionable[active] : actionable.find((h) => h.name.toLowerCase() === q.toLowerCase());
 
-      if (selected) router.push(packageHref(selected.name));
+      if (!selected) return;
+      track({ name: "search_result_opened", props: { package: selected.name, position: actionable.indexOf(selected) + 1 } });
+      router.push(packageHref(selected.name));
     } else if (e.key === "Escape") {
       e.preventDefault();
       update("");

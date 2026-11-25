@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "cn";
+import { clickEvent } from "@/lib/databuddy-client";
 
 const LINKS = [
   { href: "/publish", label: "Publish" },
@@ -31,8 +32,10 @@ function Links({ current }: { current: string | null }) {
           );
         }
 
+        const event = l.href === "https://docs.apmjs.dev" ? clickEvent({ name: "docs_cta_clicked", props: { location: "nav" } }) : {};
+
         return (
-          <Link key={l.href} href={l.href} aria-current={active ? "page" : undefined} className={className}>
+          <Link key={l.href} href={l.href} aria-current={active ? "page" : undefined} className={className} {...event}>
             {l.label}
           </Link>
         );

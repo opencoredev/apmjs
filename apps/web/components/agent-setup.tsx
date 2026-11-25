@@ -10,6 +10,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { CopyBlock, CopyGlyph, CopyStatus, useCopy } from "@/components/copy-button";
 import { INSTRUCTIONS_LINE, mcpSetups, setupPrompt } from "@/lib/agent-prompt";
+import { clickEvent, track } from "@/lib/databuddy-client";
 
 const SETUPS = mcpSetups();
 
@@ -42,7 +43,10 @@ export function AgentSetup() {
             </p>
           </div>
         </div>
-        <Button size="lg" className="w-full sm:w-auto" onClick={() => prompt.copy(setupPrompt(), () => setManual(true))}>
+        <Button size="lg" className="w-full sm:w-auto" onClick={() => {
+            track({ name: "agent_setup_copied", props: { kind: "prompt" } });
+            prompt.copy(setupPrompt(), () => setManual(true));
+          }}>
           <CopyGlyph copied={prompt.state === "copied"} className="[&_svg]:text-current" />
           {prompt.state === "copied" ? "Prompt copied" : "Copy setup prompt"}
         </Button>
@@ -59,13 +63,13 @@ export function AgentSetup() {
           Set up by hand
           <ChevronDownIcon className={cn("size-3.5 transition-transform duration-150", manual && "rotate-180")} aria-hidden />
         </button>
-        <Link href="/docs#agents" className="-mx-1 inline-flex h-7 items-center gap-1 rounded-md px-1 text-muted-foreground transition-colors hover:text-foreground">
+        <Link href="/docs#agents" {...clickEvent({ name: "docs_cta_clicked", props: { location: "agent_setup" } })} className="-mx-1 inline-flex h-7 items-center gap-1 rounded-md px-1 text-muted-foreground transition-colors hover:text-foreground">
           Agent guide
           <ArrowRightIcon className="size-3.5" aria-hidden />
         </Link>
       </div>
       <div id="agent-setup-manual" hidden={!manual} className="min-w-0 flex-col gap-6 border-t p-4 sm:p-5 [&:not([hidden])]:flex">
-        <CopyBlock wrap text={INSTRUCTIONS_LINE} label="Copy the instructions line" caption="Add this line to AGENTS.md, CLAUDE.md or a Cursor rule. Any agent that can fetch a URL can follow it." />
+        <CopyBlock wrap text={INSTRUCTIONS_LINE} label="Copy the instructions line" event={{ name: "agent_setup_copied", props: { kind: "instructions" } }} caption="Add this line to AGENTS.md, CLAUDE.md or a Cursor rule. Any agent that can fetch a URL can follow it." />
         <div className="flex min-w-0 flex-col gap-3">
           <p className="text-[13px] text-muted-foreground">Optional: connect apm&apos;s MCP server, so the agent gets the verdict as a tool call.</p>
           <Tabs
@@ -82,7 +86,7 @@ export function AgentSetup() {
               ))}
             </TabsList>
           </Tabs>
-          <CopyBlock key={key} text={setup.text} label={`Copy the ${setup.agent} setting`} caption={setup.kind === "command" ? `${setup.where}:` : `In ${setup.where}:`} />
+          <CopyBlock key={key} text={setup.text} label={`Copy the ${setup.agent} setting`} event={{ name: "mcp_setup_copied", props: { agent: key, source: "home" } }} caption={setup.kind === "command" ? `${setup.where}:` : `In ${setup.where}:`} />
           <p className="text-[13px] leading-5 text-muted-foreground">Start a new agent session afterwards: the server loads when a session starts.</p>
         </div>
       </div>

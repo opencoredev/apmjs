@@ -1,19 +1,27 @@
 "use client";
 
 import Link from "next/link";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowRightIcon, BotIcon, ChevronRightIcon } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { CopyBlock, CopyGlyph, CopyStatus, useCopy } from "@/components/copy-button";
 import { INSTALL_CLIENTS, InstallClient, installCommand, installNote, type InstallNote } from "@/lib/install-note";
 import { packagePrompt } from "@/lib/agent-prompt";
+import { clickEvent, copyEvent, installDefaultClient, track, type TrackedEvent } from "@/lib/databuddy-client";
 
 const isClient = (v: unknown): v is InstallClient => InstallClient.safeParse(v).success;
 
+/** Databuddy's client id, inlined at build time; "" on every build but production's, which reads no flags. */
+const DATABUDDY_CLIENT_ID = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
+
 function DocsLink({ href }: { href: string }) {
   return (
-    <Link href={href} className="inline-flex items-center gap-1 font-medium whitespace-nowrap text-foreground underline-offset-4 hover:underline">
+    <Link
+      href={href}
+      {...clickEvent({ name: "docs_cta_clicked", props: { location: "install_note" } })}
+      className="inline-flex items-center gap-1 font-medium whitespace-nowrap text-foreground underline-offset-4 hover:underline"
+    >
       Setup guide
       <ArrowRightIcon className="size-3.5" aria-hidden />
     </Link>
@@ -34,7 +42,7 @@ function WithFlags({ text }: { text: string }) {
 }
 
 /** What the selected client's command does and does not check, with the setting a stock client needs. */
-function Note({ note }: { note: InstallNote }) {
+function Note({ note, client }: { note: InstallNote; client: InstallClient }) {
   if (note.kind === "checked") {
     return (
       <div className="flex flex-col gap-1 text-sm leading-6 text-pretty text-muted-foreground">
@@ -57,7 +65,7 @@ function Note({ note }: { note: InstallNote }) {
   return (
     <div className="flex flex-col gap-3 text-sm leading-6 text-pretty text-muted-foreground">
       <p>{note.lead}</p>
-      <CopyBlock oneLine={!note.config.includes("\n")} text={note.config} label={`Copy the ${note.file} setting`} />
+      <CopyBlock oneLine={!note.config.includes("\n")} text={note.config} label={`Copy the ${note.file} setting`} event={{ name: "registry_setup_copied", props: { client } }} />
       <p>
         <WithFlags text={note.effect} /> <DocsLink href={note.docs} />
       </p>
@@ -102,13 +110,14 @@ function AgentPrompt({ name }: { name: string }) {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <Button
           variant="secondary"
-          onClick={() =>
+          onClick={() => {
+            track({ name: "agent_prompt_copied", props: { package: name } });
             copy(prompt, () => {
               if (detailsRef.current) detailsRef.current.open = true;
 
               if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-            })
-          }
+            });
+          }}
         >
           {state === "copied" ? <CopyGlyph copied /> : <BotIcon aria-hidden />}
           {state === "copied" ? "Prompt copied" : "Copy prompt for your agent"}
@@ -130,11 +139,12 @@ function AgentPrompt({ name }: { name: string }) {
             type="button"
             aria-label={state === "copied" ? "Copied" : "Copy the prompt"}
             className="absolute top-1.5 right-1.5 grid size-9 place-items-center rounded-lg bg-background text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-surface hover:text-foreground active:scale-[0.96]"
-            onClick={() =>
+            onClick={() => {
+              track({ name: "agent_prompt_copied", props: { package: name } });
               copy(prompt, () => {
                 if (preRef.current) window.getSelection()?.selectAllChildren(preRef.current);
-              })
-            }
+              });
+            }}
           >
             <CopyGlyph copied={state === "copied"} />
           </button>
@@ -146,9 +156,18 @@ function AgentPrompt({ name }: { name: string }) {
 
 export function InstallTabs({ name, version, registry }: { name: string; version: string | null; registry: string }) {
   const [client, setClient] = useState<InstallClient>("apm");
+  const chosen = useRef(false);
   const { state, copy } = useCopy();
+
+  // The install-default-client flag may start the box on another client; a tab the visitor already picked wins.
+  useEffect(() => {
+    void installDefaultClient({ clientId: DATABUDDY_CLIENT_ID, fallback: "apm" }).then((c) => {
+      if (!chosen.current) setClient(c);
+    });
+  }, []);
   const codeRef = useRef<HTMLElement>(null);
   const command = installCommand({ client, name, version });
+  const copied = { name: "install_command_copied", props: { client, package: name } } as const satisfies TrackedEvent;
 
   return (
     <section data-install aria-labelledby="install" className="flex flex-col gap-3">
@@ -159,7 +178,9 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         <Tabs
           value={client}
           onValueChange={(v) => {
-            if (isClient(v)) setClient(v);
+            if (!isClient(v)) return;
+            chosen.current = true;
+            setClient(v);
           }}
         >
           <TabsList className="h-8 gap-0.5 rounded-lg bg-surface p-0.5">
@@ -172,7 +193,7 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         </Tabs>
       </div>
       <div className="flex items-center gap-2 rounded-xl bg-surface py-1.5 pr-1.5 pl-3 sm:pl-4">
-        <code ref={codeRef} className="min-w-0 flex-1 truncate font-mono text-[15px]">
+        <code ref={codeRef} {...copyEvent(copied)} className="min-w-0 flex-1 truncate font-mono text-[15px]">
           <span className="text-faint select-none">$ </span>
           {command}
         </code>
@@ -180,17 +201,18 @@ export function InstallTabs({ name, version, registry }: { name: string; version
           type="button"
           aria-label={state === "copied" ? "Copied" : "Copy install command"}
           className="grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-[background-color,color,scale] duration-150 hover:bg-background hover:text-foreground active:scale-[0.96]"
-          onClick={() =>
+          onClick={() => {
+            track(copied);
             copy(command, () => {
               if (codeRef.current) window.getSelection()?.selectAllChildren(codeRef.current);
-            })
-          }
+            });
+          }}
         >
           <CopyGlyph copied={state === "copied"} />
         </button>
       </div>
       <CopyStatus state={state} manual="Couldn't copy automatically. The command is selected: press Ctrl+C or ⌘C." />
-      <Note note={installNote({ client, registry })} />
+      <Note note={installNote({ client, registry })} client={client} />
       <AgentPrompt name={name} />
     </section>
   );
