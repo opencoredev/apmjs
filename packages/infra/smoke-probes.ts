@@ -5,7 +5,7 @@
 // unit tests (test/smoke-probes.test.ts) need no network.
 import { z } from "zod";
 
-export type Fetch = (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<Response>;
+export type Fetch = (url: string, init: { headers: Record<string, string>; signal: AbortSignal; redirect: "follow" | "manual" }) => Promise<Response>;
 
 export type Check = { ok: boolean; name: string; detail: string };
 
@@ -21,6 +21,12 @@ export const EXPLAIN = { attemptMs: 30_000, deadlineMs: 60_000, attempts: 3, bac
 
 /** A known-good large package: analysed, scored 98, with a dependency tree the explain walks whole. */
 export const LARGE = { name: "next", version: "16.4.6" } as const;
+
+/**
+ * The user agent of an npm client. The registry redirects a tarball request from npm, pnpm or yarn 1 to npm's own URL
+ * once its checks pass (registry fast-tarball.ts) and streams every other client's, so the refusal is probed as both.
+ */
+export const NPM_CLIENT = "npm/10.9.2 node/v22.12.0 linux x64 workspaces/false";
 
 /** OSV MAL-2026-20430 lists ugent_uws 10.9.9 to 10.9.11; npm still serves them, 10.9.11 as latest, beside a clean 9.0.0. */
 export const OSSF_LISTED = { name: "ugent_uws", version: "10.9.11", id: "MAL-2026-20430" } as const;
@@ -41,9 +47,9 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | null {
 /**
  * A GET, bounded: the answer must start and finish within `timeoutMs`, and its body is read once, up to BODY_CAP. Status
  * null when there is no usable answer (none in time, or one over the cap), the text then saying why; data is the body read
- * as `schema`, null when it is not that.
+ * as `schema`, null when it is not that. With `manual`, a redirect is the answer, not followed.
  */
-export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutMs: number; schema: z.ZodType<T>; accept?: string }): Promise<Got<T>> {
+export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutMs: number; schema: z.ZodType<T>; accept?: string; userAgent?: string; manual?: boolean }): Promise<Got<T>> {
   const signal = AbortSignal.timeout(input.timeoutMs);
   // the deadline also stops a body read the fetch does not tie to the signal
   const stopped = new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(new Error(`no answer within ${input.timeoutMs} ms`)), { once: true }));
@@ -52,7 +58,7 @@ export async function boundedGet<T>(fetch: Fetch, url: string, input: { timeoutM
   stopped.catch(() => undefined);
 
   try {
-    const res = await Promise.race([fetch(url, { headers: { accept: input.accept ?? "application/json", "cache-control": "no-cache" }, signal }), stopped]);
+    const res = await Promise.race([fetch(url, { headers: { accept: input.accept ?? "application/json", "cache-control": "no-cache", ...(input.userAgent ? { "user-agent": input.userAgent } : {}) }, signal, redirect: input.manual ? "manual" : "follow" }), stopped]);
     const media = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? null;
     const chunks: Uint8Array[] = [];
     let size = 0;
@@ -146,7 +152,7 @@ const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[
 
 /**
  * The OSSF-listed version: explain says do-not-install citing its id, the registry refuses its tarball with a 403 citing
- * it (registry osv.ts listedTarballText), and each packument view, answered as the view asked for and for this package,
+ * it (registry osv.ts listedTarballText) to the default client and to npm, a redirect failing either, and each packument view, answered as the view asked for and for this package,
  * leaves it out of its versions while still listing a valid one, and tags as latest a version it lists.
  */
 export async function ossfListed(deps: ProbeDeps): Promise<Check[]> {
@@ -158,10 +164,12 @@ export async function ossfListed(deps: ProbeDeps): Promise<Check[]> {
 
   out.push({ ok: explained.status === 200 && about(d, name, version) && d.verdict === "do-not-install" && cited, name: `explain says do-not-install for an OSSF-listed version (${name}@${version}), citing ${id}`, detail: d ? `verdict ${d.verdict}, ${d.name}@${d.version}, ${cited ? "cites" : "does not cite"} ${id}, ${attempts} attempt${attempts === 1 ? "" : "s"}` : answerOf(explained) });
 
-  const tarball = await boundedGet(deps.fetch, `${deps.registry}${name}/-/${name}-${version}.tgz`, { timeoutMs: REGISTRY_MS, schema: Refused });
-  const refused = tarball.status === 403 && tarball.data?.error.includes(id) === true;
+  for (const [client, userAgent] of [["the default client", undefined], ["npm", NPM_CLIENT]] as const) {
+    const tarball = await boundedGet(deps.fetch, `${deps.registry}${name}/-/${name}-${version}.tgz`, { timeoutMs: REGISTRY_MS, schema: Refused, userAgent, manual: true });
+    const refused = tarball.status === 403 && tarball.data?.error.includes(id) === true;
 
-  out.push({ ok: refused, name: `the registry refuses its tarball with 403, citing ${id}`, detail: refused ? `HTTP 403, ${tarball.data?.error.slice(0, 120)}` : answerOf(tarball) });
+    out.push({ ok: refused, name: `the registry refuses its tarball to ${client} with 403, citing ${id}`, detail: refused ? `HTTP 403, ${tarball.data?.error.slice(0, 120)}` : answerOf(tarball) });
+  }
 
   for (const [view, accept] of [["full", "application/json"], ["install", "application/vnd.npm.install-v1+json"]] as const) {
     const r = await boundedGet(deps.fetch, `${deps.registry}${name}`, { timeoutMs: REGISTRY_MS, schema: Packument, accept });
