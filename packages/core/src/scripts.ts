@@ -32,9 +32,10 @@ export type HookCommand = { from: string; text: string; viaEval: boolean; added:
 /**
  * A lifecycle hook, the commands it reaches and the names of the scripts it runs (itself included). `cut` says why the
  * expansion stopped before it reached every command (nesting past MAX_DEPTH, or more than MAX_COMMANDS commands), or
- * is null when it read them all: a hook read in part is never read as one that runs nothing more.
+ * is null when it read them all: a hook read in part is never read as one that runs nothing more. `addedScripts`: those
+ * of `scripts` only the shell reading reaches (HookCommand.added).
  */
-export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[]; cut: string | null };
+export type ExpandedHook = { hook: string; kind: HookKind; commands: HookCommand[]; scripts: string[]; addedScripts: string[]; cut: string | null };
 
 const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
@@ -414,6 +415,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     if (own === undefined) continue;
     const commands: HookCommand[] = [];
     const followed = new Set<string>([hook]);
+    const addedScripts: string[] = [];
     // what the first two passes read, for the next to read its references in
     const read: { text: string; depth: number }[] = [];
     let cut: string | null = null;
@@ -445,6 +447,8 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
 
           if (body === undefined || followed.has(n) || (pass !== 1 && !admits(from, depth + 1))) continue;
           followed.add(n);
+
+          if (pass === 3) addedScripts.push(n);
           visit(body, from, depth + 1, false, pass);
         }
       }
@@ -480,7 +484,7 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
       }
     }
 
-    out.push({ hook, kind, commands, scripts: [...followed], cut });
+    out.push({ hook, kind, commands, scripts: [...followed], addedScripts, cut });
   }
 
   return out;

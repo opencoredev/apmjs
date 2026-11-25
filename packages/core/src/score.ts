@@ -600,6 +600,15 @@ function invokedFiles(manifest: AnalyzeInput["manifest"], byPath: ReadonlyMap<st
   return out;
 }
 
+/** The hooks as the first two passes read them, without what only the shell reading adds (HookCommand.added). */
+function baselineHooks(hooks: readonly ExpandedHook[]): ExpandedHook[] {
+  return hooks.map((h) => {
+    const added = new Set(h.addedScripts);
+
+    return { ...h, commands: h.commands.filter((c) => !c.added), scripts: h.scripts.filter((s) => !added.has(s)), addedScripts: [] };
+  });
+}
+
 /** Images, fonts, archives and WebAssembly, recognised by their first bytes. JavaScript cannot start with these. */
 function isBinaryData(e: TarEntry): boolean {
   return hasDataMagic(e.data);
@@ -1467,8 +1476,11 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
 
   for (const f of rest) take(f);
 
-  // the second layer's, from what is left: what scripts and bin run first, then what everything held reaches
-  const invoked = invokedFiles(manifest, byPath, hooks);
+  // the second layer's, from what is left: what scripts and bin run first, then what everything held reaches, as the
+  // first two passes of expandHooks read the hooks; then, from what that leaves, what only the shell reading adds
+  const baseline = invokedFiles(manifest, byPath, baselineHooks(hooks));
+  const all = invokedFiles(manifest, byPath, hooks);
+  let invoked = baseline;
 
   const takeExtra = (f: TarEntry): void => {
     if (held.has(f.path) || extra.has(f.path) || (!invoked.has(f.path) && !readAsTextBefore(f.path, f.data)) || f.size > MAX_ANALYZED_FILE_BYTES || total + f.size > budget) return;
@@ -1478,25 +1490,34 @@ export function planLayers(input: { manifest: AnalyzeInput["manifest"]; files: r
 
   const shellRuns = input.shellRuns ?? new Map<string, readonly string[]>();
   const seenX = new Set<string>();
-  const queueX = [...invoked, ...held];
+  const queueX = [...baseline, ...held];
+  let qi = 0;
 
-  for (let qi = 0; qi < queueX.length; qi++) {
-    const path = queueX[qi] ?? "";
-    const f = byPath.get(path);
+  const walk = (): void => {
+    for (; qi < queueX.length; qi++) {
+      const path = queueX[qi] ?? "";
+      const f = byPath.get(path);
 
-    if (!f || seenX.has(path)) continue;
-    seenX.add(path);
-    takeExtra(f);
+      if (!f || seenX.has(path)) continue;
+      seenX.add(path);
+      takeExtra(f);
 
-    if (!held.has(path) && !extra.has(path)) continue;
+      if (!held.has(path) && !extra.has(path)) continue;
 
-    for (const spec of [...(imports.get(path) ?? []), ...(shellRuns.get(path) ?? [])]) {
-      charge("score", 1);
+      for (const spec of [...(imports.get(path) ?? []), ...(shellRuns.get(path) ?? [])]) {
+        charge("score", 1);
 
-      // beside the file, or from the package's folder, where npm runs a script's commands (as `analyze` resolves them)
-      for (const target of candidatesOf(byPath, path, spec)) if (!seenX.has(target.path)) queueX.push(target.path);
+        // beside the file, or from the package's folder, where npm runs a script's commands (as `analyze` resolves them)
+        for (const target of candidatesOf(byPath, path, spec)) if (!seenX.has(target.path)) queueX.push(target.path);
+      }
     }
-  }
+  };
+
+  walk();
+  invoked = all;
+
+  for (const p of all) if (!baseline.has(p)) queueX.push(p);
+  walk();
 
   return { production: held, extra };
 }
@@ -2460,7 +2481,7 @@ function analyzeMetered(input: AnalyzeInput): Analysis {
     return read.imports;
   };
 
-  const v3 = readLikeV3({ files, byPath, manifest, installCommands, gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld, invoked: new Set(), viewed: viewedWhole, viewImports });
+  const v3 = readLikeV3({ files, byPath, manifest, installCommands: installCommands.filter((c) => !c.added), gyp, budget, readWhole, dynamicAt, add, read: readRaw, notHeld, invoked: new Set(), viewed: viewedWhole, viewImports });
   // production's facts before its flows across files add theirs: the extra layer's assessment works those out again
   const productionFacts = new Map([...fileFacts].map(([path, list]) => [path, [...list]]));
 

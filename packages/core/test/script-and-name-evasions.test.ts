@@ -541,3 +541,29 @@ describe("the third pass never costs what fe2e641 read", () => {
   });
 });
 
+
+describe("the third pass's targets wait for fe2e641's whole reading plan", () => {
+  const enc = new TextEncoder();
+  const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+
+  test("an in-memory read with room for the entry and its import stays complete", () => {
+    const manifest = { name: "probe-pkg", version: "1.0.0", license: "MIT", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/setup.js" } };
+    const pj = file("package.json", JSON.stringify(manifest));
+    const index = file("index.js", "require('./helper.js');\n");
+    const helper = file("helper.js", "module.exports = 2;\n".repeat(4));
+    const setup = file("lib/setup.js", "1;\n");
+    const a = analyze({ name: "probe-pkg", manifest, files: [pj, index, helper, setup], publisher: "a", previousPublishers: [], maxScannedBytes: pj.size + index.size + helper.size });
+    const r = finalize(a, { publishedAt: 0, now: 1e12, deprecated: null, status: "active", statusReason: null });
+
+    expect(r.coverage).toMatchObject({ kind: "complete" });
+  });
+
+  test("a streamed plan's second layer holds a direct target before one only the shell reading reaches", () => {
+    const body = "\u007fELF native\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", scripts: { preinstall: "npm run '-s' alt", alt: "./alt-setup.so", postinstall: "./baseline.so" } };
+    const plan = planLayers({ manifest, files: [file("alt-setup.so", body), file("baseline.so", body)], imports: new Map(), budget: enc.encode(body).length });
+
+    expect([...plan.production, ...plan.extra]).toEqual(["baseline.so"]);
+  });
+});
+
