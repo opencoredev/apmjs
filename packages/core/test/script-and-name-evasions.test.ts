@@ -55,6 +55,28 @@ describe("an install script's `npm run` is followed whatever flags or quotes it 
   }
 });
 
+describe("a `--` ends the package manager's options: the next word is the script, with its pre and post scripts", () => {
+  // npm reads nothing after `--` as its own, so an `--ignore-scripts` there is an argument to the script, and npm still
+  // runs prepayload and postpayload
+  for (const cmd of ["npm run -- payload", "npm run -s -- payload", "pnpm run -- payload", "yarn --silent -- payload", "npm run -- payload --ignore-scripts"]) {
+    for (const hookName of ["prepayload", "payload", "postpayload"]) {
+      test(`${cmd}: a dropper in ${hookName}`, () => {
+        const scripts = { postinstall: cmd, prepayload: "true", payload: "true", postpayload: "true", [hookName]: DROPPER };
+        const r = scoreOf({ scripts }, {});
+
+        expect(r.ids).toContain("install-download");
+        expect(r.score).toBeLessThan(SCORE_FLOOR);
+      });
+    }
+  }
+
+  test("an --ignore-scripts before the `--` is npm's own: the script alone", () => {
+    const scripts = { postinstall: "npm run --ignore-scripts -- payload", prepayload: DROPPER, payload: "node index.js", postpayload: DROPPER };
+
+    expect(expandHooks({ scripts })[0]?.scripts).toEqual(["postinstall", "payload"]);
+  });
+});
+
 describe("npm run --ignore-scripts runs the script but not its pre and post scripts", () => {
   // npm docs, config `ignore-scripts`: `npm run`, `npm test` and the like still run their script, "but they will not run
   // any pre- or post-scripts", so a dropper in those never runs (npm 9.2 and 11.19.1 run locally print only the named
@@ -202,6 +224,26 @@ describe("node's inline-eval flag is recognised after other flags", () => {
       expect(r.score).toBe(plain.score);
     });
   }
+
+  // the word the shell hands node is `-e` however it is quoted or escaped
+  for (const cmd of [`node '-e' ${code}`, `node "-e" ${code}`, `node \\-e ${code}`, `node '--eval' ${code}`, `node '--no-warnings' "-e" ${code}`]) {
+    test(`quoted or escaped: ${cmd.slice(0, 40)}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBe(plain.score);
+    });
+  }
+
+  // cmd.exe finds an interpreter in any case
+  for (const cmd of [`Node -e ${code}`, `NODE.EXE -e ${code}`, `node.Exe --no-warnings -e ${code}`]) {
+    test(`any case: ${cmd.slice(0, 40)}`, () => {
+      const r = scoreOf({ scripts: { postinstall: cmd } }, {});
+
+      expect(r.ids).toContain("install-download");
+      expect(r.score).toBe(plain.score);
+    });
+  }
 });
 
 describe("the flag-aware reading never costs a body main reads", () => {
@@ -241,6 +283,23 @@ describe("the flag-aware reading never costs a body main reads", () => {
 
     expect(main.every((n) => hook?.commands.some((c) => c.from === `scripts.${n} (run by scripts.postinstall)`))).toBe(true);
     expect(hook?.cut).toContain("more than 200 commands");
+  });
+
+  test("a script the flag-aware reading reaches but cannot read keeps the standalone reading main gives it", () => {
+    // main never follows `npm run --silent x`, so it reads `x` as a script no hook reaches and finds the hidden text; the
+    // flag-aware reach is one level past MAX_DEPTH, and a publish-only hook's cut costs nothing, so dropping `x` from that
+    // reading would score the package better than main does
+    const hidden = `node -e 'console.log("${"\\x6e\\x6f\\x64\\x65".repeat(12)}")'`;
+    const scripts = { prepublishOnly: Array.from({ length: 8 }).reduce<string>((s) => `sh -c ${JSON.stringify(s)}`, "npm run --silent x"), x: hidden };
+    const [hook] = expandHooks({ scripts });
+
+    expect(hook?.cut).toContain("nested more than");
+    expect(hook?.scripts).not.toContain("x");
+
+    const r = scoreOf({ scripts }, {});
+
+    expect(r.ids).toContain("encoded-data");
+    expect(r.score).toBeLessThan(scoreOf({ scripts: { ...scripts, x: "true" } }, {}).score);
   });
 });
 

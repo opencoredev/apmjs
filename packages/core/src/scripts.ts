@@ -37,13 +37,14 @@ const MAX_DEPTH = 8;
 const MAX_COMMANDS = 200;
 
 const SH_C = /\b(?:sh|bash|zsh|dash)\s+-c\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")/g;
-const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()'"\\$\`{}<>]*)?)*`;
+const FLAGS = String.raw`(?:[ \t]+--?\w[\w-]*(?:=[^\s;&|()'"\\$\`{}<>]*)?)*(?:[ \t]+--)?`;
 const SCRIPT = String.raw`[ \t]+["']?([\w:.@/-]+)`;
 
 // a match takes only the package manager's word: its flags and the script name are read ahead without being consumed, so
 // the scan goes on from the next word, and a run held in a flag value or taken for the name (`npm --x=`npm run payload``,
 // `yarn --silent npm run payload`) is still found, as main's regex, which read no flags, found it. A flag value stops at
-// any separator, quote, escape or expansion, a newline ends the command, and a command may start a backtick substitution
+// any separator, quote, escape or expansion, a newline ends the command, and a command may start a backtick substitution.
+// A bare `--` ends the flags, as it ends npm's options: the next word is the name, and a flag after it is the script's
 const RUN_REF = new RegExp(String.raw`(?:^|[;&|(\`]\s*|\s)(?:npm(?=${FLAGS}[ \t]+(?:run(?:-script)?${FLAGS}${SCRIPT}|(start|test|stop|restart)\b))|yarn(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|pnpm(?=${FLAGS}(?:[ \t]+run${FLAGS})?${SCRIPT})|bun(?=${FLAGS}[ \t]+run${FLAGS}${SCRIPT}))`, "dg");
 
 // main's reading, which takes no flags, beside it: every script it finds is still followed, with its pre and post scripts
@@ -57,7 +58,9 @@ const SHELL_WORD = /\S+/g;
 // quoting, escapes, expansion, grouping and redirection: with any of them, where npm's arguments start and end is not known
 const SHELL_SYNTAX = /['"\\$`(){}<>*?[\]]/;
 const RUN_ALL = /\b(?:npm-run-all|run-s|run-p)\s+((?:[\w:.@/*-]+\s*)+)/g;
-const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/g;
+
+// any case, as cmd.exe finds `NODE.EXE`
+const INTERPRETER = /\b(?:node(?:js)?|bun|deno)(?:\.exe)?(?=\s)/gi;
 
 // starts only after a non-space, as the sticky walk always does, so a search over a run of whitespace is linear too
 const NEXT_WORD = /(?<!\s)\s+(\S+)/y;
@@ -78,7 +81,10 @@ function inlineEval(cmd: string): boolean {
     word.lastIndex = m.index + m[0].length;
 
     for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
-      const flag = w[1] ?? "";
+      // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
+      const raw = w[1] ?? "";
+      const quoted = raw.length > 1 && (raw[0] === "'" || raw[0] === '"') && raw.endsWith(raw[0]);
+      const flag = (quoted ? raw.slice(1, -1) : raw).replace(/^\\/, "");
 
       if (EVAL_FLAG.test(flag)) return true;
 
@@ -201,30 +207,40 @@ export function expandHooks(manifest: ScriptsManifest): ExpandedHook[] {
     const read: { text: string; depth: number }[] = [];
     let cut: string | null = null;
 
-    const follow = (refs: readonly ScriptRef[], depth: number, first: boolean): void => {
-      for (const { name, alone } of refs) {
-        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
-          const body = scripts[n];
-
-          if (body === undefined || followed.has(n)) continue;
-          followed.add(n);
-          visit(body, `scripts.${n} (run by scripts.${hook})`, depth + 1, false, first);
-        }
-      }
-    };
-
-    const visit = (text: string, from: string, depth: number, viaEval: boolean, first: boolean): void => {
+    /** Whether a command at this depth may be read, or the reading is cut, and why. */
+    const admits = (from: string, depth: number): boolean => {
       if (depth > MAX_DEPTH) {
         cut ??= `${from}: commands nested more than ${MAX_DEPTH} levels deep (sh -c, decoded text, npm run)`;
 
-        return;
+        return false;
       }
 
       if (commands.length >= MAX_COMMANDS) {
         cut ??= `${from}: more than ${MAX_COMMANDS} commands`;
 
-        return;
+        return false;
       }
+
+      return true;
+    };
+
+    // the first pass marks a script followed before its body is admitted, as main does; the second only once it is, so a
+    // script it reached but could not read stays one no hook reaches and keeps its standalone reading (otherScripts)
+    const follow = (refs: readonly ScriptRef[], depth: number, first: boolean): void => {
+      for (const { name, alone } of refs) {
+        for (const n of alone ? [name] : [`pre${name}`, name, `post${name}`]) {
+          const body = scripts[n];
+          const from = `scripts.${n} (run by scripts.${hook})`;
+
+          if (body === undefined || followed.has(n) || (!first && !admits(from, depth + 1))) continue;
+          followed.add(n);
+          visit(body, from, depth + 1, false, first);
+        }
+      }
+    };
+
+    const visit = (text: string, from: string, depth: number, viaEval: boolean, first: boolean): void => {
+      if (!admits(from, depth)) return;
 
       const evals = viaEval || inlineEval(text);
       commands.push({ from, text, viaEval: evals });
