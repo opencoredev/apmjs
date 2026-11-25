@@ -656,6 +656,9 @@ function printPlatformFamilies(warnings: readonly InstallWarning[], binaries: re
 /** At most this many warnings are printed per package; --json has them all. */
 const MAX_PRINTED_WARNINGS = 10;
 
+/** How to sign in to an apm registry: the browser flow, or a password where the registry uses them. */
+const LOGIN_HINT = "apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords";
+
 const EARLY_CLOSING = "apm installs it anyway: a score or a fresh publish informs, it does not block. To refuse these instead, run with --strict (or APM_STRICT=1).";
 
 /**
@@ -2286,12 +2289,12 @@ async function cmdName(a: Args): Promise<number> {
     // read are said so, never called available
     const policy = scope === null ? await namePolicy(api) : null;
     const mine = r.suggestions.find((s) => s.name === `${yours}/${base}`);
-    const instead = user === "" ? `use ${yours}/${base} (run apm login, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
+    const instead = user === "" ? `use ${yours}/${base} (log in with ${LOGIN_HINT}, then apm name to check it)` : mine?.available === true ? `${yours}/${base} is free` : `check ${yours}/${base}: apm name ${yours}/${base}`;
 
     if (scope === null && policy === "open") say(`${green("✓")} ${bold(r.query)} is available`);
     else if (scope === null && policy === null) say(`${yellow("!")} ${bold(r.query)} is free, but apm could not read this registry's rules for new names, so it cannot say whether you may publish it (apm's own registry takes a new package only under your GitHub login)`);
     else if (scope === null) say(`${yellow("!")} ${bold(r.query)} is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, ${instead}`);
-    else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Run apm login, then ask again to see whether that is you`);
+    else if (user === "") say(`${yellow("!")} ${bold(r.query)} is free, but only the owner of @${scope} can publish there. Log in (${LOGIN_HINT}), then ask again to see whether that is you`);
     else say(`${yellow("!")} ${bold(r.query)} is free but not available to you: only the owner of @${scope} can publish there. Yours is ${yours}; instead, ${instead}`);
   } else if (r.available) say(`${green("✓")} ${bold(r.query)} is available`);
   else say(`${yellow("!")} ${bold(r.query)} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}`);
@@ -2639,7 +2642,7 @@ async function cmdPublish(a: Args): Promise<number> {
   }
 
   // a dry run needs no login, but the real publish will: say so while nothing is at stake
-  if (dry && cfg.token === null) say(yellow(`apm: apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}; unless you have other publishing credentials for it, log in before the real publish (apm login, if it is an apm registry)`));
+  if (dry && cfg.token === null) say(yellow(`apm: apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}; unless you have other publishing credentials for it, log in before the real publish (on an apm registry: ${LOGIN_HINT})`));
 
   // 2. Pack with the project's own package manager and inspect exactly what would upload.
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
@@ -2702,7 +2705,7 @@ async function cmdPublish(a: Args): Promise<number> {
   const pub = await runCmd([...publishArgs(det.pm, tgzPath, tag), ...registryArgs(det.pm, cfg.registry, scopes)], { cwd, env: pubEnv, quiet: true });
   if (pub.code !== 0) {
     warn(pub.out.trim());
-    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication and this is an apm registry, run apm login (an npm login does not sign in to apm), then apm publish again; for another registry, use its own login` : ""}`);
+    fail(`apm publish: ${det.pm} publish failed for ${id}${cfg.token === null ? `. apm found no login token for ${displayRegistry(cfg.registry) ?? "this registry"}: if the error above is about authentication, log in to this registry, then apm publish again (on an apm registry: ${LOGIN_HINT})` : ""}`);
     return pub.code;
   }
   // A login token stages the version: the registry answers with an approval link in its notice.

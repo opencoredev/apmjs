@@ -235,9 +235,9 @@ describe("apm: publish", () => {
   test("apm publish without a login says to run apm login", async () => {
     const sb = makeSandbox(reg);
     const d = writePackage(work, { name: "no-login-pkg", version: "1.0.0" }, reg);
-    const r = await apm(["publish"], { cwd: d, env: sb.env });
+    const r = await apm(["publish"], { cwd: d, env: { ...sb.env, TMPDIR: work } });
     expect(r.code).not.toBe(0);
-    expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication and this is an apm registry, run apm login (an npm login does not sign in to apm), then apm publish again; for another registry, use its own login`);
+    expect(r.out).toContain(`apm found no login token for ${reg.url}: if the error above is about authentication, log in to this registry, then apm publish again (on an apm registry: apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords)`);
   });
 
   test("apm publish refuses locally when a secret would ship, before any upload", async () => {

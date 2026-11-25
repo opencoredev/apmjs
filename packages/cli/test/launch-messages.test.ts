@@ -240,7 +240,7 @@ describe("apm's messages for first-time users", () => {
     const bare = await apm(["name", "my-lib"], { cwd });
 
     expect(bare.code).toBe(0);
-    expect(bare.text).toContain("! my-lib is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, use @<your account name>/my-lib (run apm login, then apm name to check it)");
+    expect(bare.text).toContain("! my-lib is free but not available: this registry does not hand out bare names, so a new package goes under your account name (on apm's own registry, your GitHub login). Instead, use @<your account name>/my-lib (log in with apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords, then apm name to check it)");
 
     const signedIn = await apm(["name", "my-lib"], { cwd, token: true });
 
@@ -259,7 +259,7 @@ describe("apm's messages for first-time users", () => {
 
     const signedOut = await apm(["name", "@other/my-lib"], { cwd });
 
-    expect(signedOut.text).toContain("! @other/my-lib is free, but only the owner of @other can publish there. Run apm login, then ask again to see whether that is you");
+    expect(signedOut.text).toContain("! @other/my-lib is free, but only the owner of @other can publish there. Log in (apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords), then ask again to see whether that is you");
 
     const other = await apm(["name", "@other/my-lib"], { cwd, token: true });
 
@@ -296,7 +296,7 @@ describe("apm's messages for first-time users", () => {
     const cwd = folder("d2", { "package.json": JSON.stringify({ name: "@me/pkg", version: "1.0.0", files: ["index.js"] }), "index.js": "module.exports = 1;\n" });
     const r = await apm(["publish", "--dry-run", "--pm", "npm"], { cwd });
 
-    expect(r.text).toContain(`apm: apm found no login token for ${server.url.toString()}; unless you have other publishing credentials for it, log in before the real publish (apm login, if it is an apm registry)`);
+    expect(r.text).toContain(`apm: apm found no login token for ${server.url.toString()}; unless you have other publishing credentials for it, log in before the real publish (on an apm registry: apm login, or apm login --username <name> --password-stdin on a registry that signs in with passwords)`);
 
     // a real publish is not told it lacks a login before anything has failed: the package manager may have its own
     const real = await apm(["publish", "--pm", "npm"], { cwd });
