@@ -197,20 +197,65 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
       `[custom] \n${key} = ${OLD}\n`,
       `[custom] \n${key}=${OLD}\n`,
       `${key}=${OLD}\n[custom] \n${key} =${OLD}\nregistry=https://registry.apmjs.dev/\n`,
-      `a=1\r${key}=${OLD}\r[real]\n${key}=${OLD}\n`,
+      `a=1\r${key}=${OLD}\r`,
     ];
 
-    for (const user of cases) {
+    const rotate = (user: string) => {
       const p = project({ user });
       const rc = join(p.env.HOME, ".npmrc");
+      const result = saveToken(rc, "https://registry.apmjs.dev/", NEW);
 
-      saveToken(rc, "https://registry.apmjs.dev/", NEW);
-      const after = readFileSync(rc, "utf8");
+      return { p, result, after: readFileSync(rc, "utf8") };
+    };
+
+    for (const user of cases) {
+      const { p, result, after } = rotate(user);
+
+      expect(result).toEqual({ kind: "saved" });
 
       for (const sections of ["exact", "spaced"] as const) expect(decodeIni(after, sections).get(key)).toEqual({ kind: "one", item: text(NEW) });
       expect(after).not.toContain(OLD);
 
       for (const path of [NPM92_DEBIAN, NPM11]) expect(loadConfig(p.root, { HOME: p.env.HOME, PATH: path }).token).toBe(NEW);
+    }
+
+    // a copy under a header both grammars open is no npm's top-level auth, so it stays as it was (review of 5b75caa)
+    expect(rotate(`${key}=${OLD}\n[real]\n${key}=${OLD}\n`).after).toBe(`${key}=${NEW}\n[real]\n${key}=${OLD}\n`);
+  });
+
+  test("a rotation is refused, and the file left alone, when a top-level key has ${VAR} in it (review of 5b75caa)", () => {
+    const user = (s: string) => `registry=https://registry.apmjs.dev/\n${s}`;
+
+    // npm expands the name before it sets it, so ${HOST}:_authToken can be the very key being rotated
+    for (const [src, line] of [[user("${HOST}:_authToken=apm_oldoldoldoldoldold01\n"), 2], [user("[custom] \n${HOST}:_authToken = apm_oldoldoldoldoldold01\n"), 3]] as const) {
+      const p = project({ user: src });
+      const rc = join(p.env.HOME, ".npmrc");
+
+      expect(saveToken(rc, "https://registry.apmjs.dev/", "apm_newnewnewnewnewnew01")).toMatchObject({ kind: "refused", line });
+      expect(readFileSync(rc, "utf8")).toBe(src);
+    }
+
+    // under a header both grammars open it is not top-level to any npm, and the rotation goes ahead
+    const p = project({ user: user("[real]\n${HOST}:_authToken=apm_oldoldoldoldoldold01\n") });
+
+    expect(saveToken(join(p.env.HOME, ".npmrc"), "https://registry.apmjs.dev/", "apm_newnewnewnewnewnew01")).toEqual({ kind: "saved" });
+  });
+
+  test("APM_TOKEN is withheld, whatever npm is on PATH, when the grammars read the user registry differently (review of 5b75caa)", () => {
+    const user = "[custom] \nregistry=https://r.example/\n";
+
+    const env = (path: string | undefined, extra: Record<string, string> = {}) => {
+      const p = project({ user });
+
+      const base = { HOME: p.env.HOME, APM_TOKEN: "apm_envenvenvenvenvenv01", ...extra };
+
+      return loadConfig(p.root, path === undefined ? base : { ...base, PATH: path });
+    };
+
+    for (const path of [NPM92_DEBIAN, NPM11, undefined]) {
+      expect(env(path)).toMatchObject({ token: null, withheld: { kind: "ambiguous", exact: "https://r.example/", spaced: DEFAULT_REGISTRY } });
+      // naming the registry settles it
+      expect(env(path, { APM_REGISTRY: "https://r.example/" })).toMatchObject({ registry: "https://r.example/", token: "apm_envenvenvenvenvenv01", withheld: null });
     }
   });
 });
