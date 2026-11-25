@@ -104,13 +104,13 @@ export function installNote({ client, registry }: { client: InstallClient; regis
         docs: "/docs#cli",
       };
     case "bun": {
-      const effect = "The scanner is not on a registry yet, so the setup guide installs it from a clone of apm. It refuses revoked and confirmed malicious versions and warns about packages scoring under 40 (APM_SCANNER_STRICT=1 refuses them).";
+      const effect = `New installs skip revoked, yanked and confirmed malicious versions. The optional ${BUN_SCANNER} also warns about packages scoring under 40; it is not on a registry yet, so the setup guide installs it from a clone of apm.`;
 
       return {
         kind: "needs-setup",
-        lead: "Plain bun skips apm’s checks. Point it at apm and add the scanner in bunfig.toml:",
+        lead: "Plain bun skips apm’s checks. Point its registry at apm in bunfig.toml:",
         file: "bunfig.toml",
-        config: `[install]\nregistry = "${url}"\n\n[install.security]\nscanner = "${BUN_SCANNER}"`,
+        config: `[install]\nregistry = "${url}"`,
         effect,
         checks: `${effect} ${APM_ADD_CHECKS}`,
         docs: "/docs#bun",

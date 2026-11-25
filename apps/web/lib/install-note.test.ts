@@ -20,20 +20,19 @@ describe("installNote", () => {
     expect(note.docs).toBe("/docs#cli");
   });
 
-  test("bun gets the registry and the scanner in bunfig.toml", () => {
+  test("bun gets only the registry line in bunfig.toml, with the unpublished scanner as an optional extra", () => {
     const note = installNote({ client: "bun", registry });
 
     expect(note.kind).toBe("needs-setup");
 
     if (note.kind !== "needs-setup") return;
     expect(note.file).toBe("bunfig.toml");
-    expect(note.config).toContain(`registry = "${registry}/"`);
-    expect(note.config).toContain("[install.security]");
-    expect(note.config).toContain(`scanner = "${BUN_SCANNER}"`);
+    expect(note.config).toBe(`[install]\nregistry = "${registry}/"`);
     expect(note.lead).toContain("skips apm’s checks");
     expect(note.checks).toContain("apm add checks the score, cooldown and dependency tree");
     expect(note.checks.startsWith(note.effect)).toBe(true);
-    expect(note.effect).toContain("It refuses revoked");
+    expect(note.effect).toContain("New installs skip revoked");
+    expect(note.effect).toContain(BUN_SCANNER);
     expect(note.effect).toContain("not on a registry yet");
     expect(note.docs).toBe("/docs#bun");
   });
