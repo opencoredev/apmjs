@@ -159,6 +159,26 @@ async function verify(site: SiteUrl, sums: readonly CliSum[], script: string): P
   return problems;
 }
 
+// ---------- Homebrew ----------
+const BREW_TAP = "opencoredev/homebrew-tap";
+
+/** Starts the tap's Update apm workflow for this version through gh, which tests the new formula on every platform and commits it. Never fails the release; gh gets 30 s so a hung call cannot hold the release lock. */
+function startBrewUpdate(released: CliVersion): string {
+  const manual = `gh workflow run update-apm.yml --repo ${BREW_TAP} -f version=${released}`;
+
+  try {
+    const run = Bun.spawnSync(["gh", "workflow", "run", "update-apm.yml", "--repo", BREW_TAP, "-f", `version=${released}`], { stdout: "pipe", stderr: "pipe", timeout: 30_000, killSignal: "SIGKILL" });
+
+    if (run.exitCode === 0) return `Homebrew: started the ${BREW_TAP} update for ${released} (https://github.com/${BREW_TAP}/actions)`;
+
+    const why = run.exitCode === null ? "gh did not finish within 30 s and was stopped" : run.stderr.toString().trim() || `gh exited ${run.exitCode}`;
+
+    return `Homebrew: could not start the tap update (${why}); run: ${manual}`;
+  } catch (error) {
+    return `Homebrew: could not run gh (${error instanceof Error ? error.message : String(error)}), so the tap was not updated; run: ${manual}`;
+  }
+}
+
 // ---------- the run ----------
 if (args.stage !== "local") {
   const taken = takeReleaseLock({ script: import.meta.path, argv: process.argv.slice(2), stage: args.stage });
@@ -245,6 +265,8 @@ try {
       if (!recorded) appendCliRelease({ version, stage: args.stage, at: new Date().toISOString(), sha: revision, site, binaries, sums, script: scriptHash });
       log(recorded ? "release record: already has this release" : `release record: ${version} on ${args.stage}`);
     }
+
+    if (check.ok && args.stage === "production") log(startBrewUpdate(version));
 
     code = check.ok ? 0 : 1;
   }

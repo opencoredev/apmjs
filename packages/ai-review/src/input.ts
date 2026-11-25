@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { isReviewable, kindOf, linesOf, MAX_DECODED_BYTES, ordered, textOf } from "./files.ts";
+import { kindOf, linesOf, MAX_DECODED_BYTES, ordered, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -179,14 +179,15 @@ export function buildFilesInput(input: { name: string; version: string; pkg: Pac
 
   if (pj) b.add({ path: "package.json", header: "=== FILE package.json ===", body: numbered(linesOf(textOf(pj))), share: 0.25 });
   const tooLarge: string[] = [];
+  const shown = ordered(pkg.manifest, pkg.files, pkg.files);
 
-  for (const f of ordered(pkg.manifest, pkg.files, pkg.files)) {
+  for (const f of shown) {
     if (f.data.length > MAX_DECODED_BYTES) tooLarge.push(f.path);
     else if (b.left < MIN_BLOCK_CHARS) b.skip(f.path);
     else b.add({ path: f.path, header: `=== FILE ${singleLine(f.path)} ===`, body: numbered(linesOf(textOf(f))), share: MAX_FILE_SHARE });
   }
 
-  const inScope = pkg.files.filter((f) => f.path === "package.json" || isReviewable(f)).length;
+  const inScope = shown.length + (pj ? 1 : 0);
   const binaries = pkg.files.filter((f) => kindOf(f) === "binary");
 
   return finish({ name: input.name, version: input.version, previous: null, pkg, b, extra: [], inScope, binaries, tooLarge });
@@ -239,8 +240,9 @@ export function buildDiffInput(input: { name: string; version: string; previousV
 
   const isAdded = new Set(added.map((f) => f.path));
   const tooLarge: string[] = [];
+  const shown = ordered(pkg.manifest, pkg.files, [...added, ...changed], (x) => isAdded.has(x.path));
 
-  for (const f of ordered(pkg.manifest, pkg.files, [...added, ...changed], (x) => isAdded.has(x.path))) {
+  for (const f of shown) {
     const old = before.get(f.path);
 
     if (f.data.length > MAX_DECODED_BYTES || (old && old.data.length > MAX_DECODED_BYTES)) {
@@ -268,7 +270,7 @@ export function buildDiffInput(input: { name: string; version: string; previousV
   }
 
   const touched = [...added, ...changed];
-  const inScope = touched.filter((f) => f.path === "package.json" || isReviewable(f)).length;
+  const inScope = shown.length + (touched.some((f) => f.path === "package.json") ? 1 : 0);
   const binaries = touched.filter((f) => kindOf(f) === "binary");
   const read = pjChanged ? b.read : b.read.filter((p) => p !== "package.json");
   const partial = pjChanged ? b.partial : b.partial.filter((p) => p !== "package.json");
