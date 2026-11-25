@@ -1,12 +1,13 @@
 // Leasing reads each job on its own: a job the reviewer cannot read is failed by itself and the rest of its batch is
 // reviewed. npm's placeholder for the package named "-" once sank every batch it was leased in.
 import { afterEach, describe, expect, test } from "bun:test";
+import type { LeaseBatch } from "@apm/ai-review";
 import type { LogFields } from "../src/log.ts";
-import { registryClient } from "../src/registry.ts";
+import { registryClient, type RegistryClient } from "../src/registry.ts";
 
 const digest = `sha1-${"0".repeat(40)}`;
 
-function job(n: number, name: string, version: string): Record<string, unknown> {
+function job(n: number, name: string, version: string) {
   return {
     id: `job-${n}`,
     leaseId: `lease-${n}`,
@@ -35,7 +36,9 @@ async function releasedCount(released: Released[], n: number): Promise<void> {
   expect(released).toHaveLength(n);
 }
 
-function registry(jobs: unknown[], releaseGate: Promise<void> = Promise.resolve()): { url: string; released: Released[] } {
+type FakeRegistry = { url: string; released: Released[] };
+
+function registry(jobs: LeaseBatch["jobs"], releaseGate: Promise<void> = Promise.resolve()): FakeRegistry {
   const released: Released[] = [];
 
   server = Bun.serve({
@@ -60,8 +63,12 @@ function registry(jobs: unknown[], releaseGate: Promise<void> = Promise.resolve(
   return { url: server.url.toString(), released };
 }
 
-function client(url: string): { lease: (max: number) => Promise<{ name: string }[]>; logged: { event: string; fields: LogFields }[] } {
-  const logged: { event: string; fields: LogFields }[] = [];
+type Logged = { event: string; fields: LogFields };
+
+type LeasingClient = { lease: RegistryClient["lease"]; logged: Logged[] };
+
+function client(url: string): LeasingClient {
+  const logged: Logged[] = [];
   const c = registryClient({ url, token: "t", log: (_level, event, fields = {}) => logged.push({ event, fields }) });
 
   return { lease: c.lease, logged };

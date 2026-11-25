@@ -2,7 +2,7 @@
 // Tarballs come only from the configured registry origin and must match the job's checksum.
 import { createHash } from "node:crypto";
 import { readTarball, type TarEntry } from "@apm/core";
-import { readLease, type ReleaseBody, type ResultBody, type ReviewJob } from "@apm/ai-review";
+import { LeaseBatch, readLease, type ReleaseBody, type ResultBody, type ReviewJob } from "@apm/ai-review";
 import type { Logger } from "./log.ts";
 
 /** Compressed tarballs above this are not downloaded; the registry's own publish limit is 64 MB. */
@@ -65,7 +65,7 @@ export function registryClient(input: { url: string; token: string; log: Logger 
 
       if (!res.ok) throw new RegistryError(`lease: HTTP ${res.status}`, true);
 
-      const { jobs, unreadable } = readLease(await res.json());
+      const { jobs, unreadable } = readLease(LeaseBatch.parse(await res.json()));
 
       // a job this side cannot read would fail the same way every time, so it is failed on its own and the rest of
       // the batch is reviewed at once, without waiting on those releases; one whose lease cannot be read either

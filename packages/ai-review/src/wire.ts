@@ -49,23 +49,24 @@ export const LeaseResponse = z.object({ jobs: z.array(ReviewJob).max(64) });
 
 export type LeaseResponse = z.infer<typeof LeaseResponse>;
 
-/** A lease as the reviewer reads it: the batch is checked here and each job on its own (readLease). */
-const LeaseBatch = z.object({ jobs: z.array(z.unknown()).max(64) });
+/** A lease as the reviewer parses it at the boundary: the batch only, with each job read on its own by readLease. */
+export const LeaseBatch = z.object({ jobs: z.array(z.unknown()).max(64) });
+
+export type LeaseBatch = z.infer<typeof LeaseBatch>;
 
 const LeaseHandle = z.object({ id: ReviewJob.shape.id, leaseId: ReviewJob.shape.leaseId });
 
 /** A leased job this side cannot read: with its lease when that much could be read, so it can be given back. */
 export type UnreadableJob = { lease: z.infer<typeof LeaseHandle> | null; why: string };
 
-/**
- * The jobs of a lease response, each parsed on its own, so one job the reviewer cannot read never discards the
- * rest of the batch. Throws only when the response itself is not a lease.
- */
-export function readLease(body: unknown): { jobs: ReviewJob[]; unreadable: UnreadableJob[] } {
+export type LeaseRead = { jobs: ReviewJob[]; unreadable: UnreadableJob[] };
+
+/** The jobs of a lease batch, each parsed on its own, so one job the reviewer cannot read never discards the rest. */
+export function readLease(batch: LeaseBatch): LeaseRead {
   const jobs: ReviewJob[] = [];
   const unreadable: UnreadableJob[] = [];
 
-  for (const raw of LeaseBatch.parse(body).jobs) {
+  for (const raw of batch.jobs) {
     const job = ReviewJob.safeParse(raw);
 
     if (job.success) {
