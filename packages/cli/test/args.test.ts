@@ -40,6 +40,14 @@ describe("other commands", () => {
     expect(parsed("publish", "--tag=-x")).toEqual({ cmd: "publish", positional: [], flags: { tag: "-x" }, child: [] });
   });
 
+  test("--save-dev is --dev", () => {
+    expect(parsed("add", "--save-dev", "zod")).toEqual({ cmd: "add", positional: ["zod"], flags: { dev: true }, child: [] });
+  });
+
+  test("install reads --tag's value, so a bare install with it is the package manager's", () => {
+    expect(parsed("install", "--tag", "next")).toEqual({ cmd: "install", positional: [], flags: { tag: "next" }, child: [] });
+  });
+
   test("value flags are the command's own", () => {
     expect(parsed("install", "--size", "zod")).toEqual({ cmd: "install", positional: ["zod"], flags: { size: true }, child: [] });
     expect(parsed("search", "--size", "5", "http")).toEqual({ cmd: "search", positional: ["http"], flags: { size: "5" }, child: [] });

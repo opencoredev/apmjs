@@ -13,9 +13,11 @@
 //   at most EDGE_READ_DEADLINE_MS (300 ms); past it the database decides alone (blockListWithin);
 // - npm's document for the one version (Upstream.versionOf, a few KiB, kept in the isolate for the upstream TTL; npm's
 //   own CDN keeps it too, so asking for it from a Worker is a cache hit in the same data center): the version exists
-//   upstream, where its tarball is and what it must hash to.
+//   upstream, where its tarball is and what it must hash to;
+// - what the OSSF malicious-packages feed lists of the name (osv.ts, advisoriesFor: one small OSV query per name, kept
+//   in the isolate and the data center's cache): a listed version is refused with a 403 that cites its MAL- id.
 //
-// The three run at once. Once nothing refuses the version:
+// The four run at once. Once nothing refuses the version:
 //
 // - a request without credentials is answered with a redirect to npm's own tarball URL (only on the upstream's or
 //   npm's origin), never kept by any cache. The client downloads npm's bytes from npm's CDN and checks them against the
@@ -57,6 +59,7 @@ import { Store } from "./db.ts";
 import { digestLabel, digestOf, type Digest } from "./digest.ts";
 import { EDGE_READ_DEADLINE_MS, EdgeChecks, type AskOutcome } from "./edge-checks.ts";
 import { fail } from "./http.ts";
+import { listedTarballText, listedVersionsOf } from "./osv.ts";
 import { tarballBase } from "./server.ts";
 import { timed, timingOrNull, type TimingApi } from "./timing.ts";
 import { passTarball, type OpenedUpstream, type UpstreamApi, type UpstreamVersion } from "./upstream.ts";
@@ -219,12 +222,17 @@ const edgeRedirect = (input: { req: Request; name: string; version: string; upst
 
     if (base === null) return null;
     const checksStart = performance.now();
-    // npm's document is read beside the view: the database path reads it too, from this isolate's cache then
-    const [verdict, npm] = yield* Effect.all([timed(timing, "edge")(edge.value.verdict(name)), upstream.versionOf(name, version)], { concurrency: "unbounded" });
+    // npm's document and what the OSSF feed lists of the name are read beside the view: the database path reads them
+    // too, from this isolate's caches then
+    const [verdict, npm, listed] = yield* Effect.all([timed(timing, "edge")(edge.value.verdict(name)), upstream.versionOf(name, version), listedVersionsOf(name, [version])], { concurrency: "unbounded" });
 
     timing?.add("checks", performance.now() - checksStart);
 
     if (verdict.kind !== "clear") return null;
+    const listedHere = listed.get(version);
+
+    // listed by the OSSF malicious-packages feed: refused, as on the database path (osv.ts)
+    if (listedHere) return answered(req, fail(403, listedTarballText(listedHere), { knownMalicious: listedHere }), timing);
     const servable = servableOf(npm);
 
     if (servable === null || !isNpmTarball(servable.tarball, name, version, base)) return yield* Effect.as(edge.value.declined, null);
@@ -256,6 +264,9 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     // this request ends, so a check that fails here stops them
     const listing = yield* Effect.forkChild(timed(timing, "blocklist")(blockListWithin(EDGE_READ_DEADLINE_MS)));
     const document = yield* Effect.forkChild(upstream.versionOf(name, version));
+    // what the OSSF malicious-packages feed lists of the name (osv.ts), from this isolate's or the data center's copy
+    // when one is young enough
+    const feed = yield* Effect.forkChild(listedVersionsOf(name, [version]));
     // a request without credentials is sent to npm's own URL once nothing refuses it, so nothing is opened for it here;
     // one with credentials is never sent elsewhere (its Authorization would follow it there in some clients), and gets
     // npm's bytes through this Worker, opened early
@@ -277,6 +288,7 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     const read = yield* Effect.onError(store.tarballRead({ name, version, queuedSince: at - REQUEUE_AFTER_MS }), () => letGo);
     const list = yield* Fiber.join(listing);
     const npm = yield* Fiber.join(document);
+    const listedHere = (yield* Fiber.join(feed)).get(version);
 
     timing?.add("checks", performance.now() - checksStart);
 
@@ -296,6 +308,10 @@ export const fastTarball = (input: { req: Request; name: string; file: string; u
     if (read.confirmed.includes(label) || (verdict.kind === "upstream" && verdict.confirmed.some((e) => e.version === version && e.digest === label))) {
       return yield* refuse(answered(req, fail(410, confirmedText(name, version), { confirmed: true }), timing));
     }
+
+    // listed by the OSSF malicious-packages feed: refused before any byte is sent (osv.ts); one npm has since removed
+    // has no document, so the packument route refuses it the same way
+    if (listedHere) return yield* refuse(answered(req, fail(403, listedTarballText(listedHere), { knownMalicious: listedHere }), timing));
 
     // published here by the list (a publish whose transaction may still be committing): the packument route decides
     if (verdict.kind === "local") return yield* refuse(PACKUMENT);

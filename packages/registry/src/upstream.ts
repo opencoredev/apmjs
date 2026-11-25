@@ -649,11 +649,12 @@ const installKey = (input: { upstream: string; served: string; name: string }): 
 const npmEtag = (etag: string | null): string | null => (etag !== null && etag !== "" ? etag : null);
 
 /**
- * The stamp of a set of confirmed reviews (version and digest), as installRead reads them: the SHA-256 of their sorted
- * lines, so any change to the set changes it.
+ * The stamp of a set of confirmed reviews (version and digest), as installRead reads them, and of the OSSF feed's
+ * advisories for the name (`listed`, osv.ts advisoryLines): the SHA-256 of their sorted lines, so any change to either
+ * changes it. With no advisories it is the stamp of the confirmed set alone, as before the feed was read here.
  */
-export async function installStamp(rows: readonly { version: string; digest: string }[]): Promise<string> {
-  const lines = rows.map((r) => `${r.version} ${r.digest}`).toSorted().join("\n");
+export async function installStamp(rows: readonly { version: string; digest: string }[], listed: readonly string[] = []): Promise<string> {
+  const lines = [...rows.map((r) => `${r.version} ${r.digest}`), ...listed].toSorted().join("\n");
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(lines)));
 
   return [...hash].map((b) => b.toString(16).padStart(2, "0")).join("");
