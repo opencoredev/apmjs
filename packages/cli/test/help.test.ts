@@ -449,8 +449,8 @@ describe("what still goes to the package manager", () => {
     [["/abs/dev"], "apm does not pass /abs/dev on to bun"],
     [["rm", "--pm", "yarn", "zod"], "apm does not pass rm on to yarn"],
     [["ls", "--pm", "yarn"], "apm does not pass ls on to yarn"],
-    [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove passes on only the names of the packages to remove, not --no-package-lock"],
-    [["rm", "zod", "--", "--force"], "apm rm passes on only the names of the packages to remove, not --force"],
+    [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove takes only the names of the packages to remove, not --no-package-lock"],
+    [["rm", "zod", "--", "--force"], "apm rm takes only the names of the packages to remove, not --force"],
     [["index"], "apm does not pass index on to bun"],
     [["info", "left-pad"], "apm does not pass info on to bun"],
   ])("apm %p is refused: %s", async (argv, message) => {
@@ -513,6 +513,14 @@ describe("what still goes to the package manager", () => {
     expect(r.pmCalls).toEqual(["bun run --no-install dev"]);
   });
 
+  test.each([[["help", "remove"]], [["remove", "--help"]], [["rm", "-h"]]])("apm %p prints removal's help on stdout and runs nothing", async (argv) => {
+    const r = await apm(argv);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm remove <package>...");
+    expect(r.pmCalls).toEqual([]);
+  });
+
   test.each([[["help", "ci"]], [["ci", "--json", "--help"]]])("apm %p prints ci's help on stdout and runs nothing", async (argv) => {
     const r = await apm(argv);
 
@@ -530,21 +538,24 @@ describe("what still goes to the package manager", () => {
 
   const withDeps = (dependencies: Record<string, string>): string => `${JSON.stringify({ name: "help-probe", version: "1.0.0", dependencies })}\n`;
 
-  test.each(ZOD_LOCKS)("apm remove with %s passes the removal on while the lockfile pins every range package.json lists", async (pm, file, lock) => {
+  test.each(ZOD_LOCKS.filter(([pm]) => pm !== "yarn"))("apm remove with %s computes the removal in a copy first, then runs the package manager's removal", async (pm, file, lock) => {
     const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", withDeps({ zod: "^4.0.0" }), { [file]: lock });
 
     expect(r.code, r.out + r.err).toBe(0);
-    expect(r.pmCalls).toEqual([`${pm} remove zod`]);
+    expect(r.pmCalls.at(-1)).toBe(`${pm} remove zod`);
+    expect(r.pmCalls).toHaveLength(2);
   });
 
-  test.each(ZOD_LOCKS.flatMap(([pm, file, lock]) => [
-    [pm, "a range the lockfile lacks", withDeps({ zod: "^4.0.0", "is-number": "^7.0.0" }), { [file]: lock }, "package.json lists is-number@^7.0.0, which the lockfile does not pin"],
-    [pm, "a range the locked version does not satisfy", withDeps({ zod: "^5.0.0" }), { [file]: lock }, "package.json lists zod@^5.0.0, which the lockfile does not pin"],
-    [pm, "no lockfile", withDeps({ zod: "^4.0.0" }), {}, "package.json lists zod@^4.0.0, which the lockfile does not pin"],
-  ] as const))("apm remove with %s is refused for %s: the package manager would install it unchecked", async (pm, _why, packageJson, files, message) => {
-    const r = await apm(["remove", "--pm", pm, "zod"], "1.22.22", packageJson, files);
+  test.each([
+    [["remove", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no bun.lock)"],
+    [["remove", "--pm", "npm", "zod"], withDeps({ zod: "^4.0.0" }), {}, "apm remove needs a lockfile it can read (there is no package-lock.json)"],
+    [["remove", "--pm", "yarn", "zod"], withDeps({ zod: "^4.0.0" }), { "yarn.lock": ZOD_LOCKS[3]?.[2] ?? "" }, "apm cannot read yarn's lockfile, so it cannot check that a removal installs nothing new"],
+    [["remove", "left-pad"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "apm remove: left-pad is not in package.json"],
+    [["remove"], withDeps({ zod: "^4.0.0" }), { "bun.lock": ZOD_LOCKS[0]?.[2] ?? "" }, "apm remove needs the names of the packages to remove"],
+  ] as const)("apm %p is refused", async (argv, packageJson, files, message) => {
+    const r = await apm([...argv], "1.22.22", packageJson, files);
 
-    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.code, r.out + r.err).not.toBe(0);
     expect(r.err).toContain(message);
     expect(r.pmCalls).toEqual([]);
   });
