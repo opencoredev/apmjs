@@ -244,12 +244,12 @@ export function packageMarkdown(input: PackageView): string {
   const shown = version === null ? null : oneLine(version);
 
   out.push("## Install", "", codeBlock(INSTALL_CLIENTS.map((client) => installCommand({ client, name: pkg.name, version: shown })).join("\n"), "sh"), "");
-  out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm only get them once pointed at apm:", "");
+  out.push("`apm add` runs apm's checks itself. Plain bun, npm and pnpm get only some of them, and only once pointed at apm:", "");
 
   for (const client of ["bun", "npm"] as const) {
     const note = installNote({ client, registry: view.registry });
 
-    if (note.kind === "needs-setup") out.push(`${client === "npm" ? "npm and pnpm" : client} (${note.file}):`, "", codeBlock(note.config, client === "bun" ? "toml" : "ini"), "");
+    if (note.kind === "needs-setup") out.push(`${client === "npm" ? "npm and pnpm" : client} (${note.file}):`, "", codeBlock(note.config, client === "bun" ? "toml" : "ini"), "", note.effect, "");
   }
 
   out.push("## Not checked", "");

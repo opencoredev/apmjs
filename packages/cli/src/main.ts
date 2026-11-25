@@ -2170,7 +2170,8 @@ async function cmdPublish(a: Args): Promise<number> {
   const dest = mkdtempSync(join(tmpdir(), "apm-pack-"));
   process.once("exit", () => rmSync(dest, { recursive: true, force: true }));
   // packing runs the project's prepack and prepare scripts: no credentials in their env
-  const packed = await runCmd(packArgs(det.pm, dest), { cwd, env: pmEnv(cfg.registry, scopes), quiet: true });
+  const yarn = det.pm === "yarn" ? (await yarnLine({ cwd, env: pmEnv(cfg.registry, scopes) })).kind : "berry";
+  const packed = await runCmd(packArgs(det.pm, dest, yarn), { cwd, env: pmEnv(cfg.registry, scopes), quiet: true });
   const tgzName = readdirSync(dest).find((f) => f.endsWith(".tgz"));
   if (packed.code !== 0 || !tgzName) {
     warn(packed.out);

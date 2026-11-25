@@ -132,6 +132,10 @@ export function installScript(input: { site: SiteUrl; index: readonly CliSum[] }
 #   curl -fsSL ${input.site}/install | sh
 #   curl -fsSL ${input.site}/install | sh -s -- --version ${latest}
 #
+# Or with Homebrew, on macOS or Linux:
+#
+#   brew install opencoredev/tap/apm
+#
 # It downloads one apm binary for this machine from ${input.site}/cli/<version>/, checks its
 # SHA-256 against the list below (written when that version was released), and installs it
 # only if it matches: to ~/.apm/bin/apm, or $APM_INSTALL/bin/apm. It never uses sudo and does

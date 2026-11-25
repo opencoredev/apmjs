@@ -1,7 +1,7 @@
 // Spec: `apm` wraps whatever package manager the project uses (bun first, npm and pnpm too).
 // It adds a score gate before install, a preflight before publish, and one-step revoke and audit.
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRegistry, addUser, makeSandbox, writePackage, writeConsumer, run, apm, getJson, installedVersion, dig, type Registry } from "./harness";
@@ -136,7 +136,7 @@ describe("apm: install gate", () => {
     expect(r.code, r.out).toBe(0);
     expect(r.out).toMatch(/WARNING.*evil-dep@1\.0\.0.*scores \d+\/100 \(F\), under the floor of 40/);
     expect(r.out).toMatch(/x\.js:1/);
-    expect(r.out).toContain("/package/evil-dep/v/1.0.0");
+    expect(r.out).toContain("/package/evil-dep?v=1.0.0");
     expect(r.out).toContain("--strict");
     expect(installedVersion(app, "evil-dep")).toBe("1.0.0");
   });
@@ -273,6 +273,15 @@ describe("apm: publish", () => {
     const { body } = await getJson(`${reg.url}bumpy`);
     expect(dig(body, "dist-tags", "latest")).toBe("1.0.1");
     expect(r.out).toContain("bumpy@1.0.1");
+  });
+
+  test("apm publish --pm yarn packs with yarn 1 (which has no --out) and leaves no tarball in the project", async () => {
+    const sb = makeSandbox(reg, alice);
+    const d = writePackage(work, { name: "yarn-classic-lib", version: "1.0.0" }, reg, alice);
+    const r = await apm(["publish", "--pm", "yarn", "--dry-run"], { cwd: d, env: sb.env });
+    expect(r.code, r.out).toBe(0);
+    expect(r.out).toContain("index.js");
+    expect(readdirSync(d).filter((f) => f.endsWith(".tgz"))).toEqual([]);
   });
 
   test("apm publish works in a project that only has npm", async () => {

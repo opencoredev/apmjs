@@ -11,6 +11,8 @@ export const RESERVE_PER_REVIEW = 2 * (17_000 + 8_000);
 export class DailyBudget {
   private day: string;
   private used: number;
+  /** Reviews leased but not yet charged; each holds RESERVE_PER_REVIEW. */
+  private held = 0;
   private readonly file: string;
 
   constructor(
@@ -47,9 +49,26 @@ export class DailyBudget {
 
   /** Whether another review fits in what is left of today's budget. */
   canStart(): boolean {
+    return this.reviewsThatFit() >= 1;
+  }
+
+  /** How many more reviews fit in what is left of today's budget, each reserving RESERVE_PER_REVIEW, after the held ones. */
+  reviewsThatFit(): number {
     this.roll();
 
-    return this.used + RESERVE_PER_REVIEW <= this.limit;
+    return Math.max(0, Math.floor((this.limit - this.used) / RESERVE_PER_REVIEW) - this.held);
+  }
+
+  /** Holds a reserve for each of `n` leased reviews until it settles. */
+  hold(n: number): void {
+    this.held += n;
+  }
+
+  /** Releases one review's reserve and charges what it actually used. */
+  settle(tokens: number): void {
+    this.held = Math.max(0, this.held - 1);
+
+    if (tokens > 0) this.spend(tokens);
   }
 
   spend(tokens: number): void {
