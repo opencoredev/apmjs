@@ -1,7 +1,7 @@
 "use client";
 
 // Sends the custom events that server-rendered elements declare with lib/databuddy-client.ts's clickEvent and
-// copyEvent: one click listener and one copy listener on the document, so the docs overview, the 404 page and the
+// copyEvent: click and middle-click (auxclick) listeners and one copy listener on the document, so the docs overview, the 404 page and the
 // package page's evidence lines stay server components. Mounted with DatabuddyNavigation, so only on a build with a
 // client id; track() itself does nothing where the tracker did not load.
 import { useEffect } from "react";
@@ -32,10 +32,12 @@ export function AnalyticsEvents() {
     };
 
     document.addEventListener("click", onClick, { capture: true });
+    document.addEventListener("auxclick", onClick, { capture: true });
     document.addEventListener("copy", onCopy);
 
     return () => {
       document.removeEventListener("click", onClick, { capture: true });
+      document.removeEventListener("auxclick", onClick, { capture: true });
       document.removeEventListener("copy", onCopy);
     };
   }, []);

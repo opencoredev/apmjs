@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { CopyBlock, CopyGlyph, CopyStatus, useCopy } from "@/components/copy-button";
 import { INSTALL_CLIENTS, InstallClient, installCommand, installNote, type InstallNote } from "@/lib/install-note";
 import { packagePrompt } from "@/lib/agent-prompt";
-import { clickEvent, copyEvent, installDefaultClient, track, type TrackedEvent } from "@/lib/databuddy-client";
+import { clickEvent, copyEvent, installDefaultClient, track, trackInstallDefaultShown, type TrackedEvent } from "@/lib/databuddy-client";
 
 const isClient = (v: unknown): v is InstallClient => InstallClient.safeParse(v).success;
 
@@ -16,7 +16,7 @@ const isClient = (v: unknown): v is InstallClient => InstallClient.safeParse(v).
 const DATABUDDY_CLIENT_ID = process.env.NEXT_PUBLIC_DATABUDDY_CLIENT_ID?.trim() ?? "";
 
 /** The flag is asked once per document; every install box after the first reuses the answer. */
-let startingClient: Promise<InstallClient> | null = null;
+let startingClient: Promise<InstallClient | null> | null = null;
 
 function DocsLink({ href }: { href: string }) {
   return (
@@ -172,9 +172,11 @@ export function InstallTabs({ name, version, registry }: { name: string; version
   useEffect(() => {
     let live = true;
 
-    startingClient ??= installDefaultClient({ clientId: DATABUDDY_CLIENT_ID, fallback: "apm" });
+    startingClient ??= installDefaultClient({ clientId: DATABUDDY_CLIENT_ID });
     void startingClient.then((c) => {
-      if (live && !chosen.current) setClient(c);
+      if (!live || chosen.current || c === null) return;
+      setClient(c);
+      trackInstallDefaultShown(c);
     });
 
     return () => {

@@ -511,13 +511,13 @@ export function SearchHome({ recent }: { recent: ReactNode }) {
 
   // One package_searched per query whose answer stays on screen, or that a result is opened from first: its result
   // count only, never the text typed.
-  const counted = useRef<string | null>(null);
+  const counted = useRef(new Set<string>());
   const shownResults = fresh && q !== "" && current?.kind === "ok" ? current.answer.hits.length : null;
 
   const countSearch = () => {
-    if (shownResults === null || counted.current === q) return;
+    if (shownResults === null || counted.current.has(q)) return;
 
-    counted.current = q;
+    counted.current.add(q);
     track({ name: "package_searched", props: { results: shownResults } });
   };
 

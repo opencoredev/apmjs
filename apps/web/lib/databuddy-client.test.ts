@@ -2,7 +2,7 @@
 // attributes server components declare, and that nothing is sent or asked without the tracker on the page. The
 // tracker and Databuddy's flag endpoint are stand-ins here; scripts/analytics-browser.ts runs the real databuddy.js.
 import { afterEach, describe, expect, test } from "bun:test";
-import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, track } from "./databuddy-client";
+import { DATABUDDY_FLAGS_URL, EVENT_PROPS, INSTALL_DEFAULT_CLIENT_FLAG, clickEvent, copyEvent, eventFromAttributes, installDefaultClient, track, trackInstallDefaultShown } from "./databuddy-client";
 
 type Sent = { name: string; props: Readonly<Record<string, string | number>> };
 
@@ -127,50 +127,48 @@ describe("the install-default-client flag", () => {
     return bodies;
   }
 
-  test("off production (no client id) asks nothing and keeps the default", async () => {
+  test("off production (no client id) asks nothing", async () => {
     fakeTracker();
     const bodies = serve({ enabled: true, value: "npm", variant: "npm", reason: "RULE_MATCH", payload: null });
 
-    expect(await installDefaultClient({ clientId: "", fallback: "apm" })).toBe("apm");
+    expect(await installDefaultClient({ clientId: "" })).toBeNull();
     expect(bodies).toEqual([]);
   });
 
-  test("serves the variant for this visitor's random id, and reports which one it saw", async () => {
+  test("serves the variant for this visitor's random id, and reports exposure only when the box shows it", async () => {
     const t = fakeTracker("anon_abc");
     const bodies = serve({ enabled: true, value: "npm", variant: "npm", reason: "RULE_MATCH", payload: null });
 
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("npm");
+    expect(await installDefaultClient({ clientId: "client-1" })).toBe("npm");
     expect(bodies).toEqual([{ clientId: "client-1", userId: "anon_abc", keys: [INSTALL_DEFAULT_CLIENT_FLAG] }]);
+    expect(t.sent).toEqual([]);
+    trackInstallDefaultShown("npm");
     expect(t.sent).toEqual([{ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: "npm", value: "npm" } }]);
   });
 
-  test("keeps the default for a disabled flag, a value that is not a client, an error, or no visitor id", async () => {
+  test("serves nothing for a disabled flag, a value that is not a client, an error, or no visitor id", async () => {
     fakeTracker();
     serve({ enabled: false, value: "npm", reason: "DISABLED", payload: null });
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
+    expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
 
     serve({ enabled: true, value: "<script>", variant: "x", reason: "RULE_MATCH", payload: null });
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
-
-    const t = fakeTracker();
-    serve({ enabled: true, value: "npm", variant: "https://evil.test/", reason: "RULE_MATCH", payload: null });
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("npm");
-    expect(t.sent).toEqual([{ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: "npm", value: "npm" } }]);
+    expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
 
     serve({ error: "boom" }, 500);
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
+    expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
 
     fakeTracker(null);
     const bodies = serve({ enabled: true, value: "npm", variant: "npm", reason: "RULE_MATCH", payload: null });
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
+
+    expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
     expect(bodies).toEqual([]);
   });
 
-  test("without the tracker (an opt-out, another origin) it waits briefly, asks nothing and keeps the default", async () => {
+  test("without the tracker (an opt-out, another origin) it waits briefly and asks nothing", async () => {
     Reflect.set(globalThis, "window", {});
     const bodies = serve({ enabled: true, value: "npm", variant: "npm", reason: "RULE_MATCH", payload: null });
 
-    expect(await installDefaultClient({ clientId: "client-1", fallback: "apm" })).toBe("apm");
+    expect(await installDefaultClient({ clientId: "client-1" })).toBeNull();
     expect(bodies).toEqual([]);
   }, 10_000);
 });

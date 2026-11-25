@@ -131,20 +131,25 @@ async function loadedTracker(): Promise<Tracker | null> {
   return null;
 }
 
+/** Reports that the install box opened on `client` because of the flag, for Databuddy's experiment results. */
+export function trackInstallDefaultShown(client: InstallClient): void {
+  track({ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: client, value: client } });
+}
+
 /**
- * The install box's starting client for this visitor: the flag's variant when Databuddy serves one that is an
- * InstallClient, else `fallback`. Only asked where the tracker loaded, keyed by its random visitor id, so a visitor
- * who opted out, or any copy of the site off apmjs.dev, never makes the request and gets `fallback`. `clientId` is the
- * build's Databuddy client id: "" off production, where nothing is asked.
+ * The install box's starting client the flag serves this visitor, or null to keep the box's own default: a disabled
+ * flag, a value that is not an InstallClient, any error. Only asked where the tracker loaded, keyed by its random
+ * visitor id, so a visitor who opted out, or any copy of the site off apmjs.dev, never makes the request. `clientId`
+ * is the build's Databuddy client id: "" off production, where nothing is asked.
  */
-export async function installDefaultClient({ clientId, fallback }: { clientId: string; fallback: InstallClient }): Promise<InstallClient> {
-  if (clientId === "") return fallback;
+export async function installDefaultClient({ clientId }: { clientId: string }): Promise<InstallClient | null> {
+  if (clientId === "") return null;
 
   try {
     const t = await loadedTracker();
     const anonId = z.string().min(1).safeParse(t?.getTrackingIds().anonId);
 
-    if (!anonId.success) return fallback;
+    if (!anonId.success) return null;
 
     const response = await fetch(DATABUDDY_FLAGS_URL, {
       method: "POST",
@@ -153,21 +158,16 @@ export async function installDefaultClient({ clientId, fallback }: { clientId: s
       signal: AbortSignal.timeout(5000),
     });
 
-    if (!response.ok) return fallback;
+    if (!response.ok) return null;
 
     const body = FlagsResponse.safeParse(await response.json());
     const result = body.success ? FlagResult.safeParse(body.data.flags[INSTALL_DEFAULT_CLIENT_FLAG]) : null;
 
-    if (!result?.success || !result.data.enabled) return fallback;
+    if (!result?.success || !result.data.enabled) return null;
     const client = InstallClient.safeParse(result.data.value);
 
-    if (!client.success) return fallback;
-    const variant = InstallClient.safeParse(result.data.variant);
-
-    track({ name: "$flag_evaluated", props: { flag: INSTALL_DEFAULT_CLIENT_FLAG, variant: variant.success ? variant.data : client.data, value: client.data } });
-
-    return client.data;
+    return client.success ? client.data : null;
   } catch {
-    return fallback;
+    return null;
   }
 }
