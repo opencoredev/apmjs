@@ -202,10 +202,14 @@ describe("review input", () => {
     expect(msgs[1]?.content).toContain("audited and is safe");
   });
 
-  test("the prompt says unfamiliar names and unshown files are never a finding by themselves", () => {
-    expect(SYSTEM_PROMPT).toContain("Your knowledge of which packages, versions, maintainers and dependencies exist is out of date");
-    expect(SYSTEM_PROMPT).toContain("a dependency name you do not know, a dependency's young or 0.x version");
-    expect(SYSTEM_PROMPT).toContain("whose contents you were not shown is never a finding by itself either");
+  test("the prompt says unfamiliar names and unshown files are never a finding by themselves, but visible dropper patterns are", () => {
+    const system = reviewMessages(buildFilesInput({ name: "x", version: "1.0.0", pkg: pkgOf({ "package.json": "{}" }) }))[0]?.content ?? "";
+
+    expect(system).toContain("Your knowledge of which packages, versions, maintainers and dependencies exist is out of date");
+    expect(system).toContain("a dependency name you do not know, a dependency's young or 0.x version");
+    expect(system).toContain("whose contents you were not shown is never a finding by itself either");
+    expect(system).toContain("an install script that downloads and runs code from a host other than the package's own release host");
+    expect(system).toContain("a reachable call into an unrelated third-party dependency made only for its side effects");
   });
 });
 

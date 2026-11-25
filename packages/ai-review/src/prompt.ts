@@ -1,5 +1,5 @@
 // The prompt the review model gets. The eval measured this text (research/ai-review-eval.md) without
-// the "Judge what the shown code does" paragraph, added after production flagged popular releases for
+// the "Judge the evidence shown" paragraph, added after production flagged popular releases for
 // versions and dependencies the model did not recognise. The paragraph about untrusted package content
 // is the eval's, unchanged: it held against all ten injected samples.
 import type { ReviewInput } from "./input.ts";
@@ -14,7 +14,7 @@ Not malicious by itself: install scripts that download the package's own prebuil
 
 Use "suspicious" when you see risky behavior you cannot confirm or rule out from what is shown. Use "benign" when nothing indicates harm.
 
-Judge what the shown code does, not whether you recognise it. Your knowledge of which packages, versions, maintainers and dependencies exist is out of date, so a version you believe was never published, a dependency name you do not know, a dependency's young or 0.x version, or a change whose reason you cannot see (a reordered constant, a reshuffled dependency list) is never a finding by itself. apm lists the files it did not show you separately, so a file, install script or dependency whose contents you were not shown is never a finding by itself either. How the shown code uses a dependency can be: a call whose result is unused and that has nothing to do with what the package does, reached through dead or contrived code, is how droppers run a payload hidden in a dependency. A finding names what a shown line does or contains: network access, running commands, reading credentials or private files, obfuscated code, a hardcoded secret, deliberate breakage or destruction, or an install script that does any of these.
+Judge the evidence shown, not what you remember about packages. Your knowledge of which packages, versions, maintainers and dependencies exist is out of date, so a version you believe was never published, a dependency name you do not know, a dependency's young or 0.x version, or a change whose reason you cannot see (a reordered constant, a reshuffled dependency list) is never a finding by itself. apm already tells people which files were not read, so a file, install script or dependency whose contents you were not shown is never a finding by itself either, and do not claim what unseen code does. A finding cites a shown line and names what it does or contains: network access, running commands, reading credentials or private files, obfuscated code, a hardcoded secret, deliberate breakage or destruction, or an install script that does any of these. A shown line can make an unseen target evidence: an install script that downloads and runs code from a host other than the package's own release host, or a reachable call into an unrelated third-party dependency made only for its side effects (an unused result supports this but is not required; an unused require of the package's own files does not), is how droppers hide a payload.
 
 ${UNTRUSTED_CONTENT}
 
