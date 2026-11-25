@@ -102,6 +102,25 @@ describe("tar headers are read as npm and Bun install them", () => {
     expect(pathsOf(streamed(bytes))).toEqual(["package.json", "evil.js"]);
   });
 
+  // npm reads an old GNU "N" header's data as the next file's path and Bun passes over it: N(evil.js) then harmless.txt
+  // installs evil.js with npm and harmless.txt with Bun, X then N the same, and N then X installs the X path with both.
+  // Whatever its order, the archive has no one installed reading, so it is refused
+  const N = entry("././@LongLink", "package/evil.js\0", { type: "N" });
+  const X = entry("PaxHeader/a", paxRecord("path=package/harmless.txt"), { type: "x" });
+
+  for (const [name, parts] of [
+    ["an old GNU long name", [PJ, N, entry("package/harmless.txt", EVIL)]],
+    ["a PAX path then an old GNU long name", [PJ, X, N, entry("package/harmless.txt", EVIL)]],
+    ["an old GNU long name then a PAX path", [PJ, N, X, entry("package/other.txt", EVIL)]],
+  ] as const) {
+    test(`${name} is refused`, () => {
+      const bytes = tar([...parts]);
+
+      expect(() => readTar(bytes)).toThrow(ArchiveError);
+      expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
+
   test("the file after a lone zero block is read whole", () => {
     const [, evil] = readTar(tar([PJ, [zero()], entry("package/evil.js", EVIL)]));
 

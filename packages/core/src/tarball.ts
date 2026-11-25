@@ -152,6 +152,15 @@ function invalid(message: string): ArchiveError {
   return new ArchiveError("invalid", message);
 }
 
+/**
+ * An old GNU "N" header names the next file for npm (node-tar reads its data as the path, the later of it and a PAX path
+ * winning) and names nothing for Bun, which installs the file under its own header's name or PAX path. Neither reading is
+ * the installed one, so an archive with one is refused before any of its entries is read.
+ */
+function oldGnuLongPath(at: number): ArchiveError {
+  return invalid(`an old GNU long name header at byte ${at}, which npm and Bun read as different paths`);
+}
+
 /** Parses an uncompressed tar. Strips the leading "package/" (or any single top dir) from paths. */
 export function readTar(tar: Uint8Array, meter?: Meter): TarEntry[] {
   return metered(meter, () => readTarMetered(tar));
@@ -194,6 +203,8 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
+
+    if (type === "N") throw oldGnuLongPath(off);
     const dataStart = off + 512;
 
     if (dataStart + size > tar.length) throw invalid(`entry "${name}" runs past the end of the archive`);
@@ -580,6 +591,8 @@ export class TarStream {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
+
+    if (type === "N") throw oldGnuLongPath(off);
     const blocks = Math.ceil(size / 512) * 512;
     const pad = blocks - size;
     // readTar's offset once it has moved past this entry, which a PAX error names
