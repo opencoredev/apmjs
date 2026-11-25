@@ -12,7 +12,7 @@ import { DATABUDDY_FLAGS_ORIGIN } from "./databuddy-origin";
 import { InstallClient } from "./install-note";
 
 /** An npm package name, scoped or not; nothing longer or looser can ride along as a "package". */
-const PackageName = z.string().regex(/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/).max(214);
+const PackageName = z.string().regex(/^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i).max(214);
 
 const Count = z.number().int().nonnegative().max(10_000);
 

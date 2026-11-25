@@ -54,6 +54,7 @@ describe("the events", () => {
     expect(eventFromAttributes({ name: "docs_cta_clicked", props: '{"location":"https://evil.test/?q=secret"}' })).toBeNull();
     expect(eventFromAttributes({ name: "evidence_opened", props: '{"package":"my secret query","signal":"network"}' })).toBeNull();
     expect(eventFromAttributes({ name: "package_searched", props: '{"results":2.5}' })).toBeNull();
+    expect(eventFromAttributes({ name: "search_result_opened", props: '{"package":"JSONStream","position":1}' })).not.toBeNull();
     expect(eventFromAttributes({ name: "search_result_opened", props: '{"package":"@scope/pkg","position":2}' })).toEqual({ name: "search_result_opened", props: { package: "@scope/pkg", position: 2 } });
   });
 

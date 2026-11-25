@@ -194,7 +194,9 @@ export function InstallTabs({ name, version, registry }: { name: string; version
         <Tabs
           value={client}
           onValueChange={(v) => {
-            if (isClient(v)) setClient(v);
+            if (!isClient(v)) return;
+            chosen.current = true;
+            setClient(v);
           }}
         >
           <TabsList
