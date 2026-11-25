@@ -13,8 +13,9 @@ export type RepositoryField = z.infer<typeof RepositoryField>;
 // "." and ".." would be read by a browser as path segments: github.com/../.. opens github.com.
 const PART = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
-// git+https://github.com/o/r.git, git://github.com/o/r, git@github.com:o/r.git, https://github.com/o/r/tree/main/x
-const HOSTED = /^(?:git\+)?(?:https?:\/\/|git:\/\/|ssh:\/\/|git\+ssh:\/\/)?(?:[^@/]+@)?(?:www\.)?github\.com[/:]([^/]+)\/([^/#?]+)/i;
+// git+https://github.com/o/r.git, git://github.com/o/r, git@github.com:o/r.git, https://github.com/o/r/tree/main/x; a
+// trailing-dot host (github.com.) is the same host
+const HOSTED = /^(?:git\+)?(?:https?:\/\/|git:\/\/|ssh:\/\/|git\+ssh:\/\/)?(?:[^@/]+@)?(?:www\.)?github\.com\.?[/:]([^/]+)\/([^/#?]+)/i;
 
 // github:o/r and the bare o/r shorthand npm also accepts
 const SHORTHAND = /^(?:github:)?([^/:]+)\/([^/#?:]+)$/;
