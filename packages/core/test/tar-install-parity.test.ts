@@ -2,7 +2,7 @@
 // a path apm never scanned, or not be scanned at all. Each case here was extracted with npm and with `bun install` and
 // lists what both put on disk; readTar and TarStream must read the same files, or refuse the archive.
 import { describe, expect, test } from "bun:test";
-import { ArchiveError, readTar, TarStream, type TarEntry } from "../src/index.ts";
+import { ArchiveError, MAX_META_ENTRY_BYTES, readTar, TarStream, type TarEntry } from "../src/index.ts";
 
 const enc = new TextEncoder();
 
@@ -29,6 +29,20 @@ function entry(name: string, body: string, o: { type?: string; magic?: string; p
   const data = enc.encode(body);
 
   return [header({ name, size: data.length, ...o }), data, new Uint8Array((512 - (data.length % 512)) % 512)];
+}
+
+function rawEntry(name: string, data: Uint8Array, type: string): Uint8Array[] {
+  return [header({ name, size: data.length, type }), data, new Uint8Array((512 - (data.length % 512)) % 512)];
+}
+
+/** A PAX record of `key=` and these bytes, for a value that is not text. */
+function paxBytes(key: string, value: Uint8Array): Uint8Array {
+  const rest = value.length + key.length + 3;
+  let len = rest + 1;
+
+  while (String(len).length + rest !== len) len = String(len).length + rest;
+
+  return new Uint8Array([...enc.encode(`${len} ${key}=`), ...value, 0x0a]);
 }
 
 function paxRecord(kv: string): string {
@@ -120,6 +134,53 @@ describe("tar headers are read as npm and Bun install them", () => {
       expect(() => streamed(bytes)).toThrow(ArchiveError);
     });
   }
+
+  // npm and Bun pass over a metadata entry over 1 MiB and an empty long name, installing the next file under its own
+  // header name or the pending path (a long name of 2 MB, then evil.js, installs evil.js with both); and npm reads a PAX
+  // header line by line, up to a NUL, as text, where Bun reads each record by its length, as bytes (a path holding a
+  // newline installs evil.js with npm and harmless\n.txt with Bun). apm refuses them all, which leaves the package
+  // unscorable rather than scored clean
+  const junk = (n: number): string => "j".repeat(n);
+  const over = MAX_META_ENTRY_BYTES + 1;
+
+  const refused: [string, Uint8Array[][]][] = [
+    ["a GNU long name over 1 MiB", [PJ, entry("././@LongLink", `package/harmless.txt\0${junk(over)}`, { type: "L" }), entry("package/evil.js", EVIL)]],
+    ["a GNU long link name over 1 MiB", [PJ, entry("././@LongLink", `target\0${junk(over)}`, { type: "K" }), entry("package/evil.js", EVIL)]],
+    ["a PAX header over 1 MiB", [PJ, entry("PaxHeader/a", paxRecord(`path=package/harmless.txt${"/".repeat(over)}`), { type: "x" }), entry("package/evil.js", EVIL)]],
+    ["a global PAX header over 1 MiB", [PJ, entry("pax_global_header", paxRecord(`comment=${junk(over)}`), { type: "g" }), entry("package/evil.js", EVIL)]],
+    ["an empty GNU long name", [PJ, entry("././@LongLink", "", { type: "L" }), entry("package/evil.js", EVIL)]],
+    ["an empty GNU long name after a PAX path", [PJ, entry("PaxHeader/a", paxRecord("path=package/evil.js"), { type: "x" }), entry("././@LongLink", "", { type: "L" }), entry("package/harmless.txt", EVIL)]],
+    ["an empty GNU long link name", [PJ, entry("././@LongLink", "", { type: "K" }), entry("package/evil.js", EVIL)]],
+    ["a PAX path holding a newline", [PJ, entry("PaxHeader/a", paxRecord("path=package/harmless\n.txt"), { type: "x" }), entry("package/evil.js", EVIL)]],
+    ["a PAX record whose newline npm reads as a path record", [PJ, entry("PaxHeader/a", paxRecord(`comment=a\n${paxRecord("path=package/evil.js").slice(0, -1)}`), { type: "x" }), entry("package/harmless.txt", EVIL)]],
+    ["a PAX path holding a NUL", [PJ, entry("PaxHeader/a", paxRecord("path=package/evil.js\0.txt"), { type: "x" }), entry("package/evil.js", EVIL)]],
+    ["a PAX path that is not UTF-8", [PJ, rawEntry("PaxHeader/a", paxBytes("path", new Uint8Array([...enc.encode("package/a"), 0xff, ...enc.encode(".txt")])), "x"), entry("package/evil.js", EVIL)]],
+    ["a PAX record that is not UTF-8", [PJ, rawEntry("PaxHeader/a", paxBytes("comment", new Uint8Array([0xc3, 0x28])), "x"), entry("package/evil.js", EVIL)]],
+  ];
+
+  for (const [name, parts] of refused) {
+    test(`${name} is refused`, () => {
+      const bytes = tar(parts);
+
+      expect(() => readTar(bytes)).toThrow(ArchiveError);
+      expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
+
+  test("a GNU long name of exactly 1 MiB names the next file, as npm reads it", () => {
+    const name = "package/evil.js\0";
+    const bytes = tar([PJ, entry("././@LongLink", name + junk(MAX_META_ENTRY_BYTES - name.length), { type: "L" }), entry("package/harmless.txt", EVIL)]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "evil.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "evil.js"]);
+  });
+
+  test("a PAX path with multi-byte UTF-8 is read", () => {
+    const bytes = tar([PJ, rawEntry("PaxHeader/a", paxBytes("path", enc.encode("package/café.js")), "x"), entry("package/a.js", EVIL)]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "café.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "café.js"]);
+  });
 
   test("the file after a lone zero block is read whole", () => {
     const [, evil] = readTar(tar([PJ, [zero()], entry("package/evil.js", EVIL)]));

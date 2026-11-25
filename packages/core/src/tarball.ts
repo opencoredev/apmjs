@@ -153,12 +153,29 @@ function invalid(message: string): ArchiveError {
 }
 
 /**
- * An old GNU "N" header names the next file for npm (node-tar reads its data as the path, the later of it and a PAX path
- * winning) and names nothing for Bun, which installs the file under its own header's name or PAX path. Neither reading is
- * the installed one, so an archive with one is refused before any of its entries is read.
+ * The most a metadata entry (a GNU long name or long link name, or a PAX header) may be. npm's node-tar ignores one over
+ * its `maxMetaEntrySize`, 1 MiB, and installs the next file under its own header name (Bun 1.4.4 does too); a streamed
+ * read must also hold one whole to read it.
  */
-function oldGnuLongPath(at: number): ArchiveError {
-  return invalid(`an old GNU long name header at byte ${at}, which npm and Bun read as different paths`);
+export const MAX_META_ENTRY_BYTES = 1024 * 1024;
+
+/**
+ * Refuses the metadata headers npm and Bun read differently, so a file can't be installed under a name apm did not list
+ * it under, before the entry's data is read. Both readers call it on every header; the PAX records themselves are held to
+ * the same rule in paxPathOf. Each one is a way to hide a file, never something npm writes, so the archive is refused:
+ * - an old GNU "N" header: npm reads its data as the next file's path (the later of it and a PAX path winning) and Bun
+ *   passes over it.
+ * - a long name, long link name or PAX header over MAX_META_ENTRY_BYTES: npm and Bun pass over it, where readTar read it
+ *   and a streamed read can't hold it, so neither reader lists the file as installed.
+ * - an empty long name or long link name: npm passes over it, keeping the pending path, which reading it as "" would drop.
+ */
+function refuseUnsharedMeta(type: string, size: number, at: number): void {
+  if (type === "N") throw invalid(`an old GNU long name header at byte ${at}, which npm and Bun read as different paths`);
+  const meta = type === "L" || type === "K" || isPax(type) || type === "g";
+
+  if (meta && size > MAX_META_ENTRY_BYTES) throw invalid(`a metadata entry of more than ${MAX_META_ENTRY_BYTES / (1024 * 1024)} MB at byte ${at}, which npm passes over`);
+
+  if ((type === "L" || type === "K") && size === 0) throw invalid(`an empty GNU long name at byte ${at}, which npm passes over`);
 }
 
 /** Parses an uncompressed tar. Strips the leading "package/" (or any single top dir) from paths. */
@@ -203,8 +220,7 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
-
-    if (type === "N") throw oldGnuLongPath(off);
+    refuseUnsharedMeta(type, size, off);
     const dataStart = off + 512;
 
     if (dataStart + size > tar.length) throw invalid(`entry "${name}" runs past the end of the archive`);
@@ -272,6 +288,18 @@ export function readTarball(tgz: Uint8Array, maxBytes: number = MAX_UNPACKED_BYT
   return metered(meter, () => readTarMetered(gunzipCapped(tgz, Math.min(maxBytes, MAX_UNPACKED_BYTES))));
 }
 
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
+
+function isUtf8(bytes: Uint8Array): boolean {
+  try {
+    STRICT_UTF8.decode(bytes);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const DIGIT_0 = 0x30;
 const SPACE = 0x20;
 const EQUALS = 0x3d;
@@ -310,6 +338,11 @@ function paxPathOf(data: Uint8Array, at: number): string | null {
 
     if (eq <= 0) throw invalid(`malformed pax record at byte ${at}`);
 
+    // npm splits a PAX header at every newline and drops a line whose length is not its own, so a record holding one is
+    // read as other records; it reads up to a NUL in a value and Bun may read past it; and it decodes a value that is not
+    // UTF-8 to other text than Bun's bytes. Any of these lets npm install a file under a name apm did not list
+    if (record.includes(NEWLINE) || record.includes(0) || !isUtf8(record)) throw invalid(`a pax record npm and Bun read differently at byte ${at}`);
+
     if (eq === 4 && record[0] === 0x70 && record[1] === 0x61 && record[2] === 0x74 && record[3] === 0x68) path = new TextDecoder().decode(record.subarray(eq + 1));
 
     // npm takes the next entry's size from a PAX `size` (Bun does too, but not from a global one), so reading the header's
@@ -334,9 +367,6 @@ function paxPathOf(data: Uint8Array, at: number): string | null {
 
 /** Bytes of a file kept when the read does not hold it: the most any check of a file's first bytes reads, and some. */
 export const HEAD_BYTES = 16;
-
-/** The most a PAX header or GNU long name may be in a streamed read, which must hold it whole to read it. */
-export const MAX_STREAMED_NAME_BYTES = 1024 * 1024;
 
 /**
  * The most file names a streamed read keeps, in characters, all paths together: it keeps every entry's path. next
@@ -591,16 +621,15 @@ export class TarStream {
     const mode = readOctalField(header, 100, 8) ?? 0;
     const name = readString(header, 0, 100);
     const type = String.fromCharCode(header[156] ?? 48);
-
-    if (type === "N") throw oldGnuLongPath(off);
+    refuseUnsharedMeta(type, size, off);
     const blocks = Math.ceil(size / 512) * 512;
     const pad = blocks - size;
     // readTar's offset once it has moved past this entry, which a PAX error names
     const after = off + 512 + blocks;
     this.offset += blocks;
 
+    // refuseUnsharedMeta has held it to MAX_META_ENTRY_BYTES
     if (type === "L" || type === "x" || type === "X" || type === "g") {
-      if (size > MAX_STREAMED_NAME_BYTES) throw new ArchiveError("too-large", `a ${type === "L" ? "long name" : "PAX header"} of more than ${MAX_STREAMED_NAME_BYTES / (1024 * 1024)} MB`);
       // held until its last byte is in, then let go (the name it gives is charged with the entry it names)
       this.take(size);
       const meta: Extract<Pending, { kind: "meta" }> = { kind: "meta", type, name, buf: new Uint8Array(size), at: after, left: size, pad };
