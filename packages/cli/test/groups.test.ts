@@ -5,6 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_REGISTRY, loadConfig } from "../src/config.ts";
 import { devGroup, omitArgs, releaseOmission } from "../src/groups.ts";
 import { decodeIni, type IniValue, text } from "../src/ini.ts";
 import { npmAnswer, OMISSION_CASES, type OmissionCase } from "./fixtures/omission-cases.ts";
@@ -164,6 +165,26 @@ describe("finding 1 of a24c6aa: section headers read with the grammar of npm's o
 
     expect(Object.fromEntries(decodeIni(src, "spaced"))).toEqual({});
     expect([...decodeIni(src, "exact").keys()]).toEqual(["[sec]", "j"]);
+  });
+
+  test("apm's registry and token from a user .npmrc follow the same grammar (review of PR #9)", () => {
+    const user = "[custom] \nregistry=https://r.example/\n//r.example/:_authToken=apm_tokentokentokentoken\n";
+
+    const config = (path: string | undefined) => {
+      const p = project({ user });
+      const env: Record<string, string> = { HOME: p.env.HOME };
+
+      if (path !== undefined) env.PATH = path;
+
+      return loadConfig(p.root, env);
+    };
+
+    // Debian's npm 9.2 reads `[custom] ` as a key, so both lines below it are top-level, as npm itself uses them
+    expect(config(NPM92_DEBIAN)).toMatchObject({ registry: "https://r.example/", token: "apm_tokentokentokentoken" });
+    // npm 11 opens a section there and reads neither
+    expect(config(NPM11)).toMatchObject({ registry: DEFAULT_REGISTRY, token: null });
+    // no npm to ask: the settings are kept
+    expect(config(undefined)).toMatchObject({ registry: "https://r.example/", token: "apm_tokentokentokentoken" });
   });
 });
 

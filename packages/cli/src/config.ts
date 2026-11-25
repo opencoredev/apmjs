@@ -3,7 +3,8 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { decodeIni } from "./ini.ts";
+import { npmIniSections } from "./groups.ts";
+import { decodeIni, type SectionSyntax } from "./ini.ts";
 
 export const DEFAULT_REGISTRY = "https://registry.apmjs.dev/";
 
@@ -27,14 +28,23 @@ export function parseNpmrc(text: string): Map<string, string> {
   return out;
 }
 
+/**
+ * How the npm on PATH reads a `[section] ` header with trailing space: a section from ini 4.1 (npm 11), a bare key to
+ * Debian's npm 9.2 (ini 3), so the settings below it stay top-level there. When no npm is found, the exact reading,
+ * which keeps those settings, so a token npm may use is not dropped.
+ */
+function npmrcSections(env: Record<string, string | undefined>): SectionSyntax {
+  return npmIniSections(env) ?? "exact";
+}
+
 /** An .npmrc's top-level text settings as npm reads them (ini.ts): quotes removed, `; comments` dropped, sections skipped. */
-function readNpmrc(path: string): Map<string, string> {
+function readNpmrc(path: string, sections: SectionSyntax): Map<string, string> {
   try {
     const out = new Map<string, string>();
 
     if (!existsSync(path)) return out;
 
-    for (const [key, value] of decodeIni(readFileSync(path, "utf8"), "spaced")) if (value.kind === "one" && value.item.kind === "text") out.set(key, value.item.text);
+    for (const [key, value] of decodeIni(readFileSync(path, "utf8"), sections)) if (value.kind === "one" && value.item.kind === "text") out.set(key, value.item.text);
 
     return out;
   } catch {
@@ -81,7 +91,7 @@ export function sameRegistry(a: string, b: string): boolean {
  * (`npm run` exports project config as npm_config_* variables).
  */
 export function tokenRegistry(env: Record<string, string | undefined>): string {
-  return withSlash(env.APM_REGISTRY ?? readNpmrc(userconfigPath(env)).get("registry") ?? DEFAULT_REGISTRY);
+  return withSlash(env.APM_REGISTRY ?? readNpmrc(userconfigPath(env), npmrcSections(env)).get("registry") ?? DEFAULT_REGISTRY);
 }
 
 export function loadConfig(cwd: string, env: Record<string, string | undefined>): Config {
@@ -89,7 +99,8 @@ export function loadConfig(cwd: string, env: Record<string, string | undefined>)
   const userDirs = new Set<string>([homedir(), dirname(userconfig)]);
 
   if (env.HOME) userDirs.add(env.HOME);
-  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map(readNpmrc);
+  const sections = npmrcSections(env);
+  const files = [...projectNpmrcs(cwd, userDirs), userconfig].map((f) => readNpmrc(f, sections));
   const registry = withSlash(env.APM_REGISTRY ?? env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY ?? files.find((f) => f.has("registry"))?.get("registry") ?? DEFAULT_REGISTRY);
   const envToken = env.APM_TOKEN || null;
 
