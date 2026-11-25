@@ -22,7 +22,7 @@ import { Store } from "../src/db.ts";
 import { degradedRoute } from "../src/degraded.ts";
 import { EdgeChecks } from "../src/edge-checks.ts";
 import { MemoryPool, RequestMemory } from "../src/memory.ts";
-import { listedAmong, listedNotice, NAME_FRESH_MS, NAME_STALE_MS, osvFeed, REQUEST_BUDGET_MS, type Advisory } from "../src/osv.ts";
+import { KnownMalicious, listedAmong, listedNotice, NAME_FRESH_MS, NAME_STALE_MS, osvFeed, REQUEST_BUDGET_MS, type Advisory } from "../src/osv.ts";
 import { installStamp, Upstream } from "../src/upstream.ts";
 
 const POOL = new MemoryPool();
@@ -359,6 +359,26 @@ describe("what the review of 34ccf92 found", () => {
     } finally {
       flipped.length = 0;
     }
+  });
+
+  test("a request that had a partial answer for a name gets the same on every later read of it, OSV not asked again", async () => {
+    osv.unreadable.add("MAL-2026-1007");
+    const feed = osvFeed(freshRoot());
+
+    const twice = Effect.gen(function* () {
+      const k = yield* KnownMalicious;
+      const first = yield* k.advisoriesFor("half-read");
+      const attempts = osv.attempts;
+      const second = yield* k.advisoriesFor("half-read");
+
+      return { first, second, askedAgain: osv.attempts > attempts };
+    });
+
+    const got = await Effect.runPromise(twice.pipe(Effect.provide(feed)));
+
+    expect(got.first.map((a) => a.id)).toEqual(["MAL-2026-1006"]);
+    expect(got.second).toEqual(got.first);
+    expect(got.askedAgain).toBe(false);
   });
 
   test("a partial refresh after the kept answer expired keeps what both found, request after request", async () => {

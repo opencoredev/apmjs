@@ -375,10 +375,17 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
         return { advisories, complete, read };
       });
 
+    /** This request's partial answers by name: kept for it alone, never in the isolate's or the data center's cache. */
+    const partials = new Map<string, Advisory[]>();
+
     return KnownMalicious.of({
       advisoriesFor: (name) =>
         Effect.gen(function* () {
           if (!isPossibleNpmName(name)) return [];
+          const partial = partials.get(name);
+
+          // this request already had a partial answer for the name: every later read in it gets the same
+          if (partial !== undefined) return partial;
           const key = `${baseUrl} ${name}`;
           const now = Date.now();
           const youngerThan = (e: NameEntry, ms: number): boolean => e.fetchedAt <= now && now - e.fetchedAt < ms;
@@ -418,8 +425,11 @@ export function osvFeed(baseUrl: string, fetcher: typeof fetch = fetch, backgrou
           // a partial answer is not kept, so the next request asks again; this one withholds what it read (OSV's word,
           // a withdrawal included) and, for what it could not read, what the kept answer says
           const { advisories: found, read } = got.success;
+          const answer = [...found, ...kept.filter((a) => !read.has(a.id))];
 
-          return [...found, ...kept.filter((a) => !read.has(a.id))];
+          partials.set(name, answer);
+
+          return answer;
         }),
       lookup: (pkgs) =>
         Effect.gen(function* () {
