@@ -311,7 +311,7 @@ export async function handleMessage(message: Message, source: AgentSource): Prom
     case "prompts/list":
       return ok(id, { prompts: [] });
     default:
-      return rpcError(id, RPC.methodNotFound, `Method not found: ${method}`);
+      return rpcError(id, RPC.methodNotFound, `Method not found: ${inlineCode(method)}`);
   }
 }
 

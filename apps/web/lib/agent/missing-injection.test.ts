@@ -5,8 +5,11 @@ import { describe, expect, test } from "bun:test";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
+import { z } from "zod";
 import { markdownResponse } from "./agent-http";
-import { handleMessage } from "./mcp";
+import type { Json } from "./json";
+import { handleMessage, type JsonRpcResponse } from "./mcp";
+import { mcpPost } from "./mcp-http";
 import { fakeSource, pkg } from "./testing";
 
 const REGISTRY = "https://registry.apmjs.dev/";
@@ -105,4 +108,34 @@ describe("search_packages names the query as data", () => {
       });
     }
   }
+});
+
+// the protocol errors repeat a method name or a header the caller sent
+describe("MCP protocol errors name the caller's text as data", () => {
+  const RpcError = z.object({ error: z.object({ message: z.string() }) });
+  const errorOf = (answer: Json | JsonRpcResponse | null): string => RpcError.safeParse(answer).data?.error.message ?? "";
+
+  for (const payload of PAYLOADS) {
+    test(`an unknown method ${JSON.stringify(payload)}`, async () => {
+      const message = errorOf(await handleMessage({ jsonrpc: "2.0", id: 1, method: payload }, source()));
+
+      expect(message).toContain("Method not found");
+      expect(message).toContain("PWNED");
+      expect(spoofed(message), message).toEqual([]);
+      expect(types(message), message).not.toContain("heading");
+      expect(types(message), message).not.toContain("link");
+    });
+  }
+
+  // a header value cannot hold a line break, but it can hold Markdown
+  test("an unsupported MCP-Protocol-Version header", async () => {
+    const request = new Request("https://apmjs.dev/mcp", { method: "POST", headers: { "mcp-protocol-version": "[PWNED](https://evil.example/)" }, body: "{}" });
+    const res = await mcpPost(request, { source: source(), take: () => ({ ok: true }) });
+    const message = errorOf(z.json().parse(await res.json()));
+
+    expect(res.status).toBe(400);
+    expect(message).toContain("Unsupported MCP-Protocol-Version");
+    expect(message).toContain("PWNED");
+    expect(types(message), message).not.toContain("link");
+  });
 });
