@@ -400,6 +400,12 @@ const handlePublish = (req: Request, name: string, caller: Caller, ext: Extensio
     if (perm) return fail(perm.status, perm.error);
 
     if (!body._attachments || Object.keys(body._attachments).length === 0) {
+      // each key is read from the database and written to the event log: one that is no version (a NUL in it, say) is
+      // refused here, as publish refuses it, before a factor is spent; it failed the read with a 500
+      const badKey = Object.keys(body.versions).find((v) => !isValidVersion(v));
+
+      if (badKey !== undefined) return fail(400, `Invalid version ${JSON.stringify(badKey)}: apm accepts strict semver only (1.2.3, 1.2.3-beta.1).`);
+
       // a deprecation message Postgres cannot store failed the update with a 500
       if (Object.values(body.versions).some((m) => !storableText(JSON.stringify(deprecationOf(m))))) return fail(422, `A deprecation message cannot hold ${UNSTORABLE}.`);
 

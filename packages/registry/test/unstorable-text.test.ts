@@ -51,3 +51,20 @@ test.each([
 
   expect(await doc.json()).not.toHaveProperty("deprecated");
 });
+
+test("a deprecate whose version key is no version (a NUL in it) is refused, and nothing changes", async () => {
+  const name = "nul-deprecate-key";
+
+  expect((await putPublish(reg, token, { name, version: "1.0.0", main: "index.js" })).status).toBe(201);
+
+  const res = await fetch(`${reg.url}${encodePkg(name)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name, versions: { "1.0.0\u0000": { name, version: "1.0.0", deprecated: "x" }, "1.0.0": { name, version: "1.0.0", deprecated: "y" } } }),
+  });
+
+  expect(res.status).toBe(400);
+  const doc = await fetch(`${reg.url}${encodePkg(name)}/1.0.0`);
+
+  expect(await doc.json()).not.toHaveProperty("deprecated");
+});
