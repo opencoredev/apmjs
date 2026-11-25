@@ -31,7 +31,7 @@ afterAll(() => {
 
 type Run = { code: number; out: string; err: string; pmCalls: string[]; files: string[]; packageJson: string };
 
-async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_JSON): Promise<Run> {
+async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_JSON, files: Record<string, string> = {}): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), "apm-help-"));
   const cwd = join(root, "pkg");
   const bin = join(root, "bin");
@@ -41,6 +41,8 @@ async function apm(argv: string[], yarnVersion = "4.5.0", packageJson = PACKAGE_
   mkdirSync(bin);
   writeFileSync(join(cwd, "package.json"), packageJson);
   writeFileSync(join(cwd, "index.js"), "module.exports = 1;\n");
+
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(cwd, name), text);
 
   for (const pm of ["bun", "npm", "pnpm", "yarn", "bunx", "npx"]) {
     const version = pm === "yarn" ? `[ "$1" = --version ] && echo ${yarnVersion} && exit 0\n` : "";
@@ -435,8 +437,17 @@ describe("what still goes to the package manager", () => {
     [["ci", "--pm", "npm", "--audit=off"], "apm ci with no packages does not pass --audit=off on to npm"],
     [["ci", "--pm", "yarn"], "yarn has no ci; for a frozen install run apm install --frozen-lockfile"],
     [["ci", "--pm", "pnpm", "--prod"], "pnpm has no ci; for a frozen install run apm install --frozen-lockfile"],
-    [["run", "-i", "build.ts"], "apm does not pass bun's --install or -i on"],
-    [["run", "--install=force", "build.ts"], "apm does not pass bun's --install or -i on"],
+    [["run", "-i", "build.ts"], "apm does not pass bun's -i on"],
+    [["run", "--install=force", "build.ts"], "apm does not pass bun's --install=force on"],
+    [["run", "--bun", "dev"], "apm does not pass bun's --bun on"],
+    [["run", "--silent", "--bun", "dev"], "apm does not pass bun's --bun on"],
+    [["test", "--install=force"], "apm does not pass bun's --install=force on"],
+    [["start"], "apm does not pass start on to bun"],
+    [["ls"], "apm does not pass ls on to bun"],
+    [["why", "zod"], "apm does not pass why on to bun"],
+    [["/abs/dev"], "apm does not pass /abs/dev on to bun"],
+    [["remove", "--pm", "npm", "zod", "--no-package-lock"], "apm remove passes on only the names of the packages to remove, not --no-package-lock"],
+    [["rm", "zod", "--", "--force"], "apm rm passes on only the names of the packages to remove, not --force"],
     [["index"], "apm does not pass index on to bun"],
     [["info", "left-pad"], "apm does not pass info on to bun"],
   ])("apm %p is refused: %s", async (argv, message) => {
@@ -448,7 +459,7 @@ describe("what still goes to the package manager", () => {
   });
 
   test.each([
-    [["ci"], "bun ci"],
+    [["ci"], "bun install --frozen-lockfile"],
     [["ci", "--pm", "npm", "--omit", "dev"], "npm ci --omit dev"],
     [["ci", "--pm", "npm", "--omit=dev", "--ignore-scripts"], "npm ci --omit=dev --ignore-scripts"],
   ])("apm %p is the package manager's clean install", async (argv, call) => {
@@ -460,8 +471,12 @@ describe("what still goes to the package manager", () => {
 
   test.each([
     [["remove", "zod"], "bun remove zod"],
-    [["why", "zod"], "bun why zod"],
-    [["outdated"], "bun outdated"],
+    [["remove", "--pm", "npm", "zod"], "npm remove zod"],
+    [["why", "--pm", "npm", "zod"], "npm why zod"],
+    [["outdated", "--pm", "pnpm"], "pnpm outdated"],
+    [["start", "--pm", "npm"], "npm start"],
+    [["run", "dev", "-i"], "bun run --no-install dev -i"],
+    [["run", "--silent", "dev"], "bun run --no-install --silent dev"],
     [["test", "--watch"], "bun test --watch"],
     [["dev", "--port", "3000"], "bun run --no-install dev --port 3000"],
     [["run", "build.ts", "a"], "bun run --no-install build.ts a"],
@@ -471,6 +486,22 @@ describe("what still goes to the package manager", () => {
 
     expect(r.code, r.out + r.err).toBe(0);
     expect(r.pmCalls).toEqual([call]);
+  });
+
+  test("apm dev is refused while a bunfig.toml runs node as bun", async () => {
+    const r = await apm(["dev"], "4.5.0", `${JSON.stringify({ name: "help-probe", version: "1.0.0", scripts: { dev: "node dev.mjs" } })}\n`, { "bunfig.toml": "[run]\nbun = true\n" });
+
+    expect(r.code, r.out + r.err).toBe(2);
+    expect(r.err).toContain("a bunfig.toml sets run.bun");
+    expect(r.pmCalls).toEqual([]);
+  });
+
+  test("apm ci --help prints ci's help and runs nothing", async () => {
+    const r = await apm(["ci", "--help"]);
+
+    expect(r.code, r.out + r.err).toBe(0);
+    expect(r.out).toContain("usage: apm ci");
+    expect(r.pmCalls).toEqual([]);
   });
 
   test("apm run dev --help is the package manager's", async () => {

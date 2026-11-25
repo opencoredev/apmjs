@@ -2,7 +2,7 @@
 // apm: a thin layer over bun, npm, pnpm or yarn. It checks before it installs, runs or publishes,
 // then hands the real work to the package manager the project already uses.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { z } from "zod";
 import { ambiguousPaths, analyze, describeSkip, finalize, findSecrets, isValidPackageName, missingEntries, readTarball, SCORE_FLOOR, type FileLike } from "@apm/core";
@@ -2276,8 +2276,12 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
   apm restore <pkg>@<v>      undo a mistaken revoke (back to yanked)
   apm incident --since <time> [--dry-run]   account compromised: revoke tokens and recent versions
   apm login | whoami        sign in through the browser; publishes then wait for your approval
-  apm run|test|start|remove|why|ls|outdated, apm ci, or a package.json script (apm dev = bun run dev):
-                             passed to your package manager; apm refuses any other command it does not run itself
+  apm run <script|file>      your package manager's run (bun: with --no-install)
+  apm <script>               a package.json script (apm dev = bun run dev)
+  apm remove <pkg>...        your package manager's removal, by name only
+  apm test                   your package manager's test; npm, pnpm and yarn also start, why, ls and outdated
+  apm ci                     bun and npm: a frozen install, with the switches apm install takes with no packages
+  apm <anything else>        refused: it could install packages apm cannot check
   apm <command> --help       that command's flags (also -h, or apm help <command>); runs nothing
 
 Flags: --pm bun|npm|pnpm|yarn, --strict, --force, --no-cooldown, --ignore-scripts, --json, --otp <code>, --no-browser
@@ -2297,11 +2301,21 @@ const INSTALLS = new Set(["install", "i", "ci", "update", "upgrade", "up", "rebu
 const JSON_COMMANDS = new Set(["add", "install", "i", "score", "name", "explain", "search", "audit", "yank", "unyank", "revoke", "restore", "incident", "publish", "login", "whoami"]);
 
 /**
- * The package manager's commands apm passes on: ones that install nothing new (remove may lay out what is left). Any
- * other command could fetch packages apm never checks (an update, a link, a create, or one of their aliases in some
- * package manager), so apm runs it only as a script of the project's package.json, and refuses it otherwise.
+ * The package manager's commands apm passes on, besides the project's scripts: ones that install nothing new (removal,
+ * by package name alone, lays out only what the lockfile pins). bun runs a file or a script for a word that is not its
+ * own command (bun ls, bun start), and installs what that file imports, so with bun apm passes on fewer.
  */
-const PASSTHROUGH = new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"]);
+const PASSTHROUGH = new Map<Pm, ReadonlySet<string>>([
+  ["bun", new Set(["run", "test", "remove", "rm", "uninstall"])],
+  ["npm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+  ["pnpm", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+  ["yarn", new Set(["run", "test", "start", "remove", "rm", "uninstall", "why", "ls", "list", "outdated"])],
+]);
+
+const REMOVALS = new Set(["remove", "rm", "uninstall"]);
+
+/** bun's own options before what `bun run` runs that apm passes on; the others can turn bun's auto-install back on. */
+const BUN_RUN_SWITCHES = new Set(["--silent", "--watch", "--hot"]);
 
 const ProjectScripts = z.object({ scripts: z.record(z.string(), z.unknown()).optional().catch(undefined) });
 
@@ -2316,30 +2330,81 @@ function projectScripts(cwd: string): Set<string> {
   }
 }
 
+/** Whether a bunfig.toml bun reads in `cwd` sets run.bun, which runs scripts' node under bun, and so with auto-install. */
+function bunRunsNode(cwd: string): boolean {
+  const configs = [join(cwd, "bunfig.toml"), join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), ".bunfig.toml"), join(homedir(), ".bunfig.toml")];
+
+  return configs.some((file) => {
+    try {
+      const text = readFileSync(file, "utf8");
+
+      return /^\s*\[run\][^[]*^\s*bun\s*=\s*true/m.test(text) || /^\s*run\.bun\s*=\s*true/m.test(text);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Why apm refuses to pass these arguments on to `pm` for `cmd`, or null. */
+function passthroughError(cmd: string, args: readonly string[], end: number, pm: Pm, cwd: string): string | null {
+  const own = end === -1 ? args : args.slice(0, end);
+
+  if (REMOVALS.has(cmd)) {
+    const word = args.find((x) => x.startsWith("-") && x !== "--");
+
+    return word === undefined ? null : `apm ${cmd} passes on only the names of the packages to remove, not ${word}, which could make ${pm} install versions its lockfile does not pin`;
+  }
+
+  if (pm !== "bun") return null;
+
+  if (cmd === "test") {
+    const word = own.find((x) => x === "-i" || x === "--install" || x.startsWith("--install="));
+
+    return word === undefined ? null : `apm does not pass bun's ${word} on: bun would install what the tests import, unchecked`;
+  }
+
+  if (bunRunsNode(cwd)) return "a bunfig.toml sets run.bun, so bun would run node as bun and install what the code imports, unchecked";
+
+  // bun's options come before what it runs; what follows is the script's own
+  const target = own.findIndex((x) => !x.startsWith("-"));
+  const word = (target === -1 ? own : own.slice(0, target)).find((x) => !BUN_RUN_SWITCHES.has(x));
+
+  return word === undefined ? null : `apm does not pass bun's ${word} on: bun could install what the code it runs imports, unchecked`;
+}
+
+/**
+ * A command apm does not run itself. apm passes on only commands that cannot install a package it has not checked
+ * (PASSTHROUGH; run with bun gets --no-install, so bun does not install what the code it runs imports) and the
+ * project's package.json scripts by name, run as `<pm> run <script>`. Anything else (an update and every alias of it,
+ * link, create, a capitalised spelling) is refused.
+ */
 async function passthrough(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
   // apm's --pm is taken out only before --; after it, every argument is the package manager's
   const end = a.raw.indexOf("--");
-  // bun runs a file of the same name before a script, and installs what a file it runs imports unless told --no-install
-  const shadowed = det.pm === "bun" && ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"].some((ext) => existsSync(join(cwd, a.cmd + ext)));
-  const script = !PASSTHROUGH.has(a.cmd) && !shadowed && projectScripts(cwd).has(a.cmd);
+  const own = (end === -1 ? a.raw : a.raw.slice(0, end)).filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm="));
+  // bun runs a file of that name before a script, so a script that a path or a file could shadow is refused
+  const shadowed = a.cmd.includes("/") || a.cmd.startsWith(".") || ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"].some((ext) => existsSync(join(cwd, a.cmd + ext)));
+  const native = PASSTHROUGH.get(det.pm)?.has(a.cmd) === true;
+  const script = !native && !(det.pm === "bun" && shadowed) && projectScripts(cwd).has(a.cmd);
 
-  if (det.pm === "bun" && a.raw.slice(0, end === -1 ? undefined : end).some((x) => x === "-i" || x === "--install" || x.startsWith("--install="))) {
-    fail("apm: apm does not pass bun's --install or -i on: bun would install what the code it runs imports, unchecked. Nothing was run.");
-
-    return 2;
-  }
-
-  if (!PASSTHROUGH.has(a.cmd) && !script) {
+  if (!native && !script) {
     fail(`apm: apm does not pass ${a.cmd} on to ${det.pm}: it could install packages apm cannot check. Nothing was run.`);
     say(`To check and add a package, run apm add <package>. To run ${a.cmd} without apm's check, run ${det.pm} ${a.cmd} yourself.`);
 
     return 2;
   }
 
-  const own = end === -1 ? a.raw : a.raw.slice(0, end);
-  const args = [...own.filter((x, i, arr) => x !== "--pm" && arr[i - 1] !== "--pm" && !x.startsWith("--pm=")), ...(end === -1 ? [] : a.raw.slice(end))];
+  const args = [...own, ...(end === -1 ? [] : a.raw.slice(end))];
+  const error = passthroughError(script ? "run" : a.cmd, script ? [a.cmd, ...args] : args, end === -1 ? -1 : own.length + (script ? 1 : 0), det.pm, cwd);
+
+  if (error !== null) {
+    fail(`apm: ${error}. Nothing was run.`);
+    say(`To run it without apm's check, run ${det.pm} ${a.cmd} yourself.`);
+
+    return 2;
+  }
 
   const command = script ? ["run", a.cmd] : [a.cmd];
 
@@ -2388,9 +2453,18 @@ function update(a: Args): number {
 async function cleanInstall(a: Args): Promise<number> {
   const cwd = process.cwd();
   const det = pmFor(a, cwd);
-  const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
 
-  if ("args" in passed) return (await runCmd([det.pm, "ci", ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
+  if (a.raw.includes("--help") || a.raw.includes("-h")) {
+    say("usage: apm ci [switches]\n\nWith bun and npm, a frozen install from the lockfile (bun install --frozen-lockfile, npm ci), with the switches\napm install takes with no packages. pnpm and yarn have no ci: run apm install --frozen-lockfile.");
+
+    return 0;
+  }
+
+  const passed = det.pm === "yarn" || det.pm === "pnpm" ? { error: `${det.pm} has no ci; for a frozen install run apm install --frozen-lockfile` } : bareInstallArgs(a, det.pm);
+  // bun 1.1 has no ci (it runs a script of that name), so apm asks every bun for the frozen install by name
+  const command = det.pm === "bun" ? ["install", "--frozen-lockfile"] : ["ci"];
+
+  if ("args" in passed) return (await runCmd([det.pm, ...command, ...passed.args], { cwd, env: withoutSecrets(process.env) })).code;
   fail(`apm: ${passed.error}. Nothing was run.`);
 
   if (det.pm === "bun" || det.pm === "npm") say(`For other ${det.pm} ci options, run ${det.pm} ci yourself.`);
