@@ -183,17 +183,27 @@ function refuseUnsharedMeta(type: string, size: number, at: number): void {
  * Refuses a directory with a body. npm and Bun read a directory as having no data whatever its size field says, a type
  * "0" or "\0" entry whose path (a pending long name or PAX path, or its own) ends in "/" included, and read the blocks
  * after it as the next headers, so a file put there installs where reading them as the directory's data would never list
- * it. npm writes every directory with a size of 0. `path` is the path the entry takes, before it is normalized.
+ * it. npm writes every directory with a size of 0. Bun reads a hard or symbolic link, a device or a FIFO (types 1, 2, 3, 4
+ * and 6) as having no data either, where npm and apm pass over the blocks as its data, so one with a body is refused too:
+ * a header hidden there installs with Bun alone. A contiguous file (type 7) is a file to all three, slash or not, and the
+ * other types (D, M, S, V and unknown ones) are passed over whole by all three. `path` is the path the entry takes,
+ * before it is normalized.
  */
 function refuseDirectoryBody(type: string, size: number, path: string, at: number): void {
-  if (size > 0 && (type === "5" || ((type === "0" || type === "\0") && path.endsWith("/")))) throw invalid(`a directory with a ${size}-byte body at byte ${at}, which npm and Bun read as more entries`);
+  if (size === 0) return;
+
+  if (type === "5" || ((type === "0" || type === "\0") && path.endsWith("/"))) throw invalid(`a directory with a ${size}-byte body at byte ${at}, which npm and Bun read as more entries`);
+
+  if (BODYLESS_FOR_BUN.has(type)) throw invalid(`a type "${type}" entry with a ${size}-byte body at byte ${at}, which Bun reads as more entries`);
 }
+
+const BODYLESS_FOR_BUN = new Set(["1", "2", "3", "4", "6"]);
 
 /**
  * Refuses a header npm drops as TAR_ENTRY_INVALID and then reads the blocks after as the next headers, where apm (and
  * Bun, for some) reads them as its data, so a file hidden there installs unlisted: one with no path, a hard or symbolic
  * link with no target in its own linkpath field (a long link name does not count, node-tar checks the field), or any
- * other header but a PAX one with something in that field. `path` is the path node-tar checks: a metadata header's own,
+ * other header with something in that field, a PAX one included (npm 9.2's node-tar drops those too). `path` is the path node-tar checks: a metadata header's own,
  * else the pending long name or PAX path or the header's own. npm writes none of these.
  */
 function refuseDroppedEntry(header: Uint8Array, type: string, path: string, at: number): void {
@@ -203,16 +213,22 @@ function refuseDroppedEntry(header: Uint8Array, type: string, path: string, at: 
 
   if (isLink && link === "") throw invalid(`a link with no target at byte ${at}, which npm drops`);
 
-  if (!isLink && type !== "x" && type !== "g" && link !== "") throw invalid(`an entry of type "${type}" with a link target at byte ${at}, which npm drops`);
+  if (!isLink && link !== "") throw invalid(`an entry of type "${type}" with a link target at byte ${at}, which npm drops`);
 }
 
 /**
- * Refuses an entry whose pending PAX `size` is not its header's. npm and Bun take the entry's size from it, so another
- * one would put the entry's data, and every header after it, at other bytes than the header's size reads. npm writes one
- * equal to the header's with every PAX path (a file name over 100 bytes), so an equal one is read as the header's.
+ * Refuses a header whose pending PAX `size` is not its own. npm and Bun take the entry's size from it, so another one
+ * would put the entry's data, and every header after it, at other bytes than the header's size reads. npm writes one
+ * equal to the header's with every PAX path (a file name over 100 bytes), so an equal one is read as the header's. A
+ * metadata header while one is pending is refused whatever its size: npm 9.2's node-tar gives the size to it, where
+ * node-tar 7 and Bun keep it for the entry after, and npm writes the file header straight after its PAX header.
  */
-function refuseOtherSize(paxSize: number | null, size: number, at: number): void {
-  if (paxSize !== null && paxSize !== size) throw invalid(`a pax size of ${paxSize} for an entry of ${size} bytes at byte ${at}`);
+function refuseOtherSize(paxSize: number | null, type: string, size: number, at: number): void {
+  if (paxSize === null) return;
+
+  if (isMeta(type)) throw invalid(`a metadata header after a pax size at byte ${at}, which npm 9.2 gives that size`);
+
+  if (paxSize !== size) throw invalid(`a pax size of ${paxSize} for an entry of ${size} bytes at byte ${at}`);
 }
 
 /** Parses an uncompressed tar. Strips the leading "package/" (or any single top dir) from paths. */
@@ -264,10 +280,9 @@ function readTarMetered(tar: Uint8Array): TarEntry[] {
     refuseDroppedEntry(header, type, entryPath, off);
     refuseDirectoryBody(type, size, entryPath, off);
 
-    if (!isMeta(type)) {
-      refuseOtherSize(nextSize, size, off);
-      nextSize = null;
-    }
+    refuseOtherSize(nextSize, type, size, off);
+
+    if (!isMeta(type)) nextSize = null;
 
     const dataStart = off + 512;
 
@@ -697,10 +712,9 @@ export class TarStream {
     refuseDroppedEntry(header, type, entryPath, off);
     refuseDirectoryBody(type, size, entryPath, off);
 
-    if (!isMeta(type)) {
-      refuseOtherSize(this.nextSize, size, off);
-      this.nextSize = null;
-    }
+    refuseOtherSize(this.nextSize, type, size, off);
+
+    if (!isMeta(type)) this.nextSize = null;
 
     const blocks = Math.ceil(size / 512) * 512;
     const pad = blocks - size;

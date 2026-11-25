@@ -203,6 +203,16 @@ describe("tar headers are read as npm and Bun install them", () => {
     ["a GNU long name with a link target", [PJ, entry("././@LongLink", "package/a.txt\0", { type: "L", link: "x" }), entry("package/a.txt", EVIL)]],
     ["a symlink with no target", [PJ, rawEntry("package/s", hidden, "2"), a]],
     ["a hard link with no target", [PJ, rawEntry("package/s", hidden, "1"), a]],
+    // Bun reads a link, a device or a FIFO as having no body, and the blocks after it as headers: each installs evil.js
+    // with Bun, run on evo-1, where npm passes over them as the entry's data
+    ["a symlink with a body", [PJ, [header({ name: "package/s", size: hidden.length, type: "2", link: "a.js" }), hidden], a]],
+    ["a hard link with a body", [PJ, [header({ name: "package/s", size: hidden.length, type: "1", link: "package/a.js" }), hidden], a]],
+    ["a character device with a body", [PJ, rawEntry("package/s", hidden, "3"), a]],
+    ["a block device with a body", [PJ, rawEntry("package/s", hidden, "4"), a]],
+    ["a FIFO with a body", [PJ, rawEntry("package/s", hidden, "6"), a]],
+    // npm 9.2 drops a PAX header with a link target too, and reads its body as headers
+    ["a PAX header with a link target", [PJ, entry("PaxHeader/a", paxRecord("path=package/a.txt"), { type: "x", link: "x" }), entry("package/a.txt", EVIL)]],
+    ["a global PAX header with a link target", [PJ, entry("pax_global_header", paxRecord("comment=a"), { type: "g", link: "x" }), entry("package/a.txt", EVIL)]],
   ];
 
   for (const [name, parts] of hiding) {
@@ -213,6 +223,15 @@ describe("tar headers are read as npm and Bun install them", () => {
       expect(() => streamed(bytes)).toThrow(ArchiveError);
     });
   }
+
+  // npm 9.2, npm 11 and Bun all install a contiguous file (type 7) named lib/ as a file lib holding the body, and pass over
+  // an unknown type's body
+  test("a contiguous file named with a slash, and an unknown type, are read as npm and Bun install them", () => {
+    const bytes = tar([PJ, rawEntry("package/lib/", hidden, "7"), rawEntry("package/z", hidden, "Z"), a]);
+
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "lib", "a.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "lib", "a.js"]);
+  });
 
   test("an empty directory, as npm packs one, is read with the files after it", () => {
     const bytes = tar([PJ, rawEntry("package/lib/", new Uint8Array(0), "5"), entry("package/lib/a.js", "ok")]);
@@ -262,17 +281,30 @@ describe("tar headers are read as npm and Bun install them", () => {
   }
 
   // npm writes a PAX size equal to the header's with every PAX path, so that one has a single reading and is read
-  test("a PAX size equal to the header's is read, a GNU long name between them or not", () => {
-    for (const parts of [
-      [PJ, entry("PaxHeader/a", paxRecord("path=package/long.js") + paxRecord("size=000017"), { type: "x" }), entry("package/a.js", "module.exports=1\n")],
-      [PJ, entry("PaxHeader/a", paxRecord("size=17"), { type: "x" }), entry("././@LongLink", "package/long.js\0", { type: "L" }), entry("package/a.js", "module.exports=1\n")],
-    ]) {
-      const bytes = tar(parts);
+  test("a PAX size equal to the header's is read", () => {
+    const bytes = tar([PJ, entry("PaxHeader/a", paxRecord("path=package/long.js") + paxRecord("size=000017"), { type: "x" }), entry("package/a.js", "module.exports=1\n")]);
 
-      expect(pathsOf(readTar(bytes))).toEqual(["package.json", "long.js"]);
-      expect(pathsOf(streamed(bytes))).toEqual(["package.json", "long.js"]);
-    }
+    expect(pathsOf(readTar(bytes))).toEqual(["package.json", "long.js"]);
+    expect(pathsOf(streamed(bytes))).toEqual(["package.json", "long.js"]);
   });
+
+  // npm 9.2's node-tar gives a pending PAX size to the next header, a metadata one included, where node-tar 7 and Bun keep
+  // it for the entry after: even a size equal to the file's reads the metadata header's data at other bytes for npm 9.2
+  const pending: [string, Uint8Array[]][] = [
+    ["L", entry("././@LongLink", "package/long.js\0", { type: "L" })],
+    ["K", entry("././@LongLink", "target\0", { type: "K" })],
+    ["x", entry("PaxHeader/b", paxRecord("path=package/long.js"), { type: "x" })],
+    ["g", entry("pax_global_header", paxRecord("comment=a"), { type: "g" })],
+  ];
+
+  for (const [type, meta] of pending) {
+    test(`a ${type} header while a PAX size is pending is refused`, () => {
+      const bytes = tar([PJ, entry("PaxHeader/a", paxRecord("size=17"), { type: "x" }), meta, entry("package/a.js", "module.exports=1\n")]);
+
+      expect(() => readTar(bytes)).toThrow(ArchiveError);
+      expect(() => streamed(bytes)).toThrow(ArchiveError);
+    });
+  }
 
   test("a PAX size that differs from the header's is refused across a GNU long name too", () => {
     const bytes = tar([PJ, entry("PaxHeader/a", paxRecord("size=16"), { type: "x" }), entry("././@LongLink", "package/long.js\0", { type: "L" }), entry("package/a.js", "module.exports=1\n")]);
