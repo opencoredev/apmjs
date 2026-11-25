@@ -3,7 +3,7 @@
 // token budget. Also records what the model could not read, which the website shows next to the result.
 import type { TarEntry } from "@apm/core";
 import { diffLines, type Hunk } from "./diff.ts";
-import { cutAt, cutPath, kindOf, linesOf, MAX_DECODED_BYTES, ordered, shownPath, singleLine, textOf } from "./files.ts";
+import { cutAt, cutPath, kindOf, linesOf, listedPath, MAX_DECODED_BYTES, ordered, shownPath, singleLine, textOf } from "./files.ts";
 import { dependencyNamesOf, installScripts, type PackageFiles } from "./manifest.ts";
 
 /** Content budget in estimated tokens. The system prompt and header add about 1,000 on top. */
@@ -240,13 +240,6 @@ function listed(label: string, items: readonly string[], max: number): string {
   }
 
   return `${label} (${items.length}): ${shown.join(", ")}${items.length > shown.length ? " …" : ""}`;
-}
-
-/** A path in a list of paths. */
-const MAX_LISTED_PATH = 200;
-
-function listedPath(path: string): string {
-  return cutAt(shownPath(path), MAX_LISTED_PATH);
 }
 
 /** The budget left for files once the header above them is counted: it is outside the blocks, but the model reads it. */

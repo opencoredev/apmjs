@@ -2,7 +2,7 @@
 // range, and its quote is on that line. The eval kept 270 of 275 findings this way; the ones it drops
 // are the model misremembering, and a flag with no surviving citation is not treated as a flag.
 import type { TarEntry } from "@apm/core";
-import { cutPath, linesOf, shownPath, singleLine, textOf } from "./files.ts";
+import { cutPath, linesOf, listedPath, shownPath, singleLine, textOf } from "./files.ts";
 import type { RawFinding, Severity } from "./reply.ts";
 
 export type Finding = {
@@ -93,7 +93,8 @@ function candidatesOf(raw: string, named: ReadonlyMap<string, readonly string[]>
 export type Verified = { kept: Finding[]; dropped: DroppedFinding[] };
 
 /**
- * Every name the prompt showed a file under (its path, escaped onto one line, or cut to a citation's length) and the
+ * Every name the prompt showed a file under (its path, escaped onto one line, cut to a citation's length, or cut
+ * shorter in a list of paths) and the
  * files shown under it. A publisher can make two files share a shown name (`a\nb.js` and a file literally named
  * `a\\nb.js`, or two paths cut to the same length), so a citation of a shared name is checked against each of them.
  */
@@ -101,7 +102,7 @@ function shownNames(files: readonly TarEntry[]): Map<string, string[]> {
   const out = new Map<string, Set<string>>();
 
   for (const f of files) {
-    for (const s of [f.path, singleLine(f.path), shownPath(f.path)]) {
+    for (const s of [f.path, singleLine(f.path), shownPath(f.path), listedPath(f.path)]) {
       const named = out.get(s);
 
       if (named) named.add(f.path);

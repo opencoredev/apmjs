@@ -125,6 +125,13 @@ export function shownPath(path: string): string {
   return cutPath(singleLine(path), path);
 }
 
+/** A path in the prompt's lists of paths (the file list, a diff's added, removed and changed files): shorter still. */
+const MAX_LISTED_PATH = 200;
+
+export function listedPath(path: string): string {
+  return cutAt(shownPath(path), MAX_LISTED_PATH);
+}
+
 function stripDot(p: string): string {
   return p.replace(/^\.\//, "").replace(/^\//, "");
 }

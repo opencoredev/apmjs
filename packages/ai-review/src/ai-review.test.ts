@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import type { TarEntry } from "@apm/core";
-import { shownPath } from "./files.ts";
+import { listedPath, shownPath } from "./files.ts";
 import {
   buildDiffInput,
   DEFAULT_BUDGET_TOKENS,
@@ -646,6 +646,20 @@ describe("what the model is told it saw is what it saw, and what it cites is wha
     ]);
 
     expect(step.kind === "done" && step.decision.outcome === "flagged" ? step.decision.findings.length : 0).toBe(2);
+  });
+
+  test("a citation of a path as a list of paths shows it is kept", () => {
+    const path = `lib/${"p".repeat(240)}.js`;
+    const pkg = pkgOf({ "package.json": "{}", [path]: `x\n${PAYLOAD}\n` });
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+    const listed = listedPath(path);
+
+    expect(listed).not.toBe(shownPath(path));
+    expect(input.text).toContain(listed);
+    const { kept, dropped } = verifyCitations([finding({ file: listed, line: 2, quote: "require('child_process')" })], pkg.files);
+
+    expect(dropped).toEqual([]);
+    expect(kept).toHaveLength(1);
   });
 
   test("a decoy whose real path is another file's shown path does not swallow the citation", () => {
