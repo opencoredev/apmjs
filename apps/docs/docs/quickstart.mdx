@@ -26,7 +26,7 @@ Pick your package manager. Each setting goes in the project folder, so it applie
     The scanner is not on a registry yet. Until it is, install it from a clone of apm; see [Bun scanner](/guides/bun-scanner#install-it). Without it, the `registry` line alone still works.
   </Tab>
   <Tab title="npm">
-    Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions and the versions the OSSF malicious-packages feed lists. Even to an existing lockfile, the tarballs of revoked and confirmed-malicious versions answer 410, and the tarballs of OSSF-listed versions answer 403 with the version's MAL- id.
+    Add this to `.npmrc`. npm then installs through apm: new installs skip revoked, yanked and confirmed-malicious versions and the versions the OSSF malicious-packages feed lists. Even to an existing lockfile, the tarballs of revoked and confirmed-malicious versions answer 410, and the tarballs of other OSSF-listed versions answer 403 with the version's MAL- id.
 
     ```ini title=".npmrc"
     registry=https://registry.apmjs.dev/

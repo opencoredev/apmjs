@@ -43,7 +43,7 @@ Codes and passkeys protect every action that changes what people install or how 
 - Answers that belong to one user (account, sessions, staged uploads, tokens, login) are marked `Cache-Control: private, no-store`, so no shared cache keeps them.
 - Answers that can carry a version's source (file views, excerpts, readmes, scores, package answers, AI reviews) are marked `Cache-Control: private, no-store` too, and the website never caches them. The registry checks the version's status on every such request, so a revoke refuses the next one. A revoked version's score and review keep only what was found: paths, lines, rule ids, the reviewer's sentence and the revoke's reason.
 - Revoked versions answer 410 and appear as critical advisories to `bun audit` and `npm audit`.
-- Versions the OSSF malicious-packages feed lists (OSV `MAL-` advisories) are left out of every package document, plain and `~safe`, and their tarballs answer 403 with the `MAL-` id. Packages published on apm are not matched against the feed.
+- Versions the OSSF malicious-packages feed lists (OSV `MAL-` advisories) are left out of the package documents npm, pnpm and bun install from, plain and `~safe`, and their tarballs answer 403 with the `MAL-` id (410 if an apm reviewer also confirmed the version). Packages published on apm are not matched against the feed. If OSV cannot be asked and the registry has no answer for the name from the last 24 hours, it serves the package unfiltered rather than stop installs.
 
 ## How `apm add` installs what it checked
 
@@ -62,7 +62,7 @@ If the install does not match the checked lockfile, apm runs no script, leaves `
 Limits:
 
 - yarn runs install scripts while it installs, before apm can check what it installed. `apm add --strict` refuses yarn adds before anything runs. Otherwise apm warns first; with yarn 2 and later it checks the lockfile yarn computes in a copy (`--mode update-lockfile`) before yarn installs, and with yarn 1, which has no such mode, it can only check `node_modules` after yarn installed and ran scripts, and says so.
-- A bundled dependency ships inside its parent's tarball: the parent's score covers its code. apm asks only whether that version was revoked, yanked or confirmed malicious, and refuses it if so.
+- A bundled dependency ships inside its parent's tarball: the parent's score covers its code. apm asks only whether that version was revoked, yanked, confirmed malicious or listed by the OSSF malicious-packages feed, and refuses it if so.
 
 ## What apm does not protect against
 
