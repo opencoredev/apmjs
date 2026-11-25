@@ -37,11 +37,12 @@ export function parsePackageRoute(encoded: readonly string[]): PackageRoute | nu
  */
 export function parseVersionRoute(encoded: readonly string[]): { name: string; version: string } | null {
   const [v, version] = encoded.slice(-2);
-  const route = encoded.length >= 3 ? parsePackageRoute(encoded.slice(0, -2)) : null;
+  const named = encoded.slice(0, -2);
+  const route = named.length > 0 ? parsePackageRoute(named) : null;
 
   if (route?.kind !== "package" || v !== "v" || version === undefined) return null;
 
-  if (route.name.split("/").length !== (route.name.startsWith("@") ? 2 : 1)) return null;
+  if (named.length !== (route.name.startsWith("@") ? 2 : 1) || named.some((s) => decodeURIComponent(s).includes("/"))) return null;
 
   try {
     const decoded = decodeURIComponent(version);

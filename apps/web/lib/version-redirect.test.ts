@@ -67,5 +67,7 @@ describe("parseVersionRoute", () => {
     expect(parseVersionRoute(["@acme", "v", "1.0.0"])).toBeNull();
     expect(parseVersionRoute(["x%2Fy", "v", "1.0.0"])).toBeNull();
     expect(parseVersionRoute(["%40acme", "a%2Fb", "v", "1.0.0"])).toBeNull();
+    expect(parseVersionRoute(["%40acme%2F", "v", "1.0.0"])).toBeNull();
+    expect(parseVersionRoute(["%40acme%2Ftool", "v", "1.0.0"])).toBeNull();
   });
 });
