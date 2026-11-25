@@ -1106,10 +1106,12 @@ export const protocolRoute = (req: Request, url: URL, path: string, caller: Call
       return json({ ok: true });
     }
 
-    if (path.startsWith("/-/user/org.couchdb.user:") && req.method === "PUT") return yield* handleAddUser(req, decodeURIComponent(path.slice("/-/user/".length)));
+    if (path.startsWith("/-/user/org.couchdb.user:") && (req.method === "PUT" || req.method === "GET" || req.method === "HEAD")) {
+      const rawName = decodedOrNull(path.slice("/-/user/".length));
 
-    if (path.startsWith("/-/user/org.couchdb.user:") && (req.method === "GET" || req.method === "HEAD")) {
-      return yield* handleUserLookup(decodeURIComponent(path.slice("/-/user/".length)));
+      if (rawName === null) return fail(400, "The user name in the path is not valid percent-encoding");
+
+      return yield* req.method === "PUT" ? handleAddUser(req, rawName) : handleUserLookup(rawName);
     }
 
     if (path === "/-/v1/search") return yield* handleSearch(url, ext);

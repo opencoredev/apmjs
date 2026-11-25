@@ -2,7 +2,8 @@
 // Tarballs come only from the configured registry origin and must match the job's checksum.
 import { createHash } from "node:crypto";
 import { readTarball, type TarEntry } from "@apm/core";
-import { LeaseResponse, type ReleaseBody, type ResultBody, type ReviewJob } from "@apm/ai-review";
+import { LeaseBatch, readLease, type ReleaseBody, type ResultBody, type ReviewJob } from "@apm/ai-review";
+import type { Logger } from "./log.ts";
 
 /** Compressed tarballs above this are not downloaded; the registry's own publish limit is 64 MB. */
 const MAX_TARBALL_BYTES = 64 * 1024 * 1024;
@@ -47,7 +48,7 @@ async function readCapped(res: Response, max: number): Promise<Uint8Array | null
   return Buffer.concat(chunks);
 }
 
-export function registryClient(input: { url: string; token: string }): RegistryClient {
+export function registryClient(input: { url: string; token: string; log: Logger }): RegistryClient {
   const base = new URL(input.url);
   const auth = { authorization: `Bearer ${input.token}` };
 
@@ -64,7 +65,26 @@ export function registryClient(input: { url: string; token: string }): RegistryC
 
       if (!res.ok) throw new RegistryError(`lease: HTTP ${res.status}`, true);
 
-      return LeaseResponse.parse(await res.json()).jobs;
+      const { jobs, unreadable } = readLease(LeaseBatch.parse(await res.json()));
+
+      // a job this side cannot read would fail the same way every time, so it is failed on its own and the rest of
+      // the batch is reviewed at once, without waiting on those releases; one whose lease cannot be read either
+      // returns to the queue when its lease expires
+      void Promise.all(
+        unreadable.map(async ({ lease, why }) => {
+          input.log("error", "job.unreadable", { job: lease?.id ?? null, why: why.slice(0, 300) });
+
+          if (!lease) return;
+
+          try {
+            await post(`-/apm/v1/review-jobs/${encodeURIComponent(lease.id)}/release`, { leaseId: lease.leaseId, error: `unreadable job: ${why}`.slice(0, 500), retryable: false });
+          } catch (cause) {
+            input.log("error", "job.release_failed", { job: lease.id, why: cause instanceof Error ? cause.message.slice(0, 300) : "unknown" });
+          }
+        }),
+      );
+
+      return jobs;
     },
 
     async tarball(ref) {

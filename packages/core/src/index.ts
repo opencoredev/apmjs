@@ -24,7 +24,9 @@ export { boundedManifest, MANIFEST_LIMITS, measureManifest, ManifestTooLargeErro
 
 export { READING_LIMITS } from "./js.ts";
 
-export { expandHooks, gypCommands, LIFECYCLE, type ExpandedHook, type HookKind } from "./scripts.ts";
+export { expandHooks, gypCommands, LIFECYCLE, shellWords, type ExpandedHook, type HookKind } from "./scripts.ts";
+
+export { wildcardMatch } from "./glob.ts";
 
 export { MAX_ANALYSIS_WORK, Meter, MeterExhausted, metered, PHASE_NAMES, PHASES, type Phase } from "./meter.ts";
 

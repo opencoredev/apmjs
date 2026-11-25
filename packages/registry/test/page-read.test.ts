@@ -112,13 +112,16 @@ describe("pageRead", () => {
     });
   });
 
-  test("an upstream package: its kept row and its scores, as keptPackage and upstreamAnalyses have them, and the row marked asked about", async () => {
+  test("an upstream package: its kept row and the scores of the versions it lists, as keptPackage and upstreamAnalyses have them, and the row marked asked about", async () => {
     await withDatabase(async ({ sql, url }) => {
       const name = "from-npm";
-      const summary = { name, etag: '"e1"', versions: [] };
+      const summary = { name, etag: '"e1"', versions: [{ version: "1.0.0" }, { version: "0.9.0" }] };
       await sql("INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2, 100, 0)", [name, JSON.stringify(summary)]);
       await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, '1.0.0', 'sha512-d', $2, $3, 0)", [name, SCORER, JSON.stringify({ score: 70, grade: "C", signals: [] })]);
       await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail) VALUES ($1, '0.9.0', $2, 'too-large', 'over the cap')", [name, SCORER]);
+      // a version npm no longer lists: the summary cannot show it, so its analysis and outcome are not read
+      await sql("INSERT INTO upstream_analysis (package, version, digest, scorer, analysis, analyzed_at) VALUES ($1, '0.1.0', 'sha512-d', $2, $3, 0)", [name, SCORER, JSON.stringify({ score: 10, grade: "F", signals: [] })]);
+      await sql("INSERT INTO analysis_outcomes (package, version, scorer, outcome, detail) VALUES ($1, '0.2.0', $2, 'too-large', 'over the cap')", [name, SCORER]);
       const at = 10 * HOUR;
 
       const row = asUpstream(await run(url, (s) => s.pageRead({ name, at, scores: EVERY })));
@@ -128,8 +131,12 @@ describe("pageRead", () => {
 
       expect(row.kept).toEqual(kept);
       expect(row.kept?.summary).toEqual(summary);
-      expect([...row.analyses.scores]).toEqual([...analyses.scores]);
-      expect([...row.analyses.unscorable]).toEqual([...analyses.unscorable]);
+      const listed = (key: string) => key === "1.0.0 sha512-d" || key === "0.9.0";
+
+      expect(analyses.scores.size).toBe(2);
+      expect(analyses.unscorable.size).toBe(2);
+      expect([...row.analyses.scores]).toEqual([...analyses.scores].filter(([k]) => listed(k)));
+      expect([...row.analyses.unscorable]).toEqual([...analyses.unscorable].filter(([k]) => listed(k)));
       expect(row.analyses.scores.size).toBe(1);
       expect(row.analyses.unscorable.get("0.9.0")).toEqual({ reason: "too-large", detail: "over the cap", digest: null });
 
@@ -155,7 +162,7 @@ describe("pageRead", () => {
       const reused = { ...base, scorer: PREVIOUS_SCORER, coverage: undefined };
 
       expect(base.capabilities.length).toBeGreaterThan(0);
-      await sql("INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2, 100, 0)", [name, JSON.stringify({ name, distTags: { latest: "2.0.0", next: "3.0.0-rc.1" } })]);
+      await sql("INSERT INTO kept_packages (package, summary, computed_at, asked_at) VALUES ($1, $2, 100, 0)", [name, JSON.stringify({ name, distTags: { latest: "2.0.0", next: "3.0.0-rc.1" }, versions: ["1.0.0", "1.5.0", "2.0.0", "3.0.0-rc.1"].map((version) => ({ version })) })]);
 
       for (const [version, scorer, analysis] of [
         ["1.0.0", PREVIOUS_SCORER, reused],

