@@ -1049,7 +1049,11 @@ const revokeVersion = (v: VersionRecord, actor: string, reason: string, opts: { 
     const fresh = at - v.published_at <= FRESH_MS;
     const dependents = yield* store.dependentsOf(v.package);
     const step = transition(v.status, { kind: "revoke", final: opts.forceFinal === true || fresh });
-    const status = step.kind === "move" ? step.to : "revoked";
+
+    // already revoke-pending (or revoked): nothing moves. An incident sweep reaches a pending version too, and taking
+    // every refusal as final skipped the 24 h window `apm revoke` gives an older version
+    if (step.kind !== "move") return v.status;
+    const status = step.to;
     const final = status === "revoked";
     yield* store.setStatus(v.package, v.version, { status, reason, at, by: actor });
     yield* store.deleteAdvisoriesFor(v.package, v.version);
