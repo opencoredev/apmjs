@@ -157,6 +157,8 @@ describe("the shared verdict cases (tests/fixtures/explain-verdicts.json)", () =
       expect(c.resolve.risks.filter((r) => isRisky(r, { kind: "dependency", name: r.name }))).toEqual([]);
       expect(c.resolve.depReviews.kind === "off" || (c.resolve.depReviews.kind === "on" && c.resolve.depReviews.underReview.length + c.resolve.depReviews.confirmed.length === 0)).toBe(true);
       expect(c.resolve.warnings.some((w) => w.via.length === 0 && w.kind === "cooldown")).toBe(false);
+      // a version with no score installs only when the registry recorded it too large to score: a queued one is pending, never clean
+      expect(c.resolve.score !== null || c.resolve.warnings.some((w) => w.via.length === 0 && w.kind === "unscorable" && w.unscorable === "too-large")).toBe(true);
       expect(c.resolve.warnings.some((w) => w.via.length > 0 && w.kind === "cooldown" && w.signals === undefined)).toBe(false);
 
       const review = reviewOf(c.review);

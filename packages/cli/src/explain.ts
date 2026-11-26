@@ -8,11 +8,12 @@
 // inside the 24-hour cooldown that apm cannot clear, or an analysis apm could not finish. The last is fail-closed: an
 // analysis that did not read everything installs only when it positively records that the one gap is whole files left
 // unread for their size or the byte budget (readingOf); every other gap, or a record that does not say, holds. apm's
-// own work that has not started never interrupts anyone: an AI review not finished or not picked, a version still
-// queued or too large to score, a dependency not scored yet or not looked up installs, and the answer lists each in
+// own work that has not started never interrupts anyone: an AI review not finished or not picked, a version too large
+// to score, a dependency not scored yet or not looked up installs, and the answer lists each in
 // `notes` for the agent to mention after installing. A version inside the cooldown is replaced by the newest one in range
 // past it (agent.ts), so only a range with no such version stays review-first for its age. Anything apm could not read
-// is "unknown"; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
+// is "unknown", and so is a version apm has not scored yet (queued, or no word on why): a queued version is pending,
+// never clean; "do-not-install" is only for a revoked or yanked version and one an apm reviewer confirmed malicious,
 // the version or anything in its tree. Like the rest of apm it never calls a version "safe".
 import type { DistTag, Report, ReportCoverage } from "./api.ts";
 
@@ -872,6 +873,16 @@ function decide(input: ExplainInput): Decided {
     return { ...known, verdict: "unknown", summary: `apm could not read the AI reviews of ${id}'s dependencies, so it cannot say. Nothing was decided; try again.`, reasons: [], commands: null };
   }
 
+  // no score and no record that apm can never score it (queued, or the registry does not say why): nothing has read its
+  // code, so apm cannot say yet. A queued version is pending, never clean
+  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
+
+  if (report === null && ownWarning?.kind !== "unscorable") {
+    const state = ownWarning?.kind === "pending" ? `apm has not scored ${id} yet: it is still being analysed` : `apm has not scored ${id}`;
+
+    return { ...known, verdict: "unknown", summary: `${state}, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.`, reasons: ownWarning ? [`The registry said: ${quoted(ownWarning.text)}`] : [], commands: null };
+  }
+
   // 3. a real risk in what would be installed: a person should look first (holds, most serious first). What apm did
   // not finish is a note: the install goes ahead and the agent mentions it
   const signals = report?.signals ?? [];
@@ -882,7 +893,6 @@ function decide(input: ExplainInput): Decided {
   const holds: { why: string; reason: string; scored?: true }[] = [];
   const depReviewNotes: Note[] = [];
   const scoreText = report ? scoreTextOf(report) : null;
-  const ownWarning = deps.warnings.find((w) => w.via.length === 0 && w.kind !== "cooldown");
   const fresh = deps.warnings.find((w) => w.via.length === 0 && w.kind === "cooldown");
 
   if (review.kind === "reviewed" && review.state === "under-review") holds.push({ why: "the AI review flagged it and a person at apm has not decided yet", reason: reviewReason(review) });
@@ -910,12 +920,12 @@ function decide(input: ExplainInput): Decided {
     holds.push({ why: `it ${scoreText ?? ""}, under apm's floor of ${SCORE_FLOOR}, most of it for: ${label}`, reason: "", scored: true });
   }
 
-  // no score: queued, or too large to score, is apm's own work not done; any other reason (the analysis limit, bytes
-  // apm cannot read, a registry that does not say) holds
-  const unscorable = report === null && ownWarning?.kind !== "pending" && !(ownWarning?.kind === "unscorable" && ownWarning.unscorable === "too-large");
+  // recorded as never scorable: too large to score is apm's own work it cannot do; any other reason (the analysis limit,
+  // bytes apm cannot read) holds
+  const unscorable = report === null && ownWarning?.unscorable !== "too-large";
 
   if (unscorable) {
-    holds.push({ why: `apm ${ownWarning?.kind === "unscorable" ? "cannot score" : "has not scored"} it, so nothing has read its code`, reason: ownWarning?.kind === "unscorable" ? `The registry said: ${quoted(ownWarning.text)}` : "" });
+    holds.push({ why: "apm cannot score it, so nothing has read its code", reason: `The registry said: ${quoted(ownWarning?.text ?? "")}` });
   }
 
   const depReviews: DepReviews = deps.reviews;
@@ -993,14 +1003,7 @@ function decide(input: ExplainInput): Decided {
 
   if (report === null) {
     // a reason that holds is said by its hold
-    if (!unscorable) {
-      const text =
-        ownWarning?.kind === "pending"
-          ? `apm is still analysing ${id}: it has no score yet, so nothing has read its code. Ask again in a minute for its score.`
-          : `apm cannot score ${id}, so nothing has read its code. The registry said: ${quoted(ownWarning?.text ?? "")}`;
-
-      notes.push({ kind: "not-scored", text });
-    }
+    if (!unscorable) notes.push({ kind: "not-scored", text: `apm cannot score ${id}, so nothing has read its code. The registry said: ${quoted(ownWarning?.text ?? "")}` });
   } else {
     // whole files left unread for their size or the byte budget, and recorded as the only gap: apm's own gap, not a
     // risk, so the install goes ahead with what was not read said here
@@ -1063,11 +1066,9 @@ function decide(input: ExplainInput): Decided {
 
   const more = (n: number): string => (n > 0 ? `, and ${plural(n, "more note", "more notes")}` : "");
 
-  // no score: nothing has read the code, which the summary says first
+  // too large to score: nothing has read the code, which the summary says first
   if (report === null) {
-    const unread = ownWarning?.kind === "pending" ? "apm is still analysing it, so nothing has read its code yet" : "apm has no score for it, so nothing has read its code";
-
-    return { ...known, verdict: "install", summary: `Install ${id}: ${unread}, but nothing else apm checked needs a person to look first${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
+    return { ...known, verdict: "install", summary: `Install ${id}: apm has no score for it, so nothing has read its code, but nothing else apm checked needs a person to look first${more(shown.length - 1)}.${note}`, reasons, commands: run, notes };
   }
 
   // a partial reading says how much apm left unread
