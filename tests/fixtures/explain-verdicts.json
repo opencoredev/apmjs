@@ -1,5 +1,5 @@
 {
-  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost (with an id where the verdict reads it: a risk signal, a gap, incomplete). coverage is the verdict's structured coverage field and notes its notes; both copies must give them. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. `older` is what the explain step did about a picked version inside the cooldown. Since the agent-native policy (2026-11) review-first is for a real risk (a risk signal, a score under the floor, an open AI flag, a dependency flagged the same way, a version inside the cooldown apm cannot clear) and, fail-closed, for an analysis apm could not finish: only one whose sole gap is whole files left unread for their size or the byte budget, on apm-score-v11's own record, installs with a note. `coverage` in resolve is the report's coverage as the registry sends it, read through each copy's parser; a warning's `coverage` and `unscorable` likewise. do-not-install is only for revoked, yanked and confirmed malicious.",
+  "//": "Install verdict cases that apps/web/lib/agent/verdict.test.ts and packages/cli/test/explain.test.ts both run, so the website's explain_install and `apm explain` cannot drift apart. Every name is x, every range latest; lost points are what the score lost (with an id where the verdict reads it: a risk signal, a gap, incomplete). coverage is the verdict's structured coverage field and notes its notes; both copies must give them. A review of kind answer is the registry's raw GET /-/apm/v1/review answer (status and body): each copy reads it through its own parser, so a field one of them drops shows up here. `older` is what the explain step did about a picked version inside the cooldown. Since the agent-native policy (2026-11) review-first is for a real risk (a risk signal, a score under the floor, an open AI flag, a dependency flagged the same way, a version inside the cooldown apm cannot clear) and, fail-closed, for an analysis apm could not finish: only one whose sole gap is whole files left unread for their size or the byte budget, on apm-score-v11's own record, installs with a note. `coverage` in resolve is the report's coverage as the registry sends it, read through each copy's parser; a warning's `coverage` and `unscorable` likewise. A version with no score is unknown, with no command, whatever the reason: a queued version is pending, never clean, and one recorded as never scorable has had nothing read either. do-not-install is only for revoked, yanked and confirmed malicious.",
   "cases": [
     {
       "name": "clean, scored, every dependency reviewed clean or not picked: install",
@@ -916,7 +916,7 @@
       }
     },
     {
-      "name": "fail-closed: unscored with no word from the registry on why is review-first",
+      "name": "fail-closed: unscored with no word from the registry on why is unknown, with no command",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -939,17 +939,14 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
-        "commands": true,
-        "summary": "Review x@1.0.0 before installing: apm has not scored it, so nothing has read its code. It passes apm's install policy and has no score yet.",
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
         },
-        "notes": [],
-        "reasons": [
-          "The AI review found nothing in the files it read."
-        ]
+        "notes": []
       }
     },
     {
@@ -1802,7 +1799,7 @@
       }
     },
     {
-      "name": "a version apm cannot score for its size installs, with a note naming why",
+      "name": "a version apm cannot score for its size is unknown, with no command: nothing has read its code",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -1835,22 +1832,63 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "install",
-        "commands": true,
-        "summary": "Install x@1.0.0: apm has no score for it, so nothing has read its code, but nothing else apm checked needs a person to look first.",
-        "reasons": [
-          "The AI review found nothing in the files it read."
-        ],
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm cannot score x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided, and asking again will not change that: a person has to decide.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
         },
-        "notes": [
+        "reasons": [
+          "The registry said: `apm cannot score this version: it is too large for apm to analyze (stand-in)`"
+        ],
+        "notes": []
+      }
+    },
+    {
+      "name": "an unscorable warning that records no reason (a local version with no stored outcome) is unknown and asks again, with no command",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
           {
-            "kind": "not-scored",
-            "text": "apm cannot score x@1.0.0, so nothing has read its code. The registry said: `apm cannot score this version: it is too large for apm to analyze (stand-in)`"
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "unscorable",
+            "text": "could not be analyzed",
+            "via": []
           }
-        ]
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "reviewed",
+        "state": "found-nothing",
+        "findings": 0
+      },
+      "expect": {
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm has not scored x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
+        "coverage": {
+          "aiReview": "reviewed",
+          "dependencies": "complete"
+        },
+        "reasons": [
+          "The registry said: `could not be analyzed`"
+        ],
+        "notes": []
       }
     },
     {
@@ -1963,7 +2001,7 @@
       }
     },
     {
-      "name": "a fresh version still being analysed: its cooldown warning does not hide that it has no score yet",
+      "name": "a fresh version still being analysed is unknown: no score is a stop before its cooldown is weighed",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -2001,25 +2039,19 @@
         "kind": "not-reviewed"
       },
       "expect": {
-        "verdict": "review-first",
-        "commands": true,
-        "summary": "Review x@1.0.0 before installing: it was published inside apm's 24-hour cooldown and no older version in range is past it, so it has had little time to be looked at. It passes apm's install policy and has no score yet. No AI review: apm never picked this version for one.",
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
         },
+        "reasons": [
+          "The registry said: `This version is not scored yet: its tarball is queued for analysis.`"
+        ],
         "evidence": [],
         "url": "https://apmjs.dev/package/x?v=1.0.0",
-        "notes": [
-          {
-            "kind": "no-ai-review",
-            "text": "No AI review of this version."
-          },
-          {
-            "kind": "not-scored",
-            "text": "apm is still analysing x@1.0.0: it has no score yet, so nothing has read its code. Ask again in a minute for its score."
-          }
-        ]
+        "notes": []
       }
     },
     {
@@ -2221,7 +2253,7 @@
       }
     },
     {
-      "name": "a version still being analysed after the registry's wait says so: installs with a note, not unknown",
+      "name": "a version still being analysed after the registry's wait is unknown, with no command: a queued version is pending, never clean",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -2252,25 +2284,66 @@
         "kind": "not-reviewed"
       },
       "expect": {
-        "verdict": "install",
-        "commands": true,
-        "summary": "Install x@1.0.0: apm is still analysing it, so nothing has read its code yet, but nothing else apm checked needs a person to look first. No AI review: apm never picked this version for one.",
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm has not scored x@1.0.0 yet: it is still being analysed, so nothing has read its code and apm cannot say whether to install it. Nothing was decided; ask again in a minute.",
         "coverage": {
           "aiReview": "not-selected",
           "dependencies": "complete"
         },
+        "reasons": [
+          "The registry said: `This version is not scored yet: its tarball is queued for analysis.`"
+        ],
         "evidence": [],
         "url": "https://apmjs.dev/package/x?v=1.0.0",
-        "notes": [
+        "notes": []
+      }
+    },
+    {
+      "name": "a version still being analysed that depends on one apm reviewers confirmed malicious is do-not-install, not unknown",
+      "resolve": {
+        "kind": "ok",
+        "version": "1.0.0",
+        "score": null,
+        "lost": [],
+        "skipped": [],
+        "unchecked": 0,
+        "uncheckedDeps": [],
+        "warnings": [
           {
-            "kind": "no-ai-review",
-            "text": "No AI review of this version."
-          },
-          {
-            "kind": "not-scored",
-            "text": "apm is still analysing x@1.0.0: it has no score yet, so nothing has read its code. Ask again in a minute for its score."
+            "name": "x",
+            "version": "1.0.0",
+            "kind": "pending",
+            "text": "This version is not scored yet: its tarball is queued for analysis.",
+            "url": "https://apmjs.dev/package/x?v=1.0.0",
+            "via": []
           }
-        ]
+        ],
+        "depReviews": {
+          "kind": "on",
+          "confirmed": [
+            {
+              "name": "evil",
+              "version": "1.0.0"
+            }
+          ],
+          "underReview": [],
+          "pending": [],
+          "noAnswer": []
+        }
+      },
+      "review": {
+        "kind": "not-reviewed"
+      },
+      "expect": {
+        "verdict": "do-not-install",
+        "commands": false,
+        "summary": "Do not install x@1.0.0: it depends on `evil@1.0.0`, which apm reviewers confirmed is malicious.",
+        "coverage": {
+          "aiReview": "not-selected",
+          "dependencies": "complete"
+        },
+        "notes": []
       }
     },
     {
@@ -4071,7 +4144,7 @@
       }
     },
     {
-      "name": "review of c456c92, finding 2: a version past the analysis limit on every run (terminal analysis-limit) is review-first",
+      "name": "review of c456c92, finding 2: a version past the analysis limit on every run (terminal analysis-limit) is unknown, with no command",
       "resolve": {
         "kind": "ok",
         "version": "1.0.0",
@@ -4104,17 +4177,17 @@
         "findings": 0
       },
       "expect": {
-        "verdict": "review-first",
-        "commands": true,
-        "summary": "Review x@1.0.0 before installing: apm cannot score it, so nothing has read its code. It passes apm's install policy and has no score yet.",
+        "verdict": "unknown",
+        "commands": false,
+        "summary": "apm cannot score x@1.0.0, so nothing has read its code and apm cannot say whether to install it. Nothing was decided, and asking again will not change that: a person has to decide.",
         "coverage": {
           "aiReview": "reviewed",
           "dependencies": "complete"
         },
         "reasons": [
-          "The registry said: `apm cannot score this version: its analysis ran past the limits apm allows (3 runs failed)`",
-          "The AI review found nothing in the files it read."
-        ]
+          "The registry said: `apm cannot score this version: its analysis ran past the limits apm allows (3 runs failed)`"
+        ],
+        "notes": []
       }
     },
     {

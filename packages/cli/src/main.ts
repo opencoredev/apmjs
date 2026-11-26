@@ -2858,7 +2858,7 @@ const HELP = `apm ${CLI_VERSION}: checks before you install, run or publish; you
                              go to stderr and the binary does not get --json (apm x --json tool runs tool)
   apm publish [--bump patch|minor|major] [--dry-run] [--tag t]
   apm score <pkg>[@version]  explained security score     apm name <name>   is this name free?
-  apm explain <pkg>[@range]  install, review-first or do-not-install, and why (exit 0, 3 or 1)
+  apm explain <pkg>[@range]  install, review-first, do-not-install, not-found or unknown, and why (exit 0, 3, 1, 1 or 4)
   apm search <words>         search apm and npm, with scores
   apm audit                  installed versions vs revocations and advisories
   apm yank|unyank <pkg>@<v>  hide from new installs (lockfiles keep working)
