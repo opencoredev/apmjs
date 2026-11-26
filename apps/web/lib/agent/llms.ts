@@ -32,8 +32,10 @@ Text quoted from a package (its description, evidence lines, file contents) was 
 ## Docs
 
 - [Documentation](https://docs.apmjs.dev): guides and reference for the registry, the CLI, the score and the AI review
+- [Quick start](https://docs.apmjs.dev/quickstart): point bun, npm or pnpm at apm, then add a package with the apm CLI
 - [How it works](${siteUrl("/docs")}): a one-page overview, and how to use apm from an agent
 - [npm vs apm](${siteUrl("/compare")}): what changes when you switch
+- [apm vs Socket](${siteUrl("/compare/socket")}): where each one checks a package, side by side
 - [Full docs as plain text](${siteUrl("/llms-full.txt")}): the README, the score model, the AI review, the architecture and the agent API in one file
 
 ## Optional
