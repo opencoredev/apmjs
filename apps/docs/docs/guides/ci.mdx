@@ -12,7 +12,7 @@ You can run apm's checks in CI today. Publishing from CI works too, but every ve
 | Fail the install on revoked or low-scoring versions (by default a low score only warns) | `apm add --strict` or `registry=https://registry.apmjs.dev/~safe/` | Works |
 | Install only versions that pass the cooldown and floor with npm or pnpm | `registry=https://registry.apmjs.dev/~safe/` | Works, but when no version of a package passes, the view lists none (Next.js today; see below) |
 | Run the Bun security scanner automatically on `bun install` | `@apm/bun-scanner` (not on a registry yet; strict mode cannot run from a local path) | Not published yet |
-| Fail the build on revoked versions already in the lockfile | `apm audit` | Works |
+| Fail the build on revoked versions already in the lockfile | `apm audit` | Works with a login token in `APM_TOKEN`. Without one, it passes only once apm has scored every installed version ([see below](#audit-in-ci)) |
 | Upload a version from CI | `apm publish` with a login token | Works; the version is staged and a person approves it |
 | Publish live from CI with no person | OIDC trusted publishing | Does not exist |
 | Attach build provenance | Sigstore provenance | Does not exist |
@@ -29,11 +29,55 @@ The view also hides every version apm has not fully read, so it can withhold all
 
 For Bun, the [Bun scanner](/guides/bun-scanner) is not published on a registry yet (and strict mode refuses local `file:` dependencies, including itself), so use `bunfig.toml` pointed at `https://registry.apmjs.dev/~safe/` and run `apm audit --json` in CI until `@apm/bun-scanner` is published.
 
-After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked:
+The registry setting only reaches CI if the file that holds it is committed. Run `git check-ignore -v .npmrc` (or `bunfig.toml`, `.yarnrc.yml`): if it prints a `.gitignore` rule, CI and your teammates install from npm without any warning. [Move an existing project to apm](/guides/migrate#2-commit-the-file) has the fix.
+
+## Audit in CI
+
+After the install, audit what was installed. `apm audit` exits non-zero on a revoked or advised version, and also when anything could not be checked, including a version apm has not scored yet:
 
 ```bash
 apm audit --json
 ```
+
+### Without a token
+
+A CI job with no apm token audits anonymously. apm sends the installed versions to the registry 200 at a time, and for each request the registry queues at most 8 versions that have no score yet. Every other unscored version comes back as not checked:
+
+```text
+unchecked semver@7.8.2  not checked: anonymous scan queues at most 8 unscored packages per request; sign in (apm login) to queue more
+```
+
+So an anonymous audit fails on a project with more than a handful of versions nobody has scored yet, which is common right after you move a real app to apm. Scores are shared: once a version has been scored, every later audit, yours or anyone's, uses that score. The anonymous audit still reports revoked, yanked and confirmed-malicious versions, versions on the OSSF malicious-packages list, and upstream advisories for every package, because the registry checks those before it looks at the score.
+
+To fail the job only on what was found, and print what could not be checked without failing on it, read the JSON. This needs `jq`:
+
+```bash
+apm audit --json > audit.json || true
+jq '.unchecked' audit.json
+jq -e '.findings | length == 0' audit.json
+```
+
+### With a login token
+
+A request with a valid token queues every unscored version and checks up to 2,000 packages at once. There is no separate CI token type yet; use the token `apm login` gives you:
+
+1. Run `apm login` on your own machine. It writes the token to your user `.npmrc`, on the `//registry.apmjs.dev/:_authToken=` line.
+2. Copy that token into a CI secret and expose it to the audit step as `APM_TOKEN`. In GitHub Actions:
+
+   ```yaml
+   - name: apm audit
+     run: apm audit --json
+     env:
+       APM_TOKEN: ${{ secrets.APM_TOKEN }}
+   ```
+
+3. Add `apm whoami` before the audit if you want the job to stop when the token stops working: it exits 1 with `not logged in`, while a revoked or expired token makes `apm audit` run as anonymous.
+
+apm sends `APM_TOKEN` only to the registry it was issued for: `APM_REGISTRY`, else `registry=` in your user `.npmrc`, else `https://registry.apmjs.dev/`. It also keeps `APM_TOKEN` out of the environment of the package manager, install scripts and binaries it runs. If your project `.npmrc` points at the `~safe` view, apm talks to `https://registry.apmjs.dev/~safe/`, holds the token back and prints `APM_TOKEN is for https://registry.apmjs.dev/, so it is not sent to ...`. Set `APM_REGISTRY=https://registry.apmjs.dev/` for the audit step in that case.
+
+The token has the powers the warning under [Upload from CI](#upload-from-ci) describes, so treat it like a publish token.
+
+Signed in or not, a version queued for analysis needs time to get its score. `apm audit` keeps asking for 90 s (`APM_PENDING_WAIT_MS`), then lists what is still being analysed as `not scored yet`, and the audit is not a pass. That can take seconds, or several minutes when the analysis queue is busy. Run the job again later, or raise `APM_PENDING_WAIT_MS`.
 
 ## Upload from CI
 
