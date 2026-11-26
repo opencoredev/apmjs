@@ -18,6 +18,7 @@ describe("publishability", () => {
 
   test("with no visitor known, a free scoped name is its scope owner's", () => {
     expect(publishability({ name: "@sindresorhus/h564-probe", available: true })).toEqual({ kind: "scoped", scope: "@sindresorhus" });
+    expect(publishabilityText({ name: "@sindresorhus/h564-probe", publishable: { kind: "scoped", scope: "@sindresorhus" } })).toBe("@sindresorhus/h564-probe is free; only the owner of @sindresorhus (a GitHub login) can publish it.");
     expect(ownerOnlySentence("@sindresorhus", { kind: "signed-out" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. Sign in with GitHub to see whether that is you.");
     expect(ownerOnlySentence("@sindresorhus", { kind: "signed-in", scope: "@leo" })).toBe("Only the GitHub account sindresorhus can publish under @sindresorhus. Yours is @leo.");
   });

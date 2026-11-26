@@ -23,7 +23,7 @@ import { pnpmConfigRefusal, pnpmConfigRefused, projectLayout, withMemberNames, t
 import { applyChecked, computedFiles, copyProject, restoreCommands, targets, type Backup, type Computed, type Copy } from "./lockfirst.ts";
 import { makeTemp, removeTemp } from "./sandbox.ts";
 import { CLI_VERSION } from "./version.ts";
-import { publishChecks, VALID_NAME_RULE, withoutBuild, type Existing, type RegistryView } from "./publish-checks.ts";
+import { manifestChecks, registryChecks, VALID_NAME_RULE, withoutBuild, type Existing, type PublishCheck, type RegistryView } from "./publish-checks.ts";
 import { argsError, bareInstallArgs, commandOf, helpTopic } from "./commands.ts";
 
 function flag(a: Args, k: string): string | null {
@@ -2308,6 +2308,8 @@ async function nameVerdict(input: { q: string; r: z.infer<typeof NameResponse>; 
 
   if (r.taken) return { mark: "✗", text: `${r.query} is taken${r.owners.length ? ` (by ${r.owners.join(", ")})` : ""}${r.latest ? `, latest ${r.latest.version}${r.latest.score !== null ? `, score ${r.latest.score}/100` : ""}` : ""}` };
 
+  if (r.unknown) return { mark: "!", text: `apm could not ask npm whether ${r.query} is free, so it cannot say whether you may publish it. Try again shortly` };
+
   if (!r.available) return { mark: "!", text: `${r.query} is free but not available: ${r.conflicts.map((c) => c.reason).join("; ")}` };
 
   if (scope !== null && scope === user.toLowerCase()) return { mark: "✓", text: `${r.query} is available` };
@@ -2667,7 +2669,8 @@ async function existingPackage(api: Api, name: string, version: string): Promise
     const [doc, tarball] = await Promise.all([api.raw(encodeName(name)), isValidVersion(version) ? api.raw(`${encodeName(name)}/-/${name.slice(name.indexOf("/") + 1)}-${stored}.tgz`, { method: "HEAD" }) : null]);
     const listed = Packument.safeParse(doc.body);
 
-    if (doc.status !== 200 || !listed.success) return { kind: "unknown" };
+    // a 404 is the only answer that says the version's tarball is not stored; anything but 200, 404 or 410 says nothing
+    if (doc.status !== 200 || !listed.success || (tarball !== null && ![200, 404, 410].includes(tarball.status))) return { kind: "unknown" };
     const versions = Object.keys(listed.data.versions);
 
     return { kind: "local", owners: found.data.owners, versions: tarball?.status === 200 || tarball?.status === 410 ? [...versions, stored] : versions };
@@ -2676,17 +2679,32 @@ async function existingPackage(api: Api, name: string, version: string): Promise
   }
 }
 
-/** What publishChecks needs from the registry: the token's login, its rule for new names (bare names only) and the package. */
+/**
+ * What registryChecks needs from the registry: the token's login, its rule for new names (bare names only) and the
+ * package. The name check reads only names without a `~` in the package part, so for the rest what exists is unknown.
+ */
 async function registryView(cfg: Config, target: { name: string; version: string }): Promise<RegistryView> {
   const api = new Api(cfg);
-  const valid = isValidPackageName(target.name);
+
   const [user, policy, existing] = await Promise.all([
     currentLogin(api, cfg),
-    valid && !isScoped(target.name) ? namePolicy(api) : null,
-    valid ? existingPackage(api, target.name, target.version) : ({ kind: "unknown" } satisfies Existing),
+    isScoped(target.name) ? null : namePolicy(api),
+    isValidPackageName(target.name) ? existingPackage(api, target.name, target.version) : ({ kind: "unknown" } satisfies Existing),
   ]);
 
   return { user, policy, existing };
+}
+
+/** Prints a dry run's findings, refusals first; returns their reasons for the --json result. */
+function sayChecks(checks: readonly PublishCheck[]) {
+  const refused = checks.flatMap((c) => (c.kind === "refused" ? [c.reason] : []));
+  const unconfirmed = checks.flatMap((c) => (c.kind === "unconfirmed" ? [c.reason] : []));
+
+  for (const r of refused) say(red(`✗ ${r}`));
+
+  for (const u of unconfirmed) say(yellow(`! ${u}`));
+
+  return { refused, unconfirmed };
 }
 
 async function cmdPublish(a: Args): Promise<number> {
@@ -2717,6 +2735,18 @@ async function cmdPublish(a: Args): Promise<number> {
   const dry = has(a, "dry-run");
   const version = bumpKind ? bump(pj.version, bumpKind) : pj.version;
   const id = `${pj.name}@${version}`;
+
+  // what package.json alone says the registry or the package manager would refuse: said before anything is packed
+  if (dry) {
+    const found = sayChecks(manifestChecks({ name: pj.name, version, private: Boolean(pj.private), dropsBuild: det.pm === "npm" }));
+
+    if (found.refused.length > 0) {
+      fail(`dry run: nothing packed or uploaded, and publishing ${id} would be refused: fix each ✗ above first.`);
+      emit({ ok: false, status: "dry-run", ...found, name: pj.name, version, registry: cfg.registry });
+
+      return 1;
+    }
+  }
 
   // 1. Without a "files" allowlist, what ships depends on the package manager (npm ships .env.production,
   //    bun does not), so any secret-shaped file in the folder blocks the publish (before --bump touches package.json).
@@ -2800,24 +2830,33 @@ async function cmdPublish(a: Args): Promise<number> {
 
   const summary = { name: pj.name, version, registry: cfg.registry, files: files.length, score: report.score, grade: report.grade };
   if (dry) {
-    // the fields the upload would carry: a prepack script may have changed what package.json said
+    // the fields the upload carries are the packed package.json's: a pack script may have changed what package.json said
     const packedFields = PackedFields.safeParse(manifest);
-    const target = packedFields.success ? packedFields.data : { name: pj.name, version, private: pj.private };
-    const checks = publishChecks({ name: target.name, version: target.version, private: Boolean(target.private), view: await registryView(cfg, target) });
-    const refused = checks.flatMap((c) => (c.kind === "refused" ? [c.reason] : []));
-    const unconfirmed = checks.flatMap((c) => (c.kind === "unconfirmed" ? [c.reason] : []));
 
-    for (const r of refused) say(red(`✗ ${r}`));
-    for (const u of unconfirmed) say(yellow(`! ${u}`));
+    if (!packedFields.success) {
+      const refused = ["The packed package.json has no string name and version (a pack script changed them), so it cannot be published."];
 
-    if (refused.length > 0) {
+      for (const r of refused) say(red(`✗ ${r}`));
       fail(`dry run: nothing uploaded, and publishing ${id} would be refused: fix each ✗ above first.`);
-      emit({ ok: false, status: "dry-run", refused, unconfirmed, ...summary });
+      emit({ ok: false, status: "dry-run", refused, unconfirmed: [], ...summary });
+
+      return 1;
+    }
+
+    const target = { name: packedFields.data.name, version: packedFields.data.version, private: Boolean(packedFields.data.private), dropsBuild: det.pm === "npm" };
+    const local = manifestChecks(target);
+    const found = sayChecks(local.length > 0 ? local : registryChecks({ name: target.name, version: target.version, view: await registryView(cfg, target) }));
+    const result = { ...summary, name: target.name, version: target.version };
+
+    if (found.refused.length > 0) {
+      fail(`dry run: nothing uploaded, and publishing ${target.name}@${target.version} would be refused: fix each ✗ above first.`);
+      emit({ ok: false, status: "dry-run", ...found, ...result });
+
       return 1;
     }
 
     say(dim(`dry run: nothing uploaded (it would go to ${cfg.registry})`));
-    emit({ ok: true, status: "dry-run", refused, unconfirmed, ...summary });
+    emit({ ok: true, status: "dry-run", ...found, ...result });
     return 0;
   }
   const tag = flag(a, "tag") ?? (version.includes("-") ? "next" : null);

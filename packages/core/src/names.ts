@@ -7,6 +7,13 @@ export function isValidPackageName(name: string): boolean {
   return name.length > 0 && name.length <= 214 && NAME_RE.test(name);
 }
 
+const PUBLISH_NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+
+/** A name the registry's publish route takes: isValidPackageName's, with `~` allowed in the package part too. */
+export function isValidPublishName(name: string): boolean {
+  return name.length > 0 && name.length <= 214 && PUBLISH_NAME_RE.test(name);
+}
+
 /**
  * Whether npm could hold a package of this name, old names included (validate-npm-package-name's rules for old
  * packages: uppercase and URL-safe punctuation pass): an optional `@scope/` and a name, each URL-safe as written, not

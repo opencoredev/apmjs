@@ -74,7 +74,7 @@ export function publishabilityText(input: { name: string; publishable: Publishab
     case "not-yours":
       return `${name} is free, but only the owner of ${p.scope} can publish it. Yours is ${p.yours}.`;
     case "scoped":
-      return `${name} is available. You can publish it if ${p.scope} is your GitHub login.`;
+      return `${name} is free; only the owner of ${p.scope} (a GitHub login) can publish it.`;
     case "needs-scope":
       return `${name} is ${NEEDS_SCOPE_STATUS}. ${needsScopeSentence(p.suggestion)}`;
     case "not-free":

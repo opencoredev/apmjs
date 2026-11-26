@@ -1,8 +1,8 @@
 // What apm publish --dry-run checks before calling a publish fine: the rules the registry and the package manager
-// refuse a publish by (a valid lowercase name, strict semver, not "private", a version not published yet, the
-// registry's rule for new names, a name npm already has, a look-alike of a popular name). Pure: main.ts reads the
-// registry and prints the result.
-import { isScoped, isValidPackageName, isValidVersion, newNameRuleRefusal, typoConflicts, type NamePolicy } from "@apm/core";
+// refuse a publish by. manifestChecks needs only package.json (a valid lowercase name, strict semver, not "private");
+// registryChecks needs what apm read from the registry (a version not published yet, owners, the rule for new names, a
+// name npm has, a reserved or look-alike name). Pure: main.ts reads the registry and prints the result.
+import { isScoped, isValidPublishName, isValidVersion, newNameRuleRefusal, POPULAR_NAMES, typoConflicts, type NamePolicy } from "@apm/core";
 
 /** The name rule apm prints for an invalid name (apm name and apm publish --dry-run). */
 export const VALID_NAME_RULE = "a name is lowercase letters, digits and - . _ (and ~ in a scope), starts with a letter or digit, is at most 214 characters, and has at most one scope, as @scope/name";
@@ -26,10 +26,31 @@ export type RegistryView = { user: string | null; policy: NamePolicy | null; exi
 /** One finding: the registry or the package manager would refuse the publish, or apm cannot say whether it would. */
 export type PublishCheck = { kind: "refused"; reason: string } | { kind: "unconfirmed"; reason: string };
 
+/** The fields of package.json a publish is refused by. `dropsBuild`: the package manager sends the version without its build metadata (npm). */
+export type PublishTarget = { name: string; version: string; private: boolean; dropsBuild: boolean };
+
 /** The version semver compares: build metadata is ignored, so 1.0.0+a and 1.0.0 are one version to a registry. */
 export const withoutBuild = (version: string): string => version.split("+")[0] ?? version;
 
-/** The registry's rules for a first publish of `name`: its rule for new names, then npm's names, then look-alikes. */
+/** What package.json alone says would be refused: no registry answer needed. */
+export function manifestChecks(target: PublishTarget): PublishCheck[] {
+  const { name, version } = target;
+  const out: PublishCheck[] = [];
+
+  if (target.private) out.push({ kind: "refused", reason: `package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.` });
+
+  if (!isValidPublishName(name)) {
+    const lower = name.toLowerCase();
+    out.push({ kind: "refused", reason: isValidPublishName(lower) ? `${name} is not a valid name for a new package: npm names are lowercase. Use ${lower}.` : `${name} is not a valid package name: ${VALID_NAME_RULE}.` });
+  }
+
+  if (!isValidVersion(version)) out.push({ kind: "refused", reason: `"${version}" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).` });
+  else if (target.dropsBuild && version.includes("+")) out.push({ kind: "refused", reason: `npm sends ${version} as ${withoutBuild(version)}, without its build metadata, and the registry refuses a publish whose version differs from the tarball's. Drop the "+..." part, or publish with bun or pnpm.` });
+
+  return out;
+}
+
+/** The registry's rules for a first publish of `name`: its rule for new names, then reserved, npm's and look-alike names. */
 function newNameChecks(name: string, view: RegistryView): PublishCheck[] {
   const { user, policy, existing } = view;
   const out: PublishCheck[] = [];
@@ -44,7 +65,8 @@ function newNameChecks(name: string, view: RegistryView): PublishCheck[] {
     if (refused !== null) out.push({ kind: "refused", reason: refused });
   }
 
-  if (existing.kind === "npm") out.push({ kind: "refused", reason: `${name} already exists on npm, and apm shares one namespace with it, so it cannot be published over here. Pick another name under your scope.` });
+  if (POPULAR_NAMES.includes(name)) out.push({ kind: "refused", reason: `${name} is a reserved name (a widely used public package), so the registry refuses it. Pick another name under your scope.` });
+  else if (existing.kind === "npm") out.push({ kind: "refused", reason: `${name} already exists on npm, and apm shares one namespace with it, so it cannot be published over here. Pick another name under your scope.` });
   const conflicts = existing.kind === "missing" ? typoConflicts(name) : [];
 
   if (conflicts.length > 0) out.push({ kind: "refused", reason: `${name} is too close to a popular package (${conflicts.map((c) => c.reason).join("; ")}), and the registry refuses look-alikes. Pick a more distinct name.` });
@@ -73,24 +95,11 @@ function nameChecks(name: string, view: RegistryView): PublishCheck[] {
   }
 }
 
-/** Everything that would stop this publish, in the order a person fixes it: package.json first, then the registry. */
-export function publishChecks(input: { name: string; version: string; private: boolean; view: RegistryView }): PublishCheck[] {
+/** What the registry would refuse this publish for, by what apm read from it. Run after manifestChecks passes. */
+export function registryChecks(input: { name: string; version: string; view: RegistryView }): PublishCheck[] {
   const { name, version, view } = input;
-  const out: PublishCheck[] = [];
+  const same = view.existing.kind === "local" ? view.existing.versions.find((v) => withoutBuild(v) === withoutBuild(version)) : undefined;
+  const published: PublishCheck[] = same === undefined ? [] : [{ kind: "refused", reason: `${name}@${same} is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).` }];
 
-  if (input.private) out.push({ kind: "refused", reason: `package.json has "private": true, so package managers refuse to publish it. Remove "private" to publish.` });
-
-  if (!isValidPackageName(name)) {
-    const lower = name.toLowerCase();
-    out.push({ kind: "refused", reason: isValidPackageName(lower) ? `${name} is not a valid name for a new package: npm names are lowercase. Use ${lower}.` : `${name} is not a valid package name: ${VALID_NAME_RULE}.` });
-  }
-
-  if (!isValidVersion(version)) out.push({ kind: "refused", reason: `"${version}" is not a version apm accepts: apm takes strict semver only (1.2.3, 1.2.3-beta.1).` });
-
-  if (!isValidPackageName(name)) return out;
-  const same = view.existing.kind === "local" && isValidVersion(version) ? view.existing.versions.find((v) => withoutBuild(v) === withoutBuild(version)) : undefined;
-
-  if (same !== undefined) out.push({ kind: "refused", reason: `${name}@${same} is already published (or was, and was yanked or revoked). Versions are immutable; bump the version (apm publish --bump patch).` });
-
-  return [...out, ...nameChecks(name, view)];
+  return [...published, ...nameChecks(name, view)];
 }

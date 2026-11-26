@@ -4,7 +4,7 @@ import { RequestMemory } from "./memory.ts";
 import { createHash } from "node:crypto";
 import { Effect, Option } from "effect";
 import { z } from "zod";
-import { isValidTagName, isValidVersion, servableManifest } from "@apm/core";
+import { isValidPublishName, isValidTagName, isValidVersion, servableManifest } from "@apm/core";
 import { liveChangeRefusal, publishRefusal, secondFactor, stageRefusal, TOKEN_CAPABILITIES, type AccessServices, type Refusal as AccessRefusal, type TokenScope } from "./access.ts";
 import type { Analysis } from "./analysis.ts";
 import { loadAuthEngine } from "./auth.ts";
@@ -57,11 +57,7 @@ export const MAX_README_BYTES = 1024 * 1024;
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 
 // ---------- names ----------
-const NAME_RE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
-
-export function isValidName(name: string): boolean {
-  return name.length > 0 && name.length <= 214 && NAME_RE.test(name);
-}
+export const isValidName = isValidPublishName;
 
 /** The file name part a package's tarball links start with: its name without the scope. */
 export function tarballBase(name: string): string {

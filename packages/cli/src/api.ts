@@ -151,6 +151,7 @@ export const NameResponse = z.object({
   valid: z.boolean(),
   taken: z.boolean(),
   available: z.boolean(),
+  unknown: z.boolean().default(false),
   owners: z.array(z.string()),
   latest: z.object({ version: z.string(), score: z.number().nullable(), grade: z.string().nullable() }).nullable(),
   conflicts: z.array(z.object({ name: z.string(), reason: z.string() })),
